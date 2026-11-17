@@ -88,8 +88,9 @@ var _rgSpreadsheetTzCache = '';
 var _rgSheetObjCache = {};
 var _rgVerifiedSheetsCache = {};
 var _rgRecordsCache = {};
+var _rgSettingsMapCache = null;
 var RG_CACHE_CHUNK_SIZE = 95000;
-var RG_CACHE_MAX_CHUNKS = 12;
+var RG_CACHE_MAX_CHUNKS = 20;
 var RG_CACHE_TTL_SECONDS = 600;
 var RG_DATE_ONLY_FIELDS = { startDate: true, endDate: true, followUpDate: true, logDate: true };
 var RG_TIME_ONLY_FIELDS = { followUpTime: true, logTime: true };
@@ -167,11 +168,31 @@ function invalidateCache(sheetName) {
   if (sheetName) {
     delete _rgRecordsCache[sheetName];
   }
+  if (sheetName === RG_SHEETS.SETTINGS) {
+    _rgSettingsMapCache = null;
+  }
   try {
     var base = getCacheKey(sheetName);
     var keys = [base, base + '_META'];
+    if (sheetName === RG_SHEETS.SETTINGS) {
+      keys.push('RG_SETTINGS_MAP_V1');
+    }
     if (sheetName === RG_SHEETS.RESERVATIONS) {
       keys.push('RG_FACETS_V1');
+    }
+    if (
+      sheetName === RG_SHEETS.RESERVATIONS ||
+      sheetName === RG_SHEETS.FOLLOWUPS ||
+      sheetName === RG_SHEETS.PROBLEMS ||
+      sheetName === RG_SHEETS.EMPLOYEES
+    ) {
+      keys.push(
+        'RG_DASH_V1_today',
+        'RG_DASH_V1_7d',
+        'RG_DASH_V1_30d',
+        'RG_DASH_V1_month',
+        'RG_EMP_SUMMARY_V1'
+      );
     }
     for (var i = 0; i < RG_CACHE_MAX_CHUNKS; i++) {
       keys.push(base + '_' + i);
@@ -182,26 +203,50 @@ function invalidateCache(sheetName) {
 
 function invalidateAllCaches() {
   _rgRecordsCache = {};
+  _rgSettingsMapCache = null;
   var names = Object.keys(RG_SHEETS_SCHEMA);
   for (var i = 0; i < names.length; i++) {
     invalidateCache(names[i]);
   }
 }
 
+function encodeCachePayload_(serialized) {
+  if (serialized.length <= RG_CACHE_CHUNK_SIZE) return serialized;
+  try {
+    var blob = Utilities.newBlob(serialized, 'text/plain; charset=utf-8');
+    var gz = Utilities.gzip(blob);
+    return 'GZ:' + Utilities.base64Encode(gz.getBytes());
+  } catch (e) {
+    return serialized;
+  }
+}
+
+function decodeCachePayload_(rawStr) {
+  if (!rawStr) return null;
+  if (rawStr.indexOf('GZ:') === 0) {
+    var bytes = Utilities.base64Decode(rawStr.substring(3));
+    var gzBlob = Utilities.newBlob(bytes, 'application/x-gzip');
+    var plain = Utilities.ungzip(gzBlob).getDataAsString('utf-8');
+    return JSON.parse(plain);
+  }
+  return JSON.parse(rawStr);
+}
+
 function putChunkedCache_(sheetName, serialized) {
   try {
     var cache = CacheService.getScriptCache();
     var base = getCacheKey(sheetName);
-    if (serialized.length <= RG_CACHE_CHUNK_SIZE) {
-      cache.put(base, serialized, RG_CACHE_TTL_SECONDS);
+    var encoded = encodeCachePayload_(serialized);
+    if (encoded.length <= RG_CACHE_CHUNK_SIZE) {
+      cache.put(base, encoded, RG_CACHE_TTL_SECONDS);
       return;
     }
-    var totalChunks = Math.ceil(serialized.length / RG_CACHE_CHUNK_SIZE);
+    var totalChunks = Math.ceil(encoded.length / RG_CACHE_CHUNK_SIZE);
     if (totalChunks > RG_CACHE_MAX_CHUNKS) return;
     var batch = {};
     batch[base + '_META'] = String(totalChunks);
     for (var i = 0; i < totalChunks; i++) {
-      batch[base + '_' + i] = serialized.substring(i * RG_CACHE_CHUNK_SIZE, (i + 1) * RG_CACHE_CHUNK_SIZE);
+      batch[base + '_' + i] = encoded.substring(i * RG_CACHE_CHUNK_SIZE, (i + 1) * RG_CACHE_CHUNK_SIZE);
     }
     cache.remove(base);
     cache.putAll(batch, RG_CACHE_TTL_SECONDS);
@@ -213,7 +258,7 @@ function getChunkedCache_(sheetName) {
     var cache = CacheService.getScriptCache();
     var base = getCacheKey(sheetName);
     var direct = cache.get(base);
-    if (direct) return JSON.parse(direct);
+    if (direct) return decodeCachePayload_(direct);
 
     var metaRaw = cache.get(base + '_META');
     var totalChunks = Number(metaRaw || 0);
@@ -230,7 +275,7 @@ function getChunkedCache_(sheetName) {
       if (!chunk) return null;
       parts.push(chunk);
     }
-    return JSON.parse(parts.join(''));
+    return decodeCachePayload_(parts.join(''));
   } catch (e) {
     return null;
   }
@@ -442,37 +487,12 @@ function initDatabase() {
   });
 }
 
-function readAllRecords(sheetName, skipCache, includeRawJson) {
-  if (!skipCache) {
-    if (_rgRecordsCache[sheetName]) {
-      return _rgRecordsCache[sheetName];
-    }
-    var cachedRecords = getChunkedCache_(sheetName);
-    if (cachedRecords) {
-      _rgRecordsCache[sheetName] = cachedRecords;
-      return cachedRecords;
-    }
-  }
-
-  var ss = getSpreadsheet();
-  var sheet = getSheetOrCreate(ss, sheetName);
-  var lastRow = sheet.getLastRow();
-  var lastCol = sheet.getLastColumn();
-  if (lastRow <= 1 || lastCol === 0) {
-    if (!skipCache) _rgRecordsCache[sheetName] = [];
-    return [];
-  }
-
-  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
-  var fileHeaders = values[0];
-  var ssTz = getSpreadsheetTz_();
-  var skipRaw = sheetName === RG_SHEETS.RESERVATIONS && !includeRawJson;
-
+function mapSheetValuesToRecords_(fileHeaders, bodyRows, ssTz, skipRawJson) {
   var colMeta = [];
   for (var hIdx = 0; hIdx < fileHeaders.length; hIdx++) {
     var hdr = normalizeStr(fileHeaders[hIdx]);
     if (!hdr) continue;
-    if (skipRaw && hdr === 'rawJson') continue;
+    if (skipRawJson && hdr === 'rawJson') continue;
     colMeta.push({
       idx: hIdx,
       key: hdr,
@@ -483,8 +503,8 @@ function readAllRecords(sheetName, skipCache, includeRawJson) {
 
   var records = [];
   var colCount = colMeta.length;
-  for (var r = 1; r < values.length; r++) {
-    var row = values[r];
+  for (var r = 0; r < bodyRows.length; r++) {
+    var row = bodyRows[r];
     var isEmpty = true;
     var obj = {};
     for (var m = 0; m < colCount; m++) {
@@ -511,6 +531,37 @@ function readAllRecords(sheetName, skipCache, includeRawJson) {
       records.push(obj);
     }
   }
+  return records;
+}
+
+function readAllRecords(sheetName, skipCache, includeRawJson) {
+  if (!skipCache) {
+    if (_rgRecordsCache[sheetName]) {
+      return _rgRecordsCache[sheetName];
+    }
+    var cachedRecords = getChunkedCache_(sheetName);
+    if (cachedRecords) {
+      _rgRecordsCache[sheetName] = cachedRecords;
+      return cachedRecords;
+    }
+  }
+
+  var ss = getSpreadsheet();
+  var sheet = getSheetOrCreate(ss, sheetName);
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow <= 1 || lastCol === 0) {
+    if (!skipCache) _rgRecordsCache[sheetName] = [];
+    return [];
+  }
+
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var records = mapSheetValuesToRecords_(
+    values[0],
+    values.slice(1),
+    getSpreadsheetTz_(),
+    sheetName === RG_SHEETS.RESERVATIONS && !includeRawJson
+  );
 
   if (!skipCache) {
     _rgRecordsCache[sheetName] = records;
@@ -522,7 +573,49 @@ function readAllRecords(sheetName, skipCache, includeRawJson) {
   return records;
 }
 
+function readRecentRecords_(sheetName, maxRows) {
+  var limit = Math.max(1, Number(maxRows) || 200);
+  if (_rgRecordsCache[sheetName]) {
+    var mem = _rgRecordsCache[sheetName];
+    return mem.length <= limit ? mem : mem.slice(mem.length - limit);
+  }
+  var cachedRecords = getChunkedCache_(sheetName);
+  if (cachedRecords) {
+    _rgRecordsCache[sheetName] = cachedRecords;
+    return cachedRecords.length <= limit ? cachedRecords : cachedRecords.slice(cachedRecords.length - limit);
+  }
+
+  var ss = getSpreadsheet();
+  var sheet = getSheetOrCreate(ss, sheetName);
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow <= 1 || lastCol === 0) return [];
+
+  var totalDataRows = lastRow - 1;
+  if (totalDataRows <= limit) {
+    return readAllRecords(sheetName, false);
+  }
+
+  var startRow = lastRow - limit + 1;
+  var headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var tailValues = sheet.getRange(startRow, 1, limit, lastCol).getValues();
+  return mapSheetValuesToRecords_(headerRow, tailValues, getSpreadsheetTz_(), false);
+}
+
 function getSettingsMap_(skipCache) {
+  if (!skipCache) {
+    if (_rgSettingsMapCache) return _rgSettingsMapCache;
+    try {
+      var raw = CacheService.getScriptCache().get('RG_SETTINGS_MAP_V1');
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          _rgSettingsMapCache = parsed;
+          return _rgSettingsMapCache;
+        }
+      }
+    } catch (e) {}
+  }
   var rows = readAllRecords(RG_SHEETS.SETTINGS, Boolean(skipCache));
   var map = {};
   for (var i = 0; i < rows.length; i++) {
@@ -530,12 +623,25 @@ function getSettingsMap_(skipCache) {
       map[rows[i].key] = rows[i].value;
     }
   }
+  if (!skipCache) {
+    _rgSettingsMapCache = map;
+    try {
+      CacheService.getScriptCache().put('RG_SETTINGS_MAP_V1', JSON.stringify(map), RG_CACHE_TTL_SECONDS);
+    } catch (e) {}
+  }
   return map;
 }
 
 function findRecordById(sheetName, idField, idValue, skipCache) {
   var target = normalizeStr(idValue);
   if (!target) return null;
+  if (!skipCache && sheetName === RG_SHEETS.SETTINGS && idField === 'key') {
+    var map = getSettingsMap_(false);
+    if (Object.prototype.hasOwnProperty.call(map, target)) {
+      return { key: target, value: map[target] };
+    }
+    return null;
+  }
   var rows = readAllRecords(sheetName, Boolean(skipCache));
   for (var i = 0; i < rows.length; i++) {
     if (normalizeStr(rows[i][idField]) === target) {
@@ -683,7 +789,48 @@ function upsertRecordByKey(sheetName, keyField, keyValue, recordObj) {
   return { action: 'inserted', record: recordObj };
 }
 
-function batchUpsertRecords(sheetName, keyField, recordsList) {
+function normalizeCellForDiff_(cell, fieldName, ssTz) {
+  if (cell === null || cell === undefined) return '';
+  if (cell instanceof Date) {
+    if (RG_DATE_ONLY_FIELDS[fieldName]) return formatCellDateFast_(cell, ssTz, 'date');
+    if (RG_TIME_ONLY_FIELDS[fieldName]) return formatCellDateFast_(cell, ssTz, 'time');
+    return cell.toISOString();
+  }
+  if (RG_DATE_ONLY_FIELDS[fieldName] && typeof cell === 'string' && cell.length > 10) {
+    return formatDateOnly(cell);
+  }
+  return String(cell);
+}
+
+function writeDirtyRowSpans_(sheet, colCount, existingValues, dirtyIndices) {
+  if (!dirtyIndices || dirtyIndices.length === 0) return;
+  dirtyIndices.sort(function (a, b) { return a - b; });
+
+  var spans = [];
+  var spanStart = dirtyIndices[0];
+  var spanEnd = dirtyIndices[0];
+  for (var i = 1; i < dirtyIndices.length; i++) {
+    var idx = dirtyIndices[i];
+    if (idx === spanEnd) continue;
+    // Merge nearby dirty rows (gap <= 15) to reduce Sheets API calls while avoiding full-sheet rewrites
+    if (idx - spanEnd <= 15) {
+      spanEnd = idx;
+    } else {
+      spans.push([spanStart, spanEnd]);
+      spanStart = idx;
+      spanEnd = idx;
+    }
+  }
+  spans.push([spanStart, spanEnd]);
+
+  for (var s = 0; s < spans.length; s++) {
+    var a = spans[s][0];
+    var b = spans[s][1];
+    sheet.getRange(a + 2, 1, b - a + 1, colCount).setValues(existingValues.slice(a, b + 1));
+  }
+}
+
+function batchUpsertRecords(sheetName, keyField, recordsList, options) {
   if (!Array.isArray(recordsList) || recordsList.length === 0) {
     return { inserted: 0, updated: 0 };
   }
@@ -694,6 +841,8 @@ function batchUpsertRecords(sheetName, keyField, recordsList) {
   var keyIndex = headers.indexOf(keyField);
   if (keyIndex === -1) throw new Error('حقل المفتاح غير موجود: ' + keyField);
 
+  var ignoreDiff = (options && options.ignoreDiffKeys) || null;
+  var ssTz = getSpreadsheetTz_();
   var lastRow = sheet.getLastRow();
   var existingValues = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, headers.length).getValues() : [];
   var rowIndexByKey = {};
@@ -703,8 +852,8 @@ function batchUpsertRecords(sheetName, keyField, recordsList) {
   }
 
   var updatedCount = 0;
+  var dirtyIndices = [];
   var insertedRows = [];
-  var hasUpdates = false;
 
   for (var i = 0; i < recordsList.length; i++) {
     var rec = recordsList[i];
@@ -713,13 +862,28 @@ function batchUpsertRecords(sheetName, keyField, recordsList) {
 
     if (Object.prototype.hasOwnProperty.call(rowIndexByKey, keyVal)) {
       var targetIdx = rowIndexByKey[keyVal];
+      if (targetIdx >= existingValues.length) continue;
+      var targetRow = existingValues[targetIdx];
+      var rowChanged = false;
       for (var c = 0; c < headers.length; c++) {
         var h = headers[c];
-        if (Object.prototype.hasOwnProperty.call(rec, h)) {
-          existingValues[targetIdx][c] = rec[h] !== undefined && rec[h] !== null ? rec[h] : '';
+        if (!Object.prototype.hasOwnProperty.call(rec, h)) continue;
+        var nextVal = rec[h] !== undefined && rec[h] !== null ? rec[h] : '';
+        if (ignoreDiff && ignoreDiff[h]) continue;
+        if (normalizeCellForDiff_(targetRow[c], h, ssTz) !== String(nextVal)) {
+          rowChanged = true;
+          break;
         }
       }
-      hasUpdates = true;
+      if (!rowChanged) continue;
+
+      for (var uc = 0; uc < headers.length; uc++) {
+        var uh = headers[uc];
+        if (Object.prototype.hasOwnProperty.call(rec, uh)) {
+          targetRow[uc] = rec[uh] !== undefined && rec[uh] !== null ? rec[uh] : '';
+        }
+      }
+      dirtyIndices.push(targetIdx);
       updatedCount++;
     } else {
       rowIndexByKey[keyVal] = existingValues.length + insertedRows.length;
@@ -727,9 +891,8 @@ function batchUpsertRecords(sheetName, keyField, recordsList) {
     }
   }
 
-  if (hasUpdates && existingValues.length > 0) {
-    applyTextFormatForDateColumns_(sheet, headers, 2, existingValues.length);
-    sheet.getRange(2, 1, existingValues.length, headers.length).setValues(existingValues);
+  if (dirtyIndices.length > 0 && existingValues.length > 0) {
+    writeDirtyRowSpans_(sheet, headers.length, existingValues, dirtyIndices);
   }
   if (insertedRows.length > 0) {
     var appendStart = existingValues.length + 2;
@@ -737,7 +900,9 @@ function batchUpsertRecords(sheetName, keyField, recordsList) {
     sheet.getRange(appendStart, 1, insertedRows.length, headers.length).setValues(insertedRows);
   }
 
-  invalidateCache(sheetName);
+  if (dirtyIndices.length > 0 || insertedRows.length > 0) {
+    invalidateCache(sheetName);
+  }
   return {
     inserted: insertedRows.length,
     updated: updatedCount

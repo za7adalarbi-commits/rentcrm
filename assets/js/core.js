@@ -885,6 +885,94 @@
     return '';
   }
 
+  function resolveGasConnection(search, storedVal, defaultConfigUrl) {
+    var q = normalizeStr(search).replace(/^\?/, '');
+    var parts = q ? q.split('&') : [];
+    var queryAction = '';
+    for (var i = 0; i < parts.length; i++) {
+      var eqIdx = parts[i].indexOf('=');
+      if (eqIdx === -1) continue;
+      var k = parts[i].slice(0, eqIdx);
+      var rawV = '';
+      try { rawV = decodeURIComponent(parts[i].slice(eqIdx + 1).replace(/\+/g, ' ')).trim(); } catch (e) { rawV = ''; }
+      if ((k === 'sandbox' && (rawV === '1' || rawV === 'true')) || (k === 'mode' && rawV === 'sandbox') || (k === 'gasUrl' && rawV === 'sandbox')) {
+        queryAction = 'sandbox';
+        break;
+      }
+      if ((k === 'gasUrl' || k === 'gas' || k === 'api') && (rawV === 'default' || rawV === 'reset' || rawV === 'auto')) {
+        queryAction = 'reset_default';
+      }
+    }
+
+    var defCheck = validateGasUrl(defaultConfigUrl);
+    var validDefault = (defCheck.valid && !defCheck.isSandbox) ? defCheck.normalized : '';
+
+    if (queryAction === 'sandbox') {
+      return { url: '', source: 'sandbox_param', defaultUrl: validDefault, persist: false, clearStored: false };
+    }
+    if (queryAction === 'reset_default') {
+      return {
+        url: validDefault,
+        source: validDefault ? 'global_config' : 'sandbox',
+        defaultUrl: validDefault,
+        persist: false,
+        clearStored: true
+      };
+    }
+
+    var fromSearch = extractGasUrlFromSearch(search);
+    if (fromSearch) {
+      return { url: fromSearch, source: 'query_param', defaultUrl: validDefault, persist: true, clearStored: false };
+    }
+
+    var stored = normalizeStr(storedVal);
+    if (stored === '__SANDBOX__') {
+      return { url: '', source: 'local_sandbox', defaultUrl: validDefault, persist: false, clearStored: false };
+    }
+    if (stored) {
+      var storedCheck = validateGasUrl(stored);
+      if (storedCheck.valid && !storedCheck.isSandbox) {
+        return { url: storedCheck.normalized, source: 'local_storage', defaultUrl: validDefault, persist: false, clearStored: false };
+      }
+    }
+
+    if (validDefault) {
+      return { url: validDefault, source: 'global_config', defaultUrl: validDefault, persist: false, clearStored: false };
+    }
+
+    return { url: '', source: 'sandbox', defaultUrl: '', persist: false, clearStored: false };
+  }
+
+  function buildAutoConnectShareUrl(origin, pathname, gasUrl) {
+    var check = validateGasUrl(gasUrl);
+    if (!check.valid || check.isSandbox) return '';
+    var cleanOrigin = normalizeStr(origin).replace(/\/+$/, '');
+    var cleanPath = normalizeStr(pathname) || '/';
+    if (cleanPath.charAt(0) !== '/') cleanPath = '/' + cleanPath;
+    return cleanOrigin + cleanPath + '?gasUrl=' + encodeURIComponent(check.normalized);
+  }
+
+  function compactGasPayload(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+    var out = {};
+    var keys = Object.keys(payload);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (k === 'visibleCols') continue;
+      var v = payload[k];
+      if (v !== undefined) out[k] = v;
+    }
+    return out;
+  }
+
+  function getGasActionTimeoutMs(action) {
+    var key = normalizeStr(action);
+    if (key === 'pullReservations' || key === 'syncRentalGate' || key === 'exportReportData' || key === 'getReports') {
+      return 90000;
+    }
+    return 35000;
+  }
+
   function buildGasFetchOptions(action, token, payload) {
     return {
       method: 'POST',
@@ -897,7 +985,7 @@
       body: JSON.stringify({
         action: normalizeStr(action),
         token: normalizeStr(token),
-        payload: payload && typeof payload === 'object' ? payload : {}
+        payload: compactGasPayload(payload)
       })
     };
   }
@@ -1357,6 +1445,10 @@
     dedupeExtensionsByNumber: dedupeExtensionsByNumber,
     validateGasUrl: validateGasUrl,
     extractGasUrlFromSearch: extractGasUrlFromSearch,
+    resolveGasConnection: resolveGasConnection,
+    buildAutoConnectShareUrl: buildAutoConnectShareUrl,
+    compactGasPayload: compactGasPayload,
+    getGasActionTimeoutMs: getGasActionTimeoutMs,
     buildGasFetchOptions: buildGasFetchOptions,
     parseGasResponseText: parseGasResponseText,
     getApiCachePolicy: getApiCachePolicy,

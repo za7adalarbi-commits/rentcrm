@@ -24,20 +24,28 @@ function resolveDateRange(rangeKey, customFrom, customTo) {
 
 function getDashboard(session, params) {
   var p = params || {};
-  var range = resolveDateRange(normalizeStr(p.range) || '30d', p.dateFrom, p.dateTo);
+  var rangeKey = normalizeStr(p.range) || '30d';
   var todayStr = formatDateOnly(new Date());
+  var isStandardRange = (rangeKey === 'today' || rangeKey === '7d' || rangeKey === '30d' || rangeKey === 'month');
+  var cacheKey = isStandardRange ? ('RG_DASH_V1_' + rangeKey) : '';
 
+  if (cacheKey) {
+    try {
+      var cachedRaw = CacheService.getScriptCache().get(cacheKey);
+      if (cachedRaw) {
+        var cachedObj = JSON.parse(cachedRaw);
+        if (cachedObj && cachedObj.dateStr === todayStr && cachedObj.data) {
+          return cachedObj.data;
+        }
+      }
+    } catch (e) {}
+  }
+
+  var range = resolveDateRange(rangeKey, p.dateFrom, p.dateTo);
   var reservations = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
   var problems = readAllRecords(RG_SHEETS.PROBLEMS, false);
   var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
-
-  var filteredRes = reservations.filter(function (r) {
-    var d = formatDateOnly(r.startDate || r.createdAt);
-    if (range.start && d < range.start) return false;
-    if (range.end && d > range.end) return false;
-    return true;
-  });
 
   var statusCounts = {
     'تم الحجز': 0,
@@ -50,11 +58,18 @@ function getDashboard(session, params) {
   };
 
   var companyCounts = {};
+  var assignedCountsByEmp = {};
+  var filteredTotal = 0;
   var todayReservations = 0;
   var newReservations = 0;
 
-  for (var i = 0; i < filteredRes.length; i++) {
-    var res = filteredRes[i];
+  for (var i = 0; i < reservations.length; i++) {
+    var res = reservations[i];
+    var d = formatDateOnly(res.startDate || res.createdAt);
+    if (range.start && d < range.start) continue;
+    if (range.end && d > range.end) continue;
+
+    filteredTotal++;
     var st = res.internalStatus || 'تم الإنشاء';
     if (Object.prototype.hasOwnProperty.call(statusCounts, st)) {
       statusCounts[st]++;
@@ -65,6 +80,14 @@ function getDashboard(session, params) {
     if (st === 'تم الإنشاء') newReservations++;
     var comp = res.companyName || 'غير محدد';
     companyCounts[comp] = (companyCounts[comp] || 0) + 1;
+
+    var aIds = safeJsonParse(res.assignedEmployeeIds, []);
+    if (Array.isArray(aIds)) {
+      for (var ai = 0; ai < aIds.length; ai++) {
+        var eid = aIds[ai];
+        if (eid) assignedCountsByEmp[eid] = (assignedCountsByEmp[eid] || 0) + 1;
+      }
+    }
   }
 
   var todayFollowUps = 0;
@@ -100,21 +123,16 @@ function getDashboard(session, params) {
   for (var e = 0; e < employees.length; e++) {
     var emp = employees[e];
     if (emp.status !== 'active') continue;
-    var assignedTotal = 0;
-    for (var r2 = 0; r2 < filteredRes.length; r2++) {
-      var aIds = safeJsonParse(filteredRes[r2].assignedEmployeeIds, []);
-      if (aIds.indexOf(emp.id) !== -1) assignedTotal++;
-    }
     empActivityComparison.push({
       name: emp.name,
       followUps: empFollowUpCounts[emp.name] || 0,
-      assigned: assignedTotal
+      assigned: assignedCountsByEmp[emp.id] || 0
     });
   }
 
-  return {
+  var result = {
     kpis: {
-      totalReservations: filteredRes.length,
+      totalReservations: filteredTotal,
       todayReservations: todayReservations,
       newReservations: newReservations,
       booked: statusCounts['تم الحجز'],
@@ -138,6 +156,14 @@ function getDashboard(session, params) {
       employeeComparison: empActivityComparison
     }
   };
+
+  if (cacheKey) {
+    try {
+      CacheService.getScriptCache().put(cacheKey, JSON.stringify({ dateStr: todayStr, data: result }), 120);
+    } catch (e) {}
+  }
+
+  return result;
 }
 
 function getAppBootstrap(session, params) {

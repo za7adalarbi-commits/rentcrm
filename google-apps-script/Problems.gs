@@ -88,36 +88,40 @@ function createProblem(session, payload) {
       'حجز ' + reservation.reservationNumber + ' | الأولوية: ' + priority + ' | ' + description
     );
 
+    var notifBatch = [];
+    var notifiedSet = {};
     for (var k = 0; k < validIds.length; k++) {
       if (validIds[k] !== session.employeeId) {
-        createNotification(
-          validIds[k],
-          '',
-          'new_problem',
-          'مشكلة جديدة مسندة إليك',
-          'مشكلة على الحجز ' + reservation.reservationNumber + ': ' + description,
-          'Problem',
-          problem.id
-        );
+        notifiedSet[validIds[k]] = true;
+        notifBatch.push({
+          recipientEmployeeId: validIds[k],
+          recipientRole: '',
+          type: 'new_problem',
+          title: 'مشكلة جديدة مسندة إليك',
+          message: 'مشكلة على الحجز ' + reservation.reservationNumber + ': ' + description,
+          entityType: 'Problem',
+          entityId: problem.id
+        });
       }
     }
 
     if (priority === 'مرتفع') {
       for (var m = 0; m < employees.length; m++) {
         var emp = employees[m];
-        if (emp.status === 'active' && (emp.role === RG_ROLES.SUPERVISOR || emp.role === RG_ROLES.GENERAL_MANAGER)) {
-          createNotification(
-            emp.id,
-            emp.role,
-            'high_priority_problem',
-            'تنبيه: مشكلة بأولوية مرتفعة',
-            'تم فتح مشكلة مرتفعة الأولوية للحجز ' + reservation.reservationNumber + ' (' + reservation.customerName + ') بواسطة ' + session.user.name,
-            'Problem',
-            problem.id
-          );
+        if (!notifiedSet[emp.id] && emp.status === 'active' && (emp.role === RG_ROLES.SUPERVISOR || emp.role === RG_ROLES.GENERAL_MANAGER)) {
+          notifBatch.push({
+            recipientEmployeeId: emp.id,
+            recipientRole: emp.role,
+            type: 'high_priority_problem',
+            title: 'تنبيه: مشكلة بأولوية مرتفعة',
+            message: 'تم فتح مشكلة مرتفعة الأولوية للحجز ' + reservation.reservationNumber + ' (' + reservation.customerName + ') بواسطة ' + session.user.name,
+            entityType: 'Problem',
+            entityId: problem.id
+          });
         }
       }
     }
+    if (notifBatch.length > 0) createNotificationsBatch_(notifBatch);
 
     return formatProblemForClient(problem);
   });
@@ -202,13 +206,17 @@ function updateProblem(session, payload) {
       logActivity(session.user, 'تحديث مشكلة', 'Problem', existing.problemNumber, note);
     }
 
-    var allProblemsForRes = readAllRecords(RG_SHEETS.PROBLEMS, true).filter(function (pr) {
+    var hasOpenProblem = readAllRecords(RG_SHEETS.PROBLEMS, false).some(function (pr) {
       return pr.reservationId === existing.reservationId && pr.status !== 'مغلقة' && pr.status !== 'تم الحل';
     });
-    updateRecordByKey(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId, {
-      hasProblem: allProblemsForRes.length > 0 ? 'true' : 'false',
-      updatedAt: nowIso()
-    });
+    var nextFlag = hasOpenProblem ? 'true' : 'false';
+    var resRow = findRecordById(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId);
+    if (resRow && String(toBool(resRow.hasProblem)) !== nextFlag) {
+      updateRecordByKey(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId, {
+        hasProblem: nextFlag,
+        updatedAt: nowIso()
+      });
+    }
 
     return formatProblemForClient(updated);
   });

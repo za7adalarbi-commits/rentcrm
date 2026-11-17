@@ -32,7 +32,7 @@ function scheduledAutoSync() {
   var intervalRec = findRecordById(RG_SHEETS.SETTINGS, 'key', 'auto_sync_interval_hours');
   var intervalHours = intervalRec ? Math.max(1, Math.min(168, toNumber(intervalRec.value, 12))) : 12;
 
-  var logs = readAllRecords(RG_SHEETS.SYNC_LOG, true);
+  var logs = readRecentRecords_(RG_SHEETS.SYNC_LOG, 10);
   if (logs.length > 0) {
     logs.sort(function (a, b) {
       return String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt));

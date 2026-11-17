@@ -155,8 +155,8 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
     }
   }
 
-  // Round 2+: fetch all remaining pages in parallel batches of 12
-  var batchSize = 12;
+  // Round 2+: fetch all remaining pages in larger parallel batches of 20
+  var batchSize = 20;
   for (var start = 0; start < remainingReqs.length; start += batchSize) {
     var reqChunk = remainingReqs.slice(start, start + batchSize);
     var metaChunk = remainingMeta.slice(start, start + batchSize);
@@ -272,6 +272,8 @@ function pullReservations(session) {
     importedCount: syncResult.importedCount || 0,
     updatedCount: syncResult.updatedCount || 0,
     extensionsCount: syncResult.extensionsCount || 0,
+    pagesFetched: syncResult.pagesFetched || 0,
+    durationMs: syncResult.durationMs || 0,
     finishedAt: syncResult.finishedAt || nowIso()
   };
 }
@@ -454,19 +456,20 @@ function runRentalGateSyncInternal(actor) {
           hasProblem: existing ? existing.hasProblem : 'false',
           createdAt: existing ? existing.createdAt : nowStr,
           updatedAt: nowStr,
-          rawJson: JSON.stringify(item).substring(0, 5000)
+          rawJson: JSON.stringify(item).substring(0, 800)
         };
 
         resRecordsToUpsert.push(resPayload);
       }
 
+      var diffOpts = { ignoreDiffKeys: { updatedAt: true, syncedAt: true, rawJson: true } };
       if (extRecordsToUpsert.length > 0) {
-        var extResult = batchUpsertRecords(RG_SHEETS.EXTENSIONS, 'extensionNumber', extRecordsToUpsert);
+        var extResult = batchUpsertRecords(RG_SHEETS.EXTENSIONS, 'extensionNumber', extRecordsToUpsert, diffOpts);
         extensionsCount = extResult.inserted + extResult.updated;
       }
 
       if (resRecordsToUpsert.length > 0) {
-        var resResult = batchUpsertRecords(RG_SHEETS.RESERVATIONS, 'reservationNumber', resRecordsToUpsert);
+        var resResult = batchUpsertRecords(RG_SHEETS.RESERVATIONS, 'reservationNumber', resRecordsToUpsert, diffOpts);
         importedCount = resResult.inserted;
         updatedCount = resResult.updated;
       }
@@ -486,8 +489,10 @@ function runRentalGateSyncInternal(actor) {
         finishedAt: nowIso()
       };
       appendRecord(RG_SHEETS.SYNC_LOG, syncRecord);
-      logActivity(actorObj, 'سحب بيانات', 'Sync', syncRecord.id,
-        'استيراد ' + importedCount + '، تحديث ' + updatedCount + '، تمديدات ' + extensionsCount);
+      if (actorId !== 'SYSTEM' || (importedCount + updatedCount + extensionsCount) > 0) {
+        logActivity(actorObj, 'سحب بيانات', 'Sync', syncRecord.id,
+          'استيراد ' + importedCount + '، تحديث ' + updatedCount + '، تمديدات ' + extensionsCount);
+      }
 
       return syncRecord;
     } catch (err) {
@@ -513,7 +518,7 @@ function runRentalGateSyncInternal(actor) {
 
 function getSyncStatus(session) {
   requireApiAccess(session);
-  var logs = readAllRecords(RG_SHEETS.SYNC_LOG, false);
+  var logs = readRecentRecords_(RG_SHEETS.SYNC_LOG, 30);
   logs.sort(function (a, b) {
     return String(b.startedAt).localeCompare(String(a.startedAt));
   });

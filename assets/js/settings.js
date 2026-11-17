@@ -34,29 +34,52 @@
     var autoSyncEnabled = settings.auto_sync_enabled !== undefined ? Boolean(settings.auto_sync_enabled) : (syncData.autoSyncEnabled !== false);
     var autoSyncHours = Number(settings.auto_sync_interval_hours || syncData.autoSyncIntervalHours || 12);
 
+    var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
+    var currentGasUrl = connInfo.url || '';
+    var sourceLabels = {
+      global_config: 'ربط تلقائي عام للجميع (config.js / VITE_GAS_WEBAPP_URL)',
+      query_param: 'ربط تلقائي عبر الرابط المشارك',
+      local_storage: 'محفوظ في هذا المتصفح',
+      local_sandbox: 'وضع المعاينة المحلية (تجاوز مؤقت)',
+      sandbox: 'وضع المعاينة المحلية (Sandbox)'
+    };
+
     container.innerHTML =
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div><h2 class="section-title">ربط Google Apps Script Web App (/exec)</h2>' +
-          '<p class="section-subtitle">مخصص للمدير العام والمشرف فقط · الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل فعليًا بـ Google Apps Script & Google Sheets' : 'وضع المعاينة المحلية (Sandbox)') + '</strong></p></div>' +
+          '<p class="section-subtitle">مخصص للمدير العام والمشرف فقط · الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل فعليًا بـ Google Apps Script & Google Sheets' : 'وضع المعاينة المحلية (Sandbox)') + '</strong> · المصدر: <strong>' + (sourceLabels[connInfo.source] || connInfo.source || 'تلقائي') + '</strong></p></div>' +
         '</div>' +
         '<div class="form-grid-2">' +
           '<div class="form-group">' +
             '<label class="form-label" for="set-gas-url">رابط Web App (/exec)</label>' +
-            '<input class="input mono" id="set-gas-url" placeholder="https://script.google.com/macros/s/.../exec" value="' + root.RGApi.getGasUrl() + '">' +
+            '<input class="input mono" id="set-gas-url" dir="ltr" placeholder="https://script.google.com/macros/s/.../exec" value="' + currentGasUrl + '">' +
           '</div>' +
           '<div class="form-group" style="justify-content:flex-end;">' +
-            '<div class="toolbar-row" style="margin-bottom:0;">' +
+            '<div class="toolbar-row" style="margin-bottom:0;flex-wrap:wrap;">' +
               '<button type="button" class="btn btn-primary" id="btn-save-gas-url">حفظ الرابط</button>' +
               '<button type="button" class="btn" id="btn-ping-gas-url">فحص رابط Apps Script</button>' +
+              '<button type="button" class="btn btn-charcoal" id="btn-copy-autoconnect-link">نسخ رابط الربط التلقائي للفريق</button>' +
+              (connInfo.defaultUrl && (connInfo.source === 'local_storage' || connInfo.source === 'local_sandbox') ? '<button type="button" class="btn" id="btn-restore-global-gas">استعادة الربط التلقائي العام</button>' : '') +
               '<button type="button" class="btn btn-danger" id="btn-clear-gas-url">العودة لوضع المعاينة</button>' +
             '</div>' +
           '</div>' +
         '</div>' +
         '<div id="gas-ping-result" class="hidden" style="margin-top:10px;"></div>' +
+        '<div id="autoconnect-share-wrap" class="hidden" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
+          '<div style="font-size:12px;font-weight:700;margin-bottom:6px;">رابط الدخول المربوط تلقائيًا (أي موظف يفتحه يرتبط بالخادم فورًا دون إدخال أي رابط):</div>' +
+          '<input type="text" class="input mono" id="autoconnect-share-url" dir="ltr" readonly style="font-size:12px;">' +
+        '</div>' +
         '<details style="margin-top:12px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-          '<summary style="cursor:pointer;font-weight:700;font-size:13px;">خطوات الربط السريع مع Rental Gate API وGoogle Apps Script</summary>' +
-          '<ol style="margin:10px 0 0;padding-inline-start:20px;font-size:12.5px;line-height:1.8;color:var(--text-secondary);">' +
+          '<summary style="cursor:pointer;font-weight:700;font-size:13px;">الربط التلقائي للجميع + خطوات تجهيز Rental Gate API وGoogle Apps Script</summary>' +
+          '<div style="margin:10px 0 8px;padding:8px 10px;border-radius:6px;background:var(--bg-surface);border:1px solid var(--border-hairline);font-size:12.5px;line-height:1.75;">' +
+            '<strong>كيف يرتبط كل من يدخل الموقع تلقائيًا دون إعداد في صفحة تسجيل الدخول؟</strong>' +
+            '<ul style="margin:6px 0 0;padding-inline-start:18px;">' +
+              '<li><strong>الطريقة الدائمة للموقع بالكامل:</strong> أضف متغير المستودع <span class="mono" dir="ltr">VITE_GAS_WEBAPP_URL</span> في GitHub (<strong>Settings → Secrets and variables → Actions → Variables</strong>) أو ضع الرابط مرة واحدة داخل <span class="mono" dir="ltr">assets/js/config.js</span>.</li>' +
+              '<li><strong>الطريقة الفورية لمشاركة الفريق:</strong> الصق رابط <span class="mono">/exec</span> أعلاه واضغط <strong>نسخ رابط الربط التلقائي للفريق</strong> وأرسله للموظفين؛ بمجرد فتح الرابط يُحفظ تلقائيًا لكل موظف.</li>' +
+            '</ul>' +
+          '</div>' +
+          '<ol style="margin:8px 0 0;padding-inline-start:20px;font-size:12.5px;line-height:1.8;color:var(--text-secondary);">' +
             '<li>أنشئ مشروع Apps Script (أو من داخل Google Sheet عبر <strong>Extensions → Apps Script</strong>) وارفع ملفات مجلد <span class="mono">google-apps-script/</span> الـ 16 ملف <span class="mono">.gs</span> + <span class="mono">appsscript.json</span>.</li>' +
             '<li>من <strong>Project Settings → Script Properties</strong> أضف <span class="mono">RG_TOKEN</span> (رمز Rental Gate Bearer Token)، ويمكنك اختياريًا إضافة <span class="mono">SPREADSHEET_ID</span> (وإلا سيتم إنشاؤه تلقائيًا).</li>' +
             '<li>شغّل الدالة <span class="mono">setupRentalGateDatabase()</span> مرة واحدة ووافق على الصلاحيات لإنشاء التبويبات وحساب المدير (<span class="mono">admin / Admin@123</span>) وتفعيل السحب التلقائي كل 12 ساعة.</li>' +
@@ -157,9 +180,19 @@
 
     document.getElementById('btn-save-gas-url').addEventListener('click', function () {
       var val = document.getElementById('set-gas-url').value.trim();
+      var out = document.getElementById('gas-ping-result');
+      if (val && root.RGCrmCore && root.RGCrmCore.validateGasUrl) {
+        var check = root.RGCrmCore.validateGasUrl(val);
+        if (!check.valid) {
+          out.className = 'form-error';
+          out.textContent = check.message;
+          return;
+        }
+        val = check.normalized;
+      }
       root.RGApi.setGasUrl(val);
       root.RGApi.setToken('');
-      ctx.toast(val ? 'تم حفظ رابط Google Apps Script. يرجى تسجيل الدخول على الخادم الفعلي.' : 'تم المسح.');
+      ctx.toast(val ? 'تم حفظ رابط Google Apps Script. يرجى تسجيل الدخول على الخادم الفعلي.' : 'تم التبديل إلى وضع المعاينة المحلية.');
       root.RGAuth.logout().then(function () { ctx.onAuthChanged(); });
     });
 
@@ -168,6 +201,46 @@
       root.RGApi.setToken('');
       ctx.toast('تم التبديل إلى وضع المعاينة المحلية.');
       ctx.onAuthChanged();
+    });
+
+    var restoreGlobalBtn = document.getElementById('btn-restore-global-gas');
+    if (restoreGlobalBtn) {
+      restoreGlobalBtn.addEventListener('click', function () {
+        root.RGApi.setGasUrl('__DEFAULT__');
+        root.RGApi.setToken('');
+        ctx.toast('تمت استعادة الربط التلقائي العام.');
+        ctx.onAuthChanged();
+      });
+    }
+
+    document.getElementById('btn-copy-autoconnect-link').addEventListener('click', async function () {
+      var raw = document.getElementById('set-gas-url').value.trim();
+      var out = document.getElementById('gas-ping-result');
+      var shareUrl = (root.RGCrmCore && root.RGCrmCore.buildAutoConnectShareUrl)
+        ? root.RGCrmCore.buildAutoConnectShareUrl(window.location.origin, window.location.pathname, raw)
+        : '';
+      if (!shareUrl) {
+        out.className = 'form-error';
+        out.textContent = 'أدخل رابط Google Apps Script (/exec) صالحاً أولاً لتوليد رابط الربط التلقائي.';
+        return;
+      }
+      var wrap = document.getElementById('autoconnect-share-wrap');
+      var shareInput = document.getElementById('autoconnect-share-url');
+      if (wrap && shareInput) {
+        shareInput.value = shareUrl;
+        wrap.classList.remove('hidden');
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(shareUrl);
+        } else if (shareInput) {
+          shareInput.select();
+          document.execCommand('copy');
+        }
+        ctx.toast('تم نسخ رابط الربط التلقائي! أي موظف يفتحه يتصل بالخادم مباشرة.');
+      } catch (e) {
+        ctx.toast('تم توليد رابط الربط التلقائي — انسخه من الحقل أسفله.');
+      }
     });
 
     document.getElementById('btn-ping-gas-url').addEventListener('click', async function () {

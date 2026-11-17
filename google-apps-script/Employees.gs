@@ -3,6 +3,16 @@
  */
 
 function getEmployees(session) {
+  try {
+    var cachedRaw = CacheService.getScriptCache().get('RG_EMP_SUMMARY_V1');
+    if (cachedRaw) {
+      var cached = JSON.parse(cachedRaw);
+      if (cached && Array.isArray(cached.items)) {
+        return cached;
+      }
+    }
+  } catch (e) {}
+
   var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
   var reservations = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
@@ -10,7 +20,9 @@ function getEmployees(session) {
 
   var resCounts = {};
   for (var r = 0; r < reservations.length; r++) {
-    var ids = safeJsonParse(reservations[r].assignedEmployeeIds, []);
+    var rawIds = reservations[r].assignedEmployeeIds;
+    if (!rawIds || rawIds === '[]') continue;
+    var ids = safeJsonParse(rawIds, []);
     for (var j = 0; j < ids.length; j++) {
       resCounts[ids[j]] = (resCounts[ids[j]] || 0) + 1;
     }
@@ -24,7 +36,9 @@ function getEmployees(session) {
 
   var prbCounts = {};
   for (var p = 0; p < problems.length; p++) {
-    var pids = safeJsonParse(problems[p].assignedEmployeeIds, []);
+    var rawPids = problems[p].assignedEmployeeIds;
+    if (!rawPids || rawPids === '[]') continue;
+    var pids = safeJsonParse(rawPids, []);
     for (var k = 0; k < pids.length; k++) {
       prbCounts[pids[k]] = (prbCounts[pids[k]] || 0) + 1;
     }
@@ -39,12 +53,16 @@ function getEmployees(session) {
     list.push(clean);
   }
 
-  return {
+  var response = {
     items: list,
     total: list.length,
     rolePresets: readRolePresetsSetting(),
     customPermissions: readCustomPermissionsSetting()
   };
+  try {
+    CacheService.getScriptCache().put('RG_EMP_SUMMARY_V1', JSON.stringify(response), 120);
+  } catch (e) {}
+  return response;
 }
 
 function getEmployeeDetails(session, params) {

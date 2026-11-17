@@ -39,6 +39,7 @@ jobs:
         env:
           GITHUB_PAGES: "true"
           VITE_BASE_PATH: "/RENT-CRM/"
+          VITE_GAS_WEBAPP_URL: ${{ vars.VITE_GAS_WEBAPP_URL || '' }}
         run: npm run build
 
       - name: Setup Pages

@@ -334,9 +334,27 @@
       '</div>';
   }
 
+  function cleanAutoBindQueryFromAddressBar() {
+    try {
+      if (!window.location.search || !window.history || !window.history.replaceState) return;
+      var q = window.location.search.replace(/^\?/, '').split('&').filter(function (part) {
+        var k = part.split('=')[0];
+        return k && k !== 'gasUrl' && k !== 'gas' && k !== 'api';
+      });
+      var nextSearch = q.length ? ('?' + q.join('&')) : '';
+      var nextUrl = window.location.pathname + nextSearch + (window.location.hash || '');
+      window.history.replaceState(null, '', nextUrl);
+    } catch (e) {}
+  }
+
   function renderLoginScreen() {
     var appRoot = document.getElementById('app-root');
-    var isLive = root.RGApi.isLiveMode();
+    var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
+    var isLive = Boolean(connInfo.url);
+    cleanAutoBindQueryFromAddressBar();
+    if (isLive && root.RGApi.warmUpGas) {
+      root.RGApi.warmUpGas();
+    }
 
     appRoot.innerHTML =
       '<main class="auth-screen">' +
@@ -375,29 +393,23 @@
             '</form>' +
             '<div class="auth-mode-box">' +
               '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
-                '<div><strong>وضع التشغيل:</strong> ' + (isLive ? 'متصل بـ Google Apps Script' : 'معاينة محلية (Sandbox)') + '</div>' +
-                (isLive ? '<button type="button" class="btn btn-sm btn-danger" id="login-switch-sandbox">العودة للمعاينة المحلية</button>' : '') +
+                '<div><strong>حالة الخادم:</strong> ' + (isLive ? 'متصل تلقائيًا بـ Google Apps Script' : 'معاينة محلية (Sandbox)') + '</div>' +
+                (!isLive && connInfo.defaultUrl ? '<button type="button" class="btn btn-sm btn-primary" id="login-restore-default-gas">تفعيل الربط التلقائي للخادم</button>' : '') +
               '</div>' +
               (!isLive ? (
                 '<div class="auth-demo-quick">' +
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">دخول كمدير (admin)</button>' +
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">دخول كمشرف (supervisor)</button>' +
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">دخول كموظف (agent1)</button>' +
+                '</div>' +
+                '<div style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.6;">' +
+                  'يتم ربط الخادم تلقائيًا من داخل <strong>الإعدادات</strong> (بعد دخول المدير) أو عبر <span class="mono" dir="ltr">assets/js/config.js</span> دون الحاجة لإدخاله عند تسجيل الدخول.' +
                 '</div>'
               ) : (
                 '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--surface-muted,#f4f5f6);font-size:12px;line-height:1.6;color:var(--text-secondary);">' +
-                  'في الوضع المتصل بـ Google Apps Script تُقرأ الحسابات من ورقة <strong>Employees</strong> في Google Sheets. عند التهيئة الأولى يُنشأ حساب المدير الافتراضي فقط (<span class="mono" dir="ltr">admin / Admin@123</span>)، بينما حسابات المعاينة (<span class="mono" dir="ltr">supervisor / agent1</span>) تتوفر في وضع المعاينة المحلية أو بعد إضافتها من شاشة الموظفين.' +
+                  'النظام مربوط تلقائيًا بالخادم. أدخل حسابك الوظيفي المسجل في <strong>Employees</strong> للدخول مباشرة.' +
                 '</div>'
               )) +
-              '<details style="margin-top:8px;">' +
-                '<summary style="cursor:pointer;font-size:12px;color:var(--text-muted);font-weight:600;">إعداد ربط الخادم (للمدير والمشرف)</summary>' +
-                '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
-                  '<input class="input mono" id="login-gas-url" dir="ltr" placeholder="https://script.google.com/macros/s/.../exec" value="' + root.RGApi.getGasUrl() + '" style="flex:1;min-width:180px;min-height:32px;font-size:12px;">' +
-                  '<button type="button" class="btn btn-sm btn-primary" id="login-save-gas">ربط</button>' +
-                  '<button type="button" class="btn btn-sm" id="login-test-gas">فحص</button>' +
-                '</div>' +
-                '<div id="login-gas-feedback" class="hidden" style="margin-top:8px;"></div>' +
-              '</details>' +
             '</div>' +
           '</div>' +
         '</section>' +
@@ -476,44 +488,13 @@
       });
     });
 
-    var switchSandboxBtn = document.getElementById('login-switch-sandbox');
-    if (switchSandboxBtn) {
-      switchSandboxBtn.addEventListener('click', function () {
-        root.RGApi.setGasUrl('');
+    var restoreDefaultBtn = document.getElementById('login-restore-default-gas');
+    if (restoreDefaultBtn) {
+      restoreDefaultBtn.addEventListener('click', function () {
+        root.RGApi.setGasUrl('__DEFAULT__');
         root.RGApi.setToken('');
-        toast('تم التبديل لوضع المعاينة المحلية (Sandbox).');
+        toast('تمت استعادة الربط التلقائي بالخادم.');
         renderLoginScreen();
-      });
-    }
-
-    document.getElementById('login-save-gas').addEventListener('click', function () {
-      var u = document.getElementById('login-gas-url').value.trim();
-      var fb = document.getElementById('login-gas-feedback');
-      if (u && root.RGCrmCore && root.RGCrmCore.validateGasUrl) {
-        var check = root.RGCrmCore.validateGasUrl(u);
-        if (!check.valid) {
-          fb.className = 'form-error';
-          fb.textContent = check.message;
-          return;
-        }
-        u = check.normalized;
-      }
-      root.RGApi.setGasUrl(u);
-      root.RGApi.setToken('');
-      toast(u ? 'تم حفظ رابط Apps Script الفعلي.' : 'تم التبديل لوضع المعاينة.');
-      renderLoginScreen();
-    });
-
-    var testGasBtn = document.getElementById('login-test-gas');
-    if (testGasBtn) {
-      testGasBtn.addEventListener('click', async function () {
-        var u = document.getElementById('login-gas-url').value.trim();
-        var fb = document.getElementById('login-gas-feedback');
-        testGasBtn.disabled = true;
-        var res = await root.RGApi.pingGasUrl(u);
-        testGasBtn.disabled = false;
-        fb.className = res.success ? 'form-success' : 'form-error';
-        fb.textContent = res.message || (res.success ? 'تم الاتصال بنجاح.' : 'فشل الاتصال.');
       });
     }
 

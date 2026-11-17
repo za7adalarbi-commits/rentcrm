@@ -519,4 +519,45 @@ test('buildCompressedExcelSheets supports optional non-mandatory compression wit
   assert.ok(packed2[1].preformattedAoa.some((r: any) => String(r[0]).includes('--- مشكلات ---')));
 });
 
+test('resolveGasConnection, buildAutoConnectShareUrl, and payload helpers enable zero-config automatic binding', () => {
+  const globalUrl = 'https://script.google.com/macros/s/AKfycbGlobalDefault123/exec';
+  const queryUrl = 'https://script.google.com/macros/s/AKfycbTeamLink456/exec';
 
+  // 1) Visitor with empty localStorage automatically connects to globalUrl without touching login screen
+  const autoRes = core.resolveGasConnection('', '', globalUrl);
+  assert.equal(autoRes.url, globalUrl);
+  assert.equal(autoRes.source, 'global_config');
+  assert.equal(autoRes.persist, false);
+
+  // 2) Shared ?gasUrl=... link takes priority and flags persistence to localStorage
+  const qpRes = core.resolveGasConnection('?gasUrl=' + encodeURIComponent(queryUrl), '', globalUrl);
+  assert.equal(qpRes.url, queryUrl);
+  assert.equal(qpRes.source, 'query_param');
+  assert.equal(qpRes.persist, true);
+
+  // 3) Explicit ?sandbox=1 preview does not overwrite stored/global binding
+  const sbParam = core.resolveGasConnection('?sandbox=1', queryUrl, globalUrl);
+  assert.equal(sbParam.url, '');
+  assert.equal(sbParam.source, 'sandbox_param');
+
+  // 4) Local sandbox sentinel overrides global default until cleared via ?gasUrl=default
+  const localSb = core.resolveGasConnection('', '__SANDBOX__', globalUrl);
+  assert.equal(localSb.url, '');
+  assert.equal(localSb.source, 'local_sandbox');
+  assert.equal(localSb.defaultUrl, globalUrl);
+
+  const resetDef = core.resolveGasConnection('?gasUrl=default', '__SANDBOX__', globalUrl);
+  assert.equal(resetDef.url, globalUrl);
+  assert.equal(resetDef.clearStored, true);
+  assert.equal(resetDef.source, 'global_config');
+
+  // 5) Share URL generator & compact payload / timeout selection
+  const shareUrl = core.buildAutoConnectShareUrl('https://team.github.io', '/RENT-CRM/', globalUrl);
+  assert.equal(shareUrl, 'https://team.github.io/RENT-CRM/?gasUrl=' + encodeURIComponent(globalUrl));
+  assert.equal(core.buildAutoConnectShareUrl('https://team.github.io', '/', 'https://script.google.com/macros/s/abc/dev'), '');
+
+  const compacted = core.compactGasPayload({ search: 'RG', visibleCols: ['a', 'b'], unused: undefined, page: 1 });
+  assert.deepEqual(compacted, { search: 'RG', page: 1 });
+  assert.equal(core.getGasActionTimeoutMs('pullReservations') >= 90000, true);
+  assert.equal(core.getGasActionTimeoutMs('getDashboard') <= 40000, true);
+});

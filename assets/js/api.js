@@ -28,15 +28,39 @@
     }
   }
 
-  function getGasUrl() {
-    var fromSearch = (root.RGCrmCore && root.RGCrmCore.extractGasUrlFromSearch && typeof window !== 'undefined')
-      ? root.RGCrmCore.extractGasUrlFromSearch(window.location.search)
-      : '';
-    if (fromSearch) {
-      safeStorageSet(STORAGE_GAS_URL, fromSearch);
-      return fromSearch;
+  var SANDBOX_SENTINEL = '__SANDBOX__';
+  var lastWarmUpUrl = '';
+  var lastWarmUpAt = 0;
+
+  function getDefaultConfiguredGasUrl() {
+    var cfg = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.gasWebAppUrl) || root.__RG_DEFAULT_GAS_URL__ || '';
+    return String(cfg || '').trim();
+  }
+
+  function getConnectionInfo() {
+    var search = typeof window !== 'undefined' ? window.location.search : '';
+    var stored = safeStorageGet(STORAGE_GAS_URL);
+    var defUrl = getDefaultConfiguredGasUrl();
+    if (root.RGCrmCore && root.RGCrmCore.resolveGasConnection) {
+      var info = root.RGCrmCore.resolveGasConnection(search, stored, defUrl);
+      if (info.clearStored) {
+        safeStorageSet(STORAGE_GAS_URL, '');
+      } else if (info.persist && info.url) {
+        safeStorageSet(STORAGE_GAS_URL, info.url);
+      }
+      return info;
     }
-    return safeStorageGet(STORAGE_GAS_URL);
+    return {
+      url: (stored && stored !== SANDBOX_SENTINEL) ? stored : defUrl,
+      source: stored ? 'local_storage' : (defUrl ? 'global_config' : 'sandbox'),
+      defaultUrl: defUrl,
+      persist: false,
+      clearStored: false
+    };
+  }
+
+  function getGasUrl() {
+    return getConnectionInfo().url;
   }
 
   var SESSION_CACHE_KEY = 'rg_crm_swr_v1';
@@ -145,8 +169,17 @@
   }
 
   function setGasUrl(url) {
-    var clean = String(url || '').trim();
-    safeStorageSet(STORAGE_GAS_URL, clean);
+    var raw = String(url || '').trim();
+    var defUrl = getDefaultConfiguredGasUrl();
+    if (raw === '__DEFAULT__') {
+      safeStorageSet(STORAGE_GAS_URL, '');
+    } else if (!raw) {
+      safeStorageSet(STORAGE_GAS_URL, defUrl ? SANDBOX_SENTINEL : '');
+    } else if (defUrl && raw === defUrl) {
+      safeStorageSet(STORAGE_GAS_URL, '');
+    } else {
+      safeStorageSet(STORAGE_GAS_URL, raw);
+    }
     clearCache();
   }
 
@@ -161,6 +194,24 @@
 
   function isLiveMode() {
     return Boolean(getGasUrl());
+  }
+
+  function warmUpGas() {
+    var gasUrl = getGasUrl();
+    if (!gasUrl) return;
+    var now = Date.now();
+    if (gasUrl === lastWarmUpUrl && (now - lastWarmUpAt) < 240000) return;
+    lastWarmUpUrl = gasUrl;
+    lastWarmUpAt = now;
+    try {
+      var sep = gasUrl.indexOf('?') === -1 ? '?' : '&';
+      fetch(gasUrl + sep + 'action=ping', {
+        method: 'GET',
+        redirect: 'follow',
+        credentials: 'omit',
+        cache: 'no-store'
+      }).catch(function () {});
+    } catch (e) {}
   }
 
   function simpleHash(str) {
@@ -2086,6 +2137,7 @@
           }
         }
 
+        var timeoutId = null;
         try {
           var opts = (core && core.buildGasFetchOptions)
             ? core.buildGasFetchOptions(action, token, payload)
@@ -2098,8 +2150,18 @@
                 body: JSON.stringify({ action: action, token: token, payload: payload || {} })
               };
 
+          if (typeof AbortController !== 'undefined') {
+            var controller = new AbortController();
+            var timeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
+            opts.signal = controller.signal;
+            timeoutId = setTimeout(function () {
+              try { controller.abort(); } catch (e) {}
+            }, timeoutMs);
+          }
+
           var response = await fetch(gasUrl, opts);
           var text = await response.text();
+          if (timeoutId) clearTimeout(timeoutId);
           parsed = (core && core.parseGasResponseText)
             ? core.parseGasResponseText(text, response.status)
             : JSON.parse(text);
@@ -2109,11 +2171,15 @@
             document.dispatchEvent(new CustomEvent('rg:unauthorized'));
           }
         } catch (err) {
+          if (timeoutId) clearTimeout(timeoutId);
+          var isAbort = err && (err.name === 'AbortError' || String(err.message || '').indexOf('abort') !== -1);
           return {
             success: false,
-            message: 'تعذر الاتصال بخادم Google Apps Script. تأكد من صحة رابط /exec واتصالك بالإنترنت وصلاحيات النشر (Anyone): ' + (err.message || err),
+            message: isAbort
+              ? 'انتهت مهلة الاتصال بخادم Google Apps Script. يرجى المحاولة مرة أخرى.'
+              : ('تعذر الاتصال بخادم Google Apps Script. تأكد من صحة رابط /exec واتصالك بالإنترنت وصلاحيات النشر (Anyone): ' + (err.message || err)),
             data: null,
-            error: err.message || 'NETWORK_ERROR'
+            error: isAbort ? 'TIMEOUT' : (err.message || 'NETWORK_ERROR')
           };
         }
       }
@@ -2160,6 +2226,7 @@
       clean = check.normalized;
     }
 
+    var pingTimer = null;
     try {
       var opts = (core && core.buildGasFetchOptions)
         ? core.buildGasFetchOptions('ping', '', {})
@@ -2171,12 +2238,21 @@
             headers: { 'Content-Type': 'text/plain;charset=utf-8' },
             body: JSON.stringify({ action: 'ping', payload: {} })
           };
+      if (typeof AbortController !== 'undefined') {
+        var pingCtrl = new AbortController();
+        opts.signal = pingCtrl.signal;
+        pingTimer = setTimeout(function () {
+          try { pingCtrl.abort(); } catch (e) {}
+        }, 20000);
+      }
       var res = await fetch(clean, opts);
       var text = await res.text();
+      if (pingTimer) clearTimeout(pingTimer);
       return (core && core.parseGasResponseText)
         ? core.parseGasResponseText(text, res.status)
         : JSON.parse(text);
     } catch (err) {
+      if (pingTimer) clearTimeout(pingTimer);
       return {
         success: false,
         message: 'فشل الاتصال بالرابط. تأكد من نشر Web App بصلاحية Anyone: ' + (err.message || err),
@@ -2188,10 +2264,12 @@
 
   root.RGApi = {
     getGasUrl: getGasUrl,
+    getConnectionInfo: getConnectionInfo,
     setGasUrl: setGasUrl,
     getToken: getToken,
     setToken: setToken,
     isLiveMode: isLiveMode,
+    warmUpGas: warmUpGas,
     clearCache: clearCache,
     primeCache: primeCache,
     hasCached: hasCached,

@@ -7,10 +7,22 @@ function getReservations(session, params) {
   var all = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   var settingsMap = getSettingsMap_(false);
   var allowAgentAll = settingsMap.allow_agent_view_all !== undefined ? toBool(settingsMap.allow_agent_view_all) : true;
+  var restrictToAgent = session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations');
 
-  var companiesMap = {};
-  var branchesMap = {};
-  var filtered = [];
+  var cachedFacets = null;
+  try {
+    var fRaw = CacheService.getScriptCache().get('RG_FACETS_V1');
+    if (fRaw) {
+      var parsedF = JSON.parse(fRaw);
+      if (parsedF && Array.isArray(parsedF.companies) && Array.isArray(parsedF.branches)) {
+        cachedFacets = parsedF;
+      }
+    }
+  } catch (e) {}
+
+  var companiesMap = cachedFacets ? null : {};
+  var branchesMap = cachedFacets ? null : {};
+  var matched = [];
 
   var search = normalizeStr(p.search).toLowerCase();
   var company = normalizeStr(p.company);
@@ -31,89 +43,112 @@ function getReservations(session, params) {
 
   for (var i = 0; i < all.length; i++) {
     var r = all[i];
-    if (r.companyName) companiesMap[r.companyName] = true;
-    if (r.branchName) branchesMap[r.branchName] = true;
+    if (!cachedFacets) {
+      if (r.companyName) companiesMap[r.companyName] = true;
+      if (r.branchName) branchesMap[r.branchName] = true;
+    }
 
-    var assignedIds = safeJsonParse(r.assignedEmployeeIds, []);
-    if (session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations')) {
-      if (assignedIds.indexOf(session.employeeId) === -1) continue;
+    if (restrictToAgent) {
+      var rawMy = String(r.assignedEmployeeIds || '');
+      if (rawMy.indexOf(session.employeeId) === -1) continue;
+      if (safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
+    }
+
+    if (company && r.companyName !== company) continue;
+    if (branch && r.branchName !== branch) continue;
+    if (status && r.internalStatus !== status && r.originalStatusAr !== status) continue;
+    if (priority && r.priority !== priority) continue;
+    if (dateFrom && r.startDate < dateFrom) continue;
+    if (dateTo && r.startDate > dateTo) continue;
+    if (unfollowedOnly && followedResIds[r.id]) continue;
+    if (hasProblemsOnly && !toBool(r.hasProblem)) continue;
+
+    if (employeeId) {
+      var rawEmp = String(r.assignedEmployeeIds || '');
+      if (rawEmp.indexOf(employeeId) === -1) continue;
+      if (safeJsonParse(rawEmp, []).indexOf(employeeId) === -1) continue;
     }
 
     if (search) {
       var hay = (r.reservationNumber + ' ' + r.customerName + ' ' + r.customerPhone + ' ' + r.carName + ' ' + r.companyName).toLowerCase();
       if (hay.indexOf(search) === -1) continue;
     }
-    if (company && r.companyName !== company) continue;
-    if (branch && r.branchName !== branch) continue;
-    if (status && r.internalStatus !== status && r.originalStatusAr !== status) continue;
-    if (priority && r.priority !== priority) continue;
-    if (employeeId && assignedIds.indexOf(employeeId) === -1) continue;
-    if (dateFrom && r.startDate < dateFrom) continue;
-    if (dateTo && r.startDate > dateTo) continue;
-    if (unfollowedOnly && followedResIds[r.id]) continue;
-    if (hasProblemsOnly && !toBool(r.hasProblem)) continue;
 
-    filtered.push({
-      id: r.id,
-      reservationNumber: r.reservationNumber,
-      customerName: r.customerName,
-      customerPhone: r.customerPhone,
-      companyName: r.companyName,
-      branchName: r.branchName,
-      carName: r.carName,
-      plateNumber: r.plateNumber,
-      startDate: r.startDate,
-      endDate: r.endDate,
-      daysCount: toNumber(r.daysCount, 1),
-      originalStatusCode: r.originalStatusCode,
-      originalStatusAr: r.originalStatusAr,
-      pickupTypeAr: r.pickupTypeAr,
-      returnTypeAr: r.returnTypeAr,
-      baseAmount: toNumber(r.baseAmount, 0),
-      extensionsAmount: toNumber(r.extensionsAmount, 0),
-      totalAmount: toNumber(r.totalAmount, 0),
-      hasExtensions: toBool(r.hasExtensions),
-      internalStatus: r.internalStatus,
-      priority: r.priority,
-      assignedEmployeeIds: assignedIds,
-      assignedEmployeeNames: safeJsonParse(r.assignedEmployeeNames, []),
-      lastUpdateText: r.lastUpdateText,
-      lastUpdatedById: r.lastUpdatedById,
-      lastUpdatedByName: r.lastUpdatedByName,
-      lastUpdatedAt: r.lastUpdatedAt,
-      hasProblem: toBool(r.hasProblem),
-      isFollowed: Boolean(followedResIds[r.id])
-    });
+    matched.push(r);
+  }
+
+  if (!cachedFacets) {
+    cachedFacets = {
+      companies: Object.keys(companiesMap).sort(),
+      branches: Object.keys(branchesMap).sort()
+    };
+    try {
+      CacheService.getScriptCache().put('RG_FACETS_V1', JSON.stringify(cachedFacets), 600);
+    } catch (e) {}
   }
 
   var sortBy = normalizeStr(p.sortBy) || 'lastUpdatedAt';
   var sortDir = normalizeStr(p.sortDir) === 'asc' ? 1 : -1;
-  filtered.sort(function (a, b) {
-    var va = a[sortBy];
-    var vb = b[sortBy];
-    if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * sortDir;
-    var sa = String(va || '');
-    var sb = String(vb || '');
+  var numericSort = (sortBy === 'daysCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
+  matched.sort(function (a, b) {
+    if (numericSort) {
+      return (toNumber(a[sortBy], 0) - toNumber(b[sortBy], 0)) * sortDir;
+    }
+    var sa = String(a[sortBy] || '');
+    var sb = String(b[sortBy] || '');
     if (sa === sb) return 0;
     return (sa < sb ? -1 : 1) * sortDir;
   });
 
   var page = Math.max(1, toNumber(p.page, 1));
   var pageSize = Math.min(200, Math.max(1, toNumber(p.pageSize, 25)));
-  var total = filtered.length;
+  var total = matched.length;
   var startIdx = (page - 1) * pageSize;
-  var paged = filtered.slice(startIdx, startIdx + pageSize);
+  var slice = matched.slice(startIdx, startIdx + pageSize);
+
+  var items = [];
+  for (var j = 0; j < slice.length; j++) {
+    var sr = slice[j];
+    items.push({
+      id: sr.id,
+      reservationNumber: sr.reservationNumber,
+      customerName: sr.customerName,
+      customerPhone: sr.customerPhone,
+      companyName: sr.companyName,
+      branchName: sr.branchName,
+      carName: sr.carName,
+      plateNumber: sr.plateNumber,
+      startDate: sr.startDate,
+      endDate: sr.endDate,
+      daysCount: toNumber(sr.daysCount, 1),
+      originalStatusCode: sr.originalStatusCode,
+      originalStatusAr: sr.originalStatusAr,
+      pickupTypeAr: sr.pickupTypeAr,
+      returnTypeAr: sr.returnTypeAr,
+      baseAmount: toNumber(sr.baseAmount, 0),
+      extensionsAmount: toNumber(sr.extensionsAmount, 0),
+      totalAmount: toNumber(sr.totalAmount, 0),
+      hasExtensions: toBool(sr.hasExtensions),
+      internalStatus: sr.internalStatus,
+      priority: sr.priority,
+      assignedEmployeeIds: safeJsonParse(sr.assignedEmployeeIds, []),
+      assignedEmployeeNames: safeJsonParse(sr.assignedEmployeeNames, []),
+      lastUpdateText: sr.lastUpdateText,
+      lastUpdatedById: sr.lastUpdatedById,
+      lastUpdatedByName: sr.lastUpdatedByName,
+      lastUpdatedAt: sr.lastUpdatedAt,
+      hasProblem: toBool(sr.hasProblem),
+      isFollowed: Boolean(followedResIds[sr.id])
+    });
+  }
 
   return {
-    items: paged,
+    items: items,
     total: total,
     page: page,
     pageSize: pageSize,
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
-    facets: {
-      companies: Object.keys(companiesMap).sort(),
-      branches: Object.keys(branchesMap).sort()
-    }
+    facets: cachedFacets
   };
 }
 

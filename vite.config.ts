@@ -61,7 +61,8 @@ export default defineConfig(({command}) => {
         name: 'rental-gate-base-assets',
         transformIndexHtml(html) {
           const normalizedBase = base === './' ? './' : (base.endsWith('/') ? base : `${base}/`);
-          const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};</script>\n`;
+          const defaultGasUrl = String(process.env.VITE_GAS_WEBAPP_URL || '').trim();
+          const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};</script>\n`;
           let nextHtml = html.replace('</head>', `${baseInject}  </head>`);
           if (normalizedBase !== './') {
             nextHtml = nextHtml.replace(/(src|href)="\.\/assets\//g, `$1="${normalizedBase}assets/`);
