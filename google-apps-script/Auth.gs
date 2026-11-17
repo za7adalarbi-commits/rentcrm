@@ -28,9 +28,50 @@ function getSessionTtlHours() {
   return h > 0 ? h : 24;
 }
 
+var RG_SESSION_CACHE_PREFIX = 'RG_SES_';
+var RG_SESSION_CACHE_TTL = 300;
+
+function cacheSession_(tokenHash, sessionObj, expiresAtIso) {
+  try {
+    var payload = {
+      tokenHash: tokenHash,
+      employeeId: sessionObj.employeeId,
+      role: sessionObj.role,
+      permissions: sessionObj.permissions,
+      user: sessionObj.user,
+      expiresAt: expiresAtIso
+    };
+    CacheService.getScriptCache().put(RG_SESSION_CACHE_PREFIX + tokenHash, JSON.stringify(payload), RG_SESSION_CACHE_TTL);
+  } catch (e) {}
+}
+
+function clearCachedSession_(tokenHash) {
+  if (!tokenHash) return;
+  try {
+    CacheService.getScriptCache().remove(RG_SESSION_CACHE_PREFIX + tokenHash);
+  } catch (e) {}
+}
+
+function clearEmployeeSessionCache_(employeeId) {
+  var targetId = normalizeStr(employeeId);
+  if (!targetId) return;
+  try {
+    var sessions = readAllRecords(RG_SHEETS.SESSIONS, false);
+    var keys = [];
+    for (var i = 0; i < sessions.length; i++) {
+      if (sessions[i].employeeId === targetId && !toBool(sessions[i].isRevoked) && sessions[i].tokenHash) {
+        keys.push(RG_SESSION_CACHE_PREFIX + sessions[i].tokenHash);
+      }
+    }
+    if (keys.length > 0) {
+      CacheService.getScriptCache().removeAll(keys);
+    }
+  } catch (e) {}
+}
+
 function handleLogin(payload) {
   var p = payload || {};
-  var username = normalizeStr(p.username).toLowerCase();
+  var username = normalizeLoginUsername_(p.username);
   var password = String(p.password || '');
 
   if (!username || !password) {
@@ -38,18 +79,26 @@ function handleLogin(payload) {
   }
 
   return withScriptLock(function () {
-    var employees = readAllRecords(RG_SHEETS.EMPLOYEES, true);
+    var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
     if (employees.length === 0) {
       initDatabaseCore_();
       employees = readAllRecords(RG_SHEETS.EMPLOYEES, true);
     }
 
-    var user = null;
-    for (var i = 0; i < employees.length; i++) {
-      if (normalizeStr(employees[i].username).toLowerCase() === username) {
-        user = employees[i];
-        break;
+    var findByUname = function (list) {
+      for (var i = 0; i < list.length; i++) {
+        if (normalizeLoginUsername_(list[i].username) === username) {
+          return list[i];
+        }
       }
+      return null;
+    };
+
+    var user = findByUname(employees);
+    if (!user) {
+      // Fallback uncached read in case an admin edited Employees sheet manually
+      employees = readAllRecords(RG_SHEETS.EMPLOYEES, true);
+      user = findByUname(employees);
     }
 
     if (!user) {
@@ -70,13 +119,14 @@ function handleLogin(payload) {
     var ttlHours = getSessionTtlHours();
     var now = new Date();
     var expiresAt = new Date(now.getTime() + ttlHours * 3600 * 1000);
+    var expiresIso = expiresAt.toISOString();
 
     appendRecord(RG_SHEETS.SESSIONS, {
       tokenHash: tokenHash,
       employeeId: user.id,
       username: user.username,
       role: user.role,
-      expiresAt: expiresAt.toISOString(),
+      expiresAt: expiresIso,
       createdAt: now.toISOString(),
       lastSeenAt: now.toISOString(),
       isRevoked: 'false'
@@ -89,12 +139,20 @@ function handleLogin(payload) {
       syncUserSheetRecord(updatedEmp);
     }
 
+    var cleanUser = sanitizeEmployeeForClient(updatedEmp || user);
+    cacheSession_(tokenHash, {
+      employeeId: cleanUser.id,
+      role: cleanUser.role,
+      permissions: cleanUser.permissions,
+      user: cleanUser
+    }, expiresIso);
+
     logActivity(user, 'تسجيل الدخول', 'Employee', user.id, 'تسجيل دخول ناجح للمستخدم ' + user.username);
 
     return {
       token: rawToken,
-      expiresAt: expiresAt.toISOString(),
-      user: sanitizeEmployeeForClient(updatedEmp || user)
+      expiresAt: expiresIso,
+      user: cleanUser
     };
   });
 }
@@ -105,6 +163,7 @@ function handleLogout(session) {
       isRevoked: 'true',
       lastSeenAt: nowIso()
     });
+    clearCachedSession_(session.tokenHash);
     logActivity(session.user, 'تسجيل الخروج', 'Employee', session.user.id, 'تسجيل خروج');
     return { loggedOut: true };
   });
@@ -117,6 +176,23 @@ function requireAuth(token) {
   }
 
   var tokenHash = hashToken(rawToken);
+  try {
+    var cachedRaw = CacheService.getScriptCache().get(RG_SESSION_CACHE_PREFIX + tokenHash);
+    if (cachedRaw) {
+      var cached = JSON.parse(cachedRaw);
+      if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now()) {
+        return {
+          tokenHash: tokenHash,
+          employeeId: cached.employeeId,
+          role: cached.role,
+          permissions: cached.permissions,
+          user: cached.user
+        };
+      }
+      clearCachedSession_(tokenHash);
+    }
+  } catch (e) {}
+
   var sessionRec = findRecordById(RG_SHEETS.SESSIONS, 'tokenHash', tokenHash);
   if (!sessionRec || toBool(sessionRec.isRevoked)) {
     throw new Error('UNAUTHORIZED: الجلسة منتهية أو تم تسجيل الخروج.');
@@ -132,13 +208,15 @@ function requireAuth(token) {
   }
 
   var cleanUser = sanitizeEmployeeForClient(user);
-  return {
+  var result = {
     tokenHash: tokenHash,
     employeeId: user.id,
     role: user.role,
     permissions: cleanUser.permissions,
     user: cleanUser
   };
+  cacheSession_(tokenHash, result, sessionRec.expiresAt);
+  return result;
 }
 
 function requireRole(session, allowedRoles) {
@@ -163,12 +241,20 @@ function requireApiAccess(session) {
 }
 
 function revokeEmployeeSessions(employeeId) {
-  var sessions = readAllRecords(RG_SHEETS.SESSIONS, true);
-  for (var i = 0; i < sessions.length; i++) {
-    if (sessions[i].employeeId === employeeId && !toBool(sessions[i].isRevoked)) {
-      updateRecordByKey(RG_SHEETS.SESSIONS, 'tokenHash', sessions[i].tokenHash, {
-        isRevoked: 'true'
-      });
-    }
+  var targetId = normalizeStr(employeeId);
+  if (!targetId) return;
+  var revoked = updateRecordsWhere_(
+    RG_SHEETS.SESSIONS,
+    function (s) { return s.employeeId === targetId && !toBool(s.isRevoked); },
+    { isRevoked: 'true', lastSeenAt: nowIso() }
+  );
+  if (revoked.length > 0) {
+    try {
+      var keys = [];
+      for (var i = 0; i < revoked.length; i++) {
+        if (revoked[i].tokenHash) keys.push(RG_SESSION_CACHE_PREFIX + revoked[i].tokenHash);
+      }
+      if (keys.length > 0) CacheService.getScriptCache().removeAll(keys);
+    } catch (e) {}
   }
 }

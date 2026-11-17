@@ -30,7 +30,9 @@
   }
 
   async function login(username, password) {
-    var cleanUser = String(username || '').trim();
+    var cleanUser = (root.RGCrmCore && root.RGCrmCore.normalizeLoginUsername)
+      ? root.RGCrmCore.normalizeLoginUsername(username)
+      : String(username || '').trim().toLowerCase();
     var cleanPass = String(password || '');
     if (!cleanUser || !cleanPass) {
       return {

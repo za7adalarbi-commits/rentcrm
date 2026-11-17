@@ -844,7 +844,9 @@
     }
 
     if (action === 'login') {
-      var uname = String(payload.username || '').trim().toLowerCase();
+      var uname = (core && core.normalizeLoginUsername)
+        ? core.normalizeLoginUsername(payload.username)
+        : String(payload.username || '').trim().toLowerCase();
       var pwd = String(payload.password || '');
       if (!uname || !pwd) return { success: false, message: 'يرجى إدخال اسم المستخدم وكلمة المرور.', data: null, error: 'VALIDATION' };
 
@@ -1903,17 +1905,52 @@
           user: session.user,
           allowAgentViewAll: db.settings.allow_agent_view_all
         });
+        var dFrom = String(payload.dateFrom || '').trim();
+        var dTo = String(payload.dateTo || '').trim();
+        var fEmp = String(payload.employeeId || '').trim();
+        var fStatus = String(payload.status || '').trim();
+        var fPrio = String(payload.priority || '').trim();
+
         if (rType === 'followups_log') {
-          return { success: true, message: '', data: { reportType: rType, rows: db.followUps, facets: repFacets }, error: null };
+          var fuFiltered = db.followUps.filter(function (x) {
+            if (dFrom && String(x.followUpDate || '') < dFrom) return false;
+            if (dTo && String(x.followUpDate || '') > dTo) return false;
+            if (fEmp && x.employeeId !== fEmp) return false;
+            if (fStatus && x.status !== fStatus) return false;
+            return true;
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: fuFiltered, facets: repFacets }, error: null };
         }
         if (rType === 'problems') {
-          return { success: true, message: '', data: { reportType: rType, rows: db.problems, facets: repFacets }, error: null };
+          var prFiltered = db.problems.filter(function (pr) {
+            if (fPrio && pr.priority !== fPrio) return false;
+            if (fStatus && pr.status !== fStatus) return false;
+            if (fEmp && (pr.assignedEmployeeIds || []).indexOf(fEmp) === -1) return false;
+            if (dFrom && core.formatDisplayDate(pr.createdAt) < dFrom) return false;
+            if (dTo && core.formatDisplayDate(pr.createdAt) > dTo) return false;
+            return true;
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: prFiltered, facets: repFacets }, error: null };
         }
         if (rType === 'extensions') {
-          return { success: true, message: '', data: { reportType: rType, rows: db.extensions, facets: repFacets }, error: null };
+          var extFiltered = db.extensions.filter(function (ex) {
+            if (dFrom && core.formatDisplayDate(ex.startDate) < dFrom) return false;
+            if (dTo && core.formatDisplayDate(ex.startDate) > dTo) return false;
+            return true;
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: extFiltered, facets: repFacets }, error: null };
         }
         if (rType === 'unfollowed') {
           return { success: true, message: '', data: { reportType: rType, rows: filteredRes.filter(function (r) { return !r.isFollowed; }), facets: repFacets }, error: null };
+        }
+        if (rType === 'priorities') {
+          var prioRank = { 'مرتفع': 0, 'متوسط': 1, 'عادي': 2 };
+          var prioSorted = filteredRes.slice().sort(function (a, b) {
+            var ra = prioRank[a.priority] !== undefined ? prioRank[a.priority] : 3;
+            var rb = prioRank[b.priority] !== undefined ? prioRank[b.priority] : 3;
+            return ra - rb;
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: prioSorted, facets: repFacets }, error: null };
         }
         if (rType === 'employee_performance') {
           var perf = db.employees.map(function (emp) {
@@ -1928,6 +1965,21 @@
             };
           });
           return { success: true, message: '', data: { reportType: rType, rows: perf, facets: repFacets }, error: null };
+        }
+        if (rType === 'sync_log') {
+          var syncRows = db.syncLog.slice().sort(function (a, b) {
+            return String(b.startedAt || '').localeCompare(String(a.startedAt || ''));
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: syncRows, facets: repFacets }, error: null };
+        }
+        if (rType === 'activity_log') {
+          var actRows = db.activityLog.filter(function (l) {
+            if (fEmp && l.userId !== fEmp) return false;
+            if (dFrom && String(l.logDate || '') < dFrom) return false;
+            if (dTo && String(l.logDate || '') > dTo) return false;
+            return true;
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: actRows, facets: repFacets }, error: null };
         }
         return { success: true, message: '', data: { reportType: rType, rows: filteredRes, facets: repFacets }, error: null };
       }

@@ -17,6 +17,28 @@ function createNotification(recipientEmployeeId, recipientRole, type, title, mes
   });
 }
 
+function createNotificationsBatch_(items) {
+  if (!Array.isArray(items) || items.length === 0) return 0;
+  var now = nowIso();
+  var records = [];
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i] || {};
+    records.push({
+      id: generateId('NTF'),
+      recipientEmployeeId: it.recipientEmployeeId || '',
+      recipientRole: it.recipientRole || '',
+      type: it.type || 'info',
+      title: it.title || '',
+      message: it.message || '',
+      entityType: it.entityType || '',
+      entityId: it.entityId || '',
+      isRead: 'false',
+      createdAt: now
+    });
+  }
+  return batchAppendRecords(RG_SHEETS.NOTIFICATIONS, records);
+}
+
 function getNotifications(session) {
   var all = readAllRecords(RG_SHEETS.NOTIFICATIONS, false);
   var mine = all.filter(function (n) {
@@ -49,20 +71,21 @@ function getNotifications(session) {
 
 function markNotificationRead(session, payload) {
   return withScriptLock(function () {
-    var all = readAllRecords(RG_SHEETS.NOTIFICATIONS, true);
     var p = payload || {};
     var targetId = normalizeStr(p.notificationId);
     var markAll = toBool(p.markAll);
 
-    for (var i = 0; i < all.length; i++) {
-      var n = all[i];
-      var isMine = n.recipientEmployeeId === session.employeeId ||
-        (!n.recipientEmployeeId && n.recipientRole === session.role);
-      if (!isMine) continue;
-      if (markAll || n.id === targetId) {
-        updateRecordByKey(RG_SHEETS.NOTIFICATIONS, 'id', n.id, { isRead: 'true' });
-      }
-    }
+    updateRecordsWhere_(
+      RG_SHEETS.NOTIFICATIONS,
+      function (n) {
+        if (toBool(n.isRead)) return false;
+        var isMine = n.recipientEmployeeId === session.employeeId ||
+          (!n.recipientEmployeeId && n.recipientRole === session.role);
+        if (!isMine) return false;
+        return markAll || n.id === targetId;
+      },
+      { isRead: 'true' }
+    );
     return { updated: true };
   });
 }

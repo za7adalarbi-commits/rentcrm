@@ -399,3 +399,124 @@ test('formatDisplayDate and formatDisplayDateTime normalize Google Sheets UTC mi
   assert.equal(bsPolicy.ttlMs >= 30000, true);
 });
 
+test('normalizeLoginUsername trims, converts Arabic-Indic digits, and lowercases', () => {
+  assert.equal(core.normalizeLoginUsername('  Admin  '), 'admin');
+  assert.equal(core.normalizeLoginUsername('Agent١٢'), 'agent12');
+  assert.equal(core.normalizeLoginUsername('USER۰۹'), 'user09');
+  assert.equal(core.normalizeLoginUsername(''), '');
+});
+
+test('getReportColumns and formatReportCellValue return localized Arabic labels and formatted values for all report types', () => {
+  const empCols = core.getReportColumns('employee_performance');
+  assert.ok(empCols.some((c: any) => c.key === 'employeeName' && c.label === 'اسم الموظف'));
+  assert.ok(empCols.some((c: any) => c.key === 'role' && c.label === 'الدور الوظيفي'));
+
+  const empRow = {
+    employeeName: 'سارة العتيبي',
+    jobTitle: 'مشرف جودة',
+    role: 'supervisor',
+    assignedReservations: 12,
+    followUpsCount: 25,
+    problemsCount: 2,
+    lastActivity: '2026-11-16T22:00:00.000Z'
+  };
+  assert.equal(core.formatReportCellValue(empCols.find((c: any) => c.key === 'role'), empRow, 'ar'), 'المشرف');
+  assert.equal(core.formatReportCellValue(empCols.find((c: any) => c.key === 'lastActivity'), empRow, 'ar'), '2026-11-17 01:00');
+
+  const prbCols = core.getReportColumns('problems');
+  assert.ok(prbCols.some((c: any) => c.key === 'problemNumber' && c.label === 'رقم المشكلة'));
+  assert.equal(
+    core.formatReportCellValue(
+      prbCols.find((c: any) => c.key === 'assignedEmployeeNames'),
+      { assignedEmployeeNames: ['سارة', 'خالد'] },
+      'ar'
+    ),
+    'سارة، خالد'
+  );
+
+  const fuCols = core.getReportColumns('followups_log');
+  assert.ok(fuCols.some((c: any) => c.key === 'action' && c.label === 'الإجراء المتخذ'));
+  const extCols = core.getReportColumns('extensions');
+  assert.ok(extCols.some((c: any) => c.key === 'extendDays' && c.label === 'أيام التمديد'));
+});
+
+test('computePdfColumnWidths and bidi helpers produce accurate column widths and LTR-isolated Arabic strings', () => {
+  const cols = core.getReportColumns('all_reservations').slice(0, 6);
+  const widths = core.computePdfColumnWidths(cols, 1000);
+  assert.equal(widths.length, 6);
+  const sum = widths.reduce((a: number, b: number) => a + b, 0);
+  assert.ok(Math.abs(sum - 1000) < 0.01);
+  assert.ok(widths.every((w: number) => w >= 50));
+
+  assert.equal(core.isPureLtrText('RG-2026-1001'), true);
+  assert.equal(core.isPureLtrText('2026-11-17 14:30'), true);
+  assert.equal(core.isPureLtrText('تم تأكيد الحجز RG-2026-1001'), false);
+
+  const bidi = core.formatBidiPdfText('تأكيد حجز RG-2026-1001 للعميل');
+  assert.ok(bidi.includes('\u2066RG-2026-1001\u2069'));
+  const brandBidi = core.formatBidiPdfText('تقرير جميع الحجوزات — Rental Gate');
+  assert.ok(brandBidi.includes('\u2066Rental Gate\u2069'));
+  assert.equal(core.formatBidiPdfText('RG-2026-1001'), 'RG-2026-1001');
+});
+
+test('buildCompressedExcelSheets supports optional non-mandatory compression with 1 to 10 sheets max and zero data loss', () => {
+  const sampleHeaders = [
+    { key: 'id', label: 'الرقم' },
+    { key: 'note', label: 'الملاحظة' }
+  ];
+  const rows = Array.from({ length: 23 }, (_, i) => ({
+    id: `RG-${i + 1}`,
+    note: `ملاحظة   رقم   ${i + 1}`
+  }));
+
+  // 1) Compression OFF: leaves single sheet untouched without preformatted packing
+  const offResult = core.buildCompressedExcelSheets([{ name: 'الحجوزات', headers: sampleHeaders, rows }], {
+    compressEnabled: false,
+    targetSheets: 3
+  });
+  assert.equal(offResult.length, 1);
+  assert.equal(offResult[0].preformattedAoa, null);
+  assert.equal(offResult[0].rows.length, 23);
+
+  // 2) Compression ON with targetSheets = 3: splits 23 rows cleanly across 3 sheets without losing any row
+  const split3 = core.buildCompressedExcelSheets([{ name: 'الحجوزات', headers: sampleHeaders, rows }], {
+    compressEnabled: true,
+    targetSheets: 3
+  });
+  assert.equal(split3.length, 3);
+  const totalSplitRows = split3.reduce((acc: number, s: any) => acc + s.rows.length, 0);
+  assert.equal(totalSplitRows, 23);
+  assert.equal(split3[0].preformattedAoa[1][1], 'ملاحظة رقم 1');
+
+  // 3) Compression ON with targetSheets > 10 clamps strictly to max 10 sheets
+  const clampedMax = core.buildCompressedExcelSheets([{ name: 'الحجوزات', headers: sampleHeaders, rows }], {
+    compressEnabled: true,
+    targetSheets: 25
+  });
+  assert.equal(clampedMax.length, 10);
+  assert.equal(clampedMax.reduce((acc: number, s: any) => acc + s.rows.length, 0), 23);
+
+  // 4) Compression ON with targetSheets < 1 clamps strictly to 1 sheet
+  const clampedMin = core.buildCompressedExcelSheets([{ name: 'الحجوزات', headers: sampleHeaders, rows }], {
+    compressEnabled: true,
+    targetSheets: 0
+  });
+  assert.equal(clampedMin.length, 1);
+  assert.equal(clampedMin[0].rows.length, 23);
+
+  // 5) Multi-sheet packing (4 sheets compressed down into 2 sheets max)
+  const multi = [
+    { name: 'ملخص', headers: sampleHeaders, rows: rows.slice(0, 2) },
+    { name: 'تقرير', headers: sampleHeaders, rows: rows.slice(2, 5) },
+    { name: 'متابعات', headers: sampleHeaders, rows: rows.slice(5, 8) },
+    { name: 'مشكلات', headers: sampleHeaders, rows: rows.slice(8, 10) }
+  ];
+  const packed2 = core.buildCompressedExcelSheets(multi, { compressEnabled: true, targetSheets: 2 });
+  assert.equal(packed2.length, 2);
+  assert.equal(packed2[0].rows.length, 2);
+  assert.equal(packed2[1].rows.length, 8);
+  assert.ok(packed2[1].preformattedAoa.some((r: any) => String(r[0]).includes('--- تقرير ---')));
+  assert.ok(packed2[1].preformattedAoa.some((r: any) => String(r[0]).includes('--- مشكلات ---')));
+});
+
+

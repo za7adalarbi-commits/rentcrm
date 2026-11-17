@@ -21,18 +21,17 @@ function assignEmployees(session, payload) {
     }
 
     var previousIds = safeJsonParse(reservation.assignedEmployeeIds, []);
-    var existingAssignments = readAllRecords(RG_SHEETS.ASSIGNMENTS, true);
-    for (var a = 0; a < existingAssignments.length; a++) {
-      if (existingAssignments[a].reservationId === reservationId && existingAssignments[a].status === 'active') {
-        updateRecordByKey(RG_SHEETS.ASSIGNMENTS, 'id', existingAssignments[a].id, {
-          status: 'reassigned',
-          updatedAt: nowIso()
-        });
-      }
-    }
+    var nowStr = nowIso();
+    updateRecordsWhere_(
+      RG_SHEETS.ASSIGNMENTS,
+      function (a) { return a.reservationId === reservationId && a.status === 'active'; },
+      { status: 'reassigned', updatedAt: nowStr }
+    );
 
     var newIds = [];
     var newNames = [];
+    var newAssignments = [];
+    var newNotifications = [];
     for (var j = 0; j < employeeIds.length; j++) {
       var empId = normalizeStr(employeeIds[j]);
       var emp = empMap[empId];
@@ -42,7 +41,7 @@ function assignEmployees(session, payload) {
       newIds.push(empId);
       newNames.push(emp.name);
 
-      appendRecord(RG_SHEETS.ASSIGNMENTS, {
+      newAssignments.push({
         id: generateId('ASN'),
         reservationId: reservation.id,
         reservationNumber: reservation.reservationNumber,
@@ -52,26 +51,29 @@ function assignEmployees(session, payload) {
         assignedByName: session.user.name,
         roleType: j === 0 ? 'primary' : 'collaborator',
         status: 'active',
-        assignedAt: nowIso(),
-        updatedAt: nowIso()
+        assignedAt: nowStr,
+        updatedAt: nowStr
       });
 
       var isReassign = previousIds.length > 0 && previousIds.indexOf(empId) === -1;
-      createNotification(
-        emp.id,
-        emp.role,
-        isReassign ? 'reassignment' : 'new_assignment',
-        isReassign ? 'إعادة توزيع حجز' : 'إسناد حجز جديد',
-        'تم إسناد الحجز رقم ' + reservation.reservationNumber + ' (' + reservation.customerName + ') إليك.',
-        'Reservation',
-        reservation.id
-      );
+      newNotifications.push({
+        recipientEmployeeId: emp.id,
+        recipientRole: emp.role,
+        type: isReassign ? 'reassignment' : 'new_assignment',
+        title: isReassign ? 'إعادة توزيع حجز' : 'إسناد حجز جديد',
+        message: 'تم إسناد الحجز رقم ' + reservation.reservationNumber + ' (' + reservation.customerName + ') إليك.',
+        entityType: 'Reservation',
+        entityId: reservation.id
+      });
     }
+
+    if (newAssignments.length > 0) batchAppendRecords(RG_SHEETS.ASSIGNMENTS, newAssignments);
+    if (newNotifications.length > 0) createNotificationsBatch_(newNotifications);
 
     updateRecordByKey(RG_SHEETS.RESERVATIONS, 'id', reservation.id, {
       assignedEmployeeIds: JSON.stringify(newIds),
       assignedEmployeeNames: JSON.stringify(newNames),
-      updatedAt: nowIso()
+      updatedAt: nowStr
     });
 
     logActivity(
@@ -102,15 +104,11 @@ function removeAssignment(session, payload) {
     var reservation = findRecordById(RG_SHEETS.RESERVATIONS, 'id', reservationId);
     if (!reservation) throw new Error('الحجز غير موجود.');
 
-    var assignments = readAllRecords(RG_SHEETS.ASSIGNMENTS, true);
-    for (var i = 0; i < assignments.length; i++) {
-      if (assignments[i].reservationId === reservationId && assignments[i].employeeId === employeeId && assignments[i].status === 'active') {
-        updateRecordByKey(RG_SHEETS.ASSIGNMENTS, 'id', assignments[i].id, {
-          status: 'removed',
-          updatedAt: nowIso()
-        });
-      }
-    }
+    updateRecordsWhere_(
+      RG_SHEETS.ASSIGNMENTS,
+      function (a) { return a.reservationId === reservationId && a.employeeId === employeeId && a.status === 'active'; },
+      { status: 'removed', updatedAt: nowIso() }
+    );
 
     var ids = safeJsonParse(reservation.assignedEmployeeIds, []);
     var names = safeJsonParse(reservation.assignedEmployeeNames, []);
@@ -189,15 +187,11 @@ function unclaimReservation(session, payload) {
     var reservation = findRecordById(RG_SHEETS.RESERVATIONS, 'id', reservationId);
     if (!reservation) throw new Error('الحجز غير موجود.');
 
-    var assignments = readAllRecords(RG_SHEETS.ASSIGNMENTS, true);
-    for (var i = 0; i < assignments.length; i++) {
-      if (assignments[i].reservationId === reservationId && assignments[i].employeeId === session.employeeId && assignments[i].status === 'active') {
-        updateRecordByKey(RG_SHEETS.ASSIGNMENTS, 'id', assignments[i].id, {
-          status: 'unclaimed',
-          updatedAt: nowIso()
-        });
-      }
-    }
+    updateRecordsWhere_(
+      RG_SHEETS.ASSIGNMENTS,
+      function (a) { return a.reservationId === reservationId && a.employeeId === session.employeeId && a.status === 'active'; },
+      { status: 'unclaimed', updatedAt: nowIso() }
+    );
 
     var ids = safeJsonParse(reservation.assignedEmployeeIds, []);
     var names = safeJsonParse(reservation.assignedEmployeeNames, []);
@@ -303,19 +297,21 @@ function addFollowUp(session, payload) {
       logActivity(session.user, 'إضافة ملاحظة', 'Reservation', reservation.reservationNumber, notes);
     }
 
+    var notifBatch = [];
     for (var i = 0; i < assignedIds.length; i++) {
       if (assignedIds[i] !== session.employeeId) {
-        createNotification(
-          assignedIds[i],
-          '',
-          statusChanged ? 'status_change' : 'reservation_update',
-          statusChanged ? 'تغيير حالة حجز' : 'متابعة جديدة على حجز مشترك',
-          session.user.name + ' حدّث الحجز ' + reservation.reservationNumber + ' إلى: ' + status,
-          'Reservation',
-          reservation.id
-        );
+        notifBatch.push({
+          recipientEmployeeId: assignedIds[i],
+          recipientRole: '',
+          type: statusChanged ? 'status_change' : 'reservation_update',
+          title: statusChanged ? 'تغيير حالة حجز' : 'متابعة جديدة على حجز مشترك',
+          message: session.user.name + ' حدّث الحجز ' + reservation.reservationNumber + ' إلى: ' + status,
+          entityType: 'Reservation',
+          entityId: reservation.id
+        });
       }
     }
+    if (notifBatch.length > 0) createNotificationsBatch_(notifBatch);
 
     return followUp;
   });

@@ -156,7 +156,7 @@ function createEmployee(session, payload) {
 
   var p = payload || {};
   var name = normalizeStr(p.name);
-  var username = normalizeStr(p.username).toLowerCase();
+  var username = normalizeLoginUsername_(p.username);
   var password = String(p.password || '');
   var phone = normalizeStr(p.phone);
   var email = normalizeStr(p.email);
@@ -176,7 +176,7 @@ function createEmployee(session, payload) {
   return withScriptLock(function () {
     var existing = readAllRecords(RG_SHEETS.EMPLOYEES, true);
     for (var i = 0; i < existing.length; i++) {
-      if (normalizeStr(existing[i].username).toLowerCase() === username) {
+      if (normalizeLoginUsername_(existing[i].username) === username) {
         throw new Error('اسم المستخدم مستخدم مسبقًا.');
       }
     }
@@ -244,6 +244,9 @@ function updateEmployee(session, payload) {
 
     var updated = updateRecordByKey(RG_SHEETS.EMPLOYEES, 'id', employeeId, patch);
     if (updated) syncUserSheetRecord(updated);
+    if (patch.role || patch.permissions || patch.name) {
+      clearEmployeeSessionCache_(employeeId);
+    }
     logActivity(session.user, 'تحديث موظف', 'Employee', employeeId, 'تحديث بيانات/صلاحيات الموظف ' + (patch.name || existing.name));
     return sanitizeEmployeeForClient(updated);
   });

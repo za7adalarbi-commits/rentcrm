@@ -1018,6 +1018,311 @@
     return MUTATION_INVALIDATIONS[key] || [];
   }
 
+  function normalizeLoginUsername(raw) {
+    var s = normalizeStr(raw);
+    if (!s) return '';
+    s = s.replace(/[٠-٩]/g, function (d) {
+      return String('٠١٢٣٤٥٦٧٨٩'.indexOf(d));
+    }).replace(/[۰-۹]/g, function (d) {
+      return String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
+    });
+    return s.toLowerCase();
+  }
+
+  var RESERVATION_REPORT_COLUMNS = [
+    { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 1.0, formatType: 'ltr' },
+    { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer Name', widthWeight: 1.45, formatType: 'text' },
+    { key: 'customerPhone', label: 'الجوال', labelEn: 'Phone', widthWeight: 1.0, formatType: 'ltr' },
+    { key: 'companyName', label: 'الشركة', labelEn: 'Company', widthWeight: 1.2, formatType: 'text' },
+    { key: 'branchName', label: 'الفرع', labelEn: 'Branch', widthWeight: 1.25, formatType: 'text' },
+    { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.25, formatType: 'text' },
+    { key: 'startDate', label: 'بداية الحجز', labelEn: 'Start Date', widthWeight: 0.95, formatType: 'date' },
+    { key: 'endDate', label: 'نهاية الحجز', labelEn: 'End Date', widthWeight: 0.95, formatType: 'date' },
+    { key: 'originalStatusAr', label: 'حالة الحجز الأصلية', labelEn: 'Original Status', widthWeight: 1.0, formatType: 'text' },
+    { key: 'internalStatus', label: 'حالة المتابعة الداخلية', labelEn: 'Internal Status', widthWeight: 1.05, formatType: 'text' },
+    { key: 'assignedEmployeeNames', label: 'الموظفون المسؤولون', labelEn: 'Assigned Staff', widthWeight: 1.3, formatType: 'list' },
+    { key: 'priority', label: 'الأولوية', labelEn: 'Priority', widthWeight: 0.75, formatType: 'text' },
+    { key: 'totalAmount', label: 'الإجمالي', labelEn: 'Total (SAR)', widthWeight: 0.8, formatType: 'number' },
+    { key: 'lastUpdateText', label: 'آخر تحديث', labelEn: 'Last Update', widthWeight: 1.65, formatType: 'text' },
+    { key: 'lastUpdatedByName', label: 'آخر موظف', labelEn: 'Updated By', widthWeight: 1.05, formatType: 'text' }
+  ];
+
+  var REPORT_COLUMNS_BY_TYPE = {
+    all_reservations: RESERVATION_REPORT_COLUMNS,
+    by_status: RESERVATION_REPORT_COLUMNS,
+    unfollowed: RESERVATION_REPORT_COLUMNS,
+    priorities: RESERVATION_REPORT_COLUMNS,
+    employee_performance: [
+      { key: 'employeeName', label: 'اسم الموظف', labelEn: 'Employee', widthWeight: 1.4, formatType: 'text' },
+      { key: 'jobTitle', label: 'المسمى الوظيفي', labelEn: 'Job Title', widthWeight: 1.3, formatType: 'text' },
+      { key: 'role', label: 'الدور الوظيفي', labelEn: 'Role', widthWeight: 1.1, formatType: 'role' },
+      { key: 'assignedReservations', label: 'الحجوزات المسندة', labelEn: 'Assigned Bookings', widthWeight: 0.9, formatType: 'number' },
+      { key: 'followUpsCount', label: 'عدد المتابعات', labelEn: 'Follow-Ups', widthWeight: 0.85, formatType: 'number' },
+      { key: 'problemsCount', label: 'عدد المشكلات', labelEn: 'Problems', widthWeight: 0.85, formatType: 'number' },
+      { key: 'lastActivity', label: 'آخر نشاط', labelEn: 'Last Activity', widthWeight: 1.2, formatType: 'datetime' }
+    ],
+    followups_log: [
+      { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 0.95, formatType: 'ltr' },
+      { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer', widthWeight: 1.3, formatType: 'text' },
+      { key: 'employeeName', label: 'الموظف', labelEn: 'Employee', widthWeight: 1.15, formatType: 'text' },
+      { key: 'status', label: 'الحالة', labelEn: 'Status', widthWeight: 0.95, formatType: 'text' },
+      { key: 'action', label: 'الإجراء المتخذ', labelEn: 'Action', widthWeight: 1.65, formatType: 'text' },
+      { key: 'notes', label: 'الملاحظات', labelEn: 'Notes', widthWeight: 1.5, formatType: 'text' },
+      { key: 'followUpDate', label: 'التاريخ', labelEn: 'Date', widthWeight: 0.9, formatType: 'date' },
+      { key: 'followUpTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.75, formatType: 'ltr' }
+    ],
+    problems: [
+      { key: 'problemNumber', label: 'رقم المشكلة', labelEn: 'Ticket #', widthWeight: 0.95, formatType: 'ltr' },
+      { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 0.95, formatType: 'ltr' },
+      { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer', widthWeight: 1.25, formatType: 'text' },
+      { key: 'priority', label: 'الأولوية', labelEn: 'Priority', widthWeight: 0.75, formatType: 'text' },
+      { key: 'status', label: 'الحالة', labelEn: 'Status', widthWeight: 0.95, formatType: 'text' },
+      { key: 'description', label: 'وصف المشكلة', labelEn: 'Description', widthWeight: 1.85, formatType: 'text' },
+      { key: 'assignedEmployeeNames', label: 'المسؤولون', labelEn: 'Assignees', widthWeight: 1.2, formatType: 'list' },
+      { key: 'createdByName', label: 'أنشأها', labelEn: 'Created By', widthWeight: 1.05, formatType: 'text' },
+      { key: 'updatedAt', label: 'آخر تحديث', labelEn: 'Updated At', widthWeight: 1.15, formatType: 'datetime' }
+    ],
+    extensions: [
+      { key: 'extensionNumber', label: 'رقم التمديد', labelEn: 'Extension #', widthWeight: 1.0, formatType: 'ltr' },
+      { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 1.0, formatType: 'ltr' },
+      { key: 'statusAr', label: 'الحالة', labelEn: 'Status', widthWeight: 1.0, formatType: 'text' },
+      { key: 'paymentStatus', label: 'حالة الدفع', labelEn: 'Payment', widthWeight: 0.95, formatType: 'text' },
+      { key: 'extendDays', label: 'أيام التمديد', labelEn: 'Days', widthWeight: 0.85, formatType: 'number' },
+      { key: 'startDate', label: 'بداية التمديد', labelEn: 'Start Date', widthWeight: 1.0, formatType: 'date' },
+      { key: 'endDate', label: 'نهاية التمديد', labelEn: 'End Date', widthWeight: 1.0, formatType: 'date' },
+      { key: 'amount', label: 'المبلغ (ر.س)', labelEn: 'Amount', widthWeight: 0.95, formatType: 'number' }
+    ],
+    sync_log: [
+      { key: 'startedAt', label: 'وقت المزامنة', labelEn: 'Started At', widthWeight: 1.25, formatType: 'datetime' },
+      { key: 'status', label: 'الحالة', labelEn: 'Status', widthWeight: 0.85, formatType: 'text' },
+      { key: 'triggeredByName', label: 'المشغل', labelEn: 'Triggered By', widthWeight: 1.2, formatType: 'text' },
+      { key: 'importedCount', label: 'جديد', labelEn: 'Imported', widthWeight: 0.75, formatType: 'number' },
+      { key: 'updatedCount', label: 'محدث', labelEn: 'Updated', widthWeight: 0.75, formatType: 'number' },
+      { key: 'extensionsCount', label: 'التمديدات', labelEn: 'Extensions', widthWeight: 0.8, formatType: 'number' },
+      { key: 'durationMs', label: 'المدة (م.ث)', labelEn: 'Duration ms', widthWeight: 0.85, formatType: 'number' },
+      { key: 'errorMessage', label: 'ملاحظات الخطأ', labelEn: 'Error', widthWeight: 1.5, formatType: 'text' }
+    ],
+    activity_log: [
+      { key: 'userName', label: 'المستخدم', labelEn: 'User', widthWeight: 1.15, formatType: 'text' },
+      { key: 'actionType', label: 'العملية', labelEn: 'Action', widthWeight: 1.1, formatType: 'text' },
+      { key: 'entityType', label: 'العنصر', labelEn: 'Entity', widthWeight: 0.9, formatType: 'ltr' },
+      { key: 'entityId', label: 'المرجع', labelEn: 'Ref', widthWeight: 1.0, formatType: 'ltr' },
+      { key: 'details', label: 'التفاصيل', labelEn: 'Details', widthWeight: 1.8, formatType: 'text' },
+      { key: 'logDate', label: 'التاريخ', labelEn: 'Date', widthWeight: 0.95, formatType: 'date' },
+      { key: 'logTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.8, formatType: 'ltr' }
+    ]
+  };
+
+  function getReportColumns(reportType, sampleRows) {
+    var preset = REPORT_COLUMNS_BY_TYPE[normalizeStr(reportType)];
+    if (preset && preset.length) {
+      return preset.map(function (c) { return Object.assign({}, c); });
+    }
+    var first = Array.isArray(sampleRows) && sampleRows.length ? sampleRows[0] : null;
+    if (!first) return RESERVATION_REPORT_COLUMNS.slice();
+    var hidden = { rawJson: true, id: true, reservationId: true, employeeId: true, createdById: true, lastUpdatedById: true, assignedEmployeeIds: true };
+    return Object.keys(first).filter(function (k) { return !hidden[k]; }).map(function (k) {
+      return { key: k, label: k, labelEn: k, widthWeight: 1.0, formatType: 'text' };
+    });
+  }
+
+  function formatReportCellValue(col, row, lang, options) {
+    var opts = options || {};
+    var fallback = opts.emptyFallback !== undefined ? opts.emptyFallback : '-';
+    if (!row || !col) return fallback;
+    var val = typeof col.value === 'function' ? col.value(row) : row[col.key];
+    if (Array.isArray(val)) {
+      var joined = val.map(normalizeStr).filter(Boolean).join('، ');
+      return joined || fallback;
+    }
+    if (val === undefined || val === null || val === '') return fallback;
+
+    var ft = col.formatType || 'text';
+    if (ft === 'date') {
+      return formatDisplayDate(val) || String(val);
+    }
+    if (ft === 'datetime') {
+      return formatDisplayDateTime(val) || String(val);
+    }
+    if (ft === 'role') {
+      var dict = ROLE_LABELS[lang === 'en' ? 'en' : 'ar'] || ROLE_LABELS.ar;
+      return dict[val] || String(val);
+    }
+    if (ft === 'number') {
+      var num = Number(val);
+      if (!isNaN(num)) {
+        return opts.keepNumber ? num : String(Math.round(num * 100) / 100);
+      }
+    }
+    if (typeof val === 'boolean') {
+      return val ? (lang === 'en' ? 'Yes' : 'نعم') : (lang === 'en' ? 'No' : 'لا');
+    }
+    return String(val).replace(/\s+/g, ' ').trim() || fallback;
+  }
+
+  function computePdfColumnWidths(columns, totalWidth) {
+    var cols = Array.isArray(columns) ? columns : [];
+    var totalW = Number(totalWidth || 0);
+    if (!cols.length || totalW <= 0) return [];
+    var weights = cols.map(function (c) {
+      var w = Number(c && c.widthWeight);
+      return w > 0 ? w : 1;
+    });
+    var sum = weights.reduce(function (acc, w) { return acc + w; }, 0) || cols.length;
+    var minW = Math.min(totalW / (cols.length * 1.6), totalW * 0.065);
+    var rawWidths = weights.map(function (w) {
+      return Math.max(minW, (w / sum) * totalW);
+    });
+    var rawSum = rawWidths.reduce(function (acc, w) { return acc + w; }, 0) || totalW;
+    return rawWidths.map(function (w) {
+      return (w / rawSum) * totalW;
+    });
+  }
+
+  function isPureLtrText(text) {
+    var s = normalizeStr(text);
+    if (!s) return false;
+    if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(s)) {
+      return false;
+    }
+    return /[A-Za-z0-9]/.test(s);
+  }
+
+  function formatBidiPdfText(text) {
+    var s = text === null || text === undefined ? '' : String(text);
+    if (!s) return '';
+    if (!/[\u0600-\u06FF]/.test(s)) return s;
+    // Isolate multi-word LTR runs (codes, English brand/model names, ISO dates+times, phones) so RTL canvas won't invert word order or punctuation
+    return s.replace(/([A-Za-z0-9]+(?:[-_./:+][A-Za-z0-9]+)*(?:[ \t]+[A-Za-z0-9]+(?:[-_./:+][A-Za-z0-9]+)*)*)/g, function (match) {
+      return '\u2066' + match + '\u2069';
+    });
+  }
+
+  function buildCompressedExcelSheets(sheetsConfig, options) {
+    var list = Array.isArray(sheetsConfig) ? sheetsConfig : [];
+    var opts = options || {};
+    var sanitizeSheetName = function (name, idx) {
+      var clean = String(name || ('Sheet_' + (idx + 1)))
+        .replace(/[\\/?*\[\]:]/g, '-')
+        .trim();
+      return (clean || ('Sheet_' + (idx + 1))).substring(0, 31);
+    };
+
+    if (!opts.compressEnabled) {
+      return list.map(function (cfg, idx) {
+        return {
+          name: sanitizeSheetName(cfg && cfg.name, idx),
+          headers: Array.isArray(cfg && cfg.headers) ? cfg.headers : [],
+          rows: Array.isArray(cfg && cfg.rows) ? cfg.rows : [],
+          preformattedAoa: null
+        };
+      });
+    }
+
+    var rawTarget = parseInt(opts.targetSheets, 10);
+    var maxSheets = Math.min(10, Math.max(1, isNaN(rawTarget) ? 1 : rawTarget));
+    if (list.length === 0) return [];
+
+    function extractCompactAoa(cfg) {
+      var headers = Array.isArray(cfg.headers) ? cfg.headers : [];
+      var rows = Array.isArray(cfg.rows) ? cfg.rows : [];
+      var aoa = [headers.map(function (h) { return h.label || h.key || ''; })];
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        aoa.push(headers.map(function (h) {
+          var v = typeof h.value === 'function' ? h.value(r) : r[h.key];
+          if (Array.isArray(v)) v = v.map(normalizeStr).filter(Boolean).join('، ');
+          if (v === undefined || v === null) return '';
+          if (typeof v === 'number') return v;
+          if (typeof v === 'boolean') return v ? 'نعم' : 'لا';
+          return String(v).replace(/\s+/g, ' ').trim();
+        }));
+      }
+      return aoa;
+    }
+
+    // Case 1: Single dataset, user requested splitting/packing into up to maxSheets (1..10) sheets
+    if (list.length === 1) {
+      var single = list[0];
+      var sHeaders = Array.isArray(single.headers) ? single.headers : [];
+      var sRows = Array.isArray(single.rows) ? single.rows : [];
+      var bucketCount = sRows.length > 0 ? Math.min(maxSheets, sRows.length) : 1;
+      if (bucketCount === 1) {
+        return [{
+          name: sanitizeSheetName(single.name || 'Compressed_1', 0),
+          headers: sHeaders,
+          rows: sRows,
+          preformattedAoa: extractCompactAoa(single)
+        }];
+      }
+      var totalRows = sRows.length;
+      var baseSize = Math.floor(totalRows / bucketCount);
+      var remainder = totalRows % bucketCount;
+      var cursor = 0;
+      var out = [];
+      for (var b = 0; b < bucketCount; b++) {
+        var take = baseSize + (b < remainder ? 1 : 0);
+        if (take <= 0) continue;
+        var sliceRows = sRows.slice(cursor, cursor + take);
+        cursor += take;
+        var partCfg = { name: 'ورقة_' + (out.length + 1), headers: sHeaders, rows: sliceRows };
+        out.push({
+          name: sanitizeSheetName(partCfg.name, out.length),
+          headers: sHeaders,
+          rows: sliceRows,
+          preformattedAoa: extractCompactAoa(partCfg)
+        });
+      }
+      return out;
+    }
+
+    // Case 2: Multiple datasets -> pack into at most maxSheets (1..10) sheets
+    if (list.length <= maxSheets) {
+      return list.map(function (cfg, idx) {
+        return {
+          name: sanitizeSheetName(cfg.name, idx),
+          headers: Array.isArray(cfg.headers) ? cfg.headers : [],
+          rows: Array.isArray(cfg.rows) ? cfg.rows : [],
+          preformattedAoa: extractCompactAoa(cfg)
+        };
+      });
+    }
+
+    var packed = [];
+    for (var k = 0; k < maxSheets - 1; k++) {
+      packed.push({
+        name: sanitizeSheetName(list[k].name, k),
+        headers: Array.isArray(list[k].headers) ? list[k].headers : [],
+        rows: Array.isArray(list[k].rows) ? list[k].rows : [],
+        preformattedAoa: extractCompactAoa(list[k])
+      });
+    }
+
+    var mergedAoa = [];
+    var mergedHeaders = [];
+    var mergedRows = [];
+    for (var m = maxSheets - 1; m < list.length; m++) {
+      var section = list[m];
+      var sectionAoa = extractCompactAoa(section);
+      if (mergedAoa.length > 0) mergedAoa.push([]);
+      mergedAoa.push(['--- ' + (section.name || ('القسم ' + (m + 1))) + ' ---']);
+      for (var rowIdx = 0; rowIdx < sectionAoa.length; rowIdx++) {
+        mergedAoa.push(sectionAoa[rowIdx]);
+      }
+      if (!mergedHeaders.length && Array.isArray(section.headers)) mergedHeaders = section.headers;
+      if (Array.isArray(section.rows)) mergedRows = mergedRows.concat(section.rows);
+    }
+
+    packed.push({
+      name: sanitizeSheetName(maxSheets === 1 ? 'بيانات_مضغوطة' : ('مضغوط_' + maxSheets), maxSheets - 1),
+      headers: mergedHeaders,
+      rows: mergedRows,
+      preformattedAoa: mergedAoa
+    });
+
+    return packed;
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -1027,6 +1332,7 @@
     FOLLOWUP_STATUSES: FOLLOWUP_STATUSES,
     PROBLEM_PRIORITIES: PROBLEM_PRIORITIES,
     PROBLEM_STATUSES: PROBLEM_STATUSES,
+    REPORT_COLUMNS_BY_TYPE: REPORT_COLUMNS_BY_TYPE,
     translateOriginalStatus: translateOriginalStatus,
     translateDeliveryType: translateDeliveryType,
     isExtensionAcceptedAndPaid: isExtensionAcceptedAndPaid,
@@ -1057,6 +1363,13 @@
     buildApiCacheKey: buildApiCacheKey,
     getCacheInvalidationScopes: getCacheInvalidationScopes,
     formatDisplayDate: formatDisplayDate,
-    formatDisplayDateTime: formatDisplayDateTime
+    formatDisplayDateTime: formatDisplayDateTime,
+    normalizeLoginUsername: normalizeLoginUsername,
+    getReportColumns: getReportColumns,
+    formatReportCellValue: formatReportCellValue,
+    computePdfColumnWidths: computePdfColumnWidths,
+    isPureLtrText: isPureLtrText,
+    formatBidiPdfText: formatBidiPdfText,
+    buildCompressedExcelSheets: buildCompressedExcelSheets
   };
 }));

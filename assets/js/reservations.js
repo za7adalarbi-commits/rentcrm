@@ -999,11 +999,26 @@
       });
     }
 
+    function fallbackCapture(el, title) {
+      if (!el) return null;
+      if (root.RGReports && typeof root.RGReports.captureChartForPdf === 'function') {
+        return root.RGReports.captureChartForPdf(el, title);
+      }
+      var off = document.createElement('canvas');
+      off.width = Math.max(1, el.width || 600);
+      off.height = Math.max(1, el.height || 300);
+      var octx = off.getContext('2d');
+      octx.fillStyle = '#ffffff';
+      octx.fillRect(0, 0, off.width, off.height);
+      octx.drawImage(el, 0, 0, off.width, off.height);
+      return { title: title, dataUrl: off.toDataURL('image/jpeg', 0.85) };
+    }
+
     return {
       getImages: function () {
         return [
-          finEl ? { title: 'حالة الحجز والتفصيل المالي (' + r.internalStatus + ')', dataUrl: finEl.toDataURL('image/png') } : null,
-          actEl ? { title: 'أداء الموظفين ونشاط الحجز', dataUrl: actEl.toDataURL('image/png') } : null
+          fallbackCapture(finEl, 'حالة الحجز والتفصيل المالي (' + r.internalStatus + ')'),
+          fallbackCapture(actEl, 'أداء الموظفين ونشاط الحجز')
         ].filter(Boolean);
       }
     };

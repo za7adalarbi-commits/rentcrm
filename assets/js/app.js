@@ -384,7 +384,11 @@
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">دخول كمشرف (supervisor)</button>' +
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">دخول كموظف (agent1)</button>' +
                 '</div>'
-              ) : '') +
+              ) : (
+                '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--surface-muted,#f4f5f6);font-size:12px;line-height:1.6;color:var(--text-secondary);">' +
+                  'في الوضع المتصل بـ Google Apps Script تُقرأ الحسابات من ورقة <strong>Employees</strong> في Google Sheets. عند التهيئة الأولى يُنشأ حساب المدير الافتراضي فقط (<span class="mono" dir="ltr">admin / Admin@123</span>)، بينما حسابات المعاينة (<span class="mono" dir="ltr">supervisor / agent1</span>) تتوفر في وضع المعاينة المحلية أو بعد إضافتها من شاشة الموظفين.' +
+                '</div>'
+              )) +
               '<details style="margin-top:8px;">' +
                 '<summary style="cursor:pointer;font-size:12px;color:var(--text-muted);font-weight:600;">إعداد ربط الخادم (للمدير والمشرف)</summary>' +
                 '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
@@ -433,7 +437,9 @@
       errEl.classList.add('hidden');
       errEl.textContent = '';
 
-      var u = String(uEl.value || '').trim();
+      var u = (root.RGCrmCore && root.RGCrmCore.normalizeLoginUsername)
+        ? root.RGCrmCore.normalizeLoginUsername(uEl.value)
+        : String(uEl.value || '').trim();
       var p = String(pEl.value || '');
       if (!u || !p) {
         errEl.textContent = 'يرجى إدخال اسم المستخدم وكلمة المرور.';
@@ -450,7 +456,12 @@
       if (!res || !res.success) {
         submitBtn.disabled = false;
         submitBtn.textContent = 'دخول إلى النظام';
-        errEl.textContent = (res && res.message) || 'تعذر تسجيل الدخول، يرجى التحقق من البيانات.';
+        var rawMsg = (res && res.message) || 'تعذر تسجيل الدخول، يرجى التحقق من البيانات.';
+        if (isLive && rawMsg.indexOf('اسم المستخدم أو كلمة المرور غير صحيحة') !== -1) {
+          errEl.textContent = rawMsg + ' تأكد من أن الحساب مضاف في ورقة Employees بـ Google Sheets (الحساب المبدئي بعد تشغيل setupRentalGateDatabase هو admin / Admin@123)، أو استخدم زر «العودة للمعاينة المحلية» بالأسفل.';
+        } else {
+          errEl.textContent = rawMsg;
+        }
         errEl.classList.remove('hidden');
         return;
       }

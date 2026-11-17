@@ -151,6 +151,17 @@ function normalizeStr(val) {
   return String(val).trim();
 }
 
+function normalizeLoginUsername_(val) {
+  var s = normalizeStr(val);
+  if (!s) return '';
+  s = s.replace(/[\u0660-\u0669]/g, function (d) {
+    return String(d.charCodeAt(0) - 0x0660);
+  }).replace(/[\u06F0-\u06F9]/g, function (d) {
+    return String(d.charCodeAt(0) - 0x06F0);
+  });
+  return s.toLowerCase();
+}
+
 function toNumber(val, fallback) {
   var n = Number(val);
   return isNaN(n) ? (fallback || 0) : n;
