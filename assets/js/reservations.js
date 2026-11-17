@@ -13,6 +13,11 @@
     { key: 'carName', label: 'السيارة' },
     { key: 'startDate', label: 'بداية الحجز' },
     { key: 'endDate', label: 'نهاية الحجز' },
+    { key: 'daysCount', label: 'الأيام' },
+    { key: 'extensionsCount', label: 'عدد التمديدات' },
+    { key: 'extendedUntilDate', label: 'التمديد لحد' },
+    { key: 'extensionsAmount', label: 'سعر التمديد' },
+    { key: 'totalAmount', label: 'الإجمالي' },
     { key: 'originalStatusAr', label: 'الحالة الأصلية' },
     { key: 'internalStatus', label: 'المتابعة الداخلية' },
     { key: 'assignedEmployeeNames', label: 'الموظفون المسؤولون' },
@@ -77,7 +82,7 @@
     var currentUser = root.RGAuth.getUser();
     var currentEmpId = currentUser ? currentUser.id : '';
 
-    var defaultCols = JSON.parse(localStorage.getItem('rg_crm_visible_cols') || 'null') || ALL_COLUMNS.map(function (c) { return c.key; });
+    var defaultCols = JSON.parse(localStorage.getItem('rg_crm_visible_cols_v2') || 'null') || ALL_COLUMNS.map(function (c) { return c.key; });
     var state = Object.assign({
       search: '', company: '', branch: '', status: '', employeeId: '', priority: '',
       dateFrom: '', dateTo: '', unfollowedOnly: false, hasProblemsOnly: false,
@@ -188,9 +193,10 @@
               var isMine = currentEmpId && assignedIds.indexOf(currentEmpId) !== -1;
 
               var tds = visibleCols.map(function (c) {
+                var extCount = Number(r.extensionsCount || (r.hasExtensions ? 1 : 0));
                 if (c.key === 'reservationNumber') {
                   return '<td class="mono"><button type="button" class="btn-link-inline btn-open-res" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber) + '</button>' +
-                    (r.hasExtensions ? ' <span class="status-tag status-info">تمديد</span>' : '') +
+                    (extCount > 0 ? ' <span class="status-tag status-info tabular-nums">تمديد ×' + extCount + '</span>' : '') +
                     (r.hasProblem ? ' <span class="status-tag status-danger">مشكلة</span>' : '') + '</td>';
                 }
                 if (c.key === 'originalStatusAr') {
@@ -219,8 +225,37 @@
                     }).join('') +
                   '</div></td>';
                 }
-                if (c.key === 'startDate' || c.key === 'endDate') {
-                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(formatDateOnly(r[c.key])) + '</td>';
+                if (c.key === 'startDate') {
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.startDate)) + '</div>' +
+                    (r.startTime ? '<div class="time-sub">' + esc(r.startTime) + '</div>' : '') + '</td>';
+                }
+                if (c.key === 'endDate') {
+                  var endTm = r.endTime || r.originalEndTime || '';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.endDate)) + '</div>' +
+                    (endTm ? '<div class="time-sub">' + esc(endTm) + '</div>' : '') + '</td>';
+                }
+                if (c.key === 'daysCount') {
+                  var totDays = Number(r.totalDaysCount || r.daysCount || 1);
+                  var extDays = Number(r.extendedDaysCount || 0);
+                  return '<td class="tabular-nums" style="white-space:nowrap;"><div>' + totDays + ' يوم</div>' +
+                    (extDays > 0 ? '<div class="time-sub">أساسي ' + Number(r.daysCount || 1) + ' + تمديد ' + extDays + '</div>' : '') + '</td>';
+                }
+                if (c.key === 'extensionsCount') {
+                  return extCount > 0
+                    ? '<td class="tabular-nums"><span class="status-tag status-info">ممدد ×' + extCount + '</span></td>'
+                    : '<td class="tabular-nums">-</td>';
+                }
+                if (c.key === 'extendedUntilDate') {
+                  if (!r.extendedUntilDate) return '<td class="mono tabular-nums">-</td>';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.extendedUntilDate)) + '</div>' +
+                    (r.extendedUntilTime ? '<div class="time-sub">' + esc(r.extendedUntilTime) + '</div>' : '') + '</td>';
+                }
+                if (c.key === 'extensionsAmount') {
+                  var extAmt = Number(r.extensionsAmount || 0);
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' + (extAmt > 0 ? (extAmt + ' ر.س') : '-') + '</td>';
+                }
+                if (c.key === 'totalAmount') {
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><strong>' + Number(r.totalAmount || 0) + ' ر.س</strong></td>';
                 }
                 if (c.key === 'lastUpdatedAt') {
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(formatTimestamp(r.lastUpdatedAt)) + '</td>';
@@ -495,7 +530,7 @@
         var next = Array.from(container.querySelectorAll('.res-col-toggle:checked')).map(function (el) { return el.value; });
         if (next.length > 0) {
           state.visibleCols = next;
-          localStorage.setItem('rg_crm_visible_cols', JSON.stringify(next));
+          localStorage.setItem('rg_crm_visible_cols_v2', JSON.stringify(next));
           paintTableRegion({
             items: currentItems,
             total: Number((container.querySelector('#res-total-count') && container.querySelector('#res-total-count').textContent) || currentItems.length),
@@ -674,19 +709,93 @@
       '</div>';
     }
 
+    function buildExtensionsSectionHtml(r, extensions) {
+      var list = Array.isArray(extensions) ? extensions : [];
+      var extSummary = (root.RGCrmCore && root.RGCrmCore.summarizeReservationExtensions)
+        ? root.RGCrmCore.summarizeReservationExtensions(list, r, r.extendedUntilDate || r.endDate, r.extendedUntilTime || r.endTime)
+        : null;
+      var extCount = Number((extSummary && extSummary.extensionsCount) || r.extensionsCount || list.length || 0);
+      var extDays = Number((extSummary && extSummary.extendedDaysCount) || r.extendedDaysCount || 0);
+      var extAmount = Number((extSummary && extSummary.extensionsAmount) || r.extensionsAmount || 0);
+      var extUntilDate = (extSummary && extSummary.extendedUntilDate) || r.extendedUntilDate || (extCount > 0 ? r.endDate : '');
+      var extUntilTime = (extSummary && extSummary.extendedUntilTime) || r.extendedUntilTime || (extCount > 0 ? r.endTime : '');
+      var items = (extSummary && extSummary.extensions && extSummary.extensions.length) ? extSummary.extensions : list;
+
+      return '<div class="surface-card" id="drawer-extensions-section" style="padding:14px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
+          '<h4 style="margin:0;font-size:14px;">سجل وتفاصيل التمديدات (<span class="tabular-nums">' + extCount + '</span>)</h4>' +
+          '<span style="font-size:12px;color:var(--text-muted);">عدد مرات التمديد، سعر كل تمديد، وتاريخ الانتهاء الفعلي بعد التمديد</span>' +
+        '</div>' +
+        '<div class="ext-summary-strip">' +
+          '<div class="detail-kv"><span class="detail-k">كم مرة ممدد</span><span class="detail-v tabular-nums">' + extCount + ' ' + (extCount === 1 ? 'مرة' : 'مرات') + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">إجمالي أيام التمديد</span><span class="detail-v tabular-nums">' + extDays + ' يوم</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">إجمالي سعر التمديد</span><span class="detail-v mono tabular-nums">' + extAmount + ' ر.س</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">التمديد لحد</span><span class="detail-v mono tabular-nums">' + (extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(extUntilTime) : '')) : 'لا يوجد تمديد') + '</span></div>' +
+        '</div>' +
+        (items.length === 0
+          ? '<div style="margin-top:10px;font-size:13px;color:var(--text-muted);">لا توجد تمديدات مسجلة لهذا الحجز حتى الآن.</div>'
+          : '<div class="ext-list">' +
+              items.map(function (ex, idx) {
+                var seq = Number(ex.sequenceNumber || (idx + 1));
+                var typeLbl = ex.extensionTypeAr || (root.RGCrmCore && root.RGCrmCore.translateExtensionType ? root.RGCrmCore.translateExtensionType(ex.extensionType) : (ex.extensionType || 'تمديد'));
+                var payStAr = ex.paymentStatus
+                  ? (root.RGCrmCore && root.RGCrmCore.translateOriginalStatus ? root.RGCrmCore.translateOriginalStatus(ex.paymentStatus) : ex.paymentStatus)
+                  : '';
+                var payLabel = ex.paymentMethod ? (ex.paymentMethod + (payStAr ? ' (' + payStAr + ')' : '')) : (payStAr || '-');
+                var vatNote = (Number(ex.subTotal || 0) > 0 || Number(ex.vatAmount || 0) > 0)
+                  ? ('صافي ' + Number(ex.subTotal || 0) + ' + ضريبة ' + Number(ex.vatAmount || 0))
+                  : '';
+                return '<div class="ext-item">' +
+                  '<div class="ext-item-head">' +
+                    '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+                      '<span class="stage-badge">#' + seq + '</span>' +
+                      '<strong class="mono">' + esc(ex.extensionNumber || ('EXT-' + seq)) + '</strong>' +
+                      '<span class="status-tag status-info">' + esc(typeLbl) + '</span>' +
+                      (ex.statusAr ? '<span class="status-tag ' + statusClass(ex.statusAr) + '">' + esc(ex.statusAr) + '</span>' : '') +
+                    '</div>' +
+                    '<strong class="mono tabular-nums" style="color:var(--brand-primary);font-size:14px;">' + Number(ex.amount || 0) + ' ر.س</strong>' +
+                  '</div>' +
+                  '<div class="meta-inline">' +
+                    '<span class="mono tabular-nums">' + esc(formatDateOnly(ex.startDate)) + (ex.startTime ? ' ' + esc(ex.startTime) : '') + ' ← ' + esc(formatDateOnly(ex.endDate)) + (ex.endTime ? ' ' + esc(ex.endTime) : '') + '</span>' +
+                    '<span>·</span>' +
+                    '<span class="tabular-nums"><strong>' + Number(ex.extendDays || 0) + '</strong> يوم</span>' +
+                    (vatNote ? '<span>·</span><span class="tabular-nums">' + esc(vatNote) + '</span>' : '') +
+                    (payLabel !== '-' ? '<span>·</span><span>الدفع: ' + esc(payLabel) + '</span>' : '') +
+                    (ex.paymentDate ? '<span>·</span><span class="mono tabular-nums">' + esc(formatTimestamp(ex.paymentDate)) + '</span>' : '') +
+                  '</div>' +
+                '</div>';
+              }).join('') +
+            '</div>') +
+      '</div>';
+    }
+
     function paintDrawer() {
       var r = d.reservation;
       var assignedIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [];
       var assignedNames = Array.isArray(r.assignedEmployeeNames) ? r.assignedEmployeeNames : [];
       var isClaimedByMe = assignedIds.indexOf(user.id) !== -1;
+      var extCount = Number(r.extensionsCount || (Array.isArray(d.extensions) ? d.extensions.length : 0) || (r.hasExtensions ? 1 : 0));
+      var extDays = Number(r.extendedDaysCount || 0);
+      var totalDays = Number(r.totalDaysCount || ((Number(r.daysCount || 1)) + extDays));
+      var origEndD = r.originalEndDate || r.endDate;
+      var origEndT = r.originalEndTime || r.endTime || '';
+      var hasExtended = extCount > 0 || Boolean(r.extendedUntilDate);
+      var extUntilD = r.extendedUntilDate || (hasExtended ? r.endDate : '');
+      var extUntilT = r.extendedUntilTime || (hasExtended ? r.endTime : '');
 
       modalRoot.innerHTML =
         '<div class="drawer-backdrop" id="res-drawer-backdrop" data-res-id="' + esc(r.id) + '" role="dialog" aria-modal="true" aria-labelledby="drawer-res-title">' +
           '<div class="drawer-panel">' +
             '<div class="modal-header">' +
               '<div>' +
-                '<h3 class="modal-title mono" id="drawer-res-title">حجز ' + esc(r.reservationNumber) + '</h3>' +
-                '<div class="meta-inline"><span>' + esc(r.customerName) + '</span><span>·</span><span class="mono">' + esc(r.customerPhone) + '</span></div>' +
+                '<h3 class="modal-title mono" id="drawer-res-title">حجز ' + esc(r.reservationNumber) +
+                  (r.sourceReservationId ? ' <span class="status-tag status-neutral">RG #' + esc(r.sourceReservationId) + '</span>' : '') +
+                '</h3>' +
+                '<div class="meta-inline">' +
+                  '<span>' + esc(r.customerName) + '</span><span>·</span><span class="mono">' + esc(r.customerPhone) + '</span>' +
+                  (r.customerEmail ? '<span>·</span><span class="mono">' + esc(r.customerEmail) + '</span>' : '') +
+                  (r.customerIdNumber ? '<span>·</span><span class="mono">هوية: ' + esc(r.customerIdNumber) + '</span>' : '') +
+                '</div>' +
               '</div>' +
               '<div class="toolbar-row" style="margin-bottom:0;">' +
                 (opts && opts.onBack ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-back-btn">' + esc(opts.backLabel || 'العودة لملف الموظف') + '</button>' : '') +
@@ -703,6 +812,7 @@
                 '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                   '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus) + '</span>' +
                   '<span class="status-tag ' + priorityClass(r.priority) + '">الأولوية: ' + esc(r.priority || 'عادي') + '</span>' +
+                  (extCount > 0 ? '<span class="status-tag status-info tabular-nums">ممدد ' + extCount + '× (' + Number(r.extensionsAmount || 0) + ' ر.س)</span>' : '') +
                   '<span style="font-size:12.5px;color:var(--text-secondary);">المستلمون حاليًا: <strong class="tabular-nums">' + assignedIds.length + '</strong></span>' +
                 '</div>' +
                 '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
@@ -723,11 +833,27 @@
             '</div>' +
 
             '<div class="detail-summary-grid">' +
-              '<div class="detail-kv"><span class="detail-k">الشركة / الفرع</span><span class="detail-v">' + esc(r.companyName) + ' — ' + esc(r.branchName) + '</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">السيارة</span><span class="detail-v">' + esc(r.carName) + ' (' + esc(r.plateNumber || '-') + ')</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">الفترة</span><span class="detail-v mono" style="white-space:nowrap;">' + esc(formatDateOnly(r.startDate)) + ' → ' + esc(formatDateOnly(r.endDate)) + ' (' + Number(r.daysCount || 1) + ' يوم)</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">الشركة / فرع الاستلام</span><span class="detail-v">' + esc(r.companyName) + ' — ' + esc(r.branchName) +
+                (r.deliverBranchName && r.deliverBranchName !== r.branchName ? ' (التسليم: ' + esc(r.deliverBranchName) + ')' : '') + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">السيارة والفئة واللوحة</span><span class="detail-v">' + esc(r.carName) +
+                (r.carCategory ? ' · ' + esc(r.carCategory) : '') + ' (' + esc(r.plateNumber || '-') + ')</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">بداية الحجز</span><span class="detail-v mono tabular-nums">' + esc(formatDateOnly(r.startDate)) +
+                (r.startTime ? ' · ' + esc(r.startTime) : '') + '</span>' +
+                (r.sourceCreatedAt ? '<span class="time-sub">أُنشئ بالمنصة: <span class="mono">' + esc(formatTimestamp(r.sourceCreatedAt)) + '</span></span>' : '') + '</div>' +
+              '<div class="detail-kv"><span class="detail-k">نهاية الحجز الأصلية</span><span class="detail-v mono tabular-nums">' + esc(formatDateOnly(origEndD)) +
+                (origEndT ? ' · ' + esc(origEndT) : '') + ' (' + Number(r.daysCount || 1) + ' يوم أساسي)</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">التمديد لحد (الإرجاع الفعلي)</span><span class="detail-v mono tabular-nums">' +
+                (extUntilD ? (esc(formatDateOnly(extUntilD)) + (extUntilT ? ' · ' + esc(extUntilT) : '')) : 'لا يوجد تمديد') + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">ملخص التمديد</span><span class="detail-v tabular-nums">' +
+                (extCount > 0 ? (extCount + ' مرات · ' + extDays + ' يوم إضافي · ' + Number(r.extensionsAmount || 0) + ' ر.س') : 'غير ممدد') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">الاستلام / التسليم</span><span class="detail-v">' + esc(r.pickupTypeAr) + ' / ' + esc(r.returnTypeAr) + '</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">الحالة الأصلية / الداخلية</span><span class="detail-v">' + esc(r.originalStatusAr) + ' / ' + esc(r.internalStatus) + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">حالة المنصة / الداخلية</span><span class="detail-v">' + esc(r.originalStatusAr) +
+                (r.originalStatusCode ? ' <span class="mono">(' + esc(r.originalStatusCode) + ')</span>' : '') + ' / ' + esc(r.internalStatus) + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">الدفع والتفصيل المالي</span><span class="detail-v tabular-nums">' +
+                esc(r.paymentMethod || '-') + (r.paymentStatus ? ' (' + esc(r.paymentStatus) + ')' : '') +
+                (Number(r.dailyPrice || 0) > 0 ? ' · يومي ' + Number(r.dailyPrice) + ' ر.س' : '') +
+                (Number(r.vatAmount || 0) > 0 ? ' · ضريبة ' + Number(r.vatAmount) : '') +
+                (Number(r.discountAmount || 0) > 0 ? ' · خصم ' + Number(r.discountAmount) : '') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">آخر تحديث</span><span class="detail-v">' + esc(r.lastUpdateText || '-') + '</span></div>' +
             '</div>' +
 
@@ -756,13 +882,16 @@
             '</div>' +
 
             '<div class="kpi-grid-3">' +
-              '<div class="kpi-card"><span class="kpi-label">أيام الحجز</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.daysCount || 0) + '</span></div>' +
+              '<div class="kpi-card"><span class="kpi-label">إجمالي الأيام</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + totalDays + '</span>' +
+                (extDays > 0 ? '<span class="time-sub">' + Number(r.daysCount || 1) + ' أساسي + ' + extDays + ' تمديد</span>' : '') + '</div>' +
               '<div class="kpi-card"><span class="kpi-label">المبلغ الأساسي</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.baseAmount || 0) + '</span></div>' +
-              '<div class="kpi-card"><span class="kpi-label">التمديدات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.extensionsAmount || 0) + '</span></div>' +
+              '<div class="kpi-card"><span class="kpi-label">سعر التمديد (' + extCount + '×)</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.extensionsAmount || 0) + '</span></div>' +
               '<div class="kpi-card kpi-success"><span class="kpi-label">الإجمالي (ر.س)</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.totalAmount || 0) + '</span></div>' +
               '<div class="kpi-card"><span class="kpi-label">المتابعات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + d.followUps.length + '</span></div>' +
               '<div class="kpi-card ' + (d.problems.length ? 'kpi-danger' : '') + '"><span class="kpi-label">المشكلات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + d.problems.length + '</span></div>' +
             '</div>' +
+
+            buildExtensionsSectionHtml(r, d.extensions) +
 
             '<div class="charts-grid">' +
               '<div class="chart-card"><h4 class="chart-card-title">حالة الحجز والتفصيل المالي</h4><div class="chart-canvas-wrap" style="height:190px;"><canvas id="res-drawer-chart-finance"></canvas></div></div>' +
@@ -1208,21 +1337,29 @@
           '<div class="modal-header">' +
             '<div>' +
               '<h3 class="modal-title" id="res-edit-title">تعديل تفاصيل الحجز <span class="mono">' + esc(reservation.reservationNumber) + '</span></h3>' +
-              '<div class="meta-inline"><span>تحكم المشرف والمدير العام في كامل بيانات الحجز والحالة</span></div>' +
+              '<div class="meta-inline"><span>تحكم المشرف والمدير العام في كامل بيانات الحجز والتمديدات والحالة</span></div>' +
             '</div>' +
             '<button type="button" class="btn btn-sm" id="res-edit-cancel">رجوع</button>' +
           '</div>' +
           '<div class="form-grid-2">' +
             '<div class="form-group"><label class="form-label" for="re-customer">اسم العميل</label><input class="input" id="re-customer" value="' + esc(reservation.customerName) + '" required></div>' +
             '<div class="form-group"><label class="form-label" for="re-phone">رقم الجوال</label><input class="input mono" id="re-phone" value="' + esc(reservation.customerPhone) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-email">بريد العميل</label><input class="input mono" id="re-email" value="' + esc(reservation.customerEmail || '') + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-idnum">رقم الهوية / الإقامة</label><input class="input mono" id="re-idnum" value="' + esc(reservation.customerIdNumber || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-company">شركة التأجير</label><input class="input" id="re-company" value="' + esc(reservation.companyName) + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="re-branch">الفرع</label><input class="input" id="re-branch" value="' + esc(reservation.branchName) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-branch">فرع الاستلام</label><input class="input" id="re-branch" value="' + esc(reservation.branchName) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-deliv-branch">فرع التسليم</label><input class="input" id="re-deliv-branch" value="' + esc(reservation.deliverBranchName || reservation.branchName || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-car">السيارة</label><input class="input" id="re-car" value="' + esc(reservation.carName) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-car-cat">فئة السيارة</label><input class="input" id="re-car-cat" value="' + esc(reservation.carCategory || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-plate">رقم اللوحة</label><input class="input" id="re-plate" value="' + esc(reservation.plateNumber) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-start">تاريخ البداية</label><input type="date" class="input" id="re-start" value="' + esc(formatDateOnly(reservation.startDate) === '-' ? '' : formatDateOnly(reservation.startDate)) + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="re-end">تاريخ النهاية</label><input type="date" class="input" id="re-end" value="' + esc(formatDateOnly(reservation.endDate) === '-' ? '' : formatDateOnly(reservation.endDate)) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-start-time">وقت البداية</label><input class="input mono" id="re-start-time" placeholder="14:30" value="' + esc(reservation.startTime || '') + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-end">نهاية الحجز الفعلية</label><input type="date" class="input" id="re-end" value="' + esc(formatDateOnly(reservation.endDate) === '-' ? '' : formatDateOnly(reservation.endDate)) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-ext-until">التمديد لحد</label><input type="date" class="input" id="re-ext-until" value="' + esc(formatDateOnly(reservation.extendedUntilDate) === '-' ? '' : formatDateOnly(reservation.extendedUntilDate)) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-pickup">نوع الاستلام</label><input class="input" id="re-pickup" value="' + esc(reservation.pickupTypeAr) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-return">نوع التسليم</label><input class="input" id="re-return" value="' + esc(reservation.returnTypeAr) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-pay-method">طريقة الدفع</label><input class="input" id="re-pay-method" value="' + esc(reservation.paymentMethod || '') + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-pay-status">حالة الدفع</label><input class="input" id="re-pay-status" value="' + esc(reservation.paymentStatus || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-status">الحالة الداخلية</label>' +
               '<select class="select" id="re-status">' +
                 (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(reservation.internalStatus) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
@@ -1237,14 +1374,14 @@
               '</select></div>' +
           '</div>' +
           '<div class="form-grid-3">' +
-            '<div class="form-group"><label class="form-label" for="re-days">عدد الأيام</label><input type="number" min="1" class="input mono" id="re-days" value="' + Number(reservation.daysCount || 1) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-days">الأيام الأساسية</label><input type="number" min="1" class="input mono" id="re-days" value="' + Number(reservation.daysCount || 1) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-ext-days">أيام التمديد</label><input type="number" min="0" class="input mono" id="re-ext-days" value="' + Number(reservation.extendedDaysCount || 0) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="re-ext-count">عدد مرات التمديد</label><input type="number" min="0" class="input mono" id="re-ext-count" value="' + Number(reservation.extensionsCount || 0) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-base">المبلغ الأساسي (ر.س)</label><input type="number" step="0.01" class="input mono" id="re-base" value="' + Number(reservation.baseAmount || 0) + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="re-ext">التمديدات (ر.س)</label><input type="number" step="0.01" class="input mono" id="re-ext" value="' + Number(reservation.extensionsAmount || 0) + '"></div>' +
-          '</div>' +
-          '<div class="form-grid-2">' +
+            '<div class="form-group"><label class="form-label" for="re-ext">سعر التمديد (ر.س)</label><input type="number" step="0.01" class="input mono" id="re-ext" value="' + Number(reservation.extensionsAmount || 0) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-total">الإجمالي النهائي (ر.س)</label><input type="number" step="0.01" class="input mono" id="re-total" value="' + Number(reservation.totalAmount || 0) + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="re-last">آخر تحديث / ملخص</label><input class="input" id="re-last" value="' + esc(reservation.lastUpdateText || '') + '"></div>' +
           '</div>' +
+          '<div class="form-group"><label class="form-label" for="re-last">آخر تحديث / ملخص</label><input class="input" id="re-last" value="' + esc(reservation.lastUpdateText || '') + '"></div>' +
           '<div id="res-edit-err" class="form-error hidden"></div>' +
           '<div class="modal-footer">' +
             '<button type="submit" class="btn btn-primary" id="res-edit-save">حفظ تعديلات الحجز</button>' +
@@ -1268,21 +1405,34 @@
 
     document.getElementById('res-edit-form').addEventListener('submit', async function (ev) {
       ev.preventDefault();
+      var baseDaysVal = Math.max(1, Number(document.getElementById('re-days').value || 1));
+      var extDaysVal = Math.max(0, Number(document.getElementById('re-ext-days').value || 0));
       var res = await root.RGApi.callApi('updateReservationDetails', {
         reservationId: reservation.id,
         customerName: document.getElementById('re-customer').value,
         customerPhone: document.getElementById('re-phone').value,
+        customerEmail: document.getElementById('re-email').value,
+        customerIdNumber: document.getElementById('re-idnum').value,
         companyName: document.getElementById('re-company').value,
         branchName: document.getElementById('re-branch').value,
+        deliverBranchName: document.getElementById('re-deliv-branch').value,
         carName: document.getElementById('re-car').value,
+        carCategory: document.getElementById('re-car-cat').value,
         plateNumber: document.getElementById('re-plate').value,
         startDate: document.getElementById('re-start').value,
+        startTime: document.getElementById('re-start-time').value,
         endDate: document.getElementById('re-end').value,
+        extendedUntilDate: document.getElementById('re-ext-until').value,
         pickupTypeAr: document.getElementById('re-pickup').value,
         returnTypeAr: document.getElementById('re-return').value,
+        paymentMethod: document.getElementById('re-pay-method').value,
+        paymentStatus: document.getElementById('re-pay-status').value,
         internalStatus: document.getElementById('re-status').value,
         priority: document.getElementById('re-prio').value,
-        daysCount: Number(document.getElementById('re-days').value || 1),
+        daysCount: baseDaysVal,
+        extendedDaysCount: extDaysVal,
+        totalDaysCount: baseDaysVal + extDaysVal,
+        extensionsCount: Math.max(0, Number(document.getElementById('re-ext-count').value || 0)),
         baseAmount: Number(baseEl.value || 0),
         extensionsAmount: Number(extEl.value || 0),
         totalAmount: Number(totalEl.value || 0),
@@ -1634,8 +1784,11 @@
       var incLast = document.getElementById('spdf-last').checked;
 
       var summary = [];
+      var spdfExtCount = Number(r.extensionsCount || (details.extensions ? details.extensions.length : 0) || 0);
+      var spdfTotalDays = Number(r.totalDaysCount || r.daysCount || 0);
       if (incCounters) {
-        summary.push({ label: 'أيام الحجز', value: r.daysCount + ' يوم' });
+        summary.push({ label: 'أيام الحجز', value: spdfTotalDays + ' يوم (' + Number(r.daysCount || 1) + ' + ' + Number(r.extendedDaysCount || 0) + ' تمديد)' });
+        summary.push({ label: 'التمديدات', value: spdfExtCount + ' مرات · ' + Number(r.extensionsAmount || 0) + ' ر.س' });
         summary.push({ label: 'الأساسي / التمديد / الإجمالي', value: r.baseAmount + ' + ' + r.extensionsAmount + ' = ' + r.totalAmount + ' ر.س' });
         summary.push({ label: 'عداد المتابعات', value: details.followUps.length });
         summary.push({ label: 'عداد المشكلات', value: details.problems.length });
@@ -1645,7 +1798,8 @@
       }
       if (incBooking) {
         summary.push({ label: 'الشركة والفرع', value: r.companyName + ' — ' + r.branchName });
-        summary.push({ label: 'السيارة والفترة', value: r.carName + ' | ' + formatDateOnly(r.startDate) + ' → ' + formatDateOnly(r.endDate) });
+        summary.push({ label: 'السيارة والفترة', value: r.carName + ' | ' + formatDateOnly(r.startDate) + ' → ' + formatDateOnly(r.endDate) + (r.extendedUntilDate ? ' (ممدد لحد ' + formatDateOnly(r.extendedUntilDate) + ')' : '') });
+        summary.push({ label: 'الدفع والحالة', value: (r.paymentMethod || '-') + ' (' + (r.paymentStatus || '-') + ') | ' + r.originalStatusAr });
       }
       if (incStaff) {
         summary.push({ label: 'الموظفون المسؤولون', value: (r.assignedEmployeeNames || []).join('، ') || 'غير مسند' });
@@ -1671,9 +1825,12 @@
       }
       if (incBooking && details.extensions.length) {
         extraSections.push({
-          title: 'التمديدات المعتمدة والمدفوعة (' + details.extensions.length + ')',
-          lines: details.extensions.map(function (ex) {
-            return ex.extensionNumber + ' | ' + ex.extendDays + ' يوم (' + formatDateOnly(ex.startDate) + ' → ' + formatDateOnly(ex.endDate) + ') | ' + ex.amount + ' ر.س';
+          title: 'سجل وتفاصيل التمديدات المعتمدة والمدفوعة (' + details.extensions.length + ')',
+          lines: details.extensions.map(function (ex, idx) {
+            return '#' + (ex.sequenceNumber || (idx + 1)) + ' | ' + ex.extensionNumber +
+              (ex.extensionTypeAr ? ' (' + ex.extensionTypeAr + ')' : '') +
+              ' | ' + ex.extendDays + ' يوم (' + formatDateOnly(ex.startDate) + ' → ' + formatDateOnly(ex.endDate) + ') | ' + ex.amount + ' ر.س' +
+              (ex.paymentMethod ? ' — ' + ex.paymentMethod : '');
           })
         });
       }

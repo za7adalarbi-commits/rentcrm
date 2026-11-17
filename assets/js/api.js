@@ -88,6 +88,7 @@
   var localReservationsByNs = {};
   var localCustomersByNs = {};
   var localDetailsByNs = {};
+  var localExtensionsByResNs = {};
   var localMetaByNs = {};
 
   function getCacheNamespace() {
@@ -141,6 +142,48 @@
     return nextList;
   }
 
+  function setLocalExtensionsState(ns, extList) {
+    if (!Array.isArray(extList)) return;
+    var bucket = { byResId: {}, byResNumber: {}, bySourceId: {} };
+    extList.forEach(function (ex) {
+      if (!ex || typeof ex !== 'object') return;
+      if (ex.reservationId) {
+        if (!bucket.byResId[ex.reservationId]) bucket.byResId[ex.reservationId] = [];
+        bucket.byResId[ex.reservationId].push(ex);
+      }
+      if (ex.reservationNumber) {
+        if (!bucket.byResNumber[ex.reservationNumber]) bucket.byResNumber[ex.reservationNumber] = [];
+        bucket.byResNumber[ex.reservationNumber].push(ex);
+      }
+      if (ex.sourceReservationId) {
+        var sKey = String(ex.sourceReservationId);
+        if (!bucket.bySourceId[sKey]) bucket.bySourceId[sKey] = [];
+        bucket.bySourceId[sKey].push(ex);
+      }
+    });
+    var sortExts = function (arr) {
+      arr.sort(function (a, b) {
+        var sa = Number(a.sequenceNumber || 0);
+        var sb = Number(b.sequenceNumber || 0);
+        if (sa !== sb && sa > 0 && sb > 0) return sa - sb;
+        return String(a.startDate || '').localeCompare(String(b.startDate || ''));
+      });
+    };
+    Object.keys(bucket.byResId).forEach(function (k) { sortExts(bucket.byResId[k]); });
+    Object.keys(bucket.byResNumber).forEach(function (k) { sortExts(bucket.byResNumber[k]); });
+    Object.keys(bucket.bySourceId).forEach(function (k) { sortExts(bucket.bySourceId[k]); });
+    localExtensionsByResNs[ns] = bucket;
+  }
+
+  function getCachedExtensionsForRes(ns, resObj) {
+    var bucket = localExtensionsByResNs[ns];
+    if (!bucket || !resObj) return [];
+    if (resObj.id && Array.isArray(bucket.byResId[resObj.id])) return bucket.byResId[resObj.id].slice();
+    if (resObj.reservationNumber && Array.isArray(bucket.byResNumber[resObj.reservationNumber])) return bucket.byResNumber[resObj.reservationNumber].slice();
+    if (resObj.sourceReservationId && Array.isArray(bucket.bySourceId[String(resObj.sourceReservationId)])) return bucket.bySourceId[String(resObj.sourceReservationId)].slice();
+    return [];
+  }
+
   function setLocalDetailState(ns, detailData) {
     if (!detailData || !detailData.reservation || !detailData.reservation.id) return;
     var core = root.RGCrmCore;
@@ -155,6 +198,13 @@
     });
     if (!localDetailsByNs[ns]) localDetailsByNs[ns] = {};
     localDetailsByNs[ns][resCopy.id] = rec;
+
+    if (Array.isArray(detailData.extensions)) {
+      if (!localExtensionsByResNs[ns]) localExtensionsByResNs[ns] = { byResId: {}, byResNumber: {}, bySourceId: {} };
+      localExtensionsByResNs[ns].byResId[resCopy.id] = detailData.extensions.slice();
+      if (resCopy.reservationNumber) localExtensionsByResNs[ns].byResNumber[resCopy.reservationNumber] = detailData.extensions.slice();
+      if (resCopy.sourceReservationId) localExtensionsByResNs[ns].bySourceId[String(resCopy.sourceReservationId)] = detailData.extensions.slice();
+    }
 
     // Also update reservation in reservations/customers index
     setLocalReservationsState(ns, [resCopy], false);
@@ -176,6 +226,7 @@
       var enrichedList = db.reservations.map(function (r) {
         return Object.assign({}, r, { isFollowed: Boolean(followedSet[r.id]) });
       });
+      setLocalExtensionsState(ns, db.extensions || []);
       setLocalReservationsState(ns, enrichedList, true, {
         allReservationsHydrated: true,
         allowAgentViewAll: db.settings.allow_agent_view_all !== false,
@@ -183,9 +234,17 @@
       });
       if (!localDetailsByNs[ns]) localDetailsByNs[ns] = {};
       enrichedList.forEach(function (r) {
+        var relExts = (db.extensions || []).filter(function (e) {
+          return e.reservationId === r.id || e.reservationNumber === r.reservationNumber || (r.sourceReservationId && String(e.sourceReservationId) === String(r.sourceReservationId));
+        }).sort(function (a, b) {
+          var sa = Number(a.sequenceNumber || 0);
+          var sb = Number(b.sequenceNumber || 0);
+          if (sa !== sb && sa > 0 && sb > 0) return sa - sb;
+          return String(a.startDate || '').localeCompare(String(b.startDate || ''));
+        });
         var det = {
           reservation: r,
-          extensions: (db.extensions || []).filter(function (e) { return e.reservationNumber === r.reservationNumber; }),
+          extensions: relExts,
           assignments: (db.assignments || []).filter(function (a) { return a.reservationId === r.id && a.status === 'active'; }),
           followUps: (db.followUps || []).filter(function (f) { return f.reservationId === r.id; }).sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); }),
           followUpHistory: (db.followUpHistory || []).filter(function (h) { return h.reservationId === r.id; }).sort(function (a, b) { return String(b.changedAt).localeCompare(String(a.changedAt)); }),
@@ -338,6 +397,7 @@
         delete localReservationsByNs[ns];
         delete localCustomersByNs[ns];
         delete localDetailsByNs[ns];
+        delete localExtensionsByResNs[ns];
         delete localMetaByNs[ns];
         delete hydratedNamespaces[ns];
       }
@@ -555,7 +615,7 @@
       reservation: Object.assign({}, foundRes, {
         statusHistory: (core && core.normalizeStatusHistory) ? core.normalizeStatusHistory(foundRes.statusHistory) : (foundRes.statusHistory || [])
       }),
-      extensions: [],
+      extensions: getCachedExtensionsForRes(ns, foundRes),
       assignments: (Array.isArray(foundRes.assignedEmployeeIds) ? foundRes.assignedEmployeeIds : []).map(function (eid, idx) {
         return {
           id: 'ASN_LOCAL_' + eid,
@@ -589,6 +649,9 @@
         }
         var resp = await callApi('syncLocalCache', { forceRefresh: true });
         if (resp && resp.success && resp.data && Array.isArray(resp.data.reservations)) {
+          if (Array.isArray(resp.data.extensions)) {
+            setLocalExtensionsState(ns, resp.data.extensions);
+          }
           setLocalReservationsState(ns, resp.data.reservations, true, {
             allReservationsHydrated: true,
             allowAgentViewAll: resp.data.allowAgentViewAll !== false,
@@ -1159,29 +1222,49 @@
     var reservations = [
       {
         id: 'RES_1001',
+        sourceReservationId: '884101',
         reservationNumber: 'RG-2026-8841',
+        sourceCreatedAt: t1 + 'T14:00:00.000Z',
         customerName: 'عبدالله بن محمد السبيعي',
         customerPhone: '0508877123',
+        customerEmail: 'a.alsubaie@example.sa',
+        customerIdNumber: '1084523910',
         companyName: 'ذيب لتأجير السيارات',
         branchName: 'مطار الملك خالد - الرياض',
+        deliverBranchName: 'مطار الملك خالد - الرياض',
         carName: 'هيونداي سوناتا 2026',
+        carCategory: 'سيدان متوسطة',
         plateNumber: 'ح د ب 4412',
         startDate: t0,
-        endDate: todayIso(4),
-        daysCount: 4,
+        startTime: '14:30',
+        originalEndDate: todayIso(3),
+        originalEndTime: '14:30',
+        endDate: todayIso(6),
+        endTime: '14:30',
+        extendedUntilDate: todayIso(6),
+        extendedUntilTime: '14:30',
+        daysCount: 3,
+        extendedDaysCount: 3,
+        totalDaysCount: 6,
         originalStatusCode: 'confirmed',
         originalStatusAr: 'مؤكد',
         pickupTypeAr: 'توصيل للمطار',
         returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'مدى (Mada)',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 324.64,
+        discountAmount: 0,
+        vatAmount: 146.09,
         baseAmount: 1120,
-        extensionsAmount: 280,
-        totalAmount: 1400,
+        extensionsCount: 2,
+        extensionsAmount: 800,
+        totalAmount: 1920,
         hasExtensions: true,
         internalStatus: 'تم التمديد',
         priority: 'متوسط',
         assignedEmployeeIds: ['EMP_AG1', 'EMP_AG2'],
         assignedEmployeeNames: ['خالد الحربي', 'نورة القحطاني'],
-        lastUpdateText: 'تأكيد تمديد يوم إضافي وسداد الرسوم',
+        lastUpdateText: 'تأكيد تمديد الحجز مرتين (3 أيام إضافية) وسداد 800 ر.س',
         lastUpdatedById: 'EMP_AG1',
         lastUpdatedByName: 'خالد الحربي',
         lastUpdatedAt: t0 + 'T11:15:00.000Z',
@@ -1191,21 +1274,41 @@
       },
       {
         id: 'RES_1002',
+        sourceReservationId: '884201',
         reservationNumber: 'RG-2026-8842',
+        sourceCreatedAt: t0 + 'T08:10:00.000Z',
         customerName: 'سلطان عبدالعزيز الغامدي',
         customerPhone: '0551239874',
+        customerEmail: 's.alghamdi@example.sa',
+        customerIdNumber: '1067231845',
         companyName: 'بدجت السعودية',
         branchName: 'حي العليا - الرياض',
+        deliverBranchName: 'حي العليا - الرياض',
         carName: 'تويوتا كامري GLE 2026',
+        carCategory: 'سيدان عائلية',
         plateNumber: 'س م ن 9011',
         startDate: t0,
+        startTime: '10:00',
+        originalEndDate: todayIso(3),
+        originalEndTime: '10:00',
         endDate: todayIso(3),
+        endTime: '10:00',
+        extendedUntilDate: '',
+        extendedUntilTime: '',
         daysCount: 3,
+        extendedDaysCount: 0,
+        totalDaysCount: 3,
         originalStatusCode: 'delivered',
         originalStatusAr: 'تم التسليم',
         pickupTypeAr: 'استلام من الفرع',
         returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'Apple Pay',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 243.48,
+        discountAmount: 0,
+        vatAmount: 109.57,
         baseAmount: 840,
+        extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 840,
         hasExtensions: false,
@@ -1223,21 +1326,41 @@
       },
       {
         id: 'RES_1003',
+        sourceReservationId: '884301',
         reservationNumber: 'RG-2026-8843',
+        sourceCreatedAt: t1 + 'T16:30:00.000Z',
         customerName: 'ماجد ناصر الشهري',
         customerPhone: '0534455661',
+        customerEmail: 'm.alshehri@example.sa',
+        customerIdNumber: '1091234512',
         companyName: 'يلو (الوفاق)',
         branchName: 'مطار الملك عبدالعزيز - جدة',
+        deliverBranchName: 'جدة - طريق المدينة',
         carName: 'كيا K5 2026',
+        carCategory: 'سيدان متوسطة',
         plateNumber: 'أ ب ج 7120',
         startDate: t1,
+        startTime: '18:00',
+        originalEndDate: todayIso(2),
+        originalEndTime: '18:00',
         endDate: todayIso(2),
+        endTime: '18:00',
+        extendedUntilDate: '',
+        extendedUntilTime: '',
         daysCount: 3,
+        extendedDaysCount: 0,
+        totalDaysCount: 3,
         originalStatusCode: 'pending',
         originalStatusAr: 'قيد الانتظار',
         pickupTypeAr: 'توصيل للمطار',
         returnTypeAr: 'استلام من موقع العميل',
+        paymentMethod: 'بطاقة ائتمانية',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 278.26,
+        discountAmount: 0,
+        vatAmount: 125.22,
         baseAmount: 960,
+        extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 960,
         hasExtensions: false,
@@ -1255,21 +1378,41 @@
       },
       {
         id: 'RES_1004',
+        sourceReservationId: '884401',
         reservationNumber: 'RG-2026-8844',
+        sourceCreatedAt: t2 + 'T11:00:00.000Z',
         customerName: 'ريم فهد المالكي',
         customerPhone: '0592211445',
+        customerEmail: 'r.almalki@example.sa',
+        customerIdNumber: '1055612908',
         companyName: 'مفتاح لتأجير السيارات',
         branchName: 'الخبر - الكورنيش',
+        deliverBranchName: 'الخبر - الكورنيش',
         carName: 'مازدا 6 2025',
+        carCategory: 'سيدان عائلية',
         plateNumber: 'ط ع ق 3309',
         startDate: t2,
+        startTime: '12:00',
+        originalEndDate: t0,
+        originalEndTime: '12:00',
         endDate: t0,
+        endTime: '12:00',
+        extendedUntilDate: '',
+        extendedUntilTime: '',
         daysCount: 2,
+        extendedDaysCount: 0,
+        totalDaysCount: 2,
         originalStatusCode: 'completed',
         originalStatusAr: 'مكتمل',
         pickupTypeAr: 'استلام من الفرع',
         returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'مدى (Mada)',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 269.57,
+        discountAmount: 0,
+        vatAmount: 80.87,
         baseAmount: 620,
+        extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 620,
         hasExtensions: false,
@@ -1287,21 +1430,41 @@
       },
       {
         id: 'RES_1005',
+        sourceReservationId: '884501',
         reservationNumber: 'RG-2026-8845',
+        sourceCreatedAt: t0 + 'T07:50:00.000Z',
         customerName: 'تركي سالم العجمي',
         customerPhone: '0543322119',
+        customerEmail: 't.alajmi@example.sa',
+        customerIdNumber: '1044318762',
         companyName: 'لومي لتأجير السيارات',
         branchName: 'مطار الملك فهد - الدمام',
+        deliverBranchName: 'مطار الملك فهد - الدمام',
         carName: 'شيفروليه تاهو 2026',
+        carCategory: 'SUV فاخرة',
         plateNumber: 'ر و ن 5580',
         startDate: t0,
+        startTime: '20:00',
+        originalEndDate: todayIso(5),
+        originalEndTime: '20:00',
         endDate: todayIso(5),
+        endTime: '20:00',
+        extendedUntilDate: '',
+        extendedUntilTime: '',
         daysCount: 5,
+        extendedDaysCount: 0,
+        totalDaysCount: 5,
         originalStatusCode: 'booked',
         originalStatusAr: 'تم الحجز',
         pickupTypeAr: 'توصيل للمطار',
         returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'بطاقة ائتمانية',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 478.26,
+        discountAmount: 100,
+        vatAmount: 358.7,
         baseAmount: 2750,
+        extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 2750,
         hasExtensions: false,
@@ -1319,21 +1482,41 @@
       },
       {
         id: 'RES_1006',
+        sourceReservationId: '884601',
         reservationNumber: 'RG-2026-8846',
+        sourceCreatedAt: t5 + 'T10:00:00.000Z',
         customerName: 'بندر عوض الزهراني',
         customerPhone: '0506677882',
+        customerEmail: 'b.alzahrani@example.sa',
+        customerIdNumber: '1039821440',
         companyName: 'بدجت السعودية',
         branchName: 'جدة - طريق المدينة',
+        deliverBranchName: 'جدة - طريق المدينة',
         carName: 'نيسان إكس تريل 2026',
+        carCategory: 'SUV متوسطة',
         plateNumber: 'ك ل م 1198',
         startDate: t5,
+        startTime: '11:00',
+        originalEndDate: t2,
+        originalEndTime: '11:00',
         endDate: t2,
+        endTime: '11:00',
+        extendedUntilDate: '',
+        extendedUntilTime: '',
         daysCount: 3,
+        extendedDaysCount: 0,
+        totalDaysCount: 3,
         originalStatusCode: 'cancelled',
         originalStatusAr: 'ملغي',
         pickupTypeAr: 'توصيل للموقع',
         returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'مدى (Mada)',
+        paymentStatus: 'مسترد',
+        dailyPrice: 304.35,
+        discountAmount: 0,
+        vatAmount: 136.96,
         baseAmount: 1050,
+        extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 1050,
         hasExtensions: false,
@@ -1354,18 +1537,53 @@
     var extensions = [
       {
         id: 'EXT_501',
+        sequenceNumber: 1,
         extensionNumber: 'EXT-8841-1',
         reservationId: 'RES_1001',
         reservationNumber: 'RG-2026-8841',
+        sourceReservationId: '884101',
+        extensionType: 'CLIENT',
+        extensionTypeAr: 'تمديد بواسطة العميل',
         statusCode: 'accepted',
         statusAr: 'مقبول',
         paymentStatus: 'paid',
+        paymentMethod: 'Apple Pay',
+        paymentDate: t0 + 'T10:40:00.000Z',
         extendDays: 1,
         startDate: todayIso(3),
+        startTime: '14:30',
         endDate: todayIso(4),
+        endTime: '14:30',
+        subTotal: 243.48,
+        vatAmount: 36.52,
         amount: 280,
         isAcceptedAndPaid: true,
         syncedAt: t0 + 'T09:00:00.000Z'
+      },
+      {
+        id: 'EXT_502',
+        sequenceNumber: 2,
+        extensionNumber: 'EXT-8841-2',
+        reservationId: 'RES_1001',
+        reservationNumber: 'RG-2026-8841',
+        sourceReservationId: '884101',
+        extensionType: 'AUTOMATIC',
+        extensionTypeAr: 'تمديد تلقائي',
+        statusCode: 'automatically_extended',
+        statusAr: 'تم التمديد تلقائيًا',
+        paymentStatus: 'paid_by_wallet',
+        paymentMethod: 'المحفظة',
+        paymentDate: t0 + 'T11:12:00.000Z',
+        extendDays: 2,
+        startDate: todayIso(4),
+        startTime: '14:30',
+        endDate: todayIso(6),
+        endTime: '14:30',
+        subTotal: 452.17,
+        vatAmount: 67.83,
+        amount: 520,
+        isAcceptedAndPaid: true,
+        syncedAt: t0 + 'T11:15:00.000Z'
       }
     ];
 
@@ -1493,7 +1711,7 @@
       {
         id: 'ACT_1', userId: 'EMP_ADMIN', userName: 'فهد الدوسري', userRole: 'general_manager',
         actionType: 'سحب بيانات', entityType: 'Sync', entityId: 'SYNC_1',
-        details: 'مزامنة الحجوزات والتمديدات من Rental Gate API (6 حجوزات، 1 تمديد)',
+        details: 'مزامنة الحجوزات والتمديدات من Rental Gate API (6 حجوزات، 2 تمديد)',
         logDate: t0, logTime: '09:00:00', createdAt: t0 + 'T09:00:00.000Z'
       },
       {
@@ -1545,7 +1763,7 @@
         status: 'success',
         importedCount: 6,
         updatedCount: 0,
-        extensionsCount: 1,
+        extensionsCount: 2,
         pagesFetched: 1,
         errorMessage: '',
         durationMs: 640,
@@ -1599,6 +1817,7 @@
     });
 
     return {
+      _schemaV3ExactRg: true,
       employees: employees,
       reservations: reservations,
       extensions: extensions,
@@ -1660,6 +1879,63 @@
           dirty = true;
         }
       });
+
+      if (!parsed._schemaV3ExactRg) {
+        var defResMap = {};
+        defaults.reservations.forEach(function (dr) { defResMap[dr.id] = dr; });
+        parsed.reservations = parsed.reservations.map(function (r) {
+          var defR = defResMap[r.id];
+          if (defR) {
+            var patched = Object.assign({}, defR, r);
+            if (r.id === 'RES_1001') {
+              patched.startTime = defR.startTime;
+              patched.originalEndDate = defR.originalEndDate;
+              patched.originalEndTime = defR.originalEndTime;
+              patched.endDate = defR.endDate;
+              patched.endTime = defR.endTime;
+              patched.extendedUntilDate = defR.extendedUntilDate;
+              patched.extendedUntilTime = defR.extendedUntilTime;
+              patched.daysCount = defR.daysCount;
+              patched.extendedDaysCount = defR.extendedDaysCount;
+              patched.totalDaysCount = defR.totalDaysCount;
+              patched.extensionsCount = defR.extensionsCount;
+              patched.extensionsAmount = defR.extensionsAmount;
+              patched.totalAmount = Number(patched.baseAmount || 1120) + defR.extensionsAmount;
+              patched.hasExtensions = true;
+            }
+            return patched;
+          }
+          return Object.assign({
+            startTime: '',
+            originalEndDate: r.originalEndDate || r.endDate || '',
+            originalEndTime: '',
+            endTime: '',
+            extendedUntilDate: r.extendedUntilDate || '',
+            extendedUntilTime: '',
+            extendedDaysCount: Number(r.extendedDaysCount || 0),
+            totalDaysCount: Number(r.totalDaysCount || r.daysCount || 1),
+            extensionsCount: Number(r.extensionsCount || (r.hasExtensions ? 1 : 0))
+          }, r);
+        });
+        defaults.extensions.forEach(function (defExt) {
+          var idxExt = parsed.extensions.findIndex(function (ex) { return ex && ex.id === defExt.id; });
+          if (idxExt === -1) parsed.extensions.push(defExt);
+          else parsed.extensions[idxExt] = Object.assign({}, defExt, parsed.extensions[idxExt], {
+            sequenceNumber: defExt.sequenceNumber,
+            extensionType: defExt.extensionType,
+            extensionTypeAr: defExt.extensionTypeAr,
+            startTime: defExt.startTime,
+            endTime: defExt.endTime,
+            subTotal: defExt.subTotal,
+            vatAmount: defExt.vatAmount,
+            paymentMethod: defExt.paymentMethod,
+            paymentDate: defExt.paymentDate,
+            sourceReservationId: defExt.sourceReservationId
+          });
+        });
+        parsed._schemaV3ExactRg = true;
+        dirty = true;
+      }
 
       if (!parsed.settings || typeof parsed.settings !== 'object') {
         parsed.settings = defaults.settings;
@@ -1885,6 +2161,7 @@
           message: '',
           data: {
             reservations: visibleRes,
+            extensions: (db.extensions || []).slice(),
             allowAgentViewAll: db.settings.allow_agent_view_all !== false,
             followUps: db.followUps.slice(0, 400),
             problems: db.problems.slice(0, 200),
@@ -1936,12 +2213,21 @@
         var resNorm = Object.assign({}, res, {
           statusHistory: core.normalizeStatusHistory ? core.normalizeStatusHistory(res.statusHistory) : (res.statusHistory || [])
         });
+        var relExts = db.extensions.filter(function (e) {
+          return e.reservationId === res.id || e.reservationNumber === res.reservationNumber ||
+            (res.sourceReservationId && String(e.sourceReservationId) === String(res.sourceReservationId));
+        }).sort(function (a, b) {
+          var sa = Number(a.sequenceNumber || 0);
+          var sb = Number(b.sequenceNumber || 0);
+          if (sa !== sb && sa > 0 && sb > 0) return sa - sb;
+          return String(a.startDate || '').localeCompare(String(b.startDate || ''));
+        });
         return {
           success: true,
           message: '',
           data: {
             reservation: resNorm,
-            extensions: db.extensions.filter(function (e) { return e.reservationNumber === res.reservationNumber; }),
+            extensions: relExts,
             assignments: db.assignments.filter(function (a) { return a.reservationId === res.id && a.status === 'active'; }),
             followUps: db.followUps.filter(function (f) { return f.reservationId === res.id; }).sort(function (a, b) { return b.createdAt.localeCompare(a.createdAt); }),
             followUpHistory: (db.followUpHistory || []).filter(function (h) { return h.reservationId === res.id; }).sort(function (a, b) { return String(b.changedAt).localeCompare(String(a.changedAt)); }),
@@ -2152,15 +2438,27 @@
         if (!rEdit) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
         var prevEditStatus = rEdit.internalStatus || '';
         [
-          'customerName', 'customerPhone', 'companyName', 'branchName',
-          'carName', 'plateNumber', 'startDate', 'endDate',
-          'pickupTypeAr', 'returnTypeAr', 'lastUpdateText'
+          'customerName', 'customerPhone', 'customerEmail', 'customerIdNumber',
+          'companyName', 'branchName', 'deliverBranchName', 'carName', 'carCategory',
+          'plateNumber', 'startDate', 'startTime', 'originalEndDate', 'originalEndTime',
+          'endDate', 'endTime', 'extendedUntilDate', 'extendedUntilTime',
+          'pickupTypeAr', 'returnTypeAr', 'paymentMethod', 'paymentStatus', 'lastUpdateText'
         ].forEach(function (field) {
           if (payload[field] !== undefined) rEdit[field] = String(payload[field] || '').trim();
         });
         if (payload.daysCount !== undefined) rEdit.daysCount = Math.max(1, Number(payload.daysCount || 1));
+        if (payload.extendedDaysCount !== undefined) rEdit.extendedDaysCount = Math.max(0, Number(payload.extendedDaysCount || 0));
+        if (payload.totalDaysCount !== undefined) rEdit.totalDaysCount = Math.max(1, Number(payload.totalDaysCount || 1));
+        else rEdit.totalDaysCount = Math.max(1, Number(rEdit.daysCount || 1) + Number(rEdit.extendedDaysCount || 0));
+        if (payload.extensionsCount !== undefined) rEdit.extensionsCount = Math.max(0, Number(payload.extensionsCount || 0));
+        if (payload.dailyPrice !== undefined) rEdit.dailyPrice = Number(payload.dailyPrice || 0);
+        if (payload.discountAmount !== undefined) rEdit.discountAmount = Number(payload.discountAmount || 0);
+        if (payload.vatAmount !== undefined) rEdit.vatAmount = Number(payload.vatAmount || 0);
         if (payload.baseAmount !== undefined) rEdit.baseAmount = Number(payload.baseAmount || 0);
-        if (payload.extensionsAmount !== undefined) rEdit.extensionsAmount = Number(payload.extensionsAmount || 0);
+        if (payload.extensionsAmount !== undefined) {
+          rEdit.extensionsAmount = Number(payload.extensionsAmount || 0);
+          rEdit.hasExtensions = rEdit.extensionsAmount > 0 || Number(rEdit.extensionsCount || 0) > 0;
+        }
         if (payload.totalAmount !== undefined) rEdit.totalAmount = Number(payload.totalAmount || 0);
         if (payload.internalStatus && core.isValidWorkflowStatus(payload.internalStatus)) {
           rEdit.internalStatus = payload.internalStatus;
@@ -2873,29 +3171,70 @@
 
         var pullIdx = db.syncLog.length;
         var pullNum = 'RG-2026-' + (8850 + pullIdx);
+        var pullApiId = String(885000 + pullIdx);
         var pullNames = ['ياسر عبدالرحمن التميمي', 'سلطان فهد الشهري', 'ماجد سعد الزهراني', 'تركي ناصر العتيبي'];
         var pullCars = ['فورد تورس 2026', 'تويوتا كامري 2026', 'نيسان ألتيما 2026', 'كيا K5 2026'];
-        var pullStatuses = ['confirmed', 'started', 'booked', 'in_progress'];
+        var pullStatuses = ['confirmed', 'started', 'booked', 'extended'];
         var chosenPullDate = pullRange.dateFrom || todayIso(0);
+        var origEndDateStr = (core.shiftIsoDateDays ? core.shiftIsoDateDays(chosenPullDate, 3) : todayIso(3)) + 'T10:30:00';
+        var actualEndDateStr = (core.shiftIsoDateDays ? core.shiftIsoDateDays(chosenPullDate, 5) : todayIso(5)) + 'T10:30:00';
+        var basePricePull = 1350 + (pullIdx % 3) * 150;
+        var pullIncomingExt = {
+          id: 'EXT_PULL_' + pullIdx,
+          extensionNumber: 'EXT-' + (8850 + pullIdx) + '-1',
+          reservationNumber: pullNum,
+          sourceReservationId: pullApiId,
+          extensionType: 'CLIENT',
+          extensionTypeAr: 'تمديد بواسطة العميل',
+          reservationStatus: 'paid',
+          statusCode: 'paid',
+          statusAr: 'مدفوع',
+          paymentStatus: 'paid',
+          paymentMethod: 'Apple Pay',
+          paymentDate: chosenPullDate + 'T13:15:00Z',
+          extendDays: 2,
+          extendDate: origEndDateStr,
+          newEndDate: actualEndDateStr,
+          startDate: origEndDateStr.substring(0, 10),
+          startTime: '10:30',
+          endDate: actualEndDateStr.substring(0, 10),
+          endTime: '10:30',
+          subTotal: 521.74,
+          vatAmount: 78.26,
+          amount: 600,
+          isAcceptedAndPaid: true
+        };
         var pullIncoming = {
+          reservationId: pullApiId,
+          reservationNumber: pullNum,
           reservation_number: pullNum,
-          customer_name: pullNames[pullIdx % pullNames.length],
-          customer_phone: '05077441' + String(10 + (pullIdx % 89)),
-          company_name: pullIdx % 2 === 0 ? 'ذيب لتأجير السيارات' : 'بدجت السعودية',
-          branch_name: pullIdx % 2 === 0 ? 'مطار الملك خالد - الرياض' : 'مطار الملك عبدالعزيز - جدة',
-          car_name: pullCars[pullIdx % pullCars.length],
-          plate_number: 'و هـ ي ' + String(6201 + pullIdx),
           reservationDate: chosenPullDate + 'T09:00:00Z',
-          start_date: chosenPullDate,
-          end_date: todayIso(3),
-          days_count: 3,
-          status: pullStatuses[pullIdx % pullStatuses.length],
-          pickup_type: 'airport',
-          return_type: 'branch',
-          total_price: 1350 + (pullIdx % 3) * 150
+          clientName: pullNames[pullIdx % pullNames.length],
+          clientMobile: '05077441' + String(10 + (pullIdx % 89)),
+          clientEmail: 'client' + (8850 + pullIdx) + '@example.sa',
+          companyArName: pullIdx % 2 === 0 ? 'ذيب لتأجير السيارات' : 'بدجت السعودية',
+          receiveBranchArName: pullIdx % 2 === 0 ? 'مطار الملك خالد - الرياض' : 'مطار الملك عبدالعزيز - جدة',
+          deliverBranchArName: pullIdx % 2 === 0 ? 'مطار الملك خالد - الرياض' : 'مطار الملك عبدالعزيز - جدة',
+          carNameAr: pullCars[pullIdx % pullCars.length],
+          carCategoryAr: 'سيدان فاخرة',
+          plateNumber: 'و هـ ي ' + String(6201 + pullIdx),
+          startDate: chosenPullDate + 'T10:30:00',
+          endDate: origEndDateStr,
+          actualEndDate: actualEndDateStr,
+          reservationDays: 3,
+          reservationStatus: pullStatuses[pullIdx % pullStatuses.length],
+          pickupType: 'airport',
+          returnType: 'branch',
+          paymentType: 'مدى (Mada)',
+          paymentStatus: 'paid',
+          dailyPrice: Math.round((basePricePull / 3 / 1.15) * 100) / 100,
+          discount: 0,
+          vat: Math.round((basePricePull - basePricePull / 1.15) * 100) / 100,
+          total: basePricePull,
+          extended: true
         };
 
-        var simulatedBatch = [pullIncoming];
+        var simulatedBatch = [{ apiItem: pullIncoming, exts: [pullIncomingExt] }];
         // Also simulate a realistic Rental Gate status progression on an existing reservation on re-pull
         var progTarget = db.reservations.find(function (r) { return r.reservationNumber === 'RG-2026-8843'; }) || db.reservations[0];
         if (progTarget) {
@@ -2903,36 +3242,58 @@
           var currCode = String(progTarget.originalStatusCode || '').toLowerCase();
           var curIdx = progressionOrder.indexOf(currCode);
           var nextCode = progressionOrder[(curIdx >= 0 && curIdx < progressionOrder.length - 1) ? (curIdx + 1) : 1];
+          var progExts = db.extensions.filter(function (ex) {
+            return ex.reservationId === progTarget.id || ex.reservationNumber === progTarget.reservationNumber;
+          });
           simulatedBatch.push({
-            reservation_number: progTarget.reservationNumber,
-            customer_name: progTarget.customerName,
-            customer_phone: progTarget.customerPhone,
-            company_name: progTarget.companyName,
-            branch_name: progTarget.branchName,
-            car_name: progTarget.carName,
-            plate_number: progTarget.plateNumber,
-            reservationDate: (progTarget.startDate || todayIso(0)) + 'T10:00:00Z',
-            start_date: progTarget.startDate || todayIso(0),
-            end_date: progTarget.endDate || todayIso(3),
-            days_count: progTarget.daysCount || 3,
-            status: nextCode,
-            pickup_type: 'airport',
-            return_type: 'branch',
-            total_price: progTarget.baseAmount || progTarget.totalAmount || 960
+            apiItem: {
+              reservationId: progTarget.sourceReservationId || '',
+              reservationNumber: progTarget.reservationNumber,
+              reservation_number: progTarget.reservationNumber,
+              reservationDate: progTarget.sourceCreatedAt || ((progTarget.startDate || todayIso(0)) + 'T10:00:00Z'),
+              clientName: progTarget.customerName,
+              clientMobile: progTarget.customerPhone,
+              clientEmail: progTarget.customerEmail || '',
+              customerIdNumber: progTarget.customerIdNumber || '',
+              companyArName: progTarget.companyName,
+              receiveBranchArName: progTarget.branchName,
+              deliverBranchArName: progTarget.deliverBranchName || progTarget.branchName,
+              carNameAr: progTarget.carName,
+              carCategoryAr: progTarget.carCategory || '',
+              plateNumber: progTarget.plateNumber,
+              startDate: (progTarget.startDate || todayIso(0)) + (progTarget.startTime ? ('T' + progTarget.startTime + ':00') : 'T10:00:00'),
+              endDate: (progTarget.originalEndDate || progTarget.endDate || todayIso(3)) + (progTarget.originalEndTime ? ('T' + progTarget.originalEndTime + ':00') : 'T10:00:00'),
+              actualEndDate: (progTarget.extendedUntilDate || progTarget.endDate || todayIso(3)) + (progTarget.extendedUntilTime ? ('T' + progTarget.extendedUntilTime + ':00') : ''),
+              reservationDays: progTarget.daysCount || 3,
+              reservationStatus: nextCode,
+              pickupType: progTarget.pickupTypeAr || 'airport',
+              returnType: progTarget.returnTypeAr || 'branch',
+              paymentType: progTarget.paymentMethod || '',
+              paymentStatus: progTarget.paymentStatus || '',
+              dailyPrice: progTarget.dailyPrice || 0,
+              discount: progTarget.discountAmount || 0,
+              vat: progTarget.vatAmount || 0,
+              total: progTarget.baseAmount || progTarget.totalAmount || 960
+            },
+            exts: progExts
           });
         }
 
         var filteredBatch = pullRange.hasCustomRange && core.filterSourceReservationsByPullRange
-          ? core.filterSourceReservationsByPullRange(simulatedBatch, pullRange)
+          ? simulatedBatch.filter(function (entry) {
+              return core.filterSourceReservationsByPullRange([entry.apiItem], pullRange).length > 0;
+            })
           : simulatedBatch;
 
         var importedCnt = 0;
         var updatedCnt = 0;
+        var extPulledCnt = 0;
         var changedReservations = [];
 
-        filteredBatch.forEach(function (srcItem) {
-          var existingMatch = db.reservations.find(function (r) { return r.reservationNumber === srcItem.reservation_number; });
-          var mergedItem = core.mergeSyncedReservation(existingMatch, srcItem, [], session.user);
+        filteredBatch.forEach(function (entry) {
+          var srcItem = entry.apiItem;
+          var existingMatch = db.reservations.find(function (r) { return r.reservationNumber === srcItem.reservationNumber; });
+          var mergedItem = core.mergeSyncedReservation(existingMatch, srcItem, entry.exts || [], session.user);
           if (!existingMatch) {
             db.reservations.unshift(mergedItem);
             importedCnt++;
@@ -2959,6 +3320,26 @@
               });
             }
           }
+          if (Array.isArray(entry.exts) && entry.exts.length > 0) {
+            entry.exts.forEach(function (exObj, eIdx) {
+              var fullExt = Object.assign({}, exObj, {
+                reservationId: mergedItem.id,
+                reservationNumber: mergedItem.reservationNumber,
+                sourceReservationId: mergedItem.sourceReservationId || exObj.sourceReservationId || '',
+                sequenceNumber: exObj.sequenceNumber || (eIdx + 1),
+                syncedAt: new Date().toISOString()
+              });
+              var existExtIdx = db.extensions.findIndex(function (e) {
+                return e.extensionNumber === fullExt.extensionNumber && e.reservationNumber === fullExt.reservationNumber;
+              });
+              if (existExtIdx === -1) {
+                db.extensions.push(fullExt);
+                extPulledCnt++;
+              } else {
+                db.extensions[existExtIdx] = Object.assign({}, db.extensions[existExtIdx], fullExt);
+              }
+            });
+          }
           changedReservations.push(mergedItem);
         });
 
@@ -2972,7 +3353,7 @@
           status: 'success',
           importedCount: importedCnt,
           updatedCount: updatedCnt,
-          extensionsCount: 0,
+          extensionsCount: extPulledCnt,
           pagesFetched: 1,
           errorMessage: rangeNote ? rangeNote.replace(/^\s*\|\s*/, '') : '',
           durationMs: 210,
@@ -2988,7 +3369,7 @@
           isFullSyncAction ? 'سحب بيانات' : 'سحب الحجوزات',
           isFullSyncAction ? 'Sync' : 'Reservation',
           pullSyncRec.id,
-          'سحب الحجوزات: جديد ' + importedCnt + '، محدث ' + updatedCnt + rangeNote
+          'سحب الحجوزات: جديد ' + importedCnt + '، محدث ' + updatedCnt + '، تمديدات ' + extPulledCnt + rangeNote
         );
         saveSandboxDb(db);
         return {

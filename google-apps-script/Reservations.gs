@@ -126,7 +126,7 @@ function getReservations(session, params) {
     } catch (e) {}
   }
 
-  var numericSort = (sortBy === 'daysCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
+  var numericSort = (sortBy === 'daysCount' || sortBy === 'extendedDaysCount' || sortBy === 'totalDaysCount' || sortBy === 'extensionsCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
   matched.sort(function (a, b) {
     if (numericSort) {
       return (toNumber(a[sortBy], 0) - toNumber(b[sortBy], 0)) * sortDir;
@@ -143,41 +143,7 @@ function getReservations(session, params) {
 
   var items = [];
   for (var j = 0; j < slice.length; j++) {
-    var sr = slice[j];
-    items.push({
-      id: sr.id,
-      reservationNumber: sr.reservationNumber,
-      customerName: sr.customerName,
-      customerPhone: sr.customerPhone,
-      companyName: sr.companyName,
-      branchName: sr.branchName,
-      carName: sr.carName,
-      plateNumber: sr.plateNumber,
-      startDate: sr.startDate,
-      endDate: sr.endDate,
-      daysCount: toNumber(sr.daysCount, 1),
-      originalStatusCode: sr.originalStatusCode,
-      originalStatusAr: sr.originalStatusAr,
-      pickupTypeAr: sr.pickupTypeAr,
-      returnTypeAr: sr.returnTypeAr,
-      baseAmount: toNumber(sr.baseAmount, 0),
-      extensionsAmount: toNumber(sr.extensionsAmount, 0),
-      totalAmount: toNumber(sr.totalAmount, 0),
-      hasExtensions: toBool(sr.hasExtensions),
-      internalStatus: sr.internalStatus,
-      priority: sr.priority,
-      assignedEmployeeIds: safeJsonParse(sr.assignedEmployeeIds, []),
-      assignedEmployeeNames: safeJsonParse(sr.assignedEmployeeNames, []),
-      lastUpdateText: sr.lastUpdateText,
-      lastUpdatedById: sr.lastUpdatedById,
-      lastUpdatedByName: sr.lastUpdatedByName,
-      lastUpdatedAt: sr.lastUpdatedAt,
-      hasProblem: toBool(sr.hasProblem),
-      createdAt: sr.createdAt || '',
-      updatedAt: sr.updatedAt || '',
-      statusHistory: normalizeStatusHistory_(sr.statusHistory),
-      isFollowed: Boolean(followedResIds[sr.id])
-    });
+    items.push(serializeReservationForClient_(slice[j], Boolean(followedResIds[slice[j].id])));
   }
 
   var resPayload = {
@@ -209,6 +175,9 @@ function syncLocalCache(session, params) {
   var all = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
   var problems = readAllRecords(RG_SHEETS.PROBLEMS, false);
+  var extensionsList = readAllRecords(RG_SHEETS.EXTENSIONS, false).filter(function (e) {
+    return e.isAcceptedAndPaid !== 'false';
+  });
 
   var followedResIds = {};
   for (var f = 0; f < followUps.length; f++) {
@@ -223,45 +192,19 @@ function syncLocalCache(session, params) {
       if (rawMy.indexOf(session.employeeId) === -1) continue;
       if (safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
     }
-    items.push({
-      id: sr.id,
-      reservationNumber: sr.reservationNumber,
-      customerName: sr.customerName,
-      customerPhone: sr.customerPhone,
-      companyName: sr.companyName,
-      branchName: sr.branchName,
-      carName: sr.carName,
-      plateNumber: sr.plateNumber,
-      startDate: sr.startDate,
-      endDate: sr.endDate,
-      daysCount: toNumber(sr.daysCount, 1),
-      originalStatusCode: sr.originalStatusCode,
-      originalStatusAr: sr.originalStatusAr,
-      pickupTypeAr: sr.pickupTypeAr,
-      returnTypeAr: sr.returnTypeAr,
-      baseAmount: toNumber(sr.baseAmount, 0),
-      extensionsAmount: toNumber(sr.extensionsAmount, 0),
-      totalAmount: toNumber(sr.totalAmount, 0),
-      hasExtensions: toBool(sr.hasExtensions),
-      internalStatus: sr.internalStatus,
-      priority: sr.priority,
-      assignedEmployeeIds: safeJsonParse(sr.assignedEmployeeIds, []),
-      assignedEmployeeNames: safeJsonParse(sr.assignedEmployeeNames, []),
-      lastUpdateText: sr.lastUpdateText,
-      lastUpdatedById: sr.lastUpdatedById,
-      lastUpdatedByName: sr.lastUpdatedByName,
-      lastUpdatedAt: sr.lastUpdatedAt,
-      hasProblem: toBool(sr.hasProblem),
-      createdAt: sr.createdAt || '',
-      updatedAt: sr.updatedAt || '',
-      statusHistory: normalizeStatusHistory_(sr.statusHistory),
-      isFollowed: Boolean(followedResIds[sr.id])
-    });
+    items.push(serializeReservationForClient_(sr, Boolean(followedResIds[sr.id])));
   }
 
   followUps.sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
+  extensionsList.sort(function (a, b) {
+    var sa = toNumber(a.sequenceNumber, 0);
+    var sb = toNumber(b.sequenceNumber, 0);
+    if (sa && sb && sa !== sb) return sa - sb;
+    return String(a.startDate || '').localeCompare(String(b.startDate || ''));
+  });
   return {
     reservations: items,
+    extensions: extensionsList,
     allowAgentViewAll: allowAgentAll,
     followUps: followUps.slice(0, 400),
     problems: problems.slice(0, 200),
@@ -282,7 +225,16 @@ function getReservationDetails(session, params) {
   }
 
   var extensions = readAllRecords(RG_SHEETS.EXTENSIONS, false).filter(function (e) {
-    return e.reservationNumber === reservation.reservationNumber;
+    if (e.isAcceptedAndPaid === 'false') return false;
+    if (e.reservationId && e.reservationId === reservation.id) return true;
+    if (e.reservationNumber && String(e.reservationNumber) === String(reservation.reservationNumber)) return true;
+    if (reservation.sourceReservationId && e.sourceReservationId && String(e.sourceReservationId) === String(reservation.sourceReservationId)) return true;
+    return false;
+  }).sort(function (a, b) {
+    var sa = toNumber(a.sequenceNumber, 0);
+    var sb = toNumber(b.sequenceNumber, 0);
+    if (sa && sb && sa !== sb) return sa - sb;
+    return String(a.startDate || '').localeCompare(String(b.startDate || ''));
   });
 
   var assignments = readAllRecords(RG_SHEETS.ASSIGNMENTS, false).filter(function (a) {
@@ -310,39 +262,7 @@ function getReservationDetails(session, params) {
   });
 
   return {
-    reservation: {
-      id: reservation.id,
-      reservationNumber: reservation.reservationNumber,
-      customerName: reservation.customerName,
-      customerPhone: reservation.customerPhone,
-      companyName: reservation.companyName,
-      branchName: reservation.branchName,
-      carName: reservation.carName,
-      plateNumber: reservation.plateNumber,
-      startDate: reservation.startDate,
-      endDate: reservation.endDate,
-      daysCount: toNumber(reservation.daysCount, 1),
-      originalStatusCode: reservation.originalStatusCode,
-      originalStatusAr: reservation.originalStatusAr,
-      pickupTypeAr: reservation.pickupTypeAr,
-      returnTypeAr: reservation.returnTypeAr,
-      baseAmount: toNumber(reservation.baseAmount, 0),
-      extensionsAmount: toNumber(reservation.extensionsAmount, 0),
-      totalAmount: toNumber(reservation.totalAmount, 0),
-      hasExtensions: toBool(reservation.hasExtensions),
-      internalStatus: reservation.internalStatus,
-      priority: reservation.priority,
-      assignedEmployeeIds: safeJsonParse(reservation.assignedEmployeeIds, []),
-      assignedEmployeeNames: safeJsonParse(reservation.assignedEmployeeNames, []),
-      lastUpdateText: reservation.lastUpdateText,
-      lastUpdatedById: reservation.lastUpdatedById,
-      lastUpdatedByName: reservation.lastUpdatedByName,
-      lastUpdatedAt: reservation.lastUpdatedAt,
-      hasProblem: toBool(reservation.hasProblem),
-      createdAt: reservation.createdAt || '',
-      updatedAt: reservation.updatedAt || '',
-      statusHistory: normalizeStatusHistory_(reservation.statusHistory)
-    },
+    reservation: serializeReservationForClient_(reservation, followUps.length > 0),
     extensions: extensions,
     assignments: assignments,
     followUps: followUps,
@@ -428,13 +348,7 @@ function quickUpdateReservationStatus(session, payload) {
 
     logActivity(session.user, 'تعديل حالة', 'Reservation', reservation.reservationNumber, 'تحديث مباشر إلى: ' + status + (note ? ' | ' + note : ''));
     if (updated) {
-      updated = Object.assign({}, updated, {
-        assignedEmployeeIds: safeJsonParse(updated.assignedEmployeeIds, []),
-        assignedEmployeeNames: safeJsonParse(updated.assignedEmployeeNames, []),
-        hasExtensions: toBool(updated.hasExtensions),
-        hasProblem: toBool(updated.hasProblem),
-        statusHistory: nextStages
-      });
+      updated = serializeReservationForClient_(updated, true);
     }
     return { reservation: updated, followUp: followUp };
   });
@@ -460,15 +374,24 @@ function updateReservationDetails(session, payload) {
     };
 
     var editableFields = [
-      'customerName', 'customerPhone', 'companyName', 'branchName',
-      'carName', 'plateNumber', 'startDate', 'endDate',
-      'pickupTypeAr', 'returnTypeAr', 'lastUpdateText'
+      'customerName', 'customerPhone', 'customerEmail', 'customerIdNumber',
+      'companyName', 'branchName', 'deliverBranchName',
+      'carName', 'plateNumber', 'carCategory',
+      'startDate', 'startTime', 'originalEndDate', 'originalEndTime',
+      'endDate', 'endTime', 'extendedUntilDate', 'extendedUntilTime',
+      'pickupTypeAr', 'returnTypeAr', 'paymentMethod', 'paymentStatus', 'lastUpdateText'
     ];
     for (var i = 0; i < editableFields.length; i++) {
       var f = editableFields[i];
       if (p[f] !== undefined) patch[f] = normalizeStr(p[f]);
     }
     if (p.daysCount !== undefined) patch.daysCount = Math.max(1, toNumber(p.daysCount, 1));
+    if (p.extendedDaysCount !== undefined) patch.extendedDaysCount = Math.max(0, toNumber(p.extendedDaysCount, 0));
+    if (p.totalDaysCount !== undefined) patch.totalDaysCount = Math.max(1, toNumber(p.totalDaysCount, 1));
+    if (p.extensionsCount !== undefined) patch.extensionsCount = Math.max(0, toNumber(p.extensionsCount, 0));
+    if (p.dailyPrice !== undefined) patch.dailyPrice = toNumber(p.dailyPrice, 0);
+    if (p.discountAmount !== undefined) patch.discountAmount = toNumber(p.discountAmount, 0);
+    if (p.vatAmount !== undefined) patch.vatAmount = toNumber(p.vatAmount, 0);
     if (p.baseAmount !== undefined) patch.baseAmount = toNumber(p.baseAmount, 0);
     if (p.extensionsAmount !== undefined) patch.extensionsAmount = toNumber(p.extensionsAmount, 0);
     if (p.totalAmount !== undefined) patch.totalAmount = toNumber(p.totalAmount, 0);
@@ -516,13 +439,7 @@ function updateReservationDetails(session, payload) {
 
     logActivity(session.user, 'تعديل تفاصيل الحجز', 'Reservation', existing.reservationNumber, 'تحديث تفاصيل الحجز/البيانات بواسطة ' + session.user.name);
     if (updated) {
-      updated = Object.assign({}, updated, {
-        assignedEmployeeIds: safeJsonParse(updated.assignedEmployeeIds, []),
-        assignedEmployeeNames: safeJsonParse(updated.assignedEmployeeNames, []),
-        hasExtensions: toBool(updated.hasExtensions),
-        hasProblem: toBool(updated.hasProblem),
-        statusHistory: nextStages
-      });
+      updated = serializeReservationForClient_(updated, false);
     }
     return updated;
   });

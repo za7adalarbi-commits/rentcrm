@@ -15,18 +15,26 @@ var RG_SHEETS_SCHEMA = {
     'jobTitle', 'role', 'permissions', 'status', 'lastActivity', 'createdAt', 'updatedAt'
   ],
   Reservations: [
-    'id', 'reservationNumber', 'customerName', 'customerPhone', 'companyName',
-    'branchName', 'carName', 'plateNumber', 'startDate', 'endDate', 'daysCount',
+    'id', 'sourceReservationId', 'reservationNumber', 'sourceCreatedAt',
+    'customerName', 'customerPhone', 'customerEmail', 'customerIdNumber',
+    'companyName', 'branchName', 'deliverBranchName',
+    'carName', 'plateNumber', 'carCategory',
+    'startDate', 'startTime', 'originalEndDate', 'originalEndTime',
+    'endDate', 'endTime', 'extendedUntilDate', 'extendedUntilTime',
+    'daysCount', 'extendedDaysCount', 'totalDaysCount',
     'originalStatusCode', 'originalStatusAr', 'pickupTypeAr', 'returnTypeAr',
-    'baseAmount', 'extensionsAmount', 'totalAmount', 'hasExtensions',
+    'paymentMethod', 'paymentStatus', 'dailyPrice', 'discountAmount', 'vatAmount',
+    'baseAmount', 'extensionsCount', 'extensionsAmount', 'totalAmount', 'hasExtensions',
     'internalStatus', 'priority', 'assignedEmployeeIds', 'assignedEmployeeNames',
     'lastUpdateText', 'lastUpdatedById', 'lastUpdatedByName', 'lastUpdatedAt',
     'hasProblem', 'createdAt', 'updatedAt', 'statusHistory', 'rawJson'
   ],
   Extensions: [
-    'id', 'extensionNumber', 'reservationId', 'reservationNumber', 'statusCode',
-    'statusAr', 'paymentStatus', 'extendDays', 'startDate', 'endDate',
-    'amount', 'isAcceptedAndPaid', 'syncedAt'
+    'id', 'extensionNumber', 'sequenceNumber', 'reservationId', 'reservationNumber',
+    'sourceReservationId', 'extensionType', 'extensionTypeAr', 'statusCode',
+    'statusAr', 'paymentStatus', 'paymentDate', 'paymentMethod', 'extendDays',
+    'startDate', 'startTime', 'endDate', 'endTime',
+    'subTotal', 'vatAmount', 'amount', 'isAcceptedAndPaid', 'syncedAt'
   ],
   Assignments: [
     'id', 'reservationId', 'reservationNumber', 'employeeId', 'employeeName',
@@ -94,8 +102,22 @@ var _rgDirtyCacheSheets = {};
 var RG_CACHE_CHUNK_SIZE = 95000;
 var RG_CACHE_MAX_CHUNKS = 20;
 var RG_CACHE_TTL_SECONDS = 600;
-var RG_DATE_ONLY_FIELDS = { startDate: true, endDate: true, followUpDate: true, logDate: true };
-var RG_TIME_ONLY_FIELDS = { followUpTime: true, logTime: true };
+var RG_DATE_ONLY_FIELDS = {
+  startDate: true,
+  originalEndDate: true,
+  endDate: true,
+  extendedUntilDate: true,
+  followUpDate: true,
+  logDate: true
+};
+var RG_TIME_ONLY_FIELDS = {
+  startTime: true,
+  originalEndTime: true,
+  endTime: true,
+  extendedUntilTime: true,
+  followUpTime: true,
+  logTime: true
+};
 var RG_HOT_PERSIST_CACHE_SHEETS = {
   Employees: true,
   Settings: true,

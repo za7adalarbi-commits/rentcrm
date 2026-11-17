@@ -832,8 +832,8 @@
 
       var core = root.RGCrmCore;
       var cols = (core && core.getReportColumns)
-        ? core.getReportColumns(state.reportType, state.rows).slice(0, 10)
-        : RESERVATION_COLUMNS.slice(0, 10);
+        ? core.getReportColumns(state.reportType, state.rows).slice(0, 11)
+        : RESERVATION_COLUMNS.slice(0, 11);
 
       renderReportCharts(state.reportType, state.rows);
 
@@ -874,7 +874,7 @@
         var k1 = r.internalStatus || r.status || r.employeeName || r.statusAr || 'غير محدد';
         primaryCounts[k1] = (primaryCounts[k1] || 0) + (reportType === 'employee_performance' ? Number(r.followUpsCount || 0) : 1);
 
-        var k2 = r.companyName || r.priority || r.role || r.paymentStatus || 'أخرى';
+        var k2 = r.companyName || r.extensionTypeAr || r.priority || r.role || r.paymentStatus || 'أخرى';
         secondaryCounts[k2] = (secondaryCounts[k2] || 0) + (reportType === 'employee_performance' ? Number(r.assignedReservations || 0) : 1);
       });
 

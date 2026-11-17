@@ -60,14 +60,20 @@ var RG_STATUS_MAP = {
   active: 'نشط',
   started: 'بدأ التنفيذ',
   in_progress: 'قيد التنفيذ',
+  on_the_way: 'في الطريق',
+  ready: 'جاهز للاستلام',
+  ready_for_pickup: 'جاهز للاستلام',
   hold: 'معلق',
   delivered: 'تم التسليم',
   picked_up: 'تم الاستلام',
   received: 'تم الاستلام',
+  returned: 'تم الإرجاع',
   extended: 'تم التمديد',
   automatically_extended: 'تم التمديد تلقائيًا',
   completed: 'مكتمل',
   finished: 'مكتمل',
+  closed: 'منتهي',
+  ended: 'منتهي',
   finished_by_driver: 'مكتمل عبر السائق',
   cancelled: 'ملغي',
   canceled: 'ملغي',
@@ -77,8 +83,12 @@ var RG_STATUS_MAP = {
   no_show: 'لم يحضر',
   draft: 'مسودة',
   unpaid: 'غير مدفوع',
+  waiting_payment: 'بانتظار الدفع',
+  awaiting_payment: 'بانتظار الدفع',
   paid: 'مدفوع',
   wallet_paid: 'مدفوع بالمحفظة',
+  paid_by_wallet: 'مدفوع بالمحفظة',
+  paid_wallet: 'مدفوع بالمحفظة',
   admin_approved: 'معتمد إداريًا',
   location_changed: 'تم تغيير الموقع',
   accepted: 'مقبول',
@@ -94,9 +104,25 @@ var RG_DELIVERY_MAP = {
   airport: 'توصيل للمطار',
   train_station: 'محطة القطار',
   my_location: 'توصيل لموقع العميل',
+  custom: 'موقع خاص',
+  custom_location: 'موقع خاص',
+  location: 'موقع خاص',
+  private_location: 'موقع خاص',
+  'private': 'موقع خاص',
   hotel: 'توصيل للفندق',
   return_branch: 'تسليم في الفرع',
   return_delivery: 'استلام من موقع العميل'
+};
+
+var RG_EXTENSION_TYPE_MAP = {
+  client: 'تمديد بواسطة العميل',
+  customer: 'تمديد بواسطة العميل',
+  user: 'تمديد بواسطة العميل',
+  automatic: 'تمديد تلقائي',
+  auto: 'تمديد تلقائي',
+  system: 'تمديد تلقائي',
+  admin: 'تمديد إداري',
+  manual: 'تمديد إداري'
 };
 
 function generateId(prefix) {
@@ -134,6 +160,34 @@ function formatTimeOnly(dateInput) {
     tz = Session.getScriptTimeZone() || 'Asia/Riyadh';
   } catch (e) {}
   return Utilities.formatDate(d, tz, 'HH:mm:ss');
+}
+
+function extractTimeHM_(dateInput) {
+  if (!dateInput) return '';
+  if (typeof dateInput === 'string') {
+    var s = dateInput.trim();
+    if (!s || /^\d{4}-\d{2}-\d{2}$/.test(s)) return '';
+    var hm = s.match(/^(\d{2}:\d{2})(?::\d{2})?$/);
+    if (hm) return hm[1];
+    var wall = s.match(/^\d{4}-\d{2}-\d{2}[T ](\d{2}:\d{2})/);
+    if (wall && s.indexOf('Z') === -1 && !/[+-]\d{2}:?\d{2}$/.test(s)) {
+      return wall[1];
+    }
+  }
+  var d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (isNaN(d.getTime())) return '';
+  var tz = 'Asia/Riyadh';
+  try {
+    tz = (typeof getSpreadsheetTz_ === 'function' ? getSpreadsheetTz_() : Session.getScriptTimeZone()) || 'Asia/Riyadh';
+  } catch (e) {}
+  return Utilities.formatDate(d, tz, 'HH:mm');
+}
+
+function formatDateTimeDisplay_(dateInput) {
+  if (!dateInput) return '';
+  var dPart = formatDateOnly(dateInput);
+  var tPart = extractTimeHM_(dateInput);
+  return tPart ? (dPart + ' ' + tPart) : dPart;
 }
 
 function safeJsonParse(str, fallback) {
@@ -350,26 +404,41 @@ function translateDeliveryType(type) {
   return RG_DELIVERY_MAP[key] || normalizeStr(type) || 'استلام من الفرع';
 }
 
+function translateExtensionType_(type) {
+  var key = normalizeStr(type).toLowerCase().replace(/\s+/g, '_');
+  return RG_EXTENSION_TYPE_MAP[key] || normalizeStr(type) || 'تمديد';
+}
+
+function computeDateDiffDays_(startIso, endIso) {
+  var d1 = formatDateOnly(startIso);
+  var d2 = formatDateOnly(endIso);
+  if (!d1 || !d2) return 0;
+  var t1 = Date.parse(d1 + 'T00:00:00Z');
+  var t2 = Date.parse(d2 + 'T00:00:00Z');
+  if (isNaN(t1) || isNaN(t2) || t2 <= t1) return 0;
+  return Math.round((t2 - t1) / 86400000);
+}
+
 function isExtensionAcceptedAndPaid(ext) {
   if (!ext || typeof ext !== 'object') return false;
   if (ext.rejectedByUserId || normalizeStr(ext.rejectionReason)) return false;
 
-  var st = normalizeStr(ext.reservationStatus || ext.status || ext.status_code || ext.state).toLowerCase();
-  if (st === 'cancelled' || st === 'canceled' || st === 'declined' || st === 'rejected' || st === 'hold' || st === 'created' || st === 'draft' || st === 'unpaid' || st === 'expired' || st === 'pending') {
+  var st = normalizeStr(ext.reservationStatus || ext.status || ext.status_code || ext.state).toLowerCase().replace(/\s+/g, '_');
+  if (st === 'cancelled' || st === 'canceled' || st === 'declined' || st === 'rejected' || st === 'hold' || st === 'created' || st === 'draft' || st === 'unpaid' || st === 'waiting_payment' || st === 'awaiting_payment' || st === 'expired' || st === 'pending') {
     return false;
   }
 
   var explicitPay = normalizeStr(ext.payment_status || ext.paymentStatus || ext.is_paid).toLowerCase();
   var accepted = (
     st === 'accepted' || st === 'approved' || st === 'confirmed' || st === 'active' ||
-    st === 'completed' || st === 'paid' || st === 'wallet_paid' || st === 'admin_approved' ||
-    st === 'extended' || st === 'automatically_extended' || st === 'started' ||
-    st === 'in_progress' || st === 'finished' || st === 'finished_by_driver' || st === 'مقبول'
+    st === 'completed' || st === 'paid' || st === 'wallet_paid' || st === 'paid_by_wallet' || st === 'paid_wallet' ||
+    st === 'admin_approved' || st === 'extended' || st === 'automatically_extended' || st === 'started' ||
+    st === 'in_progress' || st === 'finished' || st === 'closed' || st === 'ended' || st === 'finished_by_driver' || st === 'مقبول'
   );
   if (!accepted) return false;
 
   if (explicitPay || ext.paid !== undefined) {
-    return explicitPay === 'paid' || explicitPay === 'completed' || explicitPay === 'true' || explicitPay === '1' || explicitPay === 'مدفوع' || ext.paid === true;
+    return explicitPay === 'paid' || explicitPay === 'completed' || explicitPay === 'wallet_paid' || explicitPay === 'paid_by_wallet' || explicitPay === 'paid_wallet' || explicitPay === 'true' || explicitPay === '1' || explicitPay === 'مدفوع' || ext.paid === true;
   }
 
   // Real Rental Gate ReservationExtendFilterResponseDTO uses reservationStatus + paymentDate/paymentResult
@@ -381,6 +450,8 @@ function isExtensionAcceptedAndPaid(ext) {
     ext.paymentDate ||
     st === 'paid' ||
     st === 'wallet_paid' ||
+    st === 'paid_by_wallet' ||
+    st === 'paid_wallet' ||
     st === 'admin_approved' ||
     st === 'extended' ||
     st === 'automatically_extended' ||
@@ -392,6 +463,65 @@ function isExtensionAcceptedAndPaid(ext) {
     payResult === 'approved' ||
     payResult === 'completed'
   );
+}
+
+function summarizeReservationExtensions_(extensions, apiItem, fallbackEndDate, fallbackEndTime) {
+  var list = Array.isArray(extensions) ? extensions : [];
+  var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+  var sorted = list.slice().sort(function (a, b) {
+    var ka = (a.startDate || a.endDate || '') + ' ' + (a.startTime || '');
+    var kb = (b.startDate || b.endDate || '') + ' ' + (b.startTime || '');
+    if (ka === kb) return String(a.extensionNumber || '').localeCompare(String(b.extensionNumber || ''));
+    return ka < kb ? -1 : 1;
+  });
+
+  var amountSum = 0;
+  var daysSum = 0;
+  var lastExt = null;
+  for (var i = 0; i < sorted.length; i++) {
+    sorted[i].sequenceNumber = i + 1;
+    amountSum += toNumber(sorted[i].amount, 0);
+    daysSum += toNumber(sorted[i].extendDays, 0);
+    if (sorted[i].endDate && (!lastExt || sorted[i].endDate >= lastExt.endDate)) {
+      lastExt = sorted[i];
+    }
+  }
+
+  if (sorted.length === 0 && (toBool(item.extended) || toNumber(item.extensionsTotal, 0) > 0 || toNumber(item.extensionsCount, 0) > 0)) {
+    amountSum = toNumber(item.extensionsTotal, 0);
+    daysSum = toNumber(item.extendedDays || item.extensionsDays, 0);
+  }
+
+  var count = sorted.length > 0
+    ? sorted.length
+    : (toBool(item.extended) ? Math.max(1, toNumber(item.extensionsCount, 1)) : 0);
+
+  var apiActualEndRaw = item.actualEndDate || item.extendedUntilDate || '';
+  var apiActualEndDate = formatDateOnly(apiActualEndRaw);
+  var apiActualEndTime = extractTimeHM_(apiActualEndRaw);
+
+  var extendedUntilDate = '';
+  var extendedUntilTime = '';
+  if (lastExt && lastExt.endDate) {
+    extendedUntilDate = lastExt.endDate;
+    extendedUntilTime = lastExt.endTime || apiActualEndTime || normalizeStr(fallbackEndTime);
+  } else if (count > 0) {
+    extendedUntilDate = apiActualEndDate || formatDateOnly(fallbackEndDate);
+    extendedUntilTime = apiActualEndTime || normalizeStr(fallbackEndTime);
+  }
+  if (extendedUntilDate && apiActualEndDate && apiActualEndDate > extendedUntilDate) {
+    extendedUntilDate = apiActualEndDate;
+    extendedUntilTime = apiActualEndTime || extendedUntilTime;
+  }
+
+  return {
+    extensions: sorted,
+    extensionsCount: count,
+    extendedDaysCount: daysSum,
+    extensionsAmount: Math.round(amountSum * 100) / 100,
+    extendedUntilDate: extendedUntilDate,
+    extendedUntilTime: extendedUntilTime
+  };
 }
 
 function computeTotalAmount(baseAmount, extensionsList) {

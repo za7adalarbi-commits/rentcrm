@@ -783,4 +783,100 @@ test('resolvePullDateRange, filterSourceReservationsByPullRange, buildCustomersI
   assert.equal(merged.find((r: any) => r.id === 'R1').internalStatus, 'مؤكد');
 });
 
+test('summarizeReservationExtensions and mergeSyncedReservation capture exact extension count, amounts, types, and extended-until dates', () => {
+  assert.equal(core.translateExtensionType('CLIENT'), 'تمديد بواسطة العميل');
+  assert.equal(core.translateExtensionType('AUTOMATIC'), 'تمديد تلقائي');
+  assert.equal(core.extractTimeOnly('2026-11-17T14:30:00Z'), '17:30');
+  assert.equal(core.extractTimeOnly('2026-11-17T14:30:00'), '14:30');
+
+  const exts = [
+    {
+      extensionNumber: 'EXT-700-2',
+      extensionType: 'AUTOMATIC',
+      statusCode: 'automatically_extended',
+      paymentStatus: 'paid_by_wallet',
+      extendDays: 2,
+      startDate: '2026-11-21T14:30:00',
+      endDate: '2026-11-23T14:30:00',
+      subTotal: 452.17,
+      vatAmount: 67.83,
+      amount: 520
+    },
+    {
+      extensionNumber: 'EXT-700-1',
+      extensionType: 'CLIENT',
+      statusCode: 'accepted',
+      paymentStatus: 'paid',
+      extendDays: 1,
+      startDate: '2026-11-20T14:30:00',
+      endDate: '2026-11-21T14:30:00',
+      subTotal: 243.48,
+      vatAmount: 36.52,
+      amount: 280
+    }
+  ];
+
+  const summary = core.summarizeReservationExtensions(exts, { actualEndDate: '2026-11-23T14:30:00' }, '2026-11-20', '14:30');
+  assert.equal(summary.extensionsCount, 2);
+  assert.equal(summary.extendedDaysCount, 3);
+  assert.equal(summary.extensionsAmount, 800);
+  assert.equal(summary.extendedUntilDate, '2026-11-23');
+  assert.equal(summary.extendedUntilTime, '14:30');
+  assert.equal(summary.extensions[0].extensionNumber, 'EXT-700-1');
+  assert.equal(summary.extensions[0].extensionTypeAr, 'تمديد بواسطة العميل');
+  assert.equal(summary.extensions[1].extensionNumber, 'EXT-700-2');
+  assert.equal(summary.extensions[1].extensionTypeAr, 'تمديد تلقائي');
+
+  const merged = core.mergeSyncedReservation(
+    null,
+    {
+      reservationId: 77701,
+      reservationNumber: 'RG-2026-77701',
+      reservationDate: '2026-11-16T09:15:00Z',
+      clientName: 'خالد السالم',
+      clientMobile: '0501234567',
+      clientEmail: 'k@example.sa',
+      companyArName: 'ذيب لتأجير السيارات',
+      receiveBranchArName: 'مطار الرياض',
+      deliverBranchArName: 'فرع العليا',
+      carNameAr: 'هيونداي سوناتا 2026',
+      carCategoryAr: 'سيدان متوسطة',
+      plateNumber: 'أ ب ج 1234',
+      startDate: '2026-11-17T14:30:00',
+      endDate: '2026-11-20T14:30:00',
+      actualEndDate: '2026-11-23T14:30:00',
+      reservationDays: 3,
+      reservationStatus: 'EXTENDED',
+      paymentType: 'مدى',
+      paymentStatus: 'paid',
+      dailyPrice: 300,
+      discount: 50,
+      vat: 146.09,
+      total: 1120
+    },
+    exts,
+    { id: 'EMP_ADMIN', name: 'فهد' }
+  );
+
+  assert.equal(merged.sourceReservationId, '77701');
+  assert.equal(merged.startDate, '2026-11-17');
+  assert.equal(merged.startTime, '14:30');
+  assert.equal(merged.originalEndDate, '2026-11-20');
+  assert.equal(merged.originalEndTime, '14:30');
+  assert.equal(merged.extendedUntilDate, '2026-11-23');
+  assert.equal(merged.extendedUntilTime, '14:30');
+  assert.equal(merged.endDate, '2026-11-23');
+  assert.equal(merged.daysCount, 3);
+  assert.equal(merged.extendedDaysCount, 3);
+  assert.equal(merged.totalDaysCount, 6);
+  assert.equal(merged.extensionsCount, 2);
+  assert.equal(merged.extensionsAmount, 800);
+  assert.equal(merged.baseAmount, 1120);
+  assert.equal(merged.totalAmount, 1920);
+  assert.equal(merged.hasExtensions, true);
+  assert.equal(merged.deliverBranchName, 'فرع العليا');
+  assert.equal(merged.carCategory, 'سيدان متوسطة');
+});
+
+
 

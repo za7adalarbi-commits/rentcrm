@@ -60,14 +60,20 @@
     active: 'نشط',
     started: 'بدأ التنفيذ',
     in_progress: 'قيد التنفيذ',
+    on_the_way: 'في الطريق',
+    ready: 'جاهز للاستلام',
+    ready_for_pickup: 'جاهز للاستلام',
     hold: 'معلق',
     delivered: 'تم التسليم',
     picked_up: 'تم الاستلام',
     received: 'تم الاستلام',
+    returned: 'تم الإرجاع',
     extended: 'تم التمديد',
     automatically_extended: 'تم التمديد تلقائيًا',
     completed: 'مكتمل',
     finished: 'مكتمل',
+    closed: 'منتهي',
+    ended: 'منتهي',
     finished_by_driver: 'مكتمل عبر السائق',
     cancelled: 'ملغي',
     canceled: 'ملغي',
@@ -77,8 +83,12 @@
     no_show: 'لم يحضر',
     draft: 'مسودة',
     unpaid: 'غير مدفوع',
+    waiting_payment: 'بانتظار الدفع',
+    awaiting_payment: 'بانتظار الدفع',
     paid: 'مدفوع',
     wallet_paid: 'مدفوع بالمحفظة',
+    paid_by_wallet: 'مدفوع بالمحفظة',
+    paid_wallet: 'مدفوع بالمحفظة',
     admin_approved: 'معتمد إداريًا',
     location_changed: 'تم تغيير الموقع',
     accepted: 'مقبول',
@@ -113,9 +123,25 @@
     airport: 'توصيل للمطار',
     train_station: 'محطة القطار',
     my_location: 'توصيل لموقع العميل',
+    custom: 'موقع خاص',
+    custom_location: 'موقع خاص',
+    location: 'موقع خاص',
+    private_location: 'موقع خاص',
+    'private': 'موقع خاص',
     hotel: 'توصيل للفندق',
     return_branch: 'تسليم في الفرع',
     return_delivery: 'استلام من موقع العميل'
+  };
+
+  var EXTENSION_TYPE_TRANSLATIONS = {
+    client: 'تمديد بواسطة العميل',
+    customer: 'تمديد بواسطة العميل',
+    user: 'تمديد بواسطة العميل',
+    automatic: 'تمديد تلقائي',
+    auto: 'تمديد تلقائي',
+    system: 'تمديد تلقائي',
+    admin: 'تمديد إداري',
+    manual: 'تمديد إداري'
   };
 
   var PULL_DURATION_PRESETS = [
@@ -174,6 +200,20 @@
       return riyadhShifted.toISOString().replace('T', ' ').substring(0, 16);
     }
     return s.replace('T', ' ').substring(0, 16);
+  }
+
+  function extractTimeOnly(val) {
+    if (val === null || val === undefined || val === '') return '';
+    if (val instanceof Date && !isNaN(val.getTime())) {
+      var shifted = new Date(val.getTime() + 3 * 3600000);
+      return shifted.toISOString().substring(11, 16);
+    }
+    var s = String(val).trim();
+    if (!s || /^\d{4}-\d{2}-\d{2}$/.test(s)) return '';
+    var hmOnly = s.match(/^(\d{2}:\d{2})(?::\d{2})?$/);
+    if (hmOnly) return hmOnly[1];
+    var dt = formatDisplayDateTime(s);
+    return dt && dt.length >= 16 ? dt.substring(11, 16) : '';
   }
 
   function translateOriginalStatus(code) {
@@ -357,25 +397,30 @@
     return DELIVERY_TRANSLATIONS[key] || normalizeStr(type) || 'استلام من الفرع';
   }
 
+  function translateExtensionType(type) {
+    var key = normalizeStr(type).toLowerCase().replace(/\s+/g, '_');
+    return EXTENSION_TYPE_TRANSLATIONS[key] || normalizeStr(type) || 'تمديد';
+  }
+
   function isExtensionAcceptedAndPaid(ext) {
     if (!ext || typeof ext !== 'object') return false;
     if (ext.rejectedByUserId || normalizeStr(ext.rejectionReason)) return false;
 
-    var st = normalizeStr(ext.reservationStatus || ext.status || ext.status_code || ext.state).toLowerCase();
-    if (['cancelled', 'canceled', 'declined', 'rejected', 'hold', 'created', 'draft', 'unpaid', 'expired', 'pending'].indexOf(st) !== -1) {
+    var st = normalizeStr(ext.reservationStatus || ext.status || ext.status_code || ext.state).toLowerCase().replace(/\s+/g, '_');
+    if (['cancelled', 'canceled', 'declined', 'rejected', 'hold', 'created', 'draft', 'unpaid', 'waiting_payment', 'awaiting_payment', 'expired', 'pending'].indexOf(st) !== -1) {
       return false;
     }
 
     var acceptedStatuses = [
       'accepted', 'approved', 'confirmed', 'active', 'completed', 'paid', 'wallet_paid',
-      'admin_approved', 'extended', 'automatically_extended', 'started', 'in_progress',
-      'finished', 'finished_by_driver', 'مقبول'
+      'paid_by_wallet', 'paid_wallet', 'admin_approved', 'extended', 'automatically_extended',
+      'started', 'in_progress', 'finished', 'closed', 'ended', 'finished_by_driver', 'مقبول'
     ];
     if (acceptedStatuses.indexOf(st) === -1) return false;
 
     var explicitPay = normalizeStr(ext.payment_status || ext.paymentStatus || ext.is_paid).toLowerCase();
     if (explicitPay || ext.paid !== undefined) {
-      return ['paid', 'completed', 'true', '1', 'مدفوع'].indexOf(explicitPay) !== -1 || ext.paid === true;
+      return ['paid', 'completed', 'wallet_paid', 'paid_by_wallet', 'paid_wallet', 'true', '1', 'مدفوع'].indexOf(explicitPay) !== -1 || ext.paid === true;
     }
 
     var payResult = normalizeStr(ext.paymentResult).toLowerCase();
@@ -384,7 +429,7 @@
     }
     return Boolean(
       ext.paymentDate ||
-      ['paid', 'wallet_paid', 'admin_approved', 'extended', 'automatically_extended', 'finished', 'finished_by_driver'].indexOf(st) !== -1 ||
+      ['paid', 'wallet_paid', 'paid_by_wallet', 'paid_wallet', 'admin_approved', 'extended', 'automatically_extended', 'finished', 'finished_by_driver'].indexOf(st) !== -1 ||
       ['paid', 'captured', 'success', 'approved', 'completed'].indexOf(payResult) !== -1
     );
   }
@@ -399,23 +444,154 @@
     return Math.round(total * 100) / 100;
   }
 
+  function computeDateDiffDays(startIso, endIso) {
+    var d1 = formatDisplayDate(startIso);
+    var d2 = formatDisplayDate(endIso);
+    if (!d1 || !d2) return 0;
+    var t1 = Date.parse(d1 + 'T00:00:00Z');
+    var t2 = Date.parse(d2 + 'T00:00:00Z');
+    if (isNaN(t1) || isNaN(t2) || t2 <= t1) return 0;
+    return Math.round((t2 - t1) / 86400000);
+  }
+
+  function summarizeReservationExtensions(extensions, apiItem, fallbackEndDate, fallbackEndTime) {
+    var list = Array.isArray(extensions) ? extensions : [];
+    var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+    var normalized = list.filter(function (ex) {
+      return ex && typeof ex === 'object';
+    }).map(function (ex, idx) {
+      var rawStart = ex.extendDate || ex.startDate || ex.start_date || ex.from_date || ex.createdAt || '';
+      var startDate = formatDisplayDate(rawStart);
+      var startTime = normalizeStr(ex.startTime) || extractTimeOnly(rawStart);
+      var days = toNum(ex.extendDays !== undefined ? ex.extendDays : (ex.days !== undefined ? ex.days : ex.extend_days), 0);
+      var rawEnd = ex.newEndDate || ex.actualEndDate || ex.endDate || ex.end_date || ex.to_date || '';
+      var endDate = formatDisplayDate(rawEnd);
+      var endTime = normalizeStr(ex.endTime) || extractTimeOnly(rawEnd) || startTime;
+      if (!endDate && startDate && days > 0) {
+        endDate = shiftIsoDateDays(startDate, days);
+      }
+      if (days <= 0 && startDate && endDate) {
+        days = computeDateDiffDays(startDate, endDate);
+      }
+      var amt = Math.round(toNum(ex.amount !== undefined ? ex.amount : (ex.total !== undefined ? ex.total : ex.price), 0) * 100) / 100;
+      var subAmt = Math.round(toNum(ex.subTotal !== undefined ? ex.subTotal : ex.subtotal, 0) * 100) / 100;
+      var vatAmt = Math.round(toNum(ex.vatAmount !== undefined ? ex.vatAmount : ex.vat, 0) * 100) / 100;
+      var extTypeRaw = normalizeStr(ex.extensionType || ex.extension_type || ex.type);
+      var stCode = normalizeStr(ex.statusCode || ex.reservationStatus || ex.status || 'paid');
+      var payStatus = normalizeStr(ex.paymentStatus || ex.payment_status || ex.paymentResult || (ex.paymentDate ? 'paid' : ''));
+      return Object.assign({}, ex, {
+        sequenceNumber: idx + 1,
+        extensionNumber: normalizeStr(ex.extensionNumber || ex.extendId || ex.id || ex.extension_number || ex.code || ('EXT-' + (idx + 1))),
+        extensionType: extTypeRaw,
+        extensionTypeAr: normalizeStr(ex.extensionTypeAr) || translateExtensionType(extTypeRaw),
+        statusCode: stCode,
+        statusAr: normalizeStr(ex.statusAr) || translateOriginalStatus(stCode),
+        paymentStatus: payStatus,
+        paymentDate: normalizeStr(ex.paymentDate),
+        paymentMethod: normalizeStr(ex.paymentMethod || ex.paymentType),
+        extendDays: Math.max(0, days),
+        startDate: startDate,
+        startTime: startTime,
+        endDate: endDate,
+        endTime: endTime,
+        subTotal: subAmt,
+        vatAmount: vatAmt,
+        amount: amt
+      });
+    }).sort(function (a, b) {
+      var ka = (a.startDate || a.endDate || '') + ' ' + (a.startTime || '');
+      var kb = (b.startDate || b.endDate || '') + ' ' + (b.startTime || '');
+      if (ka === kb) return String(a.extensionNumber || '').localeCompare(String(b.extensionNumber || ''));
+      return ka < kb ? -1 : 1;
+    }).map(function (ex, idx) {
+      return Object.assign({}, ex, { sequenceNumber: idx + 1 });
+    });
+
+    var amountSum = 0;
+    var daysSum = 0;
+    var lastExt = null;
+    for (var i = 0; i < normalized.length; i++) {
+      amountSum += toNum(normalized[i].amount, 0);
+      daysSum += toNum(normalized[i].extendDays, 0);
+      if (normalized[i].endDate && (!lastExt || normalized[i].endDate >= lastExt.endDate)) {
+        lastExt = normalized[i];
+      }
+    }
+
+    if (normalized.length === 0 && (item.extended || toNum(item.extensionsTotal, 0) > 0 || toNum(item.extensionsCount, 0) > 0)) {
+      amountSum = toNum(item.extensionsTotal, 0);
+      daysSum = toNum(item.extendedDays || item.extensionsDays, 0);
+    }
+
+    var count = normalized.length > 0
+      ? normalized.length
+      : (item.extended ? Math.max(1, toNum(item.extensionsCount, 1)) : 0);
+
+    var apiActualEndRaw = item.actualEndDate || item.extendedUntilDate || '';
+    var apiActualEndDate = formatDisplayDate(apiActualEndRaw);
+    var apiActualEndTime = extractTimeOnly(apiActualEndRaw);
+
+    var extendedUntilDate = '';
+    var extendedUntilTime = '';
+    if (lastExt && lastExt.endDate) {
+      extendedUntilDate = lastExt.endDate;
+      extendedUntilTime = lastExt.endTime || apiActualEndTime || normalizeStr(fallbackEndTime);
+    } else if (count > 0) {
+      extendedUntilDate = apiActualEndDate || formatDisplayDate(fallbackEndDate);
+      extendedUntilTime = apiActualEndTime || normalizeStr(fallbackEndTime);
+    }
+
+    if (extendedUntilDate && apiActualEndDate && apiActualEndDate > extendedUntilDate) {
+      extendedUntilDate = apiActualEndDate;
+      extendedUntilTime = apiActualEndTime || extendedUntilTime;
+    }
+
+    return {
+      extensions: normalized,
+      extensionsCount: count,
+      extendedDaysCount: daysSum,
+      extensionsAmount: Math.round(amountSum * 100) / 100,
+      extendedUntilDate: extendedUntilDate,
+      extendedUntilTime: extendedUntilTime
+    };
+  }
+
   function mergeSyncedReservation(existing, apiItem, acceptedExtensions, actor) {
     var resApiId = normalizeStr(apiItem.reservationId || apiItem.id);
     var resNumber = normalizeStr(apiItem.reservationNumber || apiItem.reservation_number || apiItem.code || apiItem.reference || resApiId);
-    var statusCode = normalizeStr(apiItem.reservationStatus || apiItem.status || apiItem.status_code).toLowerCase();
+    var statusCode = normalizeStr(apiItem.reservationStatus || apiItem.status || apiItem.status_code).toLowerCase().replace(/\s+/g, '_');
+
+    var rawStart = apiItem.startDate || apiItem.start_date || apiItem.pickup_date;
+    var rawOrigEnd = apiItem.endDate || apiItem.end_date || apiItem.return_date || apiItem.actualEndDate;
+    var rawActualEnd = apiItem.actualEndDate || rawOrigEnd;
+
+    var startDate = formatDisplayDate(rawStart);
+    var startTime = normalizeStr(apiItem.startTime) || extractTimeOnly(rawStart);
+    var originalEndDate = formatDisplayDate(rawOrigEnd);
+    var originalEndTime = normalizeStr(apiItem.originalEndTime || apiItem.endTime) || extractTimeOnly(rawOrigEnd);
+
     var exts = Array.isArray(acceptedExtensions) ? acceptedExtensions : [];
-    var extAmountSum = 0;
-    for (var i = 0; i < exts.length; i++) {
-      extAmountSum += toNum(exts[i].amount !== undefined ? exts[i].amount : exts[i].total, 0);
+    var extSummary = summarizeReservationExtensions(exts, apiItem, rawActualEnd, extractTimeOnly(rawActualEnd) || originalEndTime);
+
+    var effectiveEndDate = extSummary.extendedUntilDate || formatDisplayDate(rawActualEnd) || originalEndDate;
+    var effectiveEndTime = extSummary.extendedUntilTime || extractTimeOnly(rawActualEnd) || originalEndTime;
+
+    var baseDays = toNum(apiItem.reservationDays || apiItem.days_count || apiItem.days, 0);
+    if (baseDays <= 0 && startDate && originalEndDate) {
+      baseDays = Math.max(1, computeDateDiffDays(startDate, originalEndDate));
     }
-    if (exts.length === 0 && apiItem.extended && toNum(apiItem.extensionsTotal, 0) > 0) {
-      extAmountSum = toNum(apiItem.extensionsTotal, 0);
+    if (baseDays <= 0) baseDays = 1;
+
+    var extendedDaysCount = extSummary.extendedDaysCount;
+    if (extendedDaysCount <= 0 && extSummary.extensionsCount > 0 && originalEndDate && effectiveEndDate && effectiveEndDate > originalEndDate) {
+      extendedDaysCount = computeDateDiffDays(originalEndDate, effectiveEndDate);
     }
+    var totalDaysCount = baseDays + extendedDaysCount;
 
     var baseAmount = toNum(apiItem.total !== undefined ? apiItem.total : (apiItem.total_price || apiItem.amount || apiItem.base_amount), 0);
     var totalAmount = exts.length > 0
-      ? computeTotalAmount(baseAmount, exts)
-      : Math.round((baseAmount + extAmountSum) * 100) / 100;
+      ? computeTotalAmount(baseAmount, extSummary.extensions)
+      : Math.round((baseAmount + extSummary.extensionsAmount) * 100) / 100;
     var now = new Date().toISOString();
     var actorId = (actor && (actor.employeeId || actor.id)) || 'system';
     var actorName = (actor && actor.name) || 'النظام';
@@ -491,26 +667,50 @@
       }
     }
 
+    var receiveBranch = normalizeStr(apiItem.receiveBranchArName || apiItem.receiveBranchEnName || apiItem.branch_name || (apiItem.branch && apiItem.branch.name) || '');
+    var deliverBranch = normalizeStr(apiItem.deliverBranchArName || apiItem.deliverBranchEnName || apiItem.returnBranchName || receiveBranch);
+    var sourceCreatedRaw = apiItem.reservationDate || apiItem.createdAt || apiItem.created_at || '';
+
     return {
       id: existing ? existing.id : ('RES_' + resNumber),
+      sourceReservationId: resApiId || resNumber,
       reservationNumber: resNumber,
+      sourceCreatedAt: formatDisplayDateTime(sourceCreatedRaw) || normalizeStr(sourceCreatedRaw),
       customerName: normalizeStr(apiItem.clientName || apiItem.customer_name || (apiItem.customer && apiItem.customer.name) || 'عميل'),
-      customerPhone: normalizeStr(apiItem.clientMobile || apiItem.customer_phone || (apiItem.customer && apiItem.customer.phone) || ''),
+      customerPhone: normalizeStr(apiItem.clientMobile || apiItem.customer_phone || (apiItem.customer && (apiItem.customer.phone || apiItem.customer.mobile)) || ''),
+      customerEmail: normalizeStr(apiItem.clientEmail || apiItem.customer_email || (apiItem.customer && apiItem.customer.email) || ''),
+      customerIdNumber: normalizeStr(apiItem.clientNationalId || apiItem.clientIdNumber || (apiItem.customer && apiItem.customer.idNumber) || ''),
       companyName: normalizeStr(apiItem.companyArName || apiItem.companyEnName || apiItem.company_name || (apiItem.company && apiItem.company.name) || ''),
-      branchName: normalizeStr(apiItem.receiveBranchArName || apiItem.receiveBranchEnName || apiItem.branch_name || (apiItem.branch && apiItem.branch.name) || ''),
+      branchName: receiveBranch,
+      deliverBranchName: deliverBranch,
       carName: normalizeStr(apiItem.carNameAr || apiItem.carNameEn || apiItem.car_name || (apiItem.car && apiItem.car.name) || ''),
       plateNumber: normalizeStr(apiItem.plate_number || apiItem.plateNumber || (apiItem.car && apiItem.car.plate_number) || ''),
-      startDate: formatDisplayDate(apiItem.startDate || apiItem.start_date || apiItem.pickup_date),
-      endDate: formatDisplayDate(apiItem.actualEndDate || apiItem.endDate || apiItem.end_date || apiItem.return_date),
-      daysCount: toNum(apiItem.reservationDays || apiItem.days_count || apiItem.days, 1),
+      carCategory: normalizeStr(apiItem.carCategoryAr || apiItem.carTypeAr || apiItem.carCategory || (apiItem.car && apiItem.car.category) || ''),
+      startDate: startDate,
+      startTime: startTime,
+      originalEndDate: originalEndDate,
+      originalEndTime: originalEndTime,
+      endDate: effectiveEndDate,
+      endTime: effectiveEndTime,
+      extendedUntilDate: extSummary.extendedUntilDate,
+      extendedUntilTime: extSummary.extendedUntilTime,
+      daysCount: baseDays,
+      extendedDaysCount: extendedDaysCount,
+      totalDaysCount: totalDaysCount,
       originalStatusCode: statusCode,
       originalStatusAr: translateOriginalStatus(statusCode),
       pickupTypeAr: translateDeliveryType(apiItem.receiveType || apiItem.pickup_type || apiItem.delivery_type),
       returnTypeAr: translateDeliveryType(apiItem.deliverType || apiItem.return_type || apiItem.dropoff_type),
-      baseAmount: baseAmount,
-      extensionsAmount: Math.round(extAmountSum * 100) / 100,
+      paymentMethod: normalizeStr(apiItem.paymentType || apiItem.paymentMethod || ''),
+      paymentStatus: normalizeStr(apiItem.paymentStatus || apiItem.paymentResult || ''),
+      dailyPrice: toNum(apiItem.dailyPrice || apiItem.dayPrice || apiItem.pricePerDay, 0),
+      discountAmount: toNum(apiItem.discount || apiItem.discountAmount, 0),
+      vatAmount: toNum(apiItem.vat || apiItem.vatAmount || apiItem.tax, 0),
+      baseAmount: Math.round(baseAmount * 100) / 100,
+      extensionsCount: extSummary.extensionsCount,
+      extensionsAmount: extSummary.extensionsAmount,
       totalAmount: totalAmount,
-      hasExtensions: exts.length > 0 || Boolean(apiItem.extended),
+      hasExtensions: extSummary.extensionsCount > 0 || Boolean(apiItem.extended),
       internalStatus: nextInternalStatus,
       priority: existing ? existing.priority : 'عادي',
       assignedEmployeeIds: existing ? existing.assignedEmployeeIds : [],
@@ -1475,20 +1675,23 @@
 
   var RESERVATION_REPORT_COLUMNS = [
     { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 1.0, formatType: 'ltr' },
-    { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer Name', widthWeight: 1.45, formatType: 'text' },
+    { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer Name', widthWeight: 1.35, formatType: 'text' },
     { key: 'customerPhone', label: 'الجوال', labelEn: 'Phone', widthWeight: 1.0, formatType: 'ltr' },
-    { key: 'companyName', label: 'الشركة', labelEn: 'Company', widthWeight: 1.2, formatType: 'text' },
-    { key: 'branchName', label: 'الفرع', labelEn: 'Branch', widthWeight: 1.25, formatType: 'text' },
-    { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.25, formatType: 'text' },
-    { key: 'startDate', label: 'بداية الحجز', labelEn: 'Start Date', widthWeight: 0.95, formatType: 'date' },
-    { key: 'endDate', label: 'نهاية الحجز', labelEn: 'End Date', widthWeight: 0.95, formatType: 'date' },
+    { key: 'companyName', label: 'الشركة', labelEn: 'Company', widthWeight: 1.15, formatType: 'text' },
+    { key: 'branchName', label: 'الفرع', labelEn: 'Branch', widthWeight: 1.2, formatType: 'text' },
+    { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.2, formatType: 'text' },
+    { key: 'startDate', label: 'بداية الحجز', labelEn: 'Start Date', widthWeight: 0.9, formatType: 'date' },
+    { key: 'endDate', label: 'نهاية الحجز', labelEn: 'End Date', widthWeight: 0.9, formatType: 'date' },
+    { key: 'extensionsCount', label: 'مرات التمديد', labelEn: 'Extensions #', widthWeight: 0.75, formatType: 'number' },
+    { key: 'extendedUntilDate', label: 'التمديد لحد', labelEn: 'Extended Until', widthWeight: 0.9, formatType: 'date' },
+    { key: 'extensionsAmount', label: 'سعر التمديد', labelEn: 'Ext. Amount', widthWeight: 0.8, formatType: 'number' },
     { key: 'originalStatusAr', label: 'حالة الحجز الأصلية', labelEn: 'Original Status', widthWeight: 1.0, formatType: 'text' },
-    { key: 'internalStatus', label: 'حالة المتابعة الداخلية', labelEn: 'Internal Status', widthWeight: 1.05, formatType: 'text' },
-    { key: 'assignedEmployeeNames', label: 'الموظفون المسؤولون', labelEn: 'Assigned Staff', widthWeight: 1.3, formatType: 'list' },
+    { key: 'internalStatus', label: 'حالة المتابعة الداخلية', labelEn: 'Internal Status', widthWeight: 1.0, formatType: 'text' },
+    { key: 'assignedEmployeeNames', label: 'الموظفون المسؤولون', labelEn: 'Assigned Staff', widthWeight: 1.25, formatType: 'list' },
     { key: 'priority', label: 'الأولوية', labelEn: 'Priority', widthWeight: 0.75, formatType: 'text' },
     { key: 'totalAmount', label: 'الإجمالي', labelEn: 'Total (SAR)', widthWeight: 0.8, formatType: 'number' },
-    { key: 'lastUpdateText', label: 'آخر تحديث', labelEn: 'Last Update', widthWeight: 1.65, formatType: 'text' },
-    { key: 'lastUpdatedByName', label: 'آخر موظف', labelEn: 'Updated By', widthWeight: 1.05, formatType: 'text' }
+    { key: 'lastUpdateText', label: 'آخر تحديث', labelEn: 'Last Update', widthWeight: 1.5, formatType: 'text' },
+    { key: 'lastUpdatedByName', label: 'آخر موظف', labelEn: 'Updated By', widthWeight: 1.0, formatType: 'text' }
   ];
 
   var REPORT_COLUMNS_BY_TYPE = {
@@ -1527,14 +1730,15 @@
       { key: 'updatedAt', label: 'آخر تحديث', labelEn: 'Updated At', widthWeight: 1.15, formatType: 'datetime' }
     ],
     extensions: [
-      { key: 'extensionNumber', label: 'رقم التمديد', labelEn: 'Extension #', widthWeight: 1.0, formatType: 'ltr' },
-      { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 1.0, formatType: 'ltr' },
-      { key: 'statusAr', label: 'الحالة', labelEn: 'Status', widthWeight: 1.0, formatType: 'text' },
-      { key: 'paymentStatus', label: 'حالة الدفع', labelEn: 'Payment', widthWeight: 0.95, formatType: 'text' },
-      { key: 'extendDays', label: 'أيام التمديد', labelEn: 'Days', widthWeight: 0.85, formatType: 'number' },
-      { key: 'startDate', label: 'بداية التمديد', labelEn: 'Start Date', widthWeight: 1.0, formatType: 'date' },
-      { key: 'endDate', label: 'نهاية التمديد', labelEn: 'End Date', widthWeight: 1.0, formatType: 'date' },
-      { key: 'amount', label: 'المبلغ (ر.س)', labelEn: 'Amount', widthWeight: 0.95, formatType: 'number' }
+      { key: 'extensionNumber', label: 'رقم التمديد', labelEn: 'Extension #', widthWeight: 0.95, formatType: 'ltr' },
+      { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 0.95, formatType: 'ltr' },
+      { key: 'extensionTypeAr', label: 'نوع التمديد', labelEn: 'Type', widthWeight: 1.15, formatType: 'text' },
+      { key: 'statusAr', label: 'الحالة', labelEn: 'Status', widthWeight: 0.95, formatType: 'text' },
+      { key: 'paymentStatus', label: 'حالة الدفع', labelEn: 'Payment', widthWeight: 0.85, formatType: 'text' },
+      { key: 'extendDays', label: 'أيام التمديد', labelEn: 'Days', widthWeight: 0.75, formatType: 'number' },
+      { key: 'startDate', label: 'بداية التمديد', labelEn: 'Start Date', widthWeight: 0.95, formatType: 'date' },
+      { key: 'endDate', label: 'التمديد لحد', labelEn: 'Extended Until', widthWeight: 0.95, formatType: 'date' },
+      { key: 'amount', label: 'سعر التمديد (ر.س)', labelEn: 'Amount', widthWeight: 0.9, formatType: 'number' }
     ],
     sync_log: [
       { key: 'startedAt', label: 'وقت المزامنة', labelEn: 'Started At', widthWeight: 1.25, formatType: 'datetime' },
@@ -1948,7 +2152,9 @@
     buildCustomersIndexFromReservations: buildCustomersIndexFromReservations,
     mergeReservationBatch: mergeReservationBatch,
     translateDeliveryType: translateDeliveryType,
+    translateExtensionType: translateExtensionType,
     isExtensionAcceptedAndPaid: isExtensionAcceptedAndPaid,
+    summarizeReservationExtensions: summarizeReservationExtensions,
     computeTotalAmount: computeTotalAmount,
     mergeSyncedReservation: mergeSyncedReservation,
     resolveEffectivePermissions: resolveEffectivePermissions,
@@ -1981,6 +2187,7 @@
     getCacheInvalidationScopes: getCacheInvalidationScopes,
     formatDisplayDate: formatDisplayDate,
     formatDisplayDateTime: formatDisplayDateTime,
+    extractTimeOnly: extractTimeOnly,
     normalizeLoginUsername: normalizeLoginUsername,
     getReportColumns: getReportColumns,
     formatReportCellValue: formatReportCellValue,
