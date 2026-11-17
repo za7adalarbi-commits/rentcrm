@@ -611,3 +611,40 @@ test('mutation deduplication lock keys, notification target routing, and optimis
   assert.equal(core.getApiCachePolicy('getProblemDetails').cacheable, true);
 });
 
+test('computeDataFingerprint, shouldAutoRefreshNow, silentRefresh cache keys, and keepalive work as expected', () => {
+  const dashA = { kpis: { totalReservations: 10, openProblems: 2 }, charts: { statusDistribution: { 'تم الحجز': 4 } } };
+  const dashB = { charts: { statusDistribution: { 'تم الحجز': 4 } }, kpis: { openProblems: 2, totalReservations: 10 } };
+  const dashChanged = { kpis: { totalReservations: 11, openProblems: 2 }, charts: { statusDistribution: { 'تم الحجز': 4 } } };
+
+  assert.equal(core.computeDataFingerprint(dashA), core.computeDataFingerprint(dashB));
+  assert.notEqual(core.computeDataFingerprint(dashA), core.computeDataFingerprint(dashChanged));
+
+  const notifsA = { unreadCount: 1, items: [{ id: 'N1', isRead: false }] };
+  const notifsRead = { unreadCount: 0, items: [{ id: 'N1', isRead: true }] };
+  assert.notEqual(core.computeDataFingerprint(notifsA), core.computeDataFingerprint(notifsRead));
+
+  assert.equal(core.shouldAutoRefreshNow({
+    isModalOpen: false,
+    isInputFocused: false,
+    isOffline: false,
+    isHidden: false,
+    hasActiveLocks: false
+  }), true);
+  assert.equal(core.shouldAutoRefreshNow({ isModalOpen: true }), false);
+  assert.equal(core.shouldAutoRefreshNow({ isInputFocused: true }), false);
+  assert.equal(core.shouldAutoRefreshNow({ isOffline: true }), false);
+  assert.equal(core.shouldAutoRefreshNow({ isHidden: true }), false);
+  assert.equal(core.shouldAutoRefreshNow({ hasActiveLocks: true }), false);
+
+  const keyNormal = core.buildApiCacheKey('https://script.google.com/macros/s/abc/exec', 'TOK_1', 'getDashboard', { range: '30d' });
+  const keySilent = core.buildApiCacheKey('https://script.google.com/macros/s/abc/exec', 'TOK_1', 'getDashboard', { range: '30d', silentRefresh: true });
+  assert.equal(keyNormal, keySilent);
+
+  const smallFetch = core.buildGasFetchOptions('getDashboard', 'TOK_1', { range: '30d', silentRefresh: true });
+  assert.equal(smallFetch.keepalive, true);
+  assert.equal(smallFetch.body.includes('silentRefresh'), false);
+
+  const bigFetch = core.buildGasFetchOptions('syncRentalGate', 'TOK_1', { big: 'x'.repeat(65000) });
+  assert.equal(bigFetch.keepalive, undefined);
+});
+

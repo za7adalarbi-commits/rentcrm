@@ -5,6 +5,7 @@
   'use strict';
 
   var currentUser = null;
+  var pendingBootstrap = null;
 
   function getUser() {
     return currentUser;
@@ -12,6 +13,22 @@
 
   function setUser(user) {
     currentUser = user;
+  }
+
+  function primeBootstrapCaches(bs, range) {
+    if (!bs || !root.RGApi || !root.RGApi.primeCache) return;
+    var r = range || '30d';
+    if (bs.user) root.RGApi.primeCache('getMe', {}, { user: bs.user });
+    if (bs.dashboard) root.RGApi.primeCache('getDashboard', { range: r }, bs.dashboard);
+    if (bs.employees) root.RGApi.primeCache('getEmployees', {}, bs.employees);
+    if (bs.notifications) root.RGApi.primeCache('getNotifications', {}, bs.notifications);
+    if (bs.problems) root.RGApi.primeCache('getProblems', {}, bs.problems);
+  }
+
+  function consumeBootstrap() {
+    var out = pendingBootstrap;
+    pendingBootstrap = null;
+    return out;
   }
 
   async function restoreSession() {
@@ -29,11 +46,12 @@
     return null;
   }
 
-  async function login(username, password) {
+  async function login(username, password, opts) {
     var cleanUser = (root.RGCrmCore && root.RGCrmCore.normalizeLoginUsername)
       ? root.RGCrmCore.normalizeLoginUsername(username)
       : String(username || '').trim().toLowerCase();
     var cleanPass = String(password || '');
+    var range = (opts && opts.range) || '30d';
     if (!cleanUser || !cleanPass) {
       return {
         success: false,
@@ -43,10 +61,21 @@
       };
     }
     try {
-      var res = await root.RGApi.callApi('login', { username: cleanUser, password: cleanPass });
+      var res = await root.RGApi.callApi('login', {
+        username: cleanUser,
+        password: cleanPass,
+        includeBootstrap: true,
+        range: range
+      });
       if (res && res.success && res.data && res.data.token && res.data.user) {
         root.RGApi.setToken(res.data.token);
         currentUser = res.data.user;
+        if (res.data.bootstrap) {
+          pendingBootstrap = { range: range, data: res.data.bootstrap };
+          primeBootstrapCaches(res.data.bootstrap, range);
+        } else {
+          pendingBootstrap = null;
+        }
       }
       return res || { success: false, message: 'تعذر إتمام تسجيل الدخول.' };
     } catch (err) {
@@ -60,6 +89,7 @@
   }
 
   async function logout() {
+    pendingBootstrap = null;
     try {
       if (root.RGApi.getToken()) {
         await root.RGApi.callApi('logout', {});
@@ -74,6 +104,8 @@
     setUser: setUser,
     restoreSession: restoreSession,
     login: login,
-    logout: logout
+    logout: logout,
+    consumeBootstrap: consumeBootstrap,
+    primeBootstrapCaches: primeBootstrapCaches
   };
 })(window);

@@ -402,11 +402,23 @@ function getMyFollowUps(session, params) {
 
 function getTeamFollowUps(session, params) {
   var p = params || {};
-  var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
   var filterEmp = normalizeStr(p.employeeId);
   var filterStatus = normalizeStr(p.status);
   var filterDate = normalizeStr(p.date);
+  var isUnfiltered = !filterEmp && !filterStatus && !filterDate;
+  var cacheKey = isUnfiltered ? ('RG_TEAM_FU_V' + getCacheVersion_('FU')) : '';
 
+  if (cacheKey) {
+    try {
+      var cachedRaw = CacheService.getScriptCache().get(cacheKey);
+      if (cachedRaw) {
+        var cached = JSON.parse(cachedRaw);
+        if (cached && Array.isArray(cached.items)) return cached;
+      }
+    } catch (e) {}
+  }
+
+  var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
   var filtered = followUps.filter(function (f) {
     if (filterEmp && f.employeeId !== filterEmp) return false;
     if (filterStatus && f.status !== filterStatus) return false;
@@ -418,7 +430,14 @@ function getTeamFollowUps(session, params) {
     return String(b.createdAt).localeCompare(String(a.createdAt));
   });
 
-  return { items: filtered.slice(0, 300), total: filtered.length };
+  var result = { items: filtered.slice(0, 300), total: filtered.length };
+  if (cacheKey) {
+    try {
+      var str = JSON.stringify(result);
+      if (str.length < 95000) CacheService.getScriptCache().put(cacheKey, str, 180);
+    } catch (e2) {}
+  }
+  return result;
 }
 
 function getFollowUpHistory(session, params) {

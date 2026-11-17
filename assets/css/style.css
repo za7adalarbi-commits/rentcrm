@@ -1298,4 +1298,111 @@ html[dir="ltr"] .data-table td.mono {
   50% { opacity: 0.48; }
 }
 
+@keyframes rgFadeSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
+@keyframes rgModalPop {
+  from {
+    opacity: 0;
+    transform: scale(0.975) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes rgDrawerSlideRtl {
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes rgDrawerSlideLtr {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes rgSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.route-view,
+.toast-item,
+.notif-popover {
+  animation: rgFadeSlideUp 130ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.modal-panel {
+  animation: rgModalPop 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.drawer-panel {
+  animation: rgDrawerSlideRtl 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+html[dir="ltr"] .drawer-panel {
+  animation-name: rgDrawerSlideLtr;
+}
+
+.btn:active:not(:disabled),
+.segmented-btn:active:not(:disabled),
+.kpi-card:active,
+.nav-item:active {
+  transform: scale(0.97);
+}
+
+.btn[aria-busy="true"],
+.quick-status-select[aria-busy="true"] {
+  opacity: 0.72;
+  cursor: progress;
+}
+
+.rg-spinning svg,
+svg.rg-spinning {
+  animation: rgSpin 650ms linear infinite;
+}
+
+.kpi-card {
+  transition: border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .route-view,
+  .toast-item,
+  .notif-popover,
+  .modal-panel,
+  .drawer-panel,
+  .rg-skeleton-line,
+  .rg-skeleton-box,
+  .rg-spinning svg,
+  svg.rg-spinning {
+    animation: none !important;
+  }
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+  }
+}

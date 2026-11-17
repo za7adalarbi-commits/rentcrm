@@ -132,28 +132,34 @@ function handleLogin(payload) {
       isRevoked: 'false'
     });
 
-    var updatedEmp = updateRecordByKey(RG_SHEETS.EMPLOYEES, 'id', user.id, {
-      lastActivity: now.toISOString()
-    });
-    if (updatedEmp) {
-      syncUserSheetRecord(updatedEmp);
-    }
+    var nowIsoStr = now.toISOString();
+    touchEmployeeActivityThrottled_(user.id, nowIsoStr);
 
-    var cleanUser = sanitizeEmployeeForClient(updatedEmp || user);
-    cacheSession_(tokenHash, {
+    var cleanUser = sanitizeEmployeeForClient(user);
+    cleanUser.lastActivity = nowIsoStr;
+
+    var sessionObj = {
+      tokenHash: tokenHash,
       employeeId: cleanUser.id,
       role: cleanUser.role,
       permissions: cleanUser.permissions,
       user: cleanUser
-    }, expiresIso);
+    };
+    cacheSession_(tokenHash, sessionObj, expiresIso);
 
     logActivity(user, 'تسجيل الدخول', 'Employee', user.id, 'تسجيل دخول ناجح للمستخدم ' + user.username);
 
-    return {
+    var response = {
       token: rawToken,
       expiresAt: expiresIso,
       user: cleanUser
     };
+    if (p.includeBootstrap !== false) {
+      response.bootstrap = getAppBootstrap(sessionObj, {
+        range: normalizeStr(p.range) || '30d'
+      });
+    }
+    return response;
   });
 }
 

@@ -22,19 +22,26 @@ function resolveDateRange(rangeKey, customFrom, customTo) {
   return { start: start, end: end };
 }
 
+var _rgDashMemCache = {};
+
 function getDashboard(session, params) {
   var p = params || {};
   var rangeKey = normalizeStr(p.range) || '30d';
   var todayStr = formatDateOnly(new Date());
   var isStandardRange = (rangeKey === 'today' || rangeKey === '7d' || rangeKey === '30d' || rangeKey === 'month');
-  var cacheKey = isStandardRange ? ('RG_DASH_V1_' + rangeKey) : '';
+  var verKey = getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + getCacheVersion_('PRB');
+  var cacheKey = isStandardRange ? ('RG_DASH_V' + verKey + '_' + rangeKey) : '';
 
   if (cacheKey) {
+    if (_rgDashMemCache[cacheKey] && _rgDashMemCache[cacheKey].dateStr === todayStr) {
+      return _rgDashMemCache[cacheKey].data;
+    }
     try {
       var cachedRaw = CacheService.getScriptCache().get(cacheKey);
       if (cachedRaw) {
         var cachedObj = JSON.parse(cachedRaw);
         if (cachedObj && cachedObj.dateStr === todayStr && cachedObj.data) {
+          _rgDashMemCache[cacheKey] = cachedObj;
           return cachedObj.data;
         }
       }
@@ -158,8 +165,10 @@ function getDashboard(session, params) {
   };
 
   if (cacheKey) {
+    var payloadToCache = { dateStr: todayStr, data: result };
+    _rgDashMemCache[cacheKey] = payloadToCache;
     try {
-      CacheService.getScriptCache().put(cacheKey, JSON.stringify({ dateStr: todayStr, data: result }), 120);
+      CacheService.getScriptCache().put(cacheKey, JSON.stringify(payloadToCache), 300);
     } catch (e) {}
   }
 

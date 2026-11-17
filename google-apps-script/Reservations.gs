@@ -4,14 +4,52 @@
 
 function getReservations(session, params) {
   var p = params || {};
-  var all = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   var settingsMap = getSettingsMap_(false);
   var allowAgentAll = settingsMap.allow_agent_view_all !== undefined ? toBool(settingsMap.allow_agent_view_all) : true;
   var restrictToAgent = session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations');
 
+  var search = normalizeStr(p.search).toLowerCase();
+  var company = normalizeStr(p.company);
+  var branch = normalizeStr(p.branch);
+  var status = normalizeStr(p.status);
+  var employeeId = normalizeStr(p.employeeId);
+  var priority = normalizeStr(p.priority);
+  var dateFrom = normalizeStr(p.dateFrom);
+  var dateTo = normalizeStr(p.dateTo);
+  var unfollowedOnly = toBool(p.unfollowedOnly);
+  var hasProblemsOnly = toBool(p.hasProblemsOnly);
+  var sortBy = normalizeStr(p.sortBy) || 'lastUpdatedAt';
+  var sortDir = normalizeStr(p.sortDir) === 'asc' ? 1 : -1;
+  var page = Math.max(1, toNumber(p.page, 1));
+  var pageSize = Math.min(200, Math.max(1, toNumber(p.pageSize, 25)));
+
+  var isDefaultQuery = !search && !company && !branch && !status && !employeeId && !priority &&
+    !dateFrom && !dateTo && !unfollowedOnly && !hasProblemsOnly &&
+    page === 1 && sortBy === 'lastUpdatedAt' && sortDir === -1;
+
+  var resVer = getCacheVersion_('RES');
+  var fuVer = getCacheVersion_('FU');
+  var defaultCacheKey = isDefaultQuery
+    ? ('RG_RES_DEF_V' + resVer + '_' + fuVer + '_' + (restrictToAgent ? session.employeeId : 'ALL') + '_' + pageSize)
+    : '';
+
+  if (defaultCacheKey) {
+    try {
+      var defCachedRaw = CacheService.getScriptCache().get(defaultCacheKey);
+      if (defCachedRaw) {
+        var defCached = JSON.parse(defCachedRaw);
+        if (defCached && Array.isArray(defCached.items)) {
+          return defCached;
+        }
+      }
+    } catch (e0) {}
+  }
+
+  var all = readAllRecords(RG_SHEETS.RESERVATIONS, false);
+  var facetsKey = 'RG_FACETS_V' + resVer;
   var cachedFacets = null;
   try {
-    var fRaw = CacheService.getScriptCache().get('RG_FACETS_V1');
+    var fRaw = CacheService.getScriptCache().get(facetsKey);
     if (fRaw) {
       var parsedF = JSON.parse(fRaw);
       if (parsedF && Array.isArray(parsedF.companies) && Array.isArray(parsedF.branches)) {
@@ -24,21 +62,22 @@ function getReservations(session, params) {
   var branchesMap = cachedFacets ? null : {};
   var matched = [];
 
-  var search = normalizeStr(p.search).toLowerCase();
-  var company = normalizeStr(p.company);
-  var branch = normalizeStr(p.branch);
-  var status = normalizeStr(p.status);
-  var employeeId = normalizeStr(p.employeeId);
-  var priority = normalizeStr(p.priority);
-  var dateFrom = normalizeStr(p.dateFrom);
-  var dateTo = normalizeStr(p.dateTo);
-  var unfollowedOnly = toBool(p.unfollowedOnly);
-  var hasProblemsOnly = toBool(p.hasProblemsOnly);
-
-  var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
-  var followedResIds = {};
-  for (var f = 0; f < followUps.length; f++) {
-    followedResIds[followUps[f].reservationId] = true;
+  var followedKey = 'RG_FOLLOWED_RES_V' + fuVer;
+  var followedResIds = null;
+  try {
+    var flRaw = CacheService.getScriptCache().get(followedKey);
+    if (flRaw) followedResIds = JSON.parse(flRaw);
+  } catch (e1) {}
+  if (!followedResIds || typeof followedResIds !== 'object') {
+    followedResIds = {};
+    var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
+    for (var f = 0; f < followUps.length; f++) {
+      if (followUps[f].reservationId) followedResIds[followUps[f].reservationId] = true;
+    }
+    try {
+      var flStr = JSON.stringify(followedResIds);
+      if (flStr.length < 95000) CacheService.getScriptCache().put(followedKey, flStr, 300);
+    } catch (e2) {}
   }
 
   for (var i = 0; i < all.length; i++) {
@@ -83,12 +122,10 @@ function getReservations(session, params) {
       branches: Object.keys(branchesMap).sort()
     };
     try {
-      CacheService.getScriptCache().put('RG_FACETS_V1', JSON.stringify(cachedFacets), 600);
+      CacheService.getScriptCache().put(facetsKey, JSON.stringify(cachedFacets), 600);
     } catch (e) {}
   }
 
-  var sortBy = normalizeStr(p.sortBy) || 'lastUpdatedAt';
-  var sortDir = normalizeStr(p.sortDir) === 'asc' ? 1 : -1;
   var numericSort = (sortBy === 'daysCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
   matched.sort(function (a, b) {
     if (numericSort) {
@@ -100,8 +137,6 @@ function getReservations(session, params) {
     return (sa < sb ? -1 : 1) * sortDir;
   });
 
-  var page = Math.max(1, toNumber(p.page, 1));
-  var pageSize = Math.min(200, Math.max(1, toNumber(p.pageSize, 25)));
   var total = matched.length;
   var startIdx = (page - 1) * pageSize;
   var slice = matched.slice(startIdx, startIdx + pageSize);
@@ -142,7 +177,7 @@ function getReservations(session, params) {
     });
   }
 
-  return {
+  var resPayload = {
     items: items,
     total: total,
     page: page,
@@ -150,6 +185,17 @@ function getReservations(session, params) {
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
     facets: cachedFacets
   };
+
+  if (defaultCacheKey) {
+    try {
+      var resStr = JSON.stringify(resPayload);
+      if (resStr.length < 95000) {
+        CacheService.getScriptCache().put(defaultCacheKey, resStr, 180);
+      }
+    } catch (e3) {}
+  }
+
+  return resPayload;
 }
 
 function getReservationDetails(session, params) {

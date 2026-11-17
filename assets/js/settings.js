@@ -4,6 +4,13 @@
 (function (root) {
   'use strict';
 
+  function runWithLock(btnEl, lockKey, fn) {
+    if (root.RGApp && root.RGApp.withActionLock) {
+      return root.RGApp.withActionLock(btnEl, lockKey, fn);
+    }
+    return Promise.resolve().then(fn);
+  }
+
   async function render(container, ctx) {
     var t = ctx.t;
     var user = root.RGAuth.getUser();
@@ -243,7 +250,8 @@
       }
     });
 
-    document.getElementById('btn-ping-gas-url').addEventListener('click', async function () {
+    var pingGasBtn = document.getElementById('btn-ping-gas-url');
+    pingGasBtn.addEventListener('click', function () {
       var val = document.getElementById('set-gas-url').value.trim();
       var out = document.getElementById('gas-ping-result');
       if (!val) {
@@ -251,9 +259,11 @@
         out.textContent = 'يرجى إدخال رابط Web App (/exec) أولاً.';
         return;
       }
-      var res = await root.RGApi.pingGasUrl(val);
-      out.className = res.success ? 'form-success' : 'form-error';
-      out.textContent = res.message || (res.success ? 'الاتصال ناجح!' : 'فشل الاتصال.');
+      runWithLock(pingGasBtn, 'pingGasUrl', async function () {
+        var res = await root.RGApi.pingGasUrl(val);
+        out.className = res.success ? 'form-success' : 'form-error';
+        out.textContent = res.message || (res.success ? 'الاتصال ناجح!' : 'فشل الاتصال.');
+      });
     });
 
     var rgTokenInput = document.getElementById('set-rg-token');
@@ -268,7 +278,7 @@
 
     var saveRgTokenBtn = document.getElementById('btn-save-rg-token');
     if (saveRgTokenBtn) {
-      saveRgTokenBtn.addEventListener('click', async function () {
+      saveRgTokenBtn.addEventListener('click', function () {
         var inp = document.getElementById('set-rg-token');
         var msg = document.getElementById('sync-action-msg');
         var raw = inp ? inp.value.trim() : '';
@@ -277,56 +287,63 @@
           msg.textContent = 'يرجى لصق التوكن أولاً ثم الضغط على حفظ.';
           return;
         }
-        saveRgTokenBtn.disabled = true;
-        saveRgTokenBtn.textContent = 'جاري الحفظ...';
-        var res = await root.RGApi.callApi('saveApiToken', { token: raw, testAfterSave: root.RGApi.isLiveMode() });
-        saveRgTokenBtn.disabled = false;
-        saveRgTokenBtn.textContent = 'حفظ التوكن في Apps Script';
-        if (res.success) {
-          if (inp) inp.value = '';
-          var connOk = res.data && res.data.connection ? res.data.connection.connected : null;
-          var connStatus = document.getElementById('sync-conn-status');
-          if (connStatus) {
-            connStatus.textContent = connOk === true
-              ? 'متصل بنجاح (RG_TOKEN & RENTAL_TOKEN محفوظان)'
-              : 'تم حفظ RG_TOKEN & RENTAL_TOKEN';
+        runWithLock(saveRgTokenBtn, 'saveApiToken', async function () {
+          var prevText = saveRgTokenBtn.textContent;
+          saveRgTokenBtn.textContent = 'جاري الحفظ...';
+          try {
+            var res = await root.RGApi.callApi('saveApiToken', { token: raw, testAfterSave: root.RGApi.isLiveMode() });
+            if (res.success) {
+              if (inp) inp.value = '';
+              var connOk = res.data && res.data.connection ? res.data.connection.connected : null;
+              var connStatus = document.getElementById('sync-conn-status');
+              if (connStatus) {
+                connStatus.textContent = connOk === true
+                  ? 'متصل بنجاح (RG_TOKEN & RENTAL_TOKEN محفوظان)'
+                  : 'تم حفظ RG_TOKEN & RENTAL_TOKEN';
+              }
+              msg.className = connOk === false ? 'form-error' : 'form-success';
+              msg.textContent = (res.data && res.data.connection && res.data.connection.message) || res.message || 'تم حفظ التوكن بنجاح.';
+              ctx.toast('تم حفظ التوكن بنجاح.');
+            } else {
+              msg.className = 'form-error';
+              msg.textContent = res.message || 'تعذر حفظ التوكن.';
+            }
+          } finally {
+            if (saveRgTokenBtn.isConnected !== false) saveRgTokenBtn.textContent = prevText;
           }
-          msg.className = connOk === false ? 'form-error' : 'form-success';
-          msg.textContent = (res.data && res.data.connection && res.data.connection.message) || res.message || 'تم حفظ التوكن بنجاح.';
-          ctx.toast('تم حفظ التوكن بنجاح.');
-        } else {
-          msg.className = 'form-error';
-          msg.textContent = res.message || 'تعذر حفظ التوكن.';
-        }
+        });
       });
     }
 
     var testRgBtn = document.getElementById('btn-test-rg');
     if (testRgBtn) {
-      testRgBtn.addEventListener('click', async function () {
+      testRgBtn.addEventListener('click', function () {
         var msg = document.getElementById('sync-action-msg');
-        var res = await root.RGApi.callApi('testConnection', {});
-        msg.className = (res.success && res.data && res.data.connected) ? 'form-success' : 'form-error';
-        msg.textContent = (res.data && res.data.message) || res.message;
+        runWithLock(testRgBtn, 'testConnection', async function () {
+          var res = await root.RGApi.callApi('testConnection', {});
+          msg.className = (res.success && res.data && res.data.connected) ? 'form-success' : 'form-error';
+          msg.textContent = (res.data && res.data.message) || res.message;
+        });
       });
     }
 
     var syncNowBtn = document.getElementById('btn-sync-now');
     if (syncNowBtn) {
-      syncNowBtn.addEventListener('click', async function () {
-        syncNowBtn.disabled = true;
-        syncNowBtn.textContent = 'جاري السحب...';
-        var res = await root.RGApi.callApi('syncRentalGate', {});
-        if (res.success) {
-          ctx.toast('اكتملت المزامنة بنجاح.');
-          render(container, ctx);
-        } else {
-          var msg = document.getElementById('sync-action-msg');
-          msg.className = 'form-error';
-          msg.textContent = res.message;
-          syncNowBtn.disabled = false;
-          syncNowBtn.textContent = 'سحب الحجوزات الآن';
-        }
+      syncNowBtn.addEventListener('click', function () {
+        runWithLock(syncNowBtn, 'syncRentalGate', async function () {
+          var prevText = syncNowBtn.textContent;
+          syncNowBtn.textContent = 'جاري السحب...';
+          var res = await root.RGApi.callApi('syncRentalGate', {});
+          if (res.success) {
+            ctx.toast('اكتملت المزامنة بنجاح.');
+            render(container, ctx);
+          } else {
+            var msg = document.getElementById('sync-action-msg');
+            msg.className = 'form-error';
+            msg.textContent = res.message;
+            if (syncNowBtn.isConnected !== false) syncNowBtn.textContent = prevText;
+          }
+        });
       });
     }
 
@@ -336,30 +353,36 @@
         var chk = document.getElementById('set-auto-sync-enabled');
         if (inp) inp.value = btn.getAttribute('data-hours');
         if (chk) chk.checked = true;
+        container.querySelectorAll('.auto-sync-preset').forEach(function (b) {
+          b.classList.toggle('btn-primary', b === btn);
+        });
       });
     });
 
     var sysForm = document.getElementById('sys-settings-form');
     if (sysForm) {
-      sysForm.addEventListener('submit', async function (ev) {
+      sysForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
-        var excluded = document.getElementById('set-excluded').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-        var autoEnabled = document.getElementById('set-auto-sync-enabled').checked;
-        var autoHours = Math.max(1, Math.min(168, Number(document.getElementById('set-auto-sync-hours').value || 12)));
-        var res = await root.RGApi.callApi('updateSettings', {
-          company_name: document.getElementById('set-company').value,
-          session_ttl_hours: Number(document.getElementById('set-ttl').value || 24),
-          excluded_statuses: excluded,
-          allow_agent_view_all: document.getElementById('set-agent-all').checked,
-          auto_sync_enabled: autoEnabled,
-          auto_sync_interval_hours: autoHours
+        var submitBtn = document.getElementById('btn-save-sys-settings');
+        runWithLock(submitBtn, 'updateSettings', async function () {
+          var excluded = document.getElementById('set-excluded').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+          var autoEnabled = document.getElementById('set-auto-sync-enabled').checked;
+          var autoHours = Math.max(1, Math.min(168, Number(document.getElementById('set-auto-sync-hours').value || 12)));
+          var res = await root.RGApi.callApi('updateSettings', {
+            company_name: document.getElementById('set-company').value,
+            session_ttl_hours: Number(document.getElementById('set-ttl').value || 24),
+            excluded_statuses: excluded,
+            allow_agent_view_all: document.getElementById('set-agent-all').checked,
+            auto_sync_enabled: autoEnabled,
+            auto_sync_interval_hours: autoHours
+          });
+          if (res.success) {
+            ctx.toast('تم حفظ الإعدادات وتحديث جدول التحديث التلقائي (' + (autoEnabled ? ('كل ' + autoHours + ' ساعة') : 'متوقف') + ').');
+            render(container, ctx);
+          } else {
+            ctx.toast(res.message, true);
+          }
         });
-        if (res.success) {
-          ctx.toast('تم حفظ الإعدادات وتحديث جدول التحديث التلقائي (' + (autoEnabled ? ('كل ' + autoHours + ' ساعة') : 'متوقف') + ').');
-          render(container, ctx);
-        } else {
-          ctx.toast(res.message, true);
-        }
       });
     }
   }

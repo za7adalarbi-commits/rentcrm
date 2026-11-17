@@ -3,8 +3,9 @@
  */
 
 function getEmployees(session) {
+  var empCacheKey = 'RG_EMP_SUMMARY_V' + getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + getCacheVersion_('PRB') + '_' + getCacheVersion_('EMP');
   try {
-    var cachedRaw = CacheService.getScriptCache().get('RG_EMP_SUMMARY_V1');
+    var cachedRaw = CacheService.getScriptCache().get(empCacheKey);
     if (cachedRaw) {
       var cached = JSON.parse(cachedRaw);
       if (cached && Array.isArray(cached.items)) {
@@ -60,7 +61,7 @@ function getEmployees(session) {
     customPermissions: readCustomPermissionsSetting()
   };
   try {
-    CacheService.getScriptCache().put('RG_EMP_SUMMARY_V1', JSON.stringify(response), 120);
+    CacheService.getScriptCache().put(empCacheKey, JSON.stringify(response), 300);
   } catch (e) {}
   return response;
 }

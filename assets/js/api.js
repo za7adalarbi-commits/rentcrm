@@ -31,6 +31,7 @@
   var SANDBOX_SENTINEL = '__SANDBOX__';
   var lastWarmUpUrl = '';
   var lastWarmUpAt = 0;
+  var _cachedConnInfo = null;
 
   function getDefaultConfiguredGasUrl() {
     var cfg = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.gasWebAppUrl) || root.__RG_DEFAULT_GAS_URL__ || '';
@@ -41,22 +42,30 @@
     var search = typeof window !== 'undefined' ? window.location.search : '';
     var stored = safeStorageGet(STORAGE_GAS_URL);
     var defUrl = getDefaultConfiguredGasUrl();
+    if (_cachedConnInfo && _cachedConnInfo.search === search && _cachedConnInfo.stored === stored && _cachedConnInfo.defUrl === defUrl) {
+      return _cachedConnInfo.info;
+    }
+    var info;
     if (root.RGCrmCore && root.RGCrmCore.resolveGasConnection) {
-      var info = root.RGCrmCore.resolveGasConnection(search, stored, defUrl);
+      info = root.RGCrmCore.resolveGasConnection(search, stored, defUrl);
       if (info.clearStored) {
         safeStorageSet(STORAGE_GAS_URL, '');
+        stored = '';
       } else if (info.persist && info.url) {
         safeStorageSet(STORAGE_GAS_URL, info.url);
+        stored = info.url;
       }
-      return info;
+    } else {
+      info = {
+        url: (stored && stored !== SANDBOX_SENTINEL) ? stored : defUrl,
+        source: stored ? 'local_storage' : (defUrl ? 'global_config' : 'sandbox'),
+        defaultUrl: defUrl,
+        persist: false,
+        clearStored: false
+      };
     }
-    return {
-      url: (stored && stored !== SANDBOX_SENTINEL) ? stored : defUrl,
-      source: stored ? 'local_storage' : (defUrl ? 'global_config' : 'sandbox'),
-      defaultUrl: defUrl,
-      persist: false,
-      clearStored: false
-    };
+    _cachedConnInfo = { search: search, stored: stored, defUrl: defUrl, info: info };
+    return info;
   }
 
   function getGasUrl() {
@@ -70,6 +79,7 @@
   var inFlightRequests = {};
   var inFlightMutations = {};
   var persistTimer = null;
+  var persistIdleId = null;
 
   function hydrateApiCache() {
     try {
@@ -114,14 +124,25 @@
   function schedulePersistApiCache(immediate) {
     if (immediate) {
       if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+      if (persistIdleId && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(persistIdleId);
+        persistIdleId = null;
+      }
       flushPersistApiCache();
       return;
     }
-    if (persistTimer) return;
+    if (persistTimer || persistIdleId) return;
+    if (typeof requestIdleCallback === 'function') {
+      persistIdleId = requestIdleCallback(function () {
+        persistIdleId = null;
+        flushPersistApiCache();
+      }, { timeout: 250 });
+      return;
+    }
     persistTimer = setTimeout(function () {
       persistTimer = null;
       flushPersistApiCache();
-    }, 60);
+    }, 80);
   }
 
   hydrateApiCache();
@@ -467,10 +488,28 @@
         var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
         return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
       });
+      return;
+    }
+
+    if (action === 'disableEmployee') {
+      var empTargetId = String(p.employeeId || '').trim();
+      var nextEmpStatus = p.status === 'active' ? 'active' : 'disabled';
+      if (!empTargetId) return;
+      patchCachedScopes(['employees'], function (data, actName) {
+        if (actName === 'getEmployees' && Array.isArray(data.items)) {
+          return Object.assign({}, data, {
+            items: data.items.map(function (emp) {
+              return emp.id === empTargetId ? Object.assign({}, emp, { status: nextEmpStatus, updatedAt: nowIso }) : emp;
+            })
+          });
+        }
+        return undefined;
+      });
     }
   }
 
   function setGasUrl(url) {
+    _cachedConnInfo = null;
     var raw = String(url || '').trim();
     var defUrl = getDefaultConfiguredGasUrl();
     if (raw === '__DEFAULT__') {
@@ -1223,7 +1262,14 @@
       found.lastActivity = new Date().toISOString();
       appendSandboxActivity(db, found, 'تسجيل الدخول', 'Employee', found.id, 'تسجيل دخول ناجح للمستخدم ' + found.username);
       saveSandboxDb(db);
-      return { success: true, message: 'تم تسجيل الدخول بنجاح.', data: { token: newToken, expiresAt: exp, user: sanitizeEmp(found) }, error: null };
+      var loginData = { token: newToken, expiresAt: exp, user: sanitizeEmp(found) };
+      if (payload.includeBootstrap !== false) {
+        var bsLogin = sandboxExecute('getAppBootstrap', newToken, { range: payload.range || '30d' });
+        if (bsLogin && bsLogin.success && bsLogin.data) {
+          loginData.bootstrap = bsLogin.data;
+        }
+      }
+      return { success: true, message: 'تم تسجيل الدخول بنجاح.', data: loginData, error: null };
     }
 
     var session;
@@ -1247,6 +1293,7 @@
         var bsDash = sandboxExecute('getDashboard', token, payload && payload.range ? payload : { range: '30d' });
         var bsNotif = sandboxExecute('getNotifications', token, {});
         var bsEmp = sandboxExecute('getEmployees', token, {});
+        var bsPrb = sandboxExecute('getProblems', token, {});
         return {
           success: true,
           message: '',
@@ -1254,7 +1301,8 @@
             user: session.user,
             dashboard: bsDash.success ? bsDash.data : null,
             notifications: bsNotif.success ? bsNotif.data : { items: [], unreadCount: 0 },
-            employees: bsEmp.success ? bsEmp.data : { items: [], total: 0 }
+            employees: bsEmp.success ? bsEmp.data : { items: [], total: 0 },
+            problems: bsPrb.success ? bsPrb.data : { items: [], total: 0 }
           },
           error: null
         };
@@ -2420,7 +2468,9 @@
     var core = root.RGCrmCore;
 
     var policy = (core && core.getApiCachePolicy) ? core.getApiCachePolicy(action) : { cacheable: false, ttlMs: 0, scope: '' };
-    var skipCache = Boolean(payload && (payload.forceRefresh || payload.logExport));
+    var isSilentRefresh = Boolean(payload && payload.silentRefresh);
+    var skipCache = Boolean((payload && (payload.forceRefresh || payload.logExport)) || isSilentRefresh);
+    var shouldWriteCache = Boolean(policy.cacheable && !(payload && payload.logExport));
     var cacheKey = (policy.cacheable && core && core.buildApiCacheKey)
       ? core.buildApiCacheKey(gasUrl, token, action, payload)
       : '';
@@ -2525,7 +2575,7 @@
       }
 
       if (parsed && parsed.success) {
-        if (policy.cacheable && cacheKey && !skipCache) {
+        if (shouldWriteCache && cacheKey) {
           var writeTs = Date.now();
           apiResponseCache[cacheKey] = {
             scope: policy.scope,

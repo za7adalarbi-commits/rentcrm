@@ -799,7 +799,10 @@
       }
     }
 
+    var previewSeq = 0;
+
     async function loadPreview(logExport) {
+      var seq = ++previewSeq;
       var params = {
         reportType: state.reportType,
         dateFrom: document.getElementById('rep-from').value,
@@ -810,6 +813,7 @@
         logExport: Boolean(logExport)
       };
       var r = await root.RGApi.callApi('getReports', params);
+      if (seq !== previewSeq) return;
       var wrap = document.getElementById('report-preview-wrap');
       if (!wrap) return;
       if (!r.success) {
@@ -918,8 +922,15 @@
       });
     });
 
-    document.getElementById('rep-run-btn').addEventListener('click', function () {
-      loadPreview(false);
+    var repRunBtn = document.getElementById('rep-run-btn');
+    repRunBtn.addEventListener('click', function () {
+      if (ctx.withActionLock) {
+        ctx.withActionLock(repRunBtn, 'reports:run', function () {
+          return loadPreview(false);
+        });
+      } else {
+        loadPreview(false);
+      }
     });
 
     document.getElementById('btn-open-export-modal').addEventListener('click', function () {
@@ -1040,116 +1051,126 @@
       return filtered.length ? filtered : schemaCols.slice(0, 6);
     }
 
-    document.getElementById('exp-excel-btn').addEventListener('click', async function () {
-      var btn = document.getElementById('exp-excel-btn');
-      btn.disabled = true;
-      try {
-        var incNotes = document.getElementById('exp-inc-notes').checked;
-        var incFu = document.getElementById('exp-inc-fu').checked;
-        var compressEnabled = Boolean(document.getElementById('exp-excel-compress').checked);
-        var targetSheets = Number(document.getElementById('exp-excel-sheets').value || 1);
+    var expExcelBtn = document.getElementById('exp-excel-btn');
+    expExcelBtn.addEventListener('click', function () {
+      var runExcel = async function () {
+        try {
+          var incNotes = document.getElementById('exp-inc-notes').checked;
+          var incFu = document.getElementById('exp-inc-fu').checked;
+          var compressEnabled = Boolean(document.getElementById('exp-excel-compress').checked);
+          var targetSheets = Number(document.getElementById('exp-excel-sheets').value || 1);
 
-        var rows = await collectExportRows();
-        var headers = getSelectedHeaders(rows, incNotes);
-        var sheets = [{ name: reportTitleAr, headers: headers, rows: rows }];
-        if (incFu && state.reportType !== 'followups_log') {
-          var fuRes = await root.RGApi.callApi('getTeamFollowUps', {});
-          if (fuRes.success && fuRes.data.items.length) {
-            var fuHeaders = (core && core.getReportColumns)
-              ? core.getReportColumns('followups_log', fuRes.data.items).filter(function (c) {
-                  return incNotes || c.key !== 'notes';
-                })
-              : [
-                  { key: 'reservationNumber', label: 'رقم الحجز' },
-                  { key: 'employeeName', label: 'الموظف' },
-                  { key: 'status', label: 'الحالة' },
-                  { key: 'action', label: 'الإجراء' },
-                  { key: 'followUpDate', label: 'التاريخ' },
-                  { key: 'followUpTime', label: 'الوقت' }
-                ];
-            sheets.push({
-              name: 'سجل المتابعات',
-              headers: fuHeaders,
-              rows: fuRes.data.items
-            });
+          var rows = await collectExportRows();
+          var headers = getSelectedHeaders(rows, incNotes);
+          var sheets = [{ name: reportTitleAr, headers: headers, rows: rows }];
+          if (incFu && state.reportType !== 'followups_log') {
+            var fuRes = await root.RGApi.callApi('getTeamFollowUps', {});
+            if (fuRes.success && fuRes.data.items.length) {
+              var fuHeaders = (core && core.getReportColumns)
+                ? core.getReportColumns('followups_log', fuRes.data.items).filter(function (c) {
+                    return incNotes || c.key !== 'notes';
+                  })
+                : [
+                    { key: 'reservationNumber', label: 'رقم الحجز' },
+                    { key: 'employeeName', label: 'الموظف' },
+                    { key: 'status', label: 'الحالة' },
+                    { key: 'action', label: 'الإجراء' },
+                    { key: 'followUpDate', label: 'التاريخ' },
+                    { key: 'followUpTime', label: 'الوقت' }
+                  ];
+              sheets.push({
+                name: 'سجل المتابعات',
+                headers: fuHeaders,
+                rows: fuRes.data.items
+              });
+            }
           }
+          var resMeta = await exportExcelWorkbook(sheets, 'rental-gate-' + state.reportType + '.xlsx', {
+            compressEnabled: compressEnabled,
+            targetSheets: targetSheets
+          });
+          ctx.toast(compressEnabled
+            ? ('تم تصدير Excel مضغوط في ' + resMeta.sheetCount + ' ورقات بنجاح.')
+            : 'تم تصدير ملف Excel بنجاح.');
+          modalRoot.innerHTML = '';
+        } catch (err) {
+          ctx.toast((err && err.message) || 'تعذر تصدير ملف Excel.', true);
         }
-        var resMeta = await exportExcelWorkbook(sheets, 'rental-gate-' + state.reportType + '.xlsx', {
-          compressEnabled: compressEnabled,
-          targetSheets: targetSheets
-        });
-        ctx.toast(compressEnabled
-          ? ('تم تصدير Excel مضغوط في ' + resMeta.sheetCount + ' ورقات بنجاح.')
-          : 'تم تصدير ملف Excel بنجاح.');
-        modalRoot.innerHTML = '';
-      } catch (err) {
-        ctx.toast((err && err.message) || 'تعذر تصدير ملف Excel.', true);
-      } finally {
-        btn.disabled = false;
+      };
+      if (ctx.withActionLock) {
+        ctx.withActionLock(expExcelBtn, 'reports:exportExcel', runExcel);
+      } else {
+        expExcelBtn.disabled = true;
+        runExcel().finally(function () { expExcelBtn.disabled = false; });
       }
     });
 
-    document.getElementById('exp-pdf-btn').addEventListener('click', async function () {
-      var btn = document.getElementById('exp-pdf-btn');
-      btn.disabled = true;
-      try {
-        var incNotes = document.getElementById('exp-inc-notes').checked;
-        var incFu = document.getElementById('exp-inc-fu').checked;
-        var incCharts = document.getElementById('exp-inc-charts').checked;
-        var orient = document.getElementById('exp-orient').value;
-        var maxCols = orient === 'portrait' ? 7 : 9;
+    var expPdfBtn = document.getElementById('exp-pdf-btn');
+    expPdfBtn.addEventListener('click', function () {
+      var runPdf = async function () {
+        try {
+          var incNotes = document.getElementById('exp-inc-notes').checked;
+          var incFu = document.getElementById('exp-inc-fu').checked;
+          var incCharts = document.getElementById('exp-inc-charts').checked;
+          var orient = document.getElementById('exp-orient').value;
+          var maxCols = orient === 'portrait' ? 7 : 9;
 
-        var rows = await collectExportRows();
-        var headers = getSelectedHeaders(rows, incNotes).slice(0, maxCols);
-        var user = root.RGAuth.getUser();
+          var rows = await collectExportRows();
+          var headers = getSelectedHeaders(rows, incNotes).slice(0, maxCols);
+          var user = root.RGAuth.getUser();
 
-        var chartImages = [];
-        if (incCharts) {
-          var img1 = captureChartForPdf(document.getElementById('report-chart-primary'), 'توزيع بيانات التقرير');
-          var img2 = captureChartForPdf(document.getElementById('report-chart-secondary'), 'التوزيع حسب الشركة / الأولوية');
-          if (img1) chartImages.push(img1);
-          if (img2) chartImages.push(img2);
-        }
-
-        var extraSections = [];
-        if (incFu && state.reportType !== 'followups_log') {
-          var fuRes = await root.RGApi.callApi('getTeamFollowUps', {
-            employeeId: document.getElementById('exp-emp').value
-          });
-          if (fuRes.success && Array.isArray(fuRes.data.items) && fuRes.data.items.length) {
-            extraSections.push({
-              title: 'أحدث المتابعات المسجلة (' + Math.min(25, fuRes.data.items.length) + ' من ' + fuRes.data.items.length + ')',
-              lines: fuRes.data.items.slice(0, 25).map(function (f) {
-                var d = (core && core.formatDisplayDate) ? core.formatDisplayDate(f.followUpDate) : f.followUpDate;
-                return d + ' | ' + f.reservationNumber + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (incNotes && f.notes ? ' — ' + f.notes : '');
-              })
-            });
+          var chartImages = [];
+          if (incCharts) {
+            var img1 = captureChartForPdf(document.getElementById('report-chart-primary'), 'توزيع بيانات التقرير');
+            var img2 = captureChartForPdf(document.getElementById('report-chart-secondary'), 'التوزيع حسب الشركة / الأولوية');
+            if (img1) chartImages.push(img1);
+            if (img2) chartImages.push(img2);
           }
-        }
 
-        var pdfMeta = await exportArabicPdfDocument({
-          title: document.getElementById('exp-title').value || ('تقرير ' + reportTitleAr),
-          paperSize: document.getElementById('exp-paper').value,
-          orientation: orient,
-          lang: ctx.lang,
-          exporterName: user ? user.name : '',
-          summaryItems: [
-            { label: 'نوع التقرير', value: reportTitleAr },
-            { label: 'عدد السجلات', value: rows.length }
-          ],
-          columns: headers,
-          rows: rows,
-          extraSections: extraSections,
-          chartImages: chartImages,
-          filename: 'rental-gate-' + state.reportType + '.pdf'
-        });
-        var kb = Math.max(1, Math.round((pdfMeta.sizeBytes || 0) / 1024));
-        ctx.toast('تم تصدير PDF خفيف ومرتب (' + pdfMeta.pages + ' صفحة · ' + kb + ' KB).');
-        modalRoot.innerHTML = '';
-      } catch (err) {
-        ctx.toast((err && err.message) || 'تعذر تصدير ملف PDF.', true);
-      } finally {
-        btn.disabled = false;
+          var extraSections = [];
+          if (incFu && state.reportType !== 'followups_log') {
+            var fuRes = await root.RGApi.callApi('getTeamFollowUps', {
+              employeeId: document.getElementById('exp-emp').value
+            });
+            if (fuRes.success && Array.isArray(fuRes.data.items) && fuRes.data.items.length) {
+              extraSections.push({
+                title: 'أحدث المتابعات المسجلة (' + Math.min(25, fuRes.data.items.length) + ' من ' + fuRes.data.items.length + ')',
+                lines: fuRes.data.items.slice(0, 25).map(function (f) {
+                  var d = (core && core.formatDisplayDate) ? core.formatDisplayDate(f.followUpDate) : f.followUpDate;
+                  return d + ' | ' + f.reservationNumber + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (incNotes && f.notes ? ' — ' + f.notes : '');
+                })
+              });
+            }
+          }
+
+          var pdfMeta = await exportArabicPdfDocument({
+            title: document.getElementById('exp-title').value || ('تقرير ' + reportTitleAr),
+            paperSize: document.getElementById('exp-paper').value,
+            orientation: orient,
+            lang: ctx.lang,
+            exporterName: user ? user.name : '',
+            summaryItems: [
+              { label: 'نوع التقرير', value: reportTitleAr },
+              { label: 'عدد السجلات', value: rows.length }
+            ],
+            columns: headers,
+            rows: rows,
+            extraSections: extraSections,
+            chartImages: chartImages,
+            filename: 'rental-gate-' + state.reportType + '.pdf'
+          });
+          var kb = Math.max(1, Math.round((pdfMeta.sizeBytes || 0) / 1024));
+          ctx.toast('تم تصدير PDF خفيف ومرتب (' + pdfMeta.pages + ' صفحة · ' + kb + ' KB).');
+          modalRoot.innerHTML = '';
+        } catch (err) {
+          ctx.toast((err && err.message) || 'تعذر تصدير ملف PDF.', true);
+        }
+      };
+      if (ctx.withActionLock) {
+        ctx.withActionLock(expPdfBtn, 'reports:exportPdf', runPdf);
+      } else {
+        expPdfBtn.disabled = true;
+        runPdf().finally(function () { expPdfBtn.disabled = false; });
       }
     });
   }

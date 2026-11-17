@@ -5,6 +5,7 @@
   'use strict';
 
   var chartInstances = {};
+  var dashLoadSeq = 0;
 
   function destroyCharts() {
     Object.keys(chartInstances).forEach(function (k) {
@@ -26,22 +27,29 @@
     };
   }
 
-  function buildChart(canvasId, config) {
+  function upsertChart(canvasId, config) {
     var el = document.getElementById(canvasId);
     if (!el || !root.Chart) return;
-    if (chartInstances[canvasId]) {
-      chartInstances[canvasId].destroy();
+    var existing = chartInstances[canvasId];
+    if (existing && existing.canvas === el) {
+      existing.data = config.data;
+      existing.options = Object.assign({}, config.options, { animation: false });
+      existing.update('none');
+      return;
+    }
+    if (existing) {
+      existing.destroy();
     }
     chartInstances[canvasId] = new root.Chart(el.getContext('2d'), config);
   }
 
-  function renderCharts(chartsData, t) {
+  function renderCharts(chartsData, t, isUpdate) {
     if (!root.Chart) return;
     var c = themeColors();
     var baseOpts = {
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 150 },
+      animation: isUpdate ? false : { duration: 120 },
       responsiveAnimationDuration: 0,
       plugins: {
         legend: { labels: { color: c.text, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 12 } } }
@@ -49,7 +57,7 @@
     };
 
     var stDist = chartsData.statusDistribution || {};
-    buildChart('chart-status-dist', {
+    upsertChart('chart-status-dist', {
       type: 'doughnut',
       data: {
         labels: Object.keys(stDist),
@@ -59,7 +67,7 @@
     });
 
     var empPerf = chartsData.employeePerformance || {};
-    buildChart('chart-emp-perf', {
+    upsertChart('chart-emp-perf', {
       type: 'bar',
       data: {
         labels: Object.keys(empPerf),
@@ -75,7 +83,7 @@
 
     var daily = chartsData.dailyFollowUps || {};
     var dailyKeys = Object.keys(daily).sort();
-    buildChart('chart-daily-followups', {
+    upsertChart('chart-daily-followups', {
       type: 'line',
       data: {
         labels: dailyKeys,
@@ -97,7 +105,7 @@
     });
 
     var prbPrio = chartsData.problemsByPriority || {};
-    buildChart('chart-problems-priority', {
+    upsertChart('chart-problems-priority', {
       type: 'bar',
       data: {
         labels: Object.keys(prbPrio),
@@ -117,7 +125,7 @@
     });
 
     var openClosed = chartsData.problemsOpenVsClosed || { open: 0, closed: 0 };
-    buildChart('chart-problems-open-closed', {
+    upsertChart('chart-problems-open-closed', {
       type: 'pie',
       data: {
         labels: [t('open_problems'), t('closed_problems')],
@@ -127,7 +135,7 @@
     });
 
     var byCompany = chartsData.reservationsByCompany || {};
-    buildChart('chart-res-company', {
+    upsertChart('chart-res-company', {
       type: 'bar',
       data: {
         labels: Object.keys(byCompany),
@@ -143,7 +151,7 @@
     });
 
     var comp = chartsData.employeeComparison || [];
-    buildChart('chart-emp-comparison', {
+    upsertChart('chart-emp-comparison', {
       type: 'bar',
       data: {
         labels: comp.map(function (x) { return x.name; }),
@@ -161,65 +169,8 @@
     });
   }
 
-  async function render(container, ctx) {
-    var t = ctx.t;
-    var state = ctx.state.dashboard || { range: '30d', dateFrom: '', dateTo: '' };
-    ctx.state.dashboard = state;
-
-    container.innerHTML =
-      '<div class="dashboard-filter-bar flex items-center justify-between flex-wrap gap-3">' +
-        '<div class="segmented-control" role="tablist" aria-label="' + t('time_filter') + '">' +
-          ['today', '7d', '30d', 'month', 'custom'].map(function (r) {
-            var active = state.range === r ? ' active' : '';
-            return '<button type="button" class="segmented-btn' + active + '" data-range="' + r + '">' + t('range_' + r) + '</button>';
-          }).join('') +
-        '</div>' +
-        '<div class="toolbar-row" id="dash-custom-dates" style="margin-bottom:0;' + (state.range === 'custom' ? '' : 'display:none;') + '">' +
-          '<input type="date" class="input" id="dash-date-from" value="' + (state.dateFrom || '') + '" style="width:auto;" aria-label="' + t('from_date') + '">' +
-          '<input type="date" class="input" id="dash-date-to" value="' + (state.dateTo || '') + '" style="width:auto;" aria-label="' + t('to_date') + '">' +
-          '<button type="button" class="btn btn-primary btn-sm" id="dash-apply-custom">' + t('apply') + '</button>' +
-        '</div>' +
-      '</div>' +
-      '<div class="kpi-grid grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3" id="dash-kpis"></div>' +
-      '<div class="charts-grid grid grid-cols-1 lg:grid-cols-2 gap-4">' +
-        '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_status_dist') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-status-dist"></canvas></div></section>' +
-        '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_emp_perf') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-emp-perf"></canvas></div></section>' +
-        '<section class="chart-card chart-wide lg:col-span-2"><h3 class="chart-card-title">' + t('chart_daily_fu') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-daily-followups"></canvas></div></section>' +
-        '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_prb_prio') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-problems-priority"></canvas></div></section>' +
-        '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_prb_open_closed') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-problems-open-closed"></canvas></div></section>' +
-        '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_res_company') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-res-company"></canvas></div></section>' +
-        '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_emp_comp') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-emp-comparison"></canvas></div></section>' +
-      '</div>';
-
-    container.querySelectorAll('[data-range]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        state.range = btn.getAttribute('data-range');
-        render(container, ctx);
-      });
-    });
-
-    var applyBtn = document.getElementById('dash-apply-custom');
-    if (applyBtn) {
-      applyBtn.addEventListener('click', function () {
-        state.dateFrom = document.getElementById('dash-date-from').value;
-        state.dateTo = document.getElementById('dash-date-to').value;
-        render(container, ctx);
-      });
-    }
-
-    var res = await root.RGApi.callApi('getDashboard', {
-      range: state.range,
-      dateFrom: state.dateFrom,
-      dateTo: state.dateTo
-    });
-
-    if (!res.success) {
-      document.getElementById('dash-kpis').innerHTML = '<div class="form-error">' + res.message + '</div>';
-      return;
-    }
-
-    var k = res.data.kpis || {};
-    var kpiDefs = [
+  function getKpiDefs(t) {
+    return [
       { key: 'totalReservations', label: t('kpi_total'), cls: 'kpi-card-primary border-t-2 border-t-[#d32228]', route: 'reservations', status: '' },
       { key: 'todayReservations', label: t('kpi_today'), cls: '', route: 'reservations', status: '' },
       { key: 'newReservations', label: t('kpi_new'), cls: '', route: 'reservations', status: 'تم الإنشاء' },
@@ -234,30 +185,150 @@
       { key: 'highProblems', label: t('kpi_high_problems'), cls: 'kpi-danger', route: 'problems', status: '' },
       { key: 'todayFollowUps', label: t('kpi_today_followups'), cls: '', route: 'team-followups', status: '' }
     ];
+  }
 
-    document.getElementById('dash-kpis').innerHTML = kpiDefs.map(function (item) {
+  function paintKpis(kpisEl, kpisData, t) {
+    if (!kpisEl) return;
+    var k = kpisData || {};
+    var defs = getKpiDefs(t);
+    var existingCards = kpisEl.querySelectorAll('[data-kpi-key]');
+    if (existingCards.length === defs.length) {
+      existingCards.forEach(function (cardBtn) {
+        var key = cardBtn.getAttribute('data-kpi-key');
+        var valEl = cardBtn.querySelector('.kpi-value');
+        var nextText = String(Number(k[key] || 0));
+        if (valEl && valEl.textContent !== nextText) {
+          valEl.textContent = nextText;
+        }
+      });
+      return;
+    }
+
+    kpisEl.innerHTML = defs.map(function (item) {
       return (
-        '<button type="button" class="kpi-card text-start cursor-pointer hover:border-[#d32228] transition-all duration-150 ' + item.cls + '" data-kpi-route="' + item.route + '" data-kpi-status="' + item.status + '">' +
+        '<button type="button" class="kpi-card text-start cursor-pointer hover:border-[#d32228] transition-all duration-150 ' + item.cls + '" data-kpi-key="' + item.key + '" data-kpi-route="' + item.route + '" data-kpi-status="' + item.status + '">' +
           '<span class="kpi-label">' + item.label + '</span>' +
           '<span class="kpi-value tabular-nums">' + Number(k[item.key] || 0) + '</span>' +
         '</button>'
       );
     }).join('');
+  }
 
-    document.querySelectorAll('[data-kpi-route]').forEach(function (cardBtn) {
-      cardBtn.addEventListener('click', function () {
-        var rTarget = cardBtn.getAttribute('data-kpi-route');
-        var stFilter = cardBtn.getAttribute('data-kpi-status');
-        if (rTarget === 'reservations') {
-          ctx.state.reservations = Object.assign(ctx.state.reservations || {}, { status: stFilter || '', page: 1 });
-        }
-        var navBtn = document.querySelector('.nav-item[data-route="' + rTarget + '"]');
-        if (navBtn) navBtn.click();
+  async function render(container, ctx, opts) {
+    var t = ctx.t;
+    var options = opts || {};
+    var state = ctx.state.dashboard || { range: '30d', dateFrom: '', dateTo: '' };
+    ctx.state.dashboard = state;
+
+    var isShellMounted = Boolean(container.querySelector('#dash-kpis') && container.querySelector('#chart-status-dist'));
+
+    if (!isShellMounted) {
+      container.innerHTML =
+        '<div class="dashboard-filter-bar flex items-center justify-between flex-wrap gap-3">' +
+          '<div class="segmented-control" role="tablist" aria-label="' + t('time_filter') + '">' +
+            ['today', '7d', '30d', 'month', 'custom'].map(function (r) {
+              var active = state.range === r ? ' active' : '';
+              return '<button type="button" class="segmented-btn' + active + '" data-range="' + r + '">' + t('range_' + r) + '</button>';
+            }).join('') +
+          '</div>' +
+          '<div class="toolbar-row" id="dash-custom-dates" style="margin-bottom:0;' + (state.range === 'custom' ? '' : 'display:none;') + '">' +
+            '<input type="date" class="input" id="dash-date-from" value="' + (state.dateFrom || '') + '" style="width:auto;" aria-label="' + t('from_date') + '">' +
+            '<input type="date" class="input" id="dash-date-to" value="' + (state.dateTo || '') + '" style="width:auto;" aria-label="' + t('to_date') + '">' +
+            '<button type="button" class="btn btn-primary btn-sm" id="dash-apply-custom">' + t('apply') + '</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="kpi-grid grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3" id="dash-kpis"></div>' +
+        '<div class="charts-grid grid grid-cols-1 lg:grid-cols-2 gap-4">' +
+          '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_status_dist') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-status-dist"></canvas></div></section>' +
+          '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_emp_perf') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-emp-perf"></canvas></div></section>' +
+          '<section class="chart-card chart-wide lg:col-span-2"><h3 class="chart-card-title">' + t('chart_daily_fu') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-daily-followups"></canvas></div></section>' +
+          '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_prb_prio') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-problems-priority"></canvas></div></section>' +
+          '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_prb_open_closed') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-problems-open-closed"></canvas></div></section>' +
+          '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_res_company') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-res-company"></canvas></div></section>' +
+          '<section class="chart-card"><h3 class="chart-card-title">' + t('chart_emp_comp') + '</h3><div class="chart-canvas-wrap"><canvas id="chart-emp-comparison"></canvas></div></section>' +
+        '</div>';
+
+      var kpisWrap = container.querySelector('#dash-kpis');
+      if (kpisWrap) {
+        kpisWrap.addEventListener('click', function (ev) {
+          var cardBtn = ev.target && ev.target.closest ? ev.target.closest('[data-kpi-route]') : null;
+          if (!cardBtn) return;
+          var rTarget = cardBtn.getAttribute('data-kpi-route');
+          var stFilter = cardBtn.getAttribute('data-kpi-status');
+          if (rTarget === 'reservations') {
+            ctx.state.reservations = Object.assign(ctx.state.reservations || {}, { status: stFilter || '', page: 1 });
+          }
+          var navBtn = document.querySelector('.nav-item[data-route="' + rTarget + '"]');
+          if (navBtn) navBtn.click();
+        });
+      }
+
+      container.querySelectorAll('[data-range]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var nextRange = btn.getAttribute('data-range');
+          state.range = nextRange;
+          container.querySelectorAll('[data-range]').forEach(function (b) {
+            b.classList.toggle('active', b === btn);
+          });
+          var customWrap = document.getElementById('dash-custom-dates');
+          if (customWrap) {
+            customWrap.style.display = nextRange === 'custom' ? '' : 'none';
+          }
+          loadAndPaint({ isUpdate: true });
+        });
       });
-    });
 
-    ctx.state.lastDashboardCharts = res.data.charts;
-    renderCharts(res.data.charts || {}, t);
+      var applyBtn = document.getElementById('dash-apply-custom');
+      if (applyBtn) {
+        applyBtn.addEventListener('click', function () {
+          var runApply = function () {
+            state.dateFrom = document.getElementById('dash-date-from').value;
+            state.dateTo = document.getElementById('dash-date-to').value;
+            return loadAndPaint({ isUpdate: true });
+          };
+          if (ctx.withActionLock) {
+            ctx.withActionLock(applyBtn, 'dashboard:custom', runApply);
+          } else {
+            runApply();
+          }
+        });
+      }
+    } else {
+      container.querySelectorAll('[data-range]').forEach(function (b) {
+        b.classList.toggle('active', b.getAttribute('data-range') === state.range);
+      });
+      var cw = document.getElementById('dash-custom-dates');
+      if (cw) cw.style.display = state.range === 'custom' ? '' : 'none';
+    }
+
+    async function loadAndPaint(paintOpts) {
+      var pOpts = paintOpts || {};
+      var seq = ++dashLoadSeq;
+      var kpisEl = container.querySelector('#dash-kpis');
+      var res = await root.RGApi.callApi('getDashboard', {
+        range: state.range,
+        dateFrom: state.dateFrom,
+        dateTo: state.dateTo,
+        silentRefresh: Boolean(pOpts.silentRefresh)
+      });
+      if (seq !== dashLoadSeq || !container.isConnected) return;
+
+      if (!res || !res.success) {
+        if (!pOpts.silentRefresh && kpisEl) {
+          kpisEl.innerHTML = '<div class="form-error">' + ((res && res.message) || 'تعذر تحميل لوحة التحكم.') + '</div>';
+        }
+        return;
+      }
+
+      paintKpis(kpisEl, res.data.kpis || {}, t);
+      ctx.state.lastDashboardCharts = res.data.charts;
+      renderCharts(res.data.charts || {}, t, Boolean(pOpts.isUpdate || isShellMounted));
+    }
+
+    await loadAndPaint({
+      isUpdate: isShellMounted,
+      silentRefresh: Boolean(options.silent)
+    });
   }
 
   root.RGDashboard = {

@@ -32,6 +32,7 @@ function handleApiRequest(e, method) {
 
     if (action === 'login') {
       var loginData = handleLogin(payload);
+      flushDirtyScriptCaches_();
       return jsonResponse(true, 'تم تسجيل الدخول بنجاح.', loginData);
     }
 
@@ -175,6 +176,7 @@ function handleApiRequest(e, method) {
         return jsonResponse(false, 'الإجراء المطلوب غير معروف.', null, 'UNKNOWN_ACTION: ' + action);
     }
 
+    flushDirtyScriptCaches_();
     return jsonResponse(true, 'تمت العملية بنجاح.', result, null);
   } catch (err) {
     return jsonResponse(false, err.message || 'حدث خطأ غير متوقع.', null, err.message || String(err));

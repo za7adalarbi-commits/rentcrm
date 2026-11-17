@@ -79,6 +79,17 @@
   };
   var routeRenderSeq = 0;
   var activeActionLocks = {};
+  var autoRefreshTimer = null;
+  var autoRefreshListenersBound = false;
+  var lastHiddenAt = 0;
+  var lastFingerprints = { notifications: '', routes: {} };
+
+  function computeFingerprintSafe(data) {
+    if (root.RGCrmCore && root.RGCrmCore.computeDataFingerprint) {
+      return root.RGCrmCore.computeDataFingerprint(data);
+    }
+    return '';
+  }
 
   function withActionLock(btnEl, lockKey, fn) {
     var key = String(lockKey || '');
@@ -177,7 +188,9 @@
       reset_filters: 'إعادة ضبط',
       reports_subtitle: 'إعداد وتصدير تقارير Excel وPDF الاحترافية بدعم العربية RTL',
       export_settings_btn: 'إعدادات التصدير (Excel / PDF)',
-      generate_report: 'تحديث التقرير'
+      generate_report: 'تحديث التقرير',
+      refresh: 'تحديث',
+      refresh_done: 'تم تحديث البيانات'
     },
     en: {
       brand: 'RENTAL GATE CRM',
@@ -242,7 +255,9 @@
       reset_filters: 'Reset Filters',
       reports_subtitle: 'Configure and export formatted Excel & RTL Arabic PDF reports',
       export_settings_btn: 'Export Settings (Excel / PDF)',
-      generate_report: 'Refresh Report'
+      generate_report: 'Refresh Report',
+      refresh: 'Refresh',
+      refresh_done: 'Data refreshed'
     }
   };
 
@@ -283,10 +298,11 @@
     }, 2600);
   }
 
-  async function refreshNotifications() {
+  async function refreshNotifications(opts) {
     if (!root.RGAuth.getUser()) return;
-    var res = await root.RGApi.callApi('getNotifications', {});
-    if (res.success && res.data) {
+    var payload = (opts && opts.silent) ? { silentRefresh: true } : {};
+    var res = await root.RGApi.callApi('getNotifications', payload);
+    if (res && res.success && res.data) {
       applyNotificationsState(res.data);
     }
   }
@@ -543,7 +559,8 @@
 
       submitBtn.disabled = true;
       submitBtn.textContent = 'جاري الدخول...';
-      var res = await root.RGAuth.login(u, p);
+      var dashRange = (state.dashboard && state.dashboard.range) || '30d';
+      var res = await root.RGAuth.login(u, p, { range: dashRange });
 
       if (!res || !res.success) {
         submitBtn.disabled = false;
@@ -612,6 +629,111 @@
     '</div>';
   }
 
+  function getRoutePrimaryRequest(routeId) {
+    var u = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    switch (routeId) {
+      case 'dashboard': {
+        var d = state.dashboard || { range: '30d', dateFrom: '', dateTo: '' };
+        return {
+          action: 'getDashboard',
+          payload: { range: d.range || '30d', dateFrom: d.dateFrom || '', dateTo: d.dateTo || '' }
+        };
+      }
+      case 'reservations':
+        return {
+          action: 'getReservations',
+          payload: Object.assign({ page: 1, pageSize: 20 }, state.reservations || {})
+        };
+      case 'my-followups':
+        return { action: 'getMyFollowUps', payload: {} };
+      case 'team-followups':
+        return { action: 'getTeamFollowUps', payload: {} };
+      case 'problems':
+        return {
+          action: 'getProblems',
+          payload: Object.assign({ status: '', priority: '', employeeId: '', search: '' }, state.problems || {})
+        };
+      case 'reports': {
+        var rep = state.reports || { reportType: 'all_reservations' };
+        var rf = document.getElementById('rep-from');
+        var rt = document.getElementById('rep-to');
+        var re = document.getElementById('rep-emp');
+        var rc = document.getElementById('rep-company');
+        var rb = document.getElementById('rep-branch');
+        return {
+          action: 'getReports',
+          payload: {
+            reportType: rep.reportType || 'all_reservations',
+            dateFrom: rf ? rf.value : '',
+            dateTo: rt ? rt.value : '',
+            employeeId: re ? re.value : '',
+            company: rc ? rc.value : '',
+            branch: rb ? rb.value : '',
+            logExport: false
+          }
+        };
+      }
+      case 'employees':
+        if (u && root.RGCrmCore && root.RGCrmCore.canUserPerform(u, 'view_employees')) {
+          return { action: 'getEmployees', payload: {} };
+        }
+        return null;
+      case 'activity':
+        return { action: 'getActivityLogs', payload: {} };
+      default:
+        return null;
+    }
+  }
+
+  async function renderActiveRouteView(slot, ctx, routeOpts) {
+    var curUser = root.RGAuth.getUser();
+    var rOpts = routeOpts || {};
+    switch (state.route) {
+      case 'dashboard':
+        await root.RGDashboard.render(slot, ctx, { silent: Boolean(rOpts.silent) });
+        break;
+      case 'reservations':
+        await root.RGReservations.render(slot, ctx);
+        break;
+      case 'my-followups':
+        await root.RGFollowUps.renderMyFollowUps(slot, ctx);
+        break;
+      case 'team-followups':
+        await root.RGFollowUps.renderTeamFollowUps(slot, ctx);
+        break;
+      case 'problems':
+        await root.RGProblems.render(slot, ctx);
+        break;
+      case 'reports':
+        await root.RGReports.render(slot, ctx);
+        break;
+      case 'employees':
+        await root.RGEmployees.render(slot, ctx);
+        break;
+      case 'activity':
+        await renderActivityLog(slot, ctx);
+        break;
+      case 'settings': {
+        if (!curUser || (!root.RGCrmCore.canAccessApi(curUser) && !root.RGCrmCore.canUserPerform(curUser, 'manage_settings'))) {
+          state.route = 'dashboard';
+          await root.RGDashboard.render(slot, ctx, { silent: Boolean(rOpts.silent) });
+          break;
+        }
+        await root.RGSettings.render(slot, ctx);
+        break;
+      }
+      default:
+        await root.RGDashboard.render(slot, ctx, { silent: Boolean(rOpts.silent) });
+    }
+    var req = getRoutePrimaryRequest(state.route);
+    if (req && root.RGApi && root.RGApi.getCachedData) {
+      var cached = root.RGApi.getCachedData(req.action, req.payload, true);
+      if (cached) {
+        lastFingerprints.routes[state.route] = computeFingerprintSafe(cached);
+      }
+    }
+  }
+
   async function renderRoute() {
     var container = document.getElementById('page-content');
     var heading = document.getElementById('page-heading');
@@ -654,43 +776,7 @@
     var ctx = buildAppCtx();
 
     try {
-      switch (state.route) {
-        case 'dashboard':
-          await root.RGDashboard.render(slot, ctx);
-          break;
-        case 'reservations':
-          await root.RGReservations.render(slot, ctx);
-          break;
-        case 'my-followups':
-          await root.RGFollowUps.renderMyFollowUps(slot, ctx);
-          break;
-        case 'team-followups':
-          await root.RGFollowUps.renderTeamFollowUps(slot, ctx);
-          break;
-        case 'problems':
-          await root.RGProblems.render(slot, ctx);
-          break;
-        case 'reports':
-          await root.RGReports.render(slot, ctx);
-          break;
-        case 'employees':
-          await root.RGEmployees.render(slot, ctx);
-          break;
-        case 'activity':
-          await renderActivityLog(slot, ctx);
-          break;
-        case 'settings': {
-          if (!curUser || (!root.RGCrmCore.canAccessApi(curUser) && !root.RGCrmCore.canUserPerform(curUser, 'manage_settings'))) {
-            state.route = 'dashboard';
-            await root.RGDashboard.render(slot, ctx);
-            break;
-          }
-          await root.RGSettings.render(slot, ctx);
-          break;
-        }
-        default:
-          await root.RGDashboard.render(slot, ctx);
-      }
+      await renderActiveRouteView(slot, ctx, { silent: false });
     } finally {
       clearTimeout(skeletonTimer);
     }
@@ -748,6 +834,9 @@
               '<h1 class="page-heading m-0 text-base md:text-lg font-bold text-[#313232] dark:text-white truncate" id="page-heading">' + t('nav_dashboard') + '</h1>' +
             '</div>' +
             '<div class="topbar-actions flex items-center gap-1.5 sm:gap-2 shrink-0">' +
+              '<button type="button" class="btn btn-icon" id="refresh-view-btn" aria-label="' + t('refresh') + '" title="' + t('refresh') + '">' +
+                renderIcon('M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15') +
+              '</button>' +
               '<button type="button" class="btn btn-icon" id="notif-toggle-btn" aria-label="الإشعارات">' +
                 renderIcon('M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0') +
                 '<span class="notif-count hidden" id="notif-badge">0</span>' +
@@ -802,6 +891,21 @@
       });
     });
 
+    var refreshBtn = document.getElementById('refresh-view-btn');
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', function () {
+        withActionLock(refreshBtn, 'manualRefresh', async function () {
+          refreshBtn.classList.add('rg-spinning');
+          try {
+            await refreshCurrentRouteAndNotifications({ manual: true });
+            toast(t('refresh_done'));
+          } finally {
+            refreshBtn.classList.remove('rg-spinning');
+          }
+        });
+      });
+    }
+
     document.getElementById('notif-toggle-btn').addEventListener('click', toggleNotificationsPopover);
 
     document.getElementById('theme-toggle-btn').addEventListener('click', function () {
@@ -821,6 +925,7 @@
     });
 
     document.getElementById('logout-btn').addEventListener('click', async function () {
+      stopAutoRefreshLoop();
       state.route = 'dashboard';
       await root.RGAuth.logout();
       renderLoginScreen();
@@ -830,11 +935,108 @@
   function applyNotificationsState(data) {
     if (!data) return;
     state.notifications = data;
+    lastFingerprints.notifications = computeFingerprintSafe(data);
     var badge = document.getElementById('notif-badge');
     if (badge) {
       var count = data.unreadCount || 0;
       badge.textContent = String(count);
       badge.classList.toggle('hidden', count === 0);
+    }
+  }
+
+  function canRunSilentAutoRefreshNow() {
+    var activeEl = document.activeElement;
+    var isInputFocused = Boolean(activeEl && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName));
+    var isModalOpen = Boolean(document.querySelector('#modal-root > *, #notif-popover'));
+    var isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    var isHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    var hasActiveLocks = Object.keys(activeActionLocks).length > 0;
+    if (root.RGCrmCore && root.RGCrmCore.shouldAutoRefreshNow) {
+      return root.RGCrmCore.shouldAutoRefreshNow({
+        isModalOpen: isModalOpen,
+        isInputFocused: isInputFocused,
+        isOffline: isOffline,
+        isHidden: isHidden,
+        hasActiveLocks: hasActiveLocks
+      });
+    }
+    return !isModalOpen && !isInputFocused && !isOffline && !isHidden && !hasActiveLocks;
+  }
+
+  async function refreshCurrentRouteAndNotifications(opts) {
+    var options = opts || {};
+    var curUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    if (!curUser) return;
+    if (!options.manual && !canRunSilentAutoRefreshNow()) return;
+
+    var activeRoute = state.route;
+    var req = getRoutePrimaryRequest(activeRoute);
+
+    var [notifRes, routeRes] = await Promise.all([
+      root.RGApi.callApi('getNotifications', { silentRefresh: true }),
+      req
+        ? root.RGApi.callApi(req.action, Object.assign({}, req.payload, { silentRefresh: true }))
+        : Promise.resolve(null)
+    ]);
+
+    if (!root.RGAuth || !root.RGAuth.getUser()) return;
+    if (!options.manual && !canRunSilentAutoRefreshNow()) return;
+
+    if (notifRes && notifRes.success && notifRes.data) {
+      var nextNotifFp = computeFingerprintSafe(notifRes.data);
+      if (nextNotifFp !== lastFingerprints.notifications) {
+        applyNotificationsState(notifRes.data);
+      }
+    }
+
+    if (state.route !== activeRoute) return;
+
+    if (req && routeRes && routeRes.success && routeRes.data) {
+      var nextRouteFp = computeFingerprintSafe(routeRes.data);
+      var prevRouteFp = lastFingerprints.routes[activeRoute];
+      if (options.manual || nextRouteFp !== prevRouteFp) {
+        lastFingerprints.routes[activeRoute] = nextRouteFp;
+        var container = document.getElementById('page-content');
+        var slot = container ? container.querySelector('.route-view') : null;
+        if (slot) {
+          await renderActiveRouteView(slot, buildAppCtx(), { silent: false });
+        } else {
+          await renderRoute();
+        }
+      }
+    } else if (options.manual) {
+      await renderRoute();
+    }
+  }
+
+  function stopAutoRefreshLoop() {
+    if (autoRefreshTimer) {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+  }
+
+  function startAutoRefreshLoop() {
+    stopAutoRefreshLoop();
+    autoRefreshTimer = setInterval(function () {
+      refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
+    }, 35000);
+
+    if (!autoRefreshListenersBound) {
+      autoRefreshListenersBound = true;
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'hidden') {
+          lastHiddenAt = Date.now();
+          return;
+        }
+        if (document.visibilityState === 'visible' && lastHiddenAt && (Date.now() - lastHiddenAt >= 15000)) {
+          lastHiddenAt = 0;
+          refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
+        }
+      });
+      window.addEventListener('online', function () {
+        refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
+      });
     }
   }
 
@@ -861,7 +1063,15 @@
         break;
       case 'reports':
         action = 'getReports';
-        payload = { type: 'all' };
+        payload = {
+          reportType: 'all_reservations',
+          dateFrom: '',
+          dateTo: '',
+          employeeId: '',
+          company: '',
+          branch: '',
+          logExport: false
+        };
         break;
       case 'employees':
         if (root.RGCrmCore && root.RGCrmCore.canUserPerform(u, 'view_employees')) {
@@ -870,7 +1080,7 @@
         break;
       case 'activity':
         action = 'getActivityLogs';
-        payload = { limit: 100 };
+        payload = {};
         break;
       case 'settings':
         if (root.RGCrmCore && (root.RGCrmCore.canAccessApi(u) || root.RGCrmCore.canUserPerform(u, 'manage_settings'))) {
@@ -903,33 +1113,62 @@
   }
 
   async function bootAuthenticatedApp() {
-    var user = await root.RGAuth.restoreSession();
+    var dashRange = (state.dashboard && state.dashboard.range) || '30d';
+    var consumed = root.RGAuth.consumeBootstrap ? root.RGAuth.consumeBootstrap() : null;
+    var user = root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+
+    if (user && consumed && consumed.data) {
+      if (root.RGAuth.primeBootstrapCaches) {
+        root.RGAuth.primeBootstrapCaches(consumed.data, consumed.range || dashRange);
+      }
+      renderAppShell(user);
+      if (consumed.data.notifications) applyNotificationsState(consumed.data.notifications);
+      await renderRoute();
+      scheduleBackgroundPrefetch(user);
+      startAutoRefreshLoop();
+      return;
+    }
+
+    if (!user && root.RGApi.getToken && root.RGApi.getToken()) {
+      var bootRes = await root.RGApi.callApi('getAppBootstrap', { range: dashRange });
+      if (bootRes && bootRes.success && bootRes.data && bootRes.data.user) {
+        user = bootRes.data.user;
+        if (root.RGAuth.setUser) root.RGAuth.setUser(user);
+        if (root.RGAuth.primeBootstrapCaches) {
+          root.RGAuth.primeBootstrapCaches(bootRes.data, dashRange);
+        }
+        renderAppShell(user);
+        if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
+        await renderRoute();
+        scheduleBackgroundPrefetch(user);
+        startAutoRefreshLoop();
+        return;
+      }
+      if (bootRes && bootRes.error === 'UNAUTHORIZED') {
+        root.RGApi.setToken('');
+        if (root.RGAuth.setUser) root.RGAuth.setUser(null);
+        stopAutoRefreshLoop();
+        renderLoginScreen();
+        return;
+      }
+    }
+
     if (!user) {
+      user = await root.RGAuth.restoreSession();
+    }
+    if (!user) {
+      stopAutoRefreshLoop();
       renderLoginScreen();
       return;
     }
+
     renderAppShell(user);
-
-    var dashRange = (state.dashboard && state.dashboard.range) || '30d';
-    var bootRes = await root.RGApi.callApi('getAppBootstrap', { range: dashRange });
-    if (bootRes && bootRes.success && bootRes.data) {
-      if (root.RGApi.primeCache) {
-        if (bootRes.data.dashboard) root.RGApi.primeCache('getDashboard', { range: dashRange }, bootRes.data.dashboard);
-        if (bootRes.data.employees) root.RGApi.primeCache('getEmployees', {}, bootRes.data.employees);
-        if (bootRes.data.notifications) root.RGApi.primeCache('getNotifications', {}, bootRes.data.notifications);
-        if (bootRes.data.problems) root.RGApi.primeCache('getProblems', {}, bootRes.data.problems);
-      }
-      if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
-      await renderRoute();
-      scheduleBackgroundPrefetch(user);
-      return;
-    }
-
     await Promise.all([
       renderRoute(),
       refreshNotifications()
     ]);
     scheduleBackgroundPrefetch(user);
+    startAutoRefreshLoop();
   }
 
   root.RGApp = {
@@ -939,6 +1178,7 @@
   };
 
   document.addEventListener('rg:unauthorized', function () {
+    stopAutoRefreshLoop();
     renderLoginScreen();
   });
 

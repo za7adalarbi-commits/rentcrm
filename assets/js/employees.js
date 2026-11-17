@@ -17,6 +17,13 @@
     return groups;
   }
 
+  function runWithLock(btnEl, lockKey, fn) {
+    if (root.RGApp && root.RGApp.withActionLock) {
+      return root.RGApp.withActionLock(btnEl, lockKey, fn);
+    }
+    return Promise.resolve().then(fn);
+  }
+
   async function render(container, ctx) {
     var t = ctx.t;
     var user = root.RGAuth.getUser();
@@ -125,7 +132,7 @@
                 '<div>' + esc(roleLabels[e.role] || e.role) + '</div>' +
                 '<div style="font-size:11px;color:var(--text-muted);" class="tabular-nums">' + permsList.length + ' صلاحية</div>' +
               '</td>' +
-              '<td><span class="status-tag ' + (isActive ? 'status-success' : 'status-danger') + '">' + (isActive ? 'نشط' : 'متوقف عن النشاط') + '</span></td>' +
+              '<td><span class="status-tag emp-status-tag ' + (isActive ? 'status-success' : 'status-danger') + '">' + (isActive ? 'نشط' : 'متوقف عن النشاط') + '</span></td>' +
               '<td class="tabular-nums">' + (e.reservationsCount || 0) + '</td>' +
               '<td class="tabular-nums">' + (e.followUpsCount || 0) + '</td>' +
               '<td class="tabular-nums">' + (e.problemsCount || 0) + '</td>' +
@@ -179,18 +186,64 @@
     });
 
     container.querySelectorAll('.emp-toggle-btn').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
+      btn.addEventListener('click', function () {
+        var empId = btn.getAttribute('data-id');
         var nextStatus = btn.getAttribute('data-next');
-        var resToggle = await root.RGApi.callApi('disableEmployee', {
-          employeeId: btn.getAttribute('data-id'),
-          status: nextStatus
-        });
-        if (resToggle.success) {
+        var isNowActive = nextStatus === 'active';
+        runWithLock(btn, 'disableEmployee:' + empId, function () {
+          var row = btn.closest('tr');
+          var statusTag = row ? row.querySelector('.emp-status-tag') : null;
+          var prevBtnText = btn.textContent;
+          var prevNext = nextStatus;
+          var prevBtnDanger = btn.classList.contains('btn-danger');
+          var prevTagText = statusTag ? statusTag.textContent : '';
+          var prevTagCls = statusTag ? statusTag.className : '';
+
+          btn.setAttribute('data-next', isNowActive ? 'disabled' : 'active');
+          btn.textContent = isNowActive ? 'إيقاف النشاط' : 'تشغيل النشاط';
+          btn.classList.toggle('btn-danger', isNowActive);
+          if (statusTag) {
+            statusTag.className = 'status-tag emp-status-tag ' + (isNowActive ? 'status-success' : 'status-danger');
+            statusTag.textContent = isNowActive ? 'نشط' : 'متوقف عن النشاط';
+          }
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('disableEmployee', {
+              employeeId: empId,
+              status: nextStatus
+            }, user);
+          }
           ctx.toast(nextStatus === 'disabled' ? 'تم إيقاف نشاط الموظف وإلغاء جلساته.' : 'تم تشغيل نشاط الموظف بنجاح.');
-          render(container, ctx);
-        } else {
-          ctx.toast(resToggle.message, true);
-        }
+
+          return root.RGApi.callApi('disableEmployee', {
+            employeeId: empId,
+            status: nextStatus,
+            _keepOptimisticCache: true
+          }).then(function (resToggle) {
+            if (!resToggle || !resToggle.success) {
+              if (btn.isConnected !== false) {
+                btn.setAttribute('data-next', prevNext);
+                btn.textContent = prevBtnText;
+                btn.classList.toggle('btn-danger', prevBtnDanger);
+              }
+              if (statusTag && statusTag.isConnected !== false) {
+                statusTag.className = prevTagCls;
+                statusTag.textContent = prevTagText;
+              }
+              ctx.toast((resToggle && resToggle.message) || 'تعذر تحديث حالة الموظف.', true);
+            }
+          }).catch(function () {
+            if (btn.isConnected !== false) {
+              btn.setAttribute('data-next', prevNext);
+              btn.textContent = prevBtnText;
+              btn.classList.toggle('btn-danger', prevBtnDanger);
+            }
+            if (statusTag && statusTag.isConnected !== false) {
+              statusTag.className = prevTagCls;
+              statusTag.textContent = prevTagText;
+            }
+            ctx.toast('تعذر الاتصال بالخادم أثناء تحديث حالة الموظف.', true);
+          });
+        });
       });
     });
 
@@ -204,7 +257,7 @@
       });
 
       var resetBtn = document.getElementById('preset-reset-btn');
-      resetBtn.addEventListener('click', async function () {
+      resetBtn.addEventListener('click', function () {
         if (resetBtn.getAttribute('data-confirm') !== '1') {
           resetBtn.setAttribute('data-confirm', '1');
           resetBtn.textContent = 'تأكيد استعادة الافتراضي؟';
@@ -218,15 +271,15 @@
           }, 3500);
           return;
         }
-        resetBtn.disabled = true;
-        var resp = await root.RGApi.callApi('resetRolePresets', {});
-        if (resp.success) {
-          ctx.toast(resp.message || 'تمت استعادة القوالب الافتراضية.');
-          render(container, ctx);
-        } else {
-          ctx.toast(resp.message, true);
-          resetBtn.disabled = false;
-        }
+        runWithLock(resetBtn, 'resetRolePresets', async function () {
+          var resp = await root.RGApi.callApi('resetRolePresets', {});
+          if (resp.success) {
+            ctx.toast(resp.message || 'تمت استعادة القوالب الافتراضية.');
+            render(container, ctx);
+          } else {
+            ctx.toast(resp.message, true);
+          }
+        });
       });
 
       container.querySelectorAll('.preset-edit-btn').forEach(function (btn) {
@@ -249,7 +302,7 @@
       });
 
       container.querySelectorAll('.preset-del-btn').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
+        btn.addEventListener('click', function () {
           if (btn.getAttribute('data-confirm') !== '1') {
             btn.setAttribute('data-confirm', '1');
             btn.textContent = 'تأكيد الحذف؟';
@@ -261,17 +314,18 @@
             }, 3500);
             return;
           }
-          btn.disabled = true;
-          var delResp = await root.RGApi.callApi('deleteRolePreset', { presetId: btn.getAttribute('data-id') });
-          if (delResp.success) {
-            ctx.toast(delResp.message || 'تم حذف الصلاحية الجاهزة.');
-            render(container, ctx);
-          } else {
-            ctx.toast(delResp.message, true);
-            btn.disabled = false;
-            btn.setAttribute('data-confirm', '0');
-            btn.textContent = 'حذف';
-          }
+          var pId = btn.getAttribute('data-id');
+          runWithLock(btn, 'deleteRolePreset:' + pId, async function () {
+            var delResp = await root.RGApi.callApi('deleteRolePreset', { presetId: pId });
+            if (delResp.success) {
+              ctx.toast(delResp.message || 'تم حذف الصلاحية الجاهزة.');
+              render(container, ctx);
+            } else {
+              ctx.toast(delResp.message, true);
+              btn.setAttribute('data-confirm', '0');
+              btn.textContent = 'حذف';
+            }
+          });
         });
       });
     }
@@ -392,7 +446,8 @@
       renderGrid();
     });
 
-    document.getElementById('pr-quick-perm-add').addEventListener('click', async function () {
+    var quickAddBtn = document.getElementById('pr-quick-perm-add');
+    quickAddBtn.addEventListener('click', function () {
       var lblEl = document.getElementById('pr-quick-perm-label');
       var grpEl = document.getElementById('pr-quick-perm-group');
       var lbl = lblEl.value.trim();
@@ -400,21 +455,23 @@
         ctx.toast('اكتب اسم الصلاحية الجديدة أولاً.', true);
         return;
       }
-      var addResp = await root.RGApi.callApi('savePermissionDefinition', {
-        label: lbl,
-        group: grpEl.value.trim() || 'صلاحيات مخصصة'
+      runWithLock(quickAddBtn, 'savePermissionDefinition:quick', async function () {
+        var addResp = await root.RGApi.callApi('savePermissionDefinition', {
+          label: lbl,
+          group: grpEl.value.trim() || 'صلاحيات مخصصة'
+        });
+        if (!addResp.success) {
+          ctx.toast(addResp.message, true);
+          return;
+        }
+        liveCustomPerms = addResp.data.customPermissions || [];
+        if (addResp.data.saved && addResp.data.saved.key) {
+          selectedSet[addResp.data.saved.key] = true;
+        }
+        lblEl.value = '';
+        renderGrid();
+        ctx.toast('تمت إضافة الصلاحية الجديدة وتحديدها في القالب.');
       });
-      if (!addResp.success) {
-        ctx.toast(addResp.message, true);
-        return;
-      }
-      liveCustomPerms = addResp.data.customPermissions || [];
-      if (addResp.data.saved && addResp.data.saved.key) {
-        selectedSet[addResp.data.saved.key] = true;
-      }
-      lblEl.value = '';
-      renderGrid();
-      ctx.toast('تمت إضافة الصلاحية الجديدة وتحديدها في القالب.');
     });
 
     document.getElementById('preset-modal-cancel').addEventListener('click', function () {
@@ -425,38 +482,37 @@
       }
     });
 
-    document.getElementById('preset-form').addEventListener('submit', async function (ev) {
+    document.getElementById('preset-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
       var errEl = document.getElementById('pr-form-err');
       errEl.classList.add('hidden');
       var saveBtn = document.getElementById('pr-save-btn');
-      saveBtn.disabled = true;
-
-      var perms = Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; });
-      var resp = await root.RGApi.callApi('saveRolePreset', {
-        id: isEdit ? existingPreset.id : '',
-        label: document.getElementById('pr-label').value,
-        jobTitle: document.getElementById('pr-job').value,
-        role: roleSelect.value,
-        permissions: perms
-      });
-
-      if (!resp.success) {
-        errEl.textContent = resp.message;
-        errEl.classList.remove('hidden');
-        saveBtn.disabled = false;
-        return;
-      }
-
-      ctx.toast(resp.message || 'تم حفظ الصلاحية الجاهزة.');
-      modalRoot.innerHTML = '';
-      if (onSaved) {
-        onSaved({
-          rolePresets: resp.data.rolePresets,
-          savedPreset: resp.data.savedPreset,
-          customPermissions: liveCustomPerms
+      runWithLock(saveBtn, 'saveRolePreset:' + (isEdit ? existingPreset.id : 'new'), async function () {
+        var perms = Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; });
+        var resp = await root.RGApi.callApi('saveRolePreset', {
+          id: isEdit ? existingPreset.id : '',
+          label: document.getElementById('pr-label').value,
+          jobTitle: document.getElementById('pr-job').value,
+          role: roleSelect.value,
+          permissions: perms
         });
-      }
+
+        if (!resp.success) {
+          errEl.textContent = resp.message;
+          errEl.classList.remove('hidden');
+          return;
+        }
+
+        ctx.toast(resp.message || 'تم حفظ الصلاحية الجاهزة.');
+        modalRoot.innerHTML = '';
+        if (onSaved) {
+          onSaved({
+            rolePresets: resp.data.rolePresets,
+            savedPreset: resp.data.savedPreset,
+            customPermissions: liveCustomPerms
+          });
+        }
+      });
     });
   }
 
@@ -508,57 +564,61 @@
         if (onDone) onDone({ customPermissions: liveCustom });
       });
 
-      document.getElementById('perm-add-form').addEventListener('submit', async function (ev) {
+      var permAddForm = document.getElementById('perm-add-form');
+      permAddForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
-        var resp = await root.RGApi.callApi('savePermissionDefinition', {
-          label: document.getElementById('new-perm-label').value,
-          group: document.getElementById('new-perm-group').value
+        var submitBtn = permAddForm.querySelector('button[type="submit"]');
+        runWithLock(submitBtn, 'savePermissionDefinition:add', async function () {
+          var resp = await root.RGApi.callApi('savePermissionDefinition', {
+            label: document.getElementById('new-perm-label').value,
+            group: document.getElementById('new-perm-group').value
+          });
+          if (!resp.success) {
+            ctx.toast(resp.message, true);
+            return;
+          }
+          liveCustom = resp.data.customPermissions || [];
+          ctx.toast('تمت إضافة الصلاحية الجديدة.');
+          renderCatalogModal();
         });
-        if (!resp.success) {
-          ctx.toast(resp.message, true);
-          return;
-        }
-        liveCustom = resp.data.customPermissions || [];
-        ctx.toast('تمت إضافة الصلاحية الجديدة.');
-        renderCatalogModal();
       });
 
       modalRoot.querySelectorAll('.perm-row-save').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
+        btn.addEventListener('click', function () {
           var key = btn.getAttribute('data-key');
           var row = modalRoot.querySelector('tr[data-perm-key="' + key + '"]');
           var labelVal = row.querySelector('.perm-row-label').value;
           var groupVal = row.querySelector('.perm-row-group').value;
-          btn.disabled = true;
-          var resp = await root.RGApi.callApi('savePermissionDefinition', {
-            key: key,
-            label: labelVal,
-            group: groupVal
+          runWithLock(btn, 'savePermissionDefinition:' + key, async function () {
+            var resp = await root.RGApi.callApi('savePermissionDefinition', {
+              key: key,
+              label: labelVal,
+              group: groupVal
+            });
+            if (!resp.success) {
+              ctx.toast(resp.message, true);
+              return;
+            }
+            liveCustom = resp.data.customPermissions || [];
+            ctx.toast('تم حفظ تعديل الصلاحية.');
+            renderCatalogModal();
           });
-          if (!resp.success) {
-            ctx.toast(resp.message, true);
-            btn.disabled = false;
-            return;
-          }
-          liveCustom = resp.data.customPermissions || [];
-          ctx.toast('تم حفظ تعديل الصلاحية.');
-          renderCatalogModal();
         });
       });
 
       modalRoot.querySelectorAll('.perm-row-del').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
+        btn.addEventListener('click', function () {
           var key = btn.getAttribute('data-key');
-          btn.disabled = true;
-          var resp = await root.RGApi.callApi('deletePermissionDefinition', { key: key });
-          if (!resp.success) {
-            ctx.toast(resp.message, true);
-            btn.disabled = false;
-            return;
-          }
-          liveCustom = resp.data.customPermissions || [];
-          ctx.toast(resp.message || 'تم تحديث الصلاحية.');
-          renderCatalogModal();
+          runWithLock(btn, 'deletePermissionDefinition:' + key, async function () {
+            var resp = await root.RGApi.callApi('deletePermissionDefinition', { key: key });
+            if (!resp.success) {
+              ctx.toast(resp.message, true);
+              return;
+            }
+            liveCustom = resp.data.customPermissions || [];
+            ctx.toast(resp.message || 'تم تحديث الصلاحية.');
+            renderCatalogModal();
+          });
         });
       });
     }
@@ -935,7 +995,7 @@
         });
       });
 
-      delPresetBtn.addEventListener('click', async function () {
+      delPresetBtn.addEventListener('click', function () {
         if (presetSelect.value === 'custom') return;
         if (delPresetBtn.getAttribute('data-confirm') !== '1') {
           delPresetBtn.setAttribute('data-confirm', '1');
@@ -948,16 +1008,19 @@
           }, 3500);
           return;
         }
-        captureDraft();
-        var resp = await root.RGApi.callApi('deleteRolePreset', { presetId: presetSelect.value });
-        if (!resp.success) {
-          ctx.toast(resp.message, true);
-          return;
-        }
-        presets = root.RGCrmCore.normalizeRolePresets(resp.data.rolePresets);
-        draftState.presetId = 'custom';
-        ctx.toast(resp.message || 'تم حذف الصلاحية الجاهزة.');
-        drawModal();
+        var targetPId = presetSelect.value;
+        runWithLock(delPresetBtn, 'deleteRolePreset:' + targetPId, async function () {
+          captureDraft();
+          var resp = await root.RGApi.callApi('deleteRolePreset', { presetId: targetPId });
+          if (!resp.success) {
+            ctx.toast(resp.message, true);
+            return;
+          }
+          presets = root.RGCrmCore.normalizeRolePresets(resp.data.rolePresets);
+          draftState.presetId = 'custom';
+          ctx.toast(resp.message || 'تم حذف الصلاحية الجاهزة.');
+          drawModal();
+        });
       });
 
       document.getElementById('ef-manage-perms-btn').addEventListener('click', function () {
@@ -1008,10 +1071,12 @@
         if (onSaved) onSaved();
       });
 
-      document.getElementById('emp-form').addEventListener('submit', async function (ev) {
+      var empForm = document.getElementById('emp-form');
+      empForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
         var errEl = document.getElementById('emp-form-err');
         errEl.classList.add('hidden');
+        var submitBtn = empForm.querySelector('button[type="submit"]');
 
         var selectedPerms = [];
         modalRoot.querySelectorAll('.ef-perm-checkbox:checked').forEach(function (cb) {
@@ -1035,15 +1100,17 @@
           payload.password = pwd;
         }
 
-        var res = await root.RGApi.callApi(isEdit ? 'updateEmployee' : 'createEmployee', payload);
-        if (!res.success) {
-          errEl.textContent = res.message;
-          errEl.classList.remove('hidden');
-          return;
-        }
-        ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
-        modalRoot.innerHTML = '';
-        if (onSaved) onSaved();
+        runWithLock(submitBtn, isEdit ? ('updateEmployee:' + existing.id) : ('createEmployee:' + payload.username), async function () {
+          var res = await root.RGApi.callApi(isEdit ? 'updateEmployee' : 'createEmployee', payload);
+          if (!res.success) {
+            errEl.textContent = res.message;
+            errEl.classList.remove('hidden');
+            return;
+          }
+          ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
+          modalRoot.innerHTML = '';
+          if (onSaved) onSaved();
+        });
       });
     }
 

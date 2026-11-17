@@ -958,7 +958,7 @@
     var keys = Object.keys(payload);
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
-      if (k === 'visibleCols' || k.charAt(0) === '_') continue;
+      if (k === 'visibleCols' || k === 'silentRefresh' || k.charAt(0) === '_') continue;
       var v = payload[k];
       if (v !== undefined) out[k] = v;
     }
@@ -974,7 +974,12 @@
   }
 
   function buildGasFetchOptions(action, token, payload) {
-    return {
+    var bodyStr = JSON.stringify({
+      action: normalizeStr(action),
+      token: normalizeStr(token),
+      payload: compactGasPayload(payload)
+    });
+    var opts = {
       method: 'POST',
       redirect: 'follow',
       credentials: 'omit',
@@ -982,12 +987,12 @@
       headers: {
         'Content-Type': 'text/plain;charset=utf-8'
       },
-      body: JSON.stringify({
-        action: normalizeStr(action),
-        token: normalizeStr(token),
-        payload: compactGasPayload(payload)
-      })
+      body: bodyStr
     };
+    if (bodyStr.length < 60000) {
+      opts.keepalive = true;
+    }
+    return opts;
   }
 
   function parseGasResponseText(rawText, httpStatus) {
@@ -1085,7 +1090,7 @@
 
   function stableSerializePayload(payload) {
     if (!payload || typeof payload !== 'object') return '{}';
-    var ignored = { visibleCols: true, forceRefresh: true };
+    var ignored = { visibleCols: true, forceRefresh: true, silentRefresh: true };
     var keys = Object.keys(payload).filter(function (k) {
       return !ignored[k] && payload[k] !== undefined;
     }).sort();
@@ -1522,6 +1527,53 @@
     });
   }
 
+  function hashFnvStep(str, seed) {
+    var h = seed === undefined ? 2166136261 : seed;
+    for (var i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+    }
+    return h >>> 0;
+  }
+
+  function feedFingerprintHash(val, h, depth) {
+    if (depth > 8) return hashFnvStep('D', h);
+    if (val === null || val === undefined) return hashFnvStep('N', h);
+    var t = typeof val;
+    if (t === 'string') return hashFnvStep('S:' + val, h);
+    if (t === 'number' || t === 'boolean') return hashFnvStep(t.charAt(0) + ':' + String(val), h);
+    if (Array.isArray(val)) {
+      h = hashFnvStep('A[' + val.length + ']', h);
+      for (var i = 0; i < val.length; i++) {
+        h = feedFingerprintHash(val[i], h, depth + 1);
+      }
+      return h;
+    }
+    if (t === 'object') {
+      var keys = Object.keys(val).sort();
+      h = hashFnvStep('O{' + keys.length + '}', h);
+      for (var j = 0; j < keys.length; j++) {
+        var k = keys[j];
+        if (val[k] === undefined) continue;
+        h = hashFnvStep('K:' + k, h);
+        h = feedFingerprintHash(val[k], h, depth + 1);
+      }
+      return h;
+    }
+    return h;
+  }
+
+  function computeDataFingerprint(data) {
+    if (data === undefined || data === null) return '0';
+    var h = feedFingerprintHash(data, 2166136261, 0);
+    return (h >>> 0).toString(16);
+  }
+
+  function shouldAutoRefreshNow(flags) {
+    var f = flags || {};
+    return !f.isModalOpen && !f.isInputFocused && !f.isOffline && !f.isHidden && !f.hasActiveLocks;
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -1577,6 +1629,8 @@
     buildMutationLockKey: buildMutationLockKey,
     isProblemClosedStatus: isProblemClosedStatus,
     resolveNotificationTarget: resolveNotificationTarget,
-    applyOptimisticProblemPatch: applyOptimisticProblemPatch
+    applyOptimisticProblemPatch: applyOptimisticProblemPatch,
+    computeDataFingerprint: computeDataFingerprint,
+    shouldAutoRefreshNow: shouldAutoRefreshNow
   };
 }));
