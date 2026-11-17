@@ -68,6 +68,7 @@
   var sandboxDbCache = null;
   var apiResponseCache = {};
   var inFlightRequests = {};
+  var inFlightMutations = {};
   var persistTimer = null;
 
   function hydrateApiCache() {
@@ -166,6 +167,307 @@
     var key = core.buildApiCacheKey(getGasUrl(), getToken(), action, payload || {});
     var entry = apiResponseCache[key];
     return Boolean(entry && Date.now() < entry.expiresAt);
+  }
+
+  function getCachedData(action, payload, allowStale) {
+    var core = root.RGCrmCore;
+    if (!core || !core.getApiCachePolicy || !core.buildApiCacheKey) return null;
+    var policy = core.getApiCachePolicy(action);
+    if (!policy.cacheable) return null;
+    var key = core.buildApiCacheKey(getGasUrl(), getToken(), action, payload || {});
+    var entry = apiResponseCache[key];
+    if (!entry || !entry.response || !entry.response.success) return null;
+    var limit = allowStale !== false ? (entry.staleUntil || entry.expiresAt || 0) : (entry.expiresAt || 0);
+    if (Date.now() >= limit) return null;
+    return entry.response.data;
+  }
+
+  function getCachedActionKey(entryKey) {
+    var parts = String(entryKey || '').split('|');
+    return parts.length >= 3 ? parts[2] : '';
+  }
+
+  function patchCachedScopes(scopes, updaterFn) {
+    var list = Array.isArray(scopes) ? scopes : [scopes];
+    var touched = false;
+    var now = Date.now();
+    Object.keys(apiResponseCache).forEach(function (k) {
+      var entry = apiResponseCache[k];
+      if (!entry || !entry.response || !entry.response.success || !entry.response.data) return;
+      if (list.indexOf(entry.scope) === -1) return;
+      var actName = getCachedActionKey(k);
+      var nextData = updaterFn(entry.response.data, actName, k);
+      if (nextData !== undefined && nextData !== null) {
+        entry.response = Object.assign({}, entry.response, { data: nextData });
+        entry.storedAt = now;
+        touched = true;
+      }
+    });
+    if (touched) schedulePersistApiCache(false);
+  }
+
+  function findCachedProblem(problemId) {
+    var target = String(problemId || '').trim();
+    if (!target) return null;
+    var found = null;
+    var direct = getCachedData('getProblemDetails', { problemId: target }, true);
+    if (direct && direct.problem) return direct.problem;
+    Object.keys(apiResponseCache).some(function (k) {
+      var entry = apiResponseCache[k];
+      if (!entry || !entry.response || !entry.response.success || !entry.response.data) return false;
+      var act = getCachedActionKey(k);
+      if (act === 'getProblems' && Array.isArray(entry.response.data.items)) {
+        var match = entry.response.data.items.find(function (p) { return p.id === target || p.problemNumber === target; });
+        if (match) { found = match; return true; }
+      }
+      if (act === 'getReservationDetails' && Array.isArray(entry.response.data.problems)) {
+        var m2 = entry.response.data.problems.find(function (p) { return p.id === target || p.problemNumber === target; });
+        if (m2) {
+          found = Object.assign({}, m2, {
+            updates: (entry.response.data.problemUpdates || []).filter(function (u) { return u.problemId === m2.id; })
+          });
+          return true;
+        }
+      }
+      return false;
+    });
+    return found;
+  }
+
+  function applyOptimisticMutation(action, payload, actor) {
+    var p = payload || {};
+    var core = root.RGCrmCore;
+    var actUser = actor || (root.RGAuth && root.RGAuth.getUser()) || { id: '', name: 'الموظف' };
+    var empCache = getCachedData('getEmployees', {}, true);
+    var allEmployees = (empCache && Array.isArray(empCache.items)) ? empCache.items : [];
+    var nowIso = new Date().toISOString();
+
+    if (action === 'claimReservation' || action === 'unclaimReservation') {
+      var resIdClaim = String(p.reservationId || '').trim();
+      if (!resIdClaim || !core) return;
+      var applyAssignFn = function (rec) {
+        if (!rec || rec.id !== resIdClaim) return rec;
+        var res = action === 'claimReservation'
+          ? core.claimReservationRecord(rec, actUser)
+          : core.unclaimReservationRecord(rec, actUser.id);
+        return Object.assign({}, rec, {
+          assignedEmployeeIds: res.assignedEmployeeIds,
+          assignedEmployeeNames: res.assignedEmployeeNames
+        });
+      };
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(applyAssignFn) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdClaim) {
+          return Object.assign({}, data, { reservation: applyAssignFn(data.reservation) });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          var nextAssigned = data.assignedReservations.slice();
+          if (action === 'unclaimReservation') {
+            nextAssigned = nextAssigned.filter(function (r) { return r.id !== resIdClaim; });
+          } else if (!nextAssigned.some(function (r) { return r.id === resIdClaim; })) {
+            var foundRes = null;
+            Object.keys(apiResponseCache).some(function (k) {
+              var e = apiResponseCache[k];
+              if (e && e.response && e.response.data && Array.isArray(e.response.data.items)) {
+                foundRes = e.response.data.items.find(function (x) { return x.id === resIdClaim; });
+                return Boolean(foundRes);
+              }
+              return false;
+            });
+            if (foundRes) nextAssigned.unshift(applyAssignFn(foundRes));
+          }
+          return Object.assign({}, data, { assignedReservations: nextAssigned });
+        }
+        return undefined;
+      });
+      return;
+    }
+
+    if (action === 'quickUpdateReservationStatus' || action === 'addFollowUp') {
+      var resIdFu = String(p.reservationId || '').trim();
+      var nextSt = String(p.status || '').trim();
+      var actionText = action === 'quickUpdateReservationStatus'
+        ? ('تحديث سريع للحالة إلى: ' + nextSt)
+        : String(p.action || '').trim();
+      var noteText = String(p.note !== undefined ? p.note : (p.notes || '')).trim();
+      var lastTxt = action === 'quickUpdateReservationStatus'
+        ? (noteText ? (actionText + ' — ' + noteText) : actionText)
+        : (actionText + (noteText ? (' — ' + noteText) : ''));
+
+      var patchResStatus = function (rec) {
+        if (!rec || rec.id !== resIdFu) return rec;
+        return Object.assign({}, rec, {
+          internalStatus: nextSt || rec.internalStatus,
+          lastUpdateText: lastTxt || rec.lastUpdateText,
+          lastUpdatedById: actUser.id || rec.lastUpdatedById,
+          lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
+          lastUpdatedAt: nowIso,
+          isFollowed: true
+        });
+      };
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchResStatus) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdFu) {
+          var newFuObj = {
+            id: 'FU_OPT_' + Date.now(),
+            reservationId: resIdFu,
+            reservationNumber: data.reservation.reservationNumber,
+            customerName: data.reservation.customerName,
+            employeeId: actUser.id,
+            employeeName: actUser.name,
+            status: nextSt,
+            action: actionText,
+            notes: noteText,
+            followUpDate: nowIso.substring(0, 10),
+            followUpTime: new Date().toTimeString().substring(0, 8),
+            createdAt: nowIso
+          };
+          return Object.assign({}, data, {
+            reservation: patchResStatus(data.reservation),
+            followUps: [newFuObj].concat(data.followUps || [])
+          });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, {
+            assignedReservations: data.assignedReservations.map(patchResStatus)
+          });
+        }
+        return undefined;
+      });
+      return;
+    }
+
+    if (action === 'updateProblem') {
+      var prbId = String(p.problemId || '').trim();
+      if (!prbId || !core) return;
+      var affectedResId = '';
+      var stillOpenOnRes = null;
+
+      patchCachedScopes(['problems', 'reservations'], function (data, actName) {
+        if (actName === 'getProblems' && Array.isArray(data.items)) {
+          var nextItems = data.items.map(function (item) {
+            if (item.id !== prbId) return item;
+            affectedResId = item.reservationId || affectedResId;
+            return core.applyOptimisticProblemPatch(item, p, actUser, allEmployees);
+          });
+          if (affectedResId) {
+            stillOpenOnRes = nextItems.some(function (it) {
+              return it.reservationId === affectedResId && !core.isProblemClosedStatus(it.status);
+            });
+          }
+          return Object.assign({}, data, { items: nextItems });
+        }
+        if (actName === 'getProblemDetails' && data.problem && data.problem.id === prbId) {
+          affectedResId = data.problem.reservationId || affectedResId;
+          return Object.assign({}, data, {
+            problem: core.applyOptimisticProblemPatch(data.problem, p, actUser, allEmployees)
+          });
+        }
+        if (actName === 'getReservationDetails' && Array.isArray(data.problems)) {
+          var touched = false;
+          var nextPrbs = data.problems.map(function (it) {
+            if (it.id !== prbId) return it;
+            touched = true;
+            affectedResId = it.reservationId || (data.reservation && data.reservation.id) || affectedResId;
+            return core.applyOptimisticProblemPatch(it, p, actUser, allEmployees);
+          });
+          if (!touched) return undefined;
+          var isResOpen = nextPrbs.some(function (it) { return !core.isProblemClosedStatus(it.status); });
+          stillOpenOnRes = isResOpen;
+          var patchedItem = nextPrbs.find(function (it) { return it.id === prbId; });
+          var newUpdateEntry = (patchedItem && patchedItem.updates && patchedItem.updates[0]) ? [patchedItem.updates[0]] : [];
+          return Object.assign({}, data, {
+            problems: nextPrbs,
+            problemUpdates: newUpdateEntry.concat(data.problemUpdates || []),
+            reservation: data.reservation ? Object.assign({}, data.reservation, { hasProblem: isResOpen }) : data.reservation
+          });
+        }
+        return undefined;
+      });
+
+      if (affectedResId && stillOpenOnRes !== null) {
+        patchCachedScopes(['reservations'], function (data, actName) {
+          if (actName === 'getReservations' && Array.isArray(data.items)) {
+            return Object.assign({}, data, {
+              items: data.items.map(function (r) {
+                return r.id === affectedResId ? Object.assign({}, r, { hasProblem: Boolean(stillOpenOnRes) }) : r;
+              })
+            });
+          }
+          return undefined;
+        });
+      }
+      return;
+    }
+
+    if (action === 'createProblem') {
+      var resIdPrb = String(p.reservationId || '').trim();
+      var optPrb = p._optimisticProblem || {
+        id: 'PRB_OPT_' + Date.now(),
+        problemNumber: 'PRB-' + String(Date.now()).slice(-6),
+        reservationId: resIdPrb,
+        reservationNumber: p.reservationNumber || '',
+        customerName: p.customerName || '',
+        createdById: actUser.id,
+        createdByName: actUser.name,
+        assignedEmployeeIds: Array.isArray(p.assignedEmployeeIds) && p.assignedEmployeeIds.length ? p.assignedEmployeeIds : [actUser.id],
+        assignedEmployeeNames: [],
+        description: String(p.description || '').trim(),
+        priority: p.priority || 'متوسط',
+        status: 'جديدة',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        updates: []
+      };
+      patchCachedScopes(['reservations', 'problems'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, {
+            items: data.items.map(function (r) {
+              if (r.id !== resIdPrb) return r;
+              return Object.assign({}, r, {
+                hasProblem: true,
+                priority: optPrb.priority === 'مرتفع' ? 'مرتفع' : r.priority
+              });
+            })
+          });
+        }
+        if (actName === 'getProblems' && Array.isArray(data.items)) {
+          return Object.assign({}, data, {
+            items: [optPrb].concat(data.items),
+            total: (data.total || data.items.length) + 1
+          });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdPrb) {
+          return Object.assign({}, data, {
+            reservation: Object.assign({}, data.reservation, {
+              hasProblem: true,
+              priority: optPrb.priority === 'مرتفع' ? 'مرتفع' : data.reservation.priority
+            }),
+            problems: [optPrb].concat(data.problems || [])
+          });
+        }
+        return undefined;
+      });
+      return;
+    }
+
+    if (action === 'markNotificationRead') {
+      patchCachedScopes(['notifications'], function (data, actName) {
+        if (actName !== 'getNotifications' || !Array.isArray(data.items)) return undefined;
+        var nextItems = data.items.map(function (n) {
+          if (p.markAll || n.id === p.notificationId) {
+            return Object.assign({}, n, { isRead: true });
+          }
+          return n;
+        });
+        var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
+        return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
+      });
+    }
   }
 
   function setGasUrl(url) {
@@ -1424,6 +1726,9 @@
           }).filter(Boolean);
         }
         prb.updatedAt = new Date().toISOString();
+        var defaultPrbNote = prb.status === 'مغلقة'
+          ? 'تم إغلاق المشكلة'
+          : (prb.description !== prevDesc ? 'تعديل بيانات التذكرة' : ('تحديث الحالة إلى ' + prb.status));
         db.problemUpdates.unshift({
           id: genId('PRBU'),
           problemId: prb.id,
@@ -1434,7 +1739,7 @@
           newStatus: prb.status,
           previousPriority: prevPrio,
           newPriority: prb.priority,
-          note: String(payload.note || (prb.description !== prevDesc ? 'تعديل بيانات التذكرة' : ('تحديث الحالة إلى ' + prb.status))),
+          note: String(payload.note || defaultPrbNote),
           createdAt: prb.updatedAt
         });
         if (prb.description !== prevDesc) {
@@ -1454,7 +1759,14 @@
           linkedRes.hasProblem = stillOpen;
         }
         saveSandboxDb(db);
-        return { success: true, message: 'تم تحديث التذكرة / المشكلة بنجاح.', data: prb, error: null };
+        return {
+          success: true,
+          message: 'تم تحديث التذكرة / المشكلة بنجاح.',
+          data: Object.assign({}, prb, {
+            updates: db.problemUpdates.filter(function (u) { return u.problemId === prb.id; })
+          }),
+          error: null
+        };
       }
 
       case 'getProblems': {
@@ -1473,6 +1785,26 @@
           });
         });
         return { success: true, message: '', data: { items: prbList, total: prbList.length }, error: null };
+      }
+
+      case 'getProblemDetails': {
+        var pidTarget = String(payload.problemId || payload.problemNumber || '').trim();
+        var foundPrb = db.problems.find(function (p) {
+          return p.id === pidTarget || p.problemNumber === pidTarget;
+        });
+        if (!foundPrb) {
+          return { success: false, message: 'المشكلة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        }
+        return {
+          success: true,
+          message: '',
+          data: {
+            problem: Object.assign({}, foundPrb, {
+              updates: db.problemUpdates.filter(function (u) { return u.problemId === foundPrb.id; })
+            })
+          },
+          error: null
+        };
       }
 
       case 'getEmployees': {
@@ -2120,6 +2452,14 @@
       return inFlightRequests[cacheKey];
     }
 
+    var mutLockKey = (!policy.cacheable && core && core.buildMutationLockKey)
+      ? core.buildMutationLockKey(action, payload)
+      : (!policy.cacheable ? String(action || '') : '');
+
+    if (!policy.cacheable && mutLockKey && inFlightMutations[mutLockKey]) {
+      return inFlightMutations[mutLockKey];
+    }
+
     async function executeCall() {
       var parsed;
       if (!gasUrl) {
@@ -2197,16 +2537,60 @@
           schedulePersistApiCache(false);
         } else if (core && core.getCacheInvalidationScopes) {
           var invScopes = core.getCacheInvalidationScopes(action);
-          if (invScopes.length > 0) {
+          var skipOptimisticClear = payload && payload._keepOptimisticCache;
+          if (skipOptimisticClear) {
+            // Reconcile primary cached scopes softly while clearing secondary summary/report caches
+            var secondaryOnly = invScopes.filter(function (s) {
+              return s === 'dashboard' || s === 'reports' || s === 'activity' || s === 'employees';
+            });
+            if (secondaryOnly.length > 0) clearCache(secondaryOnly);
+            if (action === 'createProblem' && parsed.data && parsed.data.id) {
+              patchCachedScopes(['problems'], function (data, actName) {
+                if (actName === 'getProblems' && Array.isArray(data.items)) {
+                  var replaced = data.items.map(function (it) {
+                    return String(it.id || '').indexOf('PRB_OPT_') === 0 && it.reservationId === parsed.data.reservationId
+                      ? parsed.data
+                      : it;
+                  });
+                  return Object.assign({}, data, { items: replaced });
+                }
+                return undefined;
+              });
+            }
+            if (action === 'updateProblem' && parsed.data && parsed.data.id) {
+              patchCachedScopes(['problems'], function (data, actName) {
+                if (actName === 'getProblems' && Array.isArray(data.items)) {
+                  return Object.assign({}, data, {
+                    items: data.items.map(function (it) { return it.id === parsed.data.id ? Object.assign({}, it, parsed.data) : it; })
+                  });
+                }
+                if (actName === 'getProblemDetails' && data.problem && data.problem.id === parsed.data.id) {
+                  return Object.assign({}, data, { problem: Object.assign({}, data.problem, parsed.data) });
+                }
+                return undefined;
+              });
+            }
+          } else if (invScopes.length > 0) {
             clearCache(invScopes);
           }
         }
+      } else if (payload && payload._keepOptimisticCache && core && core.getCacheInvalidationScopes) {
+        // Optimistic mutation failed on server -> clear affected primary caches so next read fetches truth
+        clearCache(core.getCacheInvalidationScopes(action));
       }
       return parsed;
     }
 
     if (policy.cacheable && !skipCache && cacheKey) {
       return startNetworkOrSandbox();
+    }
+
+    if (mutLockKey) {
+      var mutPromise = executeCall().finally(function () {
+        delete inFlightMutations[mutLockKey];
+      });
+      inFlightMutations[mutLockKey] = mutPromise;
+      return mutPromise;
     }
 
     return executeCall();
@@ -2273,6 +2657,10 @@
     clearCache: clearCache,
     primeCache: primeCache,
     hasCached: hasCached,
+    getCachedData: getCachedData,
+    patchCachedScopes: patchCachedScopes,
+    findCachedProblem: findCachedProblem,
+    applyOptimisticMutation: applyOptimisticMutation,
     callApi: callApi,
     pingGasUrl: pingGasUrl
   };

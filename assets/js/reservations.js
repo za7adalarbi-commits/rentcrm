@@ -59,6 +59,19 @@
     return String(iso).replace('T', ' ').substring(0, 16);
   }
 
+  function runWithLock(btnEl, lockKey, fn) {
+    if (root.RGApp && root.RGApp.withActionLock) {
+      return root.RGApp.withActionLock(btnEl, lockKey, fn);
+    }
+    return Promise.resolve().then(fn);
+  }
+
+  function isProblemClosed(status) {
+    return root.RGCrmCore && root.RGCrmCore.isProblemClosedStatus
+      ? root.RGCrmCore.isProblemClosedStatus(status)
+      : (status === 'مغلقة' || status === 'تم الحل');
+  }
+
   async function render(container, ctx) {
     var t = ctx.t;
     var currentUser = root.RGAuth.getUser();
@@ -243,51 +256,117 @@
       }
 
       region.querySelectorAll('.tbl-quick-status').forEach(function (sel) {
-        sel.addEventListener('change', async function () {
+        sel.addEventListener('change', function () {
           var rid = sel.getAttribute('data-id');
-          sel.disabled = true;
-          var resp = await root.RGApi.callApi('quickUpdateReservationStatus', {
-            reservationId: rid,
-            status: sel.value
+          var nextStatus = sel.value;
+          runWithLock(sel, 'quickUpdateReservationStatus:' + rid, function () {
+            var nowIso = new Date().toISOString();
+            var actionText = 'تحديث سريع للحالة إلى: ' + nextStatus;
+            currentItems = currentItems.map(function (item) {
+              if (item.id !== rid) return item;
+              return Object.assign({}, item, {
+                internalStatus: nextStatus,
+                lastUpdateText: actionText,
+                lastUpdatedById: currentEmpId || item.lastUpdatedById,
+                lastUpdatedByName: (currentUser && currentUser.name) || item.lastUpdatedByName,
+                lastUpdatedAt: nowIso,
+                isFollowed: true
+              });
+            });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
+                reservationId: rid,
+                status: nextStatus
+              }, currentUser);
+            }
+            paintCurrentItems();
+            ctx.toast('تم تحديث حالة الحجز إلى: ' + nextStatus);
+            return root.RGApi.callApi('quickUpdateReservationStatus', {
+              reservationId: rid,
+              status: nextStatus,
+              _keepOptimisticCache: true
+            }).then(function (resp) {
+              if (resp && resp.success) {
+                ctx.refreshNotifications();
+              } else {
+                ctx.toast((resp && resp.message) || 'تعذر تحديث حالة الحجز.', true);
+                refreshTableRegion();
+              }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم أثناء تحديث الحالة.', true);
+              refreshTableRegion();
+            });
           });
-          if (resp.success) {
-            ctx.toast('تم تحديث حالة الحجز إلى: ' + sel.value);
-            ctx.refreshNotifications();
-            refreshTableRegion();
-          } else {
-            ctx.toast(resp.message, true);
-            sel.disabled = false;
-          }
         });
       });
 
       region.querySelectorAll('.btn-claim-res').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
-          btn.disabled = true;
-          var resp = await root.RGApi.callApi('claimReservation', { reservationId: btn.getAttribute('data-id') });
-          if (resp.success) {
-            ctx.toast(resp.message || 'تم استلام الحجز في قائمتك بنجاح.');
-            ctx.refreshNotifications();
-            refreshTableRegion();
-          } else {
-            ctx.toast(resp.message, true);
-            btn.disabled = false;
-          }
+        btn.addEventListener('click', function () {
+          var rid = btn.getAttribute('data-id');
+          runWithLock(btn, 'claimReservation:' + rid, function () {
+            currentItems = currentItems.map(function (item) {
+              if (item.id !== rid) return item;
+              var claimed = root.RGCrmCore.claimReservationRecord(item, currentUser);
+              return Object.assign({}, item, {
+                assignedEmployeeIds: claimed.assignedEmployeeIds,
+                assignedEmployeeNames: claimed.assignedEmployeeNames
+              });
+            });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: rid }, currentUser);
+            }
+            paintCurrentItems();
+            ctx.toast('تم استلام الحجز في قائمتك بنجاح.');
+            return root.RGApi.callApi('claimReservation', {
+              reservationId: rid,
+              _keepOptimisticCache: true
+            }).then(function (resp) {
+              if (resp && resp.success) {
+                ctx.refreshNotifications();
+              } else {
+                ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true);
+                refreshTableRegion();
+              }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
+              refreshTableRegion();
+            });
+          });
         });
       });
 
       region.querySelectorAll('.btn-unclaim-res').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
-          btn.disabled = true;
-          var resp = await root.RGApi.callApi('unclaimReservation', { reservationId: btn.getAttribute('data-id') });
-          if (resp.success) {
-            ctx.toast(resp.message || 'تم إلغاء استلام الحجز.');
-            ctx.refreshNotifications();
-            refreshTableRegion();
-          } else {
-            ctx.toast(resp.message, true);
-            btn.disabled = false;
-          }
+        btn.addEventListener('click', function () {
+          var rid = btn.getAttribute('data-id');
+          runWithLock(btn, 'unclaimReservation:' + rid, function () {
+            currentItems = currentItems.map(function (item) {
+              if (item.id !== rid) return item;
+              var unclaimed = root.RGCrmCore.unclaimReservationRecord(item, currentEmpId);
+              return Object.assign({}, item, {
+                assignedEmployeeIds: unclaimed.assignedEmployeeIds,
+                assignedEmployeeNames: unclaimed.assignedEmployeeNames
+              });
+            });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('unclaimReservation', { reservationId: rid }, currentUser);
+            }
+            paintCurrentItems();
+            ctx.toast('تم إلغاء استلام الحجز.');
+            return root.RGApi.callApi('unclaimReservation', {
+              reservationId: rid,
+              _keepOptimisticCache: true
+            }).then(function (resp) {
+              if (resp && resp.success) {
+                ctx.refreshNotifications();
+              } else {
+                ctx.toast((resp && resp.message) || 'تعذر إلغاء استلام الحجز.', true);
+                refreshTableRegion();
+              }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم أثناء إلغاء الاستلام.', true);
+              refreshTableRegion();
+            });
+          });
         });
       });
 
@@ -309,6 +388,15 @@
       if (totalEl) totalEl.textContent = String(data.total || 0);
       region.innerHTML = buildTableRegionHtml(data);
       bindTableRegionEvents(region);
+    }
+
+    function paintCurrentItems() {
+      paintTableRegion({
+        items: currentItems,
+        total: Number((container.querySelector('#res-total-count') && container.querySelector('#res-total-count').textContent) || currentItems.length),
+        page: state.page,
+        totalPages: currentTotalPages
+      });
     }
 
     async function refreshTableRegion() {
@@ -384,24 +472,27 @@
 
     var pullBtn = document.getElementById('res-pull-btn');
     if (pullBtn) {
-      pullBtn.addEventListener('click', async function () {
-        pullBtn.disabled = true;
-        var prevLabel = pullBtn.textContent;
-        pullBtn.textContent = ctx.lang === 'en' ? 'Pulling reservations...' : 'جاري سحب الحجوزات...';
-        var resp = await root.RGApi.callApi('pullReservations', {});
-        pullBtn.disabled = false;
-        pullBtn.textContent = prevLabel;
-        if (resp.success && resp.data) {
-          var d = resp.data;
-          var msg = ctx.lang === 'en'
-            ? ('Pulled reservations: ' + (d.importedCount || 0) + ' new · ' + (d.updatedCount || 0) + ' updated · ' + (d.extensionsCount || 0) + ' extensions')
-            : ('تم سحب الحجوزات بنجاح: ' + (d.importedCount || 0) + ' جديد · ' + (d.updatedCount || 0) + ' محدث · ' + (d.extensionsCount || 0) + ' تمديد');
-          ctx.toast(msg);
-          ctx.refreshNotifications();
-          refreshTableRegion();
-        } else {
-          ctx.toast(resp.message || 'تعذر سحب الحجوزات.', true);
-        }
+      pullBtn.addEventListener('click', function () {
+        runWithLock(pullBtn, 'pullReservations', async function () {
+          var prevLabel = pullBtn.textContent;
+          pullBtn.textContent = ctx.lang === 'en' ? 'Pulling reservations...' : 'جاري سحب الحجوزات...';
+          try {
+            var resp = await root.RGApi.callApi('pullReservations', {});
+            if (resp.success && resp.data) {
+              var d = resp.data;
+              var msg = ctx.lang === 'en'
+                ? ('Pulled reservations: ' + (d.importedCount || 0) + ' new · ' + (d.updatedCount || 0) + ' updated · ' + (d.extensionsCount || 0) + ' extensions')
+                : ('تم سحب الحجوزات بنجاح: ' + (d.importedCount || 0) + ' جديد · ' + (d.updatedCount || 0) + ' محدث · ' + (d.extensionsCount || 0) + ' تمديد');
+              ctx.toast(msg);
+              ctx.refreshNotifications();
+              refreshTableRegion();
+            } else {
+              ctx.toast((resp && resp.message) || 'تعذر سحب الحجوزات.', true);
+            }
+          } finally {
+            pullBtn.textContent = prevLabel;
+          }
+        });
       });
     }
 
@@ -432,335 +523,502 @@
     }
 
     var d = detailRes.data;
-    var r = d.reservation;
     var user = root.RGAuth.getUser();
     var canAssign = root.RGCrmCore.canUserPerform(user, 'assign_employees');
     var canEditReservation = root.RGCrmCore.canUserPerform(user, 'edit_reservation_details');
     var canEditAnyFollowUp = root.RGCrmCore.canUserPerform(user, 'edit_any_followup');
     var canEditTicket = root.RGCrmCore.canUserPerform(user, 'edit_ticket_details');
 
-    var assignedIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [];
-    var assignedNames = Array.isArray(r.assignedEmployeeNames) ? r.assignedEmployeeNames : [];
-    var isClaimedByMe = assignedIds.indexOf(user.id) !== -1;
-
     function reopenSelf() {
-      openReservationDrawer(r.id, ctx, employees, onUpdated, opts);
+      openReservationDrawer(d.reservation.id, ctx, employees, onUpdated, opts);
       if (onUpdated) onUpdated();
     }
 
-    modalRoot.innerHTML =
-      '<div class="drawer-backdrop" id="res-drawer-backdrop" role="dialog" aria-modal="true" aria-labelledby="drawer-res-title">' +
-        '<div class="drawer-panel">' +
-          '<div class="modal-header">' +
-            '<div>' +
-              '<h3 class="modal-title mono" id="drawer-res-title">حجز ' + esc(r.reservationNumber) + '</h3>' +
-              '<div class="meta-inline"><span>' + esc(r.customerName) + '</span><span>·</span><span class="mono">' + esc(r.customerPhone) + '</span></div>' +
-            '</div>' +
-            '<div class="toolbar-row" style="margin-bottom:0;">' +
-              (opts && opts.onBack ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-back-btn">' + esc(opts.backLabel || 'العودة لملف الموظف') + '</button>' : '') +
-              (canEditReservation ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-edit-res-btn">تعديل تفاصيل الحجز</button>' : '') +
-              '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">تصدير PDF</button>' +
-              '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">تحويل إلى مشكلة</button>' +
-              '<button type="button" class="btn btn-sm" id="drawer-close-btn">إغلاق</button>' +
-            '</div>' +
-          '</div>' +
+    function notifyParentUpdated() {
+      if (onUpdated) onUpdated();
+    }
 
-          // Interactive Self-Service Claim / Unclaim & Quick Status Bar
-          '<div class="surface-card" style="padding:14px;border-inline-start:3px solid #d32228;display:flex;flex-direction:column;gap:12px;">' +
-            '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
-              '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus) + '</span>' +
-                '<span class="status-tag ' + priorityClass(r.priority) + '">الأولوية: ' + esc(r.priority || 'عادي') + '</span>' +
-                '<span style="font-size:12.5px;color:var(--text-secondary);">المستلمون حاليًا: <strong class="tabular-nums">' + assignedIds.length + '</strong></span>' +
+    function paintDrawer() {
+      var r = d.reservation;
+      var assignedIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [];
+      var assignedNames = Array.isArray(r.assignedEmployeeNames) ? r.assignedEmployeeNames : [];
+      var isClaimedByMe = assignedIds.indexOf(user.id) !== -1;
+
+      modalRoot.innerHTML =
+        '<div class="drawer-backdrop" id="res-drawer-backdrop" role="dialog" aria-modal="true" aria-labelledby="drawer-res-title">' +
+          '<div class="drawer-panel">' +
+            '<div class="modal-header">' +
+              '<div>' +
+                '<h3 class="modal-title mono" id="drawer-res-title">حجز ' + esc(r.reservationNumber) + '</h3>' +
+                '<div class="meta-inline"><span>' + esc(r.customerName) + '</span><span>·</span><span class="mono">' + esc(r.customerPhone) + '</span></div>' +
               '</div>' +
-              '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                (isClaimedByMe
-                  ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-unclaim-btn">إلغاء الاستلام من عندي</button>'
-                  : '<button type="button" class="btn btn-sm btn-primary" id="drawer-claim-btn">استلام الحجز عندي</button>') +
+              '<div class="toolbar-row" style="margin-bottom:0;">' +
+                (opts && opts.onBack ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-back-btn">' + esc(opts.backLabel || 'العودة لملف الموظف') + '</button>' : '') +
+                (canEditReservation ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-edit-res-btn">تعديل تفاصيل الحجز</button>' : '') +
+                '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">تصدير PDF</button>' +
+                '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">تحويل إلى مشكلة</button>' +
+                '<button type="button" class="btn btn-sm" id="drawer-close-btn">إغلاق</button>' +
               '</div>' +
             '</div>' +
-            '<div class="quick-status-bar grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)_auto] gap-2 items-center">' +
-              '<select class="select" id="drawer-quick-status" aria-label="تحديث الحالة السريع">' +
-                root.RGCrmCore.FOLLOWUP_STATUSES.map(function (s) {
-                  return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
-                }).join('') +
-              '</select>' +
-              '<input class="input" id="drawer-quick-note" placeholder="ملاحظة سريعة اختيارية عند تغيير الحالة...">' +
-              '<button type="button" class="btn btn-charcoal" id="drawer-quick-status-btn">تحديث الحالة الآن</button>' +
-            '</div>' +
-          '</div>' +
 
-          '<div class="detail-summary-grid">' +
-            '<div class="detail-kv"><span class="detail-k">الشركة / الفرع</span><span class="detail-v">' + esc(r.companyName) + ' — ' + esc(r.branchName) + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">السيارة</span><span class="detail-v">' + esc(r.carName) + ' (' + esc(r.plateNumber || '-') + ')</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">الفترة</span><span class="detail-v mono" style="white-space:nowrap;">' + esc(formatDateOnly(r.startDate)) + ' → ' + esc(formatDateOnly(r.endDate)) + ' (' + Number(r.daysCount || 1) + ' يوم)</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">الاستلام / التسليم</span><span class="detail-v">' + esc(r.pickupTypeAr) + ' / ' + esc(r.returnTypeAr) + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">الحالة الأصلية / الداخلية</span><span class="detail-v">' + esc(r.originalStatusAr) + ' / ' + esc(r.internalStatus) + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">آخر تحديث</span><span class="detail-v">' + esc(r.lastUpdateText || '-') + '</span></div>' +
-          '</div>' +
-
-          // Collaborator Chips + Individual Removal (Supervisor/GM) + Self Unclaim reminder
-          '<div class="surface-card" style="padding:14px;">' +
-            '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
-              '<h4 style="margin:0;font-size:14px;">الموظفون المشاركون في متابعة الحجز (' + assignedIds.length + ')</h4>' +
-              '<span style="font-size:12px;color:var(--text-muted);">يمكن لأكثر من موظف استلام ومتابعة نفس الحجز معًا</span>' +
-            '</div>' +
-            (assignedIds.length === 0
-              ? '<div style="font-size:13px;color:var(--text-muted);">لا يوجد موظفون مستلمون بعد — اضغط «استلام الحجز عندي» أعلاه للبدء فورًا.</div>'
-              : '<div style="display:flex;flex-wrap:wrap;gap:8px;">' +
-                  assignedIds.map(function (empId, idx) {
-                    var empName = assignedNames[idx] || empId;
-                    var isSelf = empId === user.id;
-                    return '<span class="collab-chip">' +
-                      '<span>' + esc(empName) + (isSelf ? ' (أنت)' : '') + '</span>' +
-                      (canAssign
-                        ? '<button type="button" class="collab-chip-remove drawer-remove-emp" data-emp-id="' + esc(empId) + '" data-emp-name="' + esc(empName) + '" title="إزالة إسناد ' + esc(empName) + '" aria-label="إزالة إسناد ' + esc(empName) + '">✕</button>'
-                        : '') +
-                    '</span>';
-                  }).join('') +
-                '</div>') +
-          '</div>' +
-
-          '<div class="kpi-grid-3">' +
-            '<div class="kpi-card"><span class="kpi-label">أيام الحجز</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.daysCount || 0) + '</span></div>' +
-            '<div class="kpi-card"><span class="kpi-label">المبلغ الأساسي</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.baseAmount || 0) + '</span></div>' +
-            '<div class="kpi-card"><span class="kpi-label">التمديدات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.extensionsAmount || 0) + '</span></div>' +
-            '<div class="kpi-card kpi-success"><span class="kpi-label">الإجمالي (ر.س)</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.totalAmount || 0) + '</span></div>' +
-            '<div class="kpi-card"><span class="kpi-label">المتابعات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + d.followUps.length + '</span></div>' +
-            '<div class="kpi-card ' + (d.problems.length ? 'kpi-danger' : '') + '"><span class="kpi-label">المشكلات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + d.problems.length + '</span></div>' +
-          '</div>' +
-
-          '<div class="charts-grid">' +
-            '<div class="chart-card"><h4 class="chart-card-title">حالة الحجز والتفصيل المالي</h4><div class="chart-canvas-wrap" style="height:190px;"><canvas id="res-drawer-chart-finance"></canvas></div></div>' +
-            '<div class="chart-card"><h4 class="chart-card-title">أداء الموظفين ونشاط الحجز</h4><div class="chart-canvas-wrap" style="height:190px;"><canvas id="res-drawer-chart-activity"></canvas></div></div>' +
-          '</div>' +
-
-          (canAssign ? (
-            '<div class="surface-card" style="padding:14px;">' +
-              '<h4 style="margin:0 0 10px;font-size:14px;">إدارة الإسناد من المشرف / المدير (تحديد متعدد)</h4>' +
-              '<div class="checkbox-grid">' +
-                employees.filter(function (e) { return e.status === 'active'; }).map(function (emp) {
-                  var checked = assignedIds.indexOf(emp.id) !== -1 ? 'checked' : '';
-                  return '<label class="checkbox-item"><input type="checkbox" class="drawer-assign-chk" value="' + esc(emp.id) + '" ' + checked + '> ' + esc(emp.name) + '</label>';
-                }).join('') +
+            // Interactive Self-Service Claim / Unclaim & Quick Status Bar
+            '<div class="surface-card" style="padding:14px;border-inline-start:3px solid #d32228;display:flex;flex-direction:column;gap:12px;">' +
+              '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
+                '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                  '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus) + '</span>' +
+                  '<span class="status-tag ' + priorityClass(r.priority) + '">الأولوية: ' + esc(r.priority || 'عادي') + '</span>' +
+                  '<span style="font-size:12.5px;color:var(--text-secondary);">المستلمون حاليًا: <strong class="tabular-nums">' + assignedIds.length + '</strong></span>' +
+                '</div>' +
+                '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                  (isClaimedByMe
+                    ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-unclaim-btn">إلغاء الاستلام من عندي</button>'
+                    : '<button type="button" class="btn btn-sm btn-primary" id="drawer-claim-btn">استلام الحجز عندي</button>') +
+                '</div>' +
               '</div>' +
-              '<div style="margin-top:10px;"><button type="button" class="btn btn-sm btn-primary" id="drawer-save-assign">حفظ الإسناد</button></div>' +
-            '</div>'
-          ) : '') +
-
-          '<form class="surface-card" id="drawer-fu-form" style="padding:14px;display:flex;flex-direction:column;gap:10px;">' +
-            '<h4 style="margin:0;font-size:14px;">إضافة متابعة جديدة (متاحة دون انتظار الإسناد)</h4>' +
-            '<div class="form-grid-2">' +
-              '<div class="form-group"><label class="form-label" for="fu-status">حالة المتابعة</label>' +
-                '<select class="select" id="fu-status">' +
+              '<div class="quick-status-bar grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)_auto] gap-2 items-center">' +
+                '<select class="select" id="drawer-quick-status" aria-label="تحديث الحالة السريع">' +
                   root.RGCrmCore.FOLLOWUP_STATUSES.map(function (s) {
                     return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                   }).join('') +
-                '</select></div>' +
-              '<div class="form-group"><label class="form-label" for="fu-action">الإجراء المتخذ</label>' +
-                '<input class="input" id="fu-action" placeholder="مثال: التواصل مع العميل لتأكيد الاستلام" required></div>' +
+                '</select>' +
+                '<input class="input" id="drawer-quick-note" placeholder="ملاحظة سريعة اختيارية عند تغيير الحالة...">' +
+                '<button type="button" class="btn btn-charcoal" id="drawer-quick-status-btn">تحديث الحالة الآن</button>' +
+              '</div>' +
             '</div>' +
-            '<div class="form-group"><label class="form-label" for="fu-notes">الملاحظات</label>' +
-              '<textarea class="textarea" id="fu-notes" placeholder="تفاصيل إضافية..."></textarea></div>' +
-            '<div id="fu-form-error" class="form-error hidden"></div>' +
-            '<div><button type="submit" class="btn btn-primary" id="fu-submit-btn">حفظ المتابعة</button></div>' +
-          '</form>' +
 
-          '<div>' +
-            '<h4 style="margin:0 0 10px;font-size:14px;">سجل المتابعات والملاحظات (' + d.followUps.length + ')</h4>' +
-            (d.followUps.length === 0
-              ? '<div class="empty-state" style="padding:20px;">لا توجد متابعات مسجلة لهذا الحجز بعد.</div>'
-              : '<div class="timeline-list">' + d.followUps.map(function (f) {
-                  var canEditThisFu = canEditAnyFollowUp || f.employeeId === user.id;
+            '<div class="detail-summary-grid">' +
+              '<div class="detail-kv"><span class="detail-k">الشركة / الفرع</span><span class="detail-v">' + esc(r.companyName) + ' — ' + esc(r.branchName) + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">السيارة</span><span class="detail-v">' + esc(r.carName) + ' (' + esc(r.plateNumber || '-') + ')</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">الفترة</span><span class="detail-v mono" style="white-space:nowrap;">' + esc(formatDateOnly(r.startDate)) + ' → ' + esc(formatDateOnly(r.endDate)) + ' (' + Number(r.daysCount || 1) + ' يوم)</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">الاستلام / التسليم</span><span class="detail-v">' + esc(r.pickupTypeAr) + ' / ' + esc(r.returnTypeAr) + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">الحالة الأصلية / الداخلية</span><span class="detail-v">' + esc(r.originalStatusAr) + ' / ' + esc(r.internalStatus) + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">آخر تحديث</span><span class="detail-v">' + esc(r.lastUpdateText || '-') + '</span></div>' +
+            '</div>' +
+
+            // Collaborator Chips + Individual Removal (Supervisor/GM) + Self Unclaim reminder
+            '<div class="surface-card" style="padding:14px;">' +
+              '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
+                '<h4 style="margin:0;font-size:14px;">الموظفون المشاركون في متابعة الحجز (' + assignedIds.length + ')</h4>' +
+                '<span style="font-size:12px;color:var(--text-muted);">يمكن لأكثر من موظف استلام ومتابعة نفس الحجز معًا</span>' +
+              '</div>' +
+              (assignedIds.length === 0
+                ? '<div style="font-size:13px;color:var(--text-muted);">لا يوجد موظفون مستلمون بعد — اضغط «استلام الحجز عندي» أعلاه للبدء فورًا.</div>'
+                : '<div style="display:flex;flex-wrap:wrap;gap:8px;">' +
+                    assignedIds.map(function (empId, idx) {
+                      var empName = assignedNames[idx] || empId;
+                      var isSelf = empId === user.id;
+                      return '<span class="collab-chip">' +
+                        '<span>' + esc(empName) + (isSelf ? ' (أنت)' : '') + '</span>' +
+                        (canAssign
+                          ? '<button type="button" class="collab-chip-remove drawer-remove-emp" data-emp-id="' + esc(empId) + '" data-emp-name="' + esc(empName) + '" title="إزالة إسناد ' + esc(empName) + '" aria-label="إزالة إسناد ' + esc(empName) + '">✕</button>'
+                          : '') +
+                      '</span>';
+                    }).join('') +
+                  '</div>') +
+            '</div>' +
+
+            '<div class="kpi-grid-3">' +
+              '<div class="kpi-card"><span class="kpi-label">أيام الحجز</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.daysCount || 0) + '</span></div>' +
+              '<div class="kpi-card"><span class="kpi-label">المبلغ الأساسي</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.baseAmount || 0) + '</span></div>' +
+              '<div class="kpi-card"><span class="kpi-label">التمديدات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.extensionsAmount || 0) + '</span></div>' +
+              '<div class="kpi-card kpi-success"><span class="kpi-label">الإجمالي (ر.س)</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + Number(r.totalAmount || 0) + '</span></div>' +
+              '<div class="kpi-card"><span class="kpi-label">المتابعات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + d.followUps.length + '</span></div>' +
+              '<div class="kpi-card ' + (d.problems.length ? 'kpi-danger' : '') + '"><span class="kpi-label">المشكلات</span><span class="kpi-value tabular-nums" style="font-size:20px;">' + d.problems.length + '</span></div>' +
+            '</div>' +
+
+            '<div class="charts-grid">' +
+              '<div class="chart-card"><h4 class="chart-card-title">حالة الحجز والتفصيل المالي</h4><div class="chart-canvas-wrap" style="height:190px;"><canvas id="res-drawer-chart-finance"></canvas></div></div>' +
+              '<div class="chart-card"><h4 class="chart-card-title">أداء الموظفين ونشاط الحجز</h4><div class="chart-canvas-wrap" style="height:190px;"><canvas id="res-drawer-chart-activity"></canvas></div></div>' +
+            '</div>' +
+
+            (canAssign ? (
+              '<div class="surface-card" style="padding:14px;">' +
+                '<h4 style="margin:0 0 10px;font-size:14px;">إدارة الإسناد من المشرف / المدير (تحديد متعدد)</h4>' +
+                '<div class="checkbox-grid">' +
+                  employees.filter(function (e) { return e.status === 'active'; }).map(function (emp) {
+                    var checked = assignedIds.indexOf(emp.id) !== -1 ? 'checked' : '';
+                    return '<label class="checkbox-item"><input type="checkbox" class="drawer-assign-chk" value="' + esc(emp.id) + '" ' + checked + '> ' + esc(emp.name) + '</label>';
+                  }).join('') +
+                '</div>' +
+                '<div style="margin-top:10px;"><button type="button" class="btn btn-sm btn-primary" id="drawer-save-assign">حفظ الإسناد</button></div>' +
+              '</div>'
+            ) : '') +
+
+            '<form class="surface-card" id="drawer-fu-form" style="padding:14px;display:flex;flex-direction:column;gap:10px;">' +
+              '<h4 style="margin:0;font-size:14px;">إضافة متابعة جديدة (متاحة دون انتظار الإسناد)</h4>' +
+              '<div class="form-grid-2">' +
+                '<div class="form-group"><label class="form-label" for="fu-status">حالة المتابعة</label>' +
+                  '<select class="select" id="fu-status">' +
+                    root.RGCrmCore.FOLLOWUP_STATUSES.map(function (s) {
+                      return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
+                    }).join('') +
+                  '</select></div>' +
+                '<div class="form-group"><label class="form-label" for="fu-action">الإجراء المتخذ</label>' +
+                  '<input class="input" id="fu-action" placeholder="مثال: التواصل مع العميل لتأكيد الاستلام" required></div>' +
+              '</div>' +
+              '<div class="form-group"><label class="form-label" for="fu-notes">الملاحظات</label>' +
+                '<textarea class="textarea" id="fu-notes" placeholder="تفاصيل إضافية..."></textarea></div>' +
+              '<div id="fu-form-error" class="form-error hidden"></div>' +
+              '<div><button type="submit" class="btn btn-primary" id="fu-submit-btn">حفظ المتابعة</button></div>' +
+            '</form>' +
+
+            '<div>' +
+              '<h4 style="margin:0 0 10px;font-size:14px;">سجل المتابعات والملاحظات (' + d.followUps.length + ')</h4>' +
+              (d.followUps.length === 0
+                ? '<div class="empty-state" style="padding:20px;">لا توجد متابعات مسجلة لهذا الحجز بعد.</div>'
+                : '<div class="timeline-list">' + d.followUps.map(function (f) {
+                    var canEditThisFu = canEditAnyFollowUp || f.employeeId === user.id;
+                    return '<div class="timeline-item">' +
+                      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                        '<strong>' + esc(f.employeeName) + '</strong>' +
+                        '<div style="display:flex;align-items:center;gap:8px;">' +
+                          '<span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span>' +
+                          (canEditThisFu ? '<button type="button" class="btn btn-sm btn-edit-fu" data-fu-id="' + esc(f.id) + '">تعديل</button>' : '') +
+                        '</div>' +
+                      '</div>' +
+                      '<div>' + esc(f.action) + '</div>' +
+                      (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + esc(f.notes) + '</div>' : '') +
+                      '<div class="meta-inline mono"><span>' + esc(formatDateOnly(f.followUpDate)) + '</span><span>·</span><span>' + esc(f.followUpTime) + '</span></div>' +
+                    '</div>';
+                  }).join('') + '</div>') +
+            '</div>' +
+
+            (d.problems.length ? (
+              '<div>' +
+                '<h4 style="margin:0 0 10px;font-size:14px;">المشكلات / التذاكر المرتبطة بالحجز (' + d.problems.length + ')</h4>' +
+                '<div class="timeline-list">' + d.problems.map(function (p) {
+                  var prbClosed = isProblemClosed(p.status);
                   return '<div class="timeline-item">' +
                     '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                      '<strong>' + esc(f.employeeName) + '</strong>' +
-                      '<div style="display:flex;align-items:center;gap:8px;">' +
-                        '<span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span>' +
-                        (canEditThisFu ? '<button type="button" class="btn btn-sm btn-edit-fu" data-fu-id="' + esc(f.id) + '">تعديل</button>' : '') +
+                      '<strong class="mono">' + esc(p.problemNumber) + '</strong>' +
+                      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                        '<span class="status-tag ' + priorityClass(p.priority) + '">' + esc(p.priority) + '</span>' +
+                        '<span class="status-tag ' + (prbClosed ? 'status-success' : 'status-info') + '">' + esc(p.status) + '</span>' +
+                        (!prbClosed ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb-in-drawer" data-prb-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
+                        '<button type="button" class="btn btn-sm btn-primary btn-edit-prb-in-drawer" data-prb-id="' + esc(p.id) + '">' +
+                          (canEditTicket ? 'تعديل التذكرة' : 'تحديث التذكرة') +
+                        '</button>' +
                       '</div>' +
                     '</div>' +
-                    '<div>' + esc(f.action) + '</div>' +
-                    (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + esc(f.notes) + '</div>' : '') +
-                    '<div class="meta-inline mono"><span>' + esc(formatDateOnly(f.followUpDate)) + '</span><span>·</span><span>' + esc(f.followUpTime) + '</span></div>' +
+                    '<div>' + esc(p.description) + '</div>' +
+                    '<div class="meta-inline"><span>بواسطة: ' + esc(p.createdByName) + '</span><span>·</span><span>المسؤولون: ' + esc((p.assignedEmployeeNames || []).join('، ') || '-') + '</span></div>' +
                   '</div>';
-                }).join('') + '</div>') +
+                }).join('') + '</div>' +
+              '</div>'
+            ) : '') +
           '</div>' +
+        '</div>';
 
-          (d.problems.length ? (
-            '<div>' +
-              '<h4 style="margin:0 0 10px;font-size:14px;">المشكلات / التذاكر المرتبطة بالحجز (' + d.problems.length + ')</h4>' +
-              '<div class="timeline-list">' + d.problems.map(function (p) {
-                return '<div class="timeline-item">' +
-                  '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                    '<strong class="mono">' + esc(p.problemNumber) + '</strong>' +
-                    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                      '<span class="status-tag ' + priorityClass(p.priority) + '">' + esc(p.priority) + '</span>' +
-                      '<span class="status-tag status-info">' + esc(p.status) + '</span>' +
-                      '<button type="button" class="btn btn-sm btn-primary btn-edit-prb-in-drawer" data-prb-id="' + esc(p.id) + '">' +
-                        (canEditTicket ? 'تعديل التذكرة' : 'تحديث التذكرة') +
-                      '</button>' +
-                    '</div>' +
-                  '</div>' +
-                  '<div>' + esc(p.description) + '</div>' +
-                  '<div class="meta-inline"><span>بواسطة: ' + esc(p.createdByName) + '</span><span>·</span><span>المسؤولون: ' + esc((p.assignedEmployeeNames || []).join('، ') || '-') + '</span></div>' +
-                '</div>';
-              }).join('') + '</div>' +
-            '</div>'
-          ) : '') +
-        '</div>' +
-      '</div>';
-
-    document.getElementById('drawer-close-btn').addEventListener('click', function () { modalRoot.innerHTML = ''; });
-    var backBtn = document.getElementById('drawer-back-btn');
-    if (backBtn && opts && opts.onBack) {
-      backBtn.addEventListener('click', function () { opts.onBack(); });
-    }
-
-    var claimBtn = document.getElementById('drawer-claim-btn');
-    if (claimBtn) {
-      claimBtn.addEventListener('click', async function () {
-        claimBtn.disabled = true;
-        var resp = await root.RGApi.callApi('claimReservation', { reservationId: r.id });
-        if (resp.success) {
-          ctx.toast(resp.message || 'تم استلام الحجز في قائمتك بنجاح.');
-          ctx.refreshNotifications();
-          reopenSelf();
-        } else {
-          ctx.toast(resp.message, true);
-          claimBtn.disabled = false;
-        }
-      });
-    }
-
-    var unclaimBtn = document.getElementById('drawer-unclaim-btn');
-    if (unclaimBtn) {
-      unclaimBtn.addEventListener('click', async function () {
-        unclaimBtn.disabled = true;
-        var resp = await root.RGApi.callApi('unclaimReservation', { reservationId: r.id });
-        if (resp.success) {
-          ctx.toast(resp.message || 'تم إلغاء استلام الحجز من حسابك.');
-          ctx.refreshNotifications();
-          reopenSelf();
-        } else {
-          ctx.toast(resp.message, true);
-          unclaimBtn.disabled = false;
-        }
-      });
-    }
-
-    var quickBtn = document.getElementById('drawer-quick-status-btn');
-    if (quickBtn) {
-      quickBtn.addEventListener('click', async function () {
-        quickBtn.disabled = true;
-        var nextStatus = document.getElementById('drawer-quick-status').value;
-        var quickNote = document.getElementById('drawer-quick-note').value;
-        var resp = await root.RGApi.callApi('quickUpdateReservationStatus', {
-          reservationId: r.id,
-          status: nextStatus,
-          note: quickNote
-        });
-        if (resp.success) {
-          ctx.toast('تم تحديث حالة الحجز إلى: ' + nextStatus);
-          ctx.refreshNotifications();
-          reopenSelf();
-        } else {
-          ctx.toast(resp.message, true);
-          quickBtn.disabled = false;
-        }
-      });
-    }
-
-    var editResBtn = document.getElementById('drawer-edit-res-btn');
-    if (editResBtn) {
-      editResBtn.addEventListener('click', function () {
-        openEditReservationModal(r, ctx, reopenSelf, reopenSelf);
-      });
-    }
-
-    modalRoot.querySelectorAll('.drawer-remove-emp').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
-        btn.disabled = true;
-        var resp = await root.RGApi.callApi('removeAssignment', {
-          reservationId: r.id,
-          employeeId: btn.getAttribute('data-emp-id')
-        });
-        if (resp.success) {
-          ctx.toast('تمت إزالة ' + btn.getAttribute('data-emp-name') + ' من الحجز.');
-          ctx.refreshNotifications();
-          reopenSelf();
-        } else {
-          ctx.toast(resp.message, true);
-          btn.disabled = false;
-        }
-      });
-    });
-
-    var saveAssignBtn = document.getElementById('drawer-save-assign');
-    if (saveAssignBtn) {
-      saveAssignBtn.addEventListener('click', async function () {
-        var ids = Array.from(modalRoot.querySelectorAll('.drawer-assign-chk:checked')).map(function (c) { return c.value; });
-        var resp = await root.RGApi.callApi('assignEmployees', { reservationId: r.id, employeeIds: ids });
-        if (resp.success) {
-          ctx.toast('تم تحديث الموظفين المسؤولين عن الحجز.');
-          ctx.refreshNotifications();
-          reopenSelf();
-        } else {
-          ctx.toast(resp.message, true);
-        }
-      });
-    }
-
-    document.getElementById('drawer-fu-form').addEventListener('submit', async function (ev) {
-      ev.preventDefault();
-      var errEl = document.getElementById('fu-form-error');
-      errEl.classList.add('hidden');
-      var resp = await root.RGApi.callApi('addFollowUp', {
-        reservationId: r.id,
-        status: document.getElementById('fu-status').value,
-        action: document.getElementById('fu-action').value,
-        notes: document.getElementById('fu-notes').value
-      });
-      if (!resp.success) {
-        errEl.textContent = resp.message;
-        errEl.classList.remove('hidden');
-        return;
+      document.getElementById('drawer-close-btn').addEventListener('click', function () { modalRoot.innerHTML = ''; });
+      var backBtn = document.getElementById('drawer-back-btn');
+      if (backBtn && opts && opts.onBack) {
+        backBtn.addEventListener('click', function () { opts.onBack(); });
       }
-      ctx.toast('تمت إضافة المتابعة بنجاح.');
-      ctx.refreshNotifications();
-      reopenSelf();
-    });
 
-    modalRoot.querySelectorAll('.btn-edit-fu').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var fuId = btn.getAttribute('data-fu-id');
-        var fu = d.followUps.find(function (x) { return x.id === fuId; });
-        if (fu) openEditFollowUpModal(fu, r, ctx, reopenSelf, reopenSelf);
-      });
-    });
-
-    modalRoot.querySelectorAll('.btn-edit-prb-in-drawer').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var prbId = btn.getAttribute('data-prb-id');
-        var prb = d.problems.find(function (x) { return x.id === prbId; });
-        if (prb && root.RGProblems && root.RGProblems.openProblemUpdateModal) {
-          var enriched = Object.assign({}, prb, {
-            updates: (d.problemUpdates || []).filter(function (u) { return u.problemId === prb.id; })
+      var claimBtn = document.getElementById('drawer-claim-btn');
+      if (claimBtn) {
+        claimBtn.addEventListener('click', function () {
+          runWithLock(claimBtn, 'claimReservation:' + r.id, function () {
+            var claimed = root.RGCrmCore.claimReservationRecord(r, user);
+            d.reservation = Object.assign({}, r, {
+              assignedEmployeeIds: claimed.assignedEmployeeIds,
+              assignedEmployeeNames: claimed.assignedEmployeeNames
+            });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: r.id }, user);
+            }
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast('تم استلام الحجز في قائمتك بنجاح.');
+            return root.RGApi.callApi('claimReservation', { reservationId: r.id, _keepOptimisticCache: true }).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true); reopenSelf(); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم.', true);
+              reopenSelf();
+            });
           });
-          root.RGProblems.openProblemUpdateModal(enriched, employees, ctx, reopenSelf, reopenSelf);
-        }
+        });
+      }
+
+      var unclaimBtn = document.getElementById('drawer-unclaim-btn');
+      if (unclaimBtn) {
+        unclaimBtn.addEventListener('click', function () {
+          runWithLock(unclaimBtn, 'unclaimReservation:' + r.id, function () {
+            var unclaimed = root.RGCrmCore.unclaimReservationRecord(r, user.id);
+            d.reservation = Object.assign({}, r, {
+              assignedEmployeeIds: unclaimed.assignedEmployeeIds,
+              assignedEmployeeNames: unclaimed.assignedEmployeeNames
+            });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('unclaimReservation', { reservationId: r.id }, user);
+            }
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast('تم إلغاء استلام الحجز من حسابك.');
+            return root.RGApi.callApi('unclaimReservation', { reservationId: r.id, _keepOptimisticCache: true }).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر إلغاء الاستلام.', true); reopenSelf(); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم.', true);
+              reopenSelf();
+            });
+          });
+        });
+      }
+
+      var quickBtn = document.getElementById('drawer-quick-status-btn');
+      if (quickBtn) {
+        quickBtn.addEventListener('click', function () {
+          var nextStatus = document.getElementById('drawer-quick-status').value;
+          var quickNote = String(document.getElementById('drawer-quick-note').value || '').trim();
+          runWithLock(quickBtn, 'quickUpdateReservationStatus:' + r.id, function () {
+            var now = new Date();
+            var nowIso = now.toISOString();
+            var actionText = 'تحديث سريع للحالة إلى: ' + nextStatus;
+            var optFu = {
+              id: 'FU_OPT_' + Date.now(),
+              reservationId: r.id,
+              reservationNumber: r.reservationNumber,
+              customerName: r.customerName,
+              employeeId: user.id,
+              employeeName: user.name,
+              status: nextStatus,
+              action: actionText,
+              notes: quickNote,
+              followUpDate: nowIso.substring(0, 10),
+              followUpTime: now.toTimeString().substring(0, 8),
+              createdAt: nowIso
+            };
+            d.reservation = Object.assign({}, r, {
+              internalStatus: nextStatus,
+              lastUpdateText: quickNote ? (actionText + ' — ' + quickNote) : actionText,
+              lastUpdatedById: user.id,
+              lastUpdatedByName: user.name,
+              lastUpdatedAt: nowIso
+            });
+            d.followUps = [optFu].concat(d.followUps || []);
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
+                reservationId: r.id,
+                status: nextStatus,
+                note: quickNote
+              }, user);
+            }
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast('تم تحديث حالة الحجز إلى: ' + nextStatus);
+            return root.RGApi.callApi('quickUpdateReservationStatus', {
+              reservationId: r.id,
+              status: nextStatus,
+              note: quickNote,
+              _keepOptimisticCache: true
+            }).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر تحديث الحالة.', true); reopenSelf(); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم.', true);
+              reopenSelf();
+            });
+          });
+        });
+      }
+
+      var editResBtn = document.getElementById('drawer-edit-res-btn');
+      if (editResBtn) {
+        editResBtn.addEventListener('click', function () {
+          openEditReservationModal(r, ctx, reopenSelf, reopenSelf);
+        });
+      }
+
+      modalRoot.querySelectorAll('.drawer-remove-emp').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var empId = btn.getAttribute('data-emp-id');
+          var empName = btn.getAttribute('data-emp-name');
+          runWithLock(btn, 'removeAssignment:' + r.id + ':' + empId, function () {
+            var nextIds = [];
+            var nextNames = [];
+            assignedIds.forEach(function (idItem, idx) {
+              if (idItem !== empId) {
+                nextIds.push(idItem);
+                if (assignedNames[idx]) nextNames.push(assignedNames[idx]);
+              }
+            });
+            d.reservation = Object.assign({}, r, {
+              assignedEmployeeIds: nextIds,
+              assignedEmployeeNames: nextNames
+            });
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast('تمت إزالة ' + empName + ' من الحجز.');
+            return root.RGApi.callApi('removeAssignment', {
+              reservationId: r.id,
+              employeeId: empId
+            }).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر إزالة الموظف.', true); reopenSelf(); }
+            });
+          });
+        });
       });
-    });
 
-    document.getElementById('drawer-problem-btn').addEventListener('click', function () {
-      openCreateProblemModal(r, employees, ctx, reopenSelf, reopenSelf);
-    });
+      var saveAssignBtn = document.getElementById('drawer-save-assign');
+      if (saveAssignBtn) {
+        saveAssignBtn.addEventListener('click', function () {
+          var ids = Array.from(modalRoot.querySelectorAll('.drawer-assign-chk:checked')).map(function (c) { return c.value; });
+          runWithLock(saveAssignBtn, 'assignEmployees:' + r.id, function () {
+            var names = ids.map(function (eid) {
+              var emp = employees.find(function (e) { return e.id === eid; });
+              return emp ? emp.name : eid;
+            });
+            d.reservation = Object.assign({}, r, {
+              assignedEmployeeIds: ids,
+              assignedEmployeeNames: names
+            });
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast('تم تحديث الموظفين المسؤولين عن الحجز.');
+            return root.RGApi.callApi('assignEmployees', { reservationId: r.id, employeeIds: ids }).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر حفظ الإسناد.', true); reopenSelf(); }
+            });
+          });
+        });
+      }
 
-    var drawerCharts = renderDrawerCharts(d);
+      document.getElementById('drawer-fu-form').addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var errEl = document.getElementById('fu-form-error');
+        errEl.classList.add('hidden');
+        var fuStatus = document.getElementById('fu-status').value;
+        var fuAction = String(document.getElementById('fu-action').value || '').trim();
+        var fuNotes = String(document.getElementById('fu-notes').value || '').trim();
+        if (!fuAction) {
+          errEl.textContent = 'يرجى كتابة الإجراء المتخذ.';
+          errEl.classList.remove('hidden');
+          return;
+        }
+        var fuSubmitBtn = document.getElementById('fu-submit-btn');
+        runWithLock(fuSubmitBtn, 'addFollowUp:' + r.id, function () {
+          var now = new Date();
+          var nowIso = now.toISOString();
+          var optFu = {
+            id: 'FU_OPT_' + Date.now(),
+            reservationId: r.id,
+            reservationNumber: r.reservationNumber,
+            customerName: r.customerName,
+            employeeId: user.id,
+            employeeName: user.name,
+            status: fuStatus,
+            action: fuAction,
+            notes: fuNotes,
+            followUpDate: nowIso.substring(0, 10),
+            followUpTime: now.toTimeString().substring(0, 8),
+            createdAt: nowIso
+          };
+          d.reservation = Object.assign({}, r, {
+            internalStatus: fuStatus,
+            lastUpdateText: fuAction + (fuNotes ? ' — ' + fuNotes : ''),
+            lastUpdatedById: user.id,
+            lastUpdatedByName: user.name,
+            lastUpdatedAt: nowIso
+          });
+          d.followUps = [optFu].concat(d.followUps || []);
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('addFollowUp', {
+              reservationId: r.id,
+              status: fuStatus,
+              action: fuAction,
+              notes: fuNotes
+            }, user);
+          }
+          paintDrawer();
+          notifyParentUpdated();
+          ctx.toast('تمت إضافة المتابعة بنجاح.');
+          return root.RGApi.callApi('addFollowUp', {
+            reservationId: r.id,
+            status: fuStatus,
+            action: fuAction,
+            notes: fuNotes,
+            _keepOptimisticCache: true
+          }).then(function (resp) {
+            if (resp && resp.success) ctx.refreshNotifications();
+            else { ctx.toast((resp && resp.message) || 'تعذر حفظ المتابعة.', true); reopenSelf(); }
+          }).catch(function () {
+            ctx.toast('تعذر الاتصال بالخادم أثناء حفظ المتابعة.', true);
+            reopenSelf();
+          });
+        });
+      });
 
-    document.getElementById('drawer-pdf-btn').addEventListener('click', function () {
-      openSingleReservationPdfModal(d, ctx, drawerCharts, reopenSelf);
-    });
+      modalRoot.querySelectorAll('.btn-edit-fu').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var fuId = btn.getAttribute('data-fu-id');
+          var fu = d.followUps.find(function (x) { return x.id === fuId; });
+          if (fu) openEditFollowUpModal(fu, r, ctx, reopenSelf, reopenSelf);
+        });
+      });
+
+      modalRoot.querySelectorAll('.btn-close-prb-in-drawer').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var prbId = btn.getAttribute('data-prb-id');
+          var prb = d.problems.find(function (x) { return x.id === prbId; });
+          if (!prb) return;
+          runWithLock(btn, 'updateProblem:' + prbId, function () {
+            var closePayload = {
+              problemId: prbId,
+              status: 'مغلقة',
+              priority: prb.priority || 'متوسط',
+              note: 'تم إغلاق المشكلة'
+            };
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('updateProblem', closePayload, user);
+            }
+            d.problems = (d.problems || []).map(function (it) {
+              if (it.id !== prbId) return it;
+              return root.RGCrmCore && root.RGCrmCore.applyOptimisticProblemPatch
+                ? root.RGCrmCore.applyOptimisticProblemPatch(it, closePayload, user, employees)
+                : Object.assign({}, it, { status: 'مغلقة' });
+            });
+            d.reservation = Object.assign({}, r, {
+              hasProblem: d.problems.some(function (it) { return !isProblemClosed(it.status); })
+            });
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast('تم إغلاق المشكلة ' + prb.problemNumber + ' بنجاح.');
+            return root.RGApi.callApi('updateProblem', Object.assign({ _keepOptimisticCache: true }, closePayload)).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر إغلاق المشكلة.', true); reopenSelf(); }
+            });
+          });
+        });
+      });
+
+      modalRoot.querySelectorAll('.btn-edit-prb-in-drawer').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var prbId = btn.getAttribute('data-prb-id');
+          var prb = d.problems.find(function (x) { return x.id === prbId; });
+          if (prb && root.RGProblems && root.RGProblems.openProblemUpdateModal) {
+            var enriched = Object.assign({}, prb, {
+              updates: (d.problemUpdates || []).filter(function (u) { return u.problemId === prb.id; })
+            });
+            root.RGProblems.openProblemUpdateModal(enriched, employees, ctx, notifyParentUpdated, reopenSelf);
+          }
+        });
+      });
+
+      document.getElementById('drawer-problem-btn').addEventListener('click', function () {
+        openCreateProblemModal(r, employees, ctx, notifyParentUpdated, reopenSelf);
+      });
+
+      var drawerCharts = renderDrawerCharts(d);
+
+      document.getElementById('drawer-pdf-btn').addEventListener('click', function () {
+        openSingleReservationPdfModal(d, ctx, drawerCharts, reopenSelf);
+      });
+    }
+
+    paintDrawer();
   }
 
   function openEditReservationModal(reservation, ctx, onSaved, onCancel) {
@@ -1053,29 +1311,87 @@
         '</form>' +
       '</div>';
 
+    var submitBtn = modalRoot.querySelector('#prb-create-form button[type="submit"]');
+    var handledCreate = false;
+
     document.getElementById('prb-cancel').addEventListener('click', function () {
       if (onCancel) onCancel();
       else modalRoot.innerHTML = '';
     });
-    document.getElementById('prb-create-form').addEventListener('submit', async function (ev) {
+
+    document.getElementById('prb-create-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
-      var empIds = Array.from(modalRoot.querySelectorAll('.prb-emp-chk:checked')).map(function (c) { return c.value; });
-      var res = await root.RGApi.callApi('createProblem', {
-        reservationId: reservation.id,
-        priority: document.getElementById('prb-priority').value,
-        description: document.getElementById('prb-desc').value,
-        assignedEmployeeIds: empIds
-      });
-      if (!res.success) {
-        var e = document.getElementById('prb-err');
-        e.textContent = res.message;
-        e.classList.remove('hidden');
+      if (handledCreate) return;
+
+      var prioVal = document.getElementById('prb-priority').value;
+      var descVal = String(document.getElementById('prb-desc').value || '').trim();
+      if (!descVal) {
+        var errEl = document.getElementById('prb-err');
+        errEl.textContent = 'يرجى إدخال وصف المشكلة.';
+        errEl.classList.remove('hidden');
         return;
       }
-      ctx.toast('تم إنشاء المشكلة وتسجيلها بنجاح.');
-      ctx.refreshNotifications();
-      if (onCreated) onCreated();
-      else modalRoot.innerHTML = '';
+
+      handledCreate = true;
+      var empIds = Array.from(modalRoot.querySelectorAll('.prb-emp-chk:checked')).map(function (c) { return c.value; });
+      var user = root.RGAuth.getUser();
+      var empNames = empIds.map(function (eid) {
+        var found = employees.find(function (e) { return e.id === eid; });
+        return found ? found.name : '';
+      }).filter(Boolean);
+      var nowIso = new Date().toISOString();
+      var optPrb = {
+        id: 'PRB_OPT_' + Date.now(),
+        problemNumber: 'PRB-' + String(Date.now()).slice(-6),
+        reservationId: reservation.id,
+        reservationNumber: reservation.reservationNumber,
+        customerName: reservation.customerName,
+        createdById: (user && user.id) || '',
+        createdByName: (user && user.name) || 'الموظف',
+        assignedEmployeeIds: empIds.length ? empIds : [(user && user.id) || ''],
+        assignedEmployeeNames: empNames.length ? empNames : [(user && user.name) || ''],
+        description: descVal,
+        priority: prioVal,
+        status: 'جديدة',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        updates: []
+      };
+
+      runWithLock(submitBtn, 'createProblem:' + reservation.id, function () {
+        modalRoot.innerHTML = '';
+        if (root.RGApi.applyOptimisticMutation) {
+          root.RGApi.applyOptimisticMutation('createProblem', {
+            reservationId: reservation.id,
+            reservationNumber: reservation.reservationNumber,
+            customerName: reservation.customerName,
+            priority: prioVal,
+            description: descVal,
+            assignedEmployeeIds: empIds,
+            _optimisticProblem: optPrb
+          }, user);
+        }
+        if (onCreated) onCreated(optPrb);
+        ctx.toast('تم إنشاء المشكلة وتسجيلها بنجاح.');
+
+        return root.RGApi.callApi('createProblem', {
+          reservationId: reservation.id,
+          priority: prioVal,
+          description: descVal,
+          assignedEmployeeIds: empIds,
+          _keepOptimisticCache: true
+        }).then(function (res) {
+          if (res && res.success) {
+            ctx.refreshNotifications();
+          } else {
+            ctx.toast((res && res.message) || 'تعذر مزامنة المشكلة مع الخادم.', true);
+            if (onCreated) onCreated(null);
+          }
+        }).catch(function () {
+          ctx.toast('تعذر الاتصال بالخادم أثناء حفظ المشكلة.', true);
+          if (onCreated) onCreated(null);
+        });
+      });
     });
   }
 

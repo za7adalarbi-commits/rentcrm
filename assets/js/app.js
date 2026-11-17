@@ -78,6 +78,40 @@
     notifications: { items: [], unreadCount: 0 }
   };
   var routeRenderSeq = 0;
+  var activeActionLocks = {};
+
+  function withActionLock(btnEl, lockKey, fn) {
+    var key = String(lockKey || '');
+    if (key && activeActionLocks[key]) {
+      return activeActionLocks[key];
+    }
+    var prevDisabled = btnEl ? Boolean(btnEl.disabled) : false;
+    if (btnEl) {
+      btnEl.disabled = true;
+      btnEl.setAttribute('aria-busy', 'true');
+    }
+    var p = Promise.resolve().then(fn).finally(function () {
+      if (key) delete activeActionLocks[key];
+      if (btnEl && btnEl.isConnected !== false) {
+        btnEl.disabled = prevDisabled;
+        btnEl.removeAttribute('aria-busy');
+      }
+    });
+    if (key) activeActionLocks[key] = p;
+    return p;
+  }
+
+  function buildAppCtx() {
+    return {
+      t: t,
+      lang: state.prefs.lang,
+      state: state,
+      toast: toast,
+      refreshNotifications: refreshNotifications,
+      withActionLock: withActionLock,
+      onAuthChanged: bootAuthenticatedApp
+    };
+  }
 
   var I18N = {
     ar: {
@@ -253,13 +287,7 @@
     if (!root.RGAuth.getUser()) return;
     var res = await root.RGApi.callApi('getNotifications', {});
     if (res.success && res.data) {
-      state.notifications = res.data;
-      var badge = document.getElementById('notif-badge');
-      if (badge) {
-        var count = res.data.unreadCount || 0;
-        badge.textContent = String(count);
-        badge.classList.toggle('hidden', count === 0);
-      }
+      applyNotificationsState(res.data);
     }
   }
 
@@ -281,26 +309,78 @@
       (items.length === 0
         ? '<div class="empty-state" style="padding:20px;">لا توجد إشعارات حاليًا.</div>'
         : items.map(function (n) {
+            var target = (root.RGCrmCore && root.RGCrmCore.resolveNotificationTarget)
+              ? root.RGCrmCore.resolveNotificationTarget(n)
+              : { kind: 'none', entityId: '' };
+            var actionHint = target.kind === 'problem'
+              ? '<span style="font-size:11px;color:var(--brand-primary);font-weight:700;">اضغط لاستعراض المشكلة ←</span>'
+              : (target.kind === 'reservation' ? '<span style="font-size:11px;color:var(--brand-primary);font-weight:700;">اضغط لفتح الحجز ←</span>' : '');
             return '<button type="button" class="notif-item' + (n.isRead ? '' : ' unread') + '" data-nid="' + n.id + '" style="text-align:start;font-family:inherit;">' +
               '<strong>' + n.title + '</strong>' +
               '<span style="font-size:12.5px;color:var(--text-secondary);">' + n.message + '</span>' +
-              '<span class="mono" style="font-size:11px;color:var(--text-muted);">' + (root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(n.createdAt) : String(n.createdAt).replace('T', ' ').substring(0, 16)) + '</span>' +
+              '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;">' +
+                '<span class="mono" style="font-size:11px;color:var(--text-muted);">' + (root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(n.createdAt) : String(n.createdAt).replace('T', ' ').substring(0, 16)) + '</span>' +
+                actionHint +
+              '</div>' +
             '</button>';
           }).join(''));
 
     document.body.appendChild(pop);
 
-    document.getElementById('notif-mark-all').addEventListener('click', async function () {
-      await root.RGApi.callApi('markNotificationRead', { markAll: true });
-      await refreshNotifications();
-      pop.remove();
+    document.getElementById('notif-mark-all').addEventListener('click', function () {
+      var markBtn = document.getElementById('notif-mark-all');
+      withActionLock(markBtn, 'markNotificationRead:ALL', function () {
+        var nextItems = (state.notifications.items || []).map(function (n) {
+          return Object.assign({}, n, { isRead: true });
+        });
+        applyNotificationsState({ items: nextItems, unreadCount: 0 });
+        if (root.RGApi.applyOptimisticMutation) {
+          root.RGApi.applyOptimisticMutation('markNotificationRead', { markAll: true });
+        }
+        pop.remove();
+        return root.RGApi.callApi('markNotificationRead', { markAll: true, _keepOptimisticCache: true });
+      });
     });
 
     pop.querySelectorAll('[data-nid]').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
-        await root.RGApi.callApi('markNotificationRead', { notificationId: btn.getAttribute('data-nid') });
-        await refreshNotifications();
+      btn.addEventListener('click', function () {
+        var nid = btn.getAttribute('data-nid');
+        var notif = items.find(function (x) { return x.id === nid; }) || null;
         pop.remove();
+
+        if (notif && !notif.isRead) {
+          var nextItems = (state.notifications.items || []).map(function (n) {
+            return n.id === nid ? Object.assign({}, n, { isRead: true }) : n;
+          });
+          var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
+          applyNotificationsState({ items: nextItems, unreadCount: nextUnread });
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('markNotificationRead', { notificationId: nid });
+          }
+          root.RGApi.callApi('markNotificationRead', { notificationId: nid, _keepOptimisticCache: true }).catch(function () {});
+        }
+
+        if (!notif) return;
+        var target = (root.RGCrmCore && root.RGCrmCore.resolveNotificationTarget)
+          ? root.RGCrmCore.resolveNotificationTarget(notif)
+          : { kind: 'none', entityId: '' };
+
+        var ctx = buildAppCtx();
+        if (target.kind === 'problem' && root.RGProblems && root.RGProblems.openProblemById) {
+          if (state.route !== 'problems') {
+            state.route = 'problems';
+            renderRoute();
+          }
+          root.RGProblems.openProblemById(target.entityId, ctx, function () {
+            if (state.route === 'problems') renderRoute();
+          });
+        } else if (target.kind === 'reservation' && root.RGReservations && root.RGReservations.openReservationDrawer) {
+          var empCached = root.RGApi.getCachedData ? root.RGApi.getCachedData('getEmployees', {}, true) : null;
+          var emps = (empCached && empCached.items) || [];
+          root.RGReservations.openReservationDrawer(target.entityId, ctx, emps, function () {
+            renderRoute();
+          });
+        }
       });
     });
   }
@@ -571,14 +651,7 @@
       }
     }, 30);
 
-    var ctx = {
-      t: t,
-      lang: state.prefs.lang,
-      state: state,
-      toast: toast,
-      refreshNotifications: refreshNotifications,
-      onAuthChanged: bootAuthenticatedApp
-    };
+    var ctx = buildAppCtx();
 
     try {
       switch (state.route) {
@@ -811,7 +884,7 @@
 
   function scheduleBackgroundPrefetch(user) {
     var core = root.RGCrmCore;
-    var targets = ['reservations', 'my-followups', 'problems'];
+    var targets = ['problems', 'reservations', 'my-followups'];
     if (core && core.canUserPerform && core.canUserPerform(user, 'view_all_reservations')) {
       targets.push('team-followups');
     }
@@ -824,9 +897,9 @@
           if (root.RGAuth && root.RGAuth.getUser()) {
             prefetchRouteData(routeId);
           }
-        }, idx * 80);
+        }, idx * 40);
       });
-    }, 120);
+    }, 60);
   }
 
   async function bootAuthenticatedApp() {
@@ -844,6 +917,7 @@
         if (bootRes.data.dashboard) root.RGApi.primeCache('getDashboard', { range: dashRange }, bootRes.data.dashboard);
         if (bootRes.data.employees) root.RGApi.primeCache('getEmployees', {}, bootRes.data.employees);
         if (bootRes.data.notifications) root.RGApi.primeCache('getNotifications', {}, bootRes.data.notifications);
+        if (bootRes.data.problems) root.RGApi.primeCache('getProblems', {}, bootRes.data.problems);
       }
       if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
       await renderRoute();
@@ -857,6 +931,12 @@
     ]);
     scheduleBackgroundPrefetch(user);
   }
+
+  root.RGApp = {
+    withActionLock: withActionLock,
+    applyNotificationsState: applyNotificationsState,
+    refreshNotifications: refreshNotifications
+  };
 
   document.addEventListener('rg:unauthorized', function () {
     renderLoginScreen();

@@ -99,6 +99,9 @@ function handleApiRequest(e, method) {
       case 'getProblems':
         result = getProblems(session, payload);
         break;
+      case 'getProblemDetails':
+        result = getProblemDetails(session, payload);
+        break;
       case 'getEmployees':
         result = getEmployees(session);
         break;

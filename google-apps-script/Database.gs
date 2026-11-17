@@ -164,8 +164,27 @@ function getCacheKey(sheetName) {
   return 'RG_CACHE_V2_' + sheetName;
 }
 
-function invalidateCache(sheetName) {
-  if (sheetName) {
+function getCacheVersion_(ns) {
+  try {
+    var v = CacheService.getScriptCache().get('RG_VER_' + ns);
+    return v || '1';
+  } catch (e) {
+    return '1';
+  }
+}
+
+function bumpCacheVersion_(ns) {
+  try {
+    var next = String(Date.now());
+    CacheService.getScriptCache().put('RG_VER_' + ns, next, 21600);
+    return next;
+  } catch (e) {
+    return String(Date.now());
+  }
+}
+
+function invalidateCache(sheetName, keepMemCache) {
+  if (sheetName && !keepMemCache) {
     delete _rgRecordsCache[sheetName];
   }
   if (sheetName === RG_SHEETS.SETTINGS) {
@@ -670,6 +689,57 @@ function recordToRowArray(headers, recordObj) {
   return row;
 }
 
+function cloneRecordForCache_(sheetName, recordObj) {
+  var copy = {};
+  for (var k in recordObj) {
+    if (!Object.prototype.hasOwnProperty.call(recordObj, k)) continue;
+    if (sheetName === RG_SHEETS.RESERVATIONS && k === 'rawJson') continue;
+    copy[k] = recordObj[k];
+  }
+  return copy;
+}
+
+function touchEmployeeActivityThrottled_(employeeId, isoNow) {
+  var eid = normalizeStr(employeeId);
+  if (!eid) return;
+  var throttleKey = 'RG_EMP_ACT_' + eid;
+  try {
+    var cache = CacheService.getScriptCache();
+    if (cache.get(throttleKey)) return;
+    cache.put(throttleKey, '1', 300);
+  } catch (e) {}
+
+  var ss = getSpreadsheet();
+  var sheet = getSheetOrCreate(ss, RG_SHEETS.EMPLOYEES);
+  var headers = getEffectiveHeaders(sheet, RG_SHEETS.EMPLOYEES);
+  var idIdx = headers.indexOf('id');
+  var actIdx = headers.indexOf('lastActivity');
+  if (idIdx === -1 || actIdx === -1) return;
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  var idVals = sheet.getRange(2, idIdx + 1, lastRow - 1, 1).getValues();
+  var stamp = isoNow || nowIso();
+  for (var r = 0; r < idVals.length; r++) {
+    if (normalizeStr(idVals[r][0]) === eid) {
+      sheet.getRange(r + 2, actIdx + 1).setValue(stamp);
+      if (_rgRecordsCache[RG_SHEETS.EMPLOYEES]) {
+        var mem = _rgRecordsCache[RG_SHEETS.EMPLOYEES];
+        for (var m = 0; m < mem.length; m++) {
+          if (normalizeStr(mem[m].id) === eid) {
+            mem[m].lastActivity = stamp;
+            break;
+          }
+        }
+      }
+      try {
+        var base = getCacheKey(RG_SHEETS.EMPLOYEES);
+        CacheService.getScriptCache().removeAll([base, base + '_META']);
+      } catch (e2) {}
+      return;
+    }
+  }
+}
+
 function appendRecord(sheetName, recordObj) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
@@ -677,7 +747,12 @@ function appendRecord(sheetName, recordObj) {
   var row = recordToRowArray(headers, recordObj);
   var nextRow = Math.max(2, sheet.getLastRow() + 1);
   sheet.getRange(nextRow, 1, 1, headers.length).setValues([row]);
-  invalidateCache(sheetName);
+  if (Array.isArray(_rgRecordsCache[sheetName])) {
+    _rgRecordsCache[sheetName].push(cloneRecordForCache_(sheetName, recordObj));
+    invalidateCache(sheetName, true);
+  } else {
+    invalidateCache(sheetName, false);
+  }
   return recordObj;
 }
 
@@ -693,7 +768,14 @@ function batchAppendRecords(sheetName, recordsList) {
   var startRow = Math.max(2, sheet.getLastRow() + 1);
   applyTextFormatForDateColumns_(sheet, headers, startRow, rows.length);
   sheet.getRange(startRow, 1, rows.length, headers.length).setValues(rows);
-  invalidateCache(sheetName);
+  if (Array.isArray(_rgRecordsCache[sheetName])) {
+    for (var j = 0; j < recordsList.length; j++) {
+      _rgRecordsCache[sheetName].push(cloneRecordForCache_(sheetName, recordsList[j]));
+    }
+    invalidateCache(sheetName, true);
+  } else {
+    invalidateCache(sheetName, false);
+  }
   return rows.length;
 }
 
@@ -723,7 +805,18 @@ function updateRecordByKey(sheetName, keyField, keyValue, patchObj) {
         updated[h] = rowArr[c] instanceof Date ? rowArr[c].toISOString() : rowArr[c];
       }
       sheet.getRange(rowNum, 1, 1, headers.length).setValues([rowArr]);
-      invalidateCache(sheetName);
+      if (Array.isArray(_rgRecordsCache[sheetName])) {
+        var mem = _rgRecordsCache[sheetName];
+        for (var m = 0; m < mem.length; m++) {
+          if (normalizeStr(mem[m][keyField]) === target) {
+            mem[m] = cloneRecordForCache_(sheetName, updated);
+            break;
+          }
+        }
+        invalidateCache(sheetName, true);
+      } else {
+        invalidateCache(sheetName, false);
+      }
       return updated;
     }
   }
@@ -925,7 +1018,14 @@ function deleteRecordByKey(sheetName, keyField, keyValue) {
   for (var r = keyValues.length - 1; r >= 0; r--) {
     if (normalizeStr(keyValues[r][0]) === target) {
       sheet.deleteRow(r + 2);
-      invalidateCache(sheetName);
+      if (Array.isArray(_rgRecordsCache[sheetName])) {
+        _rgRecordsCache[sheetName] = _rgRecordsCache[sheetName].filter(function (rec) {
+          return normalizeStr(rec[keyField]) !== target;
+        });
+        invalidateCache(sheetName, true);
+      } else {
+        invalidateCache(sheetName, false);
+      }
       return true;
     }
   }

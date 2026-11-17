@@ -80,36 +80,77 @@
             }).join('') + '</div>') +
       '</div>';
 
+    function runWithLock(btnEl, lockKey, fn) {
+      if (root.RGApp && root.RGApp.withActionLock) {
+        return root.RGApp.withActionLock(btnEl, lockKey, fn);
+      }
+      return Promise.resolve().then(fn);
+    }
+
     container.querySelectorAll('.myfu-quick-status').forEach(function (sel) {
-      sel.addEventListener('change', async function () {
-        sel.disabled = true;
-        var resp = await root.RGApi.callApi('quickUpdateReservationStatus', {
-          reservationId: sel.getAttribute('data-id'),
-          status: sel.value
+      sel.addEventListener('change', function () {
+        var rid = sel.getAttribute('data-id');
+        var nextStatus = sel.value;
+        var currentUser = root.RGAuth.getUser();
+        runWithLock(sel, 'quickUpdateReservationStatus:' + rid, function () {
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
+              reservationId: rid,
+              status: nextStatus
+            }, currentUser);
+          }
+          ctx.toast('تم تحديث حالة الحجز إلى: ' + nextStatus);
+          var rowEl = sel.closest('tr');
+          if (rowEl && rowEl.cells && rowEl.cells[6]) {
+            rowEl.cells[6].textContent = 'تحديث سريع للحالة إلى: ' + nextStatus;
+          }
+          return root.RGApi.callApi('quickUpdateReservationStatus', {
+            reservationId: rid,
+            status: nextStatus,
+            _keepOptimisticCache: true
+          }).then(function (resp) {
+            if (resp && resp.success) {
+              ctx.refreshNotifications();
+            } else {
+              ctx.toast((resp && resp.message) || 'تعذر تحديث الحالة.', true);
+              renderMyFollowUps(container, ctx);
+            }
+          }).catch(function () {
+            ctx.toast('تعذر الاتصال بالخادم أثناء تحديث الحالة.', true);
+            renderMyFollowUps(container, ctx);
+          });
         });
-        if (resp.success) {
-          ctx.toast('تم تحديث حالة الحجز إلى: ' + sel.value);
-          ctx.refreshNotifications();
-          renderMyFollowUps(container, ctx);
-        } else {
-          ctx.toast(resp.message, true);
-          sel.disabled = false;
-        }
       });
     });
 
     container.querySelectorAll('.myfu-unclaim').forEach(function (btn) {
-      btn.addEventListener('click', async function () {
-        btn.disabled = true;
-        var resp = await root.RGApi.callApi('unclaimReservation', { reservationId: btn.getAttribute('data-id') });
-        if (resp.success) {
-          ctx.toast(resp.message || 'تم إلغاء استلام الحجز.');
-          ctx.refreshNotifications();
-          renderMyFollowUps(container, ctx);
-        } else {
-          ctx.toast(resp.message, true);
-          btn.disabled = false;
-        }
+      btn.addEventListener('click', function () {
+        var rid = btn.getAttribute('data-id');
+        var currentUser = root.RGAuth.getUser();
+        runWithLock(btn, 'unclaimReservation:' + rid, function () {
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('unclaimReservation', { reservationId: rid }, currentUser);
+          }
+          var rowEl = btn.closest('tr');
+          if (rowEl && rowEl.parentNode) {
+            rowEl.parentNode.removeChild(rowEl);
+          }
+          ctx.toast('تم إلغاء استلام الحجز.');
+          return root.RGApi.callApi('unclaimReservation', {
+            reservationId: rid,
+            _keepOptimisticCache: true
+          }).then(function (resp) {
+            if (resp && resp.success) {
+              ctx.refreshNotifications();
+            } else {
+              ctx.toast((resp && resp.message) || 'تعذر إلغاء الاستلام.', true);
+              renderMyFollowUps(container, ctx);
+            }
+          }).catch(function () {
+            ctx.toast('تعذر الاتصال بالخادم أثناء إلغاء الاستلام.', true);
+            renderMyFollowUps(container, ctx);
+          });
+        });
       });
     });
 

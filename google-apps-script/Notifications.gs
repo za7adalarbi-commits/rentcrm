@@ -15,6 +15,7 @@ function createNotification(recipientEmployeeId, recipientRole, type, title, mes
     isRead: 'false',
     createdAt: nowIso()
   });
+  bumpCacheVersion_('NTF');
 }
 
 function createNotificationsBatch_(items) {
@@ -36,11 +37,22 @@ function createNotificationsBatch_(items) {
       createdAt: now
     });
   }
-  return batchAppendRecords(RG_SHEETS.NOTIFICATIONS, records);
+  var count = batchAppendRecords(RG_SHEETS.NOTIFICATIONS, records);
+  bumpCacheVersion_('NTF');
+  return count;
 }
 
 function getNotifications(session) {
-  var all = readAllRecords(RG_SHEETS.NOTIFICATIONS, false);
+  var cacheKey = 'RG_NTF_U_' + session.employeeId + '_V' + getCacheVersion_('NTF');
+  try {
+    var cachedRaw = CacheService.getScriptCache().get(cacheKey);
+    if (cachedRaw) {
+      var parsed = JSON.parse(cachedRaw);
+      if (parsed && Array.isArray(parsed.items)) return parsed;
+    }
+  } catch (e) {}
+
+  var all = readRecentRecords_(RG_SHEETS.NOTIFICATIONS, 250);
   var mine = all.filter(function (n) {
     return n.recipientEmployeeId === session.employeeId ||
       (!n.recipientEmployeeId && n.recipientRole === session.role);
@@ -66,7 +78,14 @@ function getNotifications(session) {
     };
   });
 
-  return { items: items, unreadCount: unreadCount };
+  var payload = { items: items, unreadCount: unreadCount };
+  try {
+    var serialized = JSON.stringify(payload);
+    if (serialized.length < 95000) {
+      CacheService.getScriptCache().put(cacheKey, serialized, 180);
+    }
+  } catch (e2) {}
+  return payload;
 }
 
 function markNotificationRead(session, payload) {
@@ -74,6 +93,19 @@ function markNotificationRead(session, payload) {
     var p = payload || {};
     var targetId = normalizeStr(p.notificationId);
     var markAll = toBool(p.markAll);
+
+    if (!markAll && targetId) {
+      var existing = findRecordById(RG_SHEETS.NOTIFICATIONS, 'id', targetId);
+      if (existing && !toBool(existing.isRead)) {
+        var isOwner = existing.recipientEmployeeId === session.employeeId ||
+          (!existing.recipientEmployeeId && existing.recipientRole === session.role);
+        if (isOwner) {
+          updateRecordByKey(RG_SHEETS.NOTIFICATIONS, 'id', targetId, { isRead: 'true' });
+        }
+      }
+      bumpCacheVersion_('NTF');
+      return { updated: true };
+    }
 
     updateRecordsWhere_(
       RG_SHEETS.NOTIFICATIONS,
@@ -86,6 +118,7 @@ function markNotificationRead(session, payload) {
       },
       { isRead: 'true' }
     );
+    bumpCacheVersion_('NTF');
     return { updated: true };
   });
 }

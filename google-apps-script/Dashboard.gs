@@ -171,7 +171,8 @@ function getAppBootstrap(session, params) {
     user: session.user,
     dashboard: getDashboard(session, params || { range: '30d' }),
     notifications: getNotifications(session),
-    employees: getEmployees(session)
+    employees: getEmployees(session),
+    problems: getProblems(session, {})
   };
 }
 

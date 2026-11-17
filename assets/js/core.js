@@ -958,7 +958,7 @@
     var keys = Object.keys(payload);
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
-      if (k === 'visibleCols') continue;
+      if (k === 'visibleCols' || k.charAt(0) === '_') continue;
       var v = payload[k];
       if (v !== undefined) out[k] = v;
     }
@@ -1041,6 +1041,7 @@
     getTeamFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getFollowUpHistory: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getProblems: { cacheable: true, ttlMs: 60000, scope: 'problems' },
+    getProblemDetails: { cacheable: true, ttlMs: 60000, scope: 'problems' },
     getNotifications: { cacheable: true, ttlMs: 30000, scope: 'notifications' },
     getActivityLogs: { cacheable: true, ttlMs: 60000, scope: 'activity' },
     getReports: { cacheable: true, ttlMs: 60000, scope: 'reports' },
@@ -1411,6 +1412,116 @@
     return packed;
   }
 
+  function buildMutationLockKey(action, payload) {
+    var act = normalizeStr(action);
+    var p = (payload && typeof payload === 'object') ? payload : {};
+    switch (act) {
+      case 'claimReservation':
+      case 'unclaimReservation':
+      case 'quickUpdateReservationStatus':
+      case 'updateReservationDetails':
+      case 'assignEmployees':
+      case 'addFollowUp':
+      case 'createProblem':
+        return act + ':' + normalizeStr(p.reservationId || p.reservationNumber);
+      case 'removeAssignment':
+        return act + ':' + normalizeStr(p.reservationId) + ':' + normalizeStr(p.employeeId);
+      case 'updateFollowUp':
+        return act + ':' + normalizeStr(p.followUpId);
+      case 'updateProblem':
+        return act + ':' + normalizeStr(p.problemId);
+      case 'markNotificationRead':
+        return act + ':' + (p.markAll ? 'ALL' : normalizeStr(p.notificationId));
+      case 'createEmployee':
+        return act + ':' + normalizeLoginUsername(p.username || p.name);
+      case 'updateEmployee':
+      case 'disableEmployee':
+        return act + ':' + normalizeStr(p.employeeId);
+      case 'saveRolePreset':
+      case 'deleteRolePreset':
+        return act + ':' + normalizeStr(p.id || p.presetId || p.label);
+      case 'savePermissionDefinition':
+      case 'deletePermissionDefinition':
+        return act + ':' + normalizeStr(p.key || p.label);
+      case 'login':
+        return act + ':' + normalizeLoginUsername(p.username);
+      default:
+        return act;
+    }
+  }
+
+  function isProblemClosedStatus(status) {
+    var s = normalizeStr(status);
+    return s === 'مغلقة' || s === 'تم الحل';
+  }
+
+  function resolveNotificationTarget(notification) {
+    var n = (notification && typeof notification === 'object') ? notification : {};
+    var entityType = normalizeStr(n.entityType);
+    var entityId = normalizeStr(n.entityId);
+    var type = normalizeStr(n.type);
+    if (!entityId) {
+      return { kind: 'none', entityId: '', route: '' };
+    }
+    if (entityType === 'Problem' || type === 'new_problem' || type === 'high_priority_problem') {
+      return { kind: 'problem', entityId: entityId, route: 'problems' };
+    }
+    if (entityType === 'Reservation' || type === 'new_assignment' || type === 'reassignment' || type === 'status_change' || type === 'reservation_update') {
+      return { kind: 'reservation', entityId: entityId, route: 'reservations' };
+    }
+    return { kind: 'none', entityId: entityId, route: '' };
+  }
+
+  function applyOptimisticProblemPatch(problem, patch, actor, allEmployees) {
+    if (!problem || typeof problem !== 'object') return problem;
+    var p = (patch && typeof patch === 'object') ? patch : {};
+    var nowStr = new Date().toISOString();
+    var nextStatus = normalizeStr(p.status) || problem.status || 'جديدة';
+    var nextPrio = normalizeStr(p.priority) || problem.priority || 'متوسط';
+    var nextDesc = (p.description !== undefined && normalizeStr(p.description)) ? normalizeStr(p.description) : problem.description;
+    var nextCust = (p.customerName !== undefined && normalizeStr(p.customerName)) ? normalizeStr(p.customerName) : problem.customerName;
+
+    var nextEmpIds = Array.isArray(p.assignedEmployeeIds)
+      ? p.assignedEmployeeIds.slice()
+      : (Array.isArray(problem.assignedEmployeeIds) ? problem.assignedEmployeeIds.slice() : []);
+    var nextEmpNames = Array.isArray(problem.assignedEmployeeNames) ? problem.assignedEmployeeNames.slice() : [];
+    if (Array.isArray(p.assignedEmployeeIds) && Array.isArray(allEmployees)) {
+      nextEmpNames = nextEmpIds.map(function (eid) {
+        var found = allEmployees.find(function (e) { return e.id === eid; });
+        return found ? found.name : '';
+      }).filter(Boolean);
+    }
+
+    var defaultNote = nextStatus === 'مغلقة'
+      ? 'تم إغلاق المشكلة'
+      : (nextDesc !== problem.description ? 'تعديل بيانات التذكرة' : ('تحديث الحالة إلى ' + nextStatus));
+    var newUpdate = {
+      id: 'PRBU_OPT_' + Date.now(),
+      problemId: problem.id,
+      reservationNumber: problem.reservationNumber,
+      employeeId: (actor && actor.id) || '',
+      employeeName: (actor && actor.name) || 'النظام',
+      previousStatus: problem.status || '',
+      newStatus: nextStatus,
+      previousPriority: problem.priority || '',
+      newPriority: nextPrio,
+      note: normalizeStr(p.note) || defaultNote,
+      createdAt: nowStr
+    };
+
+    var existingUpdates = Array.isArray(problem.updates) ? problem.updates.slice() : [];
+    return Object.assign({}, problem, {
+      status: nextStatus,
+      priority: nextPrio,
+      description: nextDesc,
+      customerName: nextCust,
+      assignedEmployeeIds: nextEmpIds,
+      assignedEmployeeNames: nextEmpNames,
+      updatedAt: nowStr,
+      updates: [newUpdate].concat(existingUpdates)
+    });
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -1462,6 +1573,10 @@
     computePdfColumnWidths: computePdfColumnWidths,
     isPureLtrText: isPureLtrText,
     formatBidiPdfText: formatBidiPdfText,
-    buildCompressedExcelSheets: buildCompressedExcelSheets
+    buildCompressedExcelSheets: buildCompressedExcelSheets,
+    buildMutationLockKey: buildMutationLockKey,
+    isProblemClosedStatus: isProblemClosedStatus,
+    resolveNotificationTarget: resolveNotificationTarget,
+    applyOptimisticProblemPatch: applyOptimisticProblemPatch
   };
 }));

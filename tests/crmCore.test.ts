@@ -561,3 +561,53 @@ test('resolveGasConnection, buildAutoConnectShareUrl, and payload helpers enable
   assert.equal(core.getGasActionTimeoutMs('pullReservations') >= 90000, true);
   assert.equal(core.getGasActionTimeoutMs('getDashboard') <= 40000, true);
 });
+
+test('mutation deduplication lock keys, notification target routing, and optimistic problem updates work reliably', () => {
+  assert.equal(core.buildMutationLockKey('claimReservation', { reservationId: 'RES_1' }), 'claimReservation:RES_1');
+  assert.equal(core.buildMutationLockKey('claimReservation', { reservationId: 'RES_1' }), 'claimReservation:RES_1');
+  assert.notEqual(core.buildMutationLockKey('claimReservation', { reservationId: 'RES_1' }), 'claimReservation:RES_2');
+  assert.equal(core.buildMutationLockKey('updateProblem', { problemId: 'PRB_201' }), 'updateProblem:PRB_201');
+  assert.equal(core.buildMutationLockKey('markNotificationRead', { markAll: true }), 'markNotificationRead:ALL');
+  assert.equal(core.buildMutationLockKey('markNotificationRead', { notificationId: 'NTF_1' }), 'markNotificationRead:NTF_1');
+
+  assert.deepEqual(
+    core.resolveNotificationTarget({ entityType: 'Problem', entityId: 'PRB_201', type: 'high_priority_problem' }),
+    { kind: 'problem', entityId: 'PRB_201', route: 'problems' }
+  );
+  assert.deepEqual(
+    core.resolveNotificationTarget({ entityType: '', entityId: 'PRB_5', type: 'new_problem' }),
+    { kind: 'problem', entityId: 'PRB_5', route: 'problems' }
+  );
+  assert.deepEqual(
+    core.resolveNotificationTarget({ entityType: 'Reservation', entityId: 'RES_1001', type: 'new_assignment' }),
+    { kind: 'reservation', entityId: 'RES_1001', route: 'reservations' }
+  );
+
+  assert.equal(core.isProblemClosedStatus('مغلقة'), true);
+  assert.equal(core.isProblemClosedStatus('تم الحل'), true);
+  assert.equal(core.isProblemClosedStatus('قيد المعالجة'), false);
+
+  const original = {
+    id: 'PRB_201',
+    problemNumber: 'PRB-884301',
+    reservationNumber: 'RG-2026-8843',
+    customerName: 'ماجد',
+    description: 'السيارة غير متوفرة',
+    priority: 'مرتفع',
+    status: 'جديدة',
+    assignedEmployeeIds: ['EMP_1'],
+    assignedEmployeeNames: ['سارة'],
+    updates: []
+  };
+  const patched = core.applyOptimisticProblemPatch(
+    original,
+    { status: 'مغلقة' },
+    { id: 'EMP_ADMIN', name: 'فهد' }
+  );
+  assert.equal(patched.status, 'مغلقة');
+  assert.equal(patched.updates.length, 1);
+  assert.equal(patched.updates[0].newStatus, 'مغلقة');
+  assert.equal(patched.updates[0].note, 'تم إغلاق المشكلة');
+  assert.equal(core.getApiCachePolicy('getProblemDetails').cacheable, true);
+});
+

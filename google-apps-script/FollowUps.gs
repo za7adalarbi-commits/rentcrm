@@ -280,22 +280,15 @@ function addFollowUp(session, payload) {
       updatedAt: now.toISOString()
     });
 
-    var updatedEmp = updateRecordByKey(RG_SHEETS.EMPLOYEES, 'id', session.employeeId, {
-      lastActivity: now.toISOString()
-    });
-    if (updatedEmp) syncUserSheetRecord(updatedEmp);
+    touchEmployeeActivityThrottled_(session.employeeId, now.toISOString());
 
     logActivity(
       session.user,
       statusChanged ? 'تعديل حالة' : 'إضافة متابعة',
       'Reservation',
       reservation.reservationNumber,
-      'الحالة: ' + status + ' | الإجراء: ' + action
+      'الحالة: ' + status + ' | الإجراء: ' + action + (notes ? (' | ملاحظة: ' + notes) : '')
     );
-
-    if (notes) {
-      logActivity(session.user, 'إضافة ملاحظة', 'Reservation', reservation.reservationNumber, notes);
-    }
 
     var notifBatch = [];
     for (var i = 0; i < assignedIds.length; i++) {

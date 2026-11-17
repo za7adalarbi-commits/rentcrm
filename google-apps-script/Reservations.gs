@@ -291,10 +291,7 @@ function quickUpdateReservationStatus(session, payload) {
       updatedAt: now.toISOString()
     });
 
-    var updatedEmp = updateRecordByKey(RG_SHEETS.EMPLOYEES, 'id', session.employeeId, {
-      lastActivity: now.toISOString()
-    });
-    if (updatedEmp) syncUserSheetRecord(updatedEmp);
+    touchEmployeeActivityThrottled_(session.employeeId, now.toISOString());
 
     logActivity(session.user, 'تعديل حالة', 'Reservation', reservation.reservationNumber, 'تحديث مباشر إلى: ' + status + (note ? ' | ' + note : ''));
     return { reservation: updated, followUp: followUp };
