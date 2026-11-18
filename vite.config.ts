@@ -62,7 +62,8 @@ export default defineConfig(({command}) => {
         transformIndexHtml(html) {
           const normalizedBase = base === './' ? './' : (base.endsWith('/') ? base : `${base}/`);
           const defaultGasUrl = String(process.env.VITE_GAS_WEBAPP_URL || '').trim();
-          const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};</script>\n`;
+          const defaultBackendUrl = String(process.env.VITE_BACKEND_API_URL || '').trim();
+          const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};window.__RG_DEFAULT_BACKEND_API_URL__ = ${JSON.stringify(defaultBackendUrl)};</script>\n`;
           let nextHtml = html.replace('</head>', `${baseInject}  </head>`);
           if (normalizedBase !== './') {
             nextHtml = nextHtml.replace(/(src|href)="\.\/assets\//g, `$1="${normalizedBase}assets/`);

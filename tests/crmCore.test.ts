@@ -9,6 +9,12 @@ test('translates reservation statuses and delivery types accurately', () => {
   assert.equal(core.translateOriginalStatus('confirmed'), 'مؤكد');
   assert.equal(core.translateOriginalStatus('delivered'), 'تم التسليم');
   assert.equal(core.translateOriginalStatus('cancelled'), 'ملغي');
+  assert.equal(core.translateOriginalStatus('active'), 'ناشط');
+  assert.equal(core.translateOriginalStatus('picked_up'), 'ناشط');
+  assert.equal(core.translateOriginalStatus('received'), 'ناشط');
+  assert.equal(core.translateOriginalStatus('on_rent'), 'ناشط');
+  assert.equal(core.translateOriginalStatus('rented'), 'ناشط');
+  assert.equal(core.translateOriginalStatus('started'), 'بدأ التنفيذ');
   assert.equal(core.translateDeliveryType('airport'), 'توصيل للمطار');
   assert.equal(core.translateDeliveryType('branch'), 'استلام من الفرع');
 });

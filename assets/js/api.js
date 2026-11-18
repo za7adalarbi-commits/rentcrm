@@ -5,6 +5,7 @@
   'use strict';
 
   var STORAGE_GAS_URL = 'rg_crm_gas_url';
+  var STORAGE_BACKEND_URL = 'rg_crm_backend_url';
   var STORAGE_TOKEN = 'rg_crm_session_token';
   var STORAGE_DB = 'rg_crm_sandbox_db_v1';
   var memoryStorage = {};
@@ -32,10 +33,44 @@
   var lastWarmUpUrl = '';
   var lastWarmUpAt = 0;
   var _cachedConnInfo = null;
+  var detectedBackendUrl = '';
+  var backendProbeDone = false;
+  var backendProbePromise = null;
 
   function getDefaultConfiguredGasUrl() {
     var cfg = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.gasWebAppUrl) || root.__RG_DEFAULT_GAS_URL__ || '';
     return String(cfg || '').trim();
+  }
+
+  function getDefaultConfiguredBackendUrl() {
+    var cfg = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.backendApiUrl) || root.__RG_DEFAULT_BACKEND_API_URL__ || '';
+    return String(cfg || '').trim();
+  }
+
+  function getBackendApiUrl() {
+    var search = typeof window !== 'undefined' ? window.location.search : '';
+    if (/(?:\?|&)sandbox=1(?:&|$)/.test(search)) return '';
+    var storedGas = safeStorageGet(STORAGE_GAS_URL);
+    if (storedGas === SANDBOX_SENTINEL) return '';
+
+    var match = search.match(/(?:\?|&)backendUrl=([^&]+)/);
+    if (match && match[1]) {
+      try {
+        var decoded = decodeURIComponent(match[1]).trim();
+        if (decoded === 'clear' || decoded === 'none') {
+          safeStorageSet(STORAGE_BACKEND_URL, '');
+        } else if (decoded) {
+          safeStorageSet(STORAGE_BACKEND_URL, decoded);
+          return decoded;
+        }
+      } catch (e) {}
+    }
+
+    var storedBackend = safeStorageGet(STORAGE_BACKEND_URL);
+    if (storedBackend) return storedBackend;
+    var defBackend = getDefaultConfiguredBackendUrl();
+    if (defBackend) return defBackend;
+    return detectedBackendUrl;
   }
 
   function getConnectionInfo() {
@@ -72,6 +107,57 @@
     return getConnectionInfo().url;
   }
 
+  function getTransportUrl() {
+    return getBackendApiUrl() || getGasUrl();
+  }
+
+  function probeBackendHealth() {
+    if (backendProbeDone) return Promise.resolve(detectedBackendUrl);
+    if (backendProbePromise) return backendProbePromise;
+    if (typeof window === 'undefined' || typeof fetch !== 'function') {
+      backendProbeDone = true;
+      return Promise.resolve('');
+    }
+    var proto = window.location ? window.location.protocol : '';
+    var host = window.location ? window.location.hostname : '';
+    var search = window.location ? window.location.search : '';
+    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host) || /(?:\?|&)sandbox=1(?:&|$)/.test(search)) {
+      backendProbeDone = true;
+      return Promise.resolve('');
+    }
+    if (getBackendApiUrl()) {
+      backendProbeDone = true;
+      return Promise.resolve(getBackendApiUrl());
+    }
+
+    backendProbePromise = (async function () {
+      var timer = null;
+      try {
+        var opts = { method: 'GET', cache: 'no-store' };
+        if (typeof AbortController !== 'undefined') {
+          var ctrl = new AbortController();
+          opts.signal = ctrl.signal;
+          timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 1500);
+        }
+        var resp = await fetch('/api/health', opts);
+        if (timer) clearTimeout(timer);
+        if (resp && resp.ok) {
+          var json = await resp.json();
+          if (json && json.ok && json.databaseConfigured && json.connected !== false) {
+            detectedBackendUrl = '/api/crm';
+          }
+        }
+      } catch (e) {
+        if (timer) clearTimeout(timer);
+      } finally {
+        backendProbeDone = true;
+      }
+      return detectedBackendUrl;
+    })();
+
+    return backendProbePromise;
+  }
+
   var SESSION_CACHE_KEY = 'rg_crm_swr_v1';
   var SWR_STALE_MAX_MS = 300000;
   var IDB_KV_MAX_AGE_MS = 86400000; // 24 hours persistent IndexedDB KV window
@@ -92,7 +178,7 @@
   var localMetaByNs = {};
 
   function getCacheNamespace() {
-    var mode = getGasUrl() || 'sandbox';
+    var mode = getTransportUrl() || 'sandbox';
     var tok = getToken() || '';
     return mode + '::' + (tok ? simpleHash(tok) : 'anon');
   }
@@ -215,7 +301,7 @@
   }
 
   function syncSandboxSnapshotToIdb(ns) {
-    if (getGasUrl()) return;
+    if (getTransportUrl()) return;
     try {
       var db = loadSandboxDb();
       if (!db || !Array.isArray(db.reservations)) return;
@@ -294,7 +380,7 @@
           }
           if (snap.meta) localMetaByNs[ns] = snap.meta;
         }
-        if (!getGasUrl() && getToken() && (!localReservationsByNs[ns] || !localReservationsByNs[ns].list.length)) {
+        if (!getTransportUrl() && getToken() && (!localReservationsByNs[ns] || !localReservationsByNs[ns].list.length)) {
           syncSandboxSnapshotToIdb(ns);
         }
       } catch (e) {}
@@ -306,7 +392,8 @@
     return hydrationPromises[ns];
   }
 
-  function ready() {
+  async function ready() {
+    await probeBackendHealth();
     return ensureHydrated(getCacheNamespace());
   }
 
@@ -384,8 +471,10 @@
   }
 
   hydrateApiCache();
-  // Kick off IndexedDB hydration immediately at boot without blocking
-  ensureHydrated(getCacheNamespace());
+  // Kick off backend health detection and IndexedDB hydration immediately at boot without blocking
+  probeBackendHealth().then(function () {
+    return ensureHydrated(getCacheNamespace());
+  });
 
   function clearCache(scopes) {
     var ns = getCacheNamespace();
@@ -568,7 +657,7 @@
     }
 
     // 3. In Sandbox mode, read synchronously from Sandbox DB and cache into IDB immediately
-    if (!getGasUrl() && getToken()) {
+    if (!getTransportUrl() && getToken()) {
       var sb = sandboxExecute('getReservationDetails', getToken(), { reservationId: target });
       if (sb && sb.success && sb.data) {
         setLocalDetailState(ns, sb.data);
@@ -643,7 +732,7 @@
 
     inFlightWarm[ns] = (async function () {
       try {
-        if (!getGasUrl()) {
+        if (!getTransportUrl()) {
           syncSandboxSnapshotToIdb(ns);
           return localMetaByNs[ns] || null;
         }
@@ -1107,11 +1196,15 @@
   }
 
   function isLiveMode() {
-    return Boolean(getGasUrl());
+    return Boolean(getTransportUrl());
   }
 
   function warmUpGas() {
     var gasUrl = getGasUrl();
+    if (getBackendApiUrl()) {
+      try { fetch('/api/health', { method: 'GET', cache: 'no-store' }).catch(function () {}); } catch (e0) {}
+      return;
+    }
     if (!gasUrl) return;
     var now = Date.now();
     if (gasUrl === lastWarmUpUrl && (now - lastWarmUpAt) < 240000) return;
@@ -3545,7 +3638,10 @@
   }
 
   async function callApi(action, payload) {
-    var gasUrl = getGasUrl();
+    await probeBackendHealth();
+    var backendUrl = getBackendApiUrl();
+    var gasUrl = backendUrl ? '' : getGasUrl();
+    var transportUrl = backendUrl || gasUrl;
     var token = getToken();
     var core = root.RGCrmCore;
     var ns = getCacheNamespace();
@@ -3555,7 +3651,7 @@
     var skipCache = Boolean((payload && (payload.forceRefresh || payload.logExport)) || isSilentRefresh);
     var shouldWriteCache = Boolean(policy.cacheable && !(payload && payload.logExport));
     var cacheKey = (policy.cacheable && core && core.buildApiCacheKey)
-      ? core.buildApiCacheKey(gasUrl, token, action, payload)
+      ? core.buildApiCacheKey(transportUrl, token, action, payload)
       : '';
 
     var startNetworkOrSandbox = function () {
@@ -3576,7 +3672,7 @@
         allowAgentViewAll: !(localMetaByNs[ns] && localMetaByNs[ns].allowAgentViewAll === false)
       } : null);
       if (fastLocalRes) {
-        if (fastLocalRes.isStale && gasUrl && !inFlightWarm[ns]) {
+        if (fastLocalRes.isStale && transportUrl && !inFlightWarm[ns]) {
           warmLocalReservationsCache().catch(function () {});
         }
         return fastLocalRes.response;
@@ -3612,8 +3708,45 @@
 
     async function executeCall() {
       var parsed;
-      if (!gasUrl) {
+      if (!transportUrl) {
         parsed = sandboxExecute(action, token, payload);
+      } else if (backendUrl) {
+        var bTimeoutId = null;
+        try {
+          var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
+          var bOpts = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            cache: 'no-store',
+            body: JSON.stringify({ action: action, token: token || '', payload: bPayload })
+          };
+          if (typeof AbortController !== 'undefined') {
+            var bController = new AbortController();
+            var bTimeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
+            bOpts.signal = bController.signal;
+            bTimeoutId = setTimeout(function () {
+              try { bController.abort(); } catch (e) {}
+            }, bTimeoutMs);
+          }
+          var bResponse = await fetch(backendUrl, bOpts);
+          if (bTimeoutId) clearTimeout(bTimeoutId);
+          parsed = await bResponse.json();
+          if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
+            setToken('');
+            document.dispatchEvent(new CustomEvent('rg:unauthorized'));
+          }
+        } catch (bErr) {
+          if (bTimeoutId) clearTimeout(bTimeoutId);
+          var isBAbort = bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1);
+          return {
+            success: false,
+            message: isBAbort
+              ? 'انتهت مهلة الاتصال بخادم قاعدة البيانات السحابية. يرجى المحاولة مرة أخرى.'
+              : ('تعذر الاتصال بخادم قاعدة البيانات السحابية: ' + (bErr.message || bErr)),
+            data: null,
+            error: isBAbort ? 'TIMEOUT' : (bErr.message || 'NETWORK_ERROR')
+          };
+        }
       } else {
         if (core && core.validateGasUrl) {
           var check = core.validateGasUrl(gasUrl);
@@ -3694,10 +3827,10 @@
                 if (root.RGIdbCache) root.RGIdbCache.upsertReservationDetail(ns, localDetailsByNs[ns][cr.id]).catch(function () {});
               }
             });
-          } else if (gasUrl) {
+          } else if (transportUrl) {
             warmLocalReservationsCache({ force: true }).catch(function () {});
           }
-          if (!gasUrl) syncSandboxSnapshotToIdb(ns);
+          if (!transportUrl) syncSandboxSnapshotToIdb(ns);
         } else if (action === 'quickUpdateReservationStatus' && parsed.data && parsed.data.reservation) {
           setLocalReservationsState(ns, [parsed.data.reservation], false);
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.reservation.id]) {
@@ -3712,7 +3845,7 @@
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
-        } else if (!gasUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
           syncSandboxSnapshotToIdb(ns);
         }
 

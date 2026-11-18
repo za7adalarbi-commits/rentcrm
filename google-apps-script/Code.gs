@@ -36,6 +36,18 @@ function handleApiRequest(e, method) {
       return jsonResponse(true, 'تم تسجيل الدخول بنجاح.', loginData);
     }
 
+    if (action === 'syncFromNeonMirror') {
+      var mirrorRes = handleNeonMirrorSync_(payload);
+      flushDirtyScriptCaches_();
+      return jsonResponse(true, 'تم تحديث نسخة Google Sheets الاحتياطية.', mirrorRes);
+    }
+
+    if (action === 'triggerNeonIncrementalSync') {
+      var trigRes = handleTriggerNeonIncrementalSync_(payload);
+      flushDirtyScriptCaches_();
+      return jsonResponse(true, 'تم تنفيذ السحب والمزامنة السحابية.', trigRes);
+    }
+
     var session = requireAuth(token);
 
     var result = null;

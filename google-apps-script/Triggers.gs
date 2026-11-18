@@ -59,10 +59,11 @@ function getTriggerStatus(session) {
   var triggers = ScriptApp.getProjectTriggers();
   var active = [];
   for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === 'scheduledAutoSync') {
+    var fn = triggers[i].getHandlerFunction();
+    if (fn === 'scheduledAutoSync' || fn === 'scheduledMinuteSync') {
       active.push({
         id: triggers[i].getUniqueId(),
-        handler: triggers[i].getHandlerFunction(),
+        handler: fn,
         eventType: String(triggers[i].getEventType())
       });
     }

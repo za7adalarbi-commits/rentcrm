@@ -731,6 +731,14 @@ function runRentalGateSyncInternal(actor, options) {
         finishedAt: nowIso()
       };
       appendRecord(RG_SHEETS.SYNC_LOG, syncRecord);
+      var neonSyncMeta = (typeof pushIncrementalSyncToNeonSafe_ === 'function')
+        ? pushIncrementalSyncToNeonSafe_(resRecordsToUpsert, extRecordsToUpsert, {
+            triggeredById: actorId,
+            triggeredByName: actorName,
+            pagesFetched: pagesFetched,
+            appliedRange: appliedRange
+          })
+        : { skipped: true };
       if (actorId !== 'SYSTEM' || (importedCount + updatedCount + extensionsCount) > 0) {
         var rangeDesc = appliedRange.hasCustomRange
           ? (' | النطاق: ' + (appliedRange.dateFrom || '-') + ' → ' + (appliedRange.dateTo || '-'))
@@ -753,7 +761,8 @@ function runRentalGateSyncInternal(actor, options) {
         startedAt: syncRecord.startedAt,
         finishedAt: syncRecord.finishedAt,
         appliedRange: appliedRange,
-        changedReservations: changedReservations
+        changedReservations: changedReservations,
+        neonSync: neonSyncMeta
       };
     } catch (err) {
       var errRecord = {
