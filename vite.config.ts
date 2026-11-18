@@ -62,7 +62,20 @@ export default defineConfig(({command}) => {
         transformIndexHtml(html) {
           const normalizedBase = base === './' ? './' : (base.endsWith('/') ? base : `${base}/`);
           const defaultGasUrl = String(process.env.VITE_GAS_WEBAPP_URL || '').trim();
-          const defaultBackendUrl = String(process.env.VITE_BACKEND_API_URL || '').trim();
+          const rawBackendUrl = String(process.env.VITE_BACKEND_API_URL || '').trim().replace(/\/+$/, '');
+          let defaultBackendUrl = rawBackendUrl;
+          if (rawBackendUrl && !/\/api\/crm$/i.test(rawBackendUrl)) {
+            if (/\/api$/i.test(rawBackendUrl)) {
+              defaultBackendUrl = `${rawBackendUrl}/crm`;
+            } else if (/^https?:\/\//i.test(rawBackendUrl)) {
+              try {
+                const parsed = new URL(rawBackendUrl);
+                if (!parsed.pathname || parsed.pathname === '/') {
+                  defaultBackendUrl = `${parsed.origin}/api/crm`;
+                }
+              } catch { /* ignore */ }
+            }
+          }
           const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};window.__RG_DEFAULT_BACKEND_API_URL__ = ${JSON.stringify(defaultBackendUrl)};</script>\n`;
           let nextHtml = html.replace('</head>', `${baseInject}  </head>`);
           if (normalizedBase !== './') {

@@ -884,5 +884,52 @@ test('summarizeReservationExtensions and mergeSyncedReservation capture exact ex
   assert.equal(merged.carCategory, 'سيدان متوسطة');
 });
 
+test('normalizeBackendApiUrl, resolveBackendEndpoint, and parseBackendResponseText prevent HTML/empty JSON crashes', () => {
+  assert.equal(
+    core.normalizeBackendApiUrl('https://rentcrm-zeta.vercel.app'),
+    'https://rentcrm-zeta.vercel.app/api/crm'
+  );
+  assert.equal(
+    core.normalizeBackendApiUrl('https://rentcrm-zeta.vercel.app/'),
+    'https://rentcrm-zeta.vercel.app/api/crm'
+  );
+  assert.equal(
+    core.normalizeBackendApiUrl('https://rentcrm-zeta.vercel.app/api'),
+    'https://rentcrm-zeta.vercel.app/api/crm'
+  );
+  assert.equal(core.normalizeBackendApiUrl('/api'), '/api/crm');
+  assert.equal(core.normalizeBackendApiUrl('/api/crm/'), '/api/crm');
+  assert.equal(core.normalizeBackendApiUrl('__SANDBOX__'), '');
+  assert.equal(core.normalizeBackendApiUrl('clear'), '');
 
+  assert.equal(core.resolveBackendEndpoint('/api/crm', '/api/health'), '/api/health');
+  assert.equal(
+    core.resolveBackendEndpoint('https://rentcrm-zeta.vercel.app', '/api/events'),
+    'https://rentcrm-zeta.vercel.app/api/events'
+  );
+  assert.equal(
+    core.resolveBackendEndpoint('https://rentcrm-zeta.vercel.app/api/crm', 'api/sync-queue'),
+    'https://rentcrm-zeta.vercel.app/api/sync-queue'
+  );
 
+  const emptyParsed = core.parseBackendResponseText('', 405);
+  assert.equal(emptyParsed.success, false);
+  assert.equal(emptyParsed.error, 'EMPTY_RESPONSE');
+  assert.equal(emptyParsed.httpStatus, 405);
+
+  const htmlParsed = core.parseBackendResponseText('<!doctype html><html><body>404</body></html>', 404);
+  assert.equal(htmlParsed.success, false);
+  assert.equal(htmlParsed.error, 'HTML_RESPONSE');
+
+  const truncatedParsed = core.parseBackendResponseText('{"success":true,"data":', 502);
+  assert.equal(truncatedParsed.success, false);
+  assert.equal(truncatedParsed.error, 'INVALID_JSON');
+
+  const okParsed = core.parseBackendResponseText('{"success":true,"data":{"ok":1}}', 200);
+  assert.equal(okParsed.success, true);
+  assert.equal(okParsed.data.ok, 1);
+
+  const errJson = core.parseBackendResponseText('{"message":"bad gateway"}', 502);
+  assert.equal(errJson.success, false);
+  assert.equal(errJson.message, 'bad gateway');
+});

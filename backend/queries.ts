@@ -3,6 +3,7 @@ import {
   crmCore,
   generateId,
   hashPassword,
+  hasPermission,
   mapEmployeeRow,
   normalizeLoginUsername,
   parseJsonArray,
@@ -2413,10 +2414,13 @@ export async function deletePermissionDefinition(executor: DbExecutor, session: 
 // ---------- LOGS, NOTIFICATIONS, REPORTS, SETTINGS & SYNC ----------
 
 export async function getActivityLogs(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'view_activity');
   const params: any[] = [];
   const clauses: string[] = [];
-  if (payload.userId) {
+  const canViewAll = hasPermission(session.user, 'view_all_logs') || hasPermission(session.user, 'view_activity');
+  if (!canViewAll) {
+    params.push(session.user.id);
+    clauses.push(`user_id = $${params.length}`);
+  } else if (payload.userId) {
     params.push(str(payload.userId));
     clauses.push(`user_id = $${params.length}`);
   }
@@ -2573,7 +2577,9 @@ export async function getTriggerStatus(_executor: DbExecutor, session: AuthSessi
 }
 
 export async function getReports(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'view_reports');
+  if (!hasPermission(session.user, 'export_reports') && !hasPermission(session.user, 'view_reports') && !hasPermission(session.user, 'view_dashboard')) {
+    requirePermission(session, 'export_reports');
+  }
   const rType = str(payload.reportType || 'all_reservations');
   const params: any[] = [];
   const clauses: string[] = [];
@@ -2703,9 +2709,13 @@ export async function pullOrSyncReservations(
       })
     });
     const text = await resp.text();
-    const parsed = JSON.parse(text);
+    const parsed = crmCore && typeof crmCore.parseGasResponseText === 'function'
+      ? crmCore.parseGasResponseText(text, resp.status)
+      : (() => {
+          try { return JSON.parse(text); } catch { return null; }
+        })();
     if (!parsed?.success) {
-      throw new Error(parsed?.message || 'فشلت المزامنة عبر Google Apps Script.');
+      throw new Error(parsed?.message || `فشلت المزامنة عبر Google Apps Script (HTTP ${resp.status}).`);
     }
     return parsed.data;
   }

@@ -47,6 +47,57 @@
     return String(cfg || '').trim();
   }
 
+  function normalizeBackendUrlValue(rawUrl) {
+    if (root.RGCrmCore && typeof root.RGCrmCore.normalizeBackendApiUrl === 'function') {
+      return root.RGCrmCore.normalizeBackendApiUrl(rawUrl);
+    }
+    var clean = String(rawUrl || '').trim().replace(/\/+$/, '');
+    if (!clean || clean === SANDBOX_SENTINEL || clean === 'clear' || clean === 'none') return '';
+    if (/\/api\/crm$/i.test(clean)) return clean;
+    if (/\/api$/i.test(clean)) return clean + '/crm';
+    if (/^https?:\/\//i.test(clean)) {
+      try {
+        var u = new URL(clean);
+        var p = (u.pathname || '').replace(/\/+$/, '');
+        if (!p) return u.origin + '/api/crm';
+      } catch (e) {}
+    }
+    return clean;
+  }
+
+  function resolveBackendEndpointUrl(endpointPath) {
+    var bUrl = getBackendApiUrl();
+    if (root.RGCrmCore && typeof root.RGCrmCore.resolveBackendEndpoint === 'function') {
+      return root.RGCrmCore.resolveBackendEndpoint(bUrl, endpointPath);
+    }
+    var ep = String(endpointPath || '').trim();
+    if (ep && ep.charAt(0) !== '/') ep = '/' + ep;
+    if (!bUrl || bUrl.charAt(0) === '/') return ep;
+    return bUrl.replace(/\/api\/crm$/i, '') + ep;
+  }
+
+  function safeParseJsonText(rawText) {
+    var trimmed = String(rawText || '').trim();
+    if (!trimmed) return null;
+    try {
+      return JSON.parse(trimmed);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function hasExplicitBackendOverride() {
+    var search = typeof window !== 'undefined' ? window.location.search : '';
+    var match = search.match(/(?:\?|&)backendUrl=([^&]+)/);
+    if (match && match[1]) {
+      try {
+        var decoded = decodeURIComponent(match[1]).trim();
+        if (decoded && decoded !== 'clear' && decoded !== 'none') return true;
+      } catch (e) {}
+    }
+    return Boolean(normalizeBackendUrlValue(safeStorageGet(STORAGE_BACKEND_URL)));
+  }
+
   function getBackendApiUrl() {
     var search = typeof window !== 'undefined' ? window.location.search : '';
     if (/(?:\?|&)sandbox=1(?:&|$)/.test(search)) return '';
@@ -59,18 +110,20 @@
         var decoded = decodeURIComponent(match[1]).trim();
         if (decoded === 'clear' || decoded === 'none') {
           safeStorageSet(STORAGE_BACKEND_URL, '');
-        } else if (decoded) {
-          safeStorageSet(STORAGE_BACKEND_URL, decoded);
-          return decoded;
+        } else {
+          var normQuery = normalizeBackendUrlValue(decoded);
+          if (normQuery) {
+            safeStorageSet(STORAGE_BACKEND_URL, normQuery);
+            return normQuery;
+          }
         }
       } catch (e) {}
     }
 
-    var storedBackend = safeStorageGet(STORAGE_BACKEND_URL);
+    var storedBackend = normalizeBackendUrlValue(safeStorageGet(STORAGE_BACKEND_URL));
     if (storedBackend) return storedBackend;
-    var defBackend = getDefaultConfiguredBackendUrl();
-    if (defBackend) return defBackend;
-    return detectedBackendUrl;
+    if (detectedBackendUrl) return detectedBackendUrl;
+    return normalizeBackendUrlValue(getDefaultConfiguredBackendUrl());
   }
 
   function getConnectionInfo() {
@@ -112,7 +165,7 @@
   }
 
   function probeBackendHealth() {
-    if (backendProbeDone) return Promise.resolve(detectedBackendUrl);
+    if (backendProbeDone) return Promise.resolve(getBackendApiUrl());
     if (backendProbePromise) return backendProbePromise;
     if (typeof window === 'undefined' || typeof fetch !== 'function') {
       backendProbeDone = true;
@@ -120,14 +173,28 @@
     }
     var proto = window.location ? window.location.protocol : '';
     var host = window.location ? window.location.hostname : '';
+    var origin = window.location ? window.location.origin : '';
     var search = window.location ? window.location.search : '';
     if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host) || /(?:\?|&)sandbox=1(?:&|$)/.test(search)) {
       backendProbeDone = true;
-      return Promise.resolve('');
+      return Promise.resolve(getBackendApiUrl());
     }
-    if (getBackendApiUrl()) {
+    if (hasExplicitBackendOverride()) {
       backendProbeDone = true;
       return Promise.resolve(getBackendApiUrl());
+    }
+    var defBackend = normalizeBackendUrlValue(getDefaultConfiguredBackendUrl());
+    if (defBackend) {
+      var isSameOriginDef = defBackend.charAt(0) === '/';
+      if (!isSameOriginDef && /^https?:\/\//i.test(defBackend)) {
+        try {
+          isSameOriginDef = new URL(defBackend).origin === origin;
+        } catch (e) {}
+      }
+      if (isSameOriginDef) {
+        backendProbeDone = true;
+        return Promise.resolve(defBackend);
+      }
     }
 
     backendProbePromise = (async function () {
@@ -142,7 +209,8 @@
         var resp = await fetch('/api/health', opts);
         if (timer) clearTimeout(timer);
         if (resp && resp.ok) {
-          var json = await resp.json();
+          var rawText = await resp.text();
+          var json = safeParseJsonText(rawText);
           if (json && json.ok && json.databaseConfigured && json.connected !== false) {
             detectedBackendUrl = '/api/crm';
           }
@@ -152,7 +220,7 @@
       } finally {
         backendProbeDone = true;
       }
-      return detectedBackendUrl;
+      return getBackendApiUrl();
     })();
 
     return backendProbePromise;
@@ -1371,14 +1439,14 @@
     var token = getToken();
     if (!token || !getBackendApiUrl()) return null;
     try {
-      var url = '/api/events?mode=poll&since=' + encodeURIComponent(String(realtimeState.lastSeq || 0));
+      var url = resolveBackendEndpointUrl('/api/events') + '?mode=poll&since=' + encodeURIComponent(String(realtimeState.lastSeq || 0));
       var resp = await fetch(url, {
         method: 'GET',
         headers: { Authorization: 'Bearer ' + token },
         cache: 'no-store'
       });
       if (!resp.ok) return null;
-      var json = await resp.json();
+      var json = safeParseJsonText(await resp.text());
       if (json && json.success && json.data) {
         if (Array.isArray(json.data.events)) {
           json.data.events.forEach(handleIncomingRealtimeEvent);
@@ -1431,7 +1499,7 @@
       return;
     }
 
-    var url = '/api/events?token=' + encodeURIComponent(token) + (realtimeState.lastSeq ? ('&since=' + realtimeState.lastSeq) : '');
+    var url = resolveBackendEndpointUrl('/api/events') + '?token=' + encodeURIComponent(token) + (realtimeState.lastSeq ? ('&since=' + realtimeState.lastSeq) : '');
     try {
       sseSource = new EventSource(url);
       realtimeState.mode = 'connecting';
@@ -1448,11 +1516,13 @@
           }
         } catch (e) {}
         emitSyncState();
-        fetch('/api/sync-queue', {
+        fetch(resolveBackendEndpointUrl('/api/sync-queue'), {
           method: 'GET',
           headers: { Authorization: 'Bearer ' + token },
           cache: 'no-store'
-        }).then(function (r) { return r.ok ? r.json() : null; }).then(function (q) {
+        }).then(function (r) {
+          return r.ok ? r.text().then(safeParseJsonText) : null;
+        }).then(function (q) {
           if (q && q.success && q.data && q.data.counts) {
             realtimeState.syncSummary = Object.assign({ pending: 0, processing: 0, synced: 0, failed: 0, total: 0 }, q.data.counts);
             emitSyncState();
@@ -4334,41 +4404,74 @@
       if (!transportUrl) {
         parsed = sandboxExecute(action, token, reqPayload);
       } else if (backendUrl) {
-        var bTimeoutId = null;
-        try {
-          var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(reqPayload) : reqPayload;
-          var bOpts = {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            cache: 'no-store',
-            body: JSON.stringify({ action: action, token: token || '', payload: bPayload })
-          };
-          if (typeof AbortController !== 'undefined') {
-            var bController = new AbortController();
-            var bTimeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
-            bOpts.signal = bController.signal;
-            bTimeoutId = setTimeout(function () {
-              try { bController.abort(); } catch (e) {}
-            }, bTimeoutMs);
+        var canRetryBackend = Boolean(policy.cacheable || (reqPayload && reqPayload.idempotencyKey));
+        var maxAttempts = canRetryBackend ? 2 : 1;
+        for (var bAttempt = 0; bAttempt < maxAttempts; bAttempt++) {
+          var bTimeoutId = null;
+          try {
+            var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(reqPayload) : reqPayload;
+            var bOpts = {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              cache: 'no-store',
+              body: JSON.stringify({ action: action, token: token || '', payload: bPayload })
+            };
+            if (typeof AbortController !== 'undefined') {
+              var bController = new AbortController();
+              var bTimeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
+              bOpts.signal = bController.signal;
+              bTimeoutId = setTimeout(function () {
+                try { bController.abort(); } catch (e) {}
+              }, bTimeoutMs);
+            }
+            var bResponse = await fetch(backendUrl, bOpts);
+            var bRawText = await bResponse.text();
+            if (bTimeoutId) clearTimeout(bTimeoutId);
+            parsed = (core && core.parseBackendResponseText)
+              ? core.parseBackendResponseText(bRawText, bResponse.status)
+              : (safeParseJsonText(bRawText) || {
+                  success: false,
+                  message: 'استجابة غير صالحة من خادم قاعدة البيانات السحابية (HTTP ' + (bResponse.status || 0) + ').',
+                  data: null,
+                  error: bRawText ? 'INVALID_JSON' : 'EMPTY_RESPONSE',
+                  httpStatus: bResponse.status
+                });
+
+            var isTransientGatewayFailure = Boolean(
+              parsed &&
+              !parsed.success &&
+              (
+                parsed.error === 'EMPTY_RESPONSE' ||
+                parsed.error === 'HTML_RESPONSE' ||
+                Number(parsed.httpStatus || bResponse.status || 0) >= 502
+              )
+            );
+            if (isTransientGatewayFailure && bAttempt + 1 < maxAttempts) {
+              await new Promise(function (resolve) { setTimeout(resolve, 250); });
+              continue;
+            }
+
+            if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
+              setToken('');
+              document.dispatchEvent(new CustomEvent('rg:unauthorized'));
+            }
+            break;
+          } catch (bErr) {
+            if (bTimeoutId) clearTimeout(bTimeoutId);
+            var isBAbort = bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1);
+            if (!isBAbort && bAttempt + 1 < maxAttempts) {
+              await new Promise(function (resolve) { setTimeout(resolve, 250); });
+              continue;
+            }
+            return {
+              success: false,
+              message: isBAbort
+                ? 'انتهت مهلة الاتصال بخادم قاعدة البيانات السحابية. يرجى المحاولة مرة أخرى.'
+                : ('تعذر الاتصال بخادم قاعدة البيانات السحابية: ' + (bErr && bErr.message ? bErr.message : bErr)),
+              data: null,
+              error: isBAbort ? 'TIMEOUT' : ((bErr && bErr.message) || 'NETWORK_ERROR')
+            };
           }
-          var bResponse = await fetch(backendUrl, bOpts);
-          if (bTimeoutId) clearTimeout(bTimeoutId);
-          parsed = await bResponse.json();
-          if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
-            setToken('');
-            document.dispatchEvent(new CustomEvent('rg:unauthorized'));
-          }
-        } catch (bErr) {
-          if (bTimeoutId) clearTimeout(bTimeoutId);
-          var isBAbort = bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1);
-          return {
-            success: false,
-            message: isBAbort
-              ? 'انتهت مهلة الاتصال بخادم قاعدة البيانات السحابية. يرجى المحاولة مرة أخرى.'
-              : ('تعذر الاتصال بخادم قاعدة البيانات السحابية: ' + (bErr.message || bErr)),
-            data: null,
-            error: isBAbort ? 'TIMEOUT' : (bErr.message || 'NETWORK_ERROR')
-          };
         }
       } else {
         if (core && core.validateGasUrl) {

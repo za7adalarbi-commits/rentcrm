@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import express from 'express';
 import { dispatchCrmRequest } from '../backend/router';
+import { mapEmployeeRow } from '../backend/auth';
+import { getActivityLogs, getReports } from '../backend/queries';
+import { applyApiCorsHeaders, parseRequestBody } from '../backend/http';
+import crmApiHandler from '../api/crm';
 import { handleSseStream, realtimeEmitter } from '../backend/realtimeBus';
 import {
   enqueueSyncOperation,
@@ -1104,3 +1108,153 @@ test('8. 1-minute backup delta sync sends ONLY rows with last_sync_at IS NULL or
     if (prevSecret === undefined) delete process.env.SYNC_API_SECRET; else process.env.SYNC_API_SECRET = prevSecret;
   }
 });
+
+test('9. mapEmployeeRow preserves custom permissions and getActivityLogs/getReports enforce accurate RBAC', async () => {
+  const customAgent = mapEmployeeRow({
+    id: 'EMP_CUSTOM_1',
+    name: 'وكيل مميز',
+    username: 'custom_agent',
+    role: 'agent',
+    permissions: JSON.stringify(['view_dashboard', 'view_reservations', 'view_all_logs', 'export_reports']),
+    status: 'active'
+  });
+  assert.equal(customAgent.permissions.includes('view_all_logs'), true);
+  assert.equal(customAgent.permissions.includes('export_reports'), true);
+  assert.equal(customAgent.permissions.includes('manage_employees'), false);
+
+  const gmUser = mapEmployeeRow({
+    id: 'EMP_ADMIN',
+    name: 'المدير العام',
+    username: 'admin',
+    role: 'general_manager',
+    permissions: '[]',
+    status: 'active'
+  });
+  const plainAgent = mapEmployeeRow({
+    id: 'EMP_AGENT_2',
+    name: 'موظف متابعة',
+    username: 'agent2',
+    role: 'agent',
+    permissions: '[]',
+    status: 'active'
+  });
+
+  const capturedQueries: Array<{ sql: string; params: any[] }> = [];
+  const stubExecutor: DbExecutor = {
+    async query<T extends Record<string, any> = any>(sql: string, params: any[] = []) {
+      capturedQueries.push({ sql: sql.replace(/\s+/g, ' ').trim(), params });
+      if (sql.includes('FROM activity_log')) {
+        return {
+          rows: [{
+            id: 'ACT_1',
+            user_id: params[0] || 'EMP_ADMIN',
+            user_name: 'اختبار',
+            user_role: 'general_manager',
+            action_type: 'تسجيل دخول',
+            entity_type: 'Auth',
+            entity_id: 'EMP_ADMIN',
+            details: 'ok',
+            log_date: '2026-11-17',
+            log_time: '12:00:00',
+            created_at: new Date('2026-11-17T12:00:00Z')
+          }] as any[],
+          rowCount: 1
+        };
+      }
+      if (sql.includes('FROM reservations')) {
+        return { rows: [] as any[], rowCount: 0 };
+      }
+      return { rows: [] as any[], rowCount: 0 };
+    },
+    async withTransaction<T>(fn: (client: DbClient) => Promise<T>) {
+      return fn({ query: this.query });
+    }
+  };
+
+  // General manager sees all logs without user_id restriction
+  const gmLogs = await getActivityLogs(stubExecutor, {
+    tokenHash: 'T1', employeeId: gmUser.id, username: gmUser.username, role: gmUser.role, expiresAt: '', user: gmUser
+  });
+  assert.equal(gmLogs.items.length, 1);
+  assert.equal(capturedQueries[0].sql.includes('user_id = $1'), false);
+
+  // Plain agent without view_all_logs is scoped strictly to their own user_id
+  capturedQueries.length = 0;
+  await getActivityLogs(stubExecutor, {
+    tokenHash: 'T2', employeeId: plainAgent.id, username: plainAgent.username, role: plainAgent.role, expiresAt: '', user: plainAgent
+  });
+  assert.equal(capturedQueries[0].sql.includes('user_id = $1'), true);
+  assert.equal(capturedQueries[0].params[0], 'EMP_AGENT_2');
+
+  // General manager can load reports via export_reports/view_dashboard without FORBIDDEN
+  const gmReport = await getReports(stubExecutor, {
+    tokenHash: 'T1', employeeId: gmUser.id, username: gmUser.username, role: gmUser.role, expiresAt: '', user: gmUser
+  }, { reportType: 'all_reservations' });
+  assert.equal(Array.isArray(gmReport.rows), true);
+
+  // Agent explicitly stripped of export_reports & view_dashboard is denied
+  const restrictedAgent = mapEmployeeRow({
+    id: 'EMP_NO_REP',
+    name: 'مقيد',
+    username: 'restricted',
+    role: 'agent',
+    permissions: JSON.stringify(['view_reservations']),
+    status: 'active'
+  });
+  await assert.rejects(
+    () => getReports(stubExecutor, {
+      tokenHash: 'T3', employeeId: restrictedAgent.id, username: restrictedAgent.username, role: restrictedAgent.role, expiresAt: '', user: restrictedAgent
+    }, { reportType: 'all_reservations' }),
+    /FORBIDDEN/
+  );
+});
+
+test('10. api/crm handler and http helpers always return valid JSON with CORS headers (never empty body)', async () => {
+  assert.deepEqual(parseRequestBody('{"action":"login","payload":{"username":"admin"}}'), {
+    action: 'login',
+    payload: { username: 'admin' }
+  });
+  assert.deepEqual(parseRequestBody('not-json'), {});
+  assert.deepEqual(parseRequestBody(Buffer.from('{"action":"ping"}')), { action: 'ping' });
+
+  const prevDbUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  const prevPgUrl = process.env.POSTGRES_URL;
+  delete process.env.POSTGRES_URL;
+  const prevNeonUrl = process.env.NEON_DATABASE_URL;
+  delete process.env.NEON_DATABASE_URL;
+
+  try {
+    const headers: Record<string, string> = {};
+    let statusCode = 0;
+    let jsonPayload: any = null;
+    const mockReq: any = {
+      method: 'POST',
+      headers: { origin: 'https://team.github.io' },
+      body: { action: 'login' }
+    };
+    const mockRes: any = {
+      headersSent: false,
+      setHeader(k: string, v: string) { headers[k] = v; },
+      status(code: number) { statusCode = code; return this; },
+      json(body: any) { jsonPayload = body; this.headersSent = true; return this; },
+      end() { this.headersSent = true; return this; }
+    };
+
+    await crmApiHandler(mockReq, mockRes);
+    assert.equal(statusCode, 503);
+    assert.equal(jsonPayload.success, false);
+    assert.equal(jsonPayload.error, 'DATABASE_UNCONFIGURED');
+    assert.equal(headers['Access-Control-Allow-Origin'], 'https://team.github.io');
+
+    // Also test applyApiCorsHeaders directly with OPTIONS
+    const corsHeaders: Record<string, string> = {};
+    applyApiCorsHeaders({ headers: {} }, { setHeader: (k: string, v: string) => { corsHeaders[k] = v; } });
+    assert.equal(corsHeaders['Access-Control-Allow-Origin'], '*');
+  } finally {
+    if (prevDbUrl !== undefined) process.env.DATABASE_URL = prevDbUrl;
+    if (prevPgUrl !== undefined) process.env.POSTGRES_URL = prevPgUrl;
+    if (prevNeonUrl !== undefined) process.env.NEON_DATABASE_URL = prevNeonUrl;
+  }
+});
+

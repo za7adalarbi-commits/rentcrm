@@ -1548,7 +1548,16 @@ export async function pullFromRentalGateDirect(
         const errBody = await resp.text().catch(() => '');
         throw new Error(`RG_API_HTTP_${resp.status}: ${errBody.slice(0, 200)}`);
       }
-      const json: any = await resp.json();
+      const rawText = await resp.text();
+      let json: any = null;
+      try {
+        json = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        throw new Error(`RG_API_INVALID_JSON (HTTP ${resp.status}): تعذر قراءة بيانات Rental Gate API.`);
+      }
+      if (!json || typeof json !== 'object') {
+        throw new Error(`RG_API_EMPTY_RESPONSE (HTTP ${resp.status}): أعادت واجهة Rental Gate استجابة فارغة.`);
+      }
       pages++;
       const list = Array.isArray(json)
         ? json

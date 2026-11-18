@@ -1,9 +1,12 @@
-import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from '../backend/db';
+import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured, type DbExecutor } from '../backend/db';
+import { applyApiCorsHeaders } from '../backend/http';
 import { logBackendError } from '../backend/logger';
 import { ensureSeededDatabase } from '../backend/queries';
 import { handleSseStream } from '../backend/realtimeBus';
 
 export default async function handler(req: any, res: any) {
+  applyApiCorsHeaders(req, res);
+
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -19,13 +22,14 @@ export default async function handler(req: any, res: any) {
     return;
   }
 
-  const executor = createPgExecutor();
+  let executor: DbExecutor | null = null;
   try {
+    executor = createPgExecutor();
     await ensureSchemaInitialized(executor);
     await ensureSeededDatabase(executor);
     await handleSseStream(req, res, executor);
   } catch (err: any) {
-    await logBackendError(executor, 'api/events', String(req.method || 'GET'), err);
+    await logBackendError(executor, 'api/events', String(req.method || 'GET'), err).catch(() => undefined);
     if (!res.headersSent) {
       res.status(500).json({
         success: false,

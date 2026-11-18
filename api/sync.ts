@@ -1,5 +1,6 @@
 import { requireApiAccess, requireAuth, verifySharedSecret } from '../backend/auth';
 import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured, type DbExecutor } from '../backend/db';
+import { applyApiCorsHeaders, parseRequestBody } from '../backend/http';
 import { logBackendError } from '../backend/logger';
 import { ensureSeededDatabase } from '../backend/queries';
 import {
@@ -10,19 +11,6 @@ import {
   runBackupDeltaSync,
   triggerImmediateSync
 } from '../backend/syncService';
-
-function parseBody(rawBody: any): Record<string, any> {
-  if (!rawBody) return {};
-  if (typeof rawBody === 'string') {
-    try {
-      const parsed = JSON.parse(rawBody);
-      return parsed && typeof parsed === 'object' ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-  return typeof rawBody === 'object' ? rawBody : {};
-}
 
 function extractProvidedToken(req: any, body: Record<string, any>): { syncSecret: string; bearer: string } {
   const headerSecret = String(req.headers?.['x-sync-secret'] || '').trim();
@@ -57,6 +45,8 @@ async function authorizeSyncRequest(req: any, body: Record<string, any>, executo
 }
 
 export default async function handler(req: any, res: any) {
+  applyApiCorsHeaders(req, res);
+
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -72,10 +62,10 @@ export default async function handler(req: any, res: any) {
     return;
   }
 
-  const body = parseBody(req.body);
-  const executor = createPgExecutor();
-
+  let executor: DbExecutor | null = null;
   try {
+    const body = parseRequestBody(req.body);
+    executor = createPgExecutor();
     await ensureSchemaInitialized(executor);
     await ensureSeededDatabase(executor);
 

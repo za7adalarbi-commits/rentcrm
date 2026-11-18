@@ -102,7 +102,9 @@ export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
 function loadSchemaSql(): string {
   const candidates = [
     path.resolve(process.cwd(), 'database/schema.sql'),
-    path.resolve(import.meta.dirname || process.cwd(), '../database/schema.sql')
+    path.resolve(import.meta.dirname || process.cwd(), '../database/schema.sql'),
+    path.resolve(process.cwd(), '../database/schema.sql'),
+    '/var/task/database/schema.sql'
   ];
   for (const p of candidates) {
     if (fs.existsSync(p)) {

@@ -12,6 +12,28 @@ import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from 
 import { ensureSeededDatabase } from './backend/queries';
 import { runBackupDeltaSync, triggerImmediateSync } from './backend/syncService';
 
+function mountApiRoute(
+  app: express.Express,
+  routePath: string,
+  handler: (req: any, res: any) => Promise<void> | void
+) {
+  app.all(routePath, (req, res) => {
+    Promise.resolve(handler(req, res)).catch((err: any) => {
+      console.error(`[API ${routePath}] Unhandled error:`, err);
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          message: String(err?.message || 'حدث خطأ غير متوقع في الخادم.'),
+          data: null,
+          error: 'INTERNAL_SERVER_ERROR'
+        });
+      } else if (!res.writableEnded) {
+        try { res.end(); } catch { /* ignore */ }
+      }
+    });
+  });
+}
+
 async function startServer() {
   const app = express();
   const port = Number(process.env.PORT || 3000);
@@ -19,30 +41,25 @@ async function startServer() {
 
   app.use(express.json({ limit: '5mb' }));
   app.use(express.text({ type: 'text/plain', limit: '5mb' }));
-
-  app.all('/api/health', (req, res) => {
-    void healthHandler(req, res);
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err && req.path.startsWith('/api/')) {
+      res.status(err.status || 400).json({
+        success: false,
+        message: String(err.message || 'صيغة بيانات الطلب غير صالحة.'),
+        data: null,
+        error: 'INVALID_REQUEST_BODY'
+      });
+      return;
+    }
+    next(err);
   });
 
-  app.all('/api/crm', (req, res) => {
-    void crmHandler(req, res);
-  });
-
-  app.all('/api/sync', (req, res) => {
-    void syncHandler(req, res);
-  });
-
-  app.all('/api/sync-queue', (req, res) => {
-    void syncQueueHandler(req, res);
-  });
-
-  app.all('/api/events', (req, res) => {
-    void eventsHandler(req, res);
-  });
-
-  app.all('/api/cron/sync', (req, res) => {
-    void cronSyncHandler(req, res);
-  });
+  mountApiRoute(app, '/api/health', healthHandler);
+  mountApiRoute(app, '/api/crm', crmHandler);
+  mountApiRoute(app, '/api/sync', syncHandler);
+  mountApiRoute(app, '/api/sync-queue', syncQueueHandler);
+  mountApiRoute(app, '/api/events', eventsHandler);
+  mountApiRoute(app, '/api/cron/sync', cronSyncHandler);
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');

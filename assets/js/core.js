@@ -1588,6 +1588,95 @@
     }
   }
 
+  function normalizeBackendApiUrl(rawUrl) {
+    var clean = normalizeStr(rawUrl).replace(/\/+$/, '');
+    if (!clean || clean === '__SANDBOX__' || clean === 'clear' || clean === 'none') {
+      return '';
+    }
+    if (/\/api\/crm$/i.test(clean)) {
+      return clean;
+    }
+    if (/\/api$/i.test(clean)) {
+      return clean + '/crm';
+    }
+    if (/^https?:\/\//i.test(clean)) {
+      try {
+        var u = new URL(clean);
+        var p = (u.pathname || '').replace(/\/+$/, '');
+        if (!p) {
+          return u.origin + '/api/crm';
+        }
+        if (/\/api$/i.test(p)) {
+          return u.origin + p + '/crm';
+        }
+        if (/\/api\/crm$/i.test(p)) {
+          return u.origin + p;
+        }
+      } catch (e) {}
+    }
+    return clean;
+  }
+
+  function resolveBackendEndpoint(backendCrmUrl, endpointPath) {
+    var ep = normalizeStr(endpointPath);
+    if (!ep) return '';
+    if (ep.charAt(0) !== '/') ep = '/' + ep;
+    var norm = normalizeBackendApiUrl(backendCrmUrl);
+    if (!norm || norm.charAt(0) === '/') return ep;
+    var base = norm.replace(/\/api\/crm$/i, '');
+    return base + ep;
+  }
+
+  function parseBackendResponseText(rawText, httpStatus) {
+    var status = Number(httpStatus || 0);
+    var trimmed = normalizeStr(rawText);
+    if (!trimmed) {
+      return {
+        success: false,
+        message: 'استجابة فارغة من خادم قاعدة البيانات السحابية (HTTP ' + status + '). يرجى التحقق من مسار /api/crm وحالة الخادم.',
+        data: null,
+        error: 'EMPTY_RESPONSE',
+        httpStatus: status
+      };
+    }
+    if (trimmed.charAt(0) === '<' || /^<!doctype/i.test(trimmed)) {
+      return {
+        success: false,
+        message: 'أعاد خادم قاعدة البيانات السحابية صفحة HTML بدلاً من JSON (HTTP ' + status + '). تأكد من توجيه الطلبات إلى /api/crm.',
+        data: null,
+        error: 'HTML_RESPONSE',
+        httpStatus: status
+      };
+    }
+    try {
+      var parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object') {
+        return {
+          success: false,
+          message: 'صيغة الاستجابة من خادم قاعدة البيانات السحابية غير صالحة (HTTP ' + status + ').',
+          data: null,
+          error: 'INVALID_RESPONSE',
+          httpStatus: status
+        };
+      }
+      if (status >= 400 && parsed.success === undefined) {
+        parsed.success = false;
+      }
+      if (parsed.success === false && !parsed.message) {
+        parsed.message = 'تعذر إتمام الطلب من خادم قاعدة البيانات السحابية (HTTP ' + status + ').';
+      }
+      return parsed;
+    } catch (e) {
+      return {
+        success: false,
+        message: 'تعذر قراءة استجابة JSON من خادم قاعدة البيانات السحابية (HTTP ' + status + ').',
+        data: null,
+        error: 'INVALID_JSON',
+        httpStatus: status
+      };
+    }
+  }
+
   var API_CACHE_POLICIES = {
     getAppBootstrap: { cacheable: true, ttlMs: 30000, scope: 'dashboard' },
     getMe: { cacheable: true, ttlMs: 300000, scope: 'employees' },
@@ -2299,6 +2388,9 @@
     getGasActionTimeoutMs: getGasActionTimeoutMs,
     buildGasFetchOptions: buildGasFetchOptions,
     parseGasResponseText: parseGasResponseText,
+    normalizeBackendApiUrl: normalizeBackendApiUrl,
+    resolveBackendEndpoint: resolveBackendEndpoint,
+    parseBackendResponseText: parseBackendResponseText,
     getApiCachePolicy: getApiCachePolicy,
     buildApiCacheKey: buildApiCacheKey,
     getCacheInvalidationScopes: getCacheInvalidationScopes,
