@@ -118,11 +118,25 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
 
   schemaInitPromise = (async () => {
     try {
-      const check = await executor.query<{ reg: string | null }>(
-        "SELECT to_regclass('public.employees') AS reg"
+      const check = await executor.query<{
+        emp_reg: string | null;
+        cust_reg: string | null;
+        evt_reg: string | null;
+        has_op_col: boolean;
+      }>(
+        `SELECT to_regclass('public.employees') AS emp_reg,
+                to_regclass('public.customers') AS cust_reg,
+                to_regclass('public.realtime_events') AS evt_reg,
+                EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'sheets_mirror_outbox'
+                    AND column_name = 'operation'
+                ) AS has_op_col`
       );
-      const exists = Boolean(check.rows[0] && check.rows[0].reg);
-      if (!exists) {
+      const row = check.rows[0];
+      const upToDate = Boolean(row && row.emp_reg && row.cust_reg && row.evt_reg && row.has_op_col);
+      if (!upToDate) {
         const sql = loadSchemaSql();
         await executor.query(sql);
       }

@@ -177,6 +177,20 @@
   var localExtensionsByResNs = {};
   var localMetaByNs = {};
 
+  var realtimeState = {
+    connected: false,
+    mode: 'idle',
+    lastSeq: 0,
+    lastEventAt: '',
+    lastSyncAt: '',
+    syncSummary: { pending: 0, processing: 0, synced: 0, failed: 0, total: 0 }
+  };
+  var sseSource = null;
+  var sseReconnectTimer = null;
+  var sseRetryAttempt = 0;
+  var seenRealtimeSeqs = {};
+  var realtimeStreamToken = '';
+
   function getCacheNamespace() {
     var mode = getTransportUrl() || 'sandbox';
     var tok = getToken() || '';
@@ -1167,6 +1181,34 @@
         }
         return undefined;
       });
+      return;
+    }
+
+    if (action === 'deleteReservation') {
+      var delResId = String(p.reservationId || p.id || '').trim();
+      if (!delResId) return;
+      var nsDelR = getCacheNamespace();
+      if (localReservationsByNs[nsDelR] && Array.isArray(localReservationsByNs[nsDelR].list)) {
+        var filteredR = localReservationsByNs[nsDelR].list.filter(function (r) {
+          return r.id !== delResId && r.reservationNumber !== delResId;
+        });
+        setLocalReservationsState(nsDelR, filteredR, true);
+      }
+      if (localDetailsByNs[nsDelR] && localDetailsByNs[nsDelR][delResId]) {
+        delete localDetailsByNs[nsDelR][delResId];
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          var nextR = data.items.filter(function (r) { return r.id !== delResId && r.reservationNumber !== delResId; });
+          return Object.assign({}, data, { items: nextR, total: Math.max(0, Number(data.total || nextR.length) - (nextR.length < data.items.length ? 1 : 0)) });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, {
+            assignedReservations: data.assignedReservations.filter(function (r) { return r.id !== delResId; })
+          });
+        }
+        return undefined;
+      });
     }
   }
 
@@ -1192,11 +1234,265 @@
 
   function setToken(token) {
     safeStorageSet(STORAGE_TOKEN, token ? String(token).trim() : '');
+    if (!token) stopRealtimeStream();
     clearCache();
   }
 
   function isLiveMode() {
     return Boolean(getTransportUrl());
+  }
+
+  function isBackendMode() {
+    return Boolean(getBackendApiUrl());
+  }
+
+  function emitSyncState() {
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      try {
+        window.dispatchEvent(new CustomEvent('rg:sync-state', { detail: getRealtimeStatus() }));
+      } catch (e) {}
+    }
+  }
+
+  function getRealtimeStatus() {
+    return {
+      connected: Boolean(realtimeState.connected),
+      mode: realtimeState.mode,
+      lastSeq: Number(realtimeState.lastSeq || 0),
+      lastEventAt: realtimeState.lastEventAt || '',
+      lastSyncAt: realtimeState.lastSyncAt || '',
+      syncSummary: Object.assign({ pending: 0, processing: 0, synced: 0, failed: 0, total: 0 }, realtimeState.syncSummary || {})
+    };
+  }
+
+  function handleIncomingRealtimeEvent(ev) {
+    if (!ev || typeof ev !== 'object') return;
+    var seqNum = Number(ev.seq || 0);
+    var dedupKey = seqNum > 0 ? ('S:' + seqNum) : (ev.id ? ('I:' + ev.id) : '');
+    if (dedupKey && seenRealtimeSeqs[dedupKey]) return;
+    if (dedupKey) seenRealtimeSeqs[dedupKey] = true;
+    if (seqNum > realtimeState.lastSeq) realtimeState.lastSeq = seqNum;
+    realtimeState.lastEventAt = ev.createdAt || new Date().toISOString();
+
+    var core = root.RGCrmCore;
+    var ns = getCacheNamespace();
+    var p = ev.payload || {};
+    var ent = String(ev.entityType || '');
+    var op = (core && core.normalizeSyncOperation) ? core.normalizeSyncOperation(ev.operation) : String(ev.operation || 'UPDATE').toUpperCase();
+
+    if (ent === 'SyncQueue' || ev.eventType === 'sync:queue_updated') {
+      if (p.counts) {
+        realtimeState.syncSummary = Object.assign({ pending: 0, processing: 0, synced: 0, failed: 0, total: 0 }, p.counts);
+      }
+      if (p.syncedAt) realtimeState.lastSyncAt = p.syncedAt;
+      clearCache(['sync']);
+      emitSyncState();
+    } else if (ent === 'Reservation') {
+      var resObj = p.reservation || (op === 'DELETE' ? { id: ev.recordId || p.id, reservationNumber: p.reservationNumber } : null);
+      if (resObj && (resObj.id || resObj.reservationNumber)) {
+        if (op === 'DELETE') {
+          if (localReservationsByNs[ns] && Array.isArray(localReservationsByNs[ns].list)) {
+            var nextLocal = (core && core.applyDeltaRecordToList)
+              ? core.applyDeltaRecordToList(localReservationsByNs[ns].list, 'DELETE', resObj, 'id')
+              : localReservationsByNs[ns].list.filter(function (x) { return x.id !== resObj.id; });
+            setLocalReservationsState(ns, nextLocal, true);
+          }
+          if (localDetailsByNs[ns] && localDetailsByNs[ns][resObj.id]) {
+            delete localDetailsByNs[ns][resObj.id];
+          }
+          patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+            if (actName === 'getReservations' && Array.isArray(data.items)) {
+              return Object.assign({}, data, {
+                items: data.items.filter(function (r) { return r.id !== resObj.id && r.reservationNumber !== resObj.reservationNumber; })
+              });
+            }
+            if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+              return Object.assign({}, data, {
+                assignedReservations: data.assignedReservations.filter(function (r) { return r.id !== resObj.id; })
+              });
+            }
+            return undefined;
+          });
+        } else {
+          setLocalReservationsState(ns, [resObj], false);
+          if (localDetailsByNs[ns] && localDetailsByNs[ns][resObj.id]) {
+            var curD = localDetailsByNs[ns][resObj.id];
+            var nextFus = curD.followUps || [];
+            if (p.followUp && p.followUp.id) {
+              nextFus = [p.followUp].concat(nextFus.filter(function (f) { return f.id !== p.followUp.id && String(f.id || '').indexOf('FU_OPT_') !== 0; }));
+            }
+            setLocalDetailState(ns, Object.assign({}, curD, { reservation: resObj, followUps: nextFus }));
+          }
+          patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+            if (actName === 'getReservations' && Array.isArray(data.items) && core && core.applyDeltaRecordToList) {
+              return Object.assign({}, data, {
+                items: core.applyDeltaRecordToList(data.items, op, resObj, 'id')
+              });
+            }
+            if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resObj.id) {
+              var nextDetFus = data.followUps || [];
+              if (p.followUp && p.followUp.id) {
+                nextDetFus = [p.followUp].concat(nextDetFus.filter(function (f) { return f.id !== p.followUp.id && String(f.id || '').indexOf('FU_OPT_') !== 0; }));
+              }
+              return Object.assign({}, data, { reservation: resObj, followUps: nextDetFus });
+            }
+            return undefined;
+          });
+        }
+      }
+      clearCache(['dashboard', 'reports', 'activity']);
+    } else if (ent === 'Customer') {
+      var custObj = p.customer || (op === 'DELETE' ? { id: ev.recordId || p.id } : null);
+      if (custObj) {
+        patchCachedScopes(['customers'], function (data, actName) {
+          if (actName === 'getCustomers' && Array.isArray(data.items) && core && core.applyDeltaRecordToList) {
+            var nextCusts = core.applyDeltaRecordToList(data.items, op, custObj, 'id');
+            return Object.assign({}, data, { items: nextCusts, total: nextCusts.length });
+          }
+          return undefined;
+        });
+      }
+      clearCache(['customers', 'activity']);
+    } else if (ent === 'Problem' || ent === 'FollowUp' || ent === 'Employee') {
+      clearCache(['problems', 'followUps', 'employees', 'dashboard', 'reservations', 'notifications', 'activity']);
+    } else if (ent === 'Sync') {
+      realtimeState.lastSyncAt = ev.createdAt || new Date().toISOString();
+      clearCache(['reservations', 'customers', 'dashboard', 'sync', 'reports']);
+    }
+
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      try {
+        window.dispatchEvent(new CustomEvent('rg:realtime-event', { detail: ev }));
+      } catch (e) {}
+    }
+  }
+
+  async function fetchRealtimeDelta() {
+    var token = getToken();
+    if (!token || !getBackendApiUrl()) return null;
+    try {
+      var url = '/api/events?mode=poll&since=' + encodeURIComponent(String(realtimeState.lastSeq || 0));
+      var resp = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer ' + token },
+        cache: 'no-store'
+      });
+      if (!resp.ok) return null;
+      var json = await resp.json();
+      if (json && json.success && json.data) {
+        if (Array.isArray(json.data.events)) {
+          json.data.events.forEach(handleIncomingRealtimeEvent);
+        }
+        if (Number(json.data.latestSeq || 0) > realtimeState.lastSeq) {
+          realtimeState.lastSeq = Number(json.data.latestSeq || 0);
+        }
+        return json.data;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function stopRealtimeStream() {
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
+    }
+    if (sseSource) {
+      try { sseSource.close(); } catch (e) {}
+      sseSource = null;
+    }
+    realtimeStreamToken = '';
+    realtimeState.connected = false;
+    realtimeState.mode = 'idle';
+    emitSyncState();
+  }
+
+  async function startRealtimeStream() {
+    await probeBackendHealth();
+    var token = getToken();
+    if (!token) {
+      stopRealtimeStream();
+      return;
+    }
+    if (!getBackendApiUrl()) {
+      realtimeState.connected = false;
+      realtimeState.mode = getGasUrl() ? 'gas' : 'sandbox';
+      emitSyncState();
+      return;
+    }
+    if (sseSource && realtimeStreamToken === token) return;
+    stopRealtimeStream();
+    realtimeStreamToken = token;
+
+    if (typeof EventSource !== 'function') {
+      realtimeState.mode = 'poll';
+      emitSyncState();
+      fetchRealtimeDelta().catch(function () {});
+      return;
+    }
+
+    var url = '/api/events?token=' + encodeURIComponent(token) + (realtimeState.lastSeq ? ('&since=' + realtimeState.lastSeq) : '');
+    try {
+      sseSource = new EventSource(url);
+      realtimeState.mode = 'connecting';
+      emitSyncState();
+
+      sseSource.addEventListener('connected', function (msg) {
+        sseRetryAttempt = 0;
+        realtimeState.connected = true;
+        realtimeState.mode = 'sse';
+        try {
+          var meta = JSON.parse(msg.data || '{}');
+          if (Number(meta.latestSeq || 0) > realtimeState.lastSeq) {
+            realtimeState.lastSeq = Number(meta.latestSeq || 0);
+          }
+        } catch (e) {}
+        emitSyncState();
+        fetch('/api/sync-queue', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer ' + token },
+          cache: 'no-store'
+        }).then(function (r) { return r.ok ? r.json() : null; }).then(function (q) {
+          if (q && q.success && q.data && q.data.counts) {
+            realtimeState.syncSummary = Object.assign({ pending: 0, processing: 0, synced: 0, failed: 0, total: 0 }, q.data.counts);
+            emitSyncState();
+          }
+        }).catch(function () {});
+      });
+
+      sseSource.addEventListener('crm_delta', function (msg) {
+        try {
+          var ev = JSON.parse(msg.data || '{}');
+          handleIncomingRealtimeEvent(ev);
+        } catch (e) {}
+      });
+
+      sseSource.onerror = function () {
+        if (sseSource) {
+          try { sseSource.close(); } catch (e) {}
+          sseSource = null;
+        }
+        realtimeState.connected = false;
+        realtimeState.mode = 'reconnecting';
+        emitSyncState();
+        if (!getToken() || !getBackendApiUrl()) return;
+        sseRetryAttempt++;
+        var waitSec = (root.RGCrmCore && root.RGCrmCore.computeExponentialBackoffSeconds)
+          ? root.RGCrmCore.computeExponentialBackoffSeconds(sseRetryAttempt, 2, 30, 0.2)
+          : Math.min(30, 2 * Math.pow(2, sseRetryAttempt - 1));
+        fetchRealtimeDelta().catch(function () {});
+        if (!sseReconnectTimer) {
+          sseReconnectTimer = setTimeout(function () {
+            sseReconnectTimer = null;
+            startRealtimeStream();
+          }, waitSec * 1000);
+        }
+      };
+    } catch (e) {
+      realtimeState.connected = false;
+      realtimeState.mode = 'poll';
+      emitSyncState();
+    }
   }
 
   function warmUpGas() {
@@ -1244,6 +1540,9 @@
     var t1 = todayIso(-1);
     var t2 = todayIso(-2);
     var t5 = todayIso(-5);
+    function minsAgoIso(mins) {
+      return new Date(Date.now() - mins * 60000).toISOString();
+    }
 
     var employees = [
       {
@@ -1360,10 +1659,10 @@
         lastUpdateText: 'تأكيد تمديد الحجز مرتين (3 أيام إضافية) وسداد 800 ر.س',
         lastUpdatedById: 'EMP_AG1',
         lastUpdatedByName: 'خالد الحربي',
-        lastUpdatedAt: t0 + 'T11:15:00.000Z',
+        lastUpdatedAt: minsAgoIso(25),
         hasProblem: false,
         createdAt: t1 + 'T14:00:00.000Z',
-        updatedAt: t0 + 'T11:15:00.000Z'
+        updatedAt: minsAgoIso(25)
       },
       {
         id: 'RES_1002',
@@ -1412,10 +1711,10 @@
         lastUpdateText: 'تم تسليم المركبة للعميل وفحص العداد',
         lastUpdatedById: 'EMP_AG1',
         lastUpdatedByName: 'خالد الحربي',
-        lastUpdatedAt: t0 + 'T10:05:00.000Z',
+        lastUpdatedAt: minsAgoIso(45),
         hasProblem: false,
         createdAt: t0 + 'T08:10:00.000Z',
-        updatedAt: t0 + 'T10:05:00.000Z'
+        updatedAt: minsAgoIso(45)
       },
       {
         id: 'RES_1003',
@@ -1464,10 +1763,10 @@
         lastUpdateText: 'تأخر تأكيد الفرع على جاهزية السيارة',
         lastUpdatedById: 'EMP_SUP1',
         lastUpdatedByName: 'سارة العتيبي',
-        lastUpdatedAt: t0 + 'T09:40:00.000Z',
+        lastUpdatedAt: minsAgoIso(75),
         hasProblem: true,
         createdAt: t1 + 'T16:30:00.000Z',
-        updatedAt: t0 + 'T09:40:00.000Z'
+        updatedAt: minsAgoIso(75)
       },
       {
         id: 'RES_1004',
@@ -1568,10 +1867,10 @@
         lastUpdateText: 'بانتظار إسناد موظف للمتابعة',
         lastUpdatedById: 'EMP_ADMIN',
         lastUpdatedByName: 'فهد الدوسري',
-        lastUpdatedAt: t0 + 'T07:50:00.000Z',
+        lastUpdatedAt: minsAgoIso(120),
         hasProblem: false,
-        createdAt: t0 + 'T07:50:00.000Z',
-        updatedAt: t0 + 'T07:50:00.000Z'
+        createdAt: minsAgoIso(120),
+        updatedAt: minsAgoIso(120)
       },
       {
         id: 'RES_1006',
@@ -1909,9 +2208,33 @@
       });
     });
 
+    var sandboxCustomers = [];
+    var seenCustMap = {};
+    reservations.forEach(function (r) {
+      var cid = (root.RGCrmCore && root.RGCrmCore.buildCustomerIdFromInput)
+        ? root.RGCrmCore.buildCustomerIdFromInput({ phone: r.customerPhone, email: r.customerEmail, name: r.customerName })
+        : ('CUST_' + (r.customerPhone || r.customerName));
+      if (!seenCustMap[cid]) {
+        seenCustMap[cid] = true;
+        sandboxCustomers.push({
+          id: cid,
+          name: r.customerName,
+          phone: r.customerPhone,
+          email: r.customerEmail || '',
+          idNumber: r.customerIdNumber || '',
+          companyName: r.companyName || '',
+          notes: '',
+          status: 'active',
+          createdAt: r.createdAt,
+          updatedAt: r.updatedAt
+        });
+      }
+    });
+
     return {
       _schemaV3ExactRg: true,
       employees: employees,
+      customers: sandboxCustomers,
       reservations: reservations,
       extensions: extensions,
       assignments: assignments,
@@ -1922,6 +2245,8 @@
       activityLog: activityLog,
       notifications: notifications,
       syncLog: syncLog,
+      syncOutbox: [],
+      realtimeEvents: [],
       settings: settings,
       sessions: []
     };
@@ -1966,9 +2291,9 @@
         });
       }
 
-      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'sessions'].forEach(function (k) {
+      ['reservations', 'customers', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'syncOutbox', 'realtimeEvents', 'sessions'].forEach(function (k) {
         if (!Array.isArray(parsed[k])) {
-          parsed[k] = defaults[k];
+          parsed[k] = defaults[k] || [];
           dirty = true;
         }
       });
@@ -2576,8 +2901,260 @@
           });
         }
         appendSandboxActivity(db, session.user, 'تعديل تفاصيل الحجز', 'Reservation', rEdit.reservationNumber, 'تعديل تفاصيل الحجز بواسطة ' + session.user.name);
+        db.syncOutbox.unshift({
+          id: genId('OUT'),
+          entityType: 'Reservation',
+          entityId: rEdit.id,
+          recordId: rEdit.reservationNumber,
+          operation: 'UPDATE',
+          status: 'synced',
+          retryCount: 0,
+          maxRetries: 5,
+          lastError: '',
+          createdAt: nowEditIso,
+          syncedAt: nowEditIso
+        });
         saveSandboxDb(db);
         return { success: true, message: 'تم حفظ تعديلات تفاصيل الحجز.', data: rEdit, error: null };
+      }
+
+      case 'getCustomers': {
+        var searchCust = String(payload.search || '').trim().toLowerCase();
+        var custItems = (db.customers || []).filter(function (c) {
+          if (!c || c.status === 'deleted') return false;
+          if (!searchCust) return true;
+          var hay = (String(c.name || '') + ' ' + String(c.phone || '') + ' ' + String(c.email || '') + ' ' + String(c.idNumber || '') + ' ' + String(c.companyName || '')).toLowerCase();
+          return hay.indexOf(searchCust) !== -1;
+        }).map(function (c) {
+          var phClean = String(c.phone || '').replace(/[\s\-()]/g, '');
+          var relBookings = db.reservations.filter(function (r) {
+            var rPh = String(r.customerPhone || '').replace(/[\s\-()]/g, '');
+            return (phClean && rPh === phClean) || String(r.customerName || '').trim() === String(c.name || '').trim();
+          });
+          var spent = relBookings.reduce(function (s, r) { return s + Number(r.totalAmount || 0); }, 0);
+          return Object.assign({}, c, {
+            totalBookings: relBookings.length,
+            totalSpent: Math.round(spent * 100) / 100
+          });
+        });
+        return { success: true, message: '', data: { items: custItems, total: custItems.length }, error: null };
+      }
+
+      case 'createCustomer': {
+        var cnameNew = String(payload.name || payload.customerName || '').trim();
+        var cphoneNew = String(payload.phone || payload.customerPhone || '').trim();
+        if (!cnameNew && !cphoneNew) {
+          return { success: false, message: 'اسم العميل أو رقم الجوال مطلوب.', data: null, error: 'VALIDATION' };
+        }
+        var nowCustNew = new Date().toISOString();
+        var normCust = core && core.normalizeCustomerRecord
+          ? core.normalizeCustomerRecord(Object.assign({}, payload, { name: cnameNew, phone: cphoneNew, status: 'active' }))
+          : { id: genId('CUST'), name: cnameNew, phone: cphoneNew, email: String(payload.email || ''), idNumber: String(payload.idNumber || ''), companyName: String(payload.companyName || ''), notes: String(payload.notes || ''), status: 'active' };
+        var existingCustIdx = db.customers.findIndex(function (c) { return c.id === normCust.id; });
+        var custOp = existingCustIdx === -1 ? 'INSERT' : 'UPDATE';
+        var fullCustNew = Object.assign({}, normCust, { createdAt: nowCustNew, updatedAt: nowCustNew });
+        if (existingCustIdx === -1) db.customers.unshift(fullCustNew);
+        else db.customers[existingCustIdx] = Object.assign({}, db.customers[existingCustIdx], fullCustNew);
+        db.syncOutbox.unshift({
+          id: genId('OUT'),
+          entityType: 'Customer',
+          entityId: fullCustNew.id,
+          recordId: fullCustNew.id,
+          operation: custOp,
+          status: 'synced',
+          retryCount: 0,
+          maxRetries: 5,
+          lastError: '',
+          createdAt: nowCustNew,
+          syncedAt: nowCustNew
+        });
+        appendSandboxActivity(db, session.user, custOp === 'INSERT' ? 'إضافة عميل' : 'تحديث عميل', 'Customer', fullCustNew.id, fullCustNew.name);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حفظ بيانات العميل بنجاح.', data: { customer: fullCustNew }, error: null };
+      }
+
+      case 'updateCustomer': {
+        var updCustId = String(payload.customerId || payload.id || '').trim();
+        var cIdx = db.customers.findIndex(function (c) { return c.id === updCustId && c.status !== 'deleted'; });
+        if (cIdx === -1) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        var nowCustUpd = new Date().toISOString();
+        var updCust = Object.assign({}, db.customers[cIdx], {
+          name: payload.name !== undefined ? String(payload.name).trim() : db.customers[cIdx].name,
+          phone: payload.phone !== undefined ? String(payload.phone).trim() : db.customers[cIdx].phone,
+          email: payload.email !== undefined ? String(payload.email).trim() : db.customers[cIdx].email,
+          idNumber: payload.idNumber !== undefined ? String(payload.idNumber).trim() : db.customers[cIdx].idNumber,
+          companyName: payload.companyName !== undefined ? String(payload.companyName).trim() : db.customers[cIdx].companyName,
+          notes: payload.notes !== undefined ? String(payload.notes).trim() : db.customers[cIdx].notes,
+          updatedAt: nowCustUpd
+        });
+        db.customers[cIdx] = updCust;
+        db.syncOutbox.unshift({
+          id: genId('OUT'),
+          entityType: 'Customer',
+          entityId: updCust.id,
+          recordId: updCust.id,
+          operation: 'UPDATE',
+          status: 'synced',
+          retryCount: 0,
+          maxRetries: 5,
+          lastError: '',
+          createdAt: nowCustUpd,
+          syncedAt: nowCustUpd
+        });
+        appendSandboxActivity(db, session.user, 'تعديل عميل', 'Customer', updCust.id, updCust.name);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم تحديث بيانات العميل بنجاح.', data: { customer: updCust }, error: null };
+      }
+
+      case 'deleteCustomer': {
+        if (!core.canUserPerform(session.user, 'edit_reservation_details')) {
+          return { success: false, message: 'FORBIDDEN: صلاحية المشرف أو المدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var delCustId = String(payload.customerId || payload.id || '').trim();
+        var dcIdx = db.customers.findIndex(function (c) { return c.id === delCustId; });
+        if (dcIdx === -1) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        var nowCustDel = new Date().toISOString();
+        var delCustName = db.customers[dcIdx].name;
+        db.customers[dcIdx].status = 'deleted';
+        db.customers[dcIdx].updatedAt = nowCustDel;
+        db.syncOutbox.unshift({
+          id: genId('OUT'),
+          entityType: 'Customer',
+          entityId: delCustId,
+          recordId: delCustId,
+          operation: 'DELETE',
+          status: 'synced',
+          retryCount: 0,
+          maxRetries: 5,
+          lastError: '',
+          createdAt: nowCustDel,
+          syncedAt: nowCustDel
+        });
+        appendSandboxActivity(db, session.user, 'حذف عميل', 'Customer', delCustId, delCustName);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حذف العميل بنجاح.', data: { deleted: true, id: delCustId }, error: null };
+      }
+
+      case 'createReservation': {
+        var newRCustomer = String(payload.customerName || '').trim();
+        if (!newRCustomer) return { success: false, message: 'اسم العميل مطلوب لإنشاء الحجز.', data: null, error: 'VALIDATION' };
+        var nowResNew = new Date().toISOString();
+        var rNumNew = String(payload.reservationNumber || ('RG-M-' + String(Date.now()).slice(-6))).trim();
+        if (db.reservations.some(function (r) { return r.reservationNumber === rNumNew; })) {
+          return { success: false, message: 'رقم الحجز مسجل مسبقًا.', data: null, error: 'DUPLICATE' };
+        }
+        var rIdNew = 'RES_' + rNumNew.replace(/[^A-Za-z0-9_-]/g, '');
+        var rStartNew = String(payload.startDate || nowResNew.slice(0, 10));
+        var rEndNew = String(payload.endDate || rStartNew);
+        var rDaysNew = Math.max(1, Number(payload.daysCount || 1));
+        var rAmtNew = Number(payload.totalAmount || 0);
+        var rStNew = String(payload.internalStatus || 'تم الإنشاء');
+        var newResObj = {
+          id: rIdNew,
+          sourceReservationId: rNumNew,
+          reservationNumber: rNumNew,
+          sourceCreatedAt: nowResNew,
+          customerName: newRCustomer,
+          customerPhone: String(payload.customerPhone || '').trim(),
+          customerEmail: String(payload.customerEmail || '').trim(),
+          customerIdNumber: String(payload.customerIdNumber || '').trim(),
+          companyName: String(payload.companyName || '').trim(),
+          branchName: String(payload.branchName || '').trim(),
+          deliverBranchName: String(payload.deliverBranchName || payload.branchName || '').trim(),
+          carName: String(payload.carName || '').trim(),
+          carCategory: String(payload.carCategory || '').trim(),
+          plateNumber: String(payload.plateNumber || '').trim(),
+          startDate: rStartNew,
+          startTime: String(payload.startTime || '10:00'),
+          originalEndDate: rEndNew,
+          originalEndTime: String(payload.endTime || '10:00'),
+          endDate: rEndNew,
+          endTime: String(payload.endTime || '10:00'),
+          extendedUntilDate: '',
+          extendedUntilTime: '',
+          daysCount: rDaysNew,
+          extendedDaysCount: 0,
+          totalDaysCount: rDaysNew,
+          originalStatusCode: 'created',
+          originalStatusAr: rStNew,
+          pickupTypeAr: 'استلام من الفرع',
+          returnTypeAr: 'تسليم في الفرع',
+          paymentMethod: String(payload.paymentMethod || ''),
+          paymentStatus: String(payload.paymentStatus || 'unpaid'),
+          dailyPrice: rDaysNew ? Math.round((rAmtNew / rDaysNew) * 100) / 100 : rAmtNew,
+          discountAmount: 0,
+          vatAmount: 0,
+          baseAmount: rAmtNew,
+          extensionsCount: 0,
+          extensionsAmount: 0,
+          totalAmount: rAmtNew,
+          hasExtensions: false,
+          internalStatus: rStNew,
+          priority: String(payload.priority || 'عادي'),
+          assignedEmployeeIds: [session.employeeId],
+          assignedEmployeeNames: [session.user.name],
+          lastUpdateText: 'إنشاء حجز جديد بواسطة ' + session.user.name,
+          lastUpdatedById: session.employeeId,
+          lastUpdatedByName: session.user.name,
+          lastUpdatedAt: nowResNew,
+          hasProblem: false,
+          createdAt: nowResNew,
+          updatedAt: nowResNew,
+          statusHistory: [{
+            stageNumber: 1,
+            source: 'supervisor_edit',
+            previousStatus: '',
+            newStatus: rStNew,
+            changedAt: nowResNew,
+            changedById: session.employeeId,
+            changedByName: session.user.name,
+            note: 'إنشاء حجز جديد'
+          }]
+        };
+        db.reservations.unshift(newResObj);
+        db.syncOutbox.unshift({
+          id: genId('OUT'),
+          entityType: 'Reservation',
+          entityId: newResObj.id,
+          recordId: newResObj.reservationNumber,
+          operation: 'INSERT',
+          status: 'synced',
+          retryCount: 0,
+          maxRetries: 5,
+          lastError: '',
+          createdAt: nowResNew,
+          syncedAt: nowResNew
+        });
+        appendSandboxActivity(db, session.user, 'إنشاء حجز', 'Reservation', newResObj.reservationNumber, newResObj.customerName);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم إنشاء الحجز بنجاح.', data: { reservation: newResObj }, error: null };
+      }
+
+      case 'deleteReservation': {
+        if (!core.canUserPerform(session.user, 'edit_reservation_details')) {
+          return { success: false, message: 'FORBIDDEN: صلاحية المشرف أو المدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var delRTarget = String(payload.reservationId || payload.id || payload.reservationNumber || '').trim();
+        var drIdx = db.reservations.findIndex(function (r) { return r.id === delRTarget || r.reservationNumber === delRTarget; });
+        if (drIdx === -1) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        var removedRes = db.reservations.splice(drIdx, 1)[0];
+        var nowResDel = new Date().toISOString();
+        db.syncOutbox.unshift({
+          id: genId('OUT'),
+          entityType: 'Reservation',
+          entityId: removedRes.id,
+          recordId: removedRes.reservationNumber,
+          operation: 'DELETE',
+          status: 'synced',
+          retryCount: 0,
+          maxRetries: 5,
+          lastError: '',
+          createdAt: nowResDel,
+          syncedAt: nowResDel
+        });
+        appendSandboxActivity(db, session.user, 'حذف حجز', 'Reservation', removedRes.reservationNumber, removedRes.customerName);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حذف الحجز بنجاح.', data: { deleted: true, id: removedRes.id, reservationNumber: removedRes.reservationNumber }, error: null };
       }
 
       case 'addFollowUp': {
@@ -3477,6 +4054,12 @@
         if (!core.canAccessApi(session.user) || !core.canUserPerform(session.user, 'sync_data')) {
           return { success: false, message: 'FORBIDDEN: صلاحيات API مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
+        var outboxItemsSt = (db.syncOutbox || []).slice(0, 60);
+        var stCounts = { pending: 0, processing: 0, synced: 0, failed: 0, total: outboxItemsSt.length };
+        outboxItemsSt.forEach(function (it) {
+          var s = (core && core.normalizeOutboxStatus) ? core.normalizeOutboxStatus(it.status) : String(it.status || 'pending');
+          if (stCounts[s] !== undefined) stCounts[s]++;
+        });
         return {
           success: true,
           message: '',
@@ -3486,10 +4069,43 @@
             autoSyncEnabled: db.settings.auto_sync_enabled !== false,
             autoSyncIntervalHours: Number(db.settings.auto_sync_interval_hours || 12),
             lastSync: db.syncLog[0] || null,
-            logs: db.syncLog
+            logs: db.syncLog,
+            queue: { counts: stCounts, items: outboxItemsSt, gasConfigured: false }
           },
           error: null
         };
+      }
+
+      case 'getSyncQueueStatus': {
+        var qItems = (db.syncOutbox || []).slice(0, 60);
+        var qCounts = { pending: 0, processing: 0, synced: 0, failed: 0, total: qItems.length };
+        qItems.forEach(function (it) {
+          var s = (core && core.normalizeOutboxStatus) ? core.normalizeOutboxStatus(it.status) : String(it.status || 'pending');
+          if (qCounts[s] !== undefined) qCounts[s]++;
+        });
+        return { success: true, message: '', data: { counts: qCounts, items: qItems, gasConfigured: false }, error: null };
+      }
+
+      case 'processSyncQueue':
+      case 'retryFailedSyncItems':
+      case 'runBackupDeltaSync': {
+        if (!core.canAccessApi(session.user) || !core.canUserPerform(session.user, 'sync_data')) {
+          return { success: false, message: 'FORBIDDEN: صلاحيات API مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var nowQIso = new Date().toISOString();
+        (db.syncOutbox || []).forEach(function (it) {
+          if (it.status !== 'synced') {
+            it.status = 'synced';
+            it.syncedAt = nowQIso;
+          }
+        });
+        saveSandboxDb(db);
+        var qAfter = sandboxExecute('getSyncQueueStatus', token, {});
+        return { success: true, message: 'تمت معالجة قائمة المزامنة في وضع المعاينة.', data: qAfter.data, error: null };
+      }
+
+      case 'getRealtimeDelta': {
+        return { success: true, message: '', data: { events: [], latestSeq: 0, serverTime: new Date().toISOString() }, error: null };
       }
 
       case 'getReports': {
@@ -3706,14 +4322,21 @@
       return inFlightMutations[mutLockKey];
     }
 
+    var reqPayload = payload || {};
+    if (!policy.cacheable && action !== 'login' && action !== 'logout' && !reqPayload.idempotencyKey) {
+      reqPayload = Object.assign({}, reqPayload, {
+        idempotencyKey: 'IDEM_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8)
+      });
+    }
+
     async function executeCall() {
       var parsed;
       if (!transportUrl) {
-        parsed = sandboxExecute(action, token, payload);
+        parsed = sandboxExecute(action, token, reqPayload);
       } else if (backendUrl) {
         var bTimeoutId = null;
         try {
-          var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
+          var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(reqPayload) : reqPayload;
           var bOpts = {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3845,7 +4468,16 @@
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
-        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
+        } else if (action === 'createReservation' && parsed.data && parsed.data.reservation) {
+          setLocalReservationsState(ns, [parsed.data.reservation], false);
+        } else if (action === 'deleteReservation' && parsed.data && parsed.data.id) {
+          if (localReservationsByNs[ns] && Array.isArray(localReservationsByNs[ns].list)) {
+            setLocalReservationsState(ns, localReservationsByNs[ns].list.filter(function (x) { return x.id !== parsed.data.id; }), true);
+          }
+          if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
+            delete localDetailsByNs[ns][parsed.data.id];
+          }
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem' || action === 'createCustomer' || action === 'updateCustomer' || action === 'deleteCustomer')) {
           syncSandboxSnapshotToIdb(ns);
         }
 
@@ -3980,6 +4612,7 @@
     getToken: getToken,
     setToken: setToken,
     isLiveMode: isLiveMode,
+    isBackendMode: isBackendMode,
     warmUpGas: warmUpGas,
     clearCache: clearCache,
     primeCache: primeCache,
@@ -3993,6 +4626,10 @@
     prefetchReservationDetails: prefetchReservationDetails,
     getLocalCacheStats: getLocalCacheStats,
     applyOptimisticMutation: applyOptimisticMutation,
+    startRealtimeStream: startRealtimeStream,
+    stopRealtimeStream: stopRealtimeStream,
+    getRealtimeStatus: getRealtimeStatus,
+    fetchRealtimeDelta: fetchRealtimeDelta,
     callApi: callApi,
     pingGasUrl: pingGasUrl
   };

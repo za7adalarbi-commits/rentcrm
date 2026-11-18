@@ -236,7 +236,20 @@ function scheduledMinuteSync() {
     var enabled = enabledRec ? toBool(enabledRec.value) : true;
     if (!enabled) return;
 
-    // Pull recent 7 days incrementally on every 1-minute tick to stay fast within GAS execution quota
+    // 1) Ask Neon backend to flush any pending/retry outbox & scan updated_at > last_sync_at deltas
+    var cfg = getNeonSyncConfig_();
+    if (cfg.syncUrl && cfg.syncSecret) {
+      try {
+        fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, {
+          action: 'deltaSync',
+          pullRentalGate: false
+        });
+      } catch (deltaErr) {
+        Logger.log('scheduledMinuteSync delta ping warning: ' + (deltaErr && deltaErr.message ? deltaErr.message : deltaErr));
+      }
+    }
+
+    // 2) Pull recent 7 days incrementally from Rental Gate to stay fast within GAS execution quota
     runRentalGateSyncInternal(
       {
         id: 'SYSTEM_1M',
@@ -282,6 +295,238 @@ function handleTriggerNeonIncrementalSync_(payload) {
   return runRentalGateSyncInternal(actor, payload || {});
 }
 
+function resolveGasOperation_(item) {
+  var op = normalizeStr(item && item.operation).toUpperCase();
+  if (op === 'INSERT' || op === 'UPDATE' || op === 'DELETE') return op;
+  var act = normalizeStr(item && item.action).toLowerCase();
+  if (act.indexOf('delete') !== -1 || act.indexOf('remove') !== -1) return 'DELETE';
+  if (act.indexOf('create') !== -1 || act.indexOf('insert') !== -1 || act.indexOf('add') !== -1) return 'INSERT';
+  return 'UPDATE';
+}
+
+function applySingleNeonSyncItem_(item, syncedAt) {
+  var outboxId = normalizeStr((item && (item.outboxId || item.id)) || '');
+  var entityType = normalizeStr(item && item.entityType);
+  var operation = resolveGasOperation_(item);
+  var action = normalizeStr(item && item.action);
+  var data = (item && item.payload && typeof item.payload === 'object') ? item.payload : {};
+  var recordId = normalizeStr((item && item.recordId) || (item && item.entityId) || data.id || data.reservationNumber || data.key || '');
+  var idempKey = normalizeStr(item && item.idempotencyKey);
+
+  if (idempKey) {
+    try {
+      var cache = CacheService.getScriptCache();
+      var prev = cache.get('NEON_DEDUP_' + idempKey);
+      if (prev) {
+        return {
+          success: true,
+          outboxId: outboxId,
+          entityType: entityType,
+          operation: operation,
+          recordId: recordId,
+          syncedAt: syncedAt,
+          deduplicated: true,
+          error: null
+        };
+      }
+    } catch (e) {}
+  }
+
+  try {
+    var etLower = entityType.toLowerCase();
+
+    if (etLower === 'customer' || action === 'upsertCustomer' || action === 'deleteCustomer') {
+      var custKey = normalizeStr(data.id || recordId);
+      if (!custKey) throw new Error('MISSING_CUSTOMER_ID');
+      if (operation === 'DELETE' || action === 'deleteCustomer') {
+        deleteRecordByKey(RG_SHEETS.CUSTOMERS, 'id', custKey);
+      } else {
+        upsertRecordByKey(RG_SHEETS.CUSTOMERS, 'id', custKey, {
+          id: custKey,
+          name: normalizeStr(data.name || 'عميل'),
+          phone: normalizeStr(data.phone),
+          email: normalizeStr(data.email),
+          idNumber: normalizeStr(data.idNumber),
+          companyName: normalizeStr(data.companyName),
+          notes: normalizeStr(data.notes),
+          status: normalizeStr(data.status || 'active'),
+          createdAt: normalizeStr(data.createdAt) || syncedAt,
+          updatedAt: normalizeStr(data.updatedAt) || syncedAt
+        });
+      }
+    } else if (etLower === 'reservation' || action === 'upsertReservation' || action === 'deleteReservation') {
+      var resNum = normalizeStr(data.reservationNumber || '');
+      var resId = normalizeStr(data.id || recordId);
+      if (!resNum && !resId) throw new Error('MISSING_RESERVATION_KEY');
+      if (operation === 'DELETE' || action === 'deleteReservation') {
+        if (resId) deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'id', resId);
+        if (resNum) deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'reservationNumber', resNum);
+      } else {
+        var resKeyField = resNum ? 'reservationNumber' : 'id';
+        var resKeyVal = resNum || resId;
+        var resRec = Object.assign({}, data, {
+          id: resId || resNum,
+          reservationNumber: resNum || resId,
+          assignedEmployeeIds: typeof data.assignedEmployeeIds === 'string'
+            ? data.assignedEmployeeIds
+            : JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
+          assignedEmployeeNames: typeof data.assignedEmployeeNames === 'string'
+            ? data.assignedEmployeeNames
+            : JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
+          statusHistory: typeof data.statusHistory === 'string'
+            ? data.statusHistory
+            : JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
+          hasExtensions: data.hasExtensions ? 'true' : 'false',
+          hasProblem: data.hasProblem ? 'true' : 'false',
+          updatedAt: normalizeStr(data.updatedAt) || syncedAt
+        });
+        upsertRecordByKey(RG_SHEETS.RESERVATIONS, resKeyField, resKeyVal, resRec);
+      }
+    } else if (etLower === 'extension' || action === 'upsertExtension' || action === 'deleteExtension') {
+      var extKey = normalizeStr(data.extensionNumber || data.id || recordId);
+      if (!extKey) throw new Error('MISSING_EXTENSION_KEY');
+      if (operation === 'DELETE') {
+        deleteRecordByKey(RG_SHEETS.EXTENSIONS, data.extensionNumber ? 'extensionNumber' : 'id', extKey);
+      } else {
+        upsertRecordByKey(RG_SHEETS.EXTENSIONS, data.extensionNumber ? 'extensionNumber' : 'id', extKey, data);
+      }
+    } else if (etLower === 'followup' || etLower === 'follow_up' || action === 'appendFollowUp' || action === 'upsertFollowUp') {
+      var fuId = normalizeStr(data.id || recordId);
+      if (!fuId) throw new Error('MISSING_FOLLOWUP_ID');
+      if (operation === 'DELETE') {
+        deleteRecordByKey(RG_SHEETS.FOLLOWUPS, 'id', fuId);
+      } else {
+        upsertRecordByKey(RG_SHEETS.FOLLOWUPS, 'id', fuId, data);
+      }
+    } else if (etLower === 'followuphistory' || action === 'appendFollowUpHistory') {
+      var fuhId = normalizeStr(data.id || recordId);
+      if (fuhId) upsertRecordByKey(RG_SHEETS.FOLLOWUP_HISTORY, 'id', fuhId, data);
+    } else if (etLower === 'assignment' || action === 'upsertAssignment' || action === 'deleteAssignment') {
+      var asgId = normalizeStr(data.id || recordId);
+      if (!asgId) throw new Error('MISSING_ASSIGNMENT_ID');
+      if (operation === 'DELETE' || action === 'deleteAssignment') {
+        deleteRecordByKey(RG_SHEETS.ASSIGNMENTS, 'id', asgId);
+      } else {
+        upsertRecordByKey(RG_SHEETS.ASSIGNMENTS, 'id', asgId, data);
+      }
+    } else if (etLower === 'problem' || etLower === 'issue' || action === 'upsertProblem') {
+      var prbId = normalizeStr(data.id || recordId);
+      if (!prbId) throw new Error('MISSING_PROBLEM_ID');
+      if (operation === 'DELETE') {
+        deleteRecordByKey(RG_SHEETS.PROBLEMS, 'id', prbId);
+        deleteRecordByKey(RG_SHEETS.ISSUES, 'id', prbId);
+      } else {
+        var prbRec = Object.assign({}, data, {
+          assignedEmployeeIds: typeof data.assignedEmployeeIds === 'string'
+            ? data.assignedEmployeeIds
+            : JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
+          assignedEmployeeNames: typeof data.assignedEmployeeNames === 'string'
+            ? data.assignedEmployeeNames
+            : JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
+          updatedAt: normalizeStr(data.updatedAt) || syncedAt
+        });
+        upsertRecordByKey(RG_SHEETS.PROBLEMS, 'id', prbId, prbRec);
+        syncIssueSheetRecord(prbRec);
+      }
+    } else if (etLower === 'problemupdate' || action === 'appendProblemUpdate') {
+      var puId = normalizeStr(data.id || recordId);
+      if (puId) upsertRecordByKey(RG_SHEETS.PROBLEM_UPDATES, 'id', puId, data);
+    } else if (etLower === 'employee' || etLower === 'user' || action === 'upsertEmployee') {
+      var empId = normalizeStr(data.id || recordId);
+      if (!empId) throw new Error('MISSING_EMPLOYEE_ID');
+      if (operation === 'DELETE') {
+        deleteRecordByKey(RG_SHEETS.EMPLOYEES, 'id', empId);
+        deleteRecordByKey(RG_SHEETS.USERS, 'id', empId);
+      } else {
+        var empRec = Object.assign({}, data, {
+          permissions: typeof data.permissions === 'string'
+            ? data.permissions
+            : JSON.stringify(Array.isArray(data.permissions) ? data.permissions : []),
+          updatedAt: normalizeStr(data.updatedAt) || syncedAt
+        });
+        upsertRecordByKey(RG_SHEETS.EMPLOYEES, 'id', empId, empRec);
+        syncUserSheetRecord(empRec);
+      }
+    } else if (etLower === 'role' || action === 'upsertRolePreset' || action === 'deleteRolePreset') {
+      var roleId = normalizeStr(data.id || recordId);
+      if (!roleId) throw new Error('MISSING_ROLE_ID');
+      if (operation === 'DELETE' || action === 'deleteRolePreset') {
+        deleteRecordByKey(RG_SHEETS.ROLES, 'id', roleId);
+      } else {
+        var roleRec = Object.assign({}, data, {
+          permissions: typeof data.permissions === 'string'
+            ? data.permissions
+            : JSON.stringify(Array.isArray(data.permissions) ? data.permissions : []),
+          updatedAt: normalizeStr(data.updatedAt) || syncedAt
+        });
+        upsertRecordByKey(RG_SHEETS.ROLES, 'id', roleId, roleRec);
+      }
+    } else if (etLower === 'permission' || action === 'upsertPermission' || action === 'deletePermission') {
+      var permKey = normalizeStr(data.key || data.id || recordId);
+      if (!permKey) throw new Error('MISSING_PERMISSION_KEY');
+      if (operation === 'DELETE' || action === 'deletePermission') {
+        deleteRecordByKey(RG_SHEETS.PERMISSIONS, 'key', permKey);
+      } else {
+        upsertRecordByKey(RG_SHEETS.PERMISSIONS, 'key', permKey, Object.assign({}, data, {
+          key: permKey,
+          updatedAt: normalizeStr(data.updatedAt) || syncedAt
+        }));
+      }
+    } else if (etLower === 'settings' || action === 'upsertSetting') {
+      var setKey = normalizeStr(data.key || recordId);
+      if (!setKey) throw new Error('MISSING_SETTING_KEY');
+      if (operation === 'DELETE') {
+        deleteRecordByKey(RG_SHEETS.SETTINGS, 'key', setKey);
+      } else {
+        upsertRecordByKey(RG_SHEETS.SETTINGS, 'key', setKey, {
+          key: setKey,
+          value: data.value !== undefined ? String(data.value) : '',
+          updatedBy: normalizeStr(data.updatedBy || 'NEON_MIRROR'),
+          updatedAt: syncedAt
+        });
+      }
+    } else if (etLower === 'rgtoken' || action === 'saveRgToken') {
+      var cleanTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
+      if (cleanTok) {
+        PropertiesService.getScriptProperties().setProperties({
+          RG_TOKEN: cleanTok,
+          RENTAL_TOKEN: cleanTok
+        });
+      }
+    } else {
+      throw new Error('UNSUPPORTED_SYNC_TARGET: ' + (entityType || action));
+    }
+
+    if (idempKey) {
+      try {
+        CacheService.getScriptCache().put('NEON_DEDUP_' + idempKey, syncedAt, 21600);
+      } catch (e2) {}
+    }
+
+    return {
+      success: true,
+      outboxId: outboxId,
+      entityType: entityType,
+      operation: operation,
+      recordId: recordId,
+      syncedAt: syncedAt,
+      deduplicated: false,
+      error: null
+    };
+  } catch (err) {
+    return {
+      success: false,
+      outboxId: outboxId,
+      entityType: entityType,
+      operation: operation,
+      recordId: recordId,
+      syncedAt: syncedAt,
+      deduplicated: false,
+      error: err && err.message ? err.message : String(err)
+    };
+  }
+}
+
 function handleNeonMirrorSync_(payload) {
   var cfg = getNeonSyncConfig_();
   var provided = normalizeStr(payload && payload.syncSecret);
@@ -289,77 +534,54 @@ function handleNeonMirrorSync_(payload) {
     throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
   }
 
-  var items = Array.isArray(payload && payload.items) ? payload.items : [];
-  var applied = 0;
+  var syncedAt = nowIso();
+  var rawItems = Array.isArray(payload && payload.items)
+    ? payload.items
+    : ((payload && (payload.entityType || payload.action || payload.payload)) ? [payload] : []);
 
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i];
-    if (!item || typeof item !== 'object') continue;
-    var action = normalizeStr(item.action);
-    var data = item.payload || {};
+  return withScriptLock(function () {
+    var results = [];
+    var applied = 0;
+    var failed = 0;
+    var deduplicatedCount = 0;
 
-    if (action === 'upsertReservation' && data.reservationNumber) {
-      var resRec = Object.assign({}, data, {
-        assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
-        assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
-        statusHistory: JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
-        hasExtensions: data.hasExtensions ? 'true' : 'false',
-        hasProblem: data.hasProblem ? 'true' : 'false'
-      });
-      upsertRecord(RG_SHEETS.RESERVATIONS, 'reservationNumber', resRec);
-      applied++;
-    } else if (action === 'appendFollowUp' && data.id) {
-      upsertRecord(RG_SHEETS.FOLLOWUPS, 'id', data);
-      applied++;
-    } else if (action === 'upsertProblem' && data.id) {
-      var prbRec = Object.assign({}, data, {
-        assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
-        assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
-      });
-      upsertRecord(RG_SHEETS.PROBLEMS, 'id', prbRec);
-      if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
-        upsertRecord(RG_SHEETS.ISSUES, 'id', prbRec);
-      }
-      applied++;
-    } else if (action === 'upsertEmployee' && data.id) {
-      var empRec = Object.assign({}, data, {
-        permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])
-      });
-      upsertRecord(RG_SHEETS.EMPLOYEES, 'id', empRec);
-      upsertRecord(RG_SHEETS.USERS, 'id', {
-        id: empRec.id,
-        name: empRec.name,
-        username: empRec.username,
-        phone: empRec.phone,
-        email: empRec.email,
-        jobTitle: empRec.jobTitle,
-        role: empRec.role,
-        permissions: empRec.permissions,
-        status: empRec.status,
-        lastActivity: empRec.lastActivity,
-        createdAt: empRec.createdAt,
-        updatedAt: empRec.updatedAt
-      });
-      applied++;
-    } else if (action === 'upsertSetting' && data.key) {
-      upsertRecord(RG_SHEETS.SETTINGS, 'key', {
-        key: data.key,
-        value: String(data.value),
-        updatedBy: normalizeStr(data.updatedBy || 'NEON_MIRROR'),
-        updatedAt: nowIso()
-      });
-      applied++;
-    } else if (action === 'saveRgToken' && data.rgToken) {
-      var cleanTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
-      if (cleanTok) {
-        PropertiesService.getScriptProperties().setProperties({
-          RG_TOKEN: cleanTok,
-          RENTAL_TOKEN: cleanTok
-        });
+    for (var i = 0; i < rawItems.length; i++) {
+      var item = rawItems[i];
+      if (!item || typeof item !== 'object') continue;
+      var itemRes = applySingleNeonSyncItem_(item, syncedAt);
+      results.push(itemRes);
+      if (itemRes.success) {
         applied++;
+        if (itemRes.deduplicated) deduplicatedCount++;
+      } else {
+        failed++;
       }
     }
-  }
 
-  return { applied: applied };
+    try {
+      PropertiesService.getScriptProperties().setProperties({
+        NEON_LAST_SYNC_AT: syncedAt,
+        NEON_LAST_SYNC_STATUS: failed > 0 && applied === 0 ? 'error' : 'success',
+        NEON_LAST_SYNC_COUNT: String(applied),
+        NEON_LAST_SYNC_ERROR: failed > 0 ? String((results.filter(function (r) { return !r.success; })[0] || {}).error || '') : ''
+      });
+    } catch (propErr) {}
+
+    var first = results.length > 0 ? results[0] : null;
+    return {
+      success: !(failed > 0 && applied === 0),
+      operation: first ? first.operation : 'BATCH',
+      recordId: first ? first.recordId : '',
+      syncedAt: syncedAt,
+      applied: applied,
+      failed: failed,
+      deduplicated: deduplicatedCount,
+      error: failed > 0 && applied === 0 ? (first ? first.error : 'SYNC_BATCH_FAILED') : null,
+      results: results
+    };
+  });
+}
+
+function handleRealtimeSync_(payload) {
+  return handleNeonMirrorSync_(payload);
 }

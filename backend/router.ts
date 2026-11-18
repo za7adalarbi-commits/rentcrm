@@ -178,6 +178,39 @@ export async function dispatchCrmRequest(
       case 'exportReportData':
         result = await queries.exportReportData(executor, session, payload);
         break;
+      case 'getCustomers':
+        result = await queries.getCustomers(executor, session, payload);
+        break;
+      case 'createCustomer':
+        result = await queries.createCustomer(executor, session, payload);
+        break;
+      case 'updateCustomer':
+        result = await queries.updateCustomer(executor, session, payload);
+        break;
+      case 'deleteCustomer':
+        result = await queries.deleteCustomer(executor, session, payload);
+        break;
+      case 'createReservation':
+        result = await queries.createReservation(executor, session, payload);
+        break;
+      case 'deleteReservation':
+        result = await queries.deleteReservation(executor, session, payload);
+        break;
+      case 'getRealtimeDelta':
+        result = await queries.getRealtimeDelta(executor, session, payload);
+        break;
+      case 'getSyncQueueStatus':
+        result = await queries.getSyncQueueStatusAction(executor, session, payload);
+        break;
+      case 'processSyncQueue':
+        result = await queries.processSyncQueueAction(executor, session);
+        break;
+      case 'retryFailedSyncItems':
+        result = await queries.retryFailedSyncItemsAction(executor, session, payload);
+        break;
+      case 'runBackupDeltaSync':
+        result = await queries.runBackupDeltaSyncAction(executor, session, payload);
+        break;
       case 'getSettings':
         result = await queries.getSettings(executor, session);
         break;

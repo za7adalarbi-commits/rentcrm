@@ -1,8 +1,15 @@
-import { verifySharedSecret } from '../backend/auth';
-import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from '../backend/db';
+import { requireApiAccess, requireAuth, verifySharedSecret } from '../backend/auth';
+import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured, type DbExecutor } from '../backend/db';
 import { logBackendError } from '../backend/logger';
 import { ensureSeededDatabase } from '../backend/queries';
-import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch } from '../backend/syncService';
+import {
+  enqueueSyncOperation,
+  getSyncQueueSummary,
+  ingestIncrementalSyncBatch,
+  retryFailedSyncItems,
+  runBackupDeltaSync,
+  triggerImmediateSync
+} from '../backend/syncService';
 
 function parseBody(rawBody: any): Record<string, any> {
   if (!rawBody) return {};
@@ -17,14 +24,36 @@ function parseBody(rawBody: any): Record<string, any> {
   return typeof rawBody === 'object' ? rawBody : {};
 }
 
-function extractProvidedSecret(req: any, body: Record<string, any>): string {
+function extractProvidedToken(req: any, body: Record<string, any>): { syncSecret: string; bearer: string } {
   const headerSecret = String(req.headers?.['x-sync-secret'] || '').trim();
-  if (headerSecret) return headerSecret;
   const authHeader = String(req.headers?.authorization || '').trim();
-  if (/^Bearer\s+/i.test(authHeader)) {
-    return authHeader.replace(/^Bearer\s+/i, '').trim();
+  const bearer = /^Bearer\s+/i.test(authHeader) ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+  const bodySecret = String(body.syncSecret || req.query?.syncSecret || '').trim();
+  return {
+    syncSecret: headerSecret || bodySecret || bearer,
+    bearer: bearer || String(body.token || req.query?.token || '').trim()
+  };
+}
+
+async function authorizeSyncRequest(req: any, body: Record<string, any>, executor: DbExecutor): Promise<boolean> {
+  const expectedSecret = String(process.env.SYNC_API_SECRET || '').trim();
+  const { syncSecret, bearer } = extractProvidedToken(req, body);
+
+  if (expectedSecret && verifySharedSecret(syncSecret, expectedSecret)) {
+    return true;
   }
-  return String(body.syncSecret || req.query?.syncSecret || '').trim();
+
+  if (bearer) {
+    try {
+      const session = await requireAuth(executor, bearer);
+      requireApiAccess(session);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
 }
 
 export default async function handler(req: any, res: any) {
@@ -43,35 +72,37 @@ export default async function handler(req: any, res: any) {
     return;
   }
 
-  const expectedSecret = String(process.env.SYNC_API_SECRET || '').trim();
   const body = parseBody(req.body);
-  const providedSecret = extractProvidedSecret(req, body);
-
-  if (!expectedSecret || !verifySharedSecret(providedSecret, expectedSecret)) {
-    res.status(401).json({
-      success: false,
-      message: 'UNAUTHORIZED: مفتاح المزامنة SYNC_API_SECRET غير صالح.',
-      data: null,
-      error: 'UNAUTHORIZED'
-    });
-    return;
-  }
-
   const executor = createPgExecutor();
+
   try {
     await ensureSchemaInitialized(executor);
     await ensureSeededDatabase(executor);
 
+    const authorized = await authorizeSyncRequest(req, body, executor);
+    if (!authorized) {
+      res.status(401).json({
+        success: false,
+        message: 'UNAUTHORIZED: مفتاح المزامنة SYNC_API_SECRET أو جلسة الإدارة غير صالحة.',
+        data: null,
+        error: 'UNAUTHORIZED'
+      });
+      return;
+    }
+
     if (req.method === 'GET') {
       const source = String(req.query?.source || 'google_apps_script').trim();
-      const ck = await executor.query(
-        `SELECT * FROM sync_checkpoints WHERE source = $1 LIMIT 1`,
-        [source]
-      );
+      const [ck, queue] = await Promise.all([
+        executor.query(`SELECT * FROM sync_checkpoints WHERE source = $1 LIMIT 1`, [source]),
+        getSyncQueueSummary(executor, Number(req.query?.limit || 60))
+      ]);
       res.status(200).json({
         success: true,
-        message: 'تم جلب حالة نقطة المزامنة.',
-        data: ck.rows[0] || null,
+        message: 'تم جلب حالة المزامنة والطابور بنجاح.',
+        data: {
+          checkpoint: ck.rows[0] || null,
+          queue
+        },
         error: null
       });
       return;
@@ -87,19 +118,90 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
-    if (body.action === 'flushOutbox') {
-      const mirrorResult = await flushSheetsMirrorOutbox(executor);
+    const action = String(body.action || '').trim();
+
+    if (action === 'queueStatus') {
+      const queue = await getSyncQueueSummary(executor, Number(body.limit || 60));
       res.status(200).json({
         success: true,
-        message: 'تمت معالجة قائمة المزامنة العكسية مع Google Sheets.',
-        data: mirrorResult,
+        message: 'تم جلب حالة طابور المزامنة الفورية.',
+        data: queue,
+        error: null
+      });
+      return;
+    }
+
+    if (action === 'enqueue') {
+      const items = Array.isArray(body.items) ? body.items : [body];
+      const enqueuedIds: string[] = [];
+      for (const item of items) {
+        if (!item || !item.entityType) continue;
+        const id = await enqueueSyncOperation(executor, {
+          entityType: String(item.entityType),
+          entityId: String(item.entityId || item.recordId || ''),
+          recordId: String(item.recordId || item.entityId || ''),
+          operation: String(item.operation || 'UPDATE'),
+          action: String(item.syncAction || item.action || 'upsertRecord'),
+          payload: item.payload && typeof item.payload === 'object' ? item.payload : {},
+          idempotencyKey: item.idempotencyKey ? String(item.idempotencyKey) : undefined
+        });
+        if (id) enqueuedIds.push(id);
+      }
+      const flush = await triggerImmediateSync(executor);
+      res.status(200).json({
+        success: true,
+        message: 'تم تسجيل عمليات المزامنة ومعالجتها فورياً.',
+        data: { enqueuedIds, flush },
+        error: null
+      });
+      return;
+    }
+
+    if (action === 'flushOutbox' || action === 'processQueue') {
+      const mirrorResult = await triggerImmediateSync(executor);
+      const queue = await getSyncQueueSummary(executor, 60);
+      res.status(200).json({
+        success: true,
+        message: 'تمت معالجة قائمة المزامنة الفورية مع Google Sheets.',
+        data: { ...mirrorResult, queue },
+        error: null
+      });
+      return;
+    }
+
+    if (action === 'retryFailed') {
+      const result = await retryFailedSyncItems(executor, Array.isArray(body.ids) ? body.ids : undefined);
+      const queue = await getSyncQueueSummary(executor, 60);
+      res.status(200).json({
+        success: true,
+        message: 'تمت إعادة جدولة ومعالجة العناصر الفاشلة.',
+        data: { ...result, queue },
+        error: null
+      });
+      return;
+    }
+
+    if (action === 'deltaSync') {
+      const result = await runBackupDeltaSync(executor, undefined, {
+        pullRentalGate: Boolean(body.pullRentalGate)
+      });
+      res.status(200).json({
+        success: true,
+        message: 'تمت المزامنة الدورية الاحتياطية (البيانات المتغيرة فقط).',
+        data: result,
         error: null
       });
       return;
     }
 
     const syncResult = await ingestIncrementalSyncBatch(executor, body);
-    const mirrorResult = await flushSheetsMirrorOutbox(executor).catch(() => ({ sent: 0, failed: 0, skipped: true }));
+    const mirrorResult = await triggerImmediateSync(executor).catch(() => ({
+      sent: 0,
+      synced: 0,
+      failed: 0,
+      retried: 0,
+      skipped: true
+    }));
 
     res.status(200).json({
       success: true,

@@ -3,8 +3,14 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import crmHandler from './api/crm';
+import cronSyncHandler from './api/cron/sync';
+import eventsHandler from './api/events';
 import healthHandler from './api/health';
 import syncHandler from './api/sync';
+import syncQueueHandler from './api/sync-queue';
+import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from './backend/db';
+import { ensureSeededDatabase } from './backend/queries';
+import { runBackupDeltaSync, triggerImmediateSync } from './backend/syncService';
 
 async function startServer() {
   const app = express();
@@ -24,6 +30,18 @@ async function startServer() {
 
   app.all('/api/sync', (req, res) => {
     void syncHandler(req, res);
+  });
+
+  app.all('/api/sync-queue', (req, res) => {
+    void syncQueueHandler(req, res);
+  });
+
+  app.all('/api/events', (req, res) => {
+    void eventsHandler(req, res);
+  });
+
+  app.all('/api/cron/sync', (req, res) => {
+    void cronSyncHandler(req, res);
   });
 
   if (process.env.NODE_ENV !== 'production') {
@@ -55,6 +73,30 @@ async function startServer() {
 
   app.listen(port, '0.0.0.0', () => {
     console.log(`RENTAL GATE CRM server listening on http://0.0.0.0:${port}`);
+
+    if (isDatabaseConfigured()) {
+      const executor = createPgExecutor();
+      ensureSchemaInitialized(executor)
+        .then(() => ensureSeededDatabase(executor))
+        .then(() => triggerImmediateSync(executor))
+        .catch(() => undefined);
+
+      if (process.env.ENABLE_LOCAL_CRON !== 'false') {
+        let runningBackupTick = false;
+        const backupTimer = setInterval(() => {
+          if (runningBackupTick) return;
+          runningBackupTick = true;
+          runBackupDeltaSync(executor, undefined, { pullRentalGate: Boolean(process.env.RG_TOKEN) })
+            .catch(() => undefined)
+            .finally(() => {
+              runningBackupTick = false;
+            });
+        }, 60000);
+        if (typeof backupTimer.unref === 'function') {
+          backupTimer.unref();
+        }
+      }
+    }
   });
 }
 

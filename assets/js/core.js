@@ -1605,34 +1605,44 @@
     getActivityLogs: { cacheable: true, ttlMs: 60000, scope: 'activity' },
     getReports: { cacheable: true, ttlMs: 60000, scope: 'reports' },
     getSettings: { cacheable: true, ttlMs: 300000, scope: 'settings' },
-    getSyncStatus: { cacheable: true, ttlMs: 60000, scope: 'sync' },
+    getSyncStatus: { cacheable: true, ttlMs: 15000, scope: 'sync' },
+    getSyncQueueStatus: { cacheable: true, ttlMs: 10000, scope: 'sync' },
+    getCustomers: { cacheable: true, ttlMs: 30000, scope: 'customers' },
     getTriggerStatus: { cacheable: true, ttlMs: 60000, scope: 'sync' }
   };
 
   var MUTATION_INVALIDATIONS = {
     login: ['*'],
     logout: ['*'],
-    claimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    unclaimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    quickUpdateReservationStatus: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateReservationDetails: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    addFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    assignEmployees: ['reservations', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    removeAssignment: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    createProblem: ['reservations', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    updateProblem: ['reservations', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    createEmployee: ['employees', 'dashboard', 'activity', 'reports'],
-    updateEmployee: ['employees', 'dashboard', 'activity', 'reports'],
-    disableEmployee: ['employees', 'dashboard', 'activity', 'reports'],
-    saveRolePreset: ['employees', 'activity'],
-    deleteRolePreset: ['employees', 'activity'],
-    resetRolePresets: ['employees', 'activity'],
-    savePermissionDefinition: ['employees', 'activity'],
-    deletePermissionDefinition: ['employees', 'activity'],
+    createCustomer: ['customers', 'reservations', 'dashboard', 'activity', 'reports', 'sync'],
+    updateCustomer: ['customers', 'reservations', 'dashboard', 'activity', 'reports', 'sync'],
+    deleteCustomer: ['customers', 'reservations', 'dashboard', 'activity', 'reports', 'sync'],
+    createReservation: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    deleteReservation: ['reservations', 'customers', 'followUps', 'problems', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    claimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    unclaimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    quickUpdateReservationStatus: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    updateReservationDetails: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    addFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    updateFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    assignEmployees: ['reservations', 'dashboard', 'employees', 'notifications', 'activity', 'reports', 'sync'],
+    removeAssignment: ['reservations', 'dashboard', 'employees', 'activity', 'reports', 'sync'],
+    createProblem: ['reservations', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports', 'sync'],
+    updateProblem: ['reservations', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports', 'sync'],
+    createEmployee: ['employees', 'dashboard', 'activity', 'reports', 'sync'],
+    updateEmployee: ['employees', 'dashboard', 'activity', 'reports', 'sync'],
+    disableEmployee: ['employees', 'dashboard', 'activity', 'reports', 'sync'],
+    saveRolePreset: ['employees', 'activity', 'sync'],
+    deleteRolePreset: ['employees', 'activity', 'sync'],
+    resetRolePresets: ['employees', 'activity', 'sync'],
+    savePermissionDefinition: ['employees', 'activity', 'sync'],
+    deletePermissionDefinition: ['employees', 'activity', 'sync'],
     markNotificationRead: ['notifications'],
-    pullReservations: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
-    syncRentalGate: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    pullReservations: ['reservations', 'customers', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    syncRentalGate: ['reservations', 'customers', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    processSyncQueue: ['sync'],
+    retryFailedSyncItems: ['sync'],
+    runBackupDeltaSync: ['sync', 'reservations', 'customers'],
     saveApiToken: ['settings', 'sync', 'activity'],
     updateSettings: ['settings', 'sync', 'reservations', 'activity']
   };
@@ -1979,6 +1989,14 @@
     var act = normalizeStr(action);
     var p = (payload && typeof payload === 'object') ? payload : {};
     switch (act) {
+      case 'createCustomer':
+        return act + ':' + normalizeStr(p.phone || p.customerPhone || p.email || p.name || p.customerName);
+      case 'updateCustomer':
+      case 'deleteCustomer':
+        return act + ':' + normalizeStr(p.customerId || p.id);
+      case 'createReservation':
+        return act + ':' + normalizeStr(p.reservationNumber || p.customerPhone || p.customerName);
+      case 'deleteReservation':
       case 'claimReservation':
       case 'unclaimReservation':
       case 'quickUpdateReservationStatus':
@@ -2132,6 +2150,101 @@
     return !f.isModalOpen && !f.isInputFocused && !f.isOffline && !f.isHidden && !f.hasActiveLocks;
   }
 
+  function computeExponentialBackoffSeconds(retryCount, baseSec, maxSec, jitterRatio) {
+    var attempt = Math.max(1, parseInt(retryCount, 10) || 1);
+    var base = Math.max(1, Number(baseSec || 5));
+    var cap = Math.max(base, Number(maxSec || 900));
+    var raw = Math.min(cap, base * Math.pow(2, attempt - 1));
+    var j = Number(jitterRatio || 0);
+    if (j > 0) {
+      raw = raw * (1 + Math.min(0.5, j));
+    }
+    return Math.round(raw);
+  }
+
+  function normalizeSyncOperation(op, action) {
+    var raw = normalizeStr(op).toUpperCase();
+    if (raw === 'INSERT' || raw === 'CREATE' || raw === 'ADD') return 'INSERT';
+    if (raw === 'DELETE' || raw === 'REMOVE') return 'DELETE';
+    if (raw === 'UPDATE' || raw === 'UPSERT') return 'UPDATE';
+    var act = normalizeStr(action).toLowerCase();
+    if (act.indexOf('delete') !== -1 || act.indexOf('remove') !== -1) return 'DELETE';
+    if (act.indexOf('append') !== -1 || act.indexOf('create') !== -1 || act.indexOf('insert') !== -1) return 'INSERT';
+    return 'UPDATE';
+  }
+
+  function normalizeOutboxStatus(status) {
+    var st = normalizeStr(status).toLowerCase();
+    if (st === 'sent' || st === 'synced' || st === 'done' || st === 'completed') return 'synced';
+    if (st === 'processing' || st === 'in_progress') return 'processing';
+    if (st === 'failed' || st === 'dead') return 'failed';
+    if (st === 'retry') return 'pending';
+    return 'pending';
+  }
+
+  function applyDeltaRecordToList(list, operation, record, idField) {
+    var keyField = idField || 'id';
+    var arr = Array.isArray(list) ? list.slice() : [];
+    var op = normalizeSyncOperation(operation);
+    if (!record || typeof record !== 'object') return arr;
+    var recKey = normalizeStr(record[keyField] || record.id || record.reservationNumber);
+    if (!recKey) return arr;
+
+    var idx = -1;
+    for (var i = 0; i < arr.length; i++) {
+      var item = arr[i];
+      if (!item) continue;
+      var k = normalizeStr(item[keyField] || item.id || item.reservationNumber);
+      if (k === recKey) {
+        idx = i;
+        break;
+      }
+    }
+
+    if (op === 'DELETE') {
+      if (idx !== -1) arr.splice(idx, 1);
+      return arr;
+    }
+
+    if (idx !== -1) {
+      arr[idx] = Object.assign({}, arr[idx], record);
+      return arr;
+    }
+    return [record].concat(arr);
+  }
+
+  function buildCustomerIdFromInput(input) {
+    var p = (input && typeof input === 'object') ? input : {};
+    var explicit = normalizeStr(p.id || p.customerId);
+    if (explicit) return explicit;
+    var phone = normalizeStr(p.phone || p.customerPhone).replace(/[\s\-()]/g, '');
+    if (phone) return 'CUST_PH_' + phone.replace(/[^A-Za-z0-9]/g, '');
+    var email = normalizeStr(p.email || p.customerEmail).toLowerCase();
+    if (email) return 'CUST_EM_' + email.replace(/[^a-z0-9]/g, '').slice(0, 24);
+    return 'CUST_' + Date.now().toString(36).toUpperCase();
+  }
+
+  function normalizeCustomerRecord(input) {
+    var p = (input && typeof input === 'object') ? input : {};
+    var phone = normalizeStr(p.phone !== undefined ? p.phone : p.customerPhone);
+    var name = normalizeStr(p.name !== undefined ? p.name : p.customerName);
+    var email = normalizeStr(p.email !== undefined ? p.email : p.customerEmail);
+    var idNumber = normalizeStr(p.idNumber !== undefined ? p.idNumber : (p.id_number !== undefined ? p.id_number : p.customerIdNumber));
+    var companyName = normalizeStr(p.companyName !== undefined ? p.companyName : p.company_name);
+    var notes = normalizeStr(p.notes);
+    var status = normalizeStr(p.status) || 'active';
+    return {
+      id: buildCustomerIdFromInput({ id: p.id || p.customerId, phone: phone, email: email, name: name }),
+      name: name || 'عميل',
+      phone: phone,
+      email: email,
+      idNumber: idNumber,
+      companyName: companyName,
+      notes: notes,
+      status: status
+    };
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -2204,6 +2317,12 @@
     resolveNotificationTarget: resolveNotificationTarget,
     applyOptimisticProblemPatch: applyOptimisticProblemPatch,
     computeDataFingerprint: computeDataFingerprint,
-    shouldAutoRefreshNow: shouldAutoRefreshNow
+    shouldAutoRefreshNow: shouldAutoRefreshNow,
+    computeExponentialBackoffSeconds: computeExponentialBackoffSeconds,
+    normalizeSyncOperation: normalizeSyncOperation,
+    normalizeOutboxStatus: normalizeOutboxStatus,
+    applyDeltaRecordToList: applyDeltaRecordToList,
+    buildCustomerIdFromInput: buildCustomerIdFromInput,
+    normalizeCustomerRecord: normalizeCustomerRecord
   };
 }));

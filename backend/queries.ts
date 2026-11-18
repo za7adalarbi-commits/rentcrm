@@ -12,13 +12,18 @@ import {
   type AuthSession
 } from './auth';
 import type { DbClient, DbExecutor } from './db';
+import { emitRealtimeEvent, fetchRealtimeEventsSince } from './realtimeBus';
 import {
   enqueueSheetsMirror,
-  flushSheetsMirrorOutbox,
+  enqueueSyncOperation,
+  getSyncQueueSummary,
   ingestIncrementalSyncBatch,
   mapExtensionRowToClient,
   mapReservationRowToClient,
-  pullFromRentalGateDirect
+  pullFromRentalGateDirect,
+  retryFailedSyncItems,
+  runBackupDeltaSync,
+  triggerImmediateSync
 } from './syncService';
 
 function str(v: unknown, fallback = ''): string {
@@ -179,6 +184,88 @@ async function createNotification(
       str(opts.entityId)
     ]
   );
+}
+
+async function runIdempotentMutation<T>(
+  executor: DbExecutor,
+  action: string,
+  payload: Record<string, any>,
+  fn: () => Promise<T>
+): Promise<T> {
+  const key = str(payload?.idempotencyKey);
+  if (!key) {
+    return fn();
+  }
+  try {
+    const existing = await executor.query<{ response: any }>(
+      `SELECT response FROM idempotency_requests WHERE idempotency_key = $1 LIMIT 1`,
+      [key]
+    );
+    if (existing.rows[0]?.response) {
+      return parseJsonValue(existing.rows[0].response, existing.rows[0].response) as T;
+    }
+  } catch {
+    // Ignore if mock executor has no idempotency_requests table
+  }
+
+  const out = await fn();
+  try {
+    await executor.query(
+      `INSERT INTO idempotency_requests (idempotency_key, action, response, created_at)
+       VALUES ($1, $2, $3::jsonb, NOW())
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+      [key, action, JSON.stringify(out ?? {})]
+    );
+  } catch {
+    // Non-blocking
+  }
+  return out;
+}
+
+function formatCustomerRow(row: any, stats?: { totalBookings?: number; totalSpent?: number }): Record<string, any> {
+  return {
+    id: str(row.id),
+    name: str(row.name),
+    phone: str(row.phone),
+    email: str(row.email),
+    idNumber: str(row.id_number ?? row.idNumber),
+    companyName: str(row.company_name ?? row.companyName),
+    notes: str(row.notes),
+    status: str(row.status || 'active'),
+    totalBookings: stats?.totalBookings ?? num(row.total_bookings, 0),
+    totalSpent: stats?.totalSpent ?? num(row.total_spent, 0),
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at)
+  };
+}
+
+async function upsertCustomerInTx(
+  tx: DbClient,
+  input: Record<string, any>,
+  nowIso: string
+): Promise<Record<string, any> | null> {
+  const norm = crmCore.normalizeCustomerRecord(input);
+  if (!norm.name && !norm.phone && !norm.email) return null;
+  try {
+    await tx.query(
+      `INSERT INTO customers (id, name, phone, email, id_number, company_name, notes, status, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$9::timestamptz)
+       ON CONFLICT (id) DO UPDATE SET
+         name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+         phone = COALESCE(NULLIF(EXCLUDED.phone, ''), customers.phone),
+         email = COALESCE(NULLIF(EXCLUDED.email, ''), customers.email),
+         id_number = COALESCE(NULLIF(EXCLUDED.id_number, ''), customers.id_number),
+         company_name = COALESCE(NULLIF(EXCLUDED.company_name, ''), customers.company_name),
+         notes = CASE WHEN EXCLUDED.notes <> '' THEN EXCLUDED.notes ELSE customers.notes END,
+         status = EXCLUDED.status,
+         deleted_at = NULL,
+         updated_at = EXCLUDED.updated_at`,
+      [norm.id, norm.name, norm.phone, norm.email, norm.idNumber, norm.companyName, norm.notes, norm.status, nowIso]
+    );
+    return { ...norm, createdAt: nowIso, updatedAt: nowIso };
+  } catch {
+    return null;
+  }
 }
 
 export async function getSettingsMap(client: DbClient): Promise<Record<string, any>> {
@@ -905,11 +992,28 @@ export async function claimReservation(executor: DbExecutor, session: AuthSessio
       lastUpdatedAt: nowIso,
       updatedAt: nowIso
     };
-    await enqueueSheetsMirror(tx, 'Reservation', updated.id, 'upsertReservation', updated);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updated.id,
+      recordId: updated.reservationNumber || updated.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updated,
+      idempotencyKey: payload.idempotencyKey ? `MIR:${payload.idempotencyKey}` : undefined
+    });
     return { added, reservation: updated };
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'reservation:updated',
+    entityType: 'Reservation',
+    recordId: result.reservation.id,
+    operation: 'UPDATE',
+    payload: { reservation: result.reservation },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return result;
 }
 
@@ -955,11 +1059,28 @@ export async function unclaimReservation(executor: DbExecutor, session: AuthSess
       assignedEmployeeNames: names,
       updatedAt: nowIso
     };
-    await enqueueSheetsMirror(tx, 'Reservation', updated.id, 'upsertReservation', updated);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updated.id,
+      recordId: updated.reservationNumber || updated.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updated,
+      idempotencyKey: payload.idempotencyKey ? `MIR:${payload.idempotencyKey}` : undefined
+    });
     return { removed: idx !== -1, reservation: updated };
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'reservation:updated',
+    entityType: 'Reservation',
+    recordId: result.reservation.id,
+    operation: 'UPDATE',
+    payload: { reservation: result.reservation },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return result;
 }
 
@@ -1044,12 +1165,37 @@ export async function quickUpdateReservationStatus(
       statusHistory: nextHistory,
       isFollowed: true
     };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    await enqueueSyncOperation(tx, {
+      entityType: 'FollowUp',
+      entityId: fuObj.id,
+      recordId: fuObj.id,
+      operation: 'INSERT',
+      action: 'appendFollowUp',
+      payload: fuObj,
+      idempotencyKey: payload.idempotencyKey ? `MIR_FU:${payload.idempotencyKey}` : undefined
+    });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.reservationNumber || updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes,
+      idempotencyKey: payload.idempotencyKey ? `MIR_RES:${payload.idempotencyKey}` : undefined
+    });
     return { reservation: updatedRes, followUp: fuObj };
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'reservation:status_changed',
+    entityType: 'Reservation',
+    recordId: out.reservation.id,
+    operation: 'UPDATE',
+    payload: { reservation: out.reservation, followUp: out.followUp },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1086,15 +1232,18 @@ export async function updateReservationDetails(
       });
     }
 
+    const nextTotal = payload.totalAmount !== undefined ? num(payload.totalAmount, existing.totalAmount) : existing.totalAmount;
     const nextObj: Record<string, any> = {
       ...existing,
       customerName: payload.customerName !== undefined ? str(payload.customerName) : existing.customerName,
       customerPhone: payload.customerPhone !== undefined ? str(payload.customerPhone) : existing.customerPhone,
+      customerEmail: payload.customerEmail !== undefined ? str(payload.customerEmail) : existing.customerEmail,
       companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
       branchName: payload.branchName !== undefined ? str(payload.branchName) : existing.branchName,
       carName: payload.carName !== undefined ? str(payload.carName) : existing.carName,
       startDate: payload.startDate !== undefined ? str(payload.startDate) : existing.startDate,
       endDate: payload.endDate !== undefined ? str(payload.endDate) : existing.endDate,
+      totalAmount: nextTotal,
       priority: payload.priority !== undefined ? str(payload.priority) : existing.priority,
       internalStatus: nextStatus,
       lastUpdateText: payload.lastUpdateText !== undefined ? str(payload.lastUpdateText) : `تعديل بيانات الحجز بواسطة ${session.user.name}`,
@@ -1110,7 +1259,8 @@ export async function updateReservationDetails(
        SET customer_name = $2, customer_phone = $3, company_name = $4, branch_name = $5,
            car_name = $6, start_date = $7, end_date = $8, priority = $9, internal_status = $10,
            last_update_text = $11, last_updated_by_id = $12, last_updated_by_name = $13,
-           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb
+           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb,
+           total_amount = $16, customer_email = $17
        WHERE id = $1`,
       [
         resId,
@@ -1127,16 +1277,52 @@ export async function updateReservationDetails(
         nextObj.lastUpdatedById,
         nextObj.lastUpdatedByName,
         nextObj.lastUpdatedAt,
-        JSON.stringify(nextObj.statusHistory)
+        JSON.stringify(nextObj.statusHistory),
+        nextObj.totalAmount,
+        nextObj.customerEmail
       ]
     );
 
+    const custSynced = await upsertCustomerInTx(tx, {
+      name: nextObj.customerName,
+      phone: nextObj.customerPhone,
+      email: nextObj.customerEmail,
+      companyName: nextObj.companyName
+    }, nowIso);
+    if (custSynced) {
+      await enqueueSyncOperation(tx, {
+        entityType: 'Customer',
+        entityId: custSynced.id,
+        recordId: custSynced.id,
+        operation: 'UPDATE',
+        action: 'upsertCustomer',
+        payload: custSynced
+      });
+    }
+
     await logActivity(tx, session.user, 'تعديل بيانات حجز', 'Reservation', existing.reservationNumber, 'تعديل تفاصيل الحجز بواسطة المشرف / الإدارة');
-    await enqueueSheetsMirror(tx, 'Reservation', nextObj.id, 'upsertReservation', nextObj);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: nextObj.id,
+      recordId: nextObj.reservationNumber || nextObj.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: nextObj,
+      idempotencyKey: payload.idempotencyKey ? `MIR:${payload.idempotencyKey}` : undefined
+    });
     return nextObj;
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'reservation:updated',
+    entityType: 'Reservation',
+    recordId: out.id,
+    operation: 'UPDATE',
+    payload: { reservation: out },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1211,12 +1397,37 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
       statusHistory: nextHistory,
       isFollowed: true
     };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    await enqueueSyncOperation(tx, {
+      entityType: 'FollowUp',
+      entityId: fuObj.id,
+      recordId: fuObj.id,
+      operation: 'INSERT',
+      action: 'appendFollowUp',
+      payload: fuObj,
+      idempotencyKey: payload.idempotencyKey ? `MIR_FU:${payload.idempotencyKey}` : undefined
+    });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.reservationNumber || updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes,
+      idempotencyKey: payload.idempotencyKey ? `MIR_RES:${payload.idempotencyKey}` : undefined
+    });
     return { followUp: fuObj, reservation: updatedRes };
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'followup:added',
+    entityType: 'Reservation',
+    recordId: out.reservation.id,
+    operation: 'UPDATE',
+    payload: { reservation: out.reservation, followUp: out.followUp },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1243,8 +1454,8 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     const nowIso = new Date().toISOString();
 
     await tx.query(
-      `UPDATE follow_ups SET status = $2, action = $3, notes = $4 WHERE id = $1`,
-      [followUpId, newStatus, newAction, newNotes]
+      `UPDATE follow_ups SET status = $2, action = $3, notes = $4, updated_at = $5::timestamptz WHERE id = $1`,
+      [followUpId, newStatus, newAction, newNotes, nowIso]
     );
 
     const hist = {
@@ -1269,6 +1480,7 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
       [hist.id, hist.followUpId, hist.reservationId, hist.reservationNumber, hist.employeeId, hist.employeeName, hist.changeType, hist.previousStatus, hist.newStatus, hist.previousAction, hist.newAction, hist.previousNotes, hist.newNotes, hist.changedAt]
     );
 
+    let updatedRes: Record<string, any> | null = null;
     const lastResQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [existing.reservationId]);
     if (lastResQuery.rows[0]) {
       const rObj = mapReservationRowToClient(lastResQuery.rows[0], false);
@@ -1293,12 +1505,52 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
          WHERE id = $1`,
         [rObj.id, newStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory)]
       );
+
+      updatedRes = {
+        ...rObj,
+        internalStatus: newStatus,
+        lastUpdateText: lastText,
+        lastUpdatedById: session.user.id,
+        lastUpdatedByName: session.user.name,
+        lastUpdatedAt: nowIso,
+        updatedAt: nowIso,
+        statusHistory: nextHistory
+      };
+      await enqueueSyncOperation(tx, {
+        entityType: 'Reservation',
+        entityId: updatedRes.id,
+        recordId: updatedRes.reservationNumber || updatedRes.id,
+        operation: 'UPDATE',
+        action: 'upsertReservation',
+        payload: updatedRes
+      });
     }
 
+    const updatedFu: Record<string, any> = { ...existing, status: newStatus, action: newAction, notes: newNotes, updatedAt: nowIso };
+    await enqueueSyncOperation(tx, {
+      entityType: 'FollowUp',
+      entityId: followUpId,
+      recordId: followUpId,
+      operation: 'UPDATE',
+      action: 'upsertFollowUp',
+      payload: updatedFu,
+      idempotencyKey: payload.idempotencyKey ? `MIR_FU:${payload.idempotencyKey}` : undefined
+    });
+
     await logActivity(tx, session.user, 'تعديل متابعة', 'FollowUp', existing.reservationNumber, `${existing.status} → ${newStatus}`);
-    return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes }, history: hist };
+    return { followUp: updatedFu, history: hist, reservation: updatedRes };
   });
 
+  await emitRealtimeEvent(executor, {
+    eventType: 'followup:updated',
+    entityType: out.reservation ? 'Reservation' : 'FollowUp',
+    recordId: out.reservation ? out.reservation.id : out.followUp.id,
+    operation: 'UPDATE',
+    payload: { followUp: out.followUp, reservation: out.reservation },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1384,11 +1636,28 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
       lastUpdatedAt: nowIso,
       updatedAt: nowIso
     };
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.reservationNumber || updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes,
+      idempotencyKey: payload.idempotencyKey ? `MIR:${payload.idempotencyKey}` : undefined
+    });
     return updatedRes;
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'reservation:assigned',
+    entityType: 'Reservation',
+    recordId: out.id,
+    operation: 'UPDATE',
+    payload: { reservation: out },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1398,7 +1667,7 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
   const employeeId = str(payload.employeeId);
   if (!resId || !employeeId) throw new Error('VALIDATION_ERROR: معرف الحجز والموظف مطلوبان.');
 
-  return executor.withTransaction(async (tx) => {
+  const out = await executor.withTransaction(async (tx) => {
     const nowIso = new Date().toISOString();
     await tx.query(
       `UPDATE assignments SET status = 'inactive', updated_at = $3::timestamptz WHERE reservation_id = $1 AND employee_id = $2`,
@@ -1418,8 +1687,29 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
       [resId, JSON.stringify(ids), JSON.stringify(names), nowIso]
     );
     await logActivity(tx, session.user, 'إلغاء إسناد', 'Reservation', resObj.reservationNumber, `إزالة إسناد الموظف ${employeeId}`);
-    return { ...resObj, assignedEmployeeIds: ids, assignedEmployeeNames: names, updatedAt: nowIso };
+    const updatedRes: Record<string, any> = { ...resObj, assignedEmployeeIds: ids, assignedEmployeeNames: names, updatedAt: nowIso };
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.reservationNumber || updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes
+    });
+    return updatedRes;
   });
+
+  await emitRealtimeEvent(executor, {
+    eventType: 'reservation:updated',
+    entityType: 'Reservation',
+    recordId: out.id,
+    operation: 'UPDATE',
+    payload: { reservation: out },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
+  return out;
 }
 
 export async function getMyFollowUps(executor: DbExecutor, session: AuthSession, _payload: Record<string, any> = {}) {
@@ -1537,6 +1827,7 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
       [generateId('PRBU'), prb.id, prb.reservationNumber, session.user.id, session.user.name, prb.priority, nowIso]
     );
 
+    let updatedResForProblem: Record<string, any> | null = null;
     if (resObj) {
       await tx.query(
         `UPDATE reservations
@@ -1546,6 +1837,21 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
          WHERE id = $1`,
         [resObj.id, prb.priority, nowIso]
       );
+      const nextResObj: Record<string, any> = {
+        ...resObj,
+        hasProblem: true,
+        priority: prb.priority === 'مرتفع' ? 'مرتفع' : resObj.priority,
+        updatedAt: nowIso
+      };
+      updatedResForProblem = nextResObj;
+      await enqueueSyncOperation(tx, {
+        entityType: 'Reservation',
+        entityId: nextResObj.id,
+        recordId: nextResObj.reservationNumber || nextResObj.id,
+        operation: 'UPDATE',
+        action: 'upsertReservation',
+        payload: nextResObj
+      });
     }
 
     if (prb.priority === 'مرتفع') {
@@ -1560,12 +1866,30 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
     }
 
     await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
-    await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
-    return { ...prb, updates: [] };
+    await enqueueSyncOperation(tx, {
+      entityType: 'Problem',
+      entityId: prb.id,
+      recordId: prb.id,
+      operation: 'INSERT',
+      action: 'upsertProblem',
+      payload: prb,
+      idempotencyKey: payload.idempotencyKey ? `MIR_PRB:${payload.idempotencyKey}` : undefined
+    });
+    return { ...prb, updates: [], _updatedReservation: updatedResForProblem };
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
+  const { _updatedReservation, ...publicProblem } = out;
+  await emitRealtimeEvent(executor, {
+    eventType: 'problem:created',
+    entityType: 'Problem',
+    recordId: publicProblem.id,
+    operation: 'INSERT',
+    payload: { problem: publicProblem, reservation: _updatedReservation },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
+  return publicProblem;
 }
 
 export async function updateProblem(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -1611,16 +1935,28 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
       [generateId('PRBU'), problemId, existing.reservationNumber, session.user.id, session.user.name, existing.status, nextStatus, existing.priority, nextPrio, note, nowIso]
     );
 
+    let updatedResForProblem: Record<string, any> | null = null;
     if (existing.reservationId) {
       const openCheck = await tx.query<{ cnt: string }>(
         `SELECT COUNT(*)::text AS cnt FROM problems WHERE reservation_id = $1 AND status NOT IN ('مغلقة', 'تم الحل')`,
         [existing.reservationId]
       );
       const hasOpen = Number(openCheck.rows[0]?.cnt || 0) > 0;
-      await tx.query(
-        `UPDATE reservations SET has_problem = $2, updated_at = $3::timestamptz WHERE id = $1`,
+      const rUpdRes = await tx.query(
+        `UPDATE reservations SET has_problem = $2, updated_at = $3::timestamptz WHERE id = $1 RETURNING *`,
         [existing.reservationId, hasOpen, nowIso]
       );
+      if (rUpdRes.rows[0]) {
+        updatedResForProblem = mapReservationRowToClient(rUpdRes.rows[0], false);
+        await enqueueSyncOperation(tx, {
+          entityType: 'Reservation',
+          entityId: updatedResForProblem.id,
+          recordId: updatedResForProblem.reservationNumber || updatedResForProblem.id,
+          operation: 'UPDATE',
+          action: 'upsertReservation',
+          payload: updatedResForProblem
+        });
+      }
     }
 
     const updatesRes = await tx.query(
@@ -1640,12 +1976,29 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
       updatedAt: nowIso,
       updates: updatesRes.rows.map(formatProblemUpdateRow)
     };
-    await enqueueSheetsMirror(tx, 'Problem', updatedProblem.id, 'upsertProblem', updatedProblem);
-    return updatedProblem;
+    await enqueueSyncOperation(tx, {
+      entityType: 'Problem',
+      entityId: updatedProblem.id,
+      recordId: updatedProblem.id,
+      operation: 'UPDATE',
+      action: 'upsertProblem',
+      payload: updatedProblem,
+      idempotencyKey: payload.idempotencyKey ? `MIR_PRB:${payload.idempotencyKey}` : undefined
+    });
+    return { updatedProblem, updatedResForProblem };
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
+  await emitRealtimeEvent(executor, {
+    eventType: 'problem:updated',
+    entityType: 'Problem',
+    recordId: out.updatedProblem.id,
+    operation: 'UPDATE',
+    payload: { problem: out.updatedProblem, reservation: out.updatedResForProblem },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
+  return out.updatedProblem;
 }
 
 export async function getProblems(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
@@ -1804,11 +2157,28 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
       job_title: str(payload.jobTitle), role, permissions: effectivePerms,
       status: 'active', last_activity: nowIso, created_at: nowIso, updated_at: nowIso
     });
-    await enqueueSheetsMirror(tx, 'Employee', id, 'upsertEmployee', { ...emp, passwordHash: pHash, salt });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Employee',
+      entityId: id,
+      recordId: id,
+      operation: 'INSERT',
+      action: 'upsertEmployee',
+      payload: { ...emp, passwordHash: pHash, salt },
+      idempotencyKey: payload.idempotencyKey ? `MIR_EMP:${payload.idempotencyKey}` : undefined
+    });
     return emp;
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'employee:created',
+    entityType: 'Employee',
+    recordId: out.id,
+    operation: 'INSERT',
+    payload: { employee: out },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1866,11 +2236,28 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
       name: nextName, phone: nextPhone, email: nextEmail, job_title: nextJob,
       role: nextRole, permissions: nextPerms, status: nextStatus, updated_at: nowIso
     });
-    await enqueueSheetsMirror(tx, 'Employee', empId, 'upsertEmployee', { ...emp, passwordHash: nextHash, salt: nextSalt });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Employee',
+      entityId: empId,
+      recordId: empId,
+      operation: 'UPDATE',
+      action: 'upsertEmployee',
+      payload: { ...emp, passwordHash: nextHash, salt: nextSalt },
+      idempotencyKey: payload.idempotencyKey ? `MIR_EMP:${payload.idempotencyKey}` : undefined
+    });
     return emp;
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'employee:updated',
+    entityType: 'Employee',
+    recordId: out.id,
+    operation: 'UPDATE',
+    payload: { employee: out },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return out;
 }
 
@@ -1897,8 +2284,26 @@ export async function saveRolePreset(executor: DbExecutor, session: AuthSession,
          permissions = EXCLUDED.permissions, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
       [res.saved.id, res.saved.label, res.saved.jobTitle, res.saved.role, JSON.stringify(res.saved.permissions), session.user.name]
     );
+    await enqueueSyncOperation(tx, {
+      entityType: 'Role',
+      entityId: res.saved.id,
+      recordId: res.saved.id,
+      operation: 'UPDATE',
+      action: 'upsertRole',
+      payload: { ...res.saved, permissions: JSON.stringify(res.saved.permissions), updatedBy: session.user.name, updatedAt: new Date().toISOString() }
+    });
     await logActivity(tx, session.user, 'تحديث قالب صلاحيات', 'RolePreset', res.saved.id, res.saved.label);
   });
+  await emitRealtimeEvent(executor, {
+    eventType: 'role:updated',
+    entityType: 'Role',
+    recordId: res.saved.id,
+    operation: 'UPDATE',
+    payload: { saved: res.saved },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return { saved: res.saved, rolePresets: res.presets };
 }
 
@@ -1907,8 +2312,28 @@ export async function deleteRolePreset(executor: DbExecutor, session: AuthSessio
   const id = str(payload.id || payload.presetId);
   const current = await getRolePresetsFromDb(executor);
   const next = crmCore.removeRolePreset(current, id);
-  await executor.query(`DELETE FROM roles WHERE id = $1`, [id]);
-  await logActivity(executor, session.user, 'حذف قالب صلاحيات', 'RolePreset', id, 'حذف قالب صلاحيات');
+  await executor.withTransaction(async (tx) => {
+    await tx.query(`DELETE FROM roles WHERE id = $1`, [id]);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Role',
+      entityId: id,
+      recordId: id,
+      operation: 'DELETE',
+      action: 'deleteRole',
+      payload: { id }
+    });
+    await logActivity(tx, session.user, 'حذف قالب صلاحيات', 'RolePreset', id, 'حذف قالب صلاحيات');
+  });
+  await emitRealtimeEvent(executor, {
+    eventType: 'role:deleted',
+    entityType: 'Role',
+    recordId: id,
+    operation: 'DELETE',
+    payload: { id },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return { rolePresets: next };
 }
 
@@ -1922,9 +2347,18 @@ export async function resetRolePresets(executor: DbExecutor, session: AuthSessio
          VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW())`,
         [preset.id, preset.label, preset.jobTitle, preset.role, JSON.stringify(preset.permissions), session.user.name]
       );
+      await enqueueSyncOperation(tx, {
+        entityType: 'Role',
+        entityId: preset.id,
+        recordId: preset.id,
+        operation: 'UPDATE',
+        action: 'upsertRole',
+        payload: { ...preset, permissions: JSON.stringify(preset.permissions), updatedBy: session.user.name, updatedAt: new Date().toISOString() }
+      });
     }
     await logActivity(tx, session.user, 'إعادة ضبط القوالب', 'RolePreset', 'ALL', 'استعادة قوالب الصلاحيات الافتراضية');
   });
+  void triggerImmediateSync(executor).catch(() => undefined);
   return { rolePresets: crmCore.JOB_ROLE_PRESETS };
 }
 
@@ -1941,8 +2375,17 @@ export async function savePermissionDefinition(executor: DbExecutor, session: Au
          updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
       [res.saved.key, res.saved.label, res.saved.group, Boolean(res.saved.isCustom), session.user.name]
     );
+    await enqueueSyncOperation(tx, {
+      entityType: 'Permission',
+      entityId: res.saved.key,
+      recordId: res.saved.key,
+      operation: 'UPDATE',
+      action: 'upsertPermission',
+      payload: { ...res.saved, updatedBy: session.user.name, updatedAt: new Date().toISOString() }
+    });
     await logActivity(tx, session.user, 'حفظ مسمى صلاحية', 'Permission', res.saved.key, res.saved.label);
   });
+  void triggerImmediateSync(executor).catch(() => undefined);
   return { saved: res.saved, permissionsCatalog: res.catalog, customPermissions: res.customPermissions };
 }
 
@@ -1951,8 +2394,19 @@ export async function deletePermissionDefinition(executor: DbExecutor, session: 
   const key = str(payload.key);
   const current = await getPermissionDefsFromDb(executor);
   const res = crmCore.removePermissionDefinition(current, key);
-  await executor.query(`DELETE FROM permissions WHERE key = $1`, [key]);
-  await logActivity(executor, session.user, 'حذف صلاحية مخصصة', 'Permission', key, 'حذف مسمى/صلاحية مخصصة');
+  await executor.withTransaction(async (tx) => {
+    await tx.query(`DELETE FROM permissions WHERE key = $1`, [key]);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Permission',
+      entityId: key,
+      recordId: key,
+      operation: 'DELETE',
+      action: 'deletePermission',
+      payload: { key }
+    });
+    await logActivity(tx, session.user, 'حذف صلاحية مخصصة', 'Permission', key, 'حذف مسمى/صلاحية مخصصة');
+  });
+  void triggerImmediateSync(executor).catch(() => undefined);
   return { permissionsCatalog: res.catalog, customPermissions: res.customPermissions };
 }
 
@@ -2051,21 +2505,38 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
         [key, value, session.user.name]
       );
-      await enqueueSheetsMirror(tx, 'Settings', key, 'upsertSetting', { key, value, updatedBy: session.user.name });
+      await enqueueSyncOperation(tx, {
+        entityType: 'Settings',
+        entityId: key,
+        recordId: key,
+        operation: 'UPDATE',
+        action: 'upsertSetting',
+        payload: { key, value, updatedBy: session.user.name }
+      });
     }
     await logActivity(tx, session.user, 'تحديث الإعدادات', 'Settings', 'system', 'تحديث إعدادات النظام في قاعدة البيانات');
   });
 
-  flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  await emitRealtimeEvent(executor, {
+    eventType: 'settings:updated',
+    entityType: 'Settings',
+    recordId: 'system',
+    operation: 'UPDATE',
+    payload: { updatedKeys: updates.map((u) => u[0]) },
+    actorId: session.user.id,
+    actorName: session.user.name
+  }).catch(() => undefined);
+  void triggerImmediateSync(executor).catch(() => undefined);
   return getSettings(executor, session);
 }
 
 export async function getSyncStatus(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const [logRes, ckRes, map] = await Promise.all([
+  const [logRes, ckRes, map, queueSummary] = await Promise.all([
     executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 20`),
     executor.query(`SELECT * FROM sync_checkpoints ORDER BY updated_at DESC LIMIT 5`),
-    getSettingsMap(executor)
+    getSettingsMap(executor),
+    getSyncQueueSummary(executor, 50)
   ]);
   const logs = logRes.rows.map((s) => ({
     id: str(s.id),
@@ -2087,7 +2558,8 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     autoSyncIntervalHours: num(map.auto_sync_interval_hours, 12),
     lastSync: logs[0] || null,
     logs,
-    checkpoints: ckRes.rows
+    checkpoints: ckRes.rows,
+    queue: queueSummary
   };
 }
 
@@ -2294,4 +2766,478 @@ export async function testRentalGateConnection(_executor: DbExecutor, session: A
     hasToken: true,
     message: resp.ok ? 'الاتصال بواجهة Rental Gate API يعمل بنجاح.' : `فشل الاتصال (HTTP ${resp.status})`
   };
+}
+
+// ---------- CUSTOMERS CRUD, MANUAL RESERVATIONS CREATE/DELETE & SYNC QUEUE ACTIONS ----------
+
+export async function getCustomers(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+  const search = str(payload.search);
+  const params: any[] = [];
+  const clauses: string[] = ['c.deleted_at IS NULL'];
+  if (search) {
+    params.push(`%${search}%`);
+    const pIdx = params.length;
+    clauses.push(`(c.name ILIKE $${pIdx} OR c.phone ILIKE $${pIdx} OR c.email ILIKE $${pIdx} OR c.id_number ILIKE $${pIdx} OR c.company_name ILIKE $${pIdx})`);
+  }
+  const whereSql = `WHERE ${clauses.join(' AND ')}`;
+  const limit = Math.min(500, Math.max(10, num(payload.limit, 200)));
+  params.push(limit);
+
+  const [custRes, resStatsRes] = await Promise.all([
+    executor.query(`SELECT c.* FROM customers c ${whereSql} ORDER BY c.updated_at DESC LIMIT $${params.length}`, params),
+    executor.query(`SELECT customer_phone, customer_name, COUNT(*)::text AS cnt, COALESCE(SUM(total_amount), 0)::text AS spent FROM reservations WHERE deleted_at IS NULL GROUP BY customer_phone, customer_name`)
+  ]);
+
+  const statsByKey = new Map<string, { totalBookings: number; totalSpent: number }>();
+  for (const r of resStatsRes.rows) {
+    const ph = str(r.customer_phone).replace(/[\s\-()]/g, '');
+    const nm = str(r.customer_name).toLowerCase();
+    const key = ph ? `PH:${ph}` : `NM:${nm}`;
+    const cur = statsByKey.get(key) || { totalBookings: 0, totalSpent: 0 };
+    cur.totalBookings += num(r.cnt, 0);
+    cur.totalSpent = Math.round((cur.totalSpent + num(r.spent, 0)) * 100) / 100;
+    statsByKey.set(key, cur);
+  }
+
+  const items = custRes.rows.map((row) => {
+    const ph = str(row.phone).replace(/[\s\-()]/g, '');
+    const nm = str(row.name).toLowerCase();
+    const stats = statsByKey.get(ph ? `PH:${ph}` : `NM:${nm}`);
+    return formatCustomerRow(row, stats);
+  });
+
+  return { items, total: items.length };
+}
+
+export async function createCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'add_followup');
+  const name = str(payload.name || payload.customerName);
+  const phone = str(payload.phone || payload.customerPhone);
+  if (!name && !phone) {
+    throw new Error('VALIDATION_ERROR: اسم العميل أو رقم الجوال مطلوب.');
+  }
+
+  return runIdempotentMutation(executor, 'createCustomer', payload, async () => {
+    const nowIso = new Date().toISOString();
+    const norm = crmCore.normalizeCustomerRecord({
+      ...payload,
+      name,
+      phone,
+      email: str(payload.email || payload.customerEmail),
+      idNumber: str(payload.idNumber || payload.customerIdNumber),
+      companyName: str(payload.companyName),
+      notes: str(payload.notes),
+      status: 'active'
+    });
+
+    const created = await executor.withTransaction(async (tx) => {
+      const existingCheck = await tx.query(`SELECT id FROM customers WHERE id = $1 LIMIT 1`, [norm.id]);
+      const isInsert = existingCheck.rows.length === 0;
+      const op: 'INSERT' | 'UPDATE' = isInsert ? 'INSERT' : 'UPDATE';
+
+      await tx.query(
+        `INSERT INTO customers (id, name, phone, email, id_number, company_name, notes, status, created_at, updated_at, deleted_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8::timestamptz,$8::timestamptz,NULL)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           phone = EXCLUDED.phone,
+           email = EXCLUDED.email,
+           id_number = EXCLUDED.id_number,
+           company_name = EXCLUDED.company_name,
+           notes = EXCLUDED.notes,
+           status = 'active',
+           deleted_at = NULL,
+           updated_at = EXCLUDED.updated_at`,
+        [norm.id, norm.name, norm.phone, norm.email, norm.idNumber, norm.companyName, norm.notes, nowIso]
+      );
+
+      const customerObj = { ...norm, createdAt: nowIso, updatedAt: nowIso };
+      await enqueueSyncOperation(tx, {
+        entityType: 'Customer',
+        entityId: customerObj.id,
+        recordId: customerObj.id,
+        operation: op,
+        action: 'upsertCustomer',
+        payload: customerObj,
+        idempotencyKey: payload.idempotencyKey ? `MIR_CUST:${payload.idempotencyKey}` : undefined
+      });
+      await logActivity(tx, session.user, isInsert ? 'إضافة عميل' : 'تحديث عميل', 'Customer', customerObj.id, `${customerObj.name} (${customerObj.phone || '-'})`);
+      return { customer: customerObj, operation: op };
+    });
+
+    await emitRealtimeEvent(executor, {
+      eventType: created.operation === 'INSERT' ? 'customer:created' : 'customer:updated',
+      entityType: 'Customer',
+      recordId: created.customer.id,
+      operation: created.operation,
+      payload: { customer: created.customer },
+      actorId: session.user.id,
+      actorName: session.user.name
+    }).catch(() => undefined);
+    void triggerImmediateSync(executor).catch(() => undefined);
+    return { customer: created.customer };
+  });
+}
+
+export async function updateCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'add_followup');
+  const custId = str(payload.customerId || payload.id);
+  if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+
+  return runIdempotentMutation(executor, 'updateCustomer', payload, async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const curRes = await tx.query(`SELECT * FROM customers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [custId]);
+      if (!curRes.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+      const cur = formatCustomerRow(curRes.rows[0]);
+      const nowIso = new Date().toISOString();
+
+      const nextCust: Record<string, any> = {
+        ...cur,
+        name: payload.name !== undefined ? str(payload.name) : (payload.customerName !== undefined ? str(payload.customerName) : cur.name),
+        phone: payload.phone !== undefined ? str(payload.phone) : (payload.customerPhone !== undefined ? str(payload.customerPhone) : cur.phone),
+        email: payload.email !== undefined ? str(payload.email) : (payload.customerEmail !== undefined ? str(payload.customerEmail) : cur.email),
+        idNumber: payload.idNumber !== undefined ? str(payload.idNumber) : cur.idNumber,
+        companyName: payload.companyName !== undefined ? str(payload.companyName) : cur.companyName,
+        notes: payload.notes !== undefined ? str(payload.notes) : cur.notes,
+        status: payload.status !== undefined ? str(payload.status) : cur.status,
+        updatedAt: nowIso
+      };
+
+      await tx.query(
+        `UPDATE customers
+         SET name = $2, phone = $3, email = $4, id_number = $5, company_name = $6, notes = $7, status = $8, updated_at = $9::timestamptz
+         WHERE id = $1`,
+        [custId, nextCust.name, nextCust.phone, nextCust.email, nextCust.idNumber, nextCust.companyName, nextCust.notes, nextCust.status, nowIso]
+      );
+
+      await enqueueSyncOperation(tx, {
+        entityType: 'Customer',
+        entityId: custId,
+        recordId: custId,
+        operation: 'UPDATE',
+        action: 'upsertCustomer',
+        payload: nextCust,
+        idempotencyKey: payload.idempotencyKey ? `MIR_CUST:${payload.idempotencyKey}` : undefined
+      });
+      await logActivity(tx, session.user, 'تعديل عميل', 'Customer', custId, `${nextCust.name} (${nextCust.phone || '-'})`);
+      return nextCust;
+    });
+
+    await emitRealtimeEvent(executor, {
+      eventType: 'customer:updated',
+      entityType: 'Customer',
+      recordId: out.id,
+      operation: 'UPDATE',
+      payload: { customer: out },
+      actorId: session.user.id,
+      actorName: session.user.name
+    }).catch(() => undefined);
+    void triggerImmediateSync(executor).catch(() => undefined);
+    return { customer: out };
+  });
+}
+
+export async function deleteCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'edit_reservation_details');
+  const custId = str(payload.customerId || payload.id);
+  if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+
+  return runIdempotentMutation(executor, 'deleteCustomer', payload, async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const curRes = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [custId]);
+      if (!curRes.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+      const cur = formatCustomerRow(curRes.rows[0]);
+      const nowIso = new Date().toISOString();
+
+      await tx.query(
+        `UPDATE customers SET status = 'deleted', deleted_at = $2::timestamptz, updated_at = $2::timestamptz WHERE id = $1`,
+        [custId, nowIso]
+      );
+      await enqueueSyncOperation(tx, {
+        entityType: 'Customer',
+        entityId: custId,
+        recordId: custId,
+        operation: 'DELETE',
+        action: 'deleteCustomer',
+        payload: { id: custId, name: cur.name, phone: cur.phone, deletedAt: nowIso },
+        idempotencyKey: payload.idempotencyKey ? `MIR_CUST_DEL:${payload.idempotencyKey}` : undefined
+      });
+      await logActivity(tx, session.user, 'حذف عميل', 'Customer', custId, `حذف سجل العميل ${cur.name}`);
+      return { id: custId, name: cur.name, deletedAt: nowIso };
+    });
+
+    await emitRealtimeEvent(executor, {
+      eventType: 'customer:deleted',
+      entityType: 'Customer',
+      recordId: out.id,
+      operation: 'DELETE',
+      payload: { customer: out, id: out.id },
+      actorId: session.user.id,
+      actorName: session.user.name
+    }).catch(() => undefined);
+    void triggerImmediateSync(executor).catch(() => undefined);
+    return { deleted: true, id: out.id };
+  });
+}
+
+export async function createReservation(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'add_followup');
+  const customerName = str(payload.customerName);
+  const customerPhone = str(payload.customerPhone);
+  if (!customerName) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب لإنشاء الحجز.');
+
+  return runIdempotentMutation(executor, 'createReservation', payload, async () => {
+    const nowIso = new Date().toISOString();
+    const resNumber = str(payload.reservationNumber) || `RG-M-${String(Date.now()).slice(-6)}`;
+    const resId = `RES_${resNumber.replace(/[^A-Za-z0-9_-]/g, '')}`;
+    const internalStatus = str(payload.internalStatus || 'تم الإنشاء');
+    if (!crmCore.isValidWorkflowStatus(internalStatus)) {
+      throw new Error('VALIDATION_ERROR: حالة الحجز المحددة غير معتمدة.');
+    }
+
+    const startDate = str(payload.startDate || nowIso.slice(0, 10));
+    const endDate = str(payload.endDate || startDate);
+    const totalAmount = num(payload.totalAmount, 0);
+    const daysCount = Math.max(1, num(payload.daysCount, 1));
+    const priority = crmCore.PROBLEM_PRIORITIES.includes(str(payload.priority)) ? str(payload.priority) : 'عادي';
+    const lastText = str(payload.lastUpdateText) || `إنشاء حجز جديد بواسطة ${session.user.name}`;
+    const statusHistory = crmCore.appendStatusStageEntry([], {
+      source: 'supervisor_edit',
+      previousStatus: '',
+      newStatus: internalStatus,
+      changedAt: nowIso,
+      changedById: session.user.id,
+      changedByName: session.user.name,
+      note: lastText
+    });
+
+    const created = await executor.withTransaction(async (tx) => {
+      const dupCheck = await tx.query(`SELECT id FROM reservations WHERE reservation_number = $1 LIMIT 1`, [resNumber]);
+      if (dupCheck.rows.length > 0) {
+        throw new Error('VALIDATION_ERROR: رقم الحجز مسجل بالفعل.');
+      }
+
+      const assignedIds = Array.isArray(payload.assignedEmployeeIds) && payload.assignedEmployeeIds.length > 0
+        ? payload.assignedEmployeeIds.map((x: any) => str(x)).filter(Boolean)
+        : [session.user.id];
+      const assignedNames = assignedIds.includes(session.user.id) && assignedIds.length === 1
+        ? [session.user.name]
+        : (Array.isArray(payload.assignedEmployeeNames) ? payload.assignedEmployeeNames : [session.user.name]);
+
+      const record: Record<string, any> = {
+        id: resId,
+        sourceReservationId: str(payload.sourceReservationId || resNumber),
+        reservationNumber: resNumber,
+        sourceCreatedAt: nowIso.slice(0, 16).replace('T', ' '),
+        customerName,
+        customerPhone,
+        customerEmail: str(payload.customerEmail),
+        customerIdNumber: str(payload.customerIdNumber),
+        companyName: str(payload.companyName),
+        branchName: str(payload.branchName),
+        deliverBranchName: str(payload.deliverBranchName || payload.branchName),
+        carName: str(payload.carName),
+        plateNumber: str(payload.plateNumber),
+        carCategory: str(payload.carCategory),
+        startDate,
+        startTime: str(payload.startTime || '10:00'),
+        originalEndDate: endDate,
+        originalEndTime: str(payload.endTime || '10:00'),
+        endDate,
+        endTime: str(payload.endTime || '10:00'),
+        extendedUntilDate: '',
+        extendedUntilTime: '',
+        daysCount,
+        extendedDaysCount: 0,
+        totalDaysCount: daysCount,
+        originalStatusCode: 'created',
+        originalStatusAr: internalStatus,
+        pickupTypeAr: str(payload.pickupTypeAr || 'استلام من الفرع'),
+        returnTypeAr: str(payload.returnTypeAr || 'تسليم في الفرع'),
+        paymentMethod: str(payload.paymentMethod),
+        paymentStatus: str(payload.paymentStatus || 'unpaid'),
+        dailyPrice: num(payload.dailyPrice, totalAmount > 0 ? Number((totalAmount / daysCount).toFixed(2)) : 0),
+        discountAmount: num(payload.discountAmount, 0),
+        vatAmount: num(payload.vatAmount, 0),
+        baseAmount: totalAmount,
+        extensionsCount: 0,
+        extensionsAmount: 0,
+        totalAmount,
+        hasExtensions: false,
+        internalStatus,
+        priority,
+        assignedEmployeeIds: assignedIds,
+        assignedEmployeeNames: assignedNames,
+        lastUpdateText: lastText,
+        lastUpdatedById: session.user.id,
+        lastUpdatedByName: session.user.name,
+        lastUpdatedAt: nowIso,
+        hasProblem: false,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        statusHistory,
+        isFollowed: false
+      };
+
+      await tx.query(
+        `INSERT INTO reservations (
+           id, source_reservation_id, reservation_number, source_created_at,
+           customer_name, customer_phone, customer_email, customer_id_number,
+           company_name, branch_name, deliver_branch_name, car_name, plate_number, car_category,
+           start_date, start_time, original_end_date, original_end_time, end_date, end_time,
+           extended_until_date, extended_until_time, days_count, extended_days_count, total_days_count,
+           original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
+           payment_method, payment_status, daily_price, discount_amount, vat_amount,
+           base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
+           internal_status, priority, assigned_employee_ids, assigned_employee_names,
+           last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
+           has_problem, created_at, updated_at, status_history, raw_json
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+           $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,
+           $40,$41,$42::jsonb,$43::jsonb,$44,$45,$46,$47,$48,$49::timestamptz,$50::timestamptz,$51::jsonb,$52
+         )`,
+        [
+          record.id, record.sourceReservationId, record.reservationNumber, record.sourceCreatedAt,
+          record.customerName, record.customerPhone, record.customerEmail, record.customerIdNumber,
+          record.companyName, record.branchName, record.deliverBranchName, record.carName, record.plateNumber, record.carCategory,
+          record.startDate, record.startTime, record.originalEndDate, record.originalEndTime, record.endDate, record.endTime,
+          record.extendedUntilDate, record.extendedUntilTime, record.daysCount, record.extendedDaysCount, record.totalDaysCount,
+          record.originalStatusCode, record.originalStatusAr, record.pickupTypeAr, record.returnTypeAr,
+          record.paymentMethod, record.paymentStatus, record.dailyPrice, record.discountAmount, record.vatAmount,
+          record.baseAmount, record.extensionsCount, record.extensionsAmount, record.totalAmount, record.hasExtensions,
+          record.internalStatus, record.priority, JSON.stringify(record.assignedEmployeeIds), JSON.stringify(record.assignedEmployeeNames),
+          record.lastUpdateText, record.lastUpdatedById, record.lastUpdatedByName, record.lastUpdatedAt,
+          record.hasProblem, record.createdAt, record.updatedAt, JSON.stringify(record.statusHistory), ''
+        ]
+      );
+
+      const cust = await upsertCustomerInTx(tx, {
+        name: customerName,
+        phone: customerPhone,
+        email: record.customerEmail,
+        idNumber: record.customerIdNumber,
+        companyName: record.companyName
+      }, nowIso);
+
+      if (cust) {
+        await enqueueSyncOperation(tx, {
+          entityType: 'Customer',
+          entityId: cust.id,
+          recordId: cust.id,
+          operation: 'INSERT',
+          action: 'upsertCustomer',
+          payload: cust
+        });
+      }
+
+      await enqueueSyncOperation(tx, {
+        entityType: 'Reservation',
+        entityId: record.id,
+        recordId: record.reservationNumber,
+        operation: 'INSERT',
+        action: 'upsertReservation',
+        payload: record,
+        idempotencyKey: payload.idempotencyKey ? `MIR_RES:${payload.idempotencyKey}` : undefined
+      });
+      await logActivity(tx, session.user, 'إنشاء حجز', 'Reservation', record.reservationNumber, `حجز جديد للعميل ${record.customerName}`);
+      return { reservation: record, customer: cust };
+    });
+
+    await emitRealtimeEvent(executor, {
+      eventType: 'reservation:created',
+      entityType: 'Reservation',
+      recordId: created.reservation.id,
+      operation: 'INSERT',
+      payload: { reservation: created.reservation, customer: created.customer },
+      actorId: session.user.id,
+      actorName: session.user.name
+    }).catch(() => undefined);
+    void triggerImmediateSync(executor).catch(() => undefined);
+    return { reservation: created.reservation, customer: created.customer };
+  });
+}
+
+export async function deleteReservation(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'edit_reservation_details');
+  const resId = str(payload.reservationId || payload.id);
+  const resNumber = str(payload.reservationNumber);
+  if (!resId && !resNumber) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  return runIdempotentMutation(executor, 'deleteReservation', payload, async () => {
+    const deleted = await executor.withTransaction(async (tx) => {
+      const sel = await tx.query(
+        `SELECT * FROM reservations WHERE ($1 <> '' AND id = $1) OR ($2 <> '' AND reservation_number = $2) LIMIT 1 FOR UPDATE`,
+        [resId, resNumber]
+      );
+      if (!sel.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+      const resObj = mapReservationRowToClient(sel.rows[0], false);
+      const nowIso = new Date().toISOString();
+
+      await tx.query(`DELETE FROM reservations WHERE id = $1`, [resObj.id]);
+      await enqueueSyncOperation(tx, {
+        entityType: 'Reservation',
+        entityId: resObj.id,
+        recordId: resObj.reservationNumber || resObj.id,
+        operation: 'DELETE',
+        action: 'deleteReservation',
+        payload: { id: resObj.id, reservationNumber: resObj.reservationNumber, deletedAt: nowIso },
+        idempotencyKey: payload.idempotencyKey ? `MIR_DEL:${payload.idempotencyKey}` : undefined
+      });
+      await logActivity(tx, session.user, 'حذف حجز', 'Reservation', resObj.reservationNumber, `حذف الحجز للعميل ${resObj.customerName}`);
+      return resObj;
+    });
+
+    await emitRealtimeEvent(executor, {
+      eventType: 'reservation:deleted',
+      entityType: 'Reservation',
+      recordId: deleted.id,
+      operation: 'DELETE',
+      payload: { id: deleted.id, reservationNumber: deleted.reservationNumber },
+      actorId: session.user.id,
+      actorName: session.user.name
+    }).catch(() => undefined);
+    void triggerImmediateSync(executor).catch(() => undefined);
+    return { deleted: true, id: deleted.id, reservationNumber: deleted.reservationNumber };
+  });
+}
+
+export async function getRealtimeDelta(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+  const sinceSeq = Math.max(0, num(payload.sinceSeq ?? payload.since, 0));
+  const limit = Math.min(200, Math.max(10, num(payload.limit, 100)));
+  const delta = await fetchRealtimeEventsSince(executor, sinceSeq, limit);
+  return {
+    ...delta,
+    serverTime: new Date().toISOString()
+  };
+}
+
+export async function getSyncQueueStatusAction(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+  const limit = Math.min(200, Math.max(10, num(payload.limit, 60)));
+  return getSyncQueueSummary(executor, limit);
+}
+
+export async function processSyncQueueAction(executor: DbExecutor, session: AuthSession) {
+  requireApiAccess(session);
+  const flush = await triggerImmediateSync(executor);
+  const summary = await getSyncQueueSummary(executor, 60);
+  return { flush, ...summary };
+}
+
+export async function retryFailedSyncItemsAction(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requireApiAccess(session);
+  const ids = Array.isArray(payload.ids) ? payload.ids.map((x: any) => str(x)).filter(Boolean) : undefined;
+  const result = await retryFailedSyncItems(executor, ids);
+  const summary = await getSyncQueueSummary(executor, 60);
+  await logActivity(executor, session.user, 'إعادة محاولة المزامنة', 'SyncQueue', 'RETRY', `إعادة جدولة ${result.resetCount} عملية`);
+  return { ...result, ...summary };
+}
+
+export async function runBackupDeltaSyncAction(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requireApiAccess(session);
+  const res = await runBackupDeltaSync(executor, session.user, {
+    pullRentalGate: payload.pullRentalGate !== false
+  });
+  const summary = await getSyncQueueSummary(executor, 60);
+  return { ...res, queue: summary };
 }

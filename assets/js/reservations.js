@@ -106,6 +106,8 @@
     var facets = payload.facets || { companies: [], branches: [] };
 
     var canPullReservations = Boolean(currentUser && root.RGCrmCore.canUserPerform(currentUser, 'pull_reservations'));
+    var canCreateReservations = Boolean(currentUser && root.RGCrmCore.canUserPerform(currentUser, 'add_followup'));
+    var canDeleteRecords = Boolean(currentUser && root.RGCrmCore.canUserPerform(currentUser, 'edit_reservation_details'));
     var isGeneralManager = Boolean(currentUser && currentUser.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var pullPresetState = state.pullPreset || 'all';
@@ -117,7 +119,9 @@
             '<h2 class="section-title">' + t('nav_reservations') + '</h2>' +
             '<p class="section-subtitle">إجمالي النتائج المطابقة: <strong class="tabular-nums" id="res-total-count">' + payload.total + '</strong> · يمكنك استلام أي حجز وتحديث حالته مباشرة أو فتح التفاصيل</p>' +
           '</div>' +
-          '<div class="toolbar-row" style="margin-bottom:0;">' +
+          '<div class="toolbar-row" style="margin-bottom:0;flex-wrap:wrap;">' +
+            (canCreateReservations ? '<button type="button" class="btn btn-primary" id="res-new-btn">' + t('new_reservation') + '</button>' : '') +
+            (canCreateReservations ? '<button type="button" class="btn" id="res-customers-btn">' + t('manage_customers') + '</button>' : '') +
             (canPullReservations ? '<button type="button" class="btn btn-charcoal" id="res-pull-btn" title="جلب أحدث الحجوزات والتمديدات">' + t('pull_reservations') + '</button>' : '') +
             '<button type="button" class="btn" id="res-cols-btn">' + t('toggle_columns') + '</button>' +
             '<button type="button" class="btn btn-primary" id="res-export-xlsx">' + t('export_excel') + '</button>' +
@@ -618,6 +622,29 @@
         exportBtn.disabled = false;
       }
     });
+
+    var newResBtn = document.getElementById('res-new-btn');
+    if (newResBtn) {
+      newResBtn.addEventListener('click', function () {
+        openCreateReservationModal(ctx, employees, function (createdRes) {
+          if (createdRes) {
+            currentItems = [createdRes].concat(currentItems);
+            var totalEl = container.querySelector('#res-total-count');
+            var nextTot = Number((totalEl && totalEl.textContent) || 0) + 1;
+            if (totalEl) totalEl.textContent = String(nextTot);
+            paintCurrentItems();
+          }
+          refreshTableRegion();
+        });
+      });
+    }
+
+    var customersBtn = document.getElementById('res-customers-btn');
+    if (customersBtn) {
+      customersBtn.addEventListener('click', function () {
+        openCustomersModal(ctx, canDeleteRecords);
+      });
+    }
   }
 
   async function openReservationDrawer(reservationId, ctx, employees, onUpdated, opts) {
@@ -1107,7 +1134,10 @@
       var editResBtn = document.getElementById('drawer-edit-res-btn');
       if (editResBtn) {
         editResBtn.addEventListener('click', function () {
-          openEditReservationModal(r, ctx, reopenSelf, reopenSelf);
+          openEditReservationModal(r, ctx, reopenSelf, reopenSelf, function () {
+            modalRoot.innerHTML = '';
+            notifyParentUpdated();
+          });
         });
       }
 
@@ -1329,7 +1359,7 @@
     }
   }
 
-  function openEditReservationModal(reservation, ctx, onSaved, onCancel) {
+  function openEditReservationModal(reservation, ctx, onSaved, onCancel, onDeleted) {
     var modalRoot = document.getElementById('modal-root');
     modalRoot.innerHTML =
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="res-edit-title">' +
@@ -1383,7 +1413,15 @@
           '</div>' +
           '<div class="form-group"><label class="form-label" for="re-last">آخر تحديث / ملخص</label><input class="input" id="re-last" value="' + esc(reservation.lastUpdateText || '') + '"></div>' +
           '<div id="res-edit-err" class="form-error hidden"></div>' +
-          '<div class="modal-footer">' +
+          '<div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">' +
+            '<div id="res-edit-delete-area" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+              '<button type="button" class="btn btn-danger" id="res-edit-delete-btn">حذف الحجز</button>' +
+              '<span id="res-edit-delete-confirm-wrap" class="hidden" style="display:none;align-items:center;gap:6px;">' +
+                '<span style="font-size:12px;color:var(--status-danger-text);font-weight:700;">تأكيد حذف الحجز نهائياً؟</span>' +
+                '<button type="button" class="btn btn-sm btn-danger" id="res-edit-delete-confirm">نعم، احذف الحجز</button>' +
+                '<button type="button" class="btn btn-sm" id="res-edit-delete-abort">تراجع</button>' +
+              '</span>' +
+            '</div>' +
             '<button type="submit" class="btn btn-primary" id="res-edit-save">حفظ تعديلات الحجز</button>' +
           '</div>' +
         '</form>' +
@@ -1403,52 +1441,415 @@
       else modalRoot.innerHTML = '';
     });
 
+    var delStartBtn = document.getElementById('res-edit-delete-btn');
+    var delConfirmWrap = document.getElementById('res-edit-delete-confirm-wrap');
+    var delConfirmBtn = document.getElementById('res-edit-delete-confirm');
+    var delAbortBtn = document.getElementById('res-edit-delete-abort');
+    if (delStartBtn && delConfirmWrap && delConfirmBtn && delAbortBtn) {
+      delStartBtn.addEventListener('click', function () {
+        delStartBtn.style.display = 'none';
+        delConfirmWrap.classList.remove('hidden');
+        delConfirmWrap.style.display = 'inline-flex';
+      });
+      delAbortBtn.addEventListener('click', function () {
+        delConfirmWrap.classList.add('hidden');
+        delConfirmWrap.style.display = 'none';
+        delStartBtn.style.display = '';
+      });
+      delConfirmBtn.addEventListener('click', function () {
+        runWithLock(delConfirmBtn, 'deleteReservation:' + reservation.id, async function () {
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('deleteReservation', { reservationId: reservation.id });
+          }
+          var delRes = await root.RGApi.callApi('deleteReservation', {
+            reservationId: reservation.id,
+            _keepOptimisticCache: true
+          });
+          if (!delRes || !delRes.success) {
+            var e = document.getElementById('res-edit-err');
+            if (e) {
+              e.textContent = (delRes && delRes.message) || 'تعذر حذف الحجز.';
+              e.classList.remove('hidden');
+            }
+            return;
+          }
+          ctx.toast('تم حذف الحجز ' + reservation.reservationNumber + ' بنجاح.');
+          ctx.refreshNotifications();
+          modalRoot.innerHTML = '';
+          if (onDeleted) onDeleted();
+        });
+      });
+    }
+
     document.getElementById('res-edit-form').addEventListener('submit', async function (ev) {
       ev.preventDefault();
-      var baseDaysVal = Math.max(1, Number(document.getElementById('re-days').value || 1));
-      var extDaysVal = Math.max(0, Number(document.getElementById('re-ext-days').value || 0));
-      var res = await root.RGApi.callApi('updateReservationDetails', {
-        reservationId: reservation.id,
-        customerName: document.getElementById('re-customer').value,
-        customerPhone: document.getElementById('re-phone').value,
-        customerEmail: document.getElementById('re-email').value,
-        customerIdNumber: document.getElementById('re-idnum').value,
-        companyName: document.getElementById('re-company').value,
-        branchName: document.getElementById('re-branch').value,
-        deliverBranchName: document.getElementById('re-deliv-branch').value,
-        carName: document.getElementById('re-car').value,
-        carCategory: document.getElementById('re-car-cat').value,
-        plateNumber: document.getElementById('re-plate').value,
-        startDate: document.getElementById('re-start').value,
-        startTime: document.getElementById('re-start-time').value,
-        endDate: document.getElementById('re-end').value,
-        extendedUntilDate: document.getElementById('re-ext-until').value,
-        pickupTypeAr: document.getElementById('re-pickup').value,
-        returnTypeAr: document.getElementById('re-return').value,
-        paymentMethod: document.getElementById('re-pay-method').value,
-        paymentStatus: document.getElementById('re-pay-status').value,
-        internalStatus: document.getElementById('re-status').value,
-        priority: document.getElementById('re-prio').value,
-        daysCount: baseDaysVal,
-        extendedDaysCount: extDaysVal,
-        totalDaysCount: baseDaysVal + extDaysVal,
-        extensionsCount: Math.max(0, Number(document.getElementById('re-ext-count').value || 0)),
-        baseAmount: Number(baseEl.value || 0),
-        extensionsAmount: Number(extEl.value || 0),
-        totalAmount: Number(totalEl.value || 0),
-        lastUpdateText: document.getElementById('re-last').value
+      var saveBtn = document.getElementById('res-edit-save');
+      runWithLock(saveBtn, 'updateReservationDetails:' + reservation.id, async function () {
+        var baseDaysVal = Math.max(1, Number(document.getElementById('re-days').value || 1));
+        var extDaysVal = Math.max(0, Number(document.getElementById('re-ext-days').value || 0));
+        var res = await root.RGApi.callApi('updateReservationDetails', {
+          reservationId: reservation.id,
+          customerName: document.getElementById('re-customer').value,
+          customerPhone: document.getElementById('re-phone').value,
+          customerEmail: document.getElementById('re-email').value,
+          customerIdNumber: document.getElementById('re-idnum').value,
+          companyName: document.getElementById('re-company').value,
+          branchName: document.getElementById('re-branch').value,
+          deliverBranchName: document.getElementById('re-deliv-branch').value,
+          carName: document.getElementById('re-car').value,
+          carCategory: document.getElementById('re-car-cat').value,
+          plateNumber: document.getElementById('re-plate').value,
+          startDate: document.getElementById('re-start').value,
+          startTime: document.getElementById('re-start-time').value,
+          endDate: document.getElementById('re-end').value,
+          extendedUntilDate: document.getElementById('re-ext-until').value,
+          pickupTypeAr: document.getElementById('re-pickup').value,
+          returnTypeAr: document.getElementById('re-return').value,
+          paymentMethod: document.getElementById('re-pay-method').value,
+          paymentStatus: document.getElementById('re-pay-status').value,
+          internalStatus: document.getElementById('re-status').value,
+          priority: document.getElementById('re-prio').value,
+          daysCount: baseDaysVal,
+          extendedDaysCount: extDaysVal,
+          totalDaysCount: baseDaysVal + extDaysVal,
+          extensionsCount: Math.max(0, Number(document.getElementById('re-ext-count').value || 0)),
+          baseAmount: Number(baseEl.value || 0),
+          extensionsAmount: Number(extEl.value || 0),
+          totalAmount: Number(totalEl.value || 0),
+          lastUpdateText: document.getElementById('re-last').value
+        });
+        if (!res.success) {
+          var e = document.getElementById('res-edit-err');
+          e.textContent = res.message;
+          e.classList.remove('hidden');
+          return;
+        }
+        ctx.toast('تم حفظ تعديلات تفاصيل الحجز بنجاح.');
+        ctx.refreshNotifications();
+        if (onSaved) onSaved();
+        else modalRoot.innerHTML = '';
       });
-      if (!res.success) {
-        var e = document.getElementById('res-edit-err');
-        e.textContent = res.message;
-        e.classList.remove('hidden');
+    });
+  }
+
+  async function openCreateReservationModal(ctx, employees, onCreated) {
+    var modalRoot = document.getElementById('modal-root');
+    var todayStr = new Date().toISOString().substring(0, 10);
+    var custList = [];
+    try {
+      var custResp = await root.RGApi.callApi('getCustomers', { limit: 150 });
+      if (custResp && custResp.success && custResp.data && Array.isArray(custResp.data.items)) {
+        custList = custResp.data.items;
+      }
+    } catch (e) {}
+
+    var statusOpts = (root.RGCrmCore.WORKFLOW_STATUS_OPTIONS || root.RGCrmCore.FOLLOWUP_STATUSES || ['تم الإنشاء', 'قيد الانتظار', 'مؤكد', 'تم الحجز']);
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="res-create-title">' +
+        '<form class="modal-panel" id="res-create-form">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h3 class="modal-title" id="res-create-title">إنشاء حجز جديد (مزامنة فورية)</h3>' +
+              '<div class="meta-inline"><span>يُحفظ الحجز والعميل فوراً في قاعدة البيانات ويُزامن مع Google Sheets مباشرة</span></div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="res-create-cancel">إغلاق</button>' +
+          '</div>' +
+          (custList.length > 0 ? (
+            '<div class="form-group" style="margin-bottom:10px;">' +
+              '<label class="form-label" for="rc-existing-cust">اختيار عميل مسجل (اختياري)</label>' +
+              '<select class="select" id="rc-existing-cust">' +
+                '<option value="">— عميل جديد أو إدخال يدوي —</option>' +
+                custList.map(function (c) {
+                  return '<option value="' + esc(c.id) + '">' + esc(c.name) + (c.phone ? ' (' + esc(c.phone) + ')' : '') + '</option>';
+                }).join('') +
+              '</select>' +
+            '</div>'
+          ) : '') +
+          '<div class="form-grid-2">' +
+            '<div class="form-group"><label class="form-label" for="rc-customer">اسم العميل *</label><input class="input" id="rc-customer" required placeholder="مثال: خالد العتيبي"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-phone">رقم الجوال</label><input class="input mono" id="rc-phone" placeholder="0501234567"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-email">البريد الإلكتروني</label><input class="input mono" id="rc-email" placeholder="client@example.sa"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-resnum">رقم الحجز (اختياري — يتولد تلقائياً)</label><input class="input mono" id="rc-resnum" placeholder="RG-M-..."></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-company">الشركة</label><input class="input" id="rc-company" placeholder="ذيب / بدجت / يلو"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-branch">الفرع</label><input class="input" id="rc-branch" placeholder="مطار الملك خالد - الرياض"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-car">السيارة</label><input class="input" id="rc-car" placeholder="تويوتا كامري 2026"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-plate">رقم اللوحة</label><input class="input" id="rc-plate" placeholder="أ ب ج 1234"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-start">تاريخ البداية</label><input type="date" class="input" id="rc-start" value="' + esc(todayStr) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-end">تاريخ النهاية</label><input type="date" class="input" id="rc-end" value="' + esc(todayStr) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-days">عدد الأيام</label><input type="number" min="1" class="input mono" id="rc-days" value="1"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-amount">الإجمالي (ر.س)</label><input type="number" min="0" step="0.01" class="input mono" id="rc-amount" value="0"></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-status">حالة الحجز</label>' +
+              '<select class="select" id="rc-status">' +
+                statusOpts.map(function (s) {
+                  return '<option value="' + esc(s) + '"' + (s === 'تم الحجز' ? ' selected' : '') + '>' + esc(s) + '</option>';
+                }).join('') +
+              '</select></div>' +
+            '<div class="form-group"><label class="form-label" for="rc-prio">الأولوية</label>' +
+              '<select class="select" id="rc-prio">' +
+                root.RGCrmCore.PROBLEM_PRIORITIES.map(function (p) {
+                  return '<option value="' + esc(p) + '">' + esc(p) + '</option>';
+                }).join('') +
+              '</select></div>' +
+          '</div>' +
+          '<div id="res-create-err" class="form-error hidden"></div>' +
+          '<div class="modal-footer">' +
+            '<button type="submit" class="btn btn-primary" id="res-create-save">حفظ وإنشاء الحجز</button>' +
+          '</div>' +
+        '</form>' +
+      '</div>';
+
+    document.getElementById('res-create-cancel').addEventListener('click', function () {
+      modalRoot.innerHTML = '';
+    });
+
+    var existingSel = document.getElementById('rc-existing-cust');
+    if (existingSel) {
+      existingSel.addEventListener('change', function () {
+        var cid = existingSel.value;
+        var found = custList.find(function (c) { return c.id === cid; });
+        if (found) {
+          document.getElementById('rc-customer').value = found.name || '';
+          document.getElementById('rc-phone').value = found.phone || '';
+          document.getElementById('rc-email').value = found.email || '';
+          if (found.companyName) document.getElementById('rc-company').value = found.companyName;
+        }
+      });
+    }
+
+    document.getElementById('res-create-form').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var errEl = document.getElementById('res-create-err');
+      errEl.classList.add('hidden');
+      var cname = String(document.getElementById('rc-customer').value || '').trim();
+      if (!cname) {
+        errEl.textContent = 'اسم العميل مطلوب لإنشاء الحجز.';
+        errEl.classList.remove('hidden');
         return;
       }
-      ctx.toast('تم حفظ تعديلات تفاصيل الحجز بنجاح.');
-      ctx.refreshNotifications();
-      if (onSaved) onSaved();
-      else modalRoot.innerHTML = '';
+      var saveBtn = document.getElementById('res-create-save');
+      runWithLock(saveBtn, 'createReservation', async function () {
+        var res = await root.RGApi.callApi('createReservation', {
+          customerName: cname,
+          customerPhone: document.getElementById('rc-phone').value.trim(),
+          customerEmail: document.getElementById('rc-email').value.trim(),
+          reservationNumber: document.getElementById('rc-resnum').value.trim(),
+          companyName: document.getElementById('rc-company').value.trim(),
+          branchName: document.getElementById('rc-branch').value.trim(),
+          carName: document.getElementById('rc-car').value.trim(),
+          plateNumber: document.getElementById('rc-plate').value.trim(),
+          startDate: document.getElementById('rc-start').value,
+          endDate: document.getElementById('rc-end').value,
+          daysCount: Math.max(1, Number(document.getElementById('rc-days').value || 1)),
+          totalAmount: Number(document.getElementById('rc-amount').value || 0),
+          internalStatus: document.getElementById('rc-status').value,
+          priority: document.getElementById('rc-prio').value
+        });
+        if (!res || !res.success) {
+          errEl.textContent = (res && res.message) || 'تعذر إنشاء الحجز.';
+          errEl.classList.remove('hidden');
+          return;
+        }
+        modalRoot.innerHTML = '';
+        ctx.toast('تم إنشاء الحجز بنجاح وإرساله للمزامنة الفورية.');
+        ctx.refreshNotifications();
+        if (onCreated) onCreated(res.data && res.data.reservation ? res.data.reservation : null);
+      });
     });
+  }
+
+  async function openCustomersModal(ctx, canDeleteCustomer) {
+    var modalRoot = document.getElementById('modal-root');
+    var searchVal = '';
+    var customers = [];
+    var editingCustomer = null;
+    var pendingDeleteId = '';
+
+    async function loadAndPaint() {
+      var resp = await root.RGApi.callApi('getCustomers', { search: searchVal, limit: 200 });
+      customers = (resp && resp.success && resp.data && Array.isArray(resp.data.items)) ? resp.data.items : [];
+      paint();
+    }
+
+    function paint() {
+      var showForm = Boolean(editingCustomer);
+      modalRoot.innerHTML =
+        '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="cust-modal-title">' +
+          '<div class="modal-panel" style="max-width:860px;width:96%;">' +
+            '<div class="modal-header">' +
+              '<div>' +
+                '<h3 class="modal-title" id="cust-modal-title">إدارة العملاء (<span class="tabular-nums">' + customers.length + '</span>)</h3>' +
+                '<div class="meta-inline"><span>قاعدة عملاء Neon + مزامنة فورية مع تبويب Customers في Google Sheets</span></div>' +
+              '</div>' +
+              '<div class="toolbar-row" style="margin-bottom:0;">' +
+                '<button type="button" class="btn btn-sm btn-primary" id="cust-add-open-btn">+ عميل جديد</button>' +
+                '<button type="button" class="btn btn-sm" id="cust-modal-close">إغلاق</button>' +
+              '</div>' +
+            '</div>' +
+            (showForm ? (
+              '<form class="surface-card" id="cust-upsert-form" style="padding:14px;margin-bottom:14px;border-inline-start:3px solid var(--brand-primary);">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+                  '<strong>' + (editingCustomer.id ? ('تعديل بيانات العميل: ' + esc(editingCustomer.name)) : 'إضافة عميل جديد') + '</strong>' +
+                  '<button type="button" class="btn btn-sm" id="cust-form-cancel">إلغاء</button>' +
+                '</div>' +
+                '<div class="form-grid-2">' +
+                  '<div class="form-group"><label class="form-label" for="cf-name">الاسم *</label><input class="input" id="cf-name" value="' + esc(editingCustomer.name || '') + '" required></div>' +
+                  '<div class="form-group"><label class="form-label" for="cf-phone">الجوال</label><input class="input mono" id="cf-phone" value="' + esc(editingCustomer.phone || '') + '"></div>' +
+                  '<div class="form-group"><label class="form-label" for="cf-email">البريد الإلكتروني</label><input class="input mono" id="cf-email" value="' + esc(editingCustomer.email || '') + '"></div>' +
+                  '<div class="form-group"><label class="form-label" for="cf-idnum">رقم الهوية</label><input class="input mono" id="cf-idnum" value="' + esc(editingCustomer.idNumber || '') + '"></div>' +
+                  '<div class="form-group"><label class="form-label" for="cf-company">الشركة المفضلة</label><input class="input" id="cf-company" value="' + esc(editingCustomer.companyName || '') + '"></div>' +
+                  '<div class="form-group"><label class="form-label" for="cf-notes">ملاحظات</label><input class="input" id="cf-notes" value="' + esc(editingCustomer.notes || '') + '"></div>' +
+                '</div>' +
+                '<div id="cust-form-err" class="form-error hidden" style="margin-top:8px;"></div>' +
+                '<div style="margin-top:10px;"><button type="submit" class="btn btn-primary" id="cust-form-save">' + (editingCustomer.id ? 'حفظ تعديل العميل' : 'إضافة العميل') + '</button></div>' +
+              '</form>'
+            ) : '') +
+            '<div style="display:flex;gap:8px;margin-bottom:12px;">' +
+              '<input type="search" class="input" id="cust-search-input" placeholder="بحث باسم العميل، الجوال، الهوية..." value="' + esc(searchVal) + '">' +
+              '<button type="button" class="btn btn-charcoal" id="cust-search-btn">بحث</button>' +
+            '</div>' +
+            (customers.length === 0
+              ? '<div class="empty-state" style="padding:24px;">لا يوجد عملاء مطابقون للبحث.</div>'
+              : '<div class="table-wrap" style="max-height:420px;overflow:auto;"><table class="data-table"><thead><tr>' +
+                  '<th>الاسم</th><th>الجوال</th><th>البريد</th><th>الشركة</th><th>الحجوزات</th><th>إجراءات</th>' +
+                '</tr></thead><tbody>' +
+                  customers.map(function (c) {
+                    var isPendingDel = pendingDeleteId === c.id;
+                    return '<tr>' +
+                      '<td><strong>' + esc(c.name) + '</strong>' + (c.notes ? '<div class="time-sub">' + esc(c.notes) + '</div>' : '') + '</td>' +
+                      '<td class="mono">' + esc(c.phone || '-') + '</td>' +
+                      '<td class="mono">' + esc(c.email || '-') + '</td>' +
+                      '<td>' + esc(c.companyName || '-') + '</td>' +
+                      '<td class="tabular-nums">' + Number(c.totalBookings || 0) + '</td>' +
+                      '<td><div style="display:flex;gap:6px;flex-wrap:nowrap;">' +
+                        '<button type="button" class="btn btn-sm cust-edit-btn" data-cid="' + esc(c.id) + '">تعديل</button>' +
+                        (canDeleteCustomer ? (
+                          isPendingDel
+                            ? '<button type="button" class="btn btn-sm btn-danger cust-del-confirm-btn" data-cid="' + esc(c.id) + '">تأكيد الحذف</button>' +
+                              '<button type="button" class="btn btn-sm cust-del-abort-btn">إلغاء</button>'
+                            : '<button type="button" class="btn btn-sm btn-danger cust-del-start-btn" data-cid="' + esc(c.id) + '">حذف</button>'
+                        ) : '') +
+                      '</div></td>' +
+                    '</tr>';
+                  }).join('') +
+                '</tbody></table></div>') +
+          '</div>' +
+        '</div>';
+
+      document.getElementById('cust-modal-close').addEventListener('click', function () {
+        modalRoot.innerHTML = '';
+      });
+      document.getElementById('cust-add-open-btn').addEventListener('click', function () {
+        editingCustomer = { id: '', name: '', phone: '', email: '', idNumber: '', companyName: '', notes: '' };
+        pendingDeleteId = '';
+        paint();
+      });
+      document.getElementById('cust-search-btn').addEventListener('click', function () {
+        searchVal = document.getElementById('cust-search-input').value.trim();
+        loadAndPaint();
+      });
+      document.getElementById('cust-search-input').addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          searchVal = ev.target.value.trim();
+          loadAndPaint();
+        }
+      });
+
+      var formCancel = document.getElementById('cust-form-cancel');
+      if (formCancel) {
+        formCancel.addEventListener('click', function () {
+          editingCustomer = null;
+          paint();
+        });
+      }
+
+      var upsertForm = document.getElementById('cust-upsert-form');
+      if (upsertForm) {
+        upsertForm.addEventListener('submit', function (ev) {
+          ev.preventDefault();
+          var errEl = document.getElementById('cust-form-err');
+          errEl.classList.add('hidden');
+          var cname = document.getElementById('cf-name').value.trim();
+          var cphone = document.getElementById('cf-phone').value.trim();
+          if (!cname && !cphone) {
+            errEl.textContent = 'اسم العميل أو رقم الجوال مطلوب.';
+            errEl.classList.remove('hidden');
+            return;
+          }
+          var saveBtn = document.getElementById('cust-form-save');
+          var isEdit = Boolean(editingCustomer && editingCustomer.id);
+          var actionName = isEdit ? 'updateCustomer' : 'createCustomer';
+          runWithLock(saveBtn, actionName + ':' + (editingCustomer.id || 'new'), async function () {
+            var payload = {
+              name: cname,
+              phone: cphone,
+              email: document.getElementById('cf-email').value.trim(),
+              idNumber: document.getElementById('cf-idnum').value.trim(),
+              companyName: document.getElementById('cf-company').value.trim(),
+              notes: document.getElementById('cf-notes').value.trim()
+            };
+            if (isEdit) payload.customerId = editingCustomer.id;
+            var resp = await root.RGApi.callApi(actionName, payload);
+            if (!resp || !resp.success) {
+              errEl.textContent = (resp && resp.message) || 'تعذر حفظ بيانات العميل.';
+              errEl.classList.remove('hidden');
+              return;
+            }
+            editingCustomer = null;
+            ctx.toast(isEdit ? 'تم تحديث بيانات العميل بنجاح.' : 'تمت إضافة العميل ومزامنته بنجاح.');
+            await loadAndPaint();
+          });
+        });
+      }
+
+      modalRoot.querySelectorAll('.cust-edit-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var cid = btn.getAttribute('data-cid');
+          var found = customers.find(function (c) { return c.id === cid; });
+          if (found) {
+            editingCustomer = Object.assign({}, found);
+            pendingDeleteId = '';
+            paint();
+          }
+        });
+      });
+
+      modalRoot.querySelectorAll('.cust-del-start-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          pendingDeleteId = btn.getAttribute('data-cid') || '';
+          paint();
+        });
+      });
+
+      modalRoot.querySelectorAll('.cust-del-abort-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          pendingDeleteId = '';
+          paint();
+        });
+      });
+
+      modalRoot.querySelectorAll('.cust-del-confirm-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var cid = btn.getAttribute('data-cid');
+          runWithLock(btn, 'deleteCustomer:' + cid, async function () {
+            var resp = await root.RGApi.callApi('deleteCustomer', { customerId: cid });
+            if (!resp || !resp.success) {
+              ctx.toast((resp && resp.message) || 'تعذر حذف العميل.', true);
+              return;
+            }
+            pendingDeleteId = '';
+            ctx.toast('تم حذف العميل بنجاح.');
+            await loadAndPaint();
+          });
+        });
+      });
+    }
+
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" role="dialog" aria-modal="true">' +
+        '<div class="modal-panel"><div class="empty-state" style="padding:24px;">جاري تحميل سجل العملاء...</div></div>' +
+      '</div>';
+    await loadAndPaint();
   }
 
   function openEditFollowUpModal(followUp, reservation, ctx, onSaved, onCancel) {

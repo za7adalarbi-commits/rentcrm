@@ -14,6 +14,9 @@ var RG_SHEETS_SCHEMA = {
     'id', 'name', 'username', 'passwordHash', 'salt', 'phone', 'email',
     'jobTitle', 'role', 'permissions', 'status', 'lastActivity', 'createdAt', 'updatedAt'
   ],
+  Customers: [
+    'id', 'name', 'phone', 'email', 'idNumber', 'companyName', 'notes', 'status', 'createdAt', 'updatedAt'
+  ],
   Reservations: [
     'id', 'sourceReservationId', 'reservationNumber', 'sourceCreatedAt',
     'customerName', 'customerPhone', 'customerEmail', 'customerIdNumber',
@@ -120,6 +123,7 @@ var RG_TIME_ONLY_FIELDS = {
 };
 var RG_HOT_PERSIST_CACHE_SHEETS = {
   Employees: true,
+  Customers: true,
   Settings: true,
   Problems: true,
   Notifications: true,

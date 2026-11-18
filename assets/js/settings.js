@@ -4,6 +4,43 @@
 (function (root) {
   'use strict';
 
+  function esc(val) {
+    return String(val === null || val === undefined ? '' : val)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function queueStatusBadge(status) {
+    if (status === 'synced') return '<span class="status-tag status-success">متزامن</span>';
+    if (status === 'processing') return '<span class="status-tag status-info">جاري المعالجة</span>';
+    if (status === 'failed') return '<span class="status-tag status-danger">فشل</span>';
+    return '<span class="status-tag status-warning">قيد الانتظار</span>';
+  }
+
+  function buildQueueTableHtml(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return '<div class="empty-state" style="padding:18px;">لا توجد عمليات مسجلة في طابور المزامنة الفورية بعد.</div>';
+    }
+    return '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+      '<th>الكيان</th><th>المعرف</th><th>العملية</th><th>الحالة</th><th>المحاولات</th><th>آخر خطأ</th><th>التوقيت</th>' +
+      '</tr></thead><tbody>' +
+      items.map(function (it) {
+        var ts = it.syncedAt || it.updatedAt || it.createdAt || '';
+        return '<tr>' +
+          '<td>' + esc(it.entityType) + '</td>' +
+          '<td class="mono">' + esc(it.recordId || it.entityId) + '</td>' +
+          '<td><span class="status-tag status-neutral mono">' + esc(it.operation || it.action) + '</span></td>' +
+          '<td>' + queueStatusBadge(it.status) + '</td>' +
+          '<td class="mono tabular-nums">' + Number(it.retryCount || 0) + ' / ' + Number(it.maxRetries || 8) + '</td>' +
+          '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(it.lastError || '') + '">' + esc(it.lastError || '-') + '</td>' +
+          '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(String(ts).replace('T', ' ').substring(0, 19)) + '</td>' +
+          '</tr>';
+      }).join('') +
+      '</tbody></table></div>';
+  }
+
   function runWithLock(btnEl, lockKey, fn) {
     if (root.RGApp && root.RGApp.withActionLock) {
       return root.RGApp.withActionLock(btnEl, lockKey, fn);
@@ -54,8 +91,35 @@
     var isGeneralManager = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var cacheStats = (root.RGApi && root.RGApi.getLocalCacheStats) ? root.RGApi.getLocalCacheStats() : { reservationsCount: 0, customersCount: 0, detailsCount: 0 };
+    var queueSummary = syncData.queue || { counts: { pending: 0, processing: 0, synced: 0, failed: 0, total: 0 }, items: [], gasConfigured: false };
+    var qCounts = queueSummary.counts || { pending: 0, processing: 0, synced: 0, failed: 0, total: 0 };
+    var rtStatus = (root.RGApi && root.RGApi.getRealtimeStatus) ? root.RGApi.getRealtimeStatus() : { connected: false, mode: 'idle' };
 
     container.innerHTML =
+      (canSync ? (
+        '<div class="surface-card" id="sync-queue-monitor-card">' +
+          '<div class="section-header">' +
+            '<div>' +
+              '<h2 class="section-title">طابور المزامنة الفورية — Neon ↔ Google Sheets</h2>' +
+              '<p class="section-subtitle">النمط: Transactional Outbox + بث فوري (SSE: <strong>' + (rtStatus.connected ? 'متصل' : esc(rtStatus.mode || 'احتياطي')) + '</strong>) + مزامنة دلتا احتياطية كل دقيقة</p>' +
+            '</div>' +
+            '<div class="toolbar-row" style="margin-bottom:0;flex-wrap:wrap;">' +
+              '<button type="button" class="btn btn-primary" id="btn-flush-queue">معالجة الطابور الآن</button>' +
+              '<button type="button" class="btn btn-charcoal" id="btn-retry-queue">إعادة محاولة الفاشلة</button>' +
+              '<button type="button" class="btn" id="btn-delta-backup">تشغيل المزامنة الاحتياطية (Delta)</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="kpi-grid-4" style="margin-bottom:14px;">' +
+            '<div class="kpi-card"><span class="kpi-label">قيد الانتظار (Pending)</span><span class="kpi-value tabular-nums" id="sq-cnt-pending">' + Number(qCounts.pending || 0) + '</span></div>' +
+            '<div class="kpi-card"><span class="kpi-label">جاري المعالجة (Processing)</span><span class="kpi-value tabular-nums" id="sq-cnt-processing">' + Number(qCounts.processing || 0) + '</span></div>' +
+            '<div class="kpi-card kpi-success"><span class="kpi-label">متزامن (Synced)</span><span class="kpi-value tabular-nums" id="sq-cnt-synced">' + Number(qCounts.synced || 0) + '</span></div>' +
+            '<div class="kpi-card ' + (Number(qCounts.failed || 0) > 0 ? 'kpi-danger' : '') + '"><span class="kpi-label">فشل (Failed)</span><span class="kpi-value tabular-nums" id="sq-cnt-failed">' + Number(qCounts.failed || 0) + '</span></div>' +
+          '</div>' +
+          '<div id="sync-queue-msg" class="hidden" style="margin-bottom:10px;"></div>' +
+          '<div id="sync-queue-table-wrap">' + buildQueueTableHtml(queueSummary.items || []) + '</div>' +
+        '</div>'
+      ) : '') +
+
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div><h2 class="section-title">ربط Google Apps Script Web App (/exec)</h2>' +
@@ -429,6 +493,128 @@
         });
       });
     }
+
+    function applyQueueSummaryToDom(qData) {
+      if (!qData) return;
+      var c = qData.counts || {};
+      var elP = document.getElementById('sq-cnt-pending');
+      var elPr = document.getElementById('sq-cnt-processing');
+      var elS = document.getElementById('sq-cnt-synced');
+      var elF = document.getElementById('sq-cnt-failed');
+      var tblWrap = document.getElementById('sync-queue-table-wrap');
+      if (elP) elP.textContent = String(Number(c.pending || 0));
+      if (elPr) elPr.textContent = String(Number(c.processing || 0));
+      if (elS) elS.textContent = String(Number(c.synced || 0));
+      if (elF) elF.textContent = String(Number(c.failed || 0));
+      if (tblWrap && Array.isArray(qData.items)) {
+        tblWrap.innerHTML = buildQueueTableHtml(qData.items);
+      }
+    }
+
+    var flushQueueBtn = document.getElementById('btn-flush-queue');
+    if (flushQueueBtn) {
+      flushQueueBtn.addEventListener('click', function () {
+        runWithLock(flushQueueBtn, 'processSyncQueue', async function () {
+          var prevTxt = flushQueueBtn.textContent;
+          flushQueueBtn.textContent = 'جاري المعالجة...';
+          try {
+            var res = await root.RGApi.callApi('processSyncQueue', {});
+            var msgEl = document.getElementById('sync-queue-msg');
+            if (res && res.success) {
+              applyQueueSummaryToDom(res.data);
+              var flushed = (res.data && res.data.flush) ? res.data.flush : {};
+              if (msgEl) {
+                msgEl.className = 'form-success';
+                msgEl.textContent = flushed.skipped
+                  ? 'تمت معالجة الوضع المحلي (GAS_WEBAPP_URL أو SYNC_API_SECRET غير مضبوط على الخادم).'
+                  : ('اكتملت المعالجة: ' + Number(flushed.synced || 0) + ' متزامن · ' + Number(flushed.retried || 0) + ' إعادة جدولة · ' + Number(flushed.failed || 0) + ' فشل');
+              }
+              ctx.toast('تمت معالجة طابور المزامنة.');
+            } else if (msgEl) {
+              msgEl.className = 'form-error';
+              msgEl.textContent = (res && res.message) || 'تعذر معالجة الطابور.';
+            }
+          } finally {
+            if (flushQueueBtn.isConnected !== false) flushQueueBtn.textContent = prevTxt;
+          }
+        });
+      });
+    }
+
+    var retryQueueBtn = document.getElementById('btn-retry-queue');
+    if (retryQueueBtn) {
+      retryQueueBtn.addEventListener('click', function () {
+        runWithLock(retryQueueBtn, 'retryFailedSyncItems', async function () {
+          var res = await root.RGApi.callApi('retryFailedSyncItems', {});
+          var msgEl = document.getElementById('sync-queue-msg');
+          if (res && res.success) {
+            applyQueueSummaryToDom(res.data);
+            if (msgEl) {
+              msgEl.className = 'form-success';
+              msgEl.textContent = 'تمت إعادة جدولة العمليات الفاشلة (' + Number((res.data && res.data.resetCount) || 0) + ') ومعالجتها.';
+            }
+            ctx.toast('تمت إعادة جدولة العمليات الفاشلة.');
+          } else if (msgEl) {
+            msgEl.className = 'form-error';
+            msgEl.textContent = (res && res.message) || 'تعذر إعادة المحاولة.';
+          }
+        });
+      });
+    }
+
+    var deltaBackupBtn = document.getElementById('btn-delta-backup');
+    if (deltaBackupBtn) {
+      deltaBackupBtn.addEventListener('click', function () {
+        runWithLock(deltaBackupBtn, 'runBackupDeltaSync', async function () {
+          var prevTxt = deltaBackupBtn.textContent;
+          deltaBackupBtn.textContent = 'جاري فحص الدلتا...';
+          try {
+            var res = await root.RGApi.callApi('runBackupDeltaSync', { pullRentalGate: false });
+            var msgEl = document.getElementById('sync-queue-msg');
+            if (res && res.success) {
+              applyQueueSummaryToDom((res.data && res.data.queue) || res.data);
+              if (msgEl) {
+                msgEl.className = 'form-success';
+                msgEl.textContent = 'اكتملت المزامنة الاحتياطية بنظام الدلتا (التغييرات غير المتزامنة فقط).';
+              }
+              ctx.toast('تمت المزامنة الاحتياطية (Delta) بنجاح.');
+            } else if (msgEl) {
+              msgEl.className = 'form-error';
+              msgEl.textContent = (res && res.message) || 'تعذر تشغيل المزامنة الاحتياطية.';
+            }
+          } finally {
+            if (deltaBackupBtn.isConnected !== false) deltaBackupBtn.textContent = prevTxt;
+          }
+        });
+      });
+    }
+  }
+
+  if (typeof window !== 'undefined' && !root.__rgSettingsRealtimeBound) {
+    root.__rgSettingsRealtimeBound = true;
+    window.addEventListener('rg:realtime-event', function (e) {
+      var ev = e && e.detail;
+      if (!ev || ev.entityType !== 'SyncQueue') return;
+      var card = document.getElementById('sync-queue-monitor-card');
+      if (!card || !root.RGApi) return;
+      root.RGApi.callApi('getSyncQueueStatus', { silentRefresh: true }).then(function (resp) {
+        if (!resp || !resp.success || !resp.data) return;
+        if (!document.getElementById('sync-queue-monitor-card')) return;
+        var c = resp.data.counts || {};
+        var elP = document.getElementById('sq-cnt-pending');
+        var elPr = document.getElementById('sq-cnt-processing');
+        var elS = document.getElementById('sq-cnt-synced');
+        var elF = document.getElementById('sq-cnt-failed');
+        var tblWrap = document.getElementById('sync-queue-table-wrap');
+        if (elP) elP.textContent = String(Number(c.pending || 0));
+        if (elPr) elPr.textContent = String(Number(c.processing || 0));
+        if (elS) elS.textContent = String(Number(c.synced || 0));
+        if (elF) elF.textContent = String(Number(c.failed || 0));
+        if (tblWrap && Array.isArray(resp.data.items)) {
+          tblWrap.innerHTML = buildQueueTableHtml(resp.data.items);
+        }
+      }).catch(function () {});
+    });
   }
 
   root.RGSettings = {
