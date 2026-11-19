@@ -14,6 +14,10 @@ var RG_SHEETS_SCHEMA = {
     'id', 'name', 'username', 'passwordHash', 'salt', 'phone', 'email',
     'jobTitle', 'role', 'permissions', 'status', 'lastActivity', 'createdAt', 'updatedAt'
   ],
+  Customers: [
+    'id', 'name', 'phone', 'email', 'idNumber', 'companyName', 'notes',
+    'status', 'createdAt', 'updatedAt', 'deletedAt'
+  ],
   Reservations: [
     'id', 'sourceReservationId', 'reservationNumber', 'sourceCreatedAt',
     'customerName', 'customerPhone', 'customerEmail', 'customerIdNumber',
@@ -932,6 +936,11 @@ function upsertRecordByKey(sheetName, keyField, keyValue, recordObj) {
   if (updated) return { action: 'updated', record: updated };
   appendRecord(sheetName, recordObj);
   return { action: 'inserted', record: recordObj };
+}
+
+function upsertRecord(sheetName, keyField, recordObj) {
+  if (!recordObj || typeof recordObj !== 'object') return null;
+  return upsertRecordByKey(sheetName, keyField, recordObj[keyField], recordObj);
 }
 
 function normalizeCellForDiff_(cell, fieldName, ssTz) {

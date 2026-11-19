@@ -1,5 +1,6 @@
 import { requireApiAccess, requireAuth, verifySharedSecret } from '../backend/auth';
 import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured, type DbExecutor } from '../backend/db';
+import { getEnv } from '../backend/env';
 import { applyApiCorsHeaders, parseRequestBody } from '../backend/http';
 import { logBackendError } from '../backend/logger';
 import { ensureSeededDatabase } from '../backend/queries';
@@ -12,7 +13,7 @@ import {
 } from '../backend/syncService';
 
 async function authorizeQueueRequest(req: any, body: Record<string, any>, executor: DbExecutor): Promise<boolean> {
-  const expectedSecret = String(process.env.SYNC_API_SECRET || '').trim();
+  const expectedSecret = String(getEnv('SYNC_API_SECRET') || '').trim();
   const headerSecret = String(req.headers?.['x-sync-secret'] || '').trim();
   const authHeader = String(req.headers?.authorization || '').trim();
   const bearer = /^Bearer\s+/i.test(authHeader) ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';

@@ -1,12 +1,14 @@
 import { verifySharedSecret } from '../../backend/auth';
 import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from '../../backend/db';
+import { getEnv } from '../../backend/env';
+import { applyApiCorsHeaders } from '../../backend/http';
 import { logBackendError } from '../../backend/logger';
 import { ensureSeededDatabase } from '../../backend/queries';
 import { runBackupDeltaSync } from '../../backend/syncService';
 
 function isAuthorizedCron(req: any): boolean {
-  const cronSecret = String(process.env.CRON_SECRET || '').trim();
-  const syncSecret = String(process.env.SYNC_API_SECRET || '').trim();
+  const cronSecret = String(getEnv('CRON_SECRET') || '').trim();
+  const syncSecret = String(getEnv('SYNC_API_SECRET') || '').trim();
   const authHeader = String(req.headers?.authorization || '').trim();
   const bearer = /^Bearer\s+/i.test(authHeader) ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
   const xSync = String(req.headers?.['x-sync-secret'] || '').trim();
@@ -20,10 +22,12 @@ function isAuthorizedCron(req: any): boolean {
     return true;
   }
 
-  return !cronSecret && !syncSecret && process.env.NODE_ENV !== 'production';
+  return !cronSecret && !syncSecret && getEnv('NODE_ENV') !== 'production';
 }
 
 export default async function handler(req: any, res: any) {
+  applyApiCorsHeaders(req, res);
+
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -54,7 +58,7 @@ export default async function handler(req: any, res: any) {
     await ensureSchemaInitialized(executor);
     await ensureSeededDatabase(executor);
     const result = await runBackupDeltaSync(executor, undefined, {
-      pullRentalGate: Boolean(process.env.RG_TOKEN)
+      pullRentalGate: Boolean(getEnv('RG_TOKEN'))
     });
     res.status(200).json({
       success: true,

@@ -1797,6 +1797,7 @@
     getDashboard: { cacheable: true, ttlMs: 60000, scope: 'dashboard' },
     getReservations: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getReservationDetails: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
+    getCustomers: { cacheable: true, ttlMs: 60000, scope: 'customers' },
     getMyFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getTeamFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getFollowUpHistory: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
@@ -1813,10 +1814,15 @@
   var MUTATION_INVALIDATIONS = {
     login: ['*'],
     logout: ['*'],
+    createCustomer: ['customers', 'activity'],
+    updateCustomer: ['customers', 'activity'],
+    deleteCustomer: ['customers', 'activity'],
+    createReservation: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports'],
+    deleteReservation: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports'],
     claimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
     unclaimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
     quickUpdateReservationStatus: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateReservationDetails: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
+    updateReservationDetails: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports'],
     addFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     updateFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     assignEmployees: ['reservations', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
@@ -1832,8 +1838,8 @@
     savePermissionDefinition: ['employees', 'activity'],
     deletePermissionDefinition: ['employees', 'activity'],
     markNotificationRead: ['notifications'],
-    pullReservations: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
-    syncRentalGate: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    pullReservations: ['reservations', 'customers', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    syncRentalGate: ['reservations', 'customers', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     saveApiToken: ['settings', 'sync', 'activity'],
     updateSettings: ['settings', 'sync', 'reservations', 'activity']
   };
@@ -2180,6 +2186,14 @@
     var act = normalizeStr(action);
     var p = (payload && typeof payload === 'object') ? payload : {};
     switch (act) {
+      case 'createCustomer':
+        return act + ':' + normalizeStr(p.phone || p.customerPhone || p.name || p.customerName);
+      case 'updateCustomer':
+      case 'deleteCustomer':
+        return act + ':' + normalizeStr(p.customerId || p.id);
+      case 'createReservation':
+        return act + ':' + normalizeStr(p.reservationNumber || p.customerName);
+      case 'deleteReservation':
       case 'claimReservation':
       case 'unclaimReservation':
       case 'quickUpdateReservationStatus':
@@ -2187,7 +2201,7 @@
       case 'assignEmployees':
       case 'addFollowUp':
       case 'createProblem':
-        return act + ':' + normalizeStr(p.reservationId || p.reservationNumber);
+        return act + ':' + normalizeStr(p.reservationId || p.id || p.reservationNumber);
       case 'removeAssignment':
         return act + ':' + normalizeStr(p.reservationId) + ':' + normalizeStr(p.employeeId);
       case 'updateFollowUp':

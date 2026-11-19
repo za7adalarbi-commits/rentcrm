@@ -4,9 +4,12 @@ import http from 'node:http';
 import express from 'express';
 import { dispatchCrmRequest } from '../backend/router';
 import { mapEmployeeRow } from '../backend/auth';
-import { getActivityLogs, getReports } from '../backend/queries';
+import { addFollowUp, createCustomer, createProblem, createReservation, deleteCustomer, getActivityLogs, getCustomers, getReports, updateCustomer, updateProblem } from '../backend/queries';
 import { applyApiCorsHeaders, parseRequestBody } from '../backend/http';
 import crmApiHandler from '../api/crm';
+import healthHandler from '../api/health';
+import syncHandler from '../api/sync';
+import cronSyncHandler from '../api/cron/sync';
 import { handleSseStream, realtimeEmitter } from '../backend/realtimeBus';
 import {
   enqueueSyncOperation,
@@ -1257,4 +1260,238 @@ test('10. api/crm handler and http helpers always return valid JSON with CORS he
     if (prevNeonUrl !== undefined) process.env.NEON_DATABASE_URL = prevNeonUrl;
   }
 });
+
+test('11. Customer & Reservation RBAC, non-blank name validation, and double-delete protection', async () => {
+  const db = createFullRealtimeMockExecutor();
+  const token = await loginAdmin(db);
+
+  const cRes = await dispatchCrmRequest(db, {
+    action: 'createCustomer',
+    token,
+    payload: { name: 'عميل التحقق', phone: '0551234567' }
+  });
+  assert.equal(cRes.success, true);
+  const custId = cRes.data.customer.id;
+
+  // Reject blank name on updateCustomer
+  const blankUpd = await dispatchCrmRequest(db, {
+    action: 'updateCustomer',
+    token,
+    payload: { customerId: custId, name: '   ' }
+  });
+  assert.equal(blankUpd.success, false);
+  assert.match(String(blankUpd.error || blankUpd.message), /VALIDATION_ERROR|مطلوب/);
+
+  // First delete succeeds; second delete reports NOT_FOUND
+  const del1 = await dispatchCrmRequest(db, {
+    action: 'deleteCustomer',
+    token,
+    payload: { customerId: custId }
+  });
+  assert.equal(del1.success, true);
+  const del2 = await dispatchCrmRequest(db, {
+    action: 'deleteCustomer',
+    token,
+    payload: { customerId: custId }
+  });
+  assert.equal(del2.success, false);
+  assert.match(String(del2.error || del2.message), /NOT_FOUND|غير موجود/);
+
+  // Restricted session lacking add_followup / edit_reservation_details / pull_reservations is denied
+  const limitedUser = mapEmployeeRow({
+    id: 'EMP_LIMITED_TEST',
+    name: 'صلاحيات محدودة',
+    username: 'limited_test',
+    role: 'qa_reports',
+    permissions: JSON.stringify(['view_reports']),
+    status: 'active'
+  });
+  const limitedSession = {
+    tokenHash: 'LIM_TOK',
+    employeeId: limitedUser.id,
+    username: limitedUser.username,
+    role: limitedUser.role,
+    expiresAt: '',
+    user: limitedUser
+  };
+
+  await assert.rejects(() => getCustomers(db, limitedSession, {}), /FORBIDDEN/);
+  await assert.rejects(() => createCustomer(db, limitedSession, { name: 'اختبار' }), /FORBIDDEN/);
+  await assert.rejects(() => updateCustomer(db, limitedSession, { customerId: custId, name: 'تعديل' }), /FORBIDDEN/);
+  await assert.rejects(() => deleteCustomer(db, limitedSession, { customerId: custId }), /FORBIDDEN/);
+  await assert.rejects(() => createReservation(db, limitedSession, { customerName: 'اختبار' }), /FORBIDDEN/);
+});
+
+test('12. addFollowUp, createProblem, and updateProblem enqueue outbox v2 ops and emit realtime events in tx', async () => {
+  const prevGas = process.env.GAS_WEBAPP_URL;
+  delete process.env.GAS_WEBAPP_URL;
+
+  const gmUser = mapEmployeeRow({
+    id: 'EMP_ADMIN',
+    name: 'المدير العام',
+    username: 'admin',
+    role: 'general_manager',
+    permissions: JSON.stringify([]),
+    status: 'active'
+  });
+  const session = {
+    tokenHash: 'GM_TOK',
+    employeeId: gmUser.id,
+    username: gmUser.username,
+    role: gmUser.role,
+    expiresAt: '',
+    user: gmUser
+  };
+
+  const outboxWrites: any[] = [];
+  const realtimeWrites: any[] = [];
+  const problemsStore = new Map<string, any>();
+  const mockResRow = {
+    id: 'RES_MOCK_1',
+    source_reservation_id: '5511',
+    reservation_number: 'RG-MOCK-1',
+    customer_name: 'فهد القحطاني',
+    customer_phone: '0501112233',
+    internal_status: 'تم الحجز',
+    assigned_employee_ids: [],
+    assigned_employee_names: [],
+    status_history: [],
+    updated_at: new Date(),
+    created_at: new Date()
+  };
+
+  const spyExec: DbExecutor = {
+    async query<T extends Record<string, any> = any>(sqlRaw: string, params: any[] = []): Promise<QueryResult<T>> {
+      const sql = sqlRaw.replace(/\s+/g, ' ').trim();
+      if (sql.startsWith('SELECT * FROM reservations WHERE id = $1 OR reservation_number = $2 LIMIT 1 FOR UPDATE')) {
+        return { rows: [mockResRow] as any[], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT * FROM reservations WHERE id = $1 FOR UPDATE')) {
+        return { rows: [mockResRow] as any[], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT id, name FROM employees WHERE id = ANY')) {
+        return { rows: [{ id: 'EMP_ADMIN', name: 'المدير العام' }] as any[], rowCount: 1 };
+      }
+      if (sql.startsWith('INSERT INTO problems')) {
+        problemsStore.set(params[0], {
+          id: params[0],
+          problem_number: params[1],
+          reservation_id: params[2],
+          reservation_number: params[3],
+          customer_name: params[4],
+          created_by_id: params[5],
+          created_by_name: params[6],
+          assigned_employee_ids: JSON.parse(params[7]),
+          assigned_employee_names: JSON.parse(params[8]),
+          description: params[9],
+          priority: params[10],
+          status: params[11],
+          created_at: new Date(params[12]),
+          updated_at: new Date(params[12])
+        });
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT * FROM problems WHERE id = $1 FOR UPDATE')) {
+        const p = problemsStore.get(params[0]);
+        return { rows: p ? [p] : [], rowCount: p ? 1 : 0 };
+      }
+      if (sql.startsWith('SELECT COUNT(*)::text AS cnt FROM problems')) {
+        return { rows: [{ cnt: '0' }] as any[], rowCount: 1 };
+      }
+      if (sql.startsWith('INSERT INTO sheets_mirror_outbox')) {
+        outboxWrites.push({ entityType: params[1], operation: params[4], action: params[5] });
+        return { rows: [{ id: params[0] }] as any[], rowCount: 1 };
+      }
+      if (sql.startsWith('INSERT INTO realtime_events')) {
+        realtimeWrites.push({ eventType: params[1], entityType: params[2], recordId: params[3], operation: params[4] });
+        return { rows: [{ seq: realtimeWrites.length, created_at: new Date() }] as any[], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    async withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
+      return fn({ query: this.query });
+    }
+  };
+
+  try {
+    await addFollowUp(spyExec, session, {
+      reservationId: 'RES_MOCK_1',
+      status: 'تم التمديد',
+      action: 'اتصال أولي',
+      notes: 'العميل جاهز للاستلام'
+    });
+    const prb = await createProblem(spyExec, session, {
+      reservationId: 'RES_MOCK_1',
+      description: 'تأخر في تسليم المركبة',
+      priority: 'مرتفع'
+    });
+    await updateProblem(spyExec, session, {
+      problemId: prb.id,
+      status: 'مغلقة',
+      note: 'تم تسليم المركبة وإغلاق التذكرة'
+    });
+
+    assert.ok(outboxWrites.some((o) => o.entityType === 'FollowUp' && o.action === 'appendFollowUp'));
+    assert.ok(outboxWrites.some((o) => o.entityType === 'Reservation' && o.action === 'upsertReservation'));
+    assert.equal(outboxWrites.filter((o) => o.entityType === 'Problem' && o.action === 'upsertProblem').length, 2);
+
+    assert.deepEqual(
+      realtimeWrites.map((e) => e.eventType),
+      ['followup:created', 'problem:created', 'problem:updated']
+    );
+  } finally {
+    if (prevGas !== undefined) process.env.GAS_WEBAPP_URL = prevGas;
+  }
+});
+
+test('13. api/health, api/sync, and api/cron/sync apply CORS headers and return JSON safely on OPTIONS / errors', async () => {
+  const prevDbUrl = process.env.DATABASE_URL;
+  const prevPgUrl = process.env.POSTGRES_URL;
+  const prevNeonUrl = process.env.NEON_DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  delete process.env.POSTGRES_URL;
+  delete process.env.NEON_DATABASE_URL;
+
+  const makeRes = () => {
+    const headers: Record<string, string> = {};
+    let statusCode = 0;
+    let body: any = null;
+    return {
+      headers,
+      get statusCode() { return statusCode; },
+      get body() { return body; },
+      setHeader(k: string, v: string) { headers[k] = v; },
+      status(c: number) { statusCode = c; return this; },
+      json(b: any) { body = b; return this; },
+      end() { return this; }
+    };
+  };
+
+  try {
+    // OPTIONS preflight
+    for (const h of [healthHandler, syncHandler, cronSyncHandler]) {
+      const r = makeRes();
+      await h({ method: 'OPTIONS', headers: { origin: 'https://crm.example.com' } }, r);
+      assert.equal(r.statusCode, 204);
+      assert.equal(r.headers['Access-Control-Allow-Origin'], 'https://crm.example.com');
+    }
+
+    // api/health returns valid JSON (200 ok:true or 500 ok:false without crash)
+    const healthRes = makeRes();
+    await healthHandler({ method: 'GET', headers: {} }, healthRes);
+    assert.ok(healthRes.statusCode === 200 || healthRes.statusCode === 500);
+    assert.equal(typeof healthRes.body.ok, 'boolean');
+
+    // api/sync returns 503 JSON when unconfigured
+    const syncRes = makeRes();
+    await syncHandler({ method: 'POST', headers: {}, body: {} }, syncRes);
+    assert.equal(syncRes.statusCode, 503);
+    assert.equal(syncRes.body.error, 'DATABASE_UNCONFIGURED');
+  } finally {
+    if (prevDbUrl !== undefined) process.env.DATABASE_URL = prevDbUrl;
+    if (prevPgUrl !== undefined) process.env.POSTGRES_URL = prevPgUrl;
+    if (prevNeonUrl !== undefined) process.env.NEON_DATABASE_URL = prevNeonUrl;
+  }
+});
+
 

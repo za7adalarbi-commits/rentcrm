@@ -177,7 +177,7 @@
                 '</label>' +
                 '<div class="password-field-wrap">' +
                   '<input type="password" class="input mono" id="ac-db-url" dir="ltr" lang="en" autocomplete="off" spellcheck="false" placeholder="postgresql://user:password@host/dbname?sslmode=require">' +
-                  '<button type="button" class="password-toggle-btn" id="toggle-ac-db-url" aria-label="إظهار رابط قاعدة البيانات">إظهار</button>' +
+                  '<button type="button" class="password-toggle-btn" id="toggle-ac-db-url" aria-pressed="false" aria-label="إظهار رابط قاعدة البيانات">إظهار</button>' +
                 '</div>' +
                 '<span style="font-size:11px;color:var(--text-muted);">يُحفظ سرّيًا في <span class="mono" dir="ltr">.env</span> فقط ولا يُكتب في ملفات المتصفح العامة. اتركه فارغًا للإبقاء على القيمة المحفوظة حاليًا.</span>' +
               '</div>' +
@@ -194,7 +194,7 @@
                 '</label>' +
                 '<div class="password-field-wrap">' +
                   '<input type="password" class="input mono" id="ac-rg-token" dir="ltr" lang="en" autocomplete="off" spellcheck="false" placeholder="الصق Bearer Token هنا ليُحفظ في .env وApps Script">' +
-                  '<button type="button" class="password-toggle-btn" id="toggle-ac-rg-token" aria-label="إظهار توكن Rental Gate">إظهار</button>' +
+                  '<button type="button" class="password-toggle-btn" id="toggle-ac-rg-token" aria-pressed="false" aria-label="إظهار توكن Rental Gate">إظهار</button>' +
                 '</div>' +
               '</div>' +
 
@@ -215,7 +215,7 @@
                   '<label class="form-label" for="ac-sync-secret">مفتاح المزامنة السحابية (<span class="mono" dir="ltr">SYNC_API_SECRET</span>) — اختياري</label>' +
                   '<div class="password-field-wrap">' +
                     '<input type="password" class="input mono" id="ac-sync-secret" dir="ltr" lang="en" autocomplete="off" placeholder="' + ((acStatus && acStatus.sync && acStatus.sync.hasSecret) ? 'مضبوط حاليًا — اتركه فارغًا للإبقاء عليه' : 'يُولّد تلقائيًا عند الحاجة') + '">' +
-                    '<button type="button" class="password-toggle-btn" id="toggle-ac-sync-secret" aria-label="إظهار مفتاح المزامنة">إظهار</button>' +
+                    '<button type="button" class="password-toggle-btn" id="toggle-ac-sync-secret" aria-pressed="false" aria-label="إظهار مفتاح المزامنة">إظهار</button>' +
                   '</div>' +
                 '</div>' +
               '</div>' +
@@ -316,7 +316,7 @@
             '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;">' +
               '<div class="password-field-wrap" style="flex:1;min-width:240px;">' +
                 '<input type="password" class="input mono" id="set-rg-token" dir="ltr" autocomplete="off" spellcheck="false" placeholder="الصق Bearer Token هنا ليُحفظ في الخادم وScript Properties">' +
-                '<button type="button" class="password-toggle-btn" id="toggle-rg-token" aria-label="إظهار التوكن">إظهار</button>' +
+                '<button type="button" class="password-toggle-btn" id="toggle-rg-token" aria-pressed="false" aria-label="إظهار التوكن">إظهار</button>' +
               '</div>' +
               '<button type="button" class="btn btn-primary" id="btn-save-rg-token">حفظ التوكن الآن</button>' +
             '</div>' +
@@ -386,20 +386,23 @@
     // Unified Auto-Connect event handlers
     var acForm = document.getElementById('auto-connect-form');
     if (acForm) {
-      var bindToggle = function (inpId, btnId) {
+      var bindToggle = function (inpId, btnId, fieldLabel) {
         var inp = document.getElementById(inpId);
         var btn = document.getElementById(btnId);
         if (inp && btn) {
           btn.addEventListener('click', function () {
             var nextType = inp.type === 'password' ? 'text' : 'password';
+            var isVisible = nextType === 'text';
             inp.type = nextType;
-            btn.textContent = nextType === 'text' ? 'إخفاء' : 'إظهار';
+            btn.textContent = isVisible ? 'إخفاء' : 'إظهار';
+            btn.setAttribute('aria-pressed', isVisible ? 'true' : 'false');
+            btn.setAttribute('aria-label', (isVisible ? 'إخفاء ' : 'إظهار ') + fieldLabel);
           });
         }
       };
-      bindToggle('ac-db-url', 'toggle-ac-db-url');
-      bindToggle('ac-rg-token', 'toggle-ac-rg-token');
-      bindToggle('ac-sync-secret', 'toggle-ac-sync-secret');
+      bindToggle('ac-db-url', 'toggle-ac-db-url', 'رابط قاعدة البيانات');
+      bindToggle('ac-rg-token', 'toggle-ac-rg-token', 'توكن Rental Gate');
+      bindToggle('ac-sync-secret', 'toggle-ac-sync-secret', 'مفتاح المزامنة');
 
       var acErrBoxLive = document.getElementById('ac-error-msg');
       acForm.querySelectorAll('input').forEach(function (inp) {
@@ -659,8 +662,11 @@
     if (rgTokenInput && toggleRgTokenBtn) {
       toggleRgTokenBtn.addEventListener('click', function () {
         var nextType = rgTokenInput.type === 'password' ? 'text' : 'password';
+        var isVisible = nextType === 'text';
         rgTokenInput.type = nextType;
-        toggleRgTokenBtn.textContent = nextType === 'text' ? 'إخفاء' : 'إظهار';
+        toggleRgTokenBtn.textContent = isVisible ? 'إخفاء' : 'إظهار';
+        toggleRgTokenBtn.setAttribute('aria-pressed', isVisible ? 'true' : 'false');
+        toggleRgTokenBtn.setAttribute('aria-label', isVisible ? 'إخفاء التوكن' : 'إظهار التوكن');
       });
     }
 

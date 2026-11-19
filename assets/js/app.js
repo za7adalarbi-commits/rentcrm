@@ -481,7 +481,7 @@
                 '<label class="form-label" for="login-password">كلمة المرور</label>' +
                 '<div class="password-field-wrap">' +
                   '<input class="input" type="password" id="login-password" dir="ltr" lang="en" autocomplete="current-password" placeholder="••••••••" required>' +
-                  '<button type="button" class="password-toggle-btn" id="toggle-login-password" aria-label="إظهار كلمة المرور">إظهار</button>' +
+                  '<button type="button" class="password-toggle-btn" id="toggle-login-password" aria-pressed="false" aria-label="إظهار كلمة المرور">إظهار</button>' +
                 '</div>' +
               '</div>' +
               '<div id="login-error" class="form-error hidden" role="alert"></div>' +
@@ -530,8 +530,11 @@
     if (pwdInput && pwdToggleBtn) {
       pwdToggleBtn.addEventListener('click', function () {
         var nextType = pwdInput.type === 'password' ? 'text' : 'password';
+        var isVisible = nextType === 'text';
         pwdInput.type = nextType;
-        pwdToggleBtn.textContent = nextType === 'text' ? 'إخفاء' : 'إظهار';
+        pwdToggleBtn.textContent = isVisible ? 'إخفاء' : 'إظهار';
+        pwdToggleBtn.setAttribute('aria-pressed', isVisible ? 'true' : 'false');
+        pwdToggleBtn.setAttribute('aria-label', isVisible ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور');
       });
     }
 

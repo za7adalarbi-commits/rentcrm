@@ -444,3 +444,115 @@ function updateReservationDetails(session, payload) {
     return updated;
   });
 }
+
+function createReservation(session, payload) {
+  if (!hasPermission(session, 'edit_reservation_details') && !hasPermission(session, 'pull_reservations') && !hasPermission(session, 'add_followup')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية إنشاء حجوزات.');
+  }
+  var p = payload || {};
+  var customerName = normalizeStr(p.customerName);
+  if (!customerName) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب لإنشاء الحجز.');
+
+  var resNumber = normalizeStr(p.reservationNumber) || ('RG-' + String(Date.now()).slice(-6));
+  var initialStatus = normalizeStr(p.internalStatus || 'تم الحجز');
+  if (!isValidWorkflowStatus_(initialStatus)) {
+    throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
+  }
+
+  return withScriptLock(function () {
+    var existing = findRecordById(RG_SHEETS.RESERVATIONS, 'reservationNumber', resNumber);
+    if (existing) {
+      throw new Error('VALIDATION_ERROR: رقم الحجز مسجل مسبقاً.');
+    }
+
+    var now = nowIso();
+    var resId = normalizeStr(p.id) || generateId('RES');
+    var baseAmt = toNumber(p.baseAmount !== undefined ? p.baseAmount : p.totalAmount, 0);
+    var totalAmt = toNumber(p.totalAmount !== undefined ? p.totalAmount : baseAmt, 0);
+    var daysCnt = Math.max(1, toNumber(p.daysCount, 1));
+    var stages = appendStatusStageEntry_([], {
+      source: 'manual_create',
+      previousStatus: '',
+      newStatus: initialStatus,
+      changedAt: now,
+      changedById: session.employeeId,
+      changedByName: session.user.name,
+      note: 'إنشاء الحجز بواسطة ' + session.user.name
+    });
+
+    var record = {
+      id: resId,
+      sourceReservationId: normalizeStr(p.sourceReservationId || resId),
+      reservationNumber: resNumber,
+      sourceCreatedAt: normalizeStr(p.sourceCreatedAt || now),
+      customerName: customerName,
+      customerPhone: normalizeStr(p.customerPhone),
+      customerEmail: normalizeStr(p.customerEmail),
+      customerIdNumber: normalizeStr(p.customerIdNumber),
+      companyName: normalizeStr(p.companyName),
+      branchName: normalizeStr(p.branchName),
+      deliverBranchName: normalizeStr(p.deliverBranchName || p.branchName),
+      carName: normalizeStr(p.carName),
+      plateNumber: normalizeStr(p.plateNumber),
+      carCategory: normalizeStr(p.carCategory),
+      startDate: normalizeStr(p.startDate || now.substring(0, 10)),
+      startTime: normalizeStr(p.startTime || '12:00'),
+      originalEndDate: normalizeStr(p.originalEndDate || p.endDate || now.substring(0, 10)),
+      originalEndTime: normalizeStr(p.originalEndTime || p.endTime || '12:00'),
+      endDate: normalizeStr(p.endDate || now.substring(0, 10)),
+      endTime: normalizeStr(p.endTime || '12:00'),
+      extendedUntilDate: normalizeStr(p.extendedUntilDate),
+      extendedUntilTime: normalizeStr(p.extendedUntilTime),
+      daysCount: daysCnt,
+      extendedDaysCount: toNumber(p.extendedDaysCount, 0),
+      totalDaysCount: toNumber(p.totalDaysCount, daysCnt),
+      originalStatusCode: normalizeStr(p.originalStatusCode || 'booked'),
+      originalStatusAr: normalizeStr(p.originalStatusAr || initialStatus),
+      pickupTypeAr: normalizeStr(p.pickupTypeAr),
+      returnTypeAr: normalizeStr(p.returnTypeAr),
+      paymentMethod: normalizeStr(p.paymentMethod),
+      paymentStatus: normalizeStr(p.paymentStatus),
+      dailyPrice: toNumber(p.dailyPrice, 0),
+      discountAmount: toNumber(p.discountAmount, 0),
+      vatAmount: toNumber(p.vatAmount, 0),
+      baseAmount: baseAmt,
+      extensionsCount: toNumber(p.extensionsCount, 0),
+      extensionsAmount: toNumber(p.extensionsAmount, 0),
+      totalAmount: totalAmt,
+      hasExtensions: Boolean(p.hasExtensions) ? 'true' : 'false',
+      internalStatus: initialStatus,
+      priority: normalizeStr(p.priority || 'عادي'),
+      assignedEmployeeIds: JSON.stringify(Array.isArray(p.assignedEmployeeIds) ? p.assignedEmployeeIds : []),
+      assignedEmployeeNames: JSON.stringify(Array.isArray(p.assignedEmployeeNames) ? p.assignedEmployeeNames : []),
+      lastUpdateText: normalizeStr(p.lastUpdateText || ('إنشاء الحجز بواسطة ' + session.user.name)),
+      lastUpdatedById: session.employeeId,
+      lastUpdatedByName: session.user.name,
+      lastUpdatedAt: now,
+      hasProblem: Boolean(p.hasProblem) ? 'true' : 'false',
+      createdAt: now,
+      updatedAt: now,
+      statusHistory: JSON.stringify(stages),
+      rawJson: ''
+    };
+
+    appendRecord(RG_SHEETS.RESERVATIONS, record);
+    logActivity(session.user, 'إنشاء حجز', 'Reservation', record.reservationNumber, record.customerName);
+    return { reservation: serializeReservationForClient_(record, false) };
+  });
+}
+
+function deleteReservation(session, payload) {
+  requirePermission(session, 'edit_reservation_details');
+  var p = payload || {};
+  var resId = normalizeStr(p.reservationId || p.id);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  return withScriptLock(function () {
+    var existing = findRecordById(RG_SHEETS.RESERVATIONS, 'id', resId);
+    if (!existing) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'id', resId);
+    logActivity(session.user, 'حذف حجز', 'Reservation', existing.reservationNumber, existing.customerName);
+    return { deleted: true, reservationId: resId };
+  });
+}
+

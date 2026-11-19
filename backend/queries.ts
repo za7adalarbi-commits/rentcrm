@@ -15,9 +15,7 @@ import type { DbClient, DbExecutor } from './dbCore';
 import { getEnv, registerBackgroundTask, setRuntimeEnv } from './env';
 import { emitRealtimeEvent } from './realtimeBus';
 import {
-  enqueueSheetsMirror,
   enqueueSyncOperation,
-  flushSheetsMirrorOutbox,
   ingestIncrementalSyncBatch,
   mapExtensionRowToClient,
   mapReservationRowToClient,
@@ -924,11 +922,27 @@ export async function claimReservation(executor: DbExecutor, session: AuthSessio
       lastUpdatedAt: nowIso,
       updatedAt: nowIso
     };
-    await enqueueSheetsMirror(tx, 'Reservation', updated.id, 'upsertReservation', updated);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updated.id,
+      recordId: updated.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updated
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:updated',
+      entityType: 'Reservation',
+      recordId: updated.id,
+      operation: 'UPDATE',
+      payload: { reservation: updated },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return { added, reservation: updated };
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return result;
 }
 
@@ -974,11 +988,27 @@ export async function unclaimReservation(executor: DbExecutor, session: AuthSess
       assignedEmployeeNames: names,
       updatedAt: nowIso
     };
-    await enqueueSheetsMirror(tx, 'Reservation', updated.id, 'upsertReservation', updated);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updated.id,
+      recordId: updated.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updated
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:updated',
+      entityType: 'Reservation',
+      recordId: updated.id,
+      operation: 'UPDATE',
+      payload: { reservation: updated },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return { removed: idx !== -1, reservation: updated };
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return result;
 }
 
@@ -1063,18 +1093,46 @@ export async function quickUpdateReservationStatus(
       statusHistory: nextHistory,
       isFollowed: true
     };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    await enqueueSyncOperation(tx, {
+      entityType: 'FollowUp',
+      entityId: fuObj.id,
+      recordId: fuObj.id,
+      operation: 'INSERT',
+      action: 'appendFollowUp',
+      payload: fuObj
+    });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:updated',
+      entityType: 'Reservation',
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      payload: { reservation: updatedRes, followUp: fuObj },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return { reservation: updatedRes, followUp: fuObj };
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
 // ---------- CUSTOMERS CRUD ----------
 
-export async function getCustomers(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+export async function getCustomers(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const canRead = ['view_dashboard', 'view_all_reservations', 'add_followup', 'edit_reservation_details']
+    .some((p) => crmCore.canUserPerform(session.user, p));
+  if (!canRead) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية استعراض بيانات العملاء.');
+  }
   const params: any[] = [];
   const clauses: string[] = ['c.deleted_at IS NULL'];
   if (payload.search) {
@@ -1095,6 +1153,9 @@ export async function getCustomers(executor: DbExecutor, _session: AuthSession, 
 }
 
 export async function createCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  if (!crmCore.canUserPerform(session.user, 'add_followup') && !crmCore.canUserPerform(session.user, 'edit_reservation_details')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية إضافة عملاء.');
+  }
   const idempotencyKey = str(payload.idempotencyKey || payload.idempotency_key);
   if (idempotencyKey) {
     const hit = await executor.query<{ response: any }>(
@@ -1174,8 +1235,14 @@ export async function createCustomer(executor: DbExecutor, session: AuthSession,
 }
 
 export async function updateCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  if (!crmCore.canUserPerform(session.user, 'add_followup') && !crmCore.canUserPerform(session.user, 'edit_reservation_details')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية تعديل بيانات العملاء.');
+  }
   const custId = str(payload.customerId || payload.id);
   if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+  if (payload.name !== undefined && !str(payload.name)) {
+    throw new Error('VALIDATION_ERROR: اسم العميل مطلوب.');
+  }
 
   const out = await executor.withTransaction(async (tx) => {
     const existingRes = await tx.query(`SELECT * FROM customers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [custId]);
@@ -1229,12 +1296,13 @@ export async function updateCustomer(executor: DbExecutor, session: AuthSession,
 }
 
 export async function deleteCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'edit_reservation_details');
   const custId = str(payload.customerId || payload.id);
   if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
 
   const out = await executor.withTransaction(async (tx) => {
     const existingRes = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [custId]);
-    if (!existingRes.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+    if (!existingRes.rows[0] || existingRes.rows[0].deleted_at) throw new Error('NOT_FOUND: العميل غير موجود.');
     const existing = formatCustomerRow(existingRes.rows[0]);
     const nowIso = new Date().toISOString();
 
@@ -1276,6 +1344,13 @@ export async function createReservation(
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
+  if (
+    !crmCore.canUserPerform(session.user, 'edit_reservation_details') &&
+    !crmCore.canUserPerform(session.user, 'pull_reservations') &&
+    !crmCore.canUserPerform(session.user, 'add_followup')
+  ) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية إنشاء حجوزات.');
+  }
   const idempotencyKey = str(payload.idempotencyKey || payload.idempotency_key);
   if (idempotencyKey) {
     const hit = await executor.query<{ response: any }>(
@@ -1701,12 +1776,35 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
       statusHistory: nextHistory,
       isFollowed: true
     };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    await enqueueSyncOperation(tx, {
+      entityType: 'FollowUp',
+      entityId: fuObj.id,
+      recordId: fuObj.id,
+      operation: 'INSERT',
+      action: 'appendFollowUp',
+      payload: fuObj
+    });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'followup:created',
+      entityType: 'FollowUp',
+      recordId: fuObj.id,
+      operation: 'INSERT',
+      payload: { followUp: fuObj, reservation: updatedRes },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return { followUp: fuObj, reservation: updatedRes };
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -1760,6 +1858,7 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     );
 
     const lastResQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [existing.reservationId]);
+    let updatedResPayload: Record<string, any> | null = null;
     if (lastResQuery.rows[0]) {
       const rObj = mapReservationRowToClient(lastResQuery.rows[0], false);
       const lastText = newAction + (newNotes ? ` — ${newNotes}` : '');
@@ -1783,12 +1882,51 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
          WHERE id = $1`,
         [rObj.id, newStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory)]
       );
+      updatedResPayload = {
+        ...rObj,
+        internalStatus: newStatus,
+        lastUpdateText: lastText,
+        lastUpdatedById: session.user.id,
+        lastUpdatedByName: session.user.name,
+        lastUpdatedAt: nowIso,
+        updatedAt: nowIso,
+        statusHistory: nextHistory
+      };
     }
 
+    const updatedFollowUp = { ...existing, status: newStatus, action: newAction, notes: newNotes };
     await logActivity(tx, session.user, 'تعديل متابعة', 'FollowUp', existing.reservationNumber, `${existing.status} → ${newStatus}`);
-    return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes }, history: hist };
+    await enqueueSyncOperation(tx, {
+      entityType: 'FollowUp',
+      entityId: followUpId,
+      recordId: followUpId,
+      operation: 'UPDATE',
+      action: 'appendFollowUp',
+      payload: updatedFollowUp
+    });
+    if (updatedResPayload) {
+      await enqueueSyncOperation(tx, {
+        entityType: 'Reservation',
+        entityId: updatedResPayload.id,
+        recordId: updatedResPayload.id,
+        operation: 'UPDATE',
+        action: 'upsertReservation',
+        payload: updatedResPayload
+      });
+    }
+    await emitRealtimeEvent(tx, {
+      eventType: 'followup:updated',
+      entityType: 'FollowUp',
+      recordId: followUpId,
+      operation: 'UPDATE',
+      payload: { followUp: updatedFollowUp, reservation: updatedResPayload },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+    return { followUp: updatedFollowUp, history: hist };
   });
 
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -1874,11 +2012,27 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
       lastUpdatedAt: nowIso,
       updatedAt: nowIso
     };
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:updated',
+      entityType: 'Reservation',
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      payload: { reservation: updatedRes },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return updatedRes;
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -1888,7 +2042,7 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
   const employeeId = str(payload.employeeId);
   if (!resId || !employeeId) throw new Error('VALIDATION_ERROR: معرف الحجز والموظف مطلوبان.');
 
-  return executor.withTransaction(async (tx) => {
+  const out = await executor.withTransaction(async (tx) => {
     const nowIso = new Date().toISOString();
     await tx.query(
       `UPDATE assignments SET status = 'inactive', updated_at = $3::timestamptz WHERE reservation_id = $1 AND employee_id = $2`,
@@ -1908,8 +2062,29 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
       [resId, JSON.stringify(ids), JSON.stringify(names), nowIso]
     );
     await logActivity(tx, session.user, 'إلغاء إسناد', 'Reservation', resObj.reservationNumber, `إزالة إسناد الموظف ${employeeId}`);
-    return { ...resObj, assignedEmployeeIds: ids, assignedEmployeeNames: names, updatedAt: nowIso };
+    const updatedRes: Record<string, any> = { ...resObj, assignedEmployeeIds: ids, assignedEmployeeNames: names, updatedAt: nowIso };
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: updatedRes.id,
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: updatedRes
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:updated',
+      entityType: 'Reservation',
+      recordId: updatedRes.id,
+      operation: 'UPDATE',
+      payload: { reservation: updatedRes },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+    return updatedRes;
   });
+
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  return out;
 }
 
 export async function getMyFollowUps(executor: DbExecutor, session: AuthSession, _payload: Record<string, any> = {}) {
@@ -2050,11 +2225,27 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
     }
 
     await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
-    await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Problem',
+      entityId: prb.id,
+      recordId: prb.id,
+      operation: 'INSERT',
+      action: 'upsertProblem',
+      payload: prb
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'problem:created',
+      entityType: 'Problem',
+      recordId: prb.id,
+      operation: 'INSERT',
+      payload: { problem: prb },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return { ...prb, updates: [] };
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -2130,11 +2321,27 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
       updatedAt: nowIso,
       updates: updatesRes.rows.map(formatProblemUpdateRow)
     };
-    await enqueueSheetsMirror(tx, 'Problem', updatedProblem.id, 'upsertProblem', updatedProblem);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Problem',
+      entityId: updatedProblem.id,
+      recordId: updatedProblem.id,
+      operation: 'UPDATE',
+      action: 'upsertProblem',
+      payload: updatedProblem
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'problem:updated',
+      entityType: 'Problem',
+      recordId: updatedProblem.id,
+      operation: 'UPDATE',
+      payload: { problem: updatedProblem },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return updatedProblem;
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -2294,11 +2501,27 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
       job_title: str(payload.jobTitle), role, permissions: effectivePerms,
       status: 'active', last_activity: nowIso, created_at: nowIso, updated_at: nowIso
     });
-    await enqueueSheetsMirror(tx, 'Employee', id, 'upsertEmployee', { ...emp, passwordHash: pHash, salt });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Employee',
+      entityId: id,
+      recordId: id,
+      operation: 'INSERT',
+      action: 'upsertEmployee',
+      payload: { ...emp, passwordHash: pHash, salt }
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'employee:created',
+      entityType: 'Employee',
+      recordId: id,
+      operation: 'INSERT',
+      payload: { employee: emp },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return emp;
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -2356,11 +2579,27 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
       name: nextName, phone: nextPhone, email: nextEmail, job_title: nextJob,
       role: nextRole, permissions: nextPerms, status: nextStatus, updated_at: nowIso
     });
-    await enqueueSheetsMirror(tx, 'Employee', empId, 'upsertEmployee', { ...emp, passwordHash: nextHash, salt: nextSalt });
+    await enqueueSyncOperation(tx, {
+      entityType: 'Employee',
+      entityId: empId,
+      recordId: empId,
+      operation: 'UPDATE',
+      action: 'upsertEmployee',
+      payload: { ...emp, passwordHash: nextHash, salt: nextSalt }
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'employee:updated',
+      entityType: 'Employee',
+      recordId: empId,
+      operation: 'UPDATE',
+      payload: { employee: emp },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
     return emp;
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -2546,12 +2785,28 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
         [key, value, session.user.name]
       );
-      await enqueueSheetsMirror(tx, 'Settings', key, 'upsertSetting', { key, value, updatedBy: session.user.name });
+      await enqueueSyncOperation(tx, {
+        entityType: 'Settings',
+        entityId: key,
+        recordId: key,
+        operation: 'UPDATE',
+        action: 'upsertSetting',
+        payload: { key, value, updatedBy: session.user.name }
+      });
     }
     await logActivity(tx, session.user, 'تحديث الإعدادات', 'Settings', 'system', 'تحديث إعدادات النظام في قاعدة البيانات');
+    await emitRealtimeEvent(tx, {
+      eventType: 'settings:updated',
+      entityType: 'Settings',
+      recordId: 'system',
+      operation: 'UPDATE',
+      payload: { keys: updates.map(([k]) => k) },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return getSettings(executor, session);
 }
 

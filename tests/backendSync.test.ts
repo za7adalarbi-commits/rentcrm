@@ -309,9 +309,14 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     }
 
     if (sql.startsWith('INSERT INTO sheets_mirror_outbox')) {
+      const isV2 = params.length >= 9;
       state.sheets_mirror_outbox.push({
-        id: params[0], entity_type: params[1], entity_id: params[2], action: params[3],
-        payload: JSON.parse(params[4]), status: 'pending'
+        id: params[0],
+        entity_type: params[1],
+        entity_id: params[2],
+        action: isV2 ? params[5] : params[3],
+        payload: JSON.parse(isV2 ? params[6] : params[4]),
+        status: 'pending'
       });
       return { rows: [], rowCount: 1 };
     }

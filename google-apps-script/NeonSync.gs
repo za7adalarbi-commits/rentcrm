@@ -282,6 +282,26 @@ function handleTriggerNeonIncrementalSync_(payload) {
   return runRentalGateSyncInternal(actor, payload || {});
 }
 
+function cloneWithPatchEs5_(baseObj, patchObj) {
+  var out = {};
+  var k;
+  if (baseObj && typeof baseObj === 'object') {
+    for (k in baseObj) {
+      if (Object.prototype.hasOwnProperty.call(baseObj, k)) {
+        out[k] = baseObj[k];
+      }
+    }
+  }
+  if (patchObj && typeof patchObj === 'object') {
+    for (k in patchObj) {
+      if (Object.prototype.hasOwnProperty.call(patchObj, k)) {
+        out[k] = patchObj[k];
+      }
+    }
+  }
+  return out;
+}
+
 function handleNeonMirrorSync_(payload) {
   var cfg = getNeonSyncConfig_();
   var provided = normalizeStr(payload && payload.syncSecret);
@@ -298,8 +318,24 @@ function handleNeonMirrorSync_(payload) {
     var action = normalizeStr(item.action);
     var data = item.payload || {};
 
-    if (action === 'upsertReservation' && data.reservationNumber) {
-      var resRec = Object.assign({}, data, {
+    if (action === 'upsertCustomer' && data.id) {
+      var custRec = cloneWithPatchEs5_(data, {
+        status: normalizeStr(data.status) || 'active',
+        updatedAt: data.updatedAt || nowIso()
+      });
+      upsertRecord(RG_SHEETS.CUSTOMERS, 'id', custRec);
+      applied++;
+    } else if (action === 'deleteCustomer' && (data.id || data.customerId)) {
+      var targetCustId = normalizeStr(data.id || data.customerId);
+      var custNow = nowIso();
+      updateRecordByKey(RG_SHEETS.CUSTOMERS, 'id', targetCustId, {
+        status: 'deleted',
+        deletedAt: custNow,
+        updatedAt: custNow
+      });
+      applied++;
+    } else if (action === 'upsertReservation' && data.reservationNumber) {
+      var resRec = cloneWithPatchEs5_(data, {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
         statusHistory: JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
@@ -308,11 +344,20 @@ function handleNeonMirrorSync_(payload) {
       });
       upsertRecord(RG_SHEETS.RESERVATIONS, 'reservationNumber', resRec);
       applied++;
+    } else if (action === 'deleteReservation' && (data.id || data.reservationNumber)) {
+      var deletedRes = false;
+      if (data.id) {
+        deletedRes = deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'id', normalizeStr(data.id));
+      }
+      if (!deletedRes && data.reservationNumber) {
+        deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'reservationNumber', normalizeStr(data.reservationNumber));
+      }
+      applied++;
     } else if (action === 'appendFollowUp' && data.id) {
       upsertRecord(RG_SHEETS.FOLLOWUPS, 'id', data);
       applied++;
     } else if (action === 'upsertProblem' && data.id) {
-      var prbRec = Object.assign({}, data, {
+      var prbRec = cloneWithPatchEs5_(data, {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
       });
@@ -322,7 +367,7 @@ function handleNeonMirrorSync_(payload) {
       }
       applied++;
     } else if (action === 'upsertEmployee' && data.id) {
-      var empRec = Object.assign({}, data, {
+      var empRec = cloneWithPatchEs5_(data, {
         permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])
       });
       upsertRecord(RG_SHEETS.EMPLOYEES, 'id', empRec);

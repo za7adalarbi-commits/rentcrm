@@ -1,22 +1,10 @@
 import { verifySharedSecret } from '../backend/auth';
 import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from '../backend/db';
 import { getEnv } from '../backend/env';
+import { applyApiCorsHeaders, parseRequestBody } from '../backend/http';
 import { logBackendError } from '../backend/logger';
 import { ensureSeededDatabase } from '../backend/queries';
 import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch } from '../backend/syncService';
-
-function parseBody(rawBody: any): Record<string, any> {
-  if (!rawBody) return {};
-  if (typeof rawBody === 'string') {
-    try {
-      const parsed = JSON.parse(rawBody);
-      return parsed && typeof parsed === 'object' ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-  return typeof rawBody === 'object' ? rawBody : {};
-}
 
 function extractProvidedSecret(req: any, body: Record<string, any>): string {
   const headerSecret = String(req.headers?.['x-sync-secret'] || '').trim();
@@ -29,6 +17,8 @@ function extractProvidedSecret(req: any, body: Record<string, any>): string {
 }
 
 export default async function handler(req: any, res: any) {
+  applyApiCorsHeaders(req, res);
+
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -45,7 +35,7 @@ export default async function handler(req: any, res: any) {
   }
 
   const expectedSecret = String(getEnv('SYNC_API_SECRET') || '').trim();
-  const body = parseBody(req.body);
+  const body = parseRequestBody(req.body);
   const providedSecret = extractProvidedSecret(req, body);
 
   if (!expectedSecret || !verifySharedSecret(providedSecret, expectedSecret)) {

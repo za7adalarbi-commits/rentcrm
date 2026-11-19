@@ -865,7 +865,10 @@
             '</div>' +
 
             '<div class="form-group"><label class="form-label" for="ef-pass">' + (isEdit ? 'إعادة تعيين كلمة المرور (اختياري — اتركه فارغًا للإبقاء)' : 'كلمة المرور (6 أحرف على الأقل)') + '</label>' +
-              '<input class="input" type="password" id="ef-pass" ' + (isEdit ? '' : 'required minlength="6"') + '></div>' +
+              '<div class="password-field-wrap">' +
+                '<input class="input" type="password" id="ef-pass" dir="ltr" lang="en" autocomplete="new-password" ' + (isEdit ? '' : 'required minlength="6"') + '>' +
+                '<button type="button" class="password-toggle-btn" id="toggle-ef-pass" aria-pressed="false" aria-label="إظهار كلمة المرور">إظهار</button>' +
+              '</div></div>' +
             '<div id="emp-form-err" class="form-error hidden"></div>' +
             '<div class="modal-footer"><button type="submit" class="btn btn-primary">' + (isEdit ? 'حفظ التعديلات والصلاحيات' : 'إنشاء الحساب') + '</button></div>' +
           '</form>' +
@@ -1065,6 +1068,19 @@
           syncPresetButtonsState();
         });
       });
+
+      var efPassInput = document.getElementById('ef-pass');
+      var toggleEfPassBtn = document.getElementById('toggle-ef-pass');
+      if (efPassInput && toggleEfPassBtn) {
+        toggleEfPassBtn.addEventListener('click', function () {
+          var nextType = efPassInput.type === 'password' ? 'text' : 'password';
+          var isVisible = nextType === 'text';
+          efPassInput.type = nextType;
+          toggleEfPassBtn.textContent = isVisible ? 'إخفاء' : 'إظهار';
+          toggleEfPassBtn.setAttribute('aria-pressed', isVisible ? 'true' : 'false');
+          toggleEfPassBtn.setAttribute('aria-label', isVisible ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور');
+        });
+      }
 
       document.getElementById('emp-cancel').addEventListener('click', function () {
         modalRoot.innerHTML = '';

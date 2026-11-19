@@ -933,6 +933,22 @@ test('Auto-Connect helpers: validateDatabaseUrl, validateRgTokenFormat, buildCli
   assert.equal(norm.normalized.rgToken, 'TOKEN_SECRET_ABCDEFGHIJK');
 });
 
+test('Frontend cache policies, invalidation scopes, and mutation lock keys include customer & reservation CRUD', () => {
+  const custPolicy = core.getApiCachePolicy('getCustomers');
+  assert.equal(custPolicy.cacheable, true);
+  assert.equal(custPolicy.scope, 'customers');
 
+  assert.ok(core.getCacheInvalidationScopes('createCustomer').includes('customers'));
+  assert.ok(core.getCacheInvalidationScopes('updateCustomer').includes('customers'));
+  assert.ok(core.getCacheInvalidationScopes('deleteCustomer').includes('customers'));
+  assert.ok(core.getCacheInvalidationScopes('createReservation').includes('reservations'));
+  assert.ok(core.getCacheInvalidationScopes('createReservation').includes('customers'));
+  assert.ok(core.getCacheInvalidationScopes('deleteReservation').includes('reservations'));
+  assert.ok(core.getCacheInvalidationScopes('deleteReservation').includes('customers'));
 
-
+  assert.equal(core.buildMutationLockKey('createCustomer', { phone: '0501234567' }), 'createCustomer:0501234567');
+  assert.equal(core.buildMutationLockKey('updateCustomer', { customerId: 'CUST_9' }), 'updateCustomer:CUST_9');
+  assert.equal(core.buildMutationLockKey('deleteCustomer', { id: 'CUST_9' }), 'deleteCustomer:CUST_9');
+  assert.equal(core.buildMutationLockKey('createReservation', { reservationNumber: 'RG-909' }), 'createReservation:RG-909');
+  assert.equal(core.buildMutationLockKey('deleteReservation', { reservationId: 'RES_9' }), 'deleteReservation:RES_9');
+});

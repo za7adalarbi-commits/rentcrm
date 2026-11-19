@@ -73,6 +73,24 @@ function handleApiRequest(e, method) {
       case 'getReservationDetails':
         result = getReservationDetails(session, payload);
         break;
+      case 'getCustomers':
+        result = getCustomers(session, payload);
+        break;
+      case 'createCustomer':
+        result = createCustomer(session, payload);
+        break;
+      case 'updateCustomer':
+        result = updateCustomer(session, payload);
+        break;
+      case 'deleteCustomer':
+        result = deleteCustomer(session, payload);
+        break;
+      case 'createReservation':
+        result = createReservation(session, payload);
+        break;
+      case 'deleteReservation':
+        result = deleteReservation(session, payload);
+        break;
       case 'claimReservation':
         result = claimReservation(session, payload);
         break;
