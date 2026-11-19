@@ -124,7 +124,7 @@
                     '</button>'
                   ) : '') +
                 '</div>' +
-                '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;" class="mono">' + esc(e.phone || '') + '</div>' +
+                '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;" class="mono cell-phone" dir="ltr">' + esc(e.phone || '') + '</div>' +
               '</td>' +
               '<td class="mono">' + esc(e.username) + '</td>' +
               '<td>' + esc(e.jobTitle) + '</td>' +
@@ -687,7 +687,7 @@
           '<div class="modal-header">' +
             '<div><h3 class="modal-title" id="emp-drawer-title">' + esc(emp.name) + '</h3>' +
             '<div class="meta-inline"><span>' + esc(emp.jobTitle) + '</span><span>·</span><span>' + esc(roleLabels[emp.role] || emp.role) + '</span>' +
-            (emp.phone ? '<span>·</span><span class="mono">' + esc(emp.phone) + '</span>' : '') + '</div></div>' +
+            (emp.phone ? '<span>·</span><span class="mono cell-phone" dir="ltr">' + esc(emp.phone) + '</span>' : '') + '</div></div>' +
             '<button type="button" class="btn btn-sm" id="emp-drawer-close">إغلاق</button>' +
           '</div>' +
 
@@ -714,7 +714,7 @@
                         '<strong class="mono">' + esc(r.reservationNumber) + '</strong>' +
                         '<span>·</span>' +
                         '<strong>' + esc(r.customerName) + '</strong>' +
-                        '<span class="mono" style="color:var(--text-muted);font-size:12px;">' + esc(r.customerPhone) + '</span>' +
+                        '<span class="mono cell-phone" dir="ltr" style="color:var(--text-muted);font-size:12px;">' + esc(r.customerPhone) + '</span>' +
                       '</div>' +
                       '<span class="status-tag status-info">' + esc(r.internalStatus) + '</span>' +
                     '</div>' +

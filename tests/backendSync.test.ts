@@ -431,6 +431,14 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows, rowCount: rows.length };
     }
 
+    if (sql.startsWith('UPDATE reservations SET reservation_number = $2 WHERE id = $1')) {
+      const r = state.reservations.find((x) => x.id === params[0]);
+      if (r) {
+        r.reservation_number = params[1];
+      }
+      return { rows: [], rowCount: r ? 1 : 0 };
+    }
+
     if (sql.startsWith('INSERT INTO reservations (') && sql.includes('unnest(')) {
       const count = Array.isArray(params[0]) ? params[0].length : 0;
       const outRows: Array<{ inserted: boolean }> = [];
@@ -953,7 +961,7 @@ test('auth hashing matches Google Apps Script formula and verifySharedSecret is 
   assert.equal(verifySharedSecret('', ''), false);
 });
 
-test('incremental sync maps pickup status to ناشط, prevents duplicates, and resolves conflicts cleanly', async () => {
+test('incremental sync maps pickup status to نشط الآن, prevents duplicates, and resolves conflicts cleanly', async () => {
   const db = createInMemoryMockExecutor();
 
   // 1) First incremental batch: new reservation with CONFIRMED + paid extension
@@ -1025,7 +1033,7 @@ test('incremental sync maps pickup status to ناشط, prevents duplicates, and 
   assert.equal(db.state.reservations[0].priority, 'مرتفع');
   assert.deepEqual(db.state.reservations[0].assigned_employee_ids, ['EMP_AG1']);
 
-  // 3) Re-sync when Rental Gate moves car to pickup (ACTIVE / PICKED_UP) -> maps to 'ناشط' & appends stage + follow_up_history
+  // 3) Re-sync when Rental Gate moves car to pickup (ACTIVE / PICKED_UP) -> maps to 'نشط الآن' & appends stage + follow_up_history
   await ingestIncrementalSyncBatch(db, {
     source: 'google_apps_script',
     reservations: [
@@ -1038,15 +1046,15 @@ test('incremental sync maps pickup status to ناشط, prevents duplicates, and 
       }
     ]
   });
-  assert.equal(db.state.reservations[0].original_status_ar, 'ناشط');
-  assert.equal(db.state.reservations[0].internal_status, 'ناشط');
+  assert.equal(db.state.reservations[0].original_status_ar, 'نشط الآن');
+  assert.equal(db.state.reservations[0].internal_status, 'نشط الآن');
   assert.equal(db.state.reservations[0].status_history.length, 2);
-  assert.equal(db.state.reservations[0].status_history[1].newStatus, 'ناشط');
+  assert.equal(db.state.reservations[0].status_history[1].newStatus, 'نشط الآن');
   assert.equal(db.state.follow_up_history.length, 1);
-  assert.equal(db.state.follow_up_history[0].new_status, 'ناشط');
+  assert.equal(db.state.follow_up_history[0].new_status, 'نشط الآن');
 });
 
-test('router handles login, RBAC enforcement, search, quick status update, dashboard ' + 'ناشط' + ' count, and Sheets mirror outbox', async () => {
+test('router handles login, RBAC enforcement, search, quick status update, dashboard ' + 'نشط الآن' + ' count, and Sheets mirror outbox', async () => {
   const db = createInMemoryMockExecutor();
 
   const ping = await dispatchCrmRequest(db, { action: 'ping' });
@@ -1084,7 +1092,7 @@ test('router handles login, RBAC enforcement, search, quick status update, dashb
   assert.equal(forbiddenSettings.success, false);
   assert.ok(String(forbiddenSettings.error).startsWith('FORBIDDEN'));
 
-  // Sync reservation with PICKED_UP status -> ناشط
+  // Sync reservation with PICKED_UP status -> نشط الآن
   await ingestIncrementalSyncBatch(db, {
     source: 'google_apps_script',
     reservations: [
@@ -1106,15 +1114,15 @@ test('router handles login, RBAC enforcement, search, quick status update, dashb
   });
   assert.equal(searchRes.success, true);
   assert.equal(searchRes.data.total, 1);
-  assert.equal(searchRes.data.items[0].internalStatus, 'ناشط');
+  assert.equal(searchRes.data.items[0].internalStatus, 'نشط الآن');
 
-  // Dashboard tracks ناشط inside statusDistribution
+  // Dashboard tracks نشط الآن inside statusDistribution
   const dashRes = await dispatchCrmRequest(db, {
     action: 'getDashboard',
     token: adminToken
   });
   assert.equal(dashRes.success, true);
-  assert.equal(dashRes.data.charts.statusDistribution['ناشط'], 1);
+  assert.equal(dashRes.data.charts.statusDistribution['نشط الآن'], 1);
 
   // Quick update status enqueues Sheets backup mirror outbox
   const resId = searchRes.data.items[0].id;
@@ -1431,7 +1439,7 @@ test('bootstrap login, month range, dynamic sorting, full detail edits, employee
   assert.equal(db.state.reservations.length, 2);
   const resB = db.state.reservations.find((r) => r.reservation_number === 'RG-B-1001');
   assert.equal(resB.customer_name, 'عميل أول محدث');
-  assert.equal(resB.internal_status, 'ناشط');
+  assert.equal(resB.internal_status, 'نشط الآن');
 
   // 2. Single-round-trip login with includeBootstrap: true
   const loginBoot = await dispatchCrmRequest(db, {
@@ -2052,6 +2060,109 @@ test('ingestIncrementalSyncBatch prevents extensions_reservation_id_fkey violati
   assert.ok(linkedParent);
   assert.equal(orphanExt.reservation_id, linkedParent.id);
 });
+
+test('pullFromRentalGateDirect fetches multi-page results when totalPages is omitted and upgrades numeric IDs without duplicate rows', async () => {
+  const prevRg = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_live_test_token_paginated_12345';
+  const db = createInMemoryMockExecutor();
+
+  try {
+    // Pre-seed a reservation that previously stored bare numeric ID "91" and stale wrong status "جاهز للاستلام" on a HOLD status
+    db.state.reservations.push({
+      id: 'RES_91',
+      source_reservation_id: '91',
+      reservation_number: '91',
+      customer_name: 'أسامة يحيى',
+      original_status_code: 'hold',
+      original_status_ar: 'جاهز للاستلام',
+      internal_status: 'جاهز للاستلام',
+      last_update_text: 'تم السحب من Rental Gate بالحالة: جاهز للاستلام',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      status_history: [{ stageNumber: 1, source: 'api_pull', newStatus: 'جاهز للاستلام', changedAt: '2026-11-18T00:00:00Z' }],
+      created_at: new Date(),
+      updated_at: new Date()
+    });
+
+    // Omitted totalPages but explicit last: false on page 0 -> should continue to page 1
+    const payload0 = extractRentalGatePagePayload({
+      data: {
+        content: [{ reservationId: 91 }],
+        last: false
+      }
+    }, 0, 1);
+    assert.equal(payload0.isLast, false);
+    assert.equal(payload0.totalPages, null);
+
+    const mockFetch = (async (url: any) => {
+      const u = String(url);
+      if (u.includes('reservations/filter')) {
+        if (u.includes('page=0')) {
+          return new Response(JSON.stringify({
+            data: {
+              content: [
+                {
+                  reservationId: 91,
+                  reservationCode: 'RG-2026-0091',
+                  clientName: 'أسامة يحيى حكمي',
+                  clientMobile: '+966537544719',
+                  reservationStatus: 'HOLD',
+                  total: 3212.99
+                }
+              ],
+              last: false
+            }
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (u.includes('page=1')) {
+          return new Response(JSON.stringify({
+            data: {
+              content: [
+                {
+                  reservationId: 92,
+                  code: 'RG-2026-0092',
+                  clientName: 'ماجد السالم',
+                  clientMobile: '+966500112233',
+                  reservationStatus: 'ACTIVE',
+                  total: 800
+                }
+              ],
+              last: true
+            }
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      return new Response(JSON.stringify({ data: { content: [], last: true } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as any;
+
+    const pullRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'المدير العام', role: 'general_manager' },
+      {},
+      mockFetch
+    );
+
+    assert.equal(pullRes.fetchedCount, 2);
+    assert.equal(pullRes.importedCount, 1);
+    assert.equal(pullRes.updatedCount, 1);
+    assert.equal(db.state.reservations.length, 2);
+
+    const upgraded91 = db.state.reservations.find((r) => r.source_reservation_id === '91');
+    assert.ok(upgraded91);
+    assert.equal(upgraded91.reservation_number, 'RG-2026-0091');
+    assert.equal(upgraded91.original_status_ar, 'معلق');
+    assert.equal(upgraded91.internal_status, 'معلق');
+
+    const new92 = db.state.reservations.find((r) => r.source_reservation_id === '92');
+    assert.ok(new92);
+    assert.equal(new92.reservation_number, 'RG-2026-0092');
+    assert.equal(new92.original_status_ar, 'نشط الآن');
+  } finally {
+    if (prevRg === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRg;
+  }
+});
+
 
 
 

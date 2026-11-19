@@ -9,12 +9,15 @@ test('translates reservation statuses and delivery types accurately', () => {
   assert.equal(core.translateOriginalStatus('confirmed'), 'مؤكد');
   assert.equal(core.translateOriginalStatus('delivered'), 'تم التسليم');
   assert.equal(core.translateOriginalStatus('cancelled'), 'ملغي');
-  assert.equal(core.translateOriginalStatus('active'), 'ناشط');
-  assert.equal(core.translateOriginalStatus('picked_up'), 'ناشط');
-  assert.equal(core.translateOriginalStatus('received'), 'ناشط');
-  assert.equal(core.translateOriginalStatus('on_rent'), 'ناشط');
-  assert.equal(core.translateOriginalStatus('rented'), 'ناشط');
-  assert.equal(core.translateOriginalStatus('started'), 'بدأ التنفيذ');
+  assert.equal(core.translateOriginalStatus('active'), 'نشط الآن');
+  assert.equal(core.translateOriginalStatus('picked_up'), 'نشط الآن');
+  assert.equal(core.translateOriginalStatus('received'), 'نشط الآن');
+  assert.equal(core.translateOriginalStatus('on_rent'), 'نشط الآن');
+  assert.equal(core.translateOriginalStatus('rented'), 'نشط الآن');
+  assert.equal(core.translateOriginalStatus('started'), 'نشط الآن');
+  assert.equal(core.translateOriginalStatus('hold'), 'معلق');
+  assert.equal(core.translateOriginalStatus('on_hold'), 'معلق');
+  assert.equal(core.translateOriginalStatus('completed'), 'منتهي');
   assert.equal(core.translateDeliveryType('airport'), 'توصيل للمطار');
   assert.equal(core.translateDeliveryType('branch'), 'استلام من الفرع');
 });
@@ -330,8 +333,8 @@ test('API cache policy, stable cache key generation, and mutation invalidation s
 });
 
 test('supports real Rental Gate OpenAPI ReservationSummaryForFilterDto and ReservationExtendFilterResponseDTO shapes', () => {
-  assert.equal(core.translateOriginalStatus('IN_PROGRESS'), 'قيد التنفيذ');
-  assert.equal(core.translateOriginalStatus('STARTED'), 'بدأ التنفيذ');
+  assert.equal(core.translateOriginalStatus('IN_PROGRESS'), 'مؤكد');
+  assert.equal(core.translateOriginalStatus('STARTED'), 'نشط الآن');
   assert.equal(core.translateDeliveryType('MY_LOCATION'), 'توصيل لموقع العميل');
 
   assert.equal(core.isExtensionAcceptedAndPaid({
@@ -384,14 +387,14 @@ test('supports real Rental Gate OpenAPI ReservationSummaryForFilterDto and Reser
   assert.equal(synced.reservationNumber, '832');
   assert.equal(synced.customerName, 'سعود الشمري');
   assert.equal(synced.companyName, 'يلو لتأجير السيارات');
-  assert.equal(synced.originalStatusAr, 'بدأ التنفيذ');
+  assert.equal(synced.originalStatusAr, 'نشط الآن');
   assert.equal(synced.pickupTypeAr, 'توصيل للمطار');
   assert.equal(synced.baseAmount, 29.13);
   assert.equal(synced.extensionsAmount, 259.89);
   assert.equal(synced.totalAmount, 289.02);
-  assert.equal(synced.internalStatus, 'بدأ التنفيذ');
+  assert.equal(synced.internalStatus, 'نشط الآن');
   assert.equal(synced.statusHistory.length, 1);
-  assert.equal(synced.statusHistory[0].newStatus, 'بدأ التنفيذ');
+  assert.equal(synced.statusHistory[0].newStatus, 'نشط الآن');
   assert.equal(synced.statusHistory[0].source, 'api_pull');
 });
 
@@ -732,17 +735,18 @@ test('mergeSyncedReservation records status stages on re-pull and preserves hist
     [],
     { id: 'EMP_ADMIN', name: 'فهد' }
   );
-  assert.equal(startedPull.internalStatus, 'بدأ التنفيذ');
+  assert.equal(startedPull.internalStatus, 'نشط الآن');
   assert.equal(startedPull.statusHistory.length, 3);
   assert.equal(startedPull.statusHistory[2].stageNumber, 3);
   assert.equal(startedPull.statusHistory[2].previousStatus, 'مؤكد');
-  assert.equal(startedPull.statusHistory[2].newStatus, 'بدأ التنفيذ');
+  assert.equal(startedPull.statusHistory[2].newStatus, 'نشط الآن');
 
   assert.equal(core.isValidWorkflowStatus('مؤكد'), true);
-  assert.equal(core.isValidWorkflowStatus('بدأ التنفيذ'), true);
+  assert.equal(core.isValidWorkflowStatus('نشط الآن'), true);
+  assert.equal(core.isValidWorkflowStatus('معلق'), true);
   assert.equal(core.isValidWorkflowStatus('تم التسليم'), true);
   assert.equal(core.isValidWorkflowStatus('INVALID_STATUS'), false);
-  assert.ok(core.getWorkflowStatusOptions('مؤكد').includes('بدأ التنفيذ'));
+  assert.ok(core.getWorkflowStatusOptions('مؤكد').includes('نشط الآن'));
   assert.equal(core.formatStatusStageSourceLabel('api_pull'), 'سحب من Rental Gate');
 });
 
@@ -939,4 +943,69 @@ test('dedupe helpers retain Rental Gate DTOs keyed only by reservationId/extendI
   assert.equal(delScopes.includes('dashboard'), true);
   assert.equal(core.buildMutationLockKey('deleteEmployee', { employeeId: 'EMP_42' }), 'deleteEmployee:EMP_42');
 });
+
+test('extractReservationNumber prefers full booking code over numeric id and reconciles stale auto-synced statuses without overwriting manual updates', () => {
+  // 1) Full code priority over bare numeric reservationId
+  assert.equal(core.extractReservationNumber({ reservationId: 91, reservationCode: 'RG-2026-0091' }), 'RG-2026-0091');
+  assert.equal(core.extractReservationNumber({ id: 90, code: 'BKG-9020' }), 'BKG-9020');
+  assert.equal(core.extractReservationNumber({ reservationId: 79, reference: 'REF-7901' }), 'REF-7901');
+  assert.equal(core.extractReservationNumber({ reservationId: 832 }), '832');
+  assert.equal(core.extractSourceReservationId({ reservationId: 91, reservationCode: 'RG-2026-0091' }), '91');
+
+  // 2) Exact Rental Gate website Arabic status labels
+  assert.equal(core.translateOriginalStatus('HOLD'), 'معلق');
+  assert.equal(core.translateOriginalStatus('ON_HOLD'), 'معلق');
+  assert.equal(core.translateOriginalStatus('SUSPENDED'), 'معلق');
+  assert.equal(core.translateOriginalStatus('FINISHED_BY_DRIVER'), 'تم التسليم من قبل السائق');
+  assert.equal(core.translateOriginalStatus('CREATED'), 'قيد الانتظار');
+  assert.equal(core.translateOriginalStatus('PAID_BY_WALLET'), 'مدفوع عن طريق المحفظة');
+  assert.equal(core.translateOriginalStatus('ADMIN_APPROVED'), 'مقبول');
+
+  // 3) Stale auto-synced status reconciliation: "جاهز للاستلام" -> "معلق" when last update was system pull
+  const staleHold = {
+    id: 'RES_91',
+    sourceReservationId: '91',
+    reservationNumber: '91',
+    originalStatusCode: 'hold',
+    originalStatusAr: 'جاهز للاستلام',
+    internalStatus: 'جاهز للاستلام',
+    lastUpdateText: 'تم السحب من Rental Gate بالحالة: جاهز للاستلام',
+    statusHistory: [{ stageNumber: 1, source: 'api_pull', newStatus: 'جاهز للاستلام', changedAt: '2026-11-18T00:00:00Z' }]
+  };
+  assert.equal(core.shouldAutoReconcileSyncedStatus(staleHold, 'معلق', false), true);
+  const reconciled = core.mergeSyncedReservation(
+    staleHold,
+    { reservationId: 91, reservationCode: 'RG-2026-0091', reservationStatus: 'HOLD', clientName: 'أسامة', total: 500 },
+    [],
+    { id: 'EMP_ADMIN', name: 'النظام' }
+  );
+  assert.equal(reconciled.reservationNumber, 'RG-2026-0091');
+  assert.equal(reconciled.originalStatusAr, 'معلق');
+  assert.equal(reconciled.internalStatus, 'معلق');
+
+  // 4) Manual employee follow-up must NEVER be clobbered when source status hasn't changed
+  const manuallyUpdatedHold = {
+    id: 'RES_92',
+    sourceReservationId: '92',
+    reservationNumber: 'RG-2026-0092',
+    originalStatusCode: 'hold',
+    originalStatusAr: 'معلق',
+    internalStatus: 'تم الحجز',
+    lastUpdateText: 'تواصلت مع العميل وتم تأكيد المستندات',
+    statusHistory: [
+      { stageNumber: 1, source: 'api_pull', newStatus: 'معلق', changedAt: '2026-11-18T00:00:00Z' },
+      { stageNumber: 2, source: 'followup', newStatus: 'تم الحجز', changedAt: '2026-11-18T01:00:00Z' }
+    ]
+  };
+  assert.equal(core.shouldAutoReconcileSyncedStatus(manuallyUpdatedHold, 'معلق', false), false);
+  const preserved = core.mergeSyncedReservation(
+    manuallyUpdatedHold,
+    { reservationId: 92, reservationNumber: 'RG-2026-0092', reservationStatus: 'HOLD', clientName: 'محمد', total: 500 },
+    [],
+    { id: 'EMP_ADMIN', name: 'النظام' }
+  );
+  assert.equal(preserved.internalStatus, 'تم الحجز');
+  assert.equal(preserved.originalStatusAr, 'معلق');
+});
+
 

@@ -43,6 +43,10 @@
   .detail-summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .filter-grid.filter-grid-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 768px) {
@@ -132,6 +136,15 @@
 @media (max-width: 639px) {
   .kpi-grid {
     grid-template-columns: 1fr;
+  }
+
+  .filter-grid.filter-grid-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .filter-grid.filter-grid-4 > :first-child {
+    grid-column: 1 / -1;
   }
 
   .quick-status-bar {

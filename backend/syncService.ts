@@ -201,15 +201,15 @@ function normalizeIncomingReservation(
   nowIso: string
 ): { record: Record<string, any>; followUpHistoryEntry: Record<string, any> | null } {
   const isNormalizedCrmShape = Boolean(raw.reservationNumber && raw.customerName !== undefined && raw.originalStatusCode !== undefined);
-  const resNumber = str(raw.reservationNumber || raw.reservation_number || raw.reservationId || raw.id);
-  const srcResId = str(raw.sourceReservationId || raw.reservationId || raw.id || resNumber);
+  const srcResId = str(crmCore.extractSourceReservationId(raw));
+  const resNumber = str(crmCore.extractReservationNumber(raw) || srcResId);
   const resId = existingClient?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNumber.replace(/[^A-Za-z0-9_-]/g, '')}`);
 
-  const rawCode = str(raw.originalStatusCode || raw.reservationStatus || raw.status || raw.status_code).toLowerCase().replace(/\s+/g, '_');
+  const rawCode = str(crmCore.extractReservationStatusCode(raw, true));
   const translatedOrigAr = crmCore.translateOriginalStatus(rawCode);
   const sourceStatusAr = (translatedOrigAr && translatedOrigAr !== 'غير محدد')
     ? translatedOrigAr
-    : (str(raw.originalStatusAr || raw.statusAr) || 'تم الإنشاء');
+    : (str(raw.originalStatusAr || raw.statusAr) || rawCode || 'قيد الانتظار');
 
   // If payload comes from normalized CRM/GAS record, preserve precomputed fields cleanly;
   // if payload comes directly from Rental Gate API, compute via shared crmCore.mergeSyncedReservation.
@@ -218,16 +218,17 @@ function normalizeIncomingReservation(
     merged = {
       ...raw,
       id: resId,
-      sourceReservationId: srcResId,
+      sourceReservationId: srcResId || resNumber,
       reservationNumber: resNumber,
       originalStatusCode: rawCode,
-      originalStatusAr: translatedOrigAr !== 'غير محدد' ? translatedOrigAr : sourceStatusAr
+      originalStatusAr: sourceStatusAr
     };
   } else {
     merged = crmCore.mergeSyncedReservation(existingClient, raw, relatedExts, actor);
     merged.id = resId;
-    merged.sourceReservationId = srcResId;
+    merged.sourceReservationId = srcResId || resNumber;
     merged.reservationNumber = resNumber;
+    merged.originalStatusAr = sourceStatusAr;
   }
 
   let nextInternalStatus = str(merged.internalStatus || sourceStatusAr);
@@ -297,6 +298,23 @@ function normalizeIncomingReservation(
         newNotes: 'تحديث تلقائي للحالة عند إعادة السحب من Rental Gate',
         changedAt: nowIso
       };
+    } else if (crmCore.shouldAutoReconcileSyncedStatus(existingClient, sourceStatusAr)) {
+      // Reconcile stale auto-synced statuses (without overriding genuine manual employee follow-ups)
+      nextInternalStatus = sourceStatusAr;
+      nextLastUpdateText = `تم السحب من Rental Gate بالحالة: ${sourceStatusAr}`;
+      nextLastUpdatedById = actor.id;
+      nextLastUpdatedByName = actor.name;
+      nextLastUpdatedAt = nowIso;
+      nextStatusHistory = crmCore.appendStatusStageEntry(prevHist, {
+        source: 'api_pull',
+        previousStatus: prevInternal || prevOrigAr,
+        newStatus: sourceStatusAr,
+        sourceStatusCode: rawCode,
+        changedAt: nowIso,
+        changedById: actor.id,
+        changedByName: actor.name,
+        note: `تصحيح تلقائي للحالة وفق موقع Rental Gate: ${sourceStatusAr}`
+      });
     } else {
       // Source status did NOT change -> strictly preserve employee workflow fields
       nextInternalStatus = prevInternal || sourceStatusAr;
@@ -422,8 +440,8 @@ export async function ingestIncrementalSyncBatch(
   try {
     await executor.withTransaction(async (tx) => {
       const lookupNums = Array.from(new Set([
-        ...incomingRes.map((r) => str(r.reservationNumber || r.reservation_number || r.reservationId || r.id)),
-        ...incomingRes.map((r) => str(r.sourceReservationId || r.reservationId || r.id)),
+        ...incomingRes.map((r) => str(crmCore.extractReservationNumber(r))),
+        ...incomingRes.map((r) => str(crmCore.extractSourceReservationId(r))),
         ...incomingExt.map((e) => str(e.reservationNumber || e.reservation_number || e.reservationId)),
         ...incomingExt.map((e) => str(e.sourceReservationId || e.reservationId))
       ].filter(Boolean)));
@@ -466,9 +484,9 @@ export async function ingestIncrementalSyncBatch(
 
       // Pre-resolve reservation IDs for incoming reservations before linking extensions
       for (const raw of incomingRes) {
-        const resNum = str(raw.reservationNumber || raw.reservation_number || raw.reservationId || raw.id);
+        const resNum = str(crmCore.extractReservationNumber(raw));
         if (!resNum) continue;
-        const srcId = str(raw.sourceReservationId || raw.reservationId || raw.id || resNum);
+        const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
         const existing = existingByNumber.get(resNum) || existingBySourceId.get(srcId) || existingById.get(str(raw.id));
         const resId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
         knownDbResIds.add(resId);
@@ -500,10 +518,19 @@ export async function ingestIncrementalSyncBatch(
       const historyBatch: Record<string, any>[] = [];
 
       for (const raw of incomingRes) {
-        const resNum = str(raw.reservationNumber || raw.reservation_number || raw.reservationId || raw.id);
+        const resNum = str(crmCore.extractReservationNumber(raw));
         if (!resNum) continue;
-        const srcId = str(raw.sourceReservationId || raw.reservationId || raw.id || resNum);
-        const existing = existingByNumber.get(resNum) || null;
+        const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
+        const existing = existingByNumber.get(resNum) || existingBySourceId.get(srcId) || existingById.get(str(raw.id)) || null;
+        if (existing && existing.reservationNumber && existing.reservationNumber !== resNum && !existingByNumber.has(resNum)) {
+          await tx.query(
+            `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
+            [existing.id, resNum]
+          ).catch(() => undefined);
+          existingByNumber.delete(existing.reservationNumber);
+          existing.reservationNumber = resNum;
+          existingByNumber.set(resNum, existing);
+        }
         const seenExtNums = new Set<string>();
         const relExts: any[] = [];
         for (const candidate of [...(extsByResKey.get(resNum) || []), ...(srcId && srcId !== resNum ? (extsByResKey.get(srcId) || []) : [])]) {
@@ -1053,15 +1080,15 @@ export function extractRentalGatePagePayload(
   json: any,
   pageIndex = 0,
   pageSize = 100
-): { rows: any[]; totalPages: number; totalElements: number; isLast: boolean } {
+): { rows: any[]; totalPages: number | null; totalElements: number; isLast: boolean } {
   if (!json || typeof json !== 'object') {
-    return { rows: [], totalPages: 1, totalElements: 0, isLast: true };
+    return { rows: [], totalPages: null, totalElements: 0, isLast: true };
   }
 
   if (Array.isArray(json)) {
     return {
       rows: json,
-      totalPages: 1,
+      totalPages: null,
       totalElements: json.length,
       isLast: json.length < pageSize
     };
@@ -1115,8 +1142,8 @@ export function extractRentalGatePagePayload(
     json?.meta?.last_page ??
     json?.pagination?.last_page;
 
-  const hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
-  const totalPages = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : 1;
+  const hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && rawTotalPages !== '' && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
+  const totalPages: number | null = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : null;
 
   const rawTotalElements =
     metaHolder?.totalElements ??
@@ -1145,7 +1172,7 @@ export function extractRentalGatePagePayload(
     isLast = true;
   } else if (explicitLast === true || explicitHasMore === false) {
     isLast = true;
-  } else if (hasTotalPages) {
+  } else if (totalPages !== null) {
     isLast = pageIndex + 1 >= totalPages;
   } else if (explicitLast === false || explicitHasMore === true) {
     isLast = false;
@@ -1171,10 +1198,11 @@ export async function pullFromRentalGateDirect(
   const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
   const appliedRange = crmCore.resolvePullDateRange(payload || {});
   const pageSize = 100;
-  const maxPages = Math.min(50, Math.max(1, num(payload?.maxPages, 25)));
+  const maxPages = Math.min(250, Math.max(1, num(payload?.maxPages, 100)));
 
   const fetchPaged = async (endpoint: string, optional = false) => {
     const items: any[] = [];
+    const seenKeys = new Set<string>();
     let pages = 0;
     for (let page = 0; page < maxPages; page++) {
       const resp = await fetchFn(`${baseApi}/${endpoint}?page=${page}&size=${pageSize}`, {
@@ -1199,8 +1227,23 @@ export async function pullFromRentalGateDirect(
       }
       pages++;
       const parsedPage = extractRentalGatePagePayload(json, page, pageSize);
-      items.push(...parsedPage.rows);
-      if (parsedPage.isLast) break;
+      let added = 0;
+      for (const row of parsedPage.rows) {
+        const rowKey = str(
+          row?.extendId ||
+          row?.extensionNumber ||
+          row?.extension_number ||
+          crmCore.extractReservationNumber(row) ||
+          crmCore.extractSourceReservationId(row)
+        );
+        if (rowKey) {
+          if (seenKeys.has(rowKey)) continue;
+          seenKeys.add(rowKey);
+        }
+        items.push(row);
+        added++;
+      }
+      if (parsedPage.isLast || (parsedPage.rows.length > 0 && added === 0)) break;
     }
     return { items, pages };
   };

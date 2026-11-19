@@ -53,32 +53,47 @@
   var STATUS_TRANSLATIONS = {
     pending: 'قيد الانتظار',
     new: 'جديد',
-    created: 'تم الإنشاء',
+    created: 'قيد الانتظار',
     confirmed: 'مؤكد',
     booked: 'تم الحجز',
     reserved: 'تم الحجز',
-    active: 'ناشط',
-    started: 'بدأ التنفيذ',
-    in_progress: 'قيد التنفيذ',
+    active: 'نشط الآن',
+    started: 'نشط الآن',
+    in_progress: 'مؤكد',
     on_the_way: 'في الطريق',
     ready: 'جاهز للاستلام',
     ready_for_pickup: 'جاهز للاستلام',
+    ready_to_pickup: 'جاهز للاستلام',
     hold: 'معلق',
+    on_hold: 'معلق',
+    onhold: 'معلق',
+    suspended: 'معلق',
+    suspend: 'معلق',
+    paused: 'معلق',
+    pause: 'معلق',
+    frozen: 'معلق',
+    hold_by_admin: 'معلق',
+    admin_hold: 'معلق',
+    waiting_approval: 'معلق',
+    waiting_confirmation: 'معلق',
+    pending_approval: 'معلق',
+    pending_confirmation: 'معلق',
+    under_review: 'معلق',
     delivered: 'تم التسليم',
-    picked_up: 'ناشط',
-    received: 'ناشط',
-    on_rent: 'ناشط',
-    rented: 'ناشط',
-    car_received: 'ناشط',
-    ongoing: 'ناشط',
+    picked_up: 'نشط الآن',
+    received: 'نشط الآن',
+    on_rent: 'نشط الآن',
+    rented: 'نشط الآن',
+    car_received: 'نشط الآن',
+    ongoing: 'نشط الآن',
     returned: 'تم الإرجاع',
     extended: 'تم التمديد',
     automatically_extended: 'تم التمديد تلقائيًا',
-    completed: 'مكتمل',
-    finished: 'مكتمل',
+    completed: 'منتهي',
+    finished: 'منتهي',
     closed: 'منتهي',
     ended: 'منتهي',
-    finished_by_driver: 'مكتمل عبر السائق',
+    finished_by_driver: 'تم التسليم من قبل السائق',
     cancelled: 'ملغي',
     canceled: 'ملغي',
     declined: 'مرفوض',
@@ -89,11 +104,12 @@
     unpaid: 'غير مدفوع',
     waiting_payment: 'بانتظار الدفع',
     awaiting_payment: 'بانتظار الدفع',
+    pending_payment: 'بانتظار الدفع',
     paid: 'مدفوع',
-    wallet_paid: 'مدفوع بالمحفظة',
-    paid_by_wallet: 'مدفوع بالمحفظة',
-    paid_wallet: 'مدفوع بالمحفظة',
-    admin_approved: 'معتمد إداريًا',
+    wallet_paid: 'مدفوع عن طريق المحفظة',
+    paid_by_wallet: 'مدفوع عن طريق المحفظة',
+    paid_wallet: 'مدفوع عن طريق المحفظة',
+    admin_approved: 'مقبول',
     location_changed: 'تم تغيير الموقع',
     accepted: 'مقبول',
     approved: 'مقبول'
@@ -221,20 +237,112 @@
   }
 
   function translateOriginalStatus(code) {
-    var key = normalizeStr(code).toLowerCase().replace(/\s+/g, '_');
+    var key = normalizeStr(code).toLowerCase().replace(/[\s-]+/g, '_');
     return STATUS_TRANSLATIONS[key] || normalizeStr(code) || 'غير محدد';
+  }
+
+  function extractSourceReservationId(apiItem) {
+    var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+    var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+    return normalizeStr(
+      item.sourceReservationId ||
+      item.reservationId ||
+      item.reservation_id ||
+      nested.reservationId ||
+      nested.reservation_id ||
+      nested.id ||
+      item.id
+    );
+  }
+
+  function extractReservationNumber(apiItem) {
+    var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+    var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+    return normalizeStr(
+      item.reservationNumber ||
+      item.reservation_number ||
+      item.reservationNo ||
+      item.reservation_no ||
+      item.reservationCode ||
+      item.reservation_code ||
+      item.bookingNumber ||
+      item.booking_number ||
+      item.bookingCode ||
+      item.booking_code ||
+      item.contractNumber ||
+      item.contract_number ||
+      item.orderNumber ||
+      item.order_number ||
+      item.referenceNumber ||
+      item.reference_number ||
+      item.refNumber ||
+      item.ref_number ||
+      item.reference ||
+      item.code ||
+      item.serialNumber ||
+      item.serial_number ||
+      item.number ||
+      nested.reservationNumber ||
+      nested.reservation_number ||
+      nested.reservationCode ||
+      nested.code ||
+      nested.reference ||
+      extractSourceReservationId(item)
+    );
+  }
+
+  function extractReservationStatusCode(apiItem, preferOriginalCode) {
+    var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+    var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+    var raw = preferOriginalCode
+      ? (item.originalStatusCode || item.reservationStatus || item.status || item.status_code || item.bookingStatus || item.contractStatus || item.statusEn || nested.reservationStatus || nested.status)
+      : (item.reservationStatus || item.status || item.status_code || item.bookingStatus || item.contractStatus || item.statusEn || item.originalStatusCode || nested.reservationStatus || nested.status);
+    return normalizeStr(raw).toLowerCase().replace(/[\s-]+/g, '_');
   }
 
   function resolveSourceWorkflowStatus(apiItem) {
     var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
-    var statusCode = normalizeStr(item.reservationStatus || item.status || item.status_code).toLowerCase().replace(/\s+/g, '_');
+    var statusCode = extractReservationStatusCode(item, true);
     if (statusCode) {
       var translated = translateOriginalStatus(statusCode);
       if (translated && translated !== 'غير محدد') return translated;
     }
     var explicitAr = normalizeStr(item.originalStatusAr || item.statusAr);
     if (explicitAr && explicitAr !== 'غير محدد') return explicitAr;
-    return 'تم الإنشاء';
+    return statusCode || 'قيد الانتظار';
+  }
+
+  function shouldAutoReconcileSyncedStatus(existing, sourceStatusAr) {
+    if (!existing || typeof existing !== 'object') return false;
+    var nextSrc = normalizeStr(sourceStatusAr);
+    if (!nextSrc || nextSrc === 'غير محدد') return false;
+    var prevInternal = normalizeStr(existing.internalStatus);
+    if (!prevInternal) return true;
+    if (prevInternal === nextSrc) return false;
+
+    var history = normalizeStatusHistory(existing.statusHistory);
+    for (var i = 0; i < history.length; i++) {
+      var src = normalizeStr(history[i].source).toLowerCase();
+      if (src && src !== 'api_pull' && src !== 'gas_sync' && src !== 'system') {
+        return false;
+      }
+    }
+
+    var lastTxt = normalizeStr(existing.lastUpdateText);
+    var isAutoSyncText = !lastTxt ||
+      lastTxt.indexOf('تم السحب من Rental Gate') === 0 ||
+      lastTxt.indexOf('تم الاستيراد من Rental Gate') === 0 ||
+      lastTxt.indexOf('تحديث الحالة من Rental Gate') === 0 ||
+      lastTxt.indexOf('بانتظار') === 0;
+    if (!isAutoSyncText) return false;
+
+    var prevOrigAr = normalizeStr(existing.originalStatusAr);
+    var prevOrigCode = normalizeStr(existing.originalStatusCode);
+    var prevWasUntouchedMirror =
+      !prevOrigAr ||
+      prevInternal === prevOrigAr ||
+      (prevOrigCode && prevInternal.toLowerCase() === prevOrigCode.toLowerCase());
+    return Boolean(prevWasUntouchedMirror);
   }
 
   function isValidWorkflowStatus(status) {
@@ -561,9 +669,9 @@
   }
 
   function mergeSyncedReservation(existing, apiItem, acceptedExtensions, actor) {
-    var resApiId = normalizeStr(apiItem.reservationId || apiItem.id);
-    var resNumber = normalizeStr(apiItem.reservationNumber || apiItem.reservation_number || apiItem.code || apiItem.reference || resApiId);
-    var statusCode = normalizeStr(apiItem.reservationStatus || apiItem.status || apiItem.status_code).toLowerCase().replace(/\s+/g, '_');
+    var resApiId = extractSourceReservationId(apiItem);
+    var resNumber = extractReservationNumber(apiItem) || resApiId;
+    var statusCode = extractReservationStatusCode(apiItem, false);
 
     var rawStart = apiItem.startDate || apiItem.start_date || apiItem.pickup_date;
     var rawOrigEnd = apiItem.endDate || apiItem.end_date || apiItem.return_date || apiItem.actualEndDate;
@@ -661,6 +769,22 @@
           changedByName: actorName,
           note: nextLastUpdateText
         });
+      } else if (shouldAutoReconcileSyncedStatus(existing, sourceStatusAr)) {
+        nextInternalStatus = sourceStatusAr;
+        nextLastUpdateText = 'تم السحب من Rental Gate بالحالة: ' + sourceStatusAr;
+        nextLastUpdatedById = actorId;
+        nextLastUpdatedByName = actorName;
+        nextLastUpdatedAt = now;
+        nextStatusHistory = appendStatusStageEntry(prevHistory, {
+          source: 'api_pull',
+          previousStatus: prevInternalStatus || prevSourceAr,
+          newStatus: sourceStatusAr,
+          sourceStatusCode: statusCode,
+          changedAt: now,
+          changedById: actorId,
+          changedByName: actorName,
+          note: 'تصحيح تلقائي للحالة وفق موقع Rental Gate: ' + sourceStatusAr
+        });
       } else {
         nextInternalStatus = prevInternalStatus || sourceStatusAr;
         nextLastUpdateText = existing.lastUpdateText || ('تم الاستيراد من Rental Gate');
@@ -702,7 +826,7 @@
       extendedDaysCount: extendedDaysCount,
       totalDaysCount: totalDaysCount,
       originalStatusCode: statusCode,
-      originalStatusAr: translateOriginalStatus(statusCode),
+      originalStatusAr: sourceStatusAr,
       pickupTypeAr: translateDeliveryType(apiItem.receiveType || apiItem.pickup_type || apiItem.delivery_type),
       returnTypeAr: translateDeliveryType(apiItem.deliverType || apiItem.return_type || apiItem.dropoff_type),
       paymentMethod: normalizeStr(apiItem.paymentType || apiItem.paymentMethod || ''),
@@ -1352,15 +1476,7 @@
     for (var i = 0; i < list.length; i++) {
       var item = list[i];
       if (!item || typeof item !== 'object') continue;
-      var key = normalizeStr(
-        item.reservation_number ||
-        item.reservationNumber ||
-        item.reservationId ||
-        item.reservation_id ||
-        item.code ||
-        item.reference ||
-        item.id
-      );
+      var key = extractReservationNumber(item);
       if (!key) continue;
       if (!Object.prototype.hasOwnProperty.call(map, key)) {
         order.push(key);
@@ -2232,6 +2348,10 @@
     PROBLEM_STATUSES: PROBLEM_STATUSES,
     REPORT_COLUMNS_BY_TYPE: REPORT_COLUMNS_BY_TYPE,
     translateOriginalStatus: translateOriginalStatus,
+    extractSourceReservationId: extractSourceReservationId,
+    extractReservationNumber: extractReservationNumber,
+    extractReservationStatusCode: extractReservationStatusCode,
+    shouldAutoReconcileSyncedStatus: shouldAutoReconcileSyncedStatus,
     resolveSourceWorkflowStatus: resolveSourceWorkflowStatus,
     isValidWorkflowStatus: isValidWorkflowStatus,
     getWorkflowStatusOptions: getWorkflowStatusOptions,

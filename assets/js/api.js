@@ -1560,7 +1560,7 @@
         extendedDaysCount: 0,
         totalDaysCount: 2,
         originalStatusCode: 'completed',
-        originalStatusAr: 'مكتمل',
+        originalStatusAr: 'منتهي',
         pickupTypeAr: 'استلام من الفرع',
         returnTypeAr: 'تسليم في الفرع',
         paymentMethod: 'مدى (Mada)',
@@ -3399,7 +3399,7 @@
         var pullApiId = String(885000 + pullIdx);
         var pullNames = ['ياسر عبدالرحمن التميمي', 'سلطان فهد الشهري', 'ماجد سعد الزهراني', 'تركي ناصر العتيبي'];
         var pullCars = ['فورد تورس 2026', 'تويوتا كامري 2026', 'نيسان ألتيما 2026', 'كيا K5 2026'];
-        var pullStatuses = ['confirmed', 'started', 'booked', 'extended'];
+        var pullStatuses = ['hold', 'confirmed', 'started', 'completed', 'pending', 'extended'];
         var chosenPullDate = pullRange.dateFrom || todayIso(0);
         var origEndDateStr = (core.shiftIsoDateDays ? core.shiftIsoDateDays(chosenPullDate, 3) : todayIso(3)) + 'T10:30:00';
         var actualEndDateStr = (core.shiftIsoDateDays ? core.shiftIsoDateDays(chosenPullDate, 5) : todayIso(5)) + 'T10:30:00';

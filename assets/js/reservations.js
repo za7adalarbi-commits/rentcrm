@@ -27,6 +27,26 @@
     { key: 'lastUpdatedAt', label: 'التاريخ والوقت' }
   ];
 
+  var DEFAULT_VISIBLE_COLS = [
+    'reservationNumber',
+    'customerName',
+    'carName',
+    'startDate',
+    'totalAmount',
+    'originalStatusAr',
+    'internalStatus'
+  ];
+
+  var COLS_STORAGE_KEY = 'rg_crm_visible_cols_v4';
+
+  function loadSavedVisibleCols() {
+    try {
+      var parsed = JSON.parse(localStorage.getItem(COLS_STORAGE_KEY) || 'null');
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch (_e) {}
+    return DEFAULT_VISIBLE_COLS.slice();
+  }
+
   function esc(val) {
     return String(val === null || val === undefined ? '' : val)
       .replace(/&/g, '&amp;')
@@ -35,10 +55,21 @@
       .replace(/"/g, '&quot;');
   }
 
+  function formatCarNameDisplay(name) {
+    var s = String(name || '').trim();
+    if (!s) return '-';
+    return s
+      .replace(/\s*[-–—]+\s*/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+
   function statusClass(status) {
-    if (['تم الحجز', 'تم التسليم', 'تم الاستلام', 'مؤكد', 'مكتمل', 'مقبول', 'مدفوع', 'مدفوع بالمحفظة', 'معتمد إداريًا'].indexOf(status) !== -1) return 'status-success';
-    if (['تم التمديد', 'تم الإنشاء', 'جديد', 'قيد الانتظار', 'بدأ التنفيذ', 'قيد التنفيذ', 'ناشط', 'نشط', 'تم التمديد تلقائيًا', 'تم تغيير الموقع'].indexOf(status) !== -1) return 'status-info';
-    if (['لم يتم الحجز', 'تم الإلغاء', 'ملغي', 'مرفوض', 'منتهي', 'لم يحضر', 'غير مدفوع', 'معلق'].indexOf(status) !== -1) return 'status-warning';
+    if (['مؤكد', 'مقبول', 'تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم التسليم من قبل السائق', 'تم الإرجاع', 'مدفوع', 'مدفوع عن طريق المحفظة', 'مدفوع بالمحفظة', 'معتمد إداريًا'].indexOf(status) !== -1) return 'status-success';
+    if (['نشط الآن', 'قيد الانتظار', 'في الطريق', 'جديد', 'تم التمديد', 'تم التمديد تلقائيًا', 'تم تغيير الموقع', 'تم الإنشاء', 'ناشط', 'نشط', 'بدأ التنفيذ', 'قيد التنفيذ', 'جاهز للاستلام'].indexOf(status) !== -1) return 'status-info';
+    if (['معلق', 'بانتظار الدفع', 'لم يتم الحجز'].indexOf(status) !== -1) return 'status-warning';
+    if (['ملغي', 'تم الإلغاء', 'مرفوض', 'غير مدفوع'].indexOf(status) !== -1) return 'status-danger';
+    if (['منتهي', 'مكتمل', 'لم يحضر', 'مسودة'].indexOf(status) !== -1) return 'status-neutral';
     return 'status-neutral';
   }
 
@@ -82,7 +113,7 @@
     var currentUser = root.RGAuth.getUser();
     var currentEmpId = currentUser ? currentUser.id : '';
 
-    var defaultCols = JSON.parse(localStorage.getItem('rg_crm_visible_cols_v2') || 'null') || ALL_COLUMNS.map(function (c) { return c.key; });
+    var defaultCols = loadSavedVisibleCols();
     var state = Object.assign({
       search: '', company: '', branch: '', status: '', employeeId: '', priority: '',
       dateFrom: '', dateTo: '', unfollowedOnly: false, hasProblemsOnly: false,
@@ -137,7 +168,7 @@
             '</div>' +
           '</div>'
         ) : '') +
-        '<div class="filter-grid">' +
+        '<div class="filter-grid filter-grid-4">' +
           '<input type="search" class="input" id="res-search" placeholder="' + t('search_placeholder') + '" value="' + esc(state.search || '') + '">' +
           '<select class="select" id="res-company" aria-label="' + t('company') + '"><option value="">' + t('all_companies') + '</option>' +
             facets.companies.map(function (c) { return '<option value="' + esc(c) + '"' + (state.company === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') +
@@ -163,6 +194,10 @@
           '<button type="button" class="btn btn-sm" id="res-reset-filters">' + t('reset_filters') + '</button>' +
         '</div>' +
         '<div id="res-cols-panel" class="surface-card hidden" style="margin-bottom:14px;padding:12px;">' +
+          '<div class="cols-panel-header">' +
+            '<span>اختر الأعمدة الظاهرة في الجدول</span>' +
+            '<button type="button" class="btn btn-sm" id="res-cols-reset">استعادة العرض المرتب</button>' +
+          '</div>' +
           '<div class="checkbox-grid">' +
             ALL_COLUMNS.map(function (col) {
               var checked = state.visibleCols.indexOf(col.key) !== -1 ? 'checked' : '';
@@ -178,6 +213,8 @@
     function buildTableRegionHtml(data) {
       var list = data.items || [];
       var visibleCols = ALL_COLUMNS.filter(function (c) { return state.visibleCols.indexOf(c.key) !== -1; });
+      var colVisible = {};
+      visibleCols.forEach(function (c) { colVisible[c.key] = true; });
       return (list.length === 0
         ? '<div class="empty-state">لا توجد حجوزات مطابقة للفلاتر الحالية.</div>'
         : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
@@ -195,20 +232,48 @@
               var tds = visibleCols.map(function (c) {
                 var extCount = Number(r.extensionsCount || (r.hasExtensions ? 1 : 0));
                 if (c.key === 'reservationNumber') {
-                  return '<td class="mono"><button type="button" class="btn-link-inline btn-open-res" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber) + '</button>' +
-                    (extCount > 0 ? ' <span class="status-tag status-info tabular-nums">تمديد ×' + extCount + '</span>' : '') +
-                    (r.hasProblem ? ' <span class="status-tag status-danger">مشكلة</span>' : '') + '</td>';
+                  var badgeHtml = '';
+                  if (extCount > 0) badgeHtml += '<span class="status-tag status-info tabular-nums">تمديد ×' + extCount + '</span>';
+                  if (r.hasProblem) badgeHtml += '<span class="status-tag status-danger">مشكلة</span>';
+                  return '<td class="mono cell-res-num">' +
+                    '<div class="cell-res-head"><button type="button" class="btn-link-inline btn-open-res" dir="ltr" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber) + '</button></div>' +
+                    (badgeHtml ? '<div class="cell-badges">' + badgeHtml + '</div>' : '') +
+                  '</td>';
+                }
+                if (c.key === 'customerName') {
+                  var showSubPhone = !colVisible.customerPhone && r.customerPhone;
+                  return '<td class="cell-customer">' +
+                    '<div class="cell-primary">' + esc(r.customerName || '-') + '</div>' +
+                    (showSubPhone ? '<div class="cell-sub"><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span></div>' : '') +
+                  '</td>';
+                }
+                if (c.key === 'customerPhone') {
+                  return '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></td>';
+                }
+                if (c.key === 'carName') {
+                  var carLabel = formatCarNameDisplay(r.carName);
+                  var metaParts = [];
+                  if (!colVisible.companyName && r.companyName) metaParts.push(r.companyName);
+                  if (!colVisible.branchName && r.branchName) metaParts.push(r.branchName);
+                  return '<td class="cell-car">' +
+                    '<div class="cell-primary cell-car-name" title="' + esc(r.carName || '') + '">' + esc(carLabel) + '</div>' +
+                    (metaParts.length ? '<div class="cell-sub">' + esc(metaParts.join(' · ')) + '</div>' : '') +
+                  '</td>';
                 }
                 if (c.key === 'originalStatusAr') {
-                  return '<td><span class="status-tag ' + statusClass(r.originalStatusAr) + '">' + esc(r.originalStatusAr) + '</span></td>';
+                  return '<td><span class="status-tag ' + statusClass(r.originalStatusAr) + '">' + esc(r.originalStatusAr || '-') + '</span></td>';
                 }
                 if (c.key === 'internalStatus') {
+                  var subAssignee = !colVisible.assignedEmployeeNames
+                    ? (assignedNames.length ? assignedNames.join('، ') : 'متاح للاستلام')
+                    : '';
                   return '<td>' +
                     '<select class="quick-status-select tbl-quick-status" data-id="' + esc(r.id) + '" aria-label="تحديث حالة الحجز ' + esc(r.reservationNumber) + '">' +
                       (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(r.internalStatus) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
                         return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                       }).join('') +
                     '</select>' +
+                    (subAssignee ? '<div class="cell-sub" title="' + esc(subAssignee) + '">' + esc(subAssignee) + '</div>' : '') +
                   '</td>';
                 }
                 if (c.key === 'priority') {
@@ -218,7 +283,7 @@
                   if (!assignedNames.length) {
                     return '<td><span class="status-tag status-neutral">متاح للاستلام</span></td>';
                   }
-                  return '<td><div style="display:flex;flex-wrap:wrap;gap:4px;">' +
+                  return '<td><div class="cell-emp-chips">' +
                     assignedNames.map(function (n, idx) {
                       var isSelf = currentEmpId && assignedIds[idx] === currentEmpId;
                       return '<span class="status-tag ' + (isSelf ? 'status-success' : 'status-info') + '">' + esc(n) + '</span>';
@@ -226,8 +291,14 @@
                   '</div></td>';
                 }
                 if (c.key === 'startDate') {
-                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.startDate)) + '</div>' +
-                    (r.startTime ? '<div class="time-sub">' + esc(r.startTime) + '</div>' : '') + '</td>';
+                  var totStartDays = Number(r.totalDaysCount || r.daysCount || 1);
+                  var periodParts = [];
+                  if (!colVisible.endDate && r.endDate) periodParts.push('حتى ' + formatDateOnly(r.endDate));
+                  if (!colVisible.daysCount) periodParts.push(totStartDays + ' يوم');
+                  return '<td class="tabular-nums" style="white-space:nowrap;">' +
+                    '<div class="cell-primary mono" dir="ltr">' + esc(formatDateOnly(r.startDate)) + (r.startTime ? ' <span class="time-sub">' + esc(r.startTime) + '</span>' : '') + '</div>' +
+                    (periodParts.length ? '<div class="cell-sub">' + esc(periodParts.join(' · ')) + '</div>' : '') +
+                  '</td>';
                 }
                 if (c.key === 'endDate') {
                   var endTm = r.endTime || r.originalEndTime || '';
@@ -251,11 +322,26 @@
                     (r.extendedUntilTime ? '<div class="time-sub">' + esc(r.extendedUntilTime) + '</div>' : '') + '</td>';
                 }
                 if (c.key === 'extensionsAmount') {
-                  var extAmt = Number(r.extensionsAmount || 0);
-                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' + (extAmt > 0 ? (extAmt + ' ر.س') : '-') + '</td>';
+                  var extAmtCol = Number(r.extensionsAmount || 0);
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' + (extAmtCol > 0 ? (extAmtCol + ' ر.س') : '-') + '</td>';
                 }
                 if (c.key === 'totalAmount') {
-                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><strong>' + Number(r.totalAmount || 0) + ' ر.س</strong></td>';
+                  var extAmt = Number(r.extensionsAmount || 0);
+                  var showExtSub = (!colVisible.extensionsCount && extCount > 0) || (!colVisible.extensionsAmount && extAmt > 0);
+                  return '<td class="tabular-nums" style="white-space:nowrap;">' +
+                    '<div class="cell-primary"><strong>' + Number(r.totalAmount || 0) + ' ر.س</strong></div>' +
+                    (showExtSub ? '<div class="cell-sub">تمديد ×' + extCount + (extAmt > 0 ? ' (+' + extAmt + ' ر.س)' : '') + '</div>' : '') +
+                  '</td>';
+                }
+                if (c.key === 'lastUpdateText') {
+                  var txt = r.lastUpdateText || '-';
+                  var metaUpd = [];
+                  if (!colVisible.lastUpdatedByName && r.lastUpdatedByName) metaUpd.push(r.lastUpdatedByName);
+                  if (!colVisible.lastUpdatedAt && r.lastUpdatedAt) metaUpd.push(formatTimestamp(r.lastUpdatedAt));
+                  return '<td>' +
+                    '<div class="cell-clamp-2" title="' + esc(txt) + '">' + esc(txt) + '</div>' +
+                    (metaUpd.length ? '<div class="cell-sub tabular-nums">' + esc(metaUpd.join(' · ')) + '</div>' : '') +
+                  '</td>';
                 }
                 if (c.key === 'lastUpdatedAt') {
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(formatTimestamp(r.lastUpdatedAt)) + '</td>';
@@ -268,7 +354,7 @@
                 : '<button type="button" class="btn btn-sm btn-charcoal btn-claim-res" data-id="' + esc(r.id) + '" title="استلام الحجز عندي للمتابعة">استلام عندي</button>';
 
               return '<tr data-res-id="' + esc(r.id) + '">' + tds +
-                '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
+                '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   claimBtnHtml +
                   '<button type="button" class="btn btn-sm btn-primary btn-open-res" data-id="' + esc(r.id) + '">التفاصيل</button>' +
                 '</div></td>' +
@@ -285,6 +371,12 @@
     }
 
     function bindTableRegionEvents(region) {
+      var wrap = region.querySelector('.table-wrap');
+      var tbl = region.querySelector('.data-table');
+      if (wrap && tbl && tbl.scrollWidth > wrap.clientWidth + 4) {
+        tbl.classList.add('has-sticky-actions');
+      }
+
       region.querySelectorAll('th[data-sort]').forEach(function (th) {
         th.addEventListener('click', function () {
           var col = th.getAttribute('data-sort');
@@ -530,7 +622,7 @@
         var next = Array.from(container.querySelectorAll('.res-col-toggle:checked')).map(function (el) { return el.value; });
         if (next.length > 0) {
           state.visibleCols = next;
-          localStorage.setItem('rg_crm_visible_cols_v2', JSON.stringify(next));
+          localStorage.setItem(COLS_STORAGE_KEY, JSON.stringify(next));
           paintTableRegion({
             items: currentItems,
             total: Number((container.querySelector('#res-total-count') && container.querySelector('#res-total-count').textContent) || currentItems.length),
@@ -540,6 +632,24 @@
         }
       });
     });
+
+    var colsResetBtn = document.getElementById('res-cols-reset');
+    if (colsResetBtn) {
+      colsResetBtn.addEventListener('click', function () {
+        state.visibleCols = DEFAULT_VISIBLE_COLS.slice();
+        localStorage.setItem(COLS_STORAGE_KEY, JSON.stringify(state.visibleCols));
+        container.querySelectorAll('.res-col-toggle').forEach(function (chk) {
+          chk.checked = state.visibleCols.indexOf(chk.value) !== -1;
+        });
+        paintTableRegion({
+          items: currentItems,
+          total: Number((container.querySelector('#res-total-count') && container.querySelector('#res-total-count').textContent) || currentItems.length),
+          page: state.page,
+          totalPages: currentTotalPages
+        });
+        ctx.toast('تمت استعادة العرض المرتب للأعمدة الأساسية.');
+      });
+    }
 
     var pullPresetEl = document.getElementById('res-pull-preset');
     var pullDatesWrap = document.getElementById('res-pull-custom-dates');
@@ -622,7 +732,7 @@
       try {
         await root.RGReports.exportExcelWorkbook([{
           name: 'Reservations',
-          headers: ALL_COLUMNS.filter(function (c) { return state.visibleCols.indexOf(c.key) !== -1; }),
+          headers: ALL_COLUMNS.slice(),
           rows: currentItems
         }], 'rental-gate-reservations.xlsx');
         ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
@@ -802,13 +912,13 @@
           '<div class="drawer-panel">' +
             '<div class="modal-header">' +
               '<div>' +
-                '<h3 class="modal-title mono" id="drawer-res-title">حجز ' + esc(r.reservationNumber) +
-                  (r.sourceReservationId ? ' <span class="status-tag status-neutral">RG #' + esc(r.sourceReservationId) + '</span>' : '') +
+                '<h3 class="modal-title mono" id="drawer-res-title">حجز <span dir="ltr">' + esc(r.reservationNumber) + '</span>' +
+                  (r.sourceReservationId ? ' <span class="status-tag status-neutral" dir="ltr">RG #' + esc(r.sourceReservationId) + '</span>' : '') +
                 '</h3>' +
                 '<div class="meta-inline">' +
-                  '<span>' + esc(r.customerName) + '</span><span>·</span><span class="mono">' + esc(r.customerPhone) + '</span>' +
-                  (r.customerEmail ? '<span>·</span><span class="mono">' + esc(r.customerEmail) + '</span>' : '') +
-                  (r.customerIdNumber ? '<span>·</span><span class="mono">هوية: ' + esc(r.customerIdNumber) + '</span>' : '') +
+                  '<span>' + esc(r.customerName) + '</span><span>·</span><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' +
+                  (r.customerEmail ? '<span>·</span><span class="mono" dir="ltr">' + esc(r.customerEmail) + '</span>' : '') +
+                  (r.customerIdNumber ? '<span>·</span><span class="mono">هوية: <span dir="ltr">' + esc(r.customerIdNumber) + '</span></span>' : '') +
                 '</div>' +
               '</div>' +
               '<div class="toolbar-row" style="margin-bottom:0;">' +
@@ -821,7 +931,7 @@
             '</div>' +
 
             // Interactive Self-Service Claim / Unclaim & Quick Status Bar
-            '<div class="surface-card" style="padding:14px;border-inline-start:3px solid #d32228;display:flex;flex-direction:column;gap:12px;">' +
+            '<div class="surface-card" style="padding:14px;background:var(--bg-surface-subtle);display:flex;flex-direction:column;gap:12px;">' +
               '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
                 '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                   '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus) + '</span>' +

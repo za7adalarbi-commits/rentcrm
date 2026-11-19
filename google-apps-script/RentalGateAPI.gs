@@ -36,67 +36,95 @@ function parseRentalGateResponse_(res) {
   return safeJsonParse(text, {});
 }
 
-function extractPagePayload_(body, pageIndex) {
-  var rows = [];
-  var totalPages = 1;
-  var isLast = true;
+function pickRowsFromPayloadObj_(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  if (Array.isArray(obj)) return obj;
+  var keys = ['content', 'items', 'results', 'reservations', 'extensions', 'records', 'rows', 'list', 'data'];
+  for (var i = 0; i < keys.length; i++) {
+    if (Array.isArray(obj[keys[i]])) return obj[keys[i]];
+  }
+  return null;
+}
 
+function extractPagePayload_(body, pageIndex, pageSize) {
+  var size = pageSize ? Math.max(1, Number(pageSize) || 100) : 100;
+  if (!body || typeof body !== 'object') {
+    return { rows: [], totalPages: 1, hasTotalPages: false, isLast: true };
+  }
   if (Array.isArray(body)) {
-    rows = body;
-  } else if (body && typeof body === 'object') {
-    if (Array.isArray(body.content)) {
-      rows = body.content;
-      totalPages = toNumber(body.totalPages, 1);
-      isLast = body.last === true || (pageIndex + 1) >= totalPages;
-    } else if (Array.isArray(body.items)) {
-      rows = body.items;
-      totalPages = toNumber((body.meta && body.meta.last_page) || (body.pagination && body.pagination.last_page) || body.last_page || body.totalPages, 1);
-      isLast = body.last === true || (pageIndex + 1) >= totalPages;
-    } else if (Array.isArray(body.results)) {
-      rows = body.results;
-      totalPages = toNumber(body.totalPages || body.last_page || (body.meta && body.meta.last_page), 1);
-      isLast = body.last === true || (pageIndex + 1) >= totalPages;
-    } else if (Array.isArray(body.reservations)) {
-      rows = body.reservations;
-      totalPages = toNumber(body.totalPages || body.last_page, 1);
-      isLast = body.last === true || (pageIndex + 1) >= totalPages;
-    } else if (Array.isArray(body.extensions)) {
-      rows = body.extensions;
-      totalPages = toNumber(body.totalPages || body.last_page, 1);
-      isLast = body.last === true || (pageIndex + 1) >= totalPages;
-    } else if (body.data) {
-      if (Array.isArray(body.data)) {
-        rows = body.data;
-        totalPages = toNumber((body.meta && body.meta.last_page) || (body.pagination && body.pagination.last_page) || body.last_page || body.totalPages, 1);
-        isLast = body.last === true || (pageIndex + 1) >= totalPages;
-      } else if (Array.isArray(body.data.content)) {
-        rows = body.data.content;
-        totalPages = toNumber(body.data.totalPages, 1);
-        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
-      } else if (Array.isArray(body.data.data)) {
-        rows = body.data.data;
-        totalPages = toNumber(body.data.last_page || (body.data.meta && body.data.meta.last_page) || (body.data.pagination && body.data.pagination.last_page), 1);
-        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
-      } else if (Array.isArray(body.data.items)) {
-        rows = body.data.items;
-        totalPages = toNumber(body.data.totalPages || body.data.last_page || (body.data.meta && body.data.meta.last_page), 1);
-        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
-      } else if (Array.isArray(body.data.results)) {
-        rows = body.data.results;
-        totalPages = toNumber(body.data.totalPages || body.data.last_page, 1);
-        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
-      } else if (Array.isArray(body.data.reservations)) {
-        rows = body.data.reservations;
-        totalPages = toNumber(body.data.totalPages || body.data.last_page, 1);
-        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
-      } else if (Array.isArray(body.data.extensions)) {
-        rows = body.data.extensions;
-        totalPages = toNumber(body.data.totalPages || body.data.last_page, 1);
-        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+    return {
+      rows: body,
+      totalPages: 1,
+      hasTotalPages: false,
+      isLast: body.length < size
+    };
+  }
+
+  var metaHolder = body;
+  var rows = pickRowsFromPayloadObj_(body);
+  if (!rows) {
+    var containers = [body.data, body.result, body.payload, body.response, body.body];
+    for (var c = 0; c < containers.length; c++) {
+      var cont = containers[c];
+      if (cont && typeof cont === 'object') {
+        var nested = pickRowsFromPayloadObj_(cont);
+        if (nested) {
+          rows = nested;
+          metaHolder = cont;
+          break;
+        }
+        if (cont.data && typeof cont.data === 'object') {
+          var deep = pickRowsFromPayloadObj_(cont.data);
+          if (deep) {
+            rows = deep;
+            metaHolder = cont.data;
+            break;
+          }
+        }
       }
     }
   }
-  return { rows: rows, totalPages: totalPages, isLast: isLast };
+
+  var safeRows = Array.isArray(rows) ? rows : [];
+  var rawTotalPages =
+    (metaHolder && (metaHolder.totalPages !== undefined ? metaHolder.totalPages :
+      (metaHolder.total_pages !== undefined ? metaHolder.total_pages :
+      (metaHolder.last_page !== undefined ? metaHolder.last_page :
+      (metaHolder.meta && metaHolder.meta.last_page !== undefined ? metaHolder.meta.last_page :
+      (metaHolder.pagination && metaHolder.pagination.last_page !== undefined ? metaHolder.pagination.last_page : undefined)))))) !== undefined
+    ? (metaHolder.totalPages !== undefined ? metaHolder.totalPages :
+      (metaHolder.total_pages !== undefined ? metaHolder.total_pages :
+      (metaHolder.last_page !== undefined ? metaHolder.last_page :
+      (metaHolder.meta && metaHolder.meta.last_page !== undefined ? metaHolder.meta.last_page :
+      metaHolder.pagination.last_page))))
+    : (body.totalPages !== undefined ? body.totalPages :
+      (body.total_pages !== undefined ? body.total_pages :
+      (body.last_page !== undefined ? body.last_page :
+      (body.meta && body.meta.last_page !== undefined ? body.meta.last_page :
+      (body.pagination && body.pagination.last_page !== undefined ? body.pagination.last_page : undefined)))));
+
+  var hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
+  var totalPages = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : 1;
+
+  var explicitLast = (metaHolder && metaHolder.last !== undefined) ? metaHolder.last : body.last;
+  var explicitHasMore = (metaHolder && metaHolder.hasMore !== undefined)
+    ? metaHolder.hasMore
+    : ((metaHolder && metaHolder.has_more !== undefined) ? metaHolder.has_more : (body.hasMore !== undefined ? body.hasMore : body.has_more));
+
+  var isLast;
+  if (safeRows.length === 0) {
+    isLast = true;
+  } else if (explicitLast === true || explicitHasMore === false) {
+    isLast = true;
+  } else if (hasTotalPages) {
+    isLast = (pageIndex + 1) >= totalPages;
+  } else if (explicitLast === false || explicitHasMore === true) {
+    isLast = false;
+  } else {
+    isLast = safeRows.length < size;
+  }
+
+  return { rows: safeRows, totalPages: totalPages, hasTotalPages: hasTotalPages, isLast: isLast };
 }
 
 function callRentalGateEndpoint(url, token, pageZeroBased, size) {
@@ -109,49 +137,82 @@ function callRentalGateEndpoint(url, token, pageZeroBased, size) {
   return parseRentalGateResponse_(res);
 }
 
+function rowPageDedupKey_(row, kind) {
+  if (!row || typeof row !== 'object') return '';
+  if (kind === 'ext') {
+    return normalizeStr(row.extendId || row.extensionNumber || row.extension_number || row.id || row.code);
+  }
+  return extractReservationNumber_(row) || extractSourceReservationId_(row);
+}
+
+function appendUniquePageRows_(targetArr, seenMap, rows, kind) {
+  var added = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var k = rowPageDedupKey_(r, kind);
+    if (k) {
+      if (seenMap[k]) continue;
+      seenMap[k] = true;
+    }
+    targetArr.push(r);
+    added++;
+  }
+  return added;
+}
+
 function fetchAllRentalGatePages(url, token) {
   var allItems = [];
-  var maxPages = 100;
+  var seenMap = {};
+  var maxPages = 150;
   var pageSize = 100;
 
-  // Fetch page 0 first to discover totalPages
   var firstBody = callRentalGateEndpoint(url, token, 0, pageSize);
   var pagesFetched = 1;
-  var firstInfo = extractPagePayload_(firstBody, 0);
-  for (var f = 0; f < firstInfo.rows.length; f++) {
-    allItems.push(firstInfo.rows[f]);
-  }
+  var firstInfo = extractPagePayload_(firstBody, 0, pageSize);
+  appendUniquePageRows_(allItems, seenMap, firstInfo.rows, 'res');
 
-  if (firstInfo.isLast || firstInfo.rows.length === 0 || firstInfo.totalPages <= 1) {
+  if (firstInfo.isLast || firstInfo.rows.length === 0) {
     return { items: allItems, pagesFetched: pagesFetched };
   }
 
-  var lastPageIdx = Math.min(firstInfo.totalPages - 1, maxPages - 1);
-  var batchSize = 10;
-  for (var startPage = 1; startPage <= lastPageIdx; startPage += batchSize) {
-    var endPage = Math.min(startPage + batchSize - 1, lastPageIdx);
-    var reqs = [];
-    for (var p = startPage; p <= endPage; p++) {
-      reqs.push(buildRentalGateRequest_(url, token, p, pageSize));
-    }
-    var responses = UrlFetchApp.fetchAll(reqs);
-    pagesFetched += responses.length;
-    var stopEarly = false;
-    for (var r = 0; r < responses.length; r++) {
-      var info = extractPagePayload_(parseRentalGateResponse_(responses[r]), startPage + r);
-      for (var k = 0; k < info.rows.length; k++) {
-        allItems.push(info.rows[k]);
+  if (firstInfo.hasTotalPages && firstInfo.totalPages > 1) {
+    var lastPageIdx = Math.min(firstInfo.totalPages - 1, maxPages - 1);
+    var batchSize = 10;
+    for (var startPage = 1; startPage <= lastPageIdx; startPage += batchSize) {
+      var endPage = Math.min(startPage + batchSize - 1, lastPageIdx);
+      var reqs = [];
+      for (var p = startPage; p <= endPage; p++) {
+        reqs.push(buildRentalGateRequest_(url, token, p, pageSize));
       }
-      if (info.rows.length === 0) stopEarly = true;
+      var responses = UrlFetchApp.fetchAll(reqs);
+      pagesFetched += responses.length;
+      var stopEarly = false;
+      for (var r = 0; r < responses.length; r++) {
+        var info = extractPagePayload_(parseRentalGateResponse_(responses[r]), startPage + r, pageSize);
+        var added = appendUniquePageRows_(allItems, seenMap, info.rows, 'res');
+        if (info.isLast || info.rows.length === 0 || (info.rows.length > 0 && added === 0)) {
+          stopEarly = true;
+        }
+      }
+      if (stopEarly) break;
     }
-    if (stopEarly) break;
+    return { items: allItems, pagesFetched: pagesFetched };
+  }
+
+  // Fallback when totalPages is omitted by upstream API: page until isLast / empty / duplicate page
+  for (var page = 1; page < maxPages; page++) {
+    var pageBody = callRentalGateEndpoint(url, token, page, pageSize);
+    pagesFetched++;
+    var pageInfo = extractPagePayload_(pageBody, page, pageSize);
+    var pageAdded = appendUniquePageRows_(allItems, seenMap, pageInfo.rows, 'res');
+    if (pageInfo.isLast || pageInfo.rows.length === 0 || pageAdded === 0) break;
   }
 
   return { items: allItems, pagesFetched: pagesFetched };
 }
 
 function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
-  var maxPages = 100;
+  var maxPages = 150;
   var pageSize = 100;
 
   // Round 1: fetch page 0 of both reservations and extensions in parallel
@@ -160,24 +221,28 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
     buildRentalGateRequest_(resUrl, token, 0, pageSize)
   ]);
 
-  var extInfo0 = extractPagePayload_(parseRentalGateResponse_(firstBatch[0]), 0);
-  var resInfo0 = extractPagePayload_(parseRentalGateResponse_(firstBatch[1]), 0);
+  var extInfo0 = extractPagePayload_(parseRentalGateResponse_(firstBatch[0]), 0, pageSize);
+  var resInfo0 = extractPagePayload_(parseRentalGateResponse_(firstBatch[1]), 0, pageSize);
 
-  var extItems = extInfo0.rows.slice();
-  var resItems = resInfo0.rows.slice();
+  var extItems = [];
+  var resItems = [];
+  var extSeen = {};
+  var resSeen = {};
+  appendUniquePageRows_(extItems, extSeen, extInfo0.rows, 'ext');
+  appendUniquePageRows_(resItems, resSeen, resInfo0.rows, 'res');
   var pagesFetched = 2;
 
   var remainingReqs = [];
   var remainingMeta = [];
 
-  if (!extInfo0.isLast && extInfo0.rows.length > 0 && extInfo0.totalPages > 1) {
+  if (!extInfo0.isLast && extInfo0.rows.length > 0 && extInfo0.hasTotalPages && extInfo0.totalPages > 1) {
     var extLast = Math.min(extInfo0.totalPages - 1, maxPages - 1);
     for (var ep = 1; ep <= extLast; ep++) {
       remainingReqs.push(buildRentalGateRequest_(extUrl, token, ep, pageSize));
       remainingMeta.push({ kind: 'ext', page: ep });
     }
   }
-  if (!resInfo0.isLast && resInfo0.rows.length > 0 && resInfo0.totalPages > 1) {
+  if (!resInfo0.isLast && resInfo0.rows.length > 0 && resInfo0.hasTotalPages && resInfo0.totalPages > 1) {
     var resLast = Math.min(resInfo0.totalPages - 1, maxPages - 1);
     for (var rp = 1; rp <= resLast; rp++) {
       remainingReqs.push(buildRentalGateRequest_(resUrl, token, rp, pageSize));
@@ -185,7 +250,7 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
     }
   }
 
-  // Round 2+: fetch all remaining pages in larger parallel batches of 20
+  // Round 2+: fetch known remaining pages in parallel batches of 20
   var batchSize = 20;
   for (var start = 0; start < remainingReqs.length; start += batchSize) {
     var reqChunk = remainingReqs.slice(start, start + batchSize);
@@ -193,11 +258,29 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
     var responses = UrlFetchApp.fetchAll(reqChunk);
     pagesFetched += responses.length;
     for (var i = 0; i < responses.length; i++) {
-      var info = extractPagePayload_(parseRentalGateResponse_(responses[i]), metaChunk[i].page);
-      var targetArr = metaChunk[i].kind === 'ext' ? extItems : resItems;
-      for (var k = 0; k < info.rows.length; k++) {
-        targetArr.push(info.rows[k]);
-      }
+      var kind = metaChunk[i].kind;
+      var info = extractPagePayload_(parseRentalGateResponse_(responses[i]), metaChunk[i].page, pageSize);
+      appendUniquePageRows_(kind === 'ext' ? extItems : resItems, kind === 'ext' ? extSeen : resSeen, info.rows, kind);
+    }
+  }
+
+  // Fallback for endpoints that return hasMore / last:false without totalPages
+  if (!resInfo0.isLast && !resInfo0.hasTotalPages && resInfo0.rows.length > 0) {
+    for (var rPage = 1; rPage < maxPages; rPage++) {
+      var rBody = callRentalGateEndpoint(resUrl, token, rPage, pageSize);
+      pagesFetched++;
+      var rInfo = extractPagePayload_(rBody, rPage, pageSize);
+      var rAdded = appendUniquePageRows_(resItems, resSeen, rInfo.rows, 'res');
+      if (rInfo.isLast || rInfo.rows.length === 0 || rAdded === 0) break;
+    }
+  }
+  if (!extInfo0.isLast && !extInfo0.hasTotalPages && extInfo0.rows.length > 0) {
+    for (var ePage = 1; ePage < maxPages; ePage++) {
+      var eBody = callRentalGateEndpoint(extUrl, token, ePage, pageSize);
+      pagesFetched++;
+      var eInfo = extractPagePayload_(eBody, ePage, pageSize);
+      var eAdded = appendUniquePageRows_(extItems, extSeen, eInfo.rows, 'ext');
+      if (eInfo.isLast || eInfo.rows.length === 0 || eAdded === 0) break;
     }
   }
 
@@ -503,9 +586,12 @@ function runRentalGateSyncInternal(actor, options) {
 
       var existingReservations = readAllRecords(RG_SHEETS.RESERVATIONS, true);
       var existingByNumber = {};
+      var existingBySourceId = {};
       for (var r = 0; r < existingReservations.length; r++) {
         var rKey = normalizeStr(existingReservations[r].reservationNumber);
+        var sKey = normalizeStr(existingReservations[r].sourceReservationId);
         if (rKey) existingByNumber[rKey] = existingReservations[r];
+        if (sKey) existingBySourceId[sKey] = existingReservations[r];
       }
 
       var resSeenMap = {};
@@ -516,12 +602,12 @@ function runRentalGateSyncInternal(actor, options) {
 
       for (var i = 0; i < resItems.length; i++) {
         var item = resItems[i];
-        var resApiId = normalizeStr(item.reservationId || item.id);
-        var resNumber = normalizeStr(item.reservationNumber || item.reservation_number || item.code || item.reference || resApiId);
+        var resApiId = extractSourceReservationId_(item);
+        var resNumber = extractReservationNumber_(item) || resApiId;
         if (!resNumber || resSeenMap[resNumber]) continue;
         resSeenMap[resNumber] = true;
 
-        var statusCode = normalizeStr(item.reservationStatus || item.status || item.status_code).toLowerCase().replace(/\s+/g, '_');
+        var statusCode = extractReservationStatusCode_(item, false);
         if (excludedSet[statusCode]) {
           excludedFilteredCount++;
           continue;
@@ -540,7 +626,7 @@ function runRentalGateSyncInternal(actor, options) {
           }
         }
 
-        var existing = existingByNumber[resNumber];
+        var existing = existingByNumber[resNumber] || (resApiId ? existingBySourceId[resApiId] : null);
         var resId = existing ? existing.id : generateId('RES');
 
         var rawStart = item.startDate || item.start_date || item.pickup_date;
@@ -666,6 +752,22 @@ function runRentalGateSyncInternal(actor, options) {
               newNotes: 'تحديث تلقائي للحالة عند إعادة السحب من Rental Gate',
               changedAt: nowStr
             });
+          } else if (shouldAutoReconcileSyncedStatus_(existing, sourceStatusAr)) {
+            nextInternalStatus = sourceStatusAr;
+            nextLastUpdateText = 'تم السحب من Rental Gate بالحالة: ' + sourceStatusAr;
+            nextLastUpdatedById = actorId;
+            nextLastUpdatedByName = actorName;
+            nextLastUpdatedAt = nowStr;
+            nextStatusHistory = appendStatusStageEntry_(prevHist, {
+              source: 'api_pull',
+              previousStatus: prevInternal || prevOrigAr,
+              newStatus: sourceStatusAr,
+              sourceStatusCode: statusCode,
+              changedAt: nowStr,
+              changedById: actorId,
+              changedByName: actorName,
+              note: 'تصحيح تلقائي للحالة وفق موقع Rental Gate: ' + sourceStatusAr
+            });
           } else {
             nextInternalStatus = prevInternal || sourceStatusAr;
             nextLastUpdateText = existing.lastUpdateText || ('تم السحب من Rental Gate بالحالة: ' + sourceStatusAr);
@@ -707,7 +809,7 @@ function runRentalGateSyncInternal(actor, options) {
           extendedDaysCount: extendedDaysVal,
           totalDaysCount: totalDaysVal,
           originalStatusCode: statusCode,
-          originalStatusAr: translateOriginalStatus(statusCode),
+          originalStatusAr: sourceStatusAr,
           pickupTypeAr: translateDeliveryType(item.receiveType || item.pickup_type || item.delivery_type),
           returnTypeAr: translateDeliveryType(item.deliverType || item.return_type || item.dropoff_type),
           paymentMethod: normalizeStr(item.paymentType || item.paymentMethod || ''),

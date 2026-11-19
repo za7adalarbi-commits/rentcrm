@@ -856,9 +856,27 @@ html[data-theme="dark"] .nav-item.active {
 
 .filter-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
+}
+
+.filter-grid.filter-grid-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.cols-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-hairline);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-primary);
 }
 
 .table-wrap {
@@ -881,7 +899,7 @@ html[data-theme="dark"] .nav-item.active {
   font-weight: 600;
   font-size: 12px;
   text-align: start;
-  padding: 11px 12px;
+  padding: 9px 7px;
   border-bottom: 1px solid var(--border-hairline);
   white-space: nowrap;
   user-select: none;
@@ -896,7 +914,7 @@ html[data-theme="dark"] .nav-item.active {
 }
 
 .data-table td {
-  padding: 10px 12px;
+  padding: 9px 7px;
   border-bottom: 1px solid var(--border-hairline);
   vertical-align: middle;
   color: var(--text-primary);
@@ -915,6 +933,127 @@ html[dir="ltr"] .data-table td.mono {
 
 .data-table td .status-tag {
   white-space: nowrap;
+}
+
+.cell-primary {
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.cell-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 170px;
+}
+
+.cell-phone {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline-block;
+}
+
+.cell-res-num {
+  min-width: 108px;
+}
+
+.cell-res-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+html[dir="ltr"] .cell-res-head {
+  justify-content: flex-start;
+}
+
+.cell-badges {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+}
+
+html[dir="ltr"] .cell-badges {
+  justify-content: flex-start;
+}
+
+.cell-customer {
+  min-width: 118px;
+  max-width: 165px;
+}
+
+.cell-car {
+  min-width: 128px;
+  max-width: 175px;
+}
+
+.cell-car-name {
+  max-width: 170px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-emp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 170px;
+}
+
+.cell-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 220px;
+  min-width: 145px;
+  line-height: 1.45;
+  white-space: normal;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.data-table td .quick-status-select {
+  max-width: 126px;
+}
+
+.table-actions-cell {
+  white-space: nowrap;
+}
+
+.data-table.has-sticky-actions th:last-child,
+.data-table.has-sticky-actions td:last-child {
+  position: sticky;
+  inset-inline-end: 0;
+  background: var(--bg-surface);
+  border-inline-start: 1px solid var(--border-hairline);
+  box-shadow: 6px 0 12px -8px rgba(15, 23, 42, 0.16);
+  z-index: 2;
+}
+
+html[dir="ltr"] .data-table.has-sticky-actions th:last-child,
+html[dir="ltr"] .data-table.has-sticky-actions td:last-child {
+  box-shadow: -6px 0 12px -8px rgba(15, 23, 42, 0.16);
+}
+
+.data-table.has-sticky-actions th:last-child {
+  background: var(--bg-surface-subtle);
+  z-index: 3;
+}
+
+.data-table.has-sticky-actions tbody tr:hover td:last-child {
+  background: var(--bg-hover);
 }
 
 .data-table tbody tr:last-child td {
@@ -1396,7 +1535,6 @@ svg.rg-spinning {
   padding: 10px 14px;
   margin-bottom: 14px;
   border: 1px solid var(--border-hairline);
-  border-inline-start: 3px solid var(--brand-primary);
   border-radius: var(--radius-sm);
   background: var(--bg-surface-subtle);
 }

@@ -12,6 +12,14 @@
       .replace(/"/g, '&quot;');
   }
 
+  function statusClass(status) {
+    if (['مؤكد', 'مقبول', 'تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم التسليم من قبل السائق', 'تم الإرجاع', 'مدفوع', 'مدفوع عن طريق المحفظة', 'مدفوع بالمحفظة', 'معتمد إداريًا'].indexOf(status) !== -1) return 'status-success';
+    if (['نشط الآن', 'قيد الانتظار', 'في الطريق', 'جديد', 'تم التمديد', 'تم التمديد تلقائيًا', 'تم تغيير الموقع', 'تم الإنشاء', 'ناشط', 'نشط', 'بدأ التنفيذ', 'قيد التنفيذ', 'جاهز للاستلام'].indexOf(status) !== -1) return 'status-info';
+    if (['معلق', 'بانتظار الدفع', 'لم يتم الحجز'].indexOf(status) !== -1) return 'status-warning';
+    if (['ملغي', 'تم الإلغاء', 'مرفوض', 'غير مدفوع'].indexOf(status) !== -1) return 'status-danger';
+    return 'status-neutral';
+  }
+
   async function renderMyFollowUps(container, ctx) {
     var t = ctx.t;
     var [res, empRes] = await Promise.all([
@@ -39,9 +47,9 @@
             '</tr></thead><tbody>' +
               assigned.map(function (r) {
                 return '<tr>' +
-                  '<td class="mono"><strong>' + esc(r.reservationNumber) + '</strong></td>' +
+                  '<td class="mono"><strong dir="ltr">' + esc(r.reservationNumber) + '</strong></td>' +
                   '<td>' + esc(r.customerName) + '</td>' +
-                  '<td class="mono">' + esc(r.customerPhone) + '</td>' +
+                  '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span></td>' +
                   '<td>' + esc(r.companyName) + '</td>' +
                   '<td>' + esc(r.carName) + '</td>' +
                   '<td>' +
@@ -51,8 +59,8 @@
                       }).join('') +
                     '</select>' +
                   '</td>' +
-                  '<td>' + esc(r.lastUpdateText || '-') + '</td>' +
-                  '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
+                  '<td><div class="cell-clamp-2" title="' + esc(r.lastUpdateText || '') + '">' + esc(r.lastUpdateText || '-') + '</div></td>' +
+                  '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                     '<button type="button" class="btn btn-sm btn-primary myfu-open" data-id="' + esc(r.id) + '">متابعة / تفاصيل</button>' +
                     '<button type="button" class="btn btn-sm btn-danger myfu-unclaim" data-id="' + esc(r.id) + '">إلغاء الاستلام</button>' +
                   '</div></td>' +
@@ -67,8 +75,8 @@
           : '<div class="timeline-list">' + followUps.map(function (f) {
               return '<div class="timeline-item">' +
                 '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
-                  '<button type="button" class="btn-link-inline mono myfu-open" data-id="' + esc(f.reservationId) + '">' + esc(f.reservationNumber) + ' — ' + esc(f.customerName) + '</button>' +
-                  '<span class="status-tag status-info">' + esc(f.status) + '</span>' +
+                  '<button type="button" class="btn-link-inline mono myfu-open" data-id="' + esc(f.reservationId) + '"><span dir="ltr">' + esc(f.reservationNumber) + '</span> — ' + esc(f.customerName) + '</button>' +
+                  '<span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span>' +
                 '</div>' +
                 '<div>' + esc(f.action) + '</div>' +
                 (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + esc(f.notes) + '</div>' : '') +
@@ -203,10 +211,10 @@
                     var story = r.latestFollowUp ? (r.latestFollowUp.status + ': ' + r.latestFollowUp.action) : (r.lastUpdateText || 'بانتظار المتابعة');
                     return '<button type="button" class="interactive-res-card tfu-open-res" data-res-id="' + esc(r.id) + '">' +
                       '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;">' +
-                        '<strong class="mono">' + esc(r.reservationNumber) + '</strong>' +
-                        '<span class="status-tag status-info">' + esc(r.internalStatus) + '</span>' +
+                        '<strong class="mono" dir="ltr">' + esc(r.reservationNumber) + '</strong>' +
+                        '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus) + '</span>' +
                       '</div>' +
-                      '<div style="font-weight:600;">' + esc(r.customerName) + ' <span class="mono" style="font-size:12px;color:var(--text-muted);">(' + esc(r.customerPhone) + ')</span></div>' +
+                      '<div style="font-weight:600;">' + esc(r.customerName) + ' <span class="mono cell-phone" dir="ltr" style="font-size:12px;color:var(--text-muted);">(' + esc(r.customerPhone) + ')</span></div>' +
                       '<div class="res-story-box"><strong>ما حدث:</strong> ' + esc(story) + '</div>' +
                       '<div style="font-size:12px;color:var(--brand-primary);font-weight:700;">عرض تفاصيل الحجز ←</div>' +
                     '</button>';
@@ -221,14 +229,14 @@
             '</tr></thead><tbody>' +
               items.map(function (f) {
                 return '<tr>' +
-                  '<td class="mono"><button type="button" class="btn-link-inline tfu-open-res" data-res-id="' + esc(f.reservationId) + '">' + esc(f.reservationNumber) + '</button></td>' +
+                  '<td class="mono"><button type="button" class="btn-link-inline tfu-open-res" dir="ltr" data-res-id="' + esc(f.reservationId) + '">' + esc(f.reservationNumber) + '</button></td>' +
                   '<td>' + esc(f.customerName) + '</td>' +
                   '<td><button type="button" class="btn-link-inline tfu-open-emp" data-emp-id="' + esc(f.employeeId) + '">' + esc(f.employeeName) + '</button></td>' +
-                  '<td><span class="status-tag status-info">' + esc(f.status) + '</span></td>' +
-                  '<td>' + esc(f.action) + '</td>' +
-                  '<td>' + esc(f.notes || '-') + '</td>' +
+                  '<td><span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span></td>' +
+                  '<td><div class="cell-clamp-2" title="' + esc(f.action || '') + '">' + esc(f.action) + '</div></td>' +
+                  '<td><div class="cell-clamp-2" title="' + esc(f.notes || '') + '">' + esc(f.notes || '-') + '</div></td>' +
                   '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + ' ' + esc(f.followUpTime) + '</td>' +
-                  '<td><button type="button" class="btn btn-sm btn-primary tfu-open-res" data-res-id="' + esc(f.reservationId) + '">التفاصيل</button></td>' +
+                  '<td class="table-actions-cell"><button type="button" class="btn btn-sm btn-primary tfu-open-res" data-res-id="' + esc(f.reservationId) + '">التفاصيل</button></td>' +
                 '</tr>';
               }).join('') +
             '</tbody></table></div>') +
