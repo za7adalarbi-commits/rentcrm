@@ -42,8 +42,134 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     error_logs: []
   };
 
+  function filterMockReservations(sql: string, params: any[], paramLimit?: number): any[] {
+    let list = state.reservations.slice();
+    const limit = typeof paramLimit === 'number' ? paramLimit : params.length;
+    const afterFrom = sql.split(/\bFROM\s+reservations(?:\s+r)?\b/i)[1] || sql;
+    const whereSegment = (afterFrom.split(/\bWHERE\b/i)[1] || '').split(/\b(?:ORDER BY|GROUP BY|LIMIT)\b/i)[0] || '';
+    const refMatches = Array.from(whereSegment.matchAll(/\$(\d+)/g));
+    const idxSet = new Set(refMatches.map((m) => Number(m[1]) - 1).filter((idx) => idx >= 0 && idx < limit));
+
+    if (whereSegment.includes('assigned_employee_ids @>') && idxSet.size > 0) {
+      for (const idx of idxSet) {
+        const p = params[idx];
+        if (typeof p === 'string' && p.startsWith('[')) {
+          try {
+            const arr = JSON.parse(p);
+            if (Array.isArray(arr) && arr.length > 0) {
+              if (whereSegment.includes('EXISTS (SELECT 1 FROM follow_ups')) {
+                list = list.filter((r) =>
+                  arr.every((eid: string) => (r.assigned_employee_ids || []).includes(eid)) ||
+                  state.follow_ups.some((f) => f.reservation_id === r.id && arr.includes(f.employee_id))
+                );
+              } else {
+                list = list.filter((r) => arr.every((eid: string) => (r.assigned_employee_ids || []).includes(eid)));
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    const fromMatch = whereSegment.match(/(?:start_date|COALESCE\(.+?\))\s*>=\s*\$(\d+)/);
+    if (fromMatch) {
+      const df = String(params[Number(fromMatch[1]) - 1] || '');
+      if (df) {
+        list = list.filter((r) => {
+          const eff = r.start_date || (r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at || '').slice(0, 10));
+          return eff >= df;
+        });
+      }
+    }
+
+    const toMatch = whereSegment.match(/(?:start_date|COALESCE\(.+?\))\s*<=\s*\$(\d+)/);
+    if (toMatch) {
+      const dt = String(params[Number(toMatch[1]) - 1] || '');
+      if (dt) {
+        list = list.filter((r) => {
+          const eff = r.start_date || (r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at || '').slice(0, 10));
+          return eff <= dt;
+        });
+      }
+    }
+
+    const statusMatch = whereSegment.match(/r\.internal_status\s*=\s*\$(\d+)/);
+    if (statusMatch) {
+      const st = String(params[Number(statusMatch[1]) - 1] || '');
+      list = list.filter((r) => r.internal_status === st);
+    }
+
+    const prioMatch = whereSegment.match(/r\.priority\s*=\s*\$(\d+)/);
+    if (prioMatch) {
+      const pr = String(params[Number(prioMatch[1]) - 1] || '');
+      list = list.filter((r) => r.priority === pr);
+    }
+
+    const compMatch = whereSegment.match(/r\.company_name\s*=\s*\$(\d+)/);
+    if (compMatch) {
+      const co = String(params[Number(compMatch[1]) - 1] || '');
+      list = list.filter((r) => r.company_name === co);
+    }
+
+    const branchMatch = whereSegment.match(/r\.branch_name\s*=\s*\$(\d+)/);
+    if (branchMatch) {
+      const br = String(params[Number(branchMatch[1]) - 1] || '');
+      list = list.filter((r) => r.branch_name === br);
+    }
+
+    if (whereSegment.includes('r.has_problem = TRUE')) {
+      list = list.filter((r) => Boolean(r.has_problem));
+    }
+    if (whereSegment.includes('r.has_extensions = TRUE')) {
+      list = list.filter((r) => Boolean(r.has_extensions));
+    }
+    if (whereSegment.includes('NOT EXISTS (SELECT 1 FROM follow_ups')) {
+      list = list.filter((r) => !state.follow_ups.some((f) => f.reservation_id === r.id));
+    }
+
+    const searchMatch = whereSegment.match(/r\.reservation_number ILIKE \$(\d+)/);
+    if (searchMatch) {
+      const needle = String(params[Number(searchMatch[1]) - 1] || '').replace(/%/g, '').toLowerCase();
+      list = list.filter((r) =>
+        String(r.reservation_number || '').toLowerCase().includes(needle) ||
+        String(r.customer_name || '').toLowerCase().includes(needle) ||
+        String(r.customer_phone || '').toLowerCase().includes(needle) ||
+        String(r.car_name || '').toLowerCase().includes(needle) ||
+        String(r.plate_number || '').toLowerCase().includes(needle) ||
+        String(r.branch_name || '').toLowerCase().includes(needle) ||
+        String(r.company_name || '').toLowerCase().includes(needle)
+      );
+    }
+
+    return list;
+  }
+
+  function sortMockReservations(sql: string, list: any[]): any[] {
+    const orderMatch = sql.match(/ORDER BY\s+r\.(\w+)\s+(ASC|DESC)/i);
+    if (!orderMatch) return list;
+    const col = orderMatch[1];
+    const dir = orderMatch[2].toUpperCase() === 'ASC' ? 1 : -1;
+    return list.slice().sort((a, b) => {
+      const va = a[col];
+      const vb = b[col];
+      if (va instanceof Date || vb instanceof Date) {
+        return ((va ? new Date(va).getTime() : 0) - (vb ? new Date(vb).getTime() : 0)) * dir;
+      }
+      if (typeof va === 'number' || typeof vb === 'number') {
+        return (Number(va || 0) - Number(vb || 0)) * dir;
+      }
+      return String(va || '').localeCompare(String(vb || '')) * dir;
+    });
+  }
+
   async function runQuery<T extends Record<string, any> = any>(sqlRaw: string, params: any[] = []): Promise<QueryResult<T>> {
     const sql = sqlRaw.replace(/\s+/g, ' ').trim();
+
+    if (sql.startsWith('CREATE INDEX IF NOT EXISTS')) {
+      return { rows: [], rowCount: 0 };
+    }
 
     if (sql.includes("to_regclass('public.employees')")) {
       return { rows: [{ reg: 'employees' }] as any[], rowCount: 1 };
@@ -97,6 +223,19 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: [], rowCount: 1 };
     }
 
+    if (sql.startsWith('SELECT * FROM roles')) {
+      return { rows: state.roles as any[], rowCount: state.roles.length };
+    }
+
+    if (sql.startsWith('SELECT * FROM permissions')) {
+      return { rows: state.permissions as any[], rowCount: state.permissions.length };
+    }
+
+    if (sql.startsWith('SELECT * FROM employees WHERE id = $1')) {
+      const rows = state.employees.filter((e) => e.id === params[0]);
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
     if (sql.startsWith('SELECT * FROM employees WHERE LOWER(username)')) {
       const uname = String(params[0] || '').toLowerCase();
       return { rows: state.employees.filter((e) => e.username.toLowerCase() === uname) as any[], rowCount: 1 };
@@ -104,6 +243,16 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
 
     if (sql.startsWith('SELECT * FROM employees ORDER BY')) {
       return { rows: state.employees as any[], rowCount: state.employees.length };
+    }
+
+    if (sql.startsWith('SELECT id, name, job_title, role, last_activity FROM employees')) {
+      return { rows: state.employees as any[], rowCount: state.employees.length };
+    }
+
+    if (sql.startsWith('SELECT id, name FROM employees WHERE id = ANY')) {
+      const ids: string[] = params[0] || [];
+      const rows = state.employees.filter((e) => ids.includes(e.id));
+      return { rows: rows as any[], rowCount: rows.length };
     }
 
     if (sql === 'SELECT * FROM employees') {
@@ -181,7 +330,11 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     }
 
     if (sql.startsWith('INSERT INTO activity_log')) {
-      state.activity_log.push({ id: params[0], user_id: params[1], user_name: params[2], action_type: params[4], entity_id: params[6], created_at: new Date() });
+      state.activity_log.push({
+        id: params[0], user_id: params[1], user_name: params[2], user_role: params[3],
+        action_type: params[4], entity_type: params[5], entity_id: params[6], details: params[7],
+        log_date: params[8], log_time: params[9], created_at: new Date()
+      });
       return { rows: [], rowCount: 1 };
     }
 
@@ -195,106 +348,120 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows, rowCount: rows.length };
     }
 
+    if (sql.startsWith('SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1')) {
+      const key = params[0];
+      const rows = state.reservations.filter((r) => r.id === key || r.reservation_number === key);
+      return { rows, rowCount: rows.length };
+    }
+
     if (sql.startsWith('SELECT * FROM reservations WHERE id = $1 FOR UPDATE')) {
       const rows = state.reservations.filter((r) => r.id === params[0]);
       return { rows, rowCount: rows.length };
     }
 
-    if (sql.startsWith('INSERT INTO reservations (')) {
-      const rec = {
-        id: params[0],
-        source_reservation_id: params[1],
-        reservation_number: params[2],
-        source_created_at: params[3],
-        customer_name: params[4],
-        customer_phone: params[5],
-        customer_email: params[6],
-        customer_id_number: params[7],
-        company_name: params[8],
-        branch_name: params[9],
-        deliver_branch_name: params[10],
-        car_name: params[11],
-        plate_number: params[12],
-        car_category: params[13],
-        start_date: params[14],
-        start_time: params[15],
-        original_end_date: params[16],
-        original_end_time: params[17],
-        end_date: params[18],
-        end_time: params[19],
-        extended_until_date: params[20],
-        extended_until_time: params[21],
-        days_count: params[22],
-        extended_days_count: params[23],
-        total_days_count: params[24],
-        original_status_code: params[25],
-        original_status_ar: params[26],
-        pickup_type_ar: params[27],
-        return_type_ar: params[28],
-        payment_method: params[29],
-        payment_status: params[30],
-        daily_price: params[31],
-        discount_amount: params[32],
-        vat_amount: params[33],
-        base_amount: params[34],
-        extensions_count: params[35],
-        extensions_amount: params[36],
-        total_amount: params[37],
-        has_extensions: params[38],
-        internal_status: params[39],
-        priority: params[40],
-        assigned_employee_ids: JSON.parse(params[41]),
-        assigned_employee_names: JSON.parse(params[42]),
-        last_update_text: params[43],
-        last_updated_by_id: params[44],
-        last_updated_by_name: params[45],
-        last_updated_at: params[46],
-        has_problem: params[47],
-        created_at: new Date(params[48]),
-        updated_at: new Date(params[49]),
-        status_history: JSON.parse(params[50]),
-        raw_json: params[51]
-      };
-      const idx = state.reservations.findIndex((r) => r.reservation_number === rec.reservation_number);
-      if (idx === -1) {
-        state.reservations.push(rec);
-        return { rows: [{ inserted: true }] as any[], rowCount: 1 };
-      } else {
-        state.reservations[idx] = { ...rec, id: state.reservations[idx].id, created_at: state.reservations[idx].created_at };
-        return { rows: [{ inserted: false }] as any[], rowCount: 1 };
+    if (sql.startsWith('INSERT INTO reservations (') && sql.includes('unnest(')) {
+      const count = Array.isArray(params[0]) ? params[0].length : 0;
+      const outRows: Array<{ inserted: boolean }> = [];
+      for (let i = 0; i < count; i++) {
+        const rec = {
+          id: params[0][i],
+          source_reservation_id: params[1][i],
+          reservation_number: params[2][i],
+          source_created_at: params[3][i],
+          customer_name: params[4][i],
+          customer_phone: params[5][i],
+          customer_email: params[6][i],
+          customer_id_number: params[7][i],
+          company_name: params[8][i],
+          branch_name: params[9][i],
+          deliver_branch_name: params[10][i],
+          car_name: params[11][i],
+          plate_number: params[12][i],
+          car_category: params[13][i],
+          start_date: params[14][i],
+          start_time: params[15][i],
+          original_end_date: params[16][i],
+          original_end_time: params[17][i],
+          end_date: params[18][i],
+          end_time: params[19][i],
+          extended_until_date: params[20][i],
+          extended_until_time: params[21][i],
+          days_count: params[22][i],
+          extended_days_count: params[23][i],
+          total_days_count: params[24][i],
+          original_status_code: params[25][i],
+          original_status_ar: params[26][i],
+          pickup_type_ar: params[27][i],
+          return_type_ar: params[28][i],
+          payment_method: params[29][i],
+          payment_status: params[30][i],
+          daily_price: params[31][i],
+          discount_amount: params[32][i],
+          vat_amount: params[33][i],
+          base_amount: params[34][i],
+          extensions_count: params[35][i],
+          extensions_amount: params[36][i],
+          total_amount: params[37][i],
+          has_extensions: params[38][i],
+          internal_status: params[39][i],
+          priority: params[40][i],
+          assigned_employee_ids: JSON.parse(params[41][i]),
+          assigned_employee_names: JSON.parse(params[42][i]),
+          last_update_text: params[43][i],
+          last_updated_by_id: params[44][i],
+          last_updated_by_name: params[45][i],
+          last_updated_at: params[46][i],
+          has_problem: params[47][i],
+          created_at: new Date(params[48][i]),
+          updated_at: new Date(params[49][i]),
+          status_history: JSON.parse(params[50][i]),
+          raw_json: params[51][i]
+        };
+        const idx = state.reservations.findIndex((r) => r.reservation_number === rec.reservation_number);
+        if (idx === -1) {
+          state.reservations.push(rec);
+          outRows.push({ inserted: true });
+        } else {
+          state.reservations[idx] = { ...rec, id: state.reservations[idx].id, created_at: state.reservations[idx].created_at };
+          outRows.push({ inserted: false });
+        }
       }
+      return { rows: outRows as any[], rowCount: outRows.length };
     }
 
-    if (sql.startsWith('INSERT INTO extensions (')) {
-      const ext = {
-        id: params[0],
-        extension_number: params[1],
-        sequence_number: params[2],
-        reservation_id: params[3],
-        reservation_number: params[4],
-        source_reservation_id: params[5],
-        extension_type: params[6],
-        extension_type_ar: params[7],
-        status_code: params[8],
-        status_ar: params[9],
-        payment_status: params[10],
-        payment_date: params[11],
-        payment_method: params[12],
-        extend_days: params[13],
-        start_date: params[14],
-        start_time: params[15],
-        end_date: params[16],
-        end_time: params[17],
-        sub_total: params[18],
-        vat_amount: params[19],
-        amount: params[20],
-        is_accepted_and_paid: params[21],
-        synced_at: new Date(params[22])
-      };
-      const idx = state.extensions.findIndex((e) => e.extension_number === ext.extension_number);
-      if (idx === -1) state.extensions.push(ext);
-      else state.extensions[idx] = ext;
-      return { rows: [], rowCount: 1 };
+    if (sql.startsWith('INSERT INTO extensions (') && sql.includes('unnest(')) {
+      const count = Array.isArray(params[0]) ? params[0].length : 0;
+      for (let i = 0; i < count; i++) {
+        const ext = {
+          id: params[0][i],
+          extension_number: params[1][i],
+          sequence_number: params[2][i],
+          reservation_id: params[3][i],
+          reservation_number: params[4][i],
+          source_reservation_id: params[5][i],
+          extension_type: params[6][i],
+          extension_type_ar: params[7][i],
+          status_code: params[8][i],
+          status_ar: params[9][i],
+          payment_status: params[10][i],
+          payment_date: params[11][i],
+          payment_method: params[12][i],
+          extend_days: params[13][i],
+          start_date: params[14][i],
+          start_time: params[15][i],
+          end_date: params[16][i],
+          end_time: params[17][i],
+          sub_total: params[18][i],
+          vat_amount: params[19][i],
+          amount: params[20][i],
+          is_accepted_and_paid: params[21][i],
+          synced_at: new Date(params[22][i])
+        };
+        const idx = state.extensions.findIndex((e) => e.extension_number === ext.extension_number);
+        if (idx === -1) state.extensions.push(ext);
+        else state.extensions[idx] = ext;
+      }
+      return { rows: [], rowCount: count };
     }
 
     if (sql.startsWith('INSERT INTO follow_ups')) {
@@ -304,6 +471,19 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
         notes: params[8], follow_up_date: params[9], follow_up_time: params[10], created_at: new Date(params[11])
       });
       return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO follow_up_history') && sql.includes('unnest(')) {
+      const count = Array.isArray(params[0]) ? params[0].length : 0;
+      for (let i = 0; i < count; i++) {
+        state.follow_up_history.push({
+          id: params[0][i], follow_up_id: params[1][i], reservation_id: params[2][i], reservation_number: params[3][i],
+          employee_id: params[4][i], employee_name: params[5][i], change_type: params[6][i], previous_status: params[7][i],
+          new_status: params[8][i], previous_action: params[9][i], new_action: params[10][i], previous_notes: params[11][i],
+          new_notes: params[12][i], changed_at: new Date(params[13][i])
+        });
+      }
+      return { rows: [], rowCount: count };
     }
 
     if (sql.startsWith('INSERT INTO follow_up_history')) {
@@ -324,8 +504,84 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
         r.last_updated_by_id = params[3];
         r.last_updated_by_name = params[4];
         r.last_updated_at = params[5];
+        r.updated_at = new Date(params[5]);
         r.status_history = JSON.parse(params[6]);
       }
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('UPDATE reservations SET customer_name = $2')) {
+      const r = state.reservations.find((x) => x.id === params[0]);
+      if (r) {
+        r.customer_name = params[1];
+        r.customer_phone = params[2];
+        r.customer_email = params[3];
+        r.customer_id_number = params[4];
+        r.company_name = params[5];
+        r.branch_name = params[6];
+        r.deliver_branch_name = params[7];
+        r.car_name = params[8];
+        r.car_category = params[9];
+        r.plate_number = params[10];
+        r.start_date = params[11];
+        r.start_time = params[12];
+        r.end_date = params[13];
+        r.end_time = params[14];
+        r.extended_until_date = params[15];
+        r.extended_until_time = params[16];
+        r.pickup_type_ar = params[17];
+        r.return_type_ar = params[18];
+        r.payment_method = params[19];
+        r.payment_status = params[20];
+        r.days_count = params[21];
+        r.extended_days_count = params[22];
+        r.total_days_count = params[23];
+        r.extensions_count = params[24];
+        r.base_amount = params[25];
+        r.extensions_amount = params[26];
+        r.total_amount = params[27];
+        r.has_extensions = params[28];
+        r.priority = params[29];
+        r.internal_status = params[30];
+        r.last_update_text = params[31];
+        r.last_updated_by_id = params[32];
+        r.last_updated_by_name = params[33];
+        r.last_updated_at = params[34];
+        r.updated_at = new Date(params[34]);
+        r.status_history = JSON.parse(params[35]);
+      }
+      return { rows: [], rowCount: r ? 1 : 0 };
+    }
+
+    if (sql.startsWith('INSERT INTO problems') || sql.startsWith('INSERT INTO issues')) {
+      if (sql.startsWith('INSERT INTO problems')) {
+        state.problems.push({
+          id: params[0], problem_number: params[1], reservation_id: params[2], reservation_number: params[3],
+          customer_name: params[4], created_by_id: params[5], created_by_name: params[6],
+          assigned_employee_ids: JSON.parse(params[7]), assigned_employee_names: JSON.parse(params[8]),
+          description: params[9], priority: params[10], status: params[11],
+          created_at: new Date(params[12]), updated_at: new Date(params[12])
+        });
+      }
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO problem_updates')) {
+      state.problem_updates.push({
+        id: params[0], problem_id: params[1], reservation_number: params[2],
+        employee_id: params[3], employee_name: params[4],
+        previous_status: params[5], new_status: params[6], previous_priority: params[7], new_priority: params[8],
+        note: params[9], created_at: new Date(params[10])
+      });
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO notifications')) {
+      state.notifications.push({
+        id: params[0], recipient_employee_id: params[1], recipient_role: params[2],
+        type: params[3], title: params[4], message: params[5], entity_type: params[6], entity_id: params[7],
+        is_read: false, created_at: new Date()
+      });
       return { rows: [], rowCount: 1 };
     }
 
@@ -352,42 +608,208 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     }
 
     if (sql.startsWith('SELECT COUNT(*)::text AS cnt FROM reservations')) {
-      let list = state.reservations;
-      if (params.length > 0 && String(params[0]).startsWith('%')) {
-        const needle = String(params[0]).replace(/%/g, '').toLowerCase();
-        list = list.filter((r) =>
-          r.reservation_number.toLowerCase().includes(needle) ||
-          r.customer_name.toLowerCase().includes(needle)
-        );
-      }
+      const list = filterMockReservations(sql, params);
       return { rows: [{ cnt: String(list.length) }] as any[], rowCount: 1 };
     }
 
     if (sql.startsWith('SELECT r.*, EXISTS (SELECT 1 FROM follow_ups')) {
-      let list = state.reservations;
-      if (params.length > 2 && String(params[0]).startsWith('%')) {
-        const needle = String(params[0]).replace(/%/g, '').toLowerCase();
-        list = list.filter((r) =>
-          r.reservation_number.toLowerCase().includes(needle) ||
-          r.customer_name.toLowerCase().includes(needle)
-        );
-      }
+      const list = sortMockReservations(sql, filterMockReservations(sql, params, Math.max(0, params.length - 2)));
+      const pageSize = Number(params[params.length - 2] || 25);
+      const offset = Number(params[params.length - 1] || 0);
+      const paged = list.slice(offset, offset + pageSize);
       return {
-        rows: list.map((r) => ({ ...r, is_followed: state.follow_ups.some((f) => f.reservation_id === r.id) })) as any[],
-        rowCount: list.length
+        rows: paged.map((r) => ({ ...r, is_followed: state.follow_ups.some((f) => f.reservation_id === r.id) })) as any[],
+        rowCount: paged.length
       };
     }
 
-    if (sql.startsWith('SELECT id, start_date, created_at, internal_status')) {
-      return { rows: state.reservations as any[], rowCount: state.reservations.length };
+    if (sql.startsWith('SELECT * FROM reservations r')) {
+      const list = sortMockReservations(sql, filterMockReservations(sql, params));
+      return { rows: list as any[], rowCount: list.length };
     }
 
-    if (sql.startsWith('SELECT employee_name, follow_up_date FROM follow_ups')) {
-      return { rows: state.follow_ups as any[], rowCount: state.follow_ups.length };
+    if (sql.startsWith('SELECT r.* FROM reservations r')) {
+      const list = filterMockReservations(sql, params);
+      return { rows: list as any[], rowCount: list.length };
     }
 
-    if (sql.startsWith('SELECT status, priority FROM problems')) {
-      return { rows: state.problems as any[], rowCount: state.problems.length };
+    // Dashboard SQL aggregate queries
+    if (sql.startsWith('SELECT COUNT(*)::int AS total_cnt')) {
+      const todayStr = String(params[params.length - 1] || '');
+      const list = filterMockReservations(sql, params, params.length - 1);
+      const todayCnt = list.filter((r) => {
+        const createdDay = r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at || '').slice(0, 10);
+        return r.start_date === todayStr || createdDay === todayStr;
+      }).length;
+      return { rows: [{ total_cnt: list.length, today_cnt: todayCnt }] as any[], rowCount: 1 };
+    }
+
+    if (sql.startsWith("SELECT COALESCE(NULLIF(internal_status, ''), 'تم الإنشاء') AS internal_status")) {
+      const list = filterMockReservations(sql, params);
+      const counts = new Map<string, number>();
+      for (const r of list) {
+        const key = r.internal_status || 'تم الإنشاء';
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      return {
+        rows: Array.from(counts.entries()).map(([internal_status, cnt]) => ({ internal_status, cnt })) as any[],
+        rowCount: counts.size
+      };
+    }
+
+    if (sql.startsWith("SELECT COALESCE(NULLIF(company_name, ''), 'غير محدد') AS company_name")) {
+      const list = filterMockReservations(sql, params);
+      const counts = new Map<string, number>();
+      for (const r of list) {
+        const key = r.company_name || 'غير محدد';
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      return {
+        rows: Array.from(counts.entries()).map(([company_name, cnt]) => ({ company_name, cnt })) as any[],
+        rowCount: counts.size
+      };
+    }
+
+    if (sql.startsWith('SELECT emp_id, COUNT(*)::int AS cnt FROM reservations r')) {
+      const list = sql.includes('WHERE') ? filterMockReservations(sql, params) : state.reservations;
+      const counts = new Map<string, number>();
+      for (const r of list) {
+        for (const eid of r.assigned_employee_ids || []) {
+          counts.set(eid, (counts.get(eid) || 0) + 1);
+        }
+      }
+      return {
+        rows: Array.from(counts.entries()).map(([emp_id, cnt]) => ({ emp_id, cnt })) as any[],
+        rowCount: counts.size
+      };
+    }
+
+    if (sql.startsWith('SELECT follow_up_date, employee_name, COUNT(*)::int AS cnt FROM follow_ups')) {
+      let list = state.follow_ups;
+      const whereSegment = sql.split(/\bWHERE\b/i)[1] || '';
+      const fromM = whereSegment.match(/follow_up_date\s*>=\s*\$(\d+)/);
+      const toM = whereSegment.match(/follow_up_date\s*<=\s*\$(\d+)/);
+      if (fromM) list = list.filter((f) => f.follow_up_date >= params[Number(fromM[1]) - 1]);
+      if (toM) list = list.filter((f) => f.follow_up_date <= params[Number(toM[1]) - 1]);
+      const counts = new Map<string, { follow_up_date: string; employee_name: string; cnt: number }>();
+      for (const f of list) {
+        const k = `${f.follow_up_date}::${f.employee_name}`;
+        const cur = counts.get(k) || { follow_up_date: f.follow_up_date, employee_name: f.employee_name, cnt: 0 };
+        cur.cnt += 1;
+        counts.set(k, cur);
+      }
+      const rows = Array.from(counts.values());
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
+    if (sql.startsWith('SELECT COUNT(*)::int AS today_cnt FROM follow_ups')) {
+      const todayCnt = state.follow_ups.filter((f) => f.follow_up_date === params[0]).length;
+      return { rows: [{ today_cnt: todayCnt }] as any[], rowCount: 1 };
+    }
+
+    if (sql.startsWith('SELECT status, priority, COUNT(*)::int AS cnt FROM problems')) {
+      const counts = new Map<string, { status: string; priority: string; cnt: number }>();
+      for (const p of state.problems) {
+        const k = `${p.status}::${p.priority}`;
+        const cur = counts.get(k) || { status: p.status, priority: p.priority, cnt: 0 };
+        cur.cnt += 1;
+        counts.set(k, cur);
+      }
+      const rows = Array.from(counts.values());
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
+    if (sql.startsWith('SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups')) {
+      const counts = new Map<string, number>();
+      for (const f of state.follow_ups) {
+        counts.set(f.employee_id, (counts.get(f.employee_id) || 0) + 1);
+      }
+      return {
+        rows: Array.from(counts.entries()).map(([employee_id, cnt]) => ({ employee_id, cnt })) as any[],
+        rowCount: counts.size
+      };
+    }
+
+    if (sql.startsWith('SELECT emp_id, COUNT(*)::int AS cnt FROM problems p')) {
+      const onlyOpen = sql.includes("NOT IN ('مغلقة', 'تم الحل')");
+      const counts = new Map<string, number>();
+      for (const p of state.problems) {
+        if (onlyOpen && (p.status === 'مغلقة' || p.status === 'تم الحل')) continue;
+        for (const eid of p.assigned_employee_ids || []) {
+          counts.set(eid, (counts.get(eid) || 0) + 1);
+        }
+      }
+      return {
+        rows: Array.from(counts.entries()).map(([emp_id, cnt]) => ({ emp_id, cnt })) as any[],
+        rowCount: counts.size
+      };
+    }
+
+    if (sql.startsWith('SELECT * FROM follow_ups WHERE reservation_id = ANY')) {
+      const rIds: string[] = params[0] || [];
+      const rows = state.follow_ups.filter((f) => rIds.includes(f.reservation_id));
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
+    if (sql.startsWith('SELECT * FROM follow_ups')) {
+      let list = state.follow_ups.slice();
+      const whereSegment = (sql.split(/\bWHERE\b/i)[1] || '').split(/\bORDER BY\b/i)[0] || '';
+      const empM = whereSegment.match(/employee_id\s*=\s*\$(\d+)/);
+      const stM = whereSegment.match(/status\s*=\s*\$(\d+)/);
+      const eqDateM = whereSegment.match(/follow_up_date\s*=\s*\$(\d+)/);
+      const fromM = whereSegment.match(/follow_up_date\s*>=\s*\$(\d+)/);
+      const toM = whereSegment.match(/follow_up_date\s*<=\s*\$(\d+)/);
+      if (empM) list = list.filter((f) => f.employee_id === params[Number(empM[1]) - 1]);
+      if (stM) list = list.filter((f) => f.status === params[Number(stM[1]) - 1]);
+      if (eqDateM) list = list.filter((f) => f.follow_up_date === params[Number(eqDateM[1]) - 1]);
+      if (fromM) list = list.filter((f) => f.follow_up_date >= params[Number(fromM[1]) - 1]);
+      if (toM) list = list.filter((f) => f.follow_up_date <= params[Number(toM[1]) - 1]);
+      return { rows: list as any[], rowCount: list.length };
+    }
+
+    if (sql.startsWith('SELECT reservation_id, COUNT(*)::int AS cnt FROM problems WHERE reservation_id = ANY')) {
+      const rIds: string[] = params[0] || [];
+      const counts = new Map<string, number>();
+      for (const p of state.problems) {
+        if (rIds.includes(p.reservation_id)) {
+          counts.set(p.reservation_id, (counts.get(p.reservation_id) || 0) + 1);
+        }
+      }
+      return {
+        rows: Array.from(counts.entries()).map(([reservation_id, cnt]) => ({ reservation_id, cnt })) as any[],
+        rowCount: counts.size
+      };
+    }
+
+    if (sql.startsWith('SELECT * FROM problems')) {
+      let list = state.problems.slice();
+      const whereSegment = (sql.split(/\bWHERE\b/i)[1] || '').split(/\bORDER BY\b/i)[0] || '';
+      const stM = whereSegment.match(/status\s*=\s*\$(\d+)/);
+      const prM = whereSegment.match(/priority\s*=\s*\$(\d+)/);
+      const empM = whereSegment.match(/assigned_employee_ids @> \$(\d+)/);
+      if (stM) list = list.filter((p) => p.status === params[Number(stM[1]) - 1]);
+      if (prM) list = list.filter((p) => p.priority === params[Number(prM[1]) - 1]);
+      if (empM) {
+        const arr = JSON.parse(params[Number(empM[1]) - 1]);
+        list = list.filter((p) => arr.every((id: string) => (p.assigned_employee_ids || []).includes(id)) || (whereSegment.includes('created_by_id') && p.created_by_id === params[1]));
+      }
+      return { rows: list as any[], rowCount: list.length };
+    }
+
+    if (sql.startsWith('SELECT * FROM problem_updates WHERE problem_id = ANY')) {
+      const pIds: string[] = params[0] || [];
+      const rows = state.problem_updates.filter((u) => pIds.includes(u.problem_id));
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
+    if (sql.startsWith('SELECT * FROM extensions')) {
+      let list = state.extensions.slice();
+      const whereSegment = (sql.split(/\bWHERE\b/i)[1] || '').split(/\bORDER BY\b/i)[0] || '';
+      const fromM = whereSegment.match(/start_date\s*>=\s*\$(\d+)/);
+      const toM = whereSegment.match(/start_date\s*<=\s*\$(\d+)/);
+      if (fromM) list = list.filter((e) => e.start_date >= params[Number(fromM[1]) - 1]);
+      if (toM) list = list.filter((e) => e.start_date <= params[Number(toM[1]) - 1]);
+      return { rows: list as any[], rowCount: list.length };
     }
 
     if (sql.startsWith("SELECT id, name, status FROM employees WHERE status = 'active'")) {
@@ -399,11 +821,13 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     }
 
     if (sql.startsWith('SELECT DISTINCT company_name')) {
-      return { rows: [] as any[], rowCount: 0 };
+      const vals = Array.from(new Set(state.reservations.map((r) => r.company_name).filter(Boolean))).sort();
+      return { rows: vals.map((company_name) => ({ company_name })) as any[], rowCount: vals.length };
     }
 
     if (sql.startsWith('SELECT DISTINCT branch_name')) {
-      return { rows: [] as any[], rowCount: 0 };
+      const vals = Array.from(new Set(state.reservations.map((r) => r.branch_name).filter(Boolean))).sort();
+      return { rows: vals.map((branch_name) => ({ branch_name })) as any[], rowCount: vals.length };
     }
 
     if (sql.startsWith('SELECT * FROM sync_log ORDER BY')) {
@@ -832,5 +1256,275 @@ test('unified setup writes fixed core files (config.js, fixedConfig.ts, .env) wi
       else process.env[k] = v;
     }
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap login, month range, dynamic sorting, full detail edits, employee stats, filtered reports, and batch deduplication', async () => {
+  const db = createInMemoryMockExecutor();
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const monthStartStr = `${todayStr.slice(0, 7)}-01`;
+  const lastYearDate = '2024-01-15';
+
+  // 1. Batch deduplication inside single ingestIncrementalSyncBatch call
+  const dupSync = await ingestIncrementalSyncBatch(db, {
+    source: 'google_apps_script',
+    reservations: [
+      {
+        reservationId: 1001,
+        reservationNumber: 'RG-B-1001',
+        clientName: 'عميل أول',
+        companyArName: 'شركة الأولى',
+        receiveBranchArName: 'فرع الرياض',
+        startDate: `${monthStartStr}T09:00:00`,
+        endDate: `${todayStr}T12:00:00`,
+        reservationDays: 2,
+        reservationStatus: 'CONFIRMED',
+        total: 500
+      },
+      {
+        reservationId: 1001,
+        reservationNumber: 'RG-B-1001',
+        clientName: 'عميل أول محدث',
+        companyArName: 'شركة الأولى',
+        receiveBranchArName: 'فرع الرياض',
+        startDate: `${monthStartStr}T09:00:00`,
+        endDate: `${todayStr}T12:00:00`,
+        reservationDays: 2,
+        reservationStatus: 'ACTIVE',
+        total: 750
+      },
+      {
+        reservationId: 1002,
+        reservationNumber: 'RG-A-1002',
+        clientName: 'عميل أقدم',
+        companyArName: 'شركة الثانية',
+        receiveBranchArName: 'فرع جدة',
+        startDate: `${lastYearDate}T10:00:00`,
+        endDate: `${lastYearDate}T18:00:00`,
+        reservationDays: 1,
+        reservationStatus: 'CONFIRMED',
+        total: 1200
+      }
+    ],
+    extensions: [
+      {
+        extendId: 801,
+        reservationId: 1001,
+        reservationNumber: 'RG-B-1001',
+        reservationStatus: 'PAID',
+        extendDays: 1,
+        startDate: `${todayStr}T12:00:00`,
+        endDate: `${todayStr}T18:00:00`,
+        total: 150
+      },
+      {
+        extendId: 801,
+        reservationId: 1001,
+        reservationNumber: 'RG-B-1001',
+        reservationStatus: 'PAID',
+        extendDays: 1,
+        startDate: `${todayStr}T12:00:00`,
+        endDate: `${todayStr}T18:00:00`,
+        total: 150
+      }
+    ]
+  });
+
+  assert.equal(dupSync.importedCount, 2);
+  assert.equal(dupSync.updatedCount, 0);
+  assert.equal(dupSync.extensionsCount, 1);
+  assert.equal(db.state.reservations.length, 2);
+  const resB = db.state.reservations.find((r) => r.reservation_number === 'RG-B-1001');
+  assert.equal(resB.customer_name, 'عميل أول محدث');
+  assert.equal(resB.internal_status, 'ناشط');
+
+  // 2. Single-round-trip login with includeBootstrap: true
+  const loginBoot = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'admin', password: 'Admin@123', includeBootstrap: true, range: 'month' }
+  });
+  assert.equal(loginBoot.success, true);
+  assert.ok(loginBoot.data.bootstrap);
+  assert.equal(loginBoot.data.bootstrap.user.username, 'admin');
+  assert.ok(Array.isArray(loginBoot.data.bootstrap.employees?.items));
+  // Month range should include current-month RG-B-1001 (1) and exclude last year RG-A-1002
+  assert.equal(loginBoot.data.bootstrap.dashboard.kpis.totalReservations, 1);
+
+  const token = loginBoot.data.token;
+
+  // 3. Dynamic sorting on getReservations (reservationNumber asc, totalAmount desc)
+  const sortNumAsc = await dispatchCrmRequest(db, {
+    action: 'getReservations',
+    token,
+    payload: { sortBy: 'reservationNumber', sortDir: 'asc', page: 1, pageSize: 10 }
+  });
+  assert.equal(sortNumAsc.success, true);
+  assert.equal(sortNumAsc.data.items.map((x: any) => x.reservationNumber).join(','), 'RG-A-1002,RG-B-1001');
+
+  const sortTotalDesc = await dispatchCrmRequest(db, {
+    action: 'getReservations',
+    token,
+    payload: { sortBy: 'totalAmount', sortDir: 'desc', page: 1, pageSize: 10 }
+  });
+  assert.equal(sortTotalDesc.data.items[0].reservationNumber, 'RG-A-1002');
+
+  // 4. updateReservationDetails persists full detail modal fields
+  const edited = await dispatchCrmRequest(db, {
+    action: 'updateReservationDetails',
+    token,
+    payload: {
+      reservationId: resB.id,
+      customerEmail: 'updated@client.sa',
+      customerIdNumber: '1020304050',
+      deliverBranchName: 'مطار جدة',
+      carCategory: 'SUV',
+      plateNumber: 'ABC 1234',
+      extensionsCount: 2,
+      extensionsAmount: 300,
+      baseAmount: 750,
+      totalAmount: 1050,
+      paymentMethod: 'MADA',
+      paymentStatus: 'PAID'
+    }
+  });
+  assert.equal(edited.success, true);
+  assert.equal(edited.data.customerEmail, 'updated@client.sa');
+  assert.equal(edited.data.plateNumber, 'ABC 1234');
+  assert.equal(edited.data.deliverBranchName, 'مطار جدة');
+  assert.equal(edited.data.totalAmount, 1050);
+
+  // 5. Add follow-up & problem, then verify getEmployees and getEmployeeDetails stats
+  const fuRes = await dispatchCrmRequest(db, {
+    action: 'addFollowUp',
+    token,
+    payload: {
+      reservationId: resB.id,
+      status: 'تم التسليم',
+      action: 'تأكيد استلام السيارة',
+      notes: 'تم التواصل مع العميل'
+    }
+  });
+  assert.equal(fuRes.success, true);
+
+  const prbRes = await dispatchCrmRequest(db, {
+    action: 'createProblem',
+    token,
+    payload: {
+      reservationId: resB.id,
+      description: 'تأخير في مطابقة الفاتورة',
+      priority: 'مرتفع',
+      assignedEmployeeIds: ['EMP_ADMIN']
+    }
+  });
+  assert.equal(prbRes.success, true);
+
+  const empsRes = await dispatchCrmRequest(db, { action: 'getEmployees', token });
+  assert.equal(empsRes.success, true);
+  const adminEmp = empsRes.data.items.find((e: any) => e.id === 'EMP_ADMIN');
+  assert.equal(adminEmp.followUpsCount, 1);
+  assert.equal(adminEmp.stats.followUpsCount, 1);
+  assert.equal(adminEmp.problemsCount, 1);
+
+  const empDetailRes = await dispatchCrmRequest(db, {
+    action: 'getEmployeeDetails',
+    token,
+    payload: { employeeId: 'EMP_ADMIN' }
+  });
+  assert.equal(empDetailRes.success, true);
+  assert.equal(empDetailRes.data.stats.reservationsCount, 1);
+  assert.equal(empDetailRes.data.stats.followUpsCount, 1);
+  assert.equal(empDetailRes.data.assignedReservations[0].followUpsCount, 1);
+  assert.equal(empDetailRes.data.assignedReservations[0].problemsCount, 1);
+
+  // 6. getReports honors filters on followups_log & problems & employee_performance
+  const repFu = await dispatchCrmRequest(db, {
+    action: 'getReports',
+    token,
+    payload: { reportType: 'followups_log', employeeId: 'EMP_SUP1' }
+  });
+  assert.equal(repFu.success, true, JSON.stringify(repFu));
+  assert.equal(repFu.data.rows.length, 0);
+
+  const repEmp = await dispatchCrmRequest(db, {
+    action: 'getReports',
+    token,
+    payload: { reportType: 'employee_performance' }
+  });
+  assert.equal(repEmp.success, true);
+  const perfAdmin = repEmp.data.rows.find((r: any) => r.employeeId === 'EMP_ADMIN');
+  assert.equal(perfAdmin.followUpsCount, 1);
+  assert.equal(perfAdmin.problemsCount, 1);
+});
+
+test('API handlers (/api/crm and /api/health) always return valid JSON and support Buffer bodies', async () => {
+  const { default: crmHandler } = await import('../api/crm');
+  const { default: healthHandler } = await import('../api/health');
+
+  const prevDb = process.env.DATABASE_URL;
+  const prevPg = process.env.POSTGRES_URL;
+  const prevNeon = process.env.NEON_DATABASE_URL;
+  const prevFixedDb = FIXED_SERVER_CONFIG.databaseUrl;
+
+  delete process.env.DATABASE_URL;
+  delete process.env.POSTGRES_URL;
+  delete process.env.NEON_DATABASE_URL;
+  FIXED_SERVER_CONFIG.databaseUrl = '';
+
+  const makeMockRes = () => {
+    const out: { statusCode: number; body: any; ended: boolean } = { statusCode: 200, body: undefined, ended: false };
+    const res: any = {
+      headersSent: false,
+      status(code: number) {
+        out.statusCode = code;
+        return res;
+      },
+      json(payload: any) {
+        out.body = payload;
+        res.headersSent = true;
+        return res;
+      },
+      end() {
+        out.ended = true;
+        res.headersSent = true;
+        return res;
+      }
+    };
+    return { res, out };
+  };
+
+  try {
+    // 1. /api/health without DB returns valid JSON
+    const hMock = makeMockRes();
+    await healthHandler({ method: 'GET', headers: {} }, hMock.res);
+    assert.equal(hMock.out.statusCode, 200);
+    assert.equal(hMock.out.body.ok, true);
+    assert.equal(hMock.out.body.databaseConfigured, false);
+
+    // 2. /api/crm with Buffer body and unconfigured DB returns structured 503 JSON (never empty)
+    const crmMock503 = makeMockRes();
+    await crmHandler({
+      method: 'POST',
+      headers: {},
+      body: Buffer.from(JSON.stringify({ action: 'login', payload: {} }), 'utf8')
+    }, crmMock503.res);
+    assert.equal(crmMock503.out.statusCode, 503);
+    assert.equal(crmMock503.out.body.success, false);
+    assert.equal(crmMock503.out.body.error, 'DATABASE_UNCONFIGURED');
+
+    // 3. /api/crm getSetupCapabilities works cleanly without DB
+    const crmCaps = makeMockRes();
+    await crmHandler({
+      method: 'POST',
+      headers: {},
+      body: { action: 'getSetupCapabilities', payload: {} }
+    }, crmCaps.res);
+    assert.equal(crmCaps.out.statusCode, 200);
+    assert.equal(crmCaps.out.body.success, true);
+    assert.equal(crmCaps.out.body.data.databaseConfigured, false);
+  } finally {
+    if (prevDb !== undefined) process.env.DATABASE_URL = prevDb;
+    if (prevPg !== undefined) process.env.POSTGRES_URL = prevPg;
+    if (prevNeon !== undefined) process.env.NEON_DATABASE_URL = prevNeon;
+    FIXED_SERVER_CONFIG.databaseUrl = prevFixedDb;
   }
 });

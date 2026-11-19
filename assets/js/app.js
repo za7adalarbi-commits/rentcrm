@@ -1138,11 +1138,14 @@
 
     if (!user && root.RGApi.getToken && root.RGApi.getToken()) {
       var bootRes = await root.RGApi.callApi('getAppBootstrap', { range: dashRange });
-      if (bootRes && bootRes.success && bootRes.data && bootRes.data.user) {
-        user = bootRes.data.user;
+      var bootUser = (bootRes && bootRes.success && bootRes.data)
+        ? (bootRes.data.user || (bootRes.data.me && bootRes.data.me.user) || null)
+        : null;
+      if (bootUser) {
+        user = bootUser;
         if (root.RGAuth.setUser) root.RGAuth.setUser(user);
         if (root.RGAuth.primeBootstrapCaches) {
-          root.RGAuth.primeBootstrapCaches(bootRes.data, dashRange);
+          root.RGAuth.primeBootstrapCaches(Object.assign({ user: bootUser }, bootRes.data), dashRange);
         }
         renderAppShell(user);
         if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
@@ -1151,7 +1154,7 @@
         startAutoRefreshLoop();
         return;
       }
-      if (bootRes && bootRes.error === 'UNAUTHORIZED') {
+      if (bootRes && String(bootRes.error || '').indexOf('UNAUTHORIZED') === 0) {
         root.RGApi.setToken('');
         if (root.RGAuth.setUser) root.RGAuth.setUser(null);
         stopAutoRefreshLoop();
@@ -1197,6 +1200,45 @@
     if (nextRoute !== state.route) {
       state.route = nextRoute;
       renderRoute();
+    }
+  });
+
+  function closeTopmostOverlay() {
+    var pop = document.getElementById('notif-popover');
+    if (pop) {
+      pop.remove();
+      return true;
+    }
+    var modalRoot = document.getElementById('modal-root');
+    if (modalRoot && modalRoot.firstElementChild) {
+      var closeBtn = modalRoot.querySelector('#res-drawer-close, #emp-drawer-close, #prb-upd-close, #res-edit-cancel, #fu-edit-cancel, #prb-loading-cancel, #emp-cancel, [data-modal-close]');
+      if (closeBtn && typeof closeBtn.click === 'function') {
+        closeBtn.click();
+      } else {
+        modalRoot.innerHTML = '';
+      }
+      return true;
+    }
+    return false;
+  }
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') {
+      closeTopmostOverlay();
+    }
+  });
+
+  document.addEventListener('click', function (ev) {
+    var pop = document.getElementById('notif-popover');
+    var toggleBtn = document.getElementById('notif-toggle-btn');
+    if (pop && !pop.contains(ev.target) && (!toggleBtn || !toggleBtn.contains(ev.target))) {
+      pop.remove();
+    }
+    var target = ev.target;
+    if (target && target.classList && (target.classList.contains('drawer-backdrop') || target.classList.contains('modal-backdrop'))) {
+      if (ev.target === target) {
+        closeTopmostOverlay();
+      }
     }
   });
 

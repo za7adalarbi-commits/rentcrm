@@ -884,5 +884,33 @@ test('summarizeReservationExtensions and mergeSyncedReservation capture exact ex
   assert.equal(merged.carCategory, 'سيدان متوسطة');
 });
 
+test('parseBackendResponseText prevents Unexpected end of JSON input on empty, HTML, and malformed responses', () => {
+  const empty500 = core.parseBackendResponseText('', 500, 'application/json');
+  assert.equal(empty500.success, false);
+  assert.equal(empty500.error, 'EMPTY_RESPONSE');
+  assert.ok(empty500.message.includes('HTTP 500'));
 
+  const empty504 = core.parseBackendResponseText('   ', 504, '');
+  assert.equal(empty504.success, false);
+  assert.equal(empty504.error, 'GATEWAY_ERROR');
 
+  const empty404 = core.parseBackendResponseText('', 404, '');
+  assert.equal(empty404.success, false);
+  assert.equal(empty404.error, 'BACKEND_NOT_FOUND');
+
+  const htmlResp = core.parseBackendResponseText('<!doctype html><html><body>Error</body></html>', 502, 'text/html');
+  assert.equal(htmlResp.success, false);
+  assert.equal(htmlResp.error, 'HTML_RESPONSE');
+
+  const badJson = core.parseBackendResponseText('FUNCTION_INVOCATION_FAILED', 500, 'text/plain');
+  assert.equal(badJson.success, false);
+  assert.equal(badJson.error, 'INVALID_JSON');
+
+  const validErr = core.parseBackendResponseText('{"success":false,"message":"DATABASE_UNCONFIGURED","data":null,"error":"DATABASE_UNCONFIGURED"}', 503, 'application/json');
+  assert.equal(validErr.success, false);
+  assert.equal(validErr.error, 'DATABASE_UNCONFIGURED');
+
+  const validOk = core.parseBackendResponseText('{"success":true,"message":"OK","data":{"ok":true},"error":null}', 200, 'application/json');
+  assert.equal(validOk.success, true);
+  assert.equal(validOk.data.ok, true);
+});

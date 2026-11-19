@@ -133,9 +133,9 @@
                 '<div style="font-size:11px;color:var(--text-muted);" class="tabular-nums">' + permsList.length + ' صلاحية</div>' +
               '</td>' +
               '<td><span class="status-tag emp-status-tag ' + (isActive ? 'status-success' : 'status-danger') + '">' + (isActive ? 'نشط' : 'متوقف عن النشاط') + '</span></td>' +
-              '<td class="tabular-nums">' + (e.reservationsCount || 0) + '</td>' +
-              '<td class="tabular-nums">' + (e.followUpsCount || 0) + '</td>' +
-              '<td class="tabular-nums">' + (e.problemsCount || 0) + '</td>' +
+              '<td class="tabular-nums">' + (e.reservationsCount !== undefined ? e.reservationsCount : ((e.stats && e.stats.assignedCount) || 0)) + '</td>' +
+              '<td class="tabular-nums">' + (e.followUpsCount !== undefined ? e.followUpsCount : ((e.stats && e.stats.followUpsCount) || 0)) + '</td>' +
+              '<td class="tabular-nums">' + (e.problemsCount !== undefined ? e.problemsCount : ((e.stats && e.stats.openProblemsCount) || 0)) + '</td>' +
               '<td class="mono tabular-nums" style="white-space:nowrap;">' + (e.lastActivity ? esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16))) : '-') + '</td>' +
               '<td><button type="button" class="btn btn-sm btn-primary emp-view-btn" data-id="' + esc(e.id) + '">العملاء</button></td>' +
               (canManage ? (
@@ -685,7 +685,7 @@
                     '</div>' +
                     '<div class="res-story-box"><strong>ما حدث في الحجز:</strong> ' + esc(whatHappened) + '</div>' +
                     '<div style="display:flex;justify-content:space-between;align-items:center;width:100%;font-size:12px;color:var(--text-muted);">' +
-                      '<span class="tabular-nums">المتابعات: ' + r.followUpsCount + ' (منها ' + r.myFollowUpsCount + ' للموظف) · المشكلات: ' + r.problemsCount + '</span>' +
+                      '<span class="tabular-nums">المتابعات: ' + (r.followUpsCount || 0) + ' (منها ' + (r.myFollowUpsCount || 0) + ' للموظف) · المشكلات: ' + (r.problemsCount || 0) + '</span>' +
                       '<span style="color:var(--brand-primary);font-weight:700;">فتح تفاصيل الحجز ←</span>' +
                     '</div>' +
                   '</button>';

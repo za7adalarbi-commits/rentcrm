@@ -376,6 +376,20 @@ function normalizeIncomingReservation(
   return { record, followUpHistoryEntry };
 }
 
+let lastSyncBatchMutatedAt = 0;
+
+export function getLastSyncBatchMutatedAt(): number {
+  return lastSyncBatchMutatedAt;
+}
+
+function chunkList<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
 export async function ingestIncrementalSyncBatch(
   executor: DbExecutor,
   payload: SyncBatchPayload
@@ -427,13 +441,13 @@ export async function ingestIncrementalSyncBatch(
         if (srcId) resIdByRef.set(srcId, resId);
       }
 
-      // Group extensions by reservation number / source ID for accurate summary calculation
+      // Group extensions by reservation number / source ID and deduplicate by extensionNumber for safe batch upsert
       const extsByResKey = new Map<string, any[]>();
-      const normalizedExts: Record<string, any>[] = [];
+      const extDedupMap = new Map<string, Record<string, any>>();
       for (const rawExt of incomingExt) {
         const ext = normalizeIncomingExtension(rawExt, resIdByRef, startedAt);
         if (!ext.extensionNumber) continue;
-        normalizedExts.push(ext);
+        extDedupMap.set(ext.extensionNumber, ext);
         if (ext.isAcceptedAndPaid) {
           const keys = [ext.reservationNumber, ext.sourceReservationId].filter(Boolean);
           for (const k of keys) {
@@ -443,10 +457,12 @@ export async function ingestIncrementalSyncBatch(
           }
         }
       }
+      const normalizedExts = Array.from(extDedupMap.values());
 
+      // Normalize and deduplicate reservations by reservationNumber before batch SQL upsert
+      const resDedupMap = new Map<string, Record<string, any>>();
       const historyBatch: Record<string, any>[] = [];
 
-      // Upsert Reservations first so extensions FK references are guaranteed valid
       for (const raw of incomingRes) {
         const resNum = str(raw.reservationNumber || raw.reservation_number || raw.reservationId || raw.id);
         if (!resNum) continue;
@@ -455,7 +471,14 @@ export async function ingestIncrementalSyncBatch(
         const relExts = extsByResKey.get(resNum) || extsByResKey.get(srcId) || [];
 
         const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt);
+        resDedupMap.set(record.reservationNumber, record);
+        if (followUpHistoryEntry) historyBatch.push(followUpHistoryEntry);
+      }
 
+      const reservationBatch = Array.from(resDedupMap.values());
+
+      // Chunked UNNEST upserts for Reservations (first so extensions FK references are valid)
+      for (const chunk of chunkList(reservationBatch, 200)) {
         const upsertRes = await tx.query<{ inserted: boolean }>(
           `INSERT INTO reservations (
              id, source_reservation_id, reservation_number, source_created_at,
@@ -469,10 +492,19 @@ export async function ingestIncrementalSyncBatch(
              internal_status, priority, assigned_employee_ids, assigned_employee_names,
              last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
              has_problem, created_at, updated_at, status_history, raw_json
-           ) VALUES (
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,
-             $40,$41,$42::jsonb,$43::jsonb,$44,$45,$46,$47,$48,$49::timestamptz,$50::timestamptz,$51::jsonb,$52
+           )
+           SELECT * FROM unnest(
+             $1::text[], $2::text[], $3::text[], $4::text[],
+             $5::text[], $6::text[], $7::text[], $8::text[],
+             $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
+             $15::text[], $16::text[], $17::text[], $18::text[], $19::text[], $20::text[],
+             $21::text[], $22::text[], $23::int4[], $24::int4[], $25::int4[],
+             $26::text[], $27::text[], $28::text[], $29::text[],
+             $30::text[], $31::text[], $32::numeric[], $33::numeric[], $34::numeric[],
+             $35::numeric[], $36::int4[], $37::numeric[], $38::numeric[], $39::boolean[],
+             $40::text[], $41::text[], $42::jsonb[], $43::jsonb[],
+             $44::text[], $45::text[], $46::text[], $47::text[],
+             $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[]
            )
            ON CONFLICT (reservation_number) DO UPDATE SET
              source_reservation_id = EXCLUDED.source_reservation_id,
@@ -526,82 +558,85 @@ export async function ingestIncrementalSyncBatch(
              raw_json = EXCLUDED.raw_json
            RETURNING (xmax = 0) AS inserted`,
           [
-            record.id,
-            record.sourceReservationId,
-            record.reservationNumber,
-            record.sourceCreatedAt,
-            record.customerName,
-            record.customerPhone,
-            record.customerEmail,
-            record.customerIdNumber,
-            record.companyName,
-            record.branchName,
-            record.deliverBranchName,
-            record.carName,
-            record.plateNumber,
-            record.carCategory,
-            record.startDate,
-            record.startTime,
-            record.originalEndDate,
-            record.originalEndTime,
-            record.endDate,
-            record.endTime,
-            record.extendedUntilDate,
-            record.extendedUntilTime,
-            record.daysCount,
-            record.extendedDaysCount,
-            record.totalDaysCount,
-            record.originalStatusCode,
-            record.originalStatusAr,
-            record.pickupTypeAr,
-            record.returnTypeAr,
-            record.paymentMethod,
-            record.paymentStatus,
-            record.dailyPrice,
-            record.discountAmount,
-            record.vatAmount,
-            record.baseAmount,
-            record.extensionsCount,
-            record.extensionsAmount,
-            record.totalAmount,
-            record.hasExtensions,
-            record.internalStatus,
-            record.priority,
-            JSON.stringify(record.assignedEmployeeIds),
-            JSON.stringify(record.assignedEmployeeNames),
-            record.lastUpdateText,
-            record.lastUpdatedById,
-            record.lastUpdatedByName,
-            record.lastUpdatedAt,
-            record.hasProblem,
-            record.createdAt,
-            record.updatedAt,
-            JSON.stringify(record.statusHistory),
-            record.rawJson
+            chunk.map((r) => r.id),
+            chunk.map((r) => r.sourceReservationId),
+            chunk.map((r) => r.reservationNumber),
+            chunk.map((r) => r.sourceCreatedAt),
+            chunk.map((r) => r.customerName),
+            chunk.map((r) => r.customerPhone),
+            chunk.map((r) => r.customerEmail),
+            chunk.map((r) => r.customerIdNumber),
+            chunk.map((r) => r.companyName),
+            chunk.map((r) => r.branchName),
+            chunk.map((r) => r.deliverBranchName),
+            chunk.map((r) => r.carName),
+            chunk.map((r) => r.plateNumber),
+            chunk.map((r) => r.carCategory),
+            chunk.map((r) => r.startDate),
+            chunk.map((r) => r.startTime),
+            chunk.map((r) => r.originalEndDate),
+            chunk.map((r) => r.originalEndTime),
+            chunk.map((r) => r.endDate),
+            chunk.map((r) => r.endTime),
+            chunk.map((r) => r.extendedUntilDate),
+            chunk.map((r) => r.extendedUntilTime),
+            chunk.map((r) => r.daysCount),
+            chunk.map((r) => r.extendedDaysCount),
+            chunk.map((r) => r.totalDaysCount),
+            chunk.map((r) => r.originalStatusCode),
+            chunk.map((r) => r.originalStatusAr),
+            chunk.map((r) => r.pickupTypeAr),
+            chunk.map((r) => r.returnTypeAr),
+            chunk.map((r) => r.paymentMethod),
+            chunk.map((r) => r.paymentStatus),
+            chunk.map((r) => r.dailyPrice),
+            chunk.map((r) => r.discountAmount),
+            chunk.map((r) => r.vatAmount),
+            chunk.map((r) => r.baseAmount),
+            chunk.map((r) => r.extensionsCount),
+            chunk.map((r) => r.extensionsAmount),
+            chunk.map((r) => r.totalAmount),
+            chunk.map((r) => r.hasExtensions),
+            chunk.map((r) => r.internalStatus),
+            chunk.map((r) => r.priority),
+            chunk.map((r) => JSON.stringify(r.assignedEmployeeIds)),
+            chunk.map((r) => JSON.stringify(r.assignedEmployeeNames)),
+            chunk.map((r) => r.lastUpdateText),
+            chunk.map((r) => r.lastUpdatedById),
+            chunk.map((r) => r.lastUpdatedByName),
+            chunk.map((r) => r.lastUpdatedAt),
+            chunk.map((r) => r.hasProblem),
+            chunk.map((r) => r.createdAt),
+            chunk.map((r) => r.updatedAt),
+            chunk.map((r) => JSON.stringify(r.statusHistory)),
+            chunk.map((r) => r.rawJson)
           ]
         );
 
-        const wasInserted = Boolean(upsertRes.rows[0]?.inserted);
-        if (wasInserted) importedCount++;
-        else updatedCount++;
-
-        if (followUpHistoryEntry) historyBatch.push(followUpHistoryEntry);
-
-        const { rawJson: _omitRaw, ...clientRes } = record;
-        changedReservations.push(clientRes);
+        for (const row of upsertRes.rows) {
+          if (row?.inserted) importedCount++;
+          else updatedCount++;
+        }
+        for (const r of chunk) {
+          const { rawJson: _omitRaw, ...clientRes } = r;
+          changedReservations.push(clientRes);
+        }
       }
 
-      // Upsert Extensions
-      for (const ext of normalizedExts) {
-        const linkedResId = ext.reservationId || resIdByRef.get(ext.reservationNumber) || resIdByRef.get(ext.sourceReservationId) || null;
+      // Chunked UNNEST upserts for Extensions
+      for (const extChunk of chunkList(normalizedExts, 250)) {
         await tx.query(
           `INSERT INTO extensions (
              id, extension_number, sequence_number, reservation_id, reservation_number,
              source_reservation_id, extension_type, extension_type_ar, status_code, status_ar,
              payment_status, payment_date, payment_method, extend_days, start_date, start_time,
              end_date, end_time, sub_total, vat_amount, amount, is_accepted_and_paid, synced_at
-           ) VALUES (
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::timestamptz
+           )
+           SELECT * FROM unnest(
+             $1::text[], $2::text[], $3::int4[], $4::text[], $5::text[],
+             $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+             $11::text[], $12::text[], $13::text[], $14::int4[], $15::text[], $16::text[],
+             $17::text[], $18::text[], $19::numeric[], $20::numeric[], $21::numeric[], $22::boolean[], $23::timestamptz[]
            )
            ON CONFLICT (extension_number) DO UPDATE SET
              sequence_number = EXCLUDED.sequence_number,
@@ -626,48 +661,67 @@ export async function ingestIncrementalSyncBatch(
              is_accepted_and_paid = EXCLUDED.is_accepted_and_paid,
              synced_at = EXCLUDED.synced_at`,
           [
-            ext.id,
-            ext.extensionNumber,
-            ext.sequenceNumber,
-            linkedResId,
-            ext.reservationNumber,
-            ext.sourceReservationId,
-            ext.extensionType,
-            ext.extensionTypeAr,
-            ext.statusCode,
-            ext.statusAr,
-            ext.paymentStatus,
-            ext.paymentDate,
-            ext.paymentMethod,
-            ext.extendDays,
-            ext.startDate,
-            ext.startTime,
-            ext.endDate,
-            ext.endTime,
-            ext.subTotal,
-            ext.vatAmount,
-            ext.amount,
-            ext.isAcceptedAndPaid,
-            ext.syncedAt
+            extChunk.map((ext) => ext.id),
+            extChunk.map((ext) => ext.extensionNumber),
+            extChunk.map((ext) => ext.sequenceNumber),
+            extChunk.map((ext) => ext.reservationId || resIdByRef.get(ext.reservationNumber) || resIdByRef.get(ext.sourceReservationId) || null),
+            extChunk.map((ext) => ext.reservationNumber),
+            extChunk.map((ext) => ext.sourceReservationId),
+            extChunk.map((ext) => ext.extensionType),
+            extChunk.map((ext) => ext.extensionTypeAr),
+            extChunk.map((ext) => ext.statusCode),
+            extChunk.map((ext) => ext.statusAr),
+            extChunk.map((ext) => ext.paymentStatus),
+            extChunk.map((ext) => ext.paymentDate),
+            extChunk.map((ext) => ext.paymentMethod),
+            extChunk.map((ext) => ext.extendDays),
+            extChunk.map((ext) => ext.startDate),
+            extChunk.map((ext) => ext.startTime),
+            extChunk.map((ext) => ext.endDate),
+            extChunk.map((ext) => ext.endTime),
+            extChunk.map((ext) => ext.subTotal),
+            extChunk.map((ext) => ext.vatAmount),
+            extChunk.map((ext) => ext.amount),
+            extChunk.map((ext) => ext.isAcceptedAndPaid),
+            extChunk.map((ext) => ext.syncedAt)
           ]
         );
-        extensionsCount++;
+        extensionsCount += extChunk.length;
       }
 
-      for (const h of historyBatch) {
+      // Chunked UNNEST inserts for FollowUpHistory
+      for (const hChunk of chunkList(historyBatch, 250)) {
         await tx.query(
           `INSERT INTO follow_up_history (
              id, follow_up_id, reservation_id, reservation_number, employee_id, employee_name,
              change_type, previous_status, new_status, previous_action, new_action,
              previous_notes, new_notes, changed_at
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::timestamptz)`,
+           )
+           SELECT * FROM unnest(
+             $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+             $7::text[], $8::text[], $9::text[], $10::text[], $11::text[],
+             $12::text[], $13::text[], $14::timestamptz[]
+           )`,
           [
-            h.id, h.followUpId, h.reservationId, h.reservationNumber, h.employeeId, h.employeeName,
-            h.changeType, h.previousStatus, h.newStatus, h.previousAction, h.newAction,
-            h.previousNotes, h.newNotes, h.changedAt
+            hChunk.map((h) => h.id),
+            hChunk.map((h) => h.followUpId),
+            hChunk.map((h) => h.reservationId),
+            hChunk.map((h) => h.reservationNumber),
+            hChunk.map((h) => h.employeeId),
+            hChunk.map((h) => h.employeeName),
+            hChunk.map((h) => h.changeType),
+            hChunk.map((h) => h.previousStatus),
+            hChunk.map((h) => h.newStatus),
+            hChunk.map((h) => h.previousAction),
+            hChunk.map((h) => h.newAction),
+            hChunk.map((h) => h.previousNotes),
+            hChunk.map((h) => h.newNotes),
+            hChunk.map((h) => h.changedAt)
           ]
         );
       }
+
+      lastSyncBatchMutatedAt = Date.now();
 
       const finishedAt = new Date().toISOString();
       const durationMs = Date.now() - startMs;

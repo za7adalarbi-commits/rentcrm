@@ -1,9 +1,23 @@
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import type { DbClient, DbExecutor } from './db';
 
-const require = createRequire(import.meta.url);
-export const crmCore: any = require('../assets/js/core.js');
+function loadCrmCore(): any {
+  const reqUrl =
+    (typeof import.meta !== 'undefined' && import.meta.url)
+      ? import.meta.url
+      : pathToFileURL(path.resolve(process.cwd(), 'backend/auth.ts')).href;
+  const localRequire = createRequire(reqUrl);
+  try {
+    return localRequire('../assets/js/core.js');
+  } catch {
+    return localRequire(path.resolve(process.cwd(), 'assets/js/core.js'));
+  }
+}
+
+export const crmCore: any = loadCrmCore();
 
 export interface AuthEmployee {
   id: string;
@@ -229,7 +243,7 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
   }
   const tHash = hashToken(token);
   const sesRes = await executor.query(
-    `SELECT s.token_hash, s.employee_id, s.username, s.role, s.expires_at, s.is_revoked,
+    `SELECT s.token_hash, s.employee_id, s.username, s.role, s.expires_at, s.is_revoked, s.last_seen_at,
             e.id AS emp_id, e.name, e.username AS emp_username, e.phone, e.email,
             e.job_title, e.role AS emp_role, e.permissions, e.status AS emp_status,
             e.last_activity, e.created_at, e.updated_at
@@ -255,12 +269,15 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
     throw new Error('UNAUTHORIZED: الحساب غير نشط أو غير موجود.');
   }
 
-  // Opportunistic touch without blocking request on errors
-  const nowIso = new Date().toISOString();
-  await executor.query(
-    `UPDATE sessions SET last_seen_at = $2::timestamptz WHERE token_hash = $1`,
-    [tHash, nowIso]
-  ).catch(() => undefined);
+  // Opportunistic touch at most once every 5 minutes without blocking read/write latency
+  const lastSeenMs = row.last_seen_at ? new Date(row.last_seen_at).getTime() : 0;
+  if (!lastSeenMs || isNaN(lastSeenMs) || (Date.now() - lastSeenMs) > 300000) {
+    const nowIso = new Date().toISOString();
+    void executor.query(
+      `UPDATE sessions SET last_seen_at = $2::timestamptz WHERE token_hash = $1`,
+      [tHash, nowIso]
+    ).catch(() => undefined);
+  }
 
   const user = mapEmployeeRow({
     id: row.emp_id,

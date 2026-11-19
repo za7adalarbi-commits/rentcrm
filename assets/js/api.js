@@ -146,12 +146,21 @@
         if (typeof AbortController !== 'undefined') {
           var ctrl = new AbortController();
           opts.signal = ctrl.signal;
-          timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 1800);
+          timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 6500);
         }
         var resp = await fetch('/api/health', opts);
         if (timer) clearTimeout(timer);
         if (resp && resp.ok) {
-          var json = await resp.json();
+          var healthText = await resp.text();
+          var trimmedHealth = String(healthText || '').trim();
+          var json = null;
+          if (trimmedHealth && trimmedHealth.charAt(0) !== '<') {
+            try {
+              json = JSON.parse(trimmedHealth);
+            } catch (parseErr) {
+              json = null;
+            }
+          }
           if (json && json.ok) {
             if (json.mode) {
               detectedMode = String(json.mode || '').trim().toLowerCase();
@@ -202,6 +211,7 @@
   var hydrationPromises = {};
   var localReservationsByNs = {};
   var localCustomersByNs = {};
+  var customersDirtyByNs = {};
   var localDetailsByNs = {};
   var localExtensionsByResNs = {};
   var localMetaByNs = {};
@@ -231,10 +241,17 @@
     });
 
     localReservationsByNs[ns] = { list: nextList, byId: byId, byNumber: byNumber, updatedAt: Date.now() };
-    var customers = (core && core.buildCustomersIndexFromReservations)
-      ? core.buildCustomersIndexFromReservations(nextList)
-      : [];
-    localCustomersByNs[ns] = customers;
+    var shouldRebuildCustomers = Boolean(replaceAll || (Array.isArray(list) && list.length > 5) || !Array.isArray(localCustomersByNs[ns]));
+    var customers = localCustomersByNs[ns] || [];
+    if (shouldRebuildCustomers) {
+      customers = (core && core.buildCustomersIndexFromReservations)
+        ? core.buildCustomersIndexFromReservations(nextList)
+        : [];
+      localCustomersByNs[ns] = customers;
+      customersDirtyByNs[ns] = false;
+    } else {
+      customersDirtyByNs[ns] = true;
+    }
 
     var prevMeta = localMetaByNs[ns] || {};
     var nextMeta = Object.assign({}, prevMeta, metaPatch || {}, {
@@ -250,7 +267,9 @@
         root.RGIdbCache.replaceReservationsSnapshot(ns, nextList, customers, nextMeta).catch(function () {});
       } else if (Array.isArray(list) && list.length > 0) {
         root.RGIdbCache.upsertReservations(ns, list).catch(function () {});
-        root.RGIdbCache.upsertCustomers(ns, customers).catch(function () {});
+        if (shouldRebuildCustomers) {
+          root.RGIdbCache.upsertCustomers(ns, customers).catch(function () {});
+        }
         root.RGIdbCache.upsertMeta(ns, nextMeta).catch(function () {});
       }
     }
@@ -544,7 +563,7 @@
     if (!policy.cacheable) return;
     var now = Date.now();
     var ns = getCacheNamespace();
-    var key = core.buildApiCacheKey(getGasUrl(), getToken(), action, payload || {});
+    var key = core.buildApiCacheKey(getTransportUrl(), getToken(), action, payload || {});
     apiResponseCache[key] = {
       key: key,
       ns: ns,
@@ -567,7 +586,7 @@
     if (!core || !core.getApiCachePolicy || !core.buildApiCacheKey) return false;
     var policy = core.getApiCachePolicy(action);
     if (!policy.cacheable) return false;
-    var key = core.buildApiCacheKey(getGasUrl(), getToken(), action, payload || {});
+    var key = core.buildApiCacheKey(getTransportUrl(), getToken(), action, payload || {});
     var entry = apiResponseCache[key];
     return Boolean(entry && Date.now() < entry.expiresAt);
   }
@@ -577,7 +596,7 @@
     if (!core || !core.getApiCachePolicy || !core.buildApiCacheKey) return null;
     var policy = core.getApiCachePolicy(action);
     if (!policy.cacheable) return null;
-    var key = core.buildApiCacheKey(getGasUrl(), getToken(), action, payload || {});
+    var key = core.buildApiCacheKey(getTransportUrl(), getToken(), action, payload || {});
     var entry = apiResponseCache[key];
     if (!entry || !entry.response || !entry.response.success) return null;
     var limit = allowStale !== false ? (entry.staleUntil || entry.expiresAt || 0) : (entry.expiresAt || 0);
@@ -639,16 +658,18 @@
 
   function getCustomersDirectory() {
     var ns = getCacheNamespace();
-    if (Array.isArray(localCustomersByNs[ns]) && localCustomersByNs[ns].length > 0) {
+    var bucket = localReservationsByNs[ns];
+    if (!customersDirtyByNs[ns] && Array.isArray(localCustomersByNs[ns]) && localCustomersByNs[ns].length > 0) {
       return localCustomersByNs[ns].slice();
     }
-    var bucket = localReservationsByNs[ns];
     if (bucket && Array.isArray(bucket.list) && bucket.list.length > 0 && root.RGCrmCore && root.RGCrmCore.buildCustomersIndexFromReservations) {
       var built = root.RGCrmCore.buildCustomersIndexFromReservations(bucket.list);
       localCustomersByNs[ns] = built;
+      customersDirtyByNs[ns] = false;
+      if (root.RGIdbCache) root.RGIdbCache.upsertCustomers(ns, built).catch(function () {});
       return built.slice();
     }
-    if (!getGasUrl() && getToken()) {
+    if (!getTransportUrl() && getToken()) {
       syncSandboxSnapshotToIdb(ns);
       return (localCustomersByNs[ns] || []).slice();
     }
@@ -3758,8 +3779,12 @@
             }, bTimeoutMs);
           }
           var bResponse = await fetch(backendUrl, bOpts);
+          var bContentType = bResponse.headers && bResponse.headers.get ? (bResponse.headers.get('content-type') || '') : '';
+          var bText = await bResponse.text();
           if (bTimeoutId) clearTimeout(bTimeoutId);
-          parsed = await bResponse.json();
+          parsed = (core && core.parseBackendResponseText)
+            ? core.parseBackendResponseText(bText, bResponse.status, bContentType)
+            : (bText ? JSON.parse(bText) : { success: false, message: 'استجابة فارغة من خادم قاعدة البيانات السحابية.', data: null, error: 'EMPTY_RESPONSE' });
           if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
             setToken('');
             document.dispatchEvent(new CustomEvent('rg:unauthorized'));
@@ -4025,9 +4050,13 @@
       if (resp.status === 404 || resp.status === 405) {
         return { success: false, staticHostOnly: true, message: 'الخادم الخلفي غير متاح على هذه الاستضافة.' };
       }
+      var contentType = resp.headers && resp.headers.get ? (resp.headers.get('content-type') || '') : '';
       var text = await resp.text();
-      var parsed = JSON.parse(text);
-      return parsed;
+      var core = root.RGCrmCore;
+      var parsed = (core && core.parseBackendResponseText)
+        ? core.parseBackendResponseText(text, resp.status, contentType)
+        : (text ? JSON.parse(text) : { success: false, message: 'استجابة فارغة من الخادم (HTTP ' + resp.status + ').', data: null, error: 'EMPTY_RESPONSE' });
+      return Object.assign({ staticHostOnly: false }, parsed);
     } catch (err) {
       return {
         success: false,

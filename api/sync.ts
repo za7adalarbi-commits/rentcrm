@@ -7,6 +7,9 @@ import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch } from '../backend/
 
 function parseBody(rawBody: any): Record<string, any> {
   if (!rawBody) return {};
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(rawBody)) {
+    rawBody = rawBody.toString('utf8');
+  }
   if (typeof rawBody === 'string') {
     try {
       const parsed = JSON.parse(rawBody);
@@ -44,8 +47,9 @@ export default async function handler(req: any, res: any) {
     return;
   }
 
-  const executor = createPgExecutor();
+  let executor: ReturnType<typeof createPgExecutor> | null = null;
   try {
+    executor = createPgExecutor();
     await ensureSchemaInitialized(executor);
     await ensureSeededDatabase(executor);
 
@@ -113,11 +117,13 @@ export default async function handler(req: any, res: any) {
     });
   } catch (err: any) {
     await logBackendError(executor, 'api/sync', String(req.method || 'POST'), err);
-    res.status(500).json({
-      success: false,
-      message: String(err?.message || 'فشل تنفيذ المزامنة السحابية.'),
-      data: null,
-      error: 'SYNC_ERROR'
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: String(err?.message || 'فشل تنفيذ المزامنة السحابية.'),
+        data: null,
+        error: 'SYNC_ERROR'
+      });
+    }
   }
 }

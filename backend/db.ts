@@ -95,14 +95,22 @@ export function getPool(): pg.Pool {
   if (!connectionString) {
     throw new Error('DATABASE_UNCONFIGURED: متغير DATABASE_URL غير مضبوط في بيئة الخادم.');
   }
-  cachedPool = new Pool({
+  const isServerless = process.env.VERCEL === '1' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+  const pool = new Pool({
     connectionString,
     ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined,
-    max: Number(process.env.PG_POOL_MAX || 10) || 10,
-    idleTimeoutMillis: 20000,
-    connectionTimeoutMillis: 10000,
+    max: Number(process.env.PG_POOL_MAX || (isServerless ? 3 : 10)) || (isServerless ? 3 : 10),
+    idleTimeoutMillis: isServerless ? 10000 : 20000,
+    connectionTimeoutMillis: 15000,
     allowExitOnIdle: true
   });
+  pool.on('error', (err) => {
+    console.error('PostgreSQL pool idle error:', err?.message || err);
+    if (cachedPool === pool) {
+      cachedPool = null;
+    }
+  });
+  cachedPool = pool;
   return cachedPool;
 }
 
@@ -140,9 +148,13 @@ export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
 }
 
 function loadSchemaSql(): string {
+  const metaDir = typeof import.meta !== 'undefined' && (import.meta as any).dirname
+    ? String((import.meta as any).dirname)
+    : process.cwd();
   const candidates = [
     path.resolve(process.cwd(), 'database/schema.sql'),
-    path.resolve(import.meta.dirname || process.cwd(), '../database/schema.sql')
+    path.resolve(metaDir, '../database/schema.sql'),
+    path.resolve(metaDir, 'database/schema.sql')
   ];
   for (const filePath of candidates) {
     if (fs.existsSync(filePath)) {
@@ -165,6 +177,13 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
       if (!exists) {
         const schemaSql = loadSchemaSql();
         await executor.query(schemaSql);
+      } else {
+        // Idempotent index check for existing databases without altering mock tests
+        await executor.query(
+          `CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);
+           CREATE INDEX IF NOT EXISTS idx_reservations_company_updated ON reservations (company_name, updated_at DESC);
+           CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);`
+        ).catch(() => undefined);
       }
       schemaInitialized = true;
     } finally {

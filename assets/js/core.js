@@ -1588,6 +1588,74 @@
     }
   }
 
+  function parseBackendResponseText(rawText, httpStatus, contentType) {
+    var status = Number(httpStatus || 0);
+    var trimmed = normalizeStr(rawText);
+    var cType = normalizeStr(contentType).toLowerCase();
+
+    if (!trimmed) {
+      if (status === 404 || status === 405) {
+        return {
+          success: false,
+          message: 'نقطة النهاية /api/crm غير متاحة على هذه الاستضافة (HTTP ' + status + ').',
+          data: null,
+          error: 'BACKEND_NOT_FOUND'
+        };
+      }
+      if (status === 502 || status === 504) {
+        return {
+          success: false,
+          message: 'انتهت مهلة أو تعذر اتصال خادم Vercel بقاعدة البيانات (HTTP ' + status + '). تحقق من رابط DATABASE_URL وحالة Neon.',
+          data: null,
+          error: 'GATEWAY_ERROR'
+        };
+      }
+      return {
+        success: false,
+        message: 'أعاد خادم قاعدة البيانات السحابية استجابة فارغة (HTTP ' + status + '). تأكد من ضبط متغير DATABASE_URL في Vercel ومراجعة سجلات الخادم (Logs).',
+        data: null,
+        error: 'EMPTY_RESPONSE'
+      };
+    }
+
+    if (trimmed.charAt(0) === '<' || /^<!doctype/i.test(trimmed) || cType.indexOf('text/html') !== -1) {
+      return {
+        success: false,
+        message: 'أعاد الخادم صفحة HTML بدلاً من JSON (HTTP ' + status + '). تأكد من توجيه مسار /api/crm إلى Serverless Function وليس إلى index.html.',
+        data: null,
+        error: 'HTML_RESPONSE'
+      };
+    }
+
+    try {
+      var parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object') {
+        return {
+          success: false,
+          message: 'صيغة استجابة الخادم السحابي غير صالحة (HTTP ' + status + ').',
+          data: null,
+          error: 'INVALID_RESPONSE'
+        };
+      }
+      if (status >= 400 && parsed.success !== false) {
+        return Object.assign({}, parsed, {
+          success: false,
+          message: parsed.message || ('خطأ من خادم قاعدة البيانات السحابية (HTTP ' + status + ').'),
+          error: parsed.error || ('HTTP_' + status)
+        });
+      }
+      return parsed;
+    } catch (e) {
+      var preview = trimmed.replace(/\s+/g, ' ').slice(0, 140);
+      return {
+        success: false,
+        message: 'تعذر قراءة استجابة الخادم السحابي كـ JSON (HTTP ' + status + '): ' + preview,
+        data: null,
+        error: 'INVALID_JSON'
+      };
+    }
+  }
+
   var API_CACHE_POLICIES = {
     getAppBootstrap: { cacheable: true, ttlMs: 30000, scope: 'dashboard' },
     getMe: { cacheable: true, ttlMs: 300000, scope: 'employees' },
@@ -2188,6 +2256,7 @@
     getGasActionTimeoutMs: getGasActionTimeoutMs,
     buildGasFetchOptions: buildGasFetchOptions,
     parseGasResponseText: parseGasResponseText,
+    parseBackendResponseText: parseBackendResponseText,
     getApiCachePolicy: getApiCachePolicy,
     buildApiCacheKey: buildApiCacheKey,
     getCacheInvalidationScopes: getCacheInvalidationScopes,

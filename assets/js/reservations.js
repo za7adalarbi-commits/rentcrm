@@ -1444,6 +1444,9 @@
         e.classList.remove('hidden');
         return;
       }
+      if (root.RGApi && root.RGApi.clearCache) {
+        root.RGApi.clearCache(['dashboard', 'reports', 'employees']);
+      }
       ctx.toast('تم حفظ تعديلات تفاصيل الحجز بنجاح.');
       ctx.refreshNotifications();
       if (onSaved) onSaved();

@@ -26,6 +26,7 @@ import {
 import {
   enqueueSheetsMirror,
   flushSheetsMirrorOutbox,
+  getLastSyncBatchMutatedAt,
   ingestIncrementalSyncBatch,
   mapExtensionRowToClient,
   mapReservationRowToClient,
@@ -242,10 +243,43 @@ async function getPermissionDefsFromDb(client: DbClient): Promise<any[]> {
   }));
 }
 
+const seededExecutors = new WeakSet<DbExecutor>();
+const seedPromiseByExec = new WeakMap<DbExecutor, Promise<void>>();
+const facetsCacheByExec = new WeakMap<DbExecutor, { expiresAt: number; syncTs: number; companies: string[]; branches: string[] }>();
+
+async function getCachedReservationFacets(executor: DbExecutor): Promise<{ companies: string[]; branches: string[] }> {
+  const now = Date.now();
+  const syncTs = getLastSyncBatchMutatedAt();
+  const cached = facetsCacheByExec.get(executor);
+  if (cached && now < cached.expiresAt && cached.syncTs === syncTs) {
+    return { companies: cached.companies, branches: cached.branches };
+  }
+  const [compFacets, branchFacets] = await Promise.all([
+    executor.query<{ company_name: string }>(
+      `SELECT DISTINCT company_name FROM reservations WHERE company_name <> '' ORDER BY company_name ASC LIMIT 200`
+    ),
+    executor.query<{ branch_name: string }>(
+      `SELECT DISTINCT branch_name FROM reservations WHERE branch_name <> '' ORDER BY branch_name ASC LIMIT 300`
+    )
+  ]);
+  const companies = compFacets.rows.map((c) => c.company_name);
+  const branches = branchFacets.rows.map((b) => b.branch_name);
+  facetsCacheByExec.set(executor, { expiresAt: now + 60000, syncTs, companies, branches });
+  return { companies, branches };
+}
+
 export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> {
-  const countRes = await executor.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM employees`);
-  const cnt = Number(countRes.rows[0]?.cnt || 0);
-  if (cnt > 0) return;
+  if (seededExecutors.has(executor)) return;
+  const inflight = seedPromiseByExec.get(executor);
+  if (inflight) return inflight;
+
+  const p = (async () => {
+    const countRes = await executor.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM employees`);
+    const cnt = Number(countRes.rows[0]?.cnt || 0);
+    if (cnt > 0) {
+      seededExecutors.add(executor);
+      return;
+    }
 
   const nowIso = new Date().toISOString();
   const seeds = [
@@ -343,6 +377,13 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       );
     }
   });
+    seededExecutors.add(executor);
+  })().finally(() => {
+    seedPromiseByExec.delete(executor);
+  });
+
+  seedPromiseByExec.set(executor, p);
+  return p;
 }
 
 // ---------- DASHBOARD & BOOTSTRAP ----------
@@ -369,12 +410,14 @@ export async function getDashboard(
     } else if (range === '30d') {
       dateFrom = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
       dateTo = today;
+    } else if (range === 'month') {
+      dateFrom = `${today.slice(0, 7)}-01`;
+      dateTo = today;
     }
   }
 
   const resParams: any[] = [];
   const resClauses: string[] = [];
-
   if (session.user.role === 'agent' && !allowAgentViewAll) {
     resParams.push(JSON.stringify([session.user.id]));
     resClauses.push(`assigned_employee_ids @> $${resParams.length}::jsonb`);
@@ -387,82 +430,136 @@ export async function getDashboard(
     resParams.push(dateTo);
     resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) <= $${resParams.length}`);
   }
-
   const resWhere = resClauses.length ? `WHERE ${resClauses.join(' AND ')}` : '';
-  const resQuery = await executor.query(
-    `SELECT id, start_date, created_at, internal_status, company_name, assigned_employee_ids
-     FROM reservations ${resWhere}`,
-    resParams
-  );
+  const totalParams = [...resParams, today];
+  const todayParamIdx = totalParams.length;
+
+  const fuParams: any[] = [];
+  const fuClauses: string[] = [];
+  if (dateFrom) {
+    fuParams.push(dateFrom);
+    fuClauses.push(`follow_up_date >= $${fuParams.length}`);
+  }
+  if (dateTo) {
+    fuParams.push(dateTo);
+    fuClauses.push(`follow_up_date <= $${fuParams.length}`);
+  }
+  const fuWhere = fuClauses.length ? `WHERE ${fuClauses.join(' AND ')}` : '';
+
+  const canSync = crmCore.canAccessApi(session.user);
+
+  const [
+    resTotalsQuery,
+    resStatusQuery,
+    resCompanyQuery,
+    resAssignedQuery,
+    fuAggQuery,
+    fuTodayQuery,
+    prbAggQuery,
+    empQuery,
+    recentActivityRes,
+    syncRes
+  ] = await Promise.all([
+    executor.query<{ total_cnt: number; today_cnt: number }>(
+      `SELECT COUNT(*)::int AS total_cnt,
+              COUNT(*) FILTER (WHERE start_date = $${todayParamIdx} OR to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $${todayParamIdx})::int AS today_cnt
+       FROM reservations ${resWhere}`,
+      totalParams
+    ),
+    executor.query<{ internal_status: string; cnt: number }>(
+      `SELECT COALESCE(NULLIF(internal_status, ''), 'تم الإنشاء') AS internal_status, COUNT(*)::int AS cnt
+       FROM reservations ${resWhere}
+       GROUP BY 1`,
+      resParams
+    ),
+    executor.query<{ company_name: string; cnt: number }>(
+      `SELECT COALESCE(NULLIF(company_name, ''), 'غير محدد') AS company_name, COUNT(*)::int AS cnt
+       FROM reservations ${resWhere}
+       GROUP BY 1`,
+      resParams
+    ),
+    executor.query<{ emp_id: string; cnt: number }>(
+      `SELECT emp_id, COUNT(*)::int AS cnt
+       FROM reservations r,
+            LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
+       ${resWhere}
+       GROUP BY emp_id`,
+      resParams
+    ),
+    executor.query<{ follow_up_date: string; employee_name: string; cnt: number }>(
+      `SELECT follow_up_date, employee_name, COUNT(*)::int AS cnt
+       FROM follow_ups ${fuWhere}
+       GROUP BY follow_up_date, employee_name`,
+      fuParams
+    ),
+    executor.query<{ today_cnt: number }>(
+      `SELECT COUNT(*)::int AS today_cnt FROM follow_ups WHERE follow_up_date = $1`,
+      [today]
+    ),
+    executor.query<{ status: string; priority: string; cnt: number }>(
+      `SELECT status, priority, COUNT(*)::int AS cnt FROM problems GROUP BY status, priority`
+    ),
+    executor.query(`SELECT id, name, status FROM employees WHERE status = 'active'`),
+    executor.query(`SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 8`),
+    canSync ? executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 1`) : Promise.resolve({ rows: [] as any[], rowCount: 0 })
+  ]);
 
   const statusCounts: Record<string, number> = {};
   for (const s of crmCore.FOLLOWUP_STATUSES) {
     statusCounts[s] = 0;
   }
+  for (const row of resStatusQuery.rows) {
+    const st = str(row.internal_status || 'تم الإنشاء');
+    statusCounts[st] = (statusCounts[st] || 0) + num(row.cnt);
+  }
+  const newReservations = (statusCounts['تم الإنشاء'] || 0) + (statusCounts['جديد'] || 0) + (statusCounts['قيد الانتظار'] || 0);
 
   const companyCounts: Record<string, number> = {};
-  let todayReservations = 0;
-  let newReservations = 0;
-
-  for (const r of resQuery.rows) {
-    const st = str(r.internal_status || 'تم الإنشاء');
-    statusCounts[st] = (statusCounts[st] || 0) + 1;
-    const cDate = r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : str(r.created_at).slice(0, 10);
-    const sDate = str(r.start_date).slice(0, 10);
-    if (cDate === today || sDate === today) todayReservations++;
-    if (st === 'تم الإنشاء' || st === 'جديد' || st === 'قيد الانتظار') newReservations++;
-    const comp = str(r.company_name || 'غير محدد');
-    companyCounts[comp] = (companyCounts[comp] || 0) + 1;
+  for (const row of resCompanyQuery.rows) {
+    const comp = str(row.company_name || 'غير محدد');
+    companyCounts[comp] = (companyCounts[comp] || 0) + num(row.cnt);
   }
 
-  const fuQuery = await executor.query(
-    `SELECT employee_name, follow_up_date FROM follow_ups`
-  );
-  let todayFollowUps = 0;
+  const assignedByEmpId = new Map<string, number>();
+  for (const row of resAssignedQuery.rows) {
+    assignedByEmpId.set(str(row.emp_id), num(row.cnt));
+  }
+
   const dailyFollowUps: Record<string, number> = {};
   const empFollowUpCounts: Record<string, number> = {};
-  for (const fu of fuQuery.rows) {
-    const fDate = str(fu.follow_up_date);
-    if (fDate === today) todayFollowUps++;
-    if (dateFrom && fDate < dateFrom) continue;
-    if (dateTo && fDate > dateTo) continue;
-    dailyFollowUps[fDate] = (dailyFollowUps[fDate] || 0) + 1;
-    empFollowUpCounts[str(fu.employee_name)] = (empFollowUpCounts[str(fu.employee_name)] || 0) + 1;
+  for (const row of fuAggQuery.rows) {
+    const cnt = num(row.cnt);
+    const fDate = str(row.follow_up_date);
+    const eName = str(row.employee_name);
+    if (fDate) dailyFollowUps[fDate] = (dailyFollowUps[fDate] || 0) + cnt;
+    if (eName) empFollowUpCounts[eName] = (empFollowUpCounts[eName] || 0) + cnt;
   }
 
-  const prbQuery = await executor.query(`SELECT status, priority FROM problems`);
   let openProblems = 0;
   let closedProblems = 0;
   let highProblems = 0;
   const problemPriorities: Record<string, number> = { 'عادي': 0, 'متوسط': 0, 'مرتفع': 0 };
-  for (const pr of prbQuery.rows) {
-    const isClosed = pr.status === 'مغلقة' || pr.status === 'تم الحل';
-    if (isClosed) closedProblems++;
-    else openProblems++;
-    if (pr.priority === 'مرتفع' && !isClosed) highProblems++;
-    if (Object.prototype.hasOwnProperty.call(problemPriorities, pr.priority)) {
-      problemPriorities[pr.priority]++;
+  for (const row of prbAggQuery.rows) {
+    const cnt = num(row.cnt);
+    const isClosed = row.status === 'مغلقة' || row.status === 'تم الحل';
+    if (isClosed) closedProblems += cnt;
+    else openProblems += cnt;
+    if (row.priority === 'مرتفع' && !isClosed) highProblems += cnt;
+    if (Object.prototype.hasOwnProperty.call(problemPriorities, row.priority)) {
+      problemPriorities[row.priority] += cnt;
     }
   }
 
-  const empQuery = await executor.query(`SELECT id, name, status FROM employees WHERE status = 'active'`);
-  const employeeComparison = empQuery.rows.map((emp) => {
-    let assignedCount = 0;
-    for (const r of resQuery.rows) {
-      const ids = parseJsonArray<string>(r.assigned_employee_ids);
-      if (ids.includes(str(emp.id))) assignedCount++;
-    }
-    return {
-      name: str(emp.name),
-      followUps: empFollowUpCounts[str(emp.name)] || 0,
-      assigned: assignedCount
-    };
-  });
+  const employeeComparison = empQuery.rows.map((emp) => ({
+    name: str(emp.name),
+    followUps: empFollowUpCounts[str(emp.name)] || 0,
+    assigned: assignedByEmpId.get(str(emp.id)) || 0
+  }));
 
   const metrics = {
     kpis: {
-      totalReservations: resQuery.rows.length,
-      todayReservations,
+      totalReservations: num(resTotalsQuery.rows[0]?.total_cnt),
+      todayReservations: num(resTotalsQuery.rows[0]?.today_cnt),
       newReservations,
       booked: statusCounts['تم الحجز'] || 0,
       delivered: statusCounts['تم التسليم'] || 0,
@@ -473,7 +570,7 @@ export async function getDashboard(
       notBooked: statusCounts['لم يتم الحجز'] || 0,
       openProblems,
       highProblems,
-      todayFollowUps
+      todayFollowUps: num(fuTodayQuery.rows[0]?.today_cnt)
     },
     charts: {
       statusDistribution: statusCounts,
@@ -486,9 +583,6 @@ export async function getDashboard(
     }
   };
 
-  const recentActivityRes = await executor.query(
-    `SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 8`
-  );
   const recentActivity = recentActivityRes.rows.map((l) => ({
     id: str(l.id),
     userId: str(l.user_id),
@@ -504,25 +598,22 @@ export async function getDashboard(
   }));
 
   let lastSync: any = null;
-  if (crmCore.canAccessApi(session.user)) {
-    const syncRes = await executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 1`);
-    if (syncRes.rows[0]) {
-      const s = syncRes.rows[0];
-      lastSync = {
-        id: str(s.id),
-        triggeredById: str(s.triggered_by_id),
-        triggeredByName: str(s.triggered_by_name),
-        status: str(s.status),
-        importedCount: num(s.imported_count),
-        updatedCount: num(s.updated_count),
-        extensionsCount: num(s.extensions_count),
-        pagesFetched: num(s.pages_fetched),
-        errorMessage: str(s.error_message),
-        durationMs: num(s.duration_ms),
-        startedAt: s.started_at instanceof Date ? s.started_at.toISOString() : str(s.started_at),
-        finishedAt: s.finished_at instanceof Date ? s.finished_at.toISOString() : str(s.finished_at)
-      };
-    }
+  if (canSync && syncRes.rows[0]) {
+    const s = syncRes.rows[0];
+    lastSync = {
+      id: str(s.id),
+      triggeredById: str(s.triggered_by_id),
+      triggeredByName: str(s.triggered_by_name),
+      status: str(s.status),
+      importedCount: num(s.imported_count),
+      updatedCount: num(s.updated_count),
+      extensionsCount: num(s.extensions_count),
+      pagesFetched: num(s.pages_fetched),
+      errorMessage: str(s.error_message),
+      durationMs: num(s.duration_ms),
+      startedAt: s.started_at instanceof Date ? s.started_at.toISOString() : str(s.started_at),
+      finishedAt: s.finished_at instanceof Date ? s.finished_at.toISOString() : str(s.finished_at)
+    };
   }
 
   return {
@@ -563,15 +654,20 @@ export async function getAppBootstrap(
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
-  const [dashboard, notifications, settings, serverCfg] = await Promise.all([
-    getDashboard(executor, session, { range: payload.range || '' }),
+  const range = str(payload.range || '30d');
+  const canEmployees = crmCore.canUserPerform(session.user, 'view_employees');
+  const canSync = crmCore.canAccessApi(session.user);
+
+  const [dashboard, notifications, settings, serverCfg, employeesData] = await Promise.all([
+    getDashboard(executor, session, { range }),
     getNotifications(executor, session),
     getSettingsMap(executor),
-    resolveServerConfig(executor)
+    resolveServerConfig(executor),
+    canEmployees ? getEmployees(executor, session) : Promise.resolve(null)
   ]);
 
   let settingsOut: any = null;
-  if (crmCore.canAccessApi(session.user)) {
+  if (canSync) {
     settingsOut = {
       ...settings,
       gas_webapp_url: serverCfg.gasWebAppUrl,
@@ -584,9 +680,11 @@ export async function getAppBootstrap(
   }
 
   return {
+    user: session.user,
     me: { user: session.user },
     dashboard,
     notifications,
+    employees: employeesData,
     settings: settingsOut
   };
 }
@@ -672,40 +770,66 @@ export async function getReservations(
 
   const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
+  const RESERVATION_SORT_COLUMNS: Record<string, string> = {
+    lastUpdatedAt: 'r.updated_at',
+    updatedAt: 'r.updated_at',
+    createdAt: 'r.created_at',
+    reservationNumber: 'r.reservation_number',
+    customerName: 'r.customer_name',
+    customerPhone: 'r.customer_phone',
+    companyName: 'r.company_name',
+    branchName: 'r.branch_name',
+    carName: 'r.car_name',
+    startDate: 'r.start_date',
+    endDate: 'r.end_date',
+    daysCount: 'r.days_count',
+    extensionsCount: 'r.extensions_count',
+    extendedUntilDate: 'r.extended_until_date',
+    extensionsAmount: 'r.extensions_amount',
+    totalAmount: 'r.total_amount',
+    originalStatusAr: 'r.original_status_ar',
+    internalStatus: 'r.internal_status',
+    priority: 'r.priority',
+    lastUpdatedByName: 'r.last_updated_by_name'
+  };
+
   let orderSql = 'r.updated_at DESC';
-  if (payload.sortBy === 'startDate_desc') orderSql = 'r.start_date DESC, r.updated_at DESC';
-  else if (payload.sortBy === 'startDate_asc') orderSql = 'r.start_date ASC, r.updated_at DESC';
-  else if (payload.sortBy === 'totalAmount_desc') orderSql = 'r.total_amount DESC, r.updated_at DESC';
+  const rawSortBy = str(payload.sortBy);
+  const rawSortDir = str(payload.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  if (rawSortBy === 'startDate_desc') {
+    orderSql = 'r.start_date DESC, r.updated_at DESC';
+  } else if (rawSortBy === 'startDate_asc') {
+    orderSql = 'r.start_date ASC, r.updated_at DESC';
+  } else if (rawSortBy === 'totalAmount_desc') {
+    orderSql = 'r.total_amount DESC, r.updated_at DESC';
+  } else if (rawSortBy && RESERVATION_SORT_COLUMNS[rawSortBy]) {
+    const col = RESERVATION_SORT_COLUMNS[rawSortBy];
+    orderSql = col === 'r.updated_at' ? `${col} ${rawSortDir}` : `${col} ${rawSortDir}, r.updated_at DESC`;
+  }
 
   const page = Math.max(1, num(payload.page, 1));
   const pageSize = Math.min(200, Math.max(1, num(payload.pageSize, 25)));
   const offset = (page - 1) * pageSize;
 
-  const countRes = await executor.query<{ cnt: string }>(
-    `SELECT COUNT(*)::text AS cnt FROM reservations r ${whereSql}`,
-    params
-  );
-  const total = Number(countRes.rows[0]?.cnt || 0);
-
   const listParams = [...params, pageSize, offset];
-  const rowsRes = await executor.query(
-    `SELECT r.*,
-            EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
-     FROM reservations r
-     ${whereSql}
-     ORDER BY ${orderSql}
-     LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
-    listParams
-  );
-
-  const [compFacets, branchFacets] = await Promise.all([
-    executor.query<{ company_name: string }>(
-      `SELECT DISTINCT company_name FROM reservations WHERE company_name <> '' ORDER BY company_name ASC LIMIT 200`
+  const [countRes, rowsRes, facets] = await Promise.all([
+    executor.query<{ cnt: string }>(
+      `SELECT COUNT(*)::text AS cnt FROM reservations r ${whereSql}`,
+      params
     ),
-    executor.query<{ branch_name: string }>(
-      `SELECT DISTINCT branch_name FROM reservations WHERE branch_name <> '' ORDER BY branch_name ASC LIMIT 300`
-    )
+    executor.query(
+      `SELECT r.*,
+              EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
+       FROM reservations r
+       ${whereSql}
+       ORDER BY ${orderSql}
+       LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams
+    ),
+    getCachedReservationFacets(executor)
   ]);
+
+  const total = Number(countRes.rows[0]?.cnt || 0);
 
   return {
     items: rowsRes.rows.map((r) => mapReservationRowToClient(r, false)),
@@ -713,10 +837,7 @@ export async function getReservations(
     page,
     pageSize,
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
-    facets: {
-      companies: compFacets.rows.map((c) => c.company_name),
-      branches: branchFacets.rows.map((b) => b.branch_name)
-    }
+    facets
   };
 }
 
@@ -1109,15 +1230,48 @@ export async function updateReservationDetails(
       });
     }
 
+    const nextDaysCount = payload.daysCount !== undefined ? Math.max(0, Math.round(num(payload.daysCount, existing.daysCount))) : existing.daysCount;
+    const nextExtDaysCount = payload.extendedDaysCount !== undefined ? Math.max(0, Math.round(num(payload.extendedDaysCount, existing.extendedDaysCount))) : existing.extendedDaysCount;
+    const nextTotalDaysCount = payload.totalDaysCount !== undefined
+      ? Math.max(0, Math.round(num(payload.totalDaysCount, nextDaysCount + nextExtDaysCount)))
+      : (nextDaysCount + nextExtDaysCount);
+    const nextExtCount = payload.extensionsCount !== undefined ? Math.max(0, Math.round(num(payload.extensionsCount, existing.extensionsCount))) : existing.extensionsCount;
+    const nextBaseAmount = payload.baseAmount !== undefined ? num(payload.baseAmount, existing.baseAmount) : existing.baseAmount;
+    const nextExtAmount = payload.extensionsAmount !== undefined ? num(payload.extensionsAmount, existing.extensionsAmount) : existing.extensionsAmount;
+    const nextTotalAmount = payload.totalAmount !== undefined
+      ? num(payload.totalAmount, Number((nextBaseAmount + nextExtAmount).toFixed(2)))
+      : existing.totalAmount;
+
     const nextObj: Record<string, any> = {
       ...existing,
       customerName: payload.customerName !== undefined ? str(payload.customerName) : existing.customerName,
       customerPhone: payload.customerPhone !== undefined ? str(payload.customerPhone) : existing.customerPhone,
+      customerEmail: payload.customerEmail !== undefined ? str(payload.customerEmail) : existing.customerEmail,
+      customerIdNumber: payload.customerIdNumber !== undefined ? str(payload.customerIdNumber) : existing.customerIdNumber,
       companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
       branchName: payload.branchName !== undefined ? str(payload.branchName) : existing.branchName,
+      deliverBranchName: payload.deliverBranchName !== undefined ? str(payload.deliverBranchName) : existing.deliverBranchName,
       carName: payload.carName !== undefined ? str(payload.carName) : existing.carName,
+      carCategory: payload.carCategory !== undefined ? str(payload.carCategory) : existing.carCategory,
+      plateNumber: payload.plateNumber !== undefined ? str(payload.plateNumber) : existing.plateNumber,
       startDate: payload.startDate !== undefined ? str(payload.startDate) : existing.startDate,
+      startTime: payload.startTime !== undefined ? str(payload.startTime) : existing.startTime,
       endDate: payload.endDate !== undefined ? str(payload.endDate) : existing.endDate,
+      endTime: payload.endTime !== undefined ? str(payload.endTime) : existing.endTime,
+      extendedUntilDate: payload.extendedUntilDate !== undefined ? str(payload.extendedUntilDate) : existing.extendedUntilDate,
+      extendedUntilTime: payload.extendedUntilTime !== undefined ? str(payload.extendedUntilTime) : existing.extendedUntilTime,
+      pickupTypeAr: payload.pickupTypeAr !== undefined ? str(payload.pickupTypeAr) : existing.pickupTypeAr,
+      returnTypeAr: payload.returnTypeAr !== undefined ? str(payload.returnTypeAr) : existing.returnTypeAr,
+      paymentMethod: payload.paymentMethod !== undefined ? str(payload.paymentMethod) : existing.paymentMethod,
+      paymentStatus: payload.paymentStatus !== undefined ? str(payload.paymentStatus) : existing.paymentStatus,
+      daysCount: nextDaysCount,
+      extendedDaysCount: nextExtDaysCount,
+      totalDaysCount: nextTotalDaysCount,
+      extensionsCount: nextExtCount,
+      baseAmount: nextBaseAmount,
+      extensionsAmount: nextExtAmount,
+      totalAmount: nextTotalAmount,
+      hasExtensions: Boolean(nextExtCount > 0 || nextExtDaysCount > 0 || existing.hasExtensions),
       priority: payload.priority !== undefined ? str(payload.priority) : existing.priority,
       internalStatus: nextStatus,
       lastUpdateText: payload.lastUpdateText !== undefined ? str(payload.lastUpdateText) : `تعديل بيانات الحجز بواسطة ${session.user.name}`,
@@ -1130,20 +1284,48 @@ export async function updateReservationDetails(
 
     await tx.query(
       `UPDATE reservations
-       SET customer_name = $2, customer_phone = $3, company_name = $4, branch_name = $5,
-           car_name = $6, start_date = $7, end_date = $8, priority = $9, internal_status = $10,
-           last_update_text = $11, last_updated_by_id = $12, last_updated_by_name = $13,
-           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb
+       SET customer_name = $2, customer_phone = $3, customer_email = $4, customer_id_number = $5,
+           company_name = $6, branch_name = $7, deliver_branch_name = $8,
+           car_name = $9, car_category = $10, plate_number = $11,
+           start_date = $12, start_time = $13, end_date = $14, end_time = $15,
+           extended_until_date = $16, extended_until_time = $17,
+           pickup_type_ar = $18, return_type_ar = $19, payment_method = $20, payment_status = $21,
+           days_count = $22, extended_days_count = $23, total_days_count = $24,
+           extensions_count = $25, base_amount = $26, extensions_amount = $27, total_amount = $28,
+           has_extensions = $29, priority = $30, internal_status = $31,
+           last_update_text = $32, last_updated_by_id = $33, last_updated_by_name = $34,
+           last_updated_at = $35, updated_at = $35::timestamptz, status_history = $36::jsonb
        WHERE id = $1`,
       [
         resId,
         nextObj.customerName,
         nextObj.customerPhone,
+        nextObj.customerEmail,
+        nextObj.customerIdNumber,
         nextObj.companyName,
         nextObj.branchName,
+        nextObj.deliverBranchName,
         nextObj.carName,
+        nextObj.carCategory,
+        nextObj.plateNumber,
         nextObj.startDate,
+        nextObj.startTime,
         nextObj.endDate,
+        nextObj.endTime,
+        nextObj.extendedUntilDate,
+        nextObj.extendedUntilTime,
+        nextObj.pickupTypeAr,
+        nextObj.returnTypeAr,
+        nextObj.paymentMethod,
+        nextObj.paymentStatus,
+        nextObj.daysCount,
+        nextObj.extendedDaysCount,
+        nextObj.totalDaysCount,
+        nextObj.extensionsCount,
+        nextObj.baseAmount,
+        nextObj.extensionsAmount,
+        nextObj.totalAmount,
+        nextObj.hasExtensions,
         nextObj.priority,
         nextObj.internalStatus,
         nextObj.lastUpdateText,
@@ -1478,6 +1660,10 @@ export async function getTeamFollowUps(executor: DbExecutor, _session: AuthSessi
     params.push(str(payload.status));
     clauses.push(`status = $${params.length}`);
   }
+  if (payload.date) {
+    params.push(str(payload.date));
+    clauses.push(`follow_up_date = $${params.length}`);
+  }
   if (payload.dateFrom) {
     params.push(str(payload.dateFrom));
     clauses.push(`follow_up_date >= $${params.length}`);
@@ -1693,13 +1879,19 @@ export async function getProblems(executor: DbExecutor, _session: AuthSession, p
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const prbRes = await executor.query(`SELECT * FROM problems ${where} ORDER BY updated_at DESC LIMIT 400`, params);
-  const updRes = await executor.query(`SELECT * FROM problem_updates ORDER BY created_at DESC LIMIT 1000`);
   const updMap = new Map<string, any[]>();
-  for (const u of updRes.rows) {
-    const pid = str(u.problem_id);
-    const list = updMap.get(pid) || [];
-    list.push(formatProblemUpdateRow(u));
-    updMap.set(pid, list);
+  if (prbRes.rows.length > 0) {
+    const pIds = prbRes.rows.map((p) => str(p.id)).filter(Boolean);
+    const updRes = await executor.query(
+      `SELECT * FROM problem_updates WHERE problem_id = ANY($1::text[]) ORDER BY created_at DESC`,
+      [pIds]
+    );
+    for (const u of updRes.rows) {
+      const pid = str(u.problem_id);
+      const list = updMap.get(pid) || [];
+      list.push(formatProblemUpdateRow(u));
+      updMap.set(pid, list);
+    }
   }
   const items = prbRes.rows.map((p) => formatProblemRow(p, updMap));
   return { items, total: items.length };
@@ -1719,32 +1911,40 @@ export async function getProblemDetails(executor: DbExecutor, _session: AuthSess
 
 export async function getEmployees(executor: DbExecutor, session: AuthSession) {
   requirePermission(session, 'view_employees');
-  const [empRes, resRes, fuRes, prbRes, presets, customPerms] = await Promise.all([
+  const [empRes, resCountsRes, fuCountsRes, prbCountsRes, presets, customPerms] = await Promise.all([
     executor.query(`SELECT * FROM employees ORDER BY created_at ASC`),
-    executor.query(`SELECT assigned_employee_ids FROM reservations`),
-    executor.query(`SELECT employee_id FROM follow_ups`),
-    executor.query(`SELECT assigned_employee_ids, status FROM problems`),
+    executor.query<{ emp_id: string; cnt: number }>(
+      `SELECT emp_id, COUNT(*)::int AS cnt
+       FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
+       GROUP BY emp_id`
+    ),
+    executor.query<{ employee_id: string; cnt: number }>(
+      `SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups GROUP BY employee_id`
+    ),
+    executor.query<{ emp_id: string; cnt: number }>(
+      `SELECT emp_id, COUNT(*)::int AS cnt
+       FROM problems p, LATERAL jsonb_array_elements_text(p.assigned_employee_ids) AS emp_id
+       WHERE p.status NOT IN ('مغلقة', 'تم الحل')
+       GROUP BY emp_id`
+    ),
     getRolePresetsFromDb(executor),
     getPermissionDefsFromDb(executor)
   ]);
 
+  const resCountMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
+  const fuCountMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
+  const prbCountMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
+
   const items = empRes.rows.map((row) => {
     const emp = mapEmployeeRow(row);
-    let assignedCount = 0;
-    for (const r of resRes.rows) {
-      if (parseJsonArray<string>(r.assigned_employee_ids).includes(emp.id)) assignedCount++;
-    }
-    let followUpsCount = 0;
-    for (const f of fuRes.rows) {
-      if (str(f.employee_id) === emp.id) followUpsCount++;
-    }
-    let openProblemsCount = 0;
-    for (const p of prbRes.rows) {
-      const closed = p.status === 'مغلقة' || p.status === 'تم الحل';
-      if (!closed && parseJsonArray<string>(p.assigned_employee_ids).includes(emp.id)) openProblemsCount++;
-    }
+    const assignedCount = resCountMap.get(emp.id) || 0;
+    const followUpsCount = fuCountMap.get(emp.id) || 0;
+    const openProblemsCount = prbCountMap.get(emp.id) || 0;
     return {
       ...emp,
+      reservationsCount: assignedCount,
+      followUpsCount,
+      problemsCount: openProblemsCount,
       stats: {
         assignedCount,
         followUpsCount,
@@ -1773,17 +1973,86 @@ export async function getEmployeeDetails(executor: DbExecutor, session: AuthSess
   if (!empRes.rows[0]) throw new Error('NOT_FOUND: الموظف غير موجود.');
   const employee = mapEmployeeRow(empRes.rows[0]);
 
+  const empIdJson = JSON.stringify([empId]);
   const [resRows, fuRows, prbRows] = await Promise.all([
-    executor.query(`SELECT * FROM reservations WHERE assigned_employee_ids @> $1::jsonb ORDER BY updated_at DESC LIMIT 200`, [JSON.stringify([empId])]),
-    executor.query(`SELECT * FROM follow_ups WHERE employee_id = $1 ORDER BY created_at DESC LIMIT 200`, [empId]),
-    executor.query(`SELECT * FROM problems WHERE assigned_employee_ids @> $1::jsonb ORDER BY updated_at DESC LIMIT 200`, [JSON.stringify([empId])])
+    executor.query(
+      `SELECT r.*
+       FROM reservations r
+       WHERE r.assigned_employee_ids @> $1::jsonb
+          OR EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id AND fu.employee_id = $2)
+       ORDER BY r.updated_at DESC
+       LIMIT 250`,
+      [empIdJson, empId]
+    ),
+    executor.query(`SELECT * FROM follow_ups WHERE employee_id = $1 ORDER BY created_at DESC LIMIT 250`, [empId]),
+    executor.query(
+      `SELECT * FROM problems WHERE assigned_employee_ids @> $1::jsonb OR created_by_id = $2 ORDER BY updated_at DESC LIMIT 250`,
+      [empIdJson, empId]
+    )
   ]);
+
+  const resIds = resRows.rows.map((r) => str(r.id)).filter(Boolean);
+  const [resFuRes, resPrbRes] = resIds.length > 0
+    ? await Promise.all([
+        executor.query(
+          `SELECT * FROM follow_ups WHERE reservation_id = ANY($1::text[]) ORDER BY created_at DESC`,
+          [resIds]
+        ),
+        executor.query<{ reservation_id: string; cnt: number }>(
+          `SELECT reservation_id, COUNT(*)::int AS cnt FROM problems WHERE reservation_id = ANY($1::text[]) GROUP BY reservation_id`,
+          [resIds]
+        )
+      ])
+    : [{ rows: [] as any[] }, { rows: [] as any[] }];
+
+  const fuByRes = new Map<string, any[]>();
+  for (const row of resFuRes.rows) {
+    const rid = str(row.reservation_id);
+    const list = fuByRes.get(rid) || [];
+    list.push(formatFollowUpRow(row));
+    fuByRes.set(rid, list);
+  }
+  const prbCountByRes = new Map<string, number>();
+  for (const row of resPrbRes.rows) {
+    prbCountByRes.set(str(row.reservation_id), num(row.cnt));
+  }
+
+  const customerKeys = new Set<string>();
+  const statusCounts: Record<string, number> = {};
+  const assignedReservations = resRows.rows.map((r) => {
+    const base = mapReservationRowToClient(r, false);
+    const cKey = str(base.customerPhone || base.customerName);
+    if (cKey) customerKeys.add(cKey);
+    const st = str(base.internalStatus || 'تم الإنشاء');
+    statusCounts[st] = (statusCounts[st] || 0) + 1;
+
+    const rFus = fuByRes.get(base.id) || [];
+    const myFusCount = rFus.filter((f) => f.employeeId === empId).length;
+    return {
+      ...base,
+      isFollowed: rFus.length > 0,
+      followUpsCount: rFus.length,
+      myFollowUpsCount: myFusCount,
+      problemsCount: prbCountByRes.get(base.id) || 0,
+      latestFollowUp: rFus[0] || null
+    };
+  });
+
+  const followUps = fuRows.rows.map(formatFollowUpRow);
+  const problems = prbRows.rows.map((p) => formatProblemRow(p));
 
   return {
     employee,
-    assignedReservations: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
-    followUps: fuRows.rows.map(formatFollowUpRow),
-    problems: prbRows.rows.map((p) => formatProblemRow(p))
+    stats: {
+      uniqueCustomersCount: customerKeys.size,
+      reservationsCount: assignedReservations.length,
+      followUpsCount: followUps.length,
+      problemsCount: problems.length,
+      statusCounts
+    },
+    assignedReservations,
+    followUps,
+    problems
   };
 }
 
@@ -1982,10 +2251,13 @@ export async function deletePermissionDefinition(executor: DbExecutor, session: 
 // ---------- LOGS, NOTIFICATIONS, REPORTS, SETTINGS & SYNC ----------
 
 export async function getActivityLogs(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'view_activity');
+  const canViewAllLogs = crmCore.canUserPerform(session.user, 'view_all_logs');
   const params: any[] = [];
   const clauses: string[] = [];
-  if (payload.userId) {
+  if (!canViewAllLogs) {
+    params.push(str(session.user.id));
+    clauses.push(`user_id = $${params.length}`);
+  } else if (payload.userId) {
     params.push(str(payload.userId));
     clauses.push(`user_id = $${params.length}`);
   }
@@ -2163,7 +2435,9 @@ export async function getTriggerStatus(executor: DbExecutor, session: AuthSessio
 }
 
 export async function getReports(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'view_reports');
+  if (!crmCore.canUserPerform(session.user, 'export_reports')) {
+    requirePermission(session, 'export_reports');
+  }
   const rType = str(payload.reportType || 'all_reservations');
   const params: any[] = [];
   const clauses: string[] = [];
@@ -2178,47 +2452,74 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
   if (rType === 'unfollowed') clauses.push(`NOT EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id)`);
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const [compRes, branchRes] = await Promise.all([
-    executor.query<{ company_name: string }>(`SELECT DISTINCT company_name FROM reservations WHERE company_name <> '' ORDER BY company_name ASC`),
-    executor.query<{ branch_name: string }>(`SELECT DISTINCT branch_name FROM reservations WHERE branch_name <> '' ORDER BY branch_name ASC`)
-  ]);
-  const facets = {
-    companies: compRes.rows.map((r) => r.company_name),
-    branches: branchRes.rows.map((r) => r.branch_name)
-  };
+  const facets = await getCachedReservationFacets(executor);
 
   if (rType === 'employee_performance') {
-    const [empRes, allRes, allFu, allPrb] = await Promise.all([
-      executor.query(`SELECT * FROM employees`),
-      executor.query(`SELECT assigned_employee_ids FROM reservations`),
-      executor.query(`SELECT employee_id FROM follow_ups`),
-      executor.query(`SELECT assigned_employee_ids FROM problems`)
+    const [empRes, resCountsRes, fuCountsRes, prbCountsRes] = await Promise.all([
+      executor.query(`SELECT id, name, job_title, role, last_activity FROM employees ORDER BY created_at ASC`),
+      executor.query<{ emp_id: string; cnt: number }>(
+        `SELECT emp_id, COUNT(*)::int AS cnt
+         FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
+         GROUP BY emp_id`
+      ),
+      executor.query<{ employee_id: string; cnt: number }>(
+        `SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups GROUP BY employee_id`
+      ),
+      executor.query<{ emp_id: string; cnt: number }>(
+        `SELECT emp_id, COUNT(*)::int AS cnt
+         FROM problems p, LATERAL jsonb_array_elements_text(p.assigned_employee_ids) AS emp_id
+         GROUP BY emp_id`
+      )
     ]);
+    const resMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
+    const fuMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
+    const prbMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
     const rows = empRes.rows.map((e) => ({
       employeeId: str(e.id),
       employeeName: str(e.name),
       jobTitle: str(e.job_title),
       role: str(e.role),
-      assignedReservations: allRes.rows.filter((r) => parseJsonArray<string>(r.assigned_employee_ids).includes(str(e.id))).length,
-      followUpsCount: allFu.rows.filter((f) => str(f.employee_id) === str(e.id)).length,
-      problemsCount: allPrb.rows.filter((p) => parseJsonArray<string>(p.assigned_employee_ids).includes(str(e.id))).length,
+      assignedReservations: resMap.get(str(e.id)) || 0,
+      followUpsCount: fuMap.get(str(e.id)) || 0,
+      problemsCount: prbMap.get(str(e.id)) || 0,
       lastActivity: str(e.last_activity)
     }));
     return { reportType: rType, rows, facets };
   }
 
   if (rType === 'followups_log') {
-    const fuRes = await executor.query(`SELECT * FROM follow_ups ORDER BY created_at DESC LIMIT 1000`);
+    const fParams: any[] = [];
+    const fClauses: string[] = [];
+    if (payload.employeeId) { fParams.push(str(payload.employeeId)); fClauses.push(`employee_id = $${fParams.length}`); }
+    if (payload.status) { fParams.push(str(payload.status)); fClauses.push(`status = $${fParams.length}`); }
+    if (payload.dateFrom) { fParams.push(str(payload.dateFrom)); fClauses.push(`follow_up_date >= $${fParams.length}`); }
+    if (payload.dateTo) { fParams.push(str(payload.dateTo)); fClauses.push(`follow_up_date <= $${fParams.length}`); }
+    const fWhere = fClauses.length ? `WHERE ${fClauses.join(' AND ')}` : '';
+    const fuRes = await executor.query(`SELECT * FROM follow_ups ${fWhere} ORDER BY created_at DESC LIMIT 1000`, fParams);
     return { reportType: rType, rows: fuRes.rows.map(formatFollowUpRow), facets };
   }
 
   if (rType === 'problems') {
-    const prbRes = await executor.query(`SELECT * FROM problems ORDER BY updated_at DESC LIMIT 1000`);
+    const pParams: any[] = [];
+    const pClauses: string[] = [];
+    if (payload.priority) { pParams.push(str(payload.priority)); pClauses.push(`priority = $${pParams.length}`); }
+    if (payload.status) { pParams.push(str(payload.status)); pClauses.push(`status = $${pParams.length}`); }
+    if (payload.employeeId) { pParams.push(JSON.stringify([str(payload.employeeId)])); pClauses.push(`assigned_employee_ids @> $${pParams.length}::jsonb`); }
+    if (payload.dateFrom) { pParams.push(str(payload.dateFrom)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= $${pParams.length}`); }
+    if (payload.dateTo) { pParams.push(str(payload.dateTo)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= $${pParams.length}`); }
+    const pWhere = pClauses.length ? `WHERE ${pClauses.join(' AND ')}` : '';
+    const prbRes = await executor.query(`SELECT * FROM problems ${pWhere} ORDER BY updated_at DESC LIMIT 1000`, pParams);
     return { reportType: rType, rows: prbRes.rows.map((p) => formatProblemRow(p)), facets };
   }
 
   if (rType === 'extensions') {
-    const extRes = await executor.query(`SELECT * FROM extensions ORDER BY synced_at DESC LIMIT 1000`);
+    const eParams: any[] = [];
+    const eClauses: string[] = [];
+    if (payload.dateFrom) { eParams.push(str(payload.dateFrom)); eClauses.push(`start_date >= $${eParams.length}`); }
+    if (payload.dateTo) { eParams.push(str(payload.dateTo)); eClauses.push(`start_date <= $${eParams.length}`); }
+    if (payload.status) { eParams.push(str(payload.status)); eClauses.push(`(status_ar = $${eParams.length} OR status_code = $${eParams.length})`); }
+    const eWhere = eClauses.length ? `WHERE ${eClauses.join(' AND ')}` : '';
+    const extRes = await executor.query(`SELECT * FROM extensions ${eWhere} ORDER BY synced_at DESC LIMIT 1000`, eParams);
     return { reportType: rType, rows: extRes.rows.map(mapExtensionRowToClient), facets };
   }
 
@@ -2228,7 +2529,13 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
   }
 
   if (rType === 'activity_log') {
-    const aRes = await executor.query(`SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 1000`);
+    const aParams: any[] = [];
+    const aClauses: string[] = [];
+    if (payload.employeeId) { aParams.push(str(payload.employeeId)); aClauses.push(`user_id = $${aParams.length}`); }
+    if (payload.dateFrom) { aParams.push(str(payload.dateFrom)); aClauses.push(`log_date >= $${aParams.length}`); }
+    if (payload.dateTo) { aParams.push(str(payload.dateTo)); aClauses.push(`log_date <= $${aParams.length}`); }
+    const aWhere = aClauses.length ? `WHERE ${aClauses.join(' AND ')}` : '';
+    const aRes = await executor.query(`SELECT * FROM activity_log ${aWhere} ORDER BY created_at DESC LIMIT 1000`, aParams);
     return { reportType: rType, rows: aRes.rows, facets };
   }
 

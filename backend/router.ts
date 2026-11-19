@@ -1,4 +1,4 @@
-import { handleLogin, handleLogout, requireAuth } from './auth';
+import { handleLogin, handleLogout, hashToken, requireAuth, type AuthSession } from './auth';
 import { ensureSchemaInitialized, type DbExecutor } from './db';
 import { logBackendError } from './logger';
 import * as queries from './queries';
@@ -42,6 +42,25 @@ export async function dispatchCrmRequest(
 
     if (action === 'login') {
       const loginData = await handleLogin(executor, payload);
+      if (payload.includeBootstrap) {
+        const tempSession: AuthSession = {
+          tokenHash: hashToken(loginData.token),
+          employeeId: loginData.user.id,
+          username: loginData.user.username,
+          role: loginData.user.role,
+          expiresAt: loginData.expiresAt,
+          user: loginData.user
+        };
+        const bootstrap = await queries.getAppBootstrap(executor, tempSession, {
+          range: payload.range || '30d'
+        });
+        return {
+          success: true,
+          message: 'تم تسجيل الدخول بنجاح.',
+          data: { ...loginData, bootstrap },
+          error: null
+        };
+      }
       return { success: true, message: 'تم تسجيل الدخول بنجاح.', data: loginData, error: null };
     }
 
