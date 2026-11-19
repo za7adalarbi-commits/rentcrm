@@ -67,8 +67,26 @@ export async function dispatchCrmRequest(
       case 'syncLocalCache':
         result = await queries.syncLocalCache(executor, session, payload);
         break;
+      case 'getCustomers':
+        result = await queries.getCustomers(executor, session, payload);
+        break;
+      case 'createCustomer':
+        result = await queries.createCustomer(executor, session, payload);
+        break;
+      case 'updateCustomer':
+        result = await queries.updateCustomer(executor, session, payload);
+        break;
+      case 'deleteCustomer':
+        result = await queries.deleteCustomer(executor, session, payload);
+        break;
       case 'getReservationDetails':
         result = await queries.getReservationDetails(executor, session, payload);
+        break;
+      case 'createReservation':
+        result = await queries.createReservation(executor, session, payload);
+        break;
+      case 'deleteReservation':
+        result = await queries.deleteReservation(executor, session, payload);
         break;
       case 'claimReservation':
         result = await queries.claimReservation(executor, session, payload);

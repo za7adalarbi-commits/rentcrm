@@ -213,7 +213,10 @@
                 '</div>' +
                 '<div class="form-group">' +
                   '<label class="form-label" for="ac-sync-secret">مفتاح المزامنة السحابية (<span class="mono" dir="ltr">SYNC_API_SECRET</span>) — اختياري</label>' +
-                  '<input type="password" class="input mono" id="ac-sync-secret" dir="ltr" lang="en" autocomplete="off" placeholder="' + ((acStatus && acStatus.sync && acStatus.sync.hasSecret) ? 'مضبوط حاليًا — اتركه فارغًا للإبقاء عليه' : 'يُولّد تلقائيًا عند الحاجة') + '">' +
+                  '<div class="password-field-wrap">' +
+                    '<input type="password" class="input mono" id="ac-sync-secret" dir="ltr" lang="en" autocomplete="off" placeholder="' + ((acStatus && acStatus.sync && acStatus.sync.hasSecret) ? 'مضبوط حاليًا — اتركه فارغًا للإبقاء عليه' : 'يُولّد تلقائيًا عند الحاجة') + '">' +
+                    '<button type="button" class="password-toggle-btn" id="toggle-ac-sync-secret" aria-label="إظهار مفتاح المزامنة">إظهار</button>' +
+                  '</div>' +
                 '</div>' +
               '</div>' +
               '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;">' +
@@ -396,6 +399,17 @@
       };
       bindToggle('ac-db-url', 'toggle-ac-db-url');
       bindToggle('ac-rg-token', 'toggle-ac-rg-token');
+      bindToggle('ac-sync-secret', 'toggle-ac-sync-secret');
+
+      var acErrBoxLive = document.getElementById('ac-error-msg');
+      acForm.querySelectorAll('input').forEach(function (inp) {
+        inp.addEventListener('input', function () {
+          if (acErrBoxLive && !acErrBoxLive.classList.contains('hidden')) {
+            acErrBoxLive.classList.add('hidden');
+            acErrBoxLive.textContent = '';
+          }
+        });
+      });
 
       var acDbInput = document.getElementById('ac-db-url');
       var acBackendInput = document.getElementById('ac-backend-url');
@@ -475,21 +489,38 @@
               }
 
               var st = res.data.status || {};
+              var setBoxState = function (valEl, text, stateClass) {
+                if (!valEl) return;
+                valEl.textContent = text;
+                var box = valEl.closest('.ac-status-box');
+                if (box) {
+                  box.classList.remove('is-ok', 'is-warn');
+                  if (stateClass) box.classList.add(stateClass);
+                }
+              };
               var elDb = document.getElementById('ac-stat-db');
               var elGas = document.getElementById('ac-stat-gas');
               var elTok = document.getElementById('ac-stat-token');
-              if (elDb && st.database) {
-                elDb.textContent = st.database.connected
-                  ? ('متصل (' + (st.database.host || 'PostgreSQL') + ')')
-                  : (st.database.configured ? ('مُعدّ (' + (st.database.host || 'DB') + ')') : 'غير مضبوط');
+              if (st.database) {
+                setBoxState(
+                  elDb,
+                  st.database.connected
+                    ? ('متصل (' + (st.database.host || 'PostgreSQL') + ')')
+                    : (st.database.configured ? ('مُعدّ (' + (st.database.host || 'DB') + ')') : 'غير مضبوط'),
+                  st.database.connected ? 'is-ok' : (st.database.configured ? 'is-warn' : '')
+                );
               }
-              if (elGas && st.gas) {
-                elGas.textContent = st.gas.url ? 'مربوط تلقائيًا (/exec)' : 'غير مضبوط بعد';
+              if (st.gas) {
+                setBoxState(elGas, st.gas.url ? 'مربوط تلقائيًا (/exec)' : 'غير مضبوط بعد', st.gas.url ? 'is-ok' : '');
               }
-              if (elTok && st.rentalGate) {
-                elTok.textContent = st.rentalGate.configured
-                  ? ('مضبوط بأمان ' + (st.rentalGate.maskedToken || ''))
-                  : 'غير مضبوط بعد';
+              if (st.rentalGate) {
+                setBoxState(
+                  elTok,
+                  st.rentalGate.configured
+                    ? ('مضبوط بأمان ' + (st.rentalGate.maskedToken || ''))
+                    : 'غير مضبوط بعد',
+                  st.rentalGate.configured ? 'is-ok' : ''
+                );
               }
 
               resPanel.innerHTML = renderAutoConnectResultHtml(res.data, hadLiveModeBefore, null);

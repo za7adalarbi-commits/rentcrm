@@ -79,7 +79,7 @@ export function mapEmployeeRow(row: any): AuthEmployee {
   const role = String(row.role || 'agent');
   const rawPerms = parseJsonArray<string>(row.permissions);
   const resolvedPerms = crmCore && typeof crmCore.resolveEffectivePermissions === 'function'
-    ? crmCore.resolveEffectivePermissions(role, rawPerms)
+    ? crmCore.resolveEffectivePermissions({ role, permissions: rawPerms })
     : rawPerms;
 
   return {

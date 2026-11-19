@@ -13,13 +13,16 @@ import {
 } from './auth';
 import type { DbClient, DbExecutor } from './dbCore';
 import { getEnv, registerBackgroundTask, setRuntimeEnv } from './env';
+import { emitRealtimeEvent } from './realtimeBus';
 import {
   enqueueSheetsMirror,
+  enqueueSyncOperation,
   flushSheetsMirrorOutbox,
   ingestIncrementalSyncBatch,
   mapExtensionRowToClient,
   mapReservationRowToClient,
-  pullFromRentalGateDirect
+  pullFromRentalGateDirect,
+  triggerImmediateSync
 } from './syncService';
 
 function str(v: unknown, fallback = ''): string {
@@ -72,6 +75,21 @@ function formatProblemRow(row: any, updatesByProblemId?: Map<string, any[]>): Re
     return { ...obj, updates: updatesByProblemId.get(obj.id) || [] };
   }
   return obj;
+}
+
+function formatCustomerRow(row: any): Record<string, any> {
+  return {
+    id: str(row.id),
+    name: str(row.name),
+    phone: str(row.phone),
+    email: str(row.email),
+    idNumber: str(row.id_number ?? row.idNumber),
+    companyName: str(row.company_name ?? row.companyName),
+    notes: str(row.notes),
+    status: str(row.status || 'active'),
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at)
+  };
 }
 
 function formatFollowUpRow(row: any): Record<string, any> {
@@ -1054,13 +1072,422 @@ export async function quickUpdateReservationStatus(
   return out;
 }
 
+// ---------- CUSTOMERS CRUD ----------
+
+export async function getCustomers(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+  const params: any[] = [];
+  const clauses: string[] = ['c.deleted_at IS NULL'];
+  if (payload.search) {
+    params.push(`%${str(payload.search)}%`);
+    const pIdx = params.length;
+    clauses.push(`(c.name ILIKE $${pIdx} OR c.phone ILIKE $${pIdx} OR c.company_name ILIKE $${pIdx})`);
+  }
+  const limit = Math.min(500, Math.max(10, num(payload.limit, 100)));
+  params.push(limit);
+  const res = await executor.query(
+    `SELECT c.* FROM customers c WHERE ${clauses.join(' AND ')} ORDER BY c.updated_at DESC LIMIT $${params.length}`,
+    params
+  );
+  return {
+    items: res.rows.map(formatCustomerRow),
+    total: res.rows.length
+  };
+}
+
+export async function createCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const idempotencyKey = str(payload.idempotencyKey || payload.idempotency_key);
+  if (idempotencyKey) {
+    const hit = await executor.query<{ response: any }>(
+      `SELECT response FROM idempotency_requests WHERE idempotency_key = $1 LIMIT 1`,
+      [idempotencyKey]
+    ).catch(() => ({ rows: [] }));
+    if (hit.rows[0]?.response) {
+      return hit.rows[0].response;
+    }
+  }
+
+  const name = str(payload.name || payload.customerName);
+  if (!name) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب.');
+
+  const phone = str(payload.phone || payload.customerPhone);
+  const email = str(payload.email || payload.customerEmail);
+  const idNumber = str(payload.idNumber || payload.customerIdNumber);
+  const companyName = str(payload.companyName);
+  const notes = str(payload.notes);
+  const custId = str(payload.id) || generateId('CUST');
+  const nowIso = new Date().toISOString();
+
+  const out = await executor.withTransaction(async (tx) => {
+    const custObj: Record<string, any> = {
+      id: custId,
+      name,
+      phone,
+      email,
+      idNumber,
+      companyName,
+      notes,
+      status: 'active',
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+
+    await tx.query(
+      `INSERT INTO customers (id, name, phone, email, id_number, company_name, notes, status, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8::timestamptz,$8::timestamptz)`,
+      [custObj.id, custObj.name, custObj.phone, custObj.email, custObj.idNumber, custObj.companyName, custObj.notes, nowIso]
+    );
+
+    await logActivity(tx, session.user, 'إضافة عميل', 'Customer', custObj.id, custObj.name);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Customer',
+      entityId: custObj.id,
+      recordId: custObj.id,
+      operation: 'INSERT',
+      action: 'upsertCustomer',
+      payload: custObj,
+      idempotencyKey: idempotencyKey ? `${idempotencyKey}:outbox` : undefined
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'customer:created',
+      entityType: 'Customer',
+      recordId: custObj.id,
+      operation: 'INSERT',
+      payload: { customer: custObj },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+
+    const response = { customer: custObj };
+    if (idempotencyKey) {
+      await tx.query(
+        `INSERT INTO idempotency_requests (idempotency_key, action, response, created_at)
+         VALUES ($1, $2, $3::jsonb, NOW())
+         ON CONFLICT (idempotency_key) DO NOTHING`,
+        [idempotencyKey, 'createCustomer', JSON.stringify(response)]
+      ).catch(() => undefined);
+    }
+    return response;
+  });
+
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  return out;
+}
+
+export async function updateCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const custId = str(payload.customerId || payload.id);
+  if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const existingRes = await tx.query(`SELECT * FROM customers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [custId]);
+    if (!existingRes.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+    const existing = formatCustomerRow(existingRes.rows[0]);
+
+    const nowIso = new Date().toISOString();
+    const updated: Record<string, any> = {
+      ...existing,
+      name: payload.name !== undefined ? str(payload.name) : existing.name,
+      phone: payload.phone !== undefined ? str(payload.phone) : existing.phone,
+      email: payload.email !== undefined ? str(payload.email) : existing.email,
+      idNumber: payload.idNumber !== undefined ? str(payload.idNumber) : existing.idNumber,
+      companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
+      notes: payload.notes !== undefined ? str(payload.notes) : existing.notes,
+      status: payload.status !== undefined ? str(payload.status) : existing.status,
+      updatedAt: nowIso
+    };
+
+    await tx.query(
+      `UPDATE customers
+       SET name = $2, phone = $3, email = $4, id_number = $5, company_name = $6, notes = $7, status = $8, updated_at = $9::timestamptz
+       WHERE id = $1`,
+      [custId, updated.name, updated.phone, updated.email, updated.idNumber, updated.companyName, updated.notes, updated.status, nowIso]
+    );
+
+    await logActivity(tx, session.user, 'تحديث عميل', 'Customer', custId, updated.name);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Customer',
+      entityId: custId,
+      recordId: custId,
+      operation: 'UPDATE',
+      action: 'upsertCustomer',
+      payload: updated
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'customer:updated',
+      entityType: 'Customer',
+      recordId: custId,
+      operation: 'UPDATE',
+      payload: { customer: updated },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+
+    return { customer: updated };
+  });
+
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  return out;
+}
+
+export async function deleteCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const custId = str(payload.customerId || payload.id);
+  if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const existingRes = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [custId]);
+    if (!existingRes.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+    const existing = formatCustomerRow(existingRes.rows[0]);
+    const nowIso = new Date().toISOString();
+
+    await tx.query(
+      `UPDATE customers SET status = 'deleted', deleted_at = $2::timestamptz, updated_at = $2::timestamptz WHERE id = $1`,
+      [custId, nowIso]
+    );
+
+    await logActivity(tx, session.user, 'حذف عميل', 'Customer', custId, existing.name);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Customer',
+      entityId: custId,
+      recordId: custId,
+      operation: 'DELETE',
+      action: 'deleteCustomer',
+      payload: { id: custId, customerId: custId }
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'customer:deleted',
+      entityType: 'Customer',
+      recordId: custId,
+      operation: 'DELETE',
+      payload: { customerId: custId },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+
+    return { deleted: true, customerId: custId };
+  });
+
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  return out;
+}
+
+// ---------- RESERVATION CREATE / EDIT DETAILS / DELETE ----------
+
+export async function createReservation(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  const idempotencyKey = str(payload.idempotencyKey || payload.idempotency_key);
+  if (idempotencyKey) {
+    const hit = await executor.query<{ response: any }>(
+      `SELECT response FROM idempotency_requests WHERE idempotency_key = $1 LIMIT 1`,
+      [idempotencyKey]
+    ).catch(() => ({ rows: [] }));
+    if (hit.rows[0]?.response) {
+      return hit.rows[0].response;
+    }
+  }
+
+  const reservationNumber = str(payload.reservationNumber) || `RG-${Date.now().toString().slice(-6)}`;
+  const customerName = str(payload.customerName);
+  if (!customerName) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب لإنشاء الحجز.');
+
+  const nowIso = new Date().toISOString();
+  const resId = str(payload.id) || generateId('RES');
+  const initialStatus = str(payload.internalStatus || 'تم الحجز');
+  if (!crmCore.isValidWorkflowStatus(initialStatus)) {
+    throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
+  }
+
+  const out = await executor.withTransaction(async (tx) => {
+    const dupCheck = await tx.query(`SELECT id FROM reservations WHERE reservation_number = $1`, [reservationNumber]);
+    if (dupCheck.rows[0]) {
+      throw new Error('VALIDATION_ERROR: رقم الحجز مسجل مسبقاً.');
+    }
+
+    const totalAmt = num(payload.totalAmount ?? payload.baseAmount, 0);
+    const baseAmt = num(payload.baseAmount ?? totalAmt, 0);
+    const daysCount = Math.max(0, num(payload.daysCount, 1));
+    const statusHistory = crmCore.appendStatusStageEntry([], {
+      source: 'manual_create',
+      previousStatus: '',
+      newStatus: initialStatus,
+      changedAt: nowIso,
+      changedById: session.user.id,
+      changedByName: session.user.name,
+      note: `إنشاء الحجز بواسطة ${session.user.name}`
+    });
+
+    const record: Record<string, any> = {
+      id: resId,
+      sourceReservationId: str(payload.sourceReservationId || resId),
+      reservationNumber,
+      sourceCreatedAt: str(payload.sourceCreatedAt || nowIso),
+      customerName,
+      customerPhone: str(payload.customerPhone),
+      customerEmail: str(payload.customerEmail),
+      customerIdNumber: str(payload.customerIdNumber),
+      companyName: str(payload.companyName),
+      branchName: str(payload.branchName),
+      deliverBranchName: str(payload.deliverBranchName || payload.branchName),
+      carName: str(payload.carName),
+      plateNumber: str(payload.plateNumber),
+      carCategory: str(payload.carCategory),
+      startDate: str(payload.startDate || nowIso.slice(0, 10)),
+      startTime: str(payload.startTime || '12:00'),
+      originalEndDate: str(payload.originalEndDate || payload.endDate || nowIso.slice(0, 10)),
+      originalEndTime: str(payload.originalEndTime || payload.endTime || '12:00'),
+      endDate: str(payload.endDate || nowIso.slice(0, 10)),
+      endTime: str(payload.endTime || '12:00'),
+      extendedUntilDate: str(payload.extendedUntilDate),
+      extendedUntilTime: str(payload.extendedUntilTime),
+      daysCount,
+      extendedDaysCount: num(payload.extendedDaysCount, 0),
+      totalDaysCount: num(payload.totalDaysCount, daysCount),
+      originalStatusCode: str(payload.originalStatusCode || 'booked'),
+      originalStatusAr: str(payload.originalStatusAr || initialStatus),
+      pickupTypeAr: str(payload.pickupTypeAr),
+      returnTypeAr: str(payload.returnTypeAr),
+      paymentMethod: str(payload.paymentMethod),
+      paymentStatus: str(payload.paymentStatus),
+      dailyPrice: num(payload.dailyPrice, 0),
+      discountAmount: num(payload.discountAmount, 0),
+      vatAmount: num(payload.vatAmount, 0),
+      baseAmount: baseAmt,
+      extensionsCount: num(payload.extensionsCount, 0),
+      extensionsAmount: num(payload.extensionsAmount, 0),
+      totalAmount: totalAmt,
+      hasExtensions: Boolean(payload.hasExtensions),
+      internalStatus: initialStatus,
+      priority: str(payload.priority || 'عادي'),
+      assignedEmployeeIds: Array.isArray(payload.assignedEmployeeIds) ? payload.assignedEmployeeIds : [],
+      assignedEmployeeNames: Array.isArray(payload.assignedEmployeeNames) ? payload.assignedEmployeeNames : [],
+      lastUpdateText: str(payload.lastUpdateText || `إنشاء الحجز بواسطة ${session.user.name}`),
+      lastUpdatedById: session.user.id,
+      lastUpdatedByName: session.user.name,
+      lastUpdatedAt: nowIso,
+      hasProblem: Boolean(payload.hasProblem),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      statusHistory
+    };
+
+    await tx.query(
+      `INSERT INTO reservations (
+         id, source_reservation_id, reservation_number, source_created_at,
+         customer_name, customer_phone, customer_email, customer_id_number,
+         company_name, branch_name, deliver_branch_name, car_name, plate_number, car_category,
+         start_date, start_time, original_end_date, original_end_time, end_date, end_time,
+         extended_until_date, extended_until_time, days_count, extended_days_count, total_days_count,
+         original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
+         payment_method, payment_status, daily_price, discount_amount, vat_amount,
+         base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
+         internal_status, priority, assigned_employee_ids, assigned_employee_names,
+         last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
+         has_problem, created_at, updated_at, status_history, raw_json
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+         $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,
+         $40,$41,$42::jsonb,$43::jsonb,$44,$45,$46,$47,$48,$49::timestamptz,$50::timestamptz,$51::jsonb,$52
+       )`,
+      [
+        record.id,
+        record.sourceReservationId,
+        record.reservationNumber,
+        record.sourceCreatedAt,
+        record.customerName,
+        record.customerPhone,
+        record.customerEmail,
+        record.customerIdNumber,
+        record.companyName,
+        record.branchName,
+        record.deliverBranchName,
+        record.carName,
+        record.plateNumber,
+        record.carCategory,
+        record.startDate,
+        record.startTime,
+        record.originalEndDate,
+        record.originalEndTime,
+        record.endDate,
+        record.endTime,
+        record.extendedUntilDate,
+        record.extendedUntilTime,
+        record.daysCount,
+        record.extendedDaysCount,
+        record.totalDaysCount,
+        record.originalStatusCode,
+        record.originalStatusAr,
+        record.pickupTypeAr,
+        record.returnTypeAr,
+        record.paymentMethod,
+        record.paymentStatus,
+        record.dailyPrice,
+        record.discountAmount,
+        record.vatAmount,
+        record.baseAmount,
+        record.extensionsCount,
+        record.extensionsAmount,
+        record.totalAmount,
+        record.hasExtensions,
+        record.internalStatus,
+        record.priority,
+        JSON.stringify(record.assignedEmployeeIds),
+        JSON.stringify(record.assignedEmployeeNames),
+        record.lastUpdateText,
+        record.lastUpdatedById,
+        record.lastUpdatedByName,
+        record.lastUpdatedAt,
+        record.hasProblem,
+        record.createdAt,
+        record.updatedAt,
+        JSON.stringify(record.statusHistory),
+        ''
+      ]
+    );
+
+    await logActivity(tx, session.user, 'إنشاء حجز', 'Reservation', record.reservationNumber, record.customerName);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: record.id,
+      recordId: record.id,
+      operation: 'INSERT',
+      action: 'upsertReservation',
+      payload: record,
+      idempotencyKey: idempotencyKey ? `${idempotencyKey}:outbox` : undefined
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:created',
+      entityType: 'Reservation',
+      recordId: record.id,
+      operation: 'INSERT',
+      payload: { reservation: record },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+
+    const response = { reservation: record };
+    if (idempotencyKey) {
+      await tx.query(
+        `INSERT INTO idempotency_requests (idempotency_key, action, response, created_at)
+         VALUES ($1, $2, $3::jsonb, NOW())
+         ON CONFLICT (idempotency_key) DO NOTHING`,
+        [idempotencyKey, 'createReservation', JSON.stringify(response)]
+      ).catch(() => undefined);
+    }
+    return response;
+  });
+
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  return out;
+}
+
 export async function updateReservationDetails(
   executor: DbExecutor,
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
   requirePermission(session, 'edit_reservation_details');
-  const resId = str(payload.reservationId);
+  const resId = str(payload.reservationId || payload.id);
   if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
 
   const out = await executor.withTransaction(async (tx) => {
@@ -1091,6 +1518,7 @@ export async function updateReservationDetails(
       ...existing,
       customerName: payload.customerName !== undefined ? str(payload.customerName) : existing.customerName,
       customerPhone: payload.customerPhone !== undefined ? str(payload.customerPhone) : existing.customerPhone,
+      customerEmail: payload.customerEmail !== undefined ? str(payload.customerEmail) : existing.customerEmail,
       companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
       branchName: payload.branchName !== undefined ? str(payload.branchName) : existing.branchName,
       carName: payload.carName !== undefined ? str(payload.carName) : existing.carName,
@@ -1098,6 +1526,7 @@ export async function updateReservationDetails(
       endDate: payload.endDate !== undefined ? str(payload.endDate) : existing.endDate,
       priority: payload.priority !== undefined ? str(payload.priority) : existing.priority,
       internalStatus: nextStatus,
+      totalAmount: payload.totalAmount !== undefined ? num(payload.totalAmount, existing.totalAmount) : existing.totalAmount,
       lastUpdateText: payload.lastUpdateText !== undefined ? str(payload.lastUpdateText) : `تعديل بيانات الحجز بواسطة ${session.user.name}`,
       lastUpdatedById: session.user.id,
       lastUpdatedByName: session.user.name,
@@ -1111,7 +1540,8 @@ export async function updateReservationDetails(
        SET customer_name = $2, customer_phone = $3, company_name = $4, branch_name = $5,
            car_name = $6, start_date = $7, end_date = $8, priority = $9, internal_status = $10,
            last_update_text = $11, last_updated_by_id = $12, last_updated_by_name = $13,
-           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb
+           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb,
+           total_amount = $16, customer_email = $17
        WHERE id = $1`,
       [
         resId,
@@ -1128,16 +1558,75 @@ export async function updateReservationDetails(
         nextObj.lastUpdatedById,
         nextObj.lastUpdatedByName,
         nextObj.lastUpdatedAt,
-        JSON.stringify(nextObj.statusHistory)
+        JSON.stringify(nextObj.statusHistory),
+        num(nextObj.totalAmount, 0),
+        str(nextObj.customerEmail)
       ]
     );
 
     await logActivity(tx, session.user, 'تعديل بيانات حجز', 'Reservation', existing.reservationNumber, 'تعديل تفاصيل الحجز بواسطة المشرف / الإدارة');
-    await enqueueSheetsMirror(tx, 'Reservation', nextObj.id, 'upsertReservation', nextObj);
-    return nextObj;
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: nextObj.id,
+      recordId: nextObj.id,
+      operation: 'UPDATE',
+      action: 'upsertReservation',
+      payload: nextObj
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:updated',
+      entityType: 'Reservation',
+      recordId: nextObj.id,
+      operation: 'UPDATE',
+      payload: { reservation: nextObj },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+    return { ...nextObj, reservation: nextObj };
   });
 
-  registerBackgroundTask(flushSheetsMirrorOutbox(executor));
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  return out;
+}
+
+export async function deleteReservation(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'edit_reservation_details');
+  const resId = str(payload.reservationId || payload.id);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
+    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+
+    await tx.query(`DELETE FROM reservations WHERE id = $1`, [resId]);
+
+    await logActivity(tx, session.user, 'حذف حجز', 'Reservation', resObj.reservationNumber, resObj.customerName);
+    await enqueueSyncOperation(tx, {
+      entityType: 'Reservation',
+      entityId: resObj.id,
+      recordId: resObj.id,
+      operation: 'DELETE',
+      action: 'deleteReservation',
+      payload: { id: resObj.id, reservationNumber: resObj.reservationNumber }
+    });
+    await emitRealtimeEvent(tx, {
+      eventType: 'reservation:deleted',
+      entityType: 'Reservation',
+      recordId: resObj.id,
+      operation: 'DELETE',
+      payload: { reservationId: resObj.id, reservationNumber: resObj.reservationNumber },
+      actorId: session.user.id,
+      actorName: session.user.name
+    });
+    return { deleted: true, reservationId: resObj.id };
+  });
+
+  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -1784,7 +2273,7 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
     const salt = crypto.randomBytes(8).toString('hex').toUpperCase();
     const pHash = hashPassword(password, salt);
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : [role];
-    const effectivePerms = crmCore.resolveEffectivePermissions(role, rawPerms);
+    const effectivePerms = crmCore.resolveEffectivePermissions({ role, permissions: rawPerms });
     const nowIso = new Date().toISOString();
     const id = generateId('EMP');
 
@@ -1825,7 +2314,7 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
 
     const nextRole = payload.role !== undefined ? str(payload.role) : str(cur.role);
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : parseJsonArray(cur.permissions);
-    const nextPerms = crmCore.resolveEffectivePermissions(nextRole, rawPerms);
+    const nextPerms = crmCore.resolveEffectivePermissions({ role: nextRole, permissions: rawPerms });
 
     let nextSalt = str(cur.salt);
     let nextHash = str(cur.password_hash);
@@ -1960,10 +2449,15 @@ export async function deletePermissionDefinition(executor: DbExecutor, session: 
 // ---------- LOGS, NOTIFICATIONS, REPORTS, SETTINGS & SYNC ----------
 
 export async function getActivityLogs(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'view_activity');
+  const canViewAll =
+    crmCore.canUserPerform(session.user, 'view_all_logs') ||
+    crmCore.canUserPerform(session.user, 'view_activity');
   const params: any[] = [];
   const clauses: string[] = [];
-  if (payload.userId) {
+  if (!canViewAll) {
+    params.push(session.user.id);
+    clauses.push(`user_id = $${params.length}`);
+  } else if (payload.userId) {
     params.push(str(payload.userId));
     clauses.push(`user_id = $${params.length}`);
   }
@@ -2110,7 +2604,13 @@ export async function getTriggerStatus(_executor: DbExecutor, session: AuthSessi
 }
 
 export async function getReports(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'view_reports');
+  const canViewReports =
+    crmCore.canUserPerform(session.user, 'export_reports') ||
+    crmCore.canUserPerform(session.user, 'view_dashboard') ||
+    crmCore.canUserPerform(session.user, 'view_reports');
+  if (!canViewReports) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية استعراض التقارير.');
+  }
   const rType = str(payload.reportType || 'all_reservations');
   const params: any[] = [];
   const clauses: string[] = [];

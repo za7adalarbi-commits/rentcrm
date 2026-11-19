@@ -1,23 +1,10 @@
-import path from 'node:path';
 import {
   authorizeAutoConnect,
   executeAutoConnect,
   getAutoConnectStatus,
   type AutoConnectInput
 } from '../backend/autoConnect';
-
-function parseBody(rawBody: any): Record<string, any> {
-  if (!rawBody) return {};
-  if (typeof rawBody === 'string') {
-    try {
-      const parsed = JSON.parse(rawBody);
-      return parsed && typeof parsed === 'object' ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-  return typeof rawBody === 'object' ? rawBody : {};
-}
+import { applyApiCorsHeaders, parseRequestBody } from '../backend/http';
 
 function extractBearerToken(req: any, body: Record<string, any>): string {
   const authHeader = String(req?.headers?.authorization || '');
@@ -26,13 +13,15 @@ function extractBearerToken(req: any, body: Record<string, any>): string {
 }
 
 export default async function handler(req: any, res: any, rootDirOverride?: string) {
+  applyApiCorsHeaders(req, res);
+
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
   }
 
   const rootDir = rootDirOverride || process.cwd();
-  const body = parseBody(req.body);
+  const body = parseRequestBody(req.body);
   const rawToken = extractBearerToken(req, body);
 
   if (req.method === 'GET') {

@@ -219,20 +219,53 @@ function createWorkerMockExecutor(): DbExecutor & { state: Record<string, any[]>
       return { rows: [], rowCount: 1 };
     }
     if (sql.startsWith('INSERT INTO sheets_mirror_outbox')) {
-      state.sheets_mirror_outbox.push({
-        id: params[0], entity_type: params[1], entity_id: params[2], action: params[3],
-        payload: JSON.parse(params[4]), status: 'pending', retry_count: 0
-      });
-      return { rows: [], rowCount: 1 };
+      const isV2 = params.length >= 9;
+      state.sheets_mirror_outbox.push(
+        isV2
+          ? {
+              id: params[0], entity_type: params[1], entity_id: params[2], record_id: params[3],
+              operation: params[4], action: params[5], payload: JSON.parse(params[6]),
+              idempotency_key: params[7] || null, max_retries: Number(params[8] || 8),
+              status: 'pending', retry_count: 0, next_retry_at: new Date(), created_at: new Date(),
+              locked_at: null, worker_id: ''
+            }
+          : {
+              id: params[0], entity_type: params[1], entity_id: params[2], action: params[3],
+              payload: JSON.parse(params[4]), status: 'pending', retry_count: 0,
+              next_retry_at: new Date(), created_at: new Date(), locked_at: null, worker_id: ''
+            }
+      );
+      return { rows: [{ id: params[0] }] as any[], rowCount: 1 };
+    }
+    if (sql.includes("SET status = 'retry'") && sql.includes("WHERE status = 'processing'")) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql.startsWith('WITH due AS')) {
+      const batchSize = Number(params[0] || 50);
+      const workerId = String(params[1] || 'WRK');
+      const due = state.sheets_mirror_outbox
+        .filter((o) => o.status === 'pending' || o.status === 'retry')
+        .slice(0, batchSize);
+      for (const o of due) {
+        o.status = 'processing';
+        o.locked_at = new Date();
+        o.worker_id = workerId;
+      }
+      return { rows: due.map((o) => ({ ...o })) as any[], rowCount: due.length };
     }
     if (sql.startsWith('SELECT * FROM sheets_mirror_outbox')) {
       const pending = state.sheets_mirror_outbox.filter((o) => o.status === 'pending' || o.status === 'retry');
       return { rows: pending as any[], rowCount: pending.length };
     }
-    if (sql.startsWith("UPDATE sheets_mirror_outbox SET status = 'sent'")) {
+    if (sql.startsWith("UPDATE sheets_mirror_outbox SET status = 'sent'") || sql.startsWith("UPDATE sheets_mirror_outbox SET status = 'synced'")) {
       const ids: string[] = params[0] || [];
+      const nextStatus = sql.includes("'synced'") ? 'synced' : 'sent';
       for (const o of state.sheets_mirror_outbox) {
-        if (ids.includes(o.id)) o.status = 'sent';
+        if (ids.includes(o.id)) {
+          o.status = nextStatus;
+          o.locked_at = null;
+          o.worker_id = '';
+        }
       }
       return { rows: [], rowCount: ids.length };
     }

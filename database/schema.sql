@@ -36,6 +36,23 @@ CREATE TABLE IF NOT EXISTS employees (
   permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
   status TEXT NOT NULL DEFAULT 'active',
   last_activity TEXT NOT NULL DEFAULT '',
+  last_sync_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 2b. Customers (realtime CRM customer directory synced with Sheets)
+CREATE TABLE IF NOT EXISTS customers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  id_number TEXT NOT NULL DEFAULT '',
+  company_name TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  deleted_at TIMESTAMPTZ,
+  last_sync_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -91,6 +108,8 @@ CREATE TABLE IF NOT EXISTS reservations (
   last_updated_by_name TEXT NOT NULL DEFAULT '',
   last_updated_at TEXT NOT NULL DEFAULT '',
   has_problem BOOLEAN NOT NULL DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ,
+  last_sync_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -152,6 +171,7 @@ CREATE TABLE IF NOT EXISTS follow_ups (
   notes TEXT NOT NULL DEFAULT '',
   follow_up_date TEXT NOT NULL DEFAULT '',
   follow_up_time TEXT NOT NULL DEFAULT '',
+  last_sync_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -187,6 +207,7 @@ CREATE TABLE IF NOT EXISTS problems (
   description TEXT NOT NULL DEFAULT '',
   priority TEXT NOT NULL DEFAULT 'متوسط',
   status TEXT NOT NULL DEFAULT 'جديدة',
+  last_sync_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -205,6 +226,7 @@ CREATE TABLE IF NOT EXISTS issues (
   description TEXT NOT NULL DEFAULT '',
   priority TEXT NOT NULL DEFAULT 'متوسط',
   status TEXT NOT NULL DEFAULT 'جديدة',
+  last_sync_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -327,22 +349,52 @@ CREATE TABLE IF NOT EXISTS sync_checkpoints (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 19. CRM -> Google Sheets Write-Back Outbox Queue (for backup mirror resilience)
+-- 19. CRM -> Google Sheets Write-Back Outbox Queue (for realtime + backup mirror resilience)
 CREATE TABLE IF NOT EXISTS sheets_mirror_outbox (
   id TEXT PRIMARY KEY,
   entity_type TEXT NOT NULL,
   entity_id TEXT NOT NULL,
+  record_id TEXT NOT NULL DEFAULT '',
+  operation TEXT NOT NULL DEFAULT 'UPDATE',
   action TEXT NOT NULL,
   payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  idempotency_key TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   retry_count INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 8,
   next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  locked_at TIMESTAMPTZ,
+  worker_id TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  processed_at TIMESTAMPTZ
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ,
+  synced_at TIMESTAMPTZ
 );
 
--- 20. Server Error & Diagnostics Log (sanitized, never stores secrets)
+-- 20. Realtime Events Stream Table (multi-client SSE / cursor polling)
+CREATE TABLE IF NOT EXISTS realtime_events (
+  seq BIGSERIAL UNIQUE,
+  id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL DEFAULT '',
+  record_id TEXT NOT NULL DEFAULT '',
+  operation TEXT NOT NULL DEFAULT 'UPDATE',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  actor_id TEXT NOT NULL DEFAULT 'SYSTEM',
+  actor_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 21. Idempotency Requests Ledger
+CREATE TABLE IF NOT EXISTS idempotency_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  action TEXT NOT NULL DEFAULT '',
+  response JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 22. Server Error & Diagnostics Log (sanitized, never stores secrets)
 CREATE TABLE IF NOT EXISTS error_logs (
   id TEXT PRIMARY KEY,
   context TEXT NOT NULL DEFAULT '',
@@ -353,10 +405,28 @@ CREATE TABLE IF NOT EXISTS error_logs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Safe additive column migrations for existing databases
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
+ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
+ALTER TABLE problems ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS record_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'UPDATE';
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 8;
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ;
+
 -- ============================================================================
 -- Performance Indexes for 100,000+ Reservations & Fast Faceted Queries
 -- ============================================================================
 
+CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers (phone);
+CREATE INDEX IF NOT EXISTS idx_customers_updated_at_desc ON customers (updated_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_reservations_updated_at_desc ON reservations (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reservations_created_at_desc ON reservations (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reservations_start_date ON reservations (start_date DESC);
@@ -403,4 +473,6 @@ CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_
 CREATE INDEX IF NOT EXISTS idx_sessions_employee_active ON sessions (employee_id, is_revoked, expires_at);
 CREATE INDEX IF NOT EXISTS idx_sync_log_started_at ON sync_log (started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mirror_outbox_pending ON sheets_mirror_outbox (status, next_retry_at) WHERE status IN ('pending', 'retry');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_idem ON sheets_mirror_outbox (idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_realtime_events_seq ON realtime_events (seq ASC);
 CREATE INDEX IF NOT EXISTS idx_error_logs_created_at ON error_logs (created_at DESC);

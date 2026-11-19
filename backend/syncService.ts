@@ -1,6 +1,6 @@
 import { crmCore, generateId, parseJsonArray } from './auth';
 import type { DbClient, DbExecutor } from './dbCore';
-import { getEnv } from './env';
+import { getEnv, registerBackgroundTask } from './env';
 import { logBackendError } from './logger';
 
 export interface SyncActor {
@@ -783,6 +783,60 @@ export async function ingestIncrementalSyncBatch(
   }
 }
 
+export interface SyncOperationInput {
+  entityType: string;
+  entityId: string;
+  recordId?: string;
+  operation?: string;
+  action: string;
+  payload?: Record<string, any>;
+  idempotencyKey?: string;
+  maxRetries?: number;
+}
+
+export interface FlushSyncQueueResult {
+  synced: number;
+  failed: number;
+  recoveredStale: number;
+  skipped: boolean;
+}
+
+export async function enqueueSyncOperation(
+  client: DbClient,
+  op: SyncOperationInput
+): Promise<string | null> {
+  const entityType = str(op?.entityType);
+  const entityId = str(op?.entityId || op?.recordId);
+  const recordId = str(op?.recordId || entityId);
+  const operation = str(op?.operation || 'UPDATE').toUpperCase();
+  const action = str(op?.action || 'upsertRecord');
+  const maxRetries = Math.max(1, num(op?.maxRetries, 8));
+  const idempotencyKey = op?.idempotencyKey ? str(op.idempotencyKey) : null;
+  if (!entityType || !entityId) return null;
+
+  const id = generateId('MIR');
+  const res = await client.query<{ id: string }>(
+    `INSERT INTO sheets_mirror_outbox (
+       id, entity_type, entity_id, record_id, operation, action, payload,
+       idempotency_key, max_retries, status, retry_count, next_retry_at, created_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'pending', 0, NOW(), NOW(), NOW())
+     ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [
+      id,
+      entityType,
+      entityId,
+      recordId,
+      operation,
+      action,
+      JSON.stringify(op?.payload || {}),
+      idempotencyKey,
+      maxRetries
+    ]
+  );
+  return res.rows[0]?.id || null;
+}
+
 export async function enqueueSheetsMirror(
   client: DbClient,
   entityType: string,
@@ -802,30 +856,61 @@ export async function enqueueSheetsMirror(
   }
 }
 
-export async function flushSheetsMirrorOutbox(
+export async function flushSyncQueue(
   executor: DbExecutor,
-  fetchFn: typeof fetch = fetch
-): Promise<{ sent: number; failed: number; skipped: boolean }> {
+  fetchFn: typeof fetch = fetch,
+  options: { batchSize?: number; staleLockSeconds?: number; syncSecretOverride?: string } = {}
+): Promise<FlushSyncQueueResult> {
+  const staleSecs = Math.max(15, num(options.staleLockSeconds, 90));
+  const staleRes = await executor.query(
+    `UPDATE sheets_mirror_outbox
+     SET status = 'retry',
+         locked_at = NULL,
+         worker_id = '',
+         updated_at = NOW(),
+         last_error = COALESCE(NULLIF(last_error, ''), 'Recovered stale processing lock')
+     WHERE status = 'processing'
+       AND locked_at IS NOT NULL
+       AND locked_at < NOW() - ($1 || ' seconds')::interval`,
+    [String(staleSecs)]
+  ).catch(() => ({ rowCount: 0 }));
+  const recoveredStale = Number(staleRes?.rowCount || 0);
+
   const gasUrl = str(getEnv('GAS_WEBAPP_URL'));
-  const syncSecret = str(getEnv('SYNC_API_SECRET'));
+  const syncSecret = str(options.syncSecretOverride || getEnv('SYNC_API_SECRET'));
   if (!gasUrl || !syncSecret) {
-    return { sent: 0, failed: 0, skipped: true };
+    return { synced: 0, failed: 0, recoveredStale, skipped: true };
   }
 
-  const pendingRes = await executor.query(
-    `SELECT * FROM sheets_mirror_outbox
-     WHERE status IN ('pending', 'retry') AND next_retry_at <= NOW()
-     ORDER BY created_at ASC
-     LIMIT 50`
+  const batchSize = Math.min(200, Math.max(1, num(options.batchSize, 50)));
+  const workerId = generateId('WRK');
+
+  const claimRes = await executor.query(
+    `WITH due AS (
+       SELECT id FROM sheets_mirror_outbox
+       WHERE status IN ('pending', 'retry') AND next_retry_at <= NOW()
+       ORDER BY created_at ASC
+       LIMIT $1
+     )
+     UPDATE sheets_mirror_outbox o
+     SET status = 'processing', locked_at = NOW(), worker_id = $2, updated_at = NOW()
+     FROM due
+     WHERE o.id = due.id
+     RETURNING o.*`,
+    [batchSize, workerId]
   );
-  if (pendingRes.rows.length === 0) {
-    return { sent: 0, failed: 0, skipped: false };
+
+  if (claimRes.rows.length === 0) {
+    return { synced: 0, failed: 0, recoveredStale, skipped: false };
   }
 
-  const items = pendingRes.rows.map((r) => ({
+  const items = claimRes.rows.map((r) => ({
     id: r.id,
+    outboxId: r.id,
     entityType: r.entity_type,
     entityId: r.entity_id,
+    recordId: str(r.record_id || r.entity_id),
+    operation: str(r.operation || 'UPDATE').toUpperCase(),
     action: r.action,
     payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {})
   }));
@@ -841,37 +926,320 @@ export async function flushSheetsMirrorOutbox(
       })
     });
     const text = await resp.text();
-    const parsed = JSON.parse(text);
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
     if (!resp.ok || !parsed?.success) {
-      throw new Error(parsed?.message || `GAS HTTP ${resp.status}`);
+      const detail = str(parsed?.error || parsed?.message || text.slice(0, 150) || `GAS HTTP ${resp.status}`);
+      throw new Error(detail);
     }
 
     const ids = items.map((x) => x.id);
     await executor.query(
       `UPDATE sheets_mirror_outbox
-       SET status = 'sent', processed_at = NOW(), last_error = ''
+       SET status = 'synced',
+           locked_at = NULL,
+           worker_id = '',
+           last_error = '',
+           processed_at = NOW(),
+           synced_at = NOW(),
+           updated_at = NOW()
        WHERE id = ANY($1::text[])`,
       [ids]
     );
-    return { sent: ids.length, failed: 0, skipped: false };
+
+    const byEntity = new Map<string, string[]>();
+    for (const it of items) {
+      const targetId = str(it.recordId || it.entityId);
+      if (!targetId) continue;
+      const list = byEntity.get(it.entityType) || [];
+      list.push(targetId);
+      byEntity.set(it.entityType, list);
+    }
+
+    const markLastSync = async (table: string, entityIds: string[] | undefined) => {
+      if (!entityIds || entityIds.length === 0) return;
+      await executor.query(
+        `UPDATE ${table} SET last_sync_at = NOW() WHERE id = ANY($1::text[])`,
+        [entityIds]
+      ).catch(() => undefined);
+    };
+
+    await Promise.all([
+      markLastSync('customers', byEntity.get('Customer')),
+      markLastSync('reservations', byEntity.get('Reservation')),
+      markLastSync('problems', byEntity.get('Problem')),
+      markLastSync('follow_ups', byEntity.get('FollowUp')),
+      markLastSync('employees', byEntity.get('Employee'))
+    ]);
+
+    return { synced: ids.length, failed: 0, recoveredStale, skipped: false };
   } catch (err: any) {
     const errMsg = String(err?.message || 'MIRROR_FAILED').slice(0, 400);
-    for (const row of pendingRes.rows) {
+    for (const row of claimRes.rows) {
       const nextRetryCount = num(row.retry_count, 0) + 1;
-      const dead = nextRetryCount >= 8;
+      const maxRetries = Math.max(1, num(row.max_retries, 8));
+      const dead = nextRetryCount >= maxRetries;
       const delaySeconds = Math.min(3600, Math.pow(2, nextRetryCount) * 15);
       await executor.query(
         `UPDATE sheets_mirror_outbox
          SET status = $2,
              retry_count = $3,
              last_error = $4,
+             locked_at = NULL,
+             worker_id = '',
+             updated_at = NOW(),
              next_retry_at = NOW() + ($5 || ' seconds')::interval
          WHERE id = $1`,
         [row.id, dead ? 'failed' : 'retry', nextRetryCount, errMsg, String(delaySeconds)]
       ).catch(() => undefined);
     }
-    return { sent: 0, failed: pendingRes.rows.length, skipped: false };
+    return { synced: 0, failed: claimRes.rows.length, recoveredStale, skipped: false };
   }
+}
+
+export async function triggerImmediateSync(
+  executor: DbExecutor,
+  fetchFn: typeof fetch = fetch
+): Promise<FlushSyncQueueResult> {
+  const promise = flushSyncQueue(executor, fetchFn);
+  registerBackgroundTask(promise.catch(() => undefined));
+  return promise;
+}
+
+export async function retryFailedSyncItems(
+  executor: DbExecutor,
+  ids?: string[],
+  fetchFn: typeof fetch = fetch
+): Promise<{ resetCount: number; flush: FlushSyncQueueResult }> {
+  const hasIds = Array.isArray(ids) && ids.length > 0;
+  const updRes = await executor.query(
+    `UPDATE sheets_mirror_outbox
+     SET status = 'pending',
+         retry_count = 0,
+         next_retry_at = NOW(),
+         locked_at = NULL,
+         worker_id = '',
+         last_error = '',
+         updated_at = NOW()
+     WHERE ${hasIds ? 'id = ANY($1::text[])' : "status IN ('failed', 'retry')"}`,
+    hasIds ? [ids] : []
+  );
+  const resetCount = Number(updRes.rowCount || 0);
+  const flush = await flushSyncQueue(executor, fetchFn);
+  return { resetCount, flush };
+}
+
+export async function getSyncQueueSummary(
+  executor: DbExecutor,
+  limit = 60
+): Promise<{
+  counts: { pending: number; processing: number; retry: number; failed: number; synced: number; sent: number; total: number };
+  items: any[];
+}> {
+  const safeLimit = Math.min(200, Math.max(1, num(limit, 60)));
+  const [countsRes, itemsRes] = await Promise.all([
+    executor.query<{ status: string; cnt: string }>(
+      `SELECT status, COUNT(*)::text AS cnt FROM sheets_mirror_outbox GROUP BY status`
+    ),
+    executor.query(
+      `SELECT * FROM sheets_mirror_outbox ORDER BY created_at DESC LIMIT $1`,
+      [safeLimit]
+    )
+  ]);
+
+  const counts = {
+    pending: 0,
+    processing: 0,
+    retry: 0,
+    failed: 0,
+    synced: 0,
+    sent: 0,
+    total: 0
+  };
+  for (const row of countsRes.rows) {
+    const k = str(row.status) as keyof typeof counts;
+    const n = num(row.cnt, 0);
+    if (k in counts && k !== 'total') {
+      counts[k] = n;
+    }
+    counts.total += n;
+  }
+
+  return {
+    counts,
+    items: itemsRes.rows.map((r) => ({
+      id: str(r.id),
+      entityType: str(r.entity_type),
+      entityId: str(r.entity_id),
+      recordId: str(r.record_id || r.entity_id),
+      operation: str(r.operation || 'UPDATE'),
+      action: str(r.action),
+      status: str(r.status),
+      retryCount: num(r.retry_count, 0),
+      maxRetries: num(r.max_retries, 8),
+      workerId: str(r.worker_id),
+      lastError: str(r.last_error),
+      nextRetryAt: r.next_retry_at instanceof Date ? r.next_retry_at.toISOString() : str(r.next_retry_at),
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : str(r.created_at),
+      syncedAt: r.synced_at instanceof Date ? r.synced_at.toISOString() : str(r.synced_at)
+    }))
+  };
+}
+
+export async function runBackupDeltaSync(
+  executor: DbExecutor,
+  syncSecretOverride?: string,
+  options: { pullRentalGate?: boolean; fetchFn?: typeof fetch } = {}
+): Promise<{
+  enqueuedMissed: number;
+  flushResult: FlushSyncQueueResult;
+  pulled: SyncIngestResult | null;
+}> {
+  const fetchFn = options.fetchFn || fetch;
+  let enqueuedMissed = 0;
+
+  const [dirtyCusts, dirtyRes, dirtyProblems] = await Promise.all([
+    executor.query(
+      `SELECT c.* FROM customers c
+       WHERE c.deleted_at IS NULL
+         AND (c.last_sync_at IS NULL OR c.updated_at > c.last_sync_at)
+         AND NOT EXISTS (
+           SELECT 1 FROM sheets_mirror_outbox o
+           WHERE o.entity_type = 'Customer' AND o.entity_id = c.id AND o.status IN ('pending', 'processing', 'retry')
+         )
+       LIMIT 200`
+    ).catch(() => ({ rows: [] })),
+    executor.query(
+      `SELECT r.* FROM reservations r
+       WHERE r.deleted_at IS NULL
+         AND (r.last_sync_at IS NULL OR r.updated_at > r.last_sync_at)
+         AND NOT EXISTS (
+           SELECT 1 FROM sheets_mirror_outbox o
+           WHERE o.entity_type = 'Reservation' AND o.entity_id = r.id AND o.status IN ('pending', 'processing', 'retry')
+         )
+       LIMIT 200`
+    ).catch(() => ({ rows: [] })),
+    executor.query(
+      `SELECT p.* FROM problems p
+       WHERE (p.last_sync_at IS NULL OR p.updated_at > p.last_sync_at)
+         AND NOT EXISTS (
+           SELECT 1 FROM sheets_mirror_outbox o
+           WHERE o.entity_type = 'Problem' AND o.entity_id = p.id AND o.status IN ('pending', 'processing', 'retry')
+         )
+       LIMIT 200`
+    ).catch(() => ({ rows: [] }))
+  ]);
+
+  if (dirtyCusts.rows.length > 0 || dirtyRes.rows.length > 0 || dirtyProblems.rows.length > 0) {
+    await executor.withTransaction(async (tx) => {
+      for (const c of dirtyCusts.rows) {
+        const payload = {
+          id: str(c.id),
+          name: str(c.name),
+          phone: str(c.phone),
+          email: str(c.email),
+          idNumber: str(c.id_number),
+          companyName: str(c.company_name),
+          notes: str(c.notes),
+          status: str(c.status || 'active'),
+          createdAt: c.created_at instanceof Date ? c.created_at.toISOString() : str(c.created_at),
+          updatedAt: c.updated_at instanceof Date ? c.updated_at.toISOString() : str(c.updated_at)
+        };
+        const id = await enqueueSyncOperation(tx, {
+          entityType: 'Customer',
+          entityId: payload.id,
+          recordId: payload.id,
+          operation: c.last_sync_at ? 'UPDATE' : 'INSERT',
+          action: 'upsertCustomer',
+          payload
+        });
+        if (id) enqueuedMissed++;
+      }
+
+      for (const r of dirtyRes.rows) {
+        const payload = mapReservationRowToClient(r, false);
+        const id = await enqueueSyncOperation(tx, {
+          entityType: 'Reservation',
+          entityId: payload.id,
+          recordId: payload.id,
+          operation: r.last_sync_at ? 'UPDATE' : 'INSERT',
+          action: 'upsertReservation',
+          payload
+        });
+        if (id) enqueuedMissed++;
+      }
+
+      for (const p of dirtyProblems.rows) {
+        const payload = {
+          id: str(p.id),
+          problemNumber: str(p.problem_number),
+          reservationId: str(p.reservation_id),
+          reservationNumber: str(p.reservation_number),
+          customerName: str(p.customer_name),
+          description: str(p.description),
+          priority: str(p.priority || 'متوسط'),
+          status: str(p.status || 'جديدة'),
+          updatedAt: p.updated_at instanceof Date ? p.updated_at.toISOString() : str(p.updated_at)
+        };
+        const id = await enqueueSyncOperation(tx, {
+          entityType: 'Problem',
+          entityId: payload.id,
+          recordId: payload.id,
+          operation: p.last_sync_at ? 'UPDATE' : 'INSERT',
+          action: 'upsertProblem',
+          payload
+        });
+        if (id) enqueuedMissed++;
+      }
+    });
+  }
+
+  let pulled: SyncIngestResult | null = null;
+  if (options.pullRentalGate && getEnv('RG_TOKEN')) {
+    pulled = await pullFromRentalGateDirect(
+      executor,
+      { id: 'CRON_DELTA', name: 'مزامنة دورية احتياطية', role: 'system' },
+      {},
+      fetchFn
+    ).catch(() => null);
+  }
+
+  const flushResult = await flushSyncQueue(executor, fetchFn, { syncSecretOverride });
+
+  const nowIso = new Date().toISOString();
+  await executor.query(
+    `INSERT INTO sync_checkpoints (
+       source, last_sync_at, last_successful_at, last_cursor, last_batch_count,
+       last_status, last_error, meta, updated_at
+     ) VALUES ('backup_delta_sync', $1::timestamptz, $1::timestamptz, '', $2, 'success', '', $3::jsonb, $1::timestamptz)
+     ON CONFLICT (source) DO UPDATE SET
+       last_sync_at = EXCLUDED.last_sync_at,
+       last_successful_at = EXCLUDED.last_successful_at,
+       last_batch_count = EXCLUDED.last_batch_count,
+       last_status = 'success',
+       last_error = '',
+       meta = EXCLUDED.meta,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      nowIso,
+      enqueuedMissed + flushResult.synced,
+      JSON.stringify({ enqueuedMissed, flushResult, pulledCount: pulled ? pulled.importedCount + pulled.updatedCount : 0 })
+    ]
+  ).catch(() => undefined);
+
+  return { enqueuedMissed, flushResult, pulled };
+}
+
+export async function flushSheetsMirrorOutbox(
+  executor: DbExecutor,
+  fetchFn: typeof fetch = fetch
+): Promise<{ sent: number; failed: number; skipped: boolean }> {
+  const res = await flushSyncQueue(executor, fetchFn);
+  return { sent: res.synced, failed: res.failed, skipped: res.skipped };
 }
 
 export async function pullFromRentalGateDirect(

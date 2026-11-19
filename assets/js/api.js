@@ -1179,10 +1179,16 @@
     _cachedConnInfo = null;
     var raw = String(url || '').trim();
     var defUrl = getDefaultConfiguredGasUrl();
+    var hasLiveBackend = Boolean(
+      defUrl ||
+      getDefaultConfiguredBackendUrl() ||
+      detectedBackendUrl ||
+      safeStorageGet(STORAGE_BACKEND_URL)
+    );
     if (raw === '__DEFAULT__') {
       safeStorageSet(STORAGE_GAS_URL, '');
     } else if (!raw) {
-      safeStorageSet(STORAGE_GAS_URL, defUrl ? SANDBOX_SENTINEL : '');
+      safeStorageSet(STORAGE_GAS_URL, hasLiveBackend ? SANDBOX_SENTINEL : '');
     } else if (defUrl && raw === defUrl) {
       safeStorageSet(STORAGE_GAS_URL, '');
     } else {
@@ -1215,8 +1221,8 @@
     });
 
     _cachedConnInfo = null;
-    safeStorageSet(STORAGE_GAS_URL, nextGas ? '' : '');
-    safeStorageSet(STORAGE_BACKEND_URL, nextBackend ? nextBackend : '');
+    safeStorageSet(STORAGE_GAS_URL, '');
+    safeStorageSet(STORAGE_BACKEND_URL, nextBackend);
     detectedBackendUrl = nextBackend;
     backendProbeDone = true;
     backendProbePromise = null;
