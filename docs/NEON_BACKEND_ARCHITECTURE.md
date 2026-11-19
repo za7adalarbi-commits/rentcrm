@@ -13,23 +13,20 @@
 
 ---
 
-## 1. إعداد قاعدة بيانات Neon PostgreSQL
+## 1. إعداد قاعدة بيانات Neon PostgreSQL (متغير بيئة واحد فقط على Vercel)
 
 1. أنشئ مشروعًا مجانيًا على [Neon](https://neon.tech) واحصل على `DATABASE_URL` (مع `sslmode=require`).
-2. أضف المتغيرات التالية في `.env` (أو في **Vercel Environment Variables**):
+2. أضف متغير بيئة **واحد فقط** في `.env` أو في **Vercel Environment Variables**:
 
 ```bash
 DATABASE_URL="postgresql://user:password@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require"
-SYNC_API_SECRET="your-strong-random-32-char-secret"
-GAS_WEBAPP_URL="https://script.google.com/macros/s/AKfycb.../exec"
-RG_TOKEN=""
 ```
 
 3. تطبيق هيكل الجداول والفهارس:
 ```bash
 node scripts/migrate-from-sheets.mjs --schema-only
 ```
-*(كما يقوم السيرفر بتهيئة الجداول والبذور الافتراضية تلقائيًا عند أول طلب إذا كانت القاعدة فارغة.)*
+*(كما يقوم السيرفر بتهيئة الجداول والبذور الافتراضية تلقائيًا عند أول طلب إذا كانت القاعدة فارغة، ويتصل أي مستخدم يفتح رابط الموقع تلقائيًا بـ `/api/crm` عبر `/api/health`.)*
 
 ---
 
@@ -49,13 +46,14 @@ node scripts/migrate-from-sheets.mjs --input path/to/sheets-export.json
 
 ---
 
-## 3. ربط Google Apps Script بالمزامنة التزايدية كل دقيقة
+## 3. الربط التلقائي من صفحة الإعدادات مع Google Apps Script
 
-1. انسخ محتوى `google-apps-script/NeonSync.gs` بالإضافة إلى تحديثات `Utils.gs`, `RentalGateAPI.gs`, `Code.gs`, `Triggers.gs` إلى مشروع Apps Script.
-2. من محرر Apps Script، نفّذ مرة واحدة:
-   - `setNeonSyncProperties("https://your-domain.vercel.app/api/sync", "YOUR_SYNC_API_SECRET")`
-   - `setupNeonEveryMinuteSync(true)` لتفعيل المزامنة التزايدية كل دقيقة (`scheduledMinuteSync`).
-3. يستخدم Apps Script بصمة SHA-256 لكل حجز وتمديد في `CacheService`/`PropertiesService` لإرسال **الحجوزات والتمديدات الجديدة أو المعدلة فقط** على دفعات مع `Retry + Backoff` وتسجيل آخر وقت ناجح للمزامنة.
+1. انسخ محتوى `google-apps-script/` (`NeonSync.gs`, `Utils.gs`, `RentalGateAPI.gs`, `Code.gs`, `Triggers.gs`) إلى مشروع Apps Script وانشره كـ **Web App (`/exec`)**.
+2. افتح صفحة **الإعدادات** داخل الموقع بحساب المدير العام وأدخل:
+   - **رابط Web App (`/exec`)**: يُحفظ عالميًا في جدول `settings` في Neon لجميع المستخدمين.
+   - **Rental Gate API Token**: يُشفر بـ AES-256-GCM داخل Neon دون الحاجة لإعادة ضبط Vercel.
+3. فور الحفظ من الإعدادات، يولّد السيرفر `SYNC_API_SECRET` تلقائيًا ويرسله مشفرًا مع `NEON_SYNC_URL` والتوكن عبر `autoBindFromServer` إلى Apps Script مع تفعيل المزامنة التلقائية كل دقيقة (`scheduledMinuteSync`).
+4. يستخدم Apps Script بصمة SHA-256 لكل حجز وتمديد في `CacheService`/`PropertiesService` لإرسال **الحجوزات والتمديدات الجديدة أو المعدلة فقط** على دفعات مع `Retry + Backoff` وتسجيل آخر وقت ناجح للمزامنة.
 
 ---
 

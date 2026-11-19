@@ -1,5 +1,5 @@
 import { handleLogin, handleLogout, requireAuth } from './auth';
-import { ensureSchemaInitialized, type DbExecutor } from './dbCore';
+import { ensureSchemaInitialized, type DbExecutor } from './db';
 import { logBackendError } from './logger';
 import * as queries from './queries';
 
@@ -67,26 +67,8 @@ export async function dispatchCrmRequest(
       case 'syncLocalCache':
         result = await queries.syncLocalCache(executor, session, payload);
         break;
-      case 'getCustomers':
-        result = await queries.getCustomers(executor, session, payload);
-        break;
-      case 'createCustomer':
-        result = await queries.createCustomer(executor, session, payload);
-        break;
-      case 'updateCustomer':
-        result = await queries.updateCustomer(executor, session, payload);
-        break;
-      case 'deleteCustomer':
-        result = await queries.deleteCustomer(executor, session, payload);
-        break;
       case 'getReservationDetails':
         result = await queries.getReservationDetails(executor, session, payload);
-        break;
-      case 'createReservation':
-        result = await queries.createReservation(executor, session, payload);
-        break;
-      case 'deleteReservation':
-        result = await queries.deleteReservation(executor, session, payload);
         break;
       case 'claimReservation':
         result = await queries.claimReservation(executor, session, payload);
@@ -184,6 +166,15 @@ export async function dispatchCrmRequest(
       case 'saveApiToken':
         result = await queries.saveApiToken(executor, session, payload);
         break;
+      case 'saveGlobalConnectionSettings':
+        result = await queries.saveGlobalConnectionSettings(executor, session, payload);
+        break;
+      case 'getSetupCapabilities':
+        result = await queries.getSetupCapabilitiesAction(executor, session);
+        break;
+      case 'applyUnifiedConnectionSetup':
+        result = await queries.applyUnifiedConnectionSetupAction(executor, session, payload);
+        break;
       case 'getSyncStatus':
         result = await queries.getSyncStatus(executor, session);
         break;
@@ -220,7 +211,7 @@ export async function dispatchCrmRequest(
   } catch (err: any) {
     const msg = String(err?.message || 'حدث خطأ غير متوقع.');
     const errorCode = msg.includes(':') ? msg.split(':')[0].trim() : 'SERVER_ERROR';
-    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN)/.test(errorCode);
+    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR)/.test(errorCode);
     if (!isExpectedClientErr) {
       await logBackendError(executor, 'router', action, err, { payload });
     }

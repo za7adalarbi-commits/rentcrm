@@ -446,7 +446,8 @@
   function renderLoginScreen() {
     var appRoot = document.getElementById('app-root');
     var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
-    var isLive = Boolean(connInfo.url);
+    var isBackendLive = Boolean(root.RGApi.isBackendConnected && root.RGApi.isBackendConnected());
+    var isLive = Boolean(isBackendLive || connInfo.url);
     cleanAutoBindQueryFromAddressBar();
     if (isLive && root.RGApi.warmUpGas) {
       root.RGApi.warmUpGas();
@@ -481,7 +482,7 @@
                 '<label class="form-label" for="login-password">كلمة المرور</label>' +
                 '<div class="password-field-wrap">' +
                   '<input class="input" type="password" id="login-password" dir="ltr" lang="en" autocomplete="current-password" placeholder="••••••••" required>' +
-                  '<button type="button" class="password-toggle-btn" id="toggle-login-password" aria-pressed="false" aria-label="إظهار كلمة المرور">إظهار</button>' +
+                  '<button type="button" class="password-toggle-btn" id="toggle-login-password" aria-label="إظهار كلمة المرور">إظهار</button>' +
                 '</div>' +
               '</div>' +
               '<div id="login-error" class="form-error hidden" role="alert"></div>' +
@@ -489,7 +490,7 @@
             '</form>' +
             '<div class="auth-mode-box">' +
               '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
-                '<div><strong>حالة الخادم:</strong> ' + (isLive ? 'متصل تلقائيًا بـ Google Apps Script' : 'معاينة محلية (Sandbox)') + '</div>' +
+                '<div><strong>حالة الخادم:</strong> ' + (isBackendLive ? 'متصل تلقائيًا بقاعدة البيانات السحابية' : (isLive ? 'متصل تلقائيًا بـ Google Apps Script' : 'معاينة محلية (Sandbox)')) + '</div>' +
                 (!isLive && connInfo.defaultUrl ? '<button type="button" class="btn btn-sm btn-primary" id="login-restore-default-gas">تفعيل الربط التلقائي للخادم</button>' : '') +
               '</div>' +
               (!isLive ? (
@@ -503,7 +504,7 @@
                 '</div>'
               ) : (
                 '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--surface-muted,#f4f5f6);font-size:12px;line-height:1.6;color:var(--text-secondary);">' +
-                  'النظام مربوط تلقائيًا بالخادم. أدخل حسابك الوظيفي المسجل في <strong>Employees</strong> للدخول مباشرة.' +
+                  'النظام مربوط تلقائيًا بالخادم. أدخل حسابك الوظيفي المسجل في <strong>الموظفين</strong> للدخول مباشرة.' +
                 '</div>'
               )) +
             '</div>' +
@@ -530,11 +531,8 @@
     if (pwdInput && pwdToggleBtn) {
       pwdToggleBtn.addEventListener('click', function () {
         var nextType = pwdInput.type === 'password' ? 'text' : 'password';
-        var isVisible = nextType === 'text';
         pwdInput.type = nextType;
-        pwdToggleBtn.textContent = isVisible ? 'إخفاء' : 'إظهار';
-        pwdToggleBtn.setAttribute('aria-pressed', isVisible ? 'true' : 'false');
-        pwdToggleBtn.setAttribute('aria-label', isVisible ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور');
+        pwdToggleBtn.textContent = nextType === 'text' ? 'إخفاء' : 'إظهار';
       });
     }
 
@@ -570,7 +568,7 @@
         submitBtn.textContent = 'دخول إلى النظام';
         var rawMsg = (res && res.message) || 'تعذر تسجيل الدخول، يرجى التحقق من البيانات.';
         if (isLive && rawMsg.indexOf('اسم المستخدم أو كلمة المرور غير صحيحة') !== -1) {
-          errEl.textContent = rawMsg + ' تأكد من أن الحساب مضاف في ورقة Employees بـ Google Sheets (الحساب المبدئي بعد تشغيل setupRentalGateDatabase هو admin / Admin@123)، أو استخدم زر «العودة للمعاينة المحلية» بالأسفل.';
+          errEl.textContent = rawMsg + ' تأكد من صحة بيانات الحساب الوظيفي المسجل في صفحة الموظفين (الحساب المبدئي للتهيئة الأولى هو admin / Admin@123).';
         } else {
           errEl.textContent = rawMsg;
         }

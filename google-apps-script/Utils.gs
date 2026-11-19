@@ -6,7 +6,6 @@
 var RG_SHEETS = {
   USERS: 'Users',
   EMPLOYEES: 'Employees',
-  CUSTOMERS: 'Customers',
   RESERVATIONS: 'Reservations',
   EXTENSIONS: 'Extensions',
   ASSIGNMENTS: 'Assignments',

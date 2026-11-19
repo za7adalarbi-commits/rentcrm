@@ -1,27 +1,48 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import pg from 'pg';
-import {
-  ensureSchemaInitialized,
-  getDatabaseUrl,
-  isDatabaseConfigured,
-  resetSchemaInitState,
-  type DbClient,
-  type DbExecutor,
-  type QueryResult,
-  type QueryResultRow
-} from './dbCore';
-import { getEnv } from './env';
-
-export { ensureSchemaInitialized, getDatabaseUrl, isDatabaseConfigured, resetSchemaInitState };
-export type { DbClient, DbExecutor, QueryResult, QueryResultRow };
+import { FIXED_SERVER_CONFIG } from './fixedConfig';
 
 const { Pool } = pg;
 
+export interface QueryResultRow {
+  [column: string]: any;
+}
+
+export interface QueryResult<T extends QueryResultRow = any> {
+  rows: T[];
+  rowCount: number | null;
+}
+
+export interface DbClient {
+  query<T extends QueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<T>>;
+}
+
+export interface DbExecutor extends DbClient {
+  withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T>;
+}
+
 let cachedPool: pg.Pool | null = null;
-let cachedPoolUrl = '';
+let schemaInitialized = false;
+let schemaInitPromise: Promise<void> | null = null;
+
+export function getDatabaseUrl(): string {
+  return String(
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.NEON_DATABASE_URL ||
+    FIXED_SERVER_CONFIG.databaseUrl ||
+    ''
+  ).trim();
+}
+
+export function isDatabaseConfigured(): boolean {
+  return Boolean(getDatabaseUrl());
+}
 
 function shouldUseSsl(connectionString: string): boolean {
   const lower = connectionString.toLowerCase();
-  if (lower.includes('sslmode=disable') || getEnv('PGSSLMODE') === 'disable') {
+  if (lower.includes('sslmode=disable') || process.env.PGSSLMODE === 'disable') {
     return false;
   }
   if (lower.includes('localhost') || lower.includes('127.0.0.1')) {
@@ -30,51 +51,58 @@ function shouldUseSsl(connectionString: string): boolean {
   return true;
 }
 
-export async function resetPool(): Promise<void> {
-  const prev = cachedPool;
-  cachedPool = null;
-  cachedPoolUrl = '';
-  resetSchemaInitState();
-  if (prev) {
-    try {
-      await prev.end();
-    } catch {
-      // ignore close errors during dynamic pool swap
-    }
+export async function testDatabaseConnection(connectionString: string): Promise<{ ok: true }> {
+  const clean = String(connectionString || '').trim();
+  if (!clean || !/^postgres(ql)?:\/\//i.test(clean)) {
+    throw new Error('VALIDATION_ERROR: صيغة رابط قاعدة بيانات PostgreSQL/Neon غير صالحة (يجب أن يبدأ بـ postgresql://).');
+  }
+  const testPool = new Pool({
+    connectionString: clean,
+    ssl: shouldUseSsl(clean) ? { rejectUnauthorized: false } : undefined,
+    max: 1,
+    connectionTimeoutMillis: 8000,
+    allowExitOnIdle: true
+  });
+  try {
+    await testPool.query('SELECT 1 AS ok');
+    return { ok: true };
+  } catch (err: any) {
+    throw new Error(`DATABASE_CONNECTION_ERROR: تعذر الاتصال بقاعدة بيانات Neon PostgreSQL (${String(err?.message || 'CONNECTION_FAILED').slice(0, 180)}).`);
+  } finally {
+    await testPool.end().catch(() => undefined);
+  }
+}
+
+export async function resetPoolForReconfig(nextDatabaseUrl?: string): Promise<void> {
+  if (cachedPool) {
+    const oldPool = cachedPool;
+    cachedPool = null;
+    await oldPool.end().catch(() => undefined);
+  }
+  schemaInitialized = false;
+  schemaInitPromise = null;
+  if (nextDatabaseUrl !== undefined) {
+    const clean = String(nextDatabaseUrl || '').trim();
+    FIXED_SERVER_CONFIG.databaseUrl = clean;
+    if (clean) process.env.DATABASE_URL = clean;
+    else delete process.env.DATABASE_URL;
   }
 }
 
 export function getPool(): pg.Pool {
+  if (cachedPool) return cachedPool;
   const connectionString = getDatabaseUrl();
   if (!connectionString) {
-    if (cachedPool) {
-      const stale = cachedPool;
-      cachedPool = null;
-      cachedPoolUrl = '';
-      resetSchemaInitState();
-      void stale.end().catch(() => undefined);
-    }
     throw new Error('DATABASE_UNCONFIGURED: متغير DATABASE_URL غير مضبوط في بيئة الخادم.');
-  }
-  if (cachedPool && cachedPoolUrl === connectionString) {
-    return cachedPool;
-  }
-  if (cachedPool && cachedPoolUrl !== connectionString) {
-    const prev = cachedPool;
-    cachedPool = null;
-    cachedPoolUrl = '';
-    resetSchemaInitState();
-    void prev.end().catch(() => undefined);
   }
   cachedPool = new Pool({
     connectionString,
     ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined,
-    max: Number(getEnv('PG_POOL_MAX', '10')) || 10,
+    max: Number(process.env.PG_POOL_MAX || 10) || 10,
     idleTimeoutMillis: 20000,
     connectionTimeoutMillis: 10000,
     allowExitOnIdle: true
   });
-  cachedPoolUrl = connectionString;
   return cachedPool;
 }
 
@@ -109,6 +137,47 @@ export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
       }
     }
   };
+}
+
+function loadSchemaSql(): string {
+  const candidates = [
+    path.resolve(process.cwd(), 'database/schema.sql'),
+    path.resolve(import.meta.dirname || process.cwd(), '../database/schema.sql')
+  ];
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath)) {
+      return fs.readFileSync(filePath, 'utf8');
+    }
+  }
+  throw new Error('SCHEMA_FILE_MISSING: لم يتم العثور على database/schema.sql');
+}
+
+export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {
+  if (schemaInitialized) return;
+  if (schemaInitPromise) return schemaInitPromise;
+
+  schemaInitPromise = (async () => {
+    try {
+      const check = await executor.query<{ reg: string | null }>(
+        "SELECT to_regclass('public.employees') AS reg"
+      );
+      const exists = Boolean(check.rows[0] && check.rows[0].reg);
+      if (!exists) {
+        const schemaSql = loadSchemaSql();
+        await executor.query(schemaSql);
+      }
+      schemaInitialized = true;
+    } finally {
+      schemaInitPromise = null;
+    }
+  })();
+
+  return schemaInitPromise;
+}
+
+export function resetSchemaInitFlagForTesting(): void {
+  schemaInitialized = false;
+  schemaInitPromise = null;
 }
 
 export async function checkDatabaseHealth(): Promise<{

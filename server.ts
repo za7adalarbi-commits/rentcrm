@@ -5,10 +5,6 @@ import path from 'node:path';
 import crmHandler from './api/crm';
 import healthHandler from './api/health';
 import syncHandler from './api/sync';
-import autoConnectHandler from './api/auto-connect';
-import eventsHandler from './api/events';
-import syncQueueHandler from './api/sync-queue';
-import cronSyncHandler from './api/cron/sync';
 
 async function startServer() {
   const app = express();
@@ -28,22 +24,6 @@ async function startServer() {
 
   app.all('/api/sync', (req, res) => {
     void syncHandler(req, res);
-  });
-
-  app.all(['/api/auto-connect', '/api/auto-connect/status'], (req, res) => {
-    void autoConnectHandler(req, res, rootDir);
-  });
-
-  app.all('/api/events', (req, res) => {
-    void eventsHandler(req, res);
-  });
-
-  app.all('/api/sync-queue', (req, res) => {
-    void syncQueueHandler(req, res);
-  });
-
-  app.all('/api/cron/sync', (req, res) => {
-    void cronSyncHandler(req, res);
   });
 
   if (process.env.NODE_ENV !== 'production') {

@@ -1506,207 +1506,6 @@
     return cleanOrigin + cleanPath + '?gasUrl=' + encodeURIComponent(check.normalized);
   }
 
-  function maskSecretValue(rawVal) {
-    var s = normalizeStr(rawVal);
-    if (!s) return '';
-    if (s.length <= 6) return '****';
-    return '****' + s.slice(-4);
-  }
-
-  function maskDatabaseUrl(rawUrl) {
-    var clean = normalizeStr(rawUrl);
-    if (!clean) return '';
-    return clean.replace(/^(postgres(?:ql)?:\/\/[^:/?#\s]+:)([^@/\s]+)(@)/i, '$1****$3');
-  }
-
-  function validateDatabaseUrl(rawUrl) {
-    var clean = normalizeStr(rawUrl);
-    if (!clean) {
-      return { valid: true, normalized: '', empty: true, host: '', masked: '', message: '' };
-    }
-    if (/[\r\n\t\s]/.test(clean)) {
-      return {
-        valid: false,
-        normalized: clean,
-        empty: false,
-        host: '',
-        masked: '',
-        message: 'رابط قاعدة البيانات يجب ألا يحتوي على مسافات أو أسطر جديدة.'
-      };
-    }
-    if (!/^postgres(ql)?:\/\//i.test(clean)) {
-      return {
-        valid: false,
-        normalized: clean,
-        empty: false,
-        host: '',
-        masked: '',
-        message: 'رابط قاعدة البيانات غير صالح؛ يجب أن يبدأ بـ postgresql:// أو postgres://'
-      };
-    }
-    var afterProto = clean.replace(/^postgres(ql)?:\/\//i, '');
-    var atIdx = afterProto.lastIndexOf('@');
-    var hostAndPath = atIdx !== -1 ? afterProto.slice(atIdx + 1) : afterProto;
-    var slashIdx = hostAndPath.indexOf('/');
-    var hostPart = slashIdx !== -1 ? hostAndPath.slice(0, slashIdx) : hostAndPath.split('?')[0];
-    var cleanHost = hostPart.split(':')[0];
-    if (!cleanHost) {
-      return {
-        valid: false,
-        normalized: clean,
-        empty: false,
-        host: '',
-        masked: '',
-        message: 'تأكد من كتابة اسم الخادم (Host) واسم قاعدة البيانات بشكل صحيح في DATABASE_URL.'
-      };
-    }
-    return {
-      valid: true,
-      normalized: clean,
-      empty: false,
-      host: cleanHost,
-      masked: maskDatabaseUrl(clean),
-      message: ''
-    };
-  }
-
-  function validateRgTokenFormat(rawToken) {
-    var clean = normalizeStr(rawToken).replace(/^Bearer\s+/i, '').trim();
-    if (!clean) {
-      return { valid: true, normalized: '', empty: true, masked: '', message: '' };
-    }
-    if (/[\r\n\t\s]/.test(clean) || clean.length < 16) {
-      return {
-        valid: false,
-        normalized: clean,
-        empty: false,
-        masked: '',
-        message: 'صيغة توكن Rental Gate غير صالحة. يجب أن يكون بطول 16 حرفًا على الأقل وبدون مسافات.'
-      };
-    }
-    return {
-      valid: true,
-      normalized: clean,
-      empty: false,
-      masked: maskSecretValue(clean),
-      message: ''
-    };
-  }
-
-  function sanitizeJsStringLiteral(val) {
-    return normalizeStr(val)
-      .replace(/\\/g, '\\\\')
-      .replace(/'/g, "\\'")
-      .replace(/\r|\n/g, '');
-  }
-
-  function buildClientConfigJsContent(config) {
-    var cfg = config || {};
-    var gasUrl = sanitizeJsStringLiteral(cfg.gasWebAppUrl || '');
-    var backendUrl = sanitizeJsStringLiteral(cfg.backendApiUrl || '');
-    return [
-      '/**',
-      ' * RENTAL GATE CRM — Global Auto-Connection Configuration',
-      ' * تم تحديث هذا الملف تلقائيًا عبر مركز الربط التلقائي داخل الموقع.',
-      ' * ملاحظة أمنية: هذا الملف مخصص للروابط العامة فقط ولا يحتوي على أي توكنات أو كلمات مرور سرية.',
-      ' */',
-      '(function (root) {',
-      "  'use strict';",
-      '  root.RG_APP_CONFIG = Object.assign({',
-      "    gasWebAppUrl: '" + gasUrl + "',",
-      "    backendApiUrl: '" + backendUrl + "'",
-      '  }, root.RG_APP_CONFIG || {});',
-      "})(typeof window !== 'undefined' ? window : globalThis);",
-      ''
-    ].join('\n');
-  }
-
-  function formatEnvLineValue(val) {
-    var clean = String(val === null || val === undefined ? '' : val).replace(/[\r\n]+/g, '').trim();
-    if (!clean) return '';
-    if (/[\s#"']/.test(clean)) {
-      return '"' + clean.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
-    }
-    return clean;
-  }
-
-  function mergeDotEnvContent(existingText, updates) {
-    var src = String(existingText || '');
-    var lines = src ? src.replace(/\r\n/g, '\n').split('\n') : [];
-    while (lines.length && lines[lines.length - 1] === '') lines.pop();
-
-    var map = updates && typeof updates === 'object' ? updates : {};
-    var updateKeys = Object.keys(map).filter(function (k) { return map[k] !== undefined; });
-    var seen = {};
-    var nextLines = [];
-
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-      var match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-      if (match && Object.prototype.hasOwnProperty.call(map, match[1]) && map[match[1]] !== undefined) {
-        var key = match[1];
-        seen[key] = true;
-        if (map[key] === null) {
-          continue;
-        }
-        nextLines.push(key + '=' + formatEnvLineValue(map[key]));
-      } else {
-        nextLines.push(line);
-      }
-    }
-
-    for (var j = 0; j < updateKeys.length; j++) {
-      var k = updateKeys[j];
-      if (seen[k] || map[k] === null) continue;
-      nextLines.push(k + '=' + formatEnvLineValue(map[k]));
-    }
-
-    return nextLines.join('\n') + '\n';
-  }
-
-  function normalizeAutoConnectPayload(rawInput) {
-    var inp = (rawInput && typeof rawInput === 'object') ? rawInput : {};
-    var dbCheck = validateDatabaseUrl(inp.databaseUrl);
-    var gasCheck = validateGasUrl(inp.gasWebAppUrl);
-    var tokenCheck = validateRgTokenFormat(inp.rgToken || inp.token);
-    var backendRaw = normalizeStr(inp.backendApiUrl);
-    var spreadsheetId = normalizeStr(inp.spreadsheetId);
-    var syncSecret = normalizeStr(inp.syncSecret);
-    var neonSyncUrl = normalizeStr(inp.neonSyncUrl);
-
-    var errors = [];
-    if (!dbCheck.valid) errors.push(dbCheck.message);
-    if (!gasCheck.valid) errors.push(gasCheck.message);
-    if (!tokenCheck.valid) errors.push(tokenCheck.message);
-
-    if (backendRaw && backendRaw.charAt(0) !== '/' && !/^https?:\/\//i.test(backendRaw)) {
-      errors.push('رابط Backend API يجب أن يكون مسارًا مثل /api/crm أو رابط http(s):// صالحًا.');
-    }
-    if (neonSyncUrl && !/^https?:\/\//i.test(neonSyncUrl)) {
-      errors.push('رابط NEON_SYNC_URL يجب أن يبدأ بـ https:// أو http://');
-    }
-
-    var effectiveBackend = backendRaw;
-    if (!effectiveBackend && dbCheck.normalized && inp.autoEnableBackend !== false) {
-      effectiveBackend = '/api/crm';
-    }
-
-    return {
-      valid: errors.length === 0,
-      errors: errors,
-      normalized: {
-        databaseUrl: dbCheck.normalized,
-        databaseHost: dbCheck.host,
-        gasWebAppUrl: gasCheck.isSandbox ? '' : gasCheck.normalized,
-        backendApiUrl: effectiveBackend,
-        rgToken: tokenCheck.normalized,
-        spreadsheetId: spreadsheetId,
-        syncSecret: syncSecret,
-        neonSyncUrl: neonSyncUrl
-      }
-    };
-  }
-
   function compactGasPayload(payload) {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
     var out = {};
@@ -1797,7 +1596,6 @@
     getDashboard: { cacheable: true, ttlMs: 60000, scope: 'dashboard' },
     getReservations: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getReservationDetails: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
-    getCustomers: { cacheable: true, ttlMs: 60000, scope: 'customers' },
     getMyFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getTeamFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getFollowUpHistory: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
@@ -1814,15 +1612,10 @@
   var MUTATION_INVALIDATIONS = {
     login: ['*'],
     logout: ['*'],
-    createCustomer: ['customers', 'activity'],
-    updateCustomer: ['customers', 'activity'],
-    deleteCustomer: ['customers', 'activity'],
-    createReservation: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports'],
-    deleteReservation: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports'],
     claimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
     unclaimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
     quickUpdateReservationStatus: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateReservationDetails: ['reservations', 'customers', 'dashboard', 'employees', 'activity', 'reports'],
+    updateReservationDetails: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
     addFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     updateFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     assignEmployees: ['reservations', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
@@ -1838,9 +1631,11 @@
     savePermissionDefinition: ['employees', 'activity'],
     deletePermissionDefinition: ['employees', 'activity'],
     markNotificationRead: ['notifications'],
-    pullReservations: ['reservations', 'customers', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
-    syncRentalGate: ['reservations', 'customers', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    pullReservations: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    syncRentalGate: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     saveApiToken: ['settings', 'sync', 'activity'],
+    saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
+    applyUnifiedConnectionSetup: ['*'],
     updateSettings: ['settings', 'sync', 'reservations', 'activity']
   };
 
@@ -2186,14 +1981,6 @@
     var act = normalizeStr(action);
     var p = (payload && typeof payload === 'object') ? payload : {};
     switch (act) {
-      case 'createCustomer':
-        return act + ':' + normalizeStr(p.phone || p.customerPhone || p.name || p.customerName);
-      case 'updateCustomer':
-      case 'deleteCustomer':
-        return act + ':' + normalizeStr(p.customerId || p.id);
-      case 'createReservation':
-        return act + ':' + normalizeStr(p.reservationNumber || p.customerName);
-      case 'deleteReservation':
       case 'claimReservation':
       case 'unclaimReservation':
       case 'quickUpdateReservationStatus':
@@ -2201,7 +1988,7 @@
       case 'assignEmployees':
       case 'addFollowUp':
       case 'createProblem':
-        return act + ':' + normalizeStr(p.reservationId || p.id || p.reservationNumber);
+        return act + ':' + normalizeStr(p.reservationId || p.reservationNumber);
       case 'removeAssignment':
         return act + ':' + normalizeStr(p.reservationId) + ':' + normalizeStr(p.employeeId);
       case 'updateFollowUp':
@@ -2397,13 +2184,6 @@
     extractGasUrlFromSearch: extractGasUrlFromSearch,
     resolveGasConnection: resolveGasConnection,
     buildAutoConnectShareUrl: buildAutoConnectShareUrl,
-    maskSecretValue: maskSecretValue,
-    maskDatabaseUrl: maskDatabaseUrl,
-    validateDatabaseUrl: validateDatabaseUrl,
-    validateRgTokenFormat: validateRgTokenFormat,
-    buildClientConfigJsContent: buildClientConfigJsContent,
-    mergeDotEnvContent: mergeDotEnvContent,
-    normalizeAutoConnectPayload: normalizeAutoConnectPayload,
     compactGasPayload: compactGasPayload,
     getGasActionTimeoutMs: getGasActionTimeoutMs,
     buildGasFetchOptions: buildGasFetchOptions,

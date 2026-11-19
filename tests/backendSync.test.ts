@@ -1,9 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { hashPassword, hashToken, normalizeLoginUsername, verifySharedSecret } from '../backend/auth';
+import { maskDatabaseUrl, persistCoreFilesOnDisk } from '../backend/coreBinding';
 import type { DbClient, DbExecutor, QueryResult } from '../backend/db';
+import { FIXED_SERVER_CONFIG } from '../backend/fixedConfig';
 import { dispatchCrmRequest } from '../backend/router';
+import {
+  decryptServerSecret,
+  encryptServerSecret,
+  readPublicHealthAutoBind,
+  resolveServerConfig
+} from '../backend/serverConfig';
+import { applyUnifiedConnectionSetup, getSetupCapabilities } from '../backend/setupService';
 import { ingestIncrementalSyncBatch } from '../backend/syncService';
 
 function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[]> } {
@@ -108,8 +120,17 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
 
+    if (sql.startsWith("SELECT value FROM settings WHERE key = 'gas_webapp_url'")) {
+      const row = state.settings.find((s) => s.key === 'gas_webapp_url');
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
+
     if (sql.startsWith('SELECT key, value FROM settings')) {
-      return { rows: state.settings as any[], rowCount: state.settings.length };
+      const filterKeys = Array.isArray(params[0]) ? params[0] : null;
+      const rows = filterKeys
+        ? state.settings.filter((s) => filterKeys.includes(s.key))
+        : state.settings;
+      return { rows: rows as any[], rowCount: rows.length };
     }
 
     if (sql.startsWith('INSERT INTO sessions')) {
@@ -309,14 +330,9 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     }
 
     if (sql.startsWith('INSERT INTO sheets_mirror_outbox')) {
-      const isV2 = params.length >= 9;
       state.sheets_mirror_outbox.push({
-        id: params[0],
-        entity_type: params[1],
-        entity_id: params[2],
-        action: isV2 ? params[5] : params[3],
-        payload: JSON.parse(isV2 ? params[6] : params[4]),
-        status: 'pending'
+        id: params[0], entity_type: params[1], entity_id: params[2], action: params[3],
+        payload: JSON.parse(params[4]), status: 'pending'
       });
       return { rows: [], rowCount: 1 };
     }
@@ -591,4 +607,230 @@ test('router handles login, RBAC enforcement, search, quick status update, dashb
   assert.equal(updRes.success, true);
   assert.equal(updRes.data.reservation.internalStatus, 'تم التسليم');
   assert.equal(db.state.sheets_mirror_outbox.length >= 2, true);
+});
+
+test('auto-binding persists global GAS URL, encrypted RG_TOKEN, and SYNC_API_SECRET in Neon without extra env vars', async () => {
+  const prevDbUrl = process.env.DATABASE_URL;
+  const prevRg = process.env.RG_TOKEN;
+  const prevGas = process.env.GAS_WEBAPP_URL;
+  const prevSecret = process.env.SYNC_API_SECRET;
+  const prevFetch = globalThis.fetch;
+  process.env.DATABASE_URL = 'postgresql://test:test@localhost:5432/rentcrm_test';
+  delete process.env.RG_TOKEN;
+  delete process.env.GAS_WEBAPP_URL;
+  delete process.env.SYNC_API_SECRET;
+
+  const gasCalls: any[] = [];
+  globalThis.fetch = (async (_url: any, init: any) => {
+    const body = init && init.body ? JSON.parse(String(init.body)) : {};
+    gasCalls.push(body);
+    return new Response(JSON.stringify({ success: true, data: { bound: true } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }) as any;
+
+  try {
+    const db = createInMemoryMockExecutor();
+    const login = await dispatchCrmRequest(db, {
+      action: 'login',
+      payload: { username: 'admin', password: 'Admin@123' }
+    });
+    assert.equal(login.success, true);
+    const adminToken = login.data.token;
+
+    // 1. Encrypt/decrypt roundtrip
+    const cipher = encryptServerSecret('rg_live_secret_token_123456');
+    assert.ok(cipher.startsWith('enc:v1:'));
+    assert.equal(cipher.includes('rg_live_secret_token_123456'), false);
+    assert.equal(decryptServerSecret(cipher), 'rg_live_secret_token_123456');
+
+    // 2. Save global GAS /exec URL from Settings -> saves in DB + auto-generates SYNC_API_SECRET + pushes autoBindFromServer
+    const saveConn = await dispatchCrmRequest(db, {
+      action: 'saveGlobalConnectionSettings',
+      token: adminToken,
+      payload: {
+        gasWebAppUrl: 'https://script.google.com/macros/s/AKfycbTestGlobalBind123/exec',
+        siteOrigin: 'https://crm.example.vercel.app'
+      }
+    });
+    assert.equal(saveConn.success, true);
+    assert.equal(saveConn.data.autoBoundGas, true);
+    assert.equal(saveConn.data.neonSyncUrl, 'https://crm.example.vercel.app/api/sync');
+    assert.equal(saveConn.data.hasSyncSecret, true);
+    assert.equal(gasCalls.length, 1);
+    assert.equal(gasCalls[0].action, 'autoBindFromServer');
+    assert.ok(String(gasCalls[0].payload.syncSecret).startsWith('rg_sync_'));
+
+    // 3. Save RG_TOKEN from Settings -> encrypted in DB & cleared from env still resolves via DB
+    const saveTok = await dispatchCrmRequest(db, {
+      action: 'saveApiToken',
+      token: adminToken,
+      payload: { token: 'Bearer rg_secret_abc_9876543210', siteOrigin: 'https://crm.example.vercel.app' }
+    });
+    assert.equal(saveTok.success, true);
+    delete process.env.RG_TOKEN;
+
+    const resolved = await resolveServerConfig(db);
+    assert.equal(resolved.gasWebAppUrl, 'https://script.google.com/macros/s/AKfycbTestGlobalBind123/exec');
+    assert.equal(resolved.rgToken, 'rg_secret_abc_9876543210');
+    assert.ok(resolved.syncApiSecret.startsWith('rg_sync_'));
+
+    // 4. getSettings never leaks internal secret keys to the browser
+    const settingsRes = await dispatchCrmRequest(db, {
+      action: 'getSettings',
+      token: adminToken
+    });
+    assert.equal(settingsRes.success, true);
+    assert.equal(settingsRes.data.gas_webapp_url, 'https://script.google.com/macros/s/AKfycbTestGlobalBind123/exec');
+    assert.equal(settingsRes.data.hasRgToken, true);
+    assert.equal(settingsRes.data.hasDirectToken, true);
+    assert.equal(settingsRes.data.hasSyncSecret, true);
+    assert.equal(settingsRes.data.rg_token_enc, undefined);
+    assert.equal(settingsRes.data.sync_api_secret_enc, undefined);
+
+    // 5. Public health helper exposes only non-secret gasWebAppUrl
+    const healthBind = await readPublicHealthAutoBind(db);
+    assert.equal(healthBind.gasWebAppUrl, 'https://script.google.com/macros/s/AKfycbTestGlobalBind123/exec');
+  } finally {
+    globalThis.fetch = prevFetch;
+    if (prevDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prevDbUrl;
+    if (prevRg === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRg;
+    if (prevGas === undefined) delete process.env.GAS_WEBAPP_URL;
+    else process.env.GAS_WEBAPP_URL = prevGas;
+    if (prevSecret === undefined) delete process.env.SYNC_API_SECRET;
+    else process.env.SYNC_API_SECRET = prevSecret;
+  }
+});
+
+test('unified setup writes fixed core files (config.js, fixedConfig.ts, .env) without exposing secrets and enforces GM RBAC', async () => {
+  const prevFixed = { ...FIXED_SERVER_CONFIG };
+  const prevEnv = {
+    DATABASE_URL: process.env.DATABASE_URL,
+    GAS_WEBAPP_URL: process.env.GAS_WEBAPP_URL,
+    RG_TOKEN: process.env.RG_TOKEN,
+    SYNC_API_SECRET: process.env.SYNC_API_SECRET,
+    RG_API_BASE_URL: process.env.RG_API_BASE_URL
+  };
+  const prevFetch = globalThis.fetch;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rg-core-bind-'));
+
+  try {
+    // Seed mock target files in tmpDir including dist/ and pre-existing .env var
+    fs.mkdirSync(path.join(tmpDir, 'assets/js'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'dist/assets/js'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'backend'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.env'), 'CUSTOM_KEEP_VAR="keep_me"\nDATABASE_URL=""\n', 'utf8');
+
+    const gasCalls: any[] = [];
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = init && init.body ? JSON.parse(String(init.body)) : {};
+      gasCalls.push(body);
+      return new Response(JSON.stringify({ success: true, data: { bound: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }) as any;
+
+    const db = createInMemoryMockExecutor();
+    const adminLogin = await dispatchCrmRequest(db, {
+      action: 'login',
+      payload: { username: 'admin', password: 'Admin@123' }
+    });
+    const agentLogin = await dispatchCrmRequest(db, {
+      action: 'login',
+      payload: { username: 'agent1', password: 'Agent@123' }
+    });
+    assert.equal(adminLogin.success, true);
+    assert.equal(agentLogin.success, true);
+
+    // 1. Non-manager cannot call applyUnifiedConnectionSetup via router
+    const denied = await dispatchCrmRequest(db, {
+      action: 'applyUnifiedConnectionSetup',
+      token: agentLogin.data.token,
+      payload: { mode: 'sandbox' }
+    });
+    assert.equal(denied.success, false);
+    assert.ok(denied.message.includes('FORBIDDEN'));
+
+    // 2. Execute unified setup persisting core files inside tmpDir
+    const setupRes = await applyUnifiedConnectionSetup({
+      executor: db,
+      rootDir: tmpDir,
+      skipLiveDbTest: true,
+      payload: {
+        mode: 'neon',
+        databaseUrl: 'postgresql://user:superSecretPass@ep-test-123.aws.neon.tech/neondb?sslmode=require',
+        gasWebAppUrl: 'https://script.google.com/macros/s/AKfycbUnifiedFixed123/exec',
+        rgToken: 'Bearer rg_live_unified_secret_999999',
+        rgApiBaseUrl: 'https://api.rentalgate.net/api',
+        persistCoreFiles: true,
+        siteOrigin: 'https://crm.example.vercel.app'
+      }
+    });
+
+    assert.equal(setupRes.saved, true);
+    assert.equal(setupRes.mode, 'neon');
+    assert.equal(setupRes.coreFilesUpdated, true);
+    assert.equal(setupRes.autoBoundGas, true);
+    assert.equal(setupRes.updatedFiles.includes('assets/js/config.js'), true);
+    assert.equal(setupRes.updatedFiles.includes('dist/assets/js/config.js'), true);
+    assert.equal(setupRes.updatedFiles.includes('backend/fixedConfig.ts'), true);
+    assert.equal(setupRes.updatedFiles.includes('.env'), true);
+
+    // Verify public config.js contains public URL/mode ONLY and ZERO secrets!
+    const configJs = fs.readFileSync(path.join(tmpDir, 'assets/js/config.js'), 'utf8');
+    assert.equal(configJs.includes('https://script.google.com/macros/s/AKfycbUnifiedFixed123/exec'), true);
+    assert.equal(configJs.includes('/api/crm'), true);
+    assert.equal(configJs.includes('"neon"'), true);
+    assert.equal(configJs.includes('superSecretPass'), false);
+    assert.equal(configJs.includes('rg_live_unified_secret_999999'), false);
+    assert.equal(configJs.includes('rg_sync_'), false);
+
+    // Verify backend/fixedConfig.ts contains server config cleanly
+    const fixedTs = fs.readFileSync(path.join(tmpDir, 'backend/fixedConfig.ts'), 'utf8');
+    assert.equal(fixedTs.includes('superSecretPass'), true);
+    assert.equal(fixedTs.includes('rg_live_unified_secret_999999'), true);
+    assert.equal(fixedTs.includes('rg_sync_'), true);
+
+    // Verify .env preserves unrelated variables and updates fixed values
+    const dotEnv = fs.readFileSync(path.join(tmpDir, '.env'), 'utf8');
+    assert.equal(dotEnv.includes('CUSTOM_KEEP_VAR="keep_me"'), true);
+    assert.equal(dotEnv.includes('CONNECTION_MODE="neon"'), true);
+
+    // Verify getSetupCapabilities masks DATABASE_URL and hides raw secrets
+    const caps = await getSetupCapabilities(db, tmpDir);
+    assert.equal(caps.hasDatabaseUrl, true);
+    assert.equal(caps.maskedDatabaseUrl, maskDatabaseUrl('postgresql://user:superSecretPass@ep-test-123.aws.neon.tech/neondb?sslmode=require'));
+    assert.equal(caps.maskedDatabaseUrl.includes('superSecretPass'), false);
+    assert.equal(caps.hasRgToken, true);
+    assert.equal(caps.hasSyncSecret, true);
+    assert.equal(caps.mode, 'neon');
+
+    // Verify GAS mode core write switches backendApiUrl to ''
+    const gasOnlyPersist = persistCoreFilesOnDisk(tmpDir, {
+      mode: 'gas',
+      databaseUrl: '',
+      gasWebAppUrl: 'https://script.google.com/macros/s/AKfycbGasOnly123/exec',
+      rgToken: '',
+      rgApiBaseUrl: 'https://api.rentalgate.net/api',
+      syncApiSecret: '',
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'admin'
+    }, { updateInMemory: false });
+    assert.equal(gasOnlyPersist.writable, true);
+    const gasConfigJs = fs.readFileSync(path.join(tmpDir, 'assets/js/config.js'), 'utf8');
+    assert.equal(gasConfigJs.includes('mode: "gas"'), true);
+    assert.equal(gasConfigJs.includes('backendApiUrl: ""'), true);
+  } finally {
+    globalThis.fetch = prevFetch;
+    Object.assign(FIXED_SERVER_CONFIG, prevFixed);
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

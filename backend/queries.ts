@@ -11,16 +11,25 @@ import {
   revokeEmployeeSessions,
   type AuthSession
 } from './auth';
-import type { DbClient, DbExecutor } from './dbCore';
-import { getEnv, registerBackgroundTask, setRuntimeEnv } from './env';
-import { emitRealtimeEvent } from './realtimeBus';
+import { getDatabaseUrl, type DbClient, type DbExecutor } from './db';
+import { isCoreFilesystemWritable, maskDatabaseUrl } from './coreBinding';
 import {
-  enqueueSyncOperation,
+  encryptServerSecret,
+  ensureSyncApiSecret,
+  resolveServerConfig,
+  upsertServerSetting
+} from './serverConfig';
+import {
+  applyUnifiedConnectionSetup as runUnifiedConnectionSetup,
+  getSetupCapabilities as readSetupCapabilities
+} from './setupService';
+import {
+  enqueueSheetsMirror,
+  flushSheetsMirrorOutbox,
   ingestIncrementalSyncBatch,
   mapExtensionRowToClient,
   mapReservationRowToClient,
-  pullFromRentalGateDirect,
-  triggerImmediateSync
+  pullFromRentalGateDirect
 } from './syncService';
 
 function str(v: unknown, fallback = ''): string {
@@ -75,21 +84,6 @@ function formatProblemRow(row: any, updatesByProblemId?: Map<string, any[]>): Re
   return obj;
 }
 
-function formatCustomerRow(row: any): Record<string, any> {
-  return {
-    id: str(row.id),
-    name: str(row.name),
-    phone: str(row.phone),
-    email: str(row.email),
-    idNumber: str(row.id_number ?? row.idNumber),
-    companyName: str(row.company_name ?? row.companyName),
-    notes: str(row.notes),
-    status: str(row.status || 'active'),
-    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at),
-    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at)
-  };
-}
-
 function formatFollowUpRow(row: any): Record<string, any> {
   return {
     id: str(row.id),
@@ -142,7 +136,7 @@ function formatProblemUpdateRow(row: any): Record<string, any> {
   };
 }
 
-async function logActivity(
+export async function logActivity(
   client: DbClient,
   actor: { id: string; name: string; role?: string },
   actionType: string,
@@ -198,10 +192,18 @@ async function createNotification(
   );
 }
 
+const INTERNAL_SECRET_SETTING_KEYS = new Set([
+  'rg_token_enc',
+  'sync_api_secret_enc',
+  'sync_api_secret',
+  'rg_token'
+]);
+
 export async function getSettingsMap(client: DbClient): Promise<Record<string, any>> {
   const res = await client.query<{ key: string; value: string }>(`SELECT key, value FROM settings`);
   const map: Record<string, any> = {};
   for (const row of res.rows) {
+    if (INTERNAL_SECRET_SETTING_KEYS.has(String(row.key))) continue;
     const raw = row.value;
     if (raw === 'true') map[row.key] = true;
     else if (raw === 'false') map[row.key] = false;
@@ -251,7 +253,7 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       id: 'EMP_ADMIN',
       name: 'فهد الدوسري',
       username: 'admin',
-      password: getEnv('SEED_ADMIN_PASSWORD', 'Admin@123'),
+      password: process.env.SEED_ADMIN_PASSWORD || 'Admin@123',
       salt: 'RG_SEED_ADMIN',
       phone: '0501122334',
       email: 'admin@rentalgate.net',
@@ -263,8 +265,8 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       id: 'EMP_SUP1',
       name: 'سارة العتيبي',
       username: 'supervisor',
-      password: getEnv('SEED_SUPERVISOR_PASSWORD', 'Super@123'),
-      salt: 'RG_SEED_SUP1',
+      password: process.env.SEED_SUPERVISOR_PASSWORD || 'Super@123',
+      salt: 'RG_SEED_SUPERVISOR',
       phone: '0554433221',
       email: 'sara@rentalgate.net',
       jobTitle: 'مشرفة خدمة العملاء',
@@ -275,7 +277,7 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       id: 'EMP_AG1',
       name: 'خالد الحربي',
       username: 'agent1',
-      password: getEnv('SEED_AGENT_PASSWORD', 'Agent@123'),
+      password: process.env.SEED_AGENT_PASSWORD || 'Agent@123',
       salt: 'RG_SEED_AG1',
       phone: '0549988776',
       email: 'khalid@rentalgate.net',
@@ -287,7 +289,7 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       id: 'EMP_AG2',
       name: 'نورة القحطاني',
       username: 'agent2',
-      password: getEnv('SEED_AGENT_PASSWORD', 'Agent@123'),
+      password: process.env.SEED_AGENT_PASSWORD || 'Agent@123',
       salt: 'RG_SEED_AG2',
       phone: '0567788990',
       email: 'noura@rentalgate.net',
@@ -561,19 +563,23 @@ export async function getAppBootstrap(
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
-  const [dashboard, notifications, settings] = await Promise.all([
+  const [dashboard, notifications, settings, serverCfg] = await Promise.all([
     getDashboard(executor, session, { range: payload.range || '' }),
     getNotifications(executor, session),
-    getSettingsMap(executor)
+    getSettingsMap(executor),
+    resolveServerConfig(executor)
   ]);
 
   let settingsOut: any = null;
   if (crmCore.canAccessApi(session.user)) {
     settingsOut = {
       ...settings,
+      gas_webapp_url: serverCfg.gasWebAppUrl,
       auto_sync_enabled: settings.auto_sync_enabled !== false,
       auto_sync_interval_hours: num(settings.auto_sync_interval_hours, 12),
-      hasRgToken: Boolean(getEnv('RG_TOKEN') || getEnv('GAS_WEBAPP_URL'))
+      hasRgToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
+      hasDirectToken: Boolean(serverCfg.rgToken),
+      hasSyncSecret: Boolean(serverCfg.syncApiSecret)
     };
   }
 
@@ -922,27 +928,11 @@ export async function claimReservation(executor: DbExecutor, session: AuthSessio
       lastUpdatedAt: nowIso,
       updatedAt: nowIso
     };
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: updated.id,
-      recordId: updated.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: updated
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:updated',
-      entityType: 'Reservation',
-      recordId: updated.id,
-      operation: 'UPDATE',
-      payload: { reservation: updated },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Reservation', updated.id, 'upsertReservation', updated);
     return { added, reservation: updated };
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return result;
 }
 
@@ -988,27 +978,11 @@ export async function unclaimReservation(executor: DbExecutor, session: AuthSess
       assignedEmployeeNames: names,
       updatedAt: nowIso
     };
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: updated.id,
-      recordId: updated.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: updated
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:updated',
-      entityType: 'Reservation',
-      recordId: updated.id,
-      operation: 'UPDATE',
-      payload: { reservation: updated },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Reservation', updated.id, 'upsertReservation', updated);
     return { removed: idx !== -1, reservation: updated };
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return result;
 }
 
@@ -1093,466 +1067,12 @@ export async function quickUpdateReservationStatus(
       statusHistory: nextHistory,
       isFollowed: true
     };
-    await enqueueSyncOperation(tx, {
-      entityType: 'FollowUp',
-      entityId: fuObj.id,
-      recordId: fuObj.id,
-      operation: 'INSERT',
-      action: 'appendFollowUp',
-      payload: fuObj
-    });
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: updatedRes.id,
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: updatedRes
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:updated',
-      entityType: 'Reservation',
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      payload: { reservation: updatedRes, followUp: fuObj },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
     return { reservation: updatedRes, followUp: fuObj };
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
-  return out;
-}
-
-// ---------- CUSTOMERS CRUD ----------
-
-export async function getCustomers(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  const canRead = ['view_dashboard', 'view_all_reservations', 'add_followup', 'edit_reservation_details']
-    .some((p) => crmCore.canUserPerform(session.user, p));
-  if (!canRead) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية استعراض بيانات العملاء.');
-  }
-  const params: any[] = [];
-  const clauses: string[] = ['c.deleted_at IS NULL'];
-  if (payload.search) {
-    params.push(`%${str(payload.search)}%`);
-    const pIdx = params.length;
-    clauses.push(`(c.name ILIKE $${pIdx} OR c.phone ILIKE $${pIdx} OR c.company_name ILIKE $${pIdx})`);
-  }
-  const limit = Math.min(500, Math.max(10, num(payload.limit, 100)));
-  params.push(limit);
-  const res = await executor.query(
-    `SELECT c.* FROM customers c WHERE ${clauses.join(' AND ')} ORDER BY c.updated_at DESC LIMIT $${params.length}`,
-    params
-  );
-  return {
-    items: res.rows.map(formatCustomerRow),
-    total: res.rows.length
-  };
-}
-
-export async function createCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  if (!crmCore.canUserPerform(session.user, 'add_followup') && !crmCore.canUserPerform(session.user, 'edit_reservation_details')) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية إضافة عملاء.');
-  }
-  const idempotencyKey = str(payload.idempotencyKey || payload.idempotency_key);
-  if (idempotencyKey) {
-    const hit = await executor.query<{ response: any }>(
-      `SELECT response FROM idempotency_requests WHERE idempotency_key = $1 LIMIT 1`,
-      [idempotencyKey]
-    ).catch(() => ({ rows: [] }));
-    if (hit.rows[0]?.response) {
-      return hit.rows[0].response;
-    }
-  }
-
-  const name = str(payload.name || payload.customerName);
-  if (!name) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب.');
-
-  const phone = str(payload.phone || payload.customerPhone);
-  const email = str(payload.email || payload.customerEmail);
-  const idNumber = str(payload.idNumber || payload.customerIdNumber);
-  const companyName = str(payload.companyName);
-  const notes = str(payload.notes);
-  const custId = str(payload.id) || generateId('CUST');
-  const nowIso = new Date().toISOString();
-
-  const out = await executor.withTransaction(async (tx) => {
-    const custObj: Record<string, any> = {
-      id: custId,
-      name,
-      phone,
-      email,
-      idNumber,
-      companyName,
-      notes,
-      status: 'active',
-      createdAt: nowIso,
-      updatedAt: nowIso
-    };
-
-    await tx.query(
-      `INSERT INTO customers (id, name, phone, email, id_number, company_name, notes, status, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8::timestamptz,$8::timestamptz)`,
-      [custObj.id, custObj.name, custObj.phone, custObj.email, custObj.idNumber, custObj.companyName, custObj.notes, nowIso]
-    );
-
-    await logActivity(tx, session.user, 'إضافة عميل', 'Customer', custObj.id, custObj.name);
-    await enqueueSyncOperation(tx, {
-      entityType: 'Customer',
-      entityId: custObj.id,
-      recordId: custObj.id,
-      operation: 'INSERT',
-      action: 'upsertCustomer',
-      payload: custObj,
-      idempotencyKey: idempotencyKey ? `${idempotencyKey}:outbox` : undefined
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'customer:created',
-      entityType: 'Customer',
-      recordId: custObj.id,
-      operation: 'INSERT',
-      payload: { customer: custObj },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-
-    const response = { customer: custObj };
-    if (idempotencyKey) {
-      await tx.query(
-        `INSERT INTO idempotency_requests (idempotency_key, action, response, created_at)
-         VALUES ($1, $2, $3::jsonb, NOW())
-         ON CONFLICT (idempotency_key) DO NOTHING`,
-        [idempotencyKey, 'createCustomer', JSON.stringify(response)]
-      ).catch(() => undefined);
-    }
-    return response;
-  });
-
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
-  return out;
-}
-
-export async function updateCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  if (!crmCore.canUserPerform(session.user, 'add_followup') && !crmCore.canUserPerform(session.user, 'edit_reservation_details')) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية تعديل بيانات العملاء.');
-  }
-  const custId = str(payload.customerId || payload.id);
-  if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
-  if (payload.name !== undefined && !str(payload.name)) {
-    throw new Error('VALIDATION_ERROR: اسم العميل مطلوب.');
-  }
-
-  const out = await executor.withTransaction(async (tx) => {
-    const existingRes = await tx.query(`SELECT * FROM customers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [custId]);
-    if (!existingRes.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
-    const existing = formatCustomerRow(existingRes.rows[0]);
-
-    const nowIso = new Date().toISOString();
-    const updated: Record<string, any> = {
-      ...existing,
-      name: payload.name !== undefined ? str(payload.name) : existing.name,
-      phone: payload.phone !== undefined ? str(payload.phone) : existing.phone,
-      email: payload.email !== undefined ? str(payload.email) : existing.email,
-      idNumber: payload.idNumber !== undefined ? str(payload.idNumber) : existing.idNumber,
-      companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
-      notes: payload.notes !== undefined ? str(payload.notes) : existing.notes,
-      status: payload.status !== undefined ? str(payload.status) : existing.status,
-      updatedAt: nowIso
-    };
-
-    await tx.query(
-      `UPDATE customers
-       SET name = $2, phone = $3, email = $4, id_number = $5, company_name = $6, notes = $7, status = $8, updated_at = $9::timestamptz
-       WHERE id = $1`,
-      [custId, updated.name, updated.phone, updated.email, updated.idNumber, updated.companyName, updated.notes, updated.status, nowIso]
-    );
-
-    await logActivity(tx, session.user, 'تحديث عميل', 'Customer', custId, updated.name);
-    await enqueueSyncOperation(tx, {
-      entityType: 'Customer',
-      entityId: custId,
-      recordId: custId,
-      operation: 'UPDATE',
-      action: 'upsertCustomer',
-      payload: updated
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'customer:updated',
-      entityType: 'Customer',
-      recordId: custId,
-      operation: 'UPDATE',
-      payload: { customer: updated },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-
-    return { customer: updated };
-  });
-
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
-  return out;
-}
-
-export async function deleteCustomer(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  requirePermission(session, 'edit_reservation_details');
-  const custId = str(payload.customerId || payload.id);
-  if (!custId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
-
-  const out = await executor.withTransaction(async (tx) => {
-    const existingRes = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [custId]);
-    if (!existingRes.rows[0] || existingRes.rows[0].deleted_at) throw new Error('NOT_FOUND: العميل غير موجود.');
-    const existing = formatCustomerRow(existingRes.rows[0]);
-    const nowIso = new Date().toISOString();
-
-    await tx.query(
-      `UPDATE customers SET status = 'deleted', deleted_at = $2::timestamptz, updated_at = $2::timestamptz WHERE id = $1`,
-      [custId, nowIso]
-    );
-
-    await logActivity(tx, session.user, 'حذف عميل', 'Customer', custId, existing.name);
-    await enqueueSyncOperation(tx, {
-      entityType: 'Customer',
-      entityId: custId,
-      recordId: custId,
-      operation: 'DELETE',
-      action: 'deleteCustomer',
-      payload: { id: custId, customerId: custId }
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'customer:deleted',
-      entityType: 'Customer',
-      recordId: custId,
-      operation: 'DELETE',
-      payload: { customerId: custId },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-
-    return { deleted: true, customerId: custId };
-  });
-
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
-  return out;
-}
-
-// ---------- RESERVATION CREATE / EDIT DETAILS / DELETE ----------
-
-export async function createReservation(
-  executor: DbExecutor,
-  session: AuthSession,
-  payload: Record<string, any> = {}
-) {
-  if (
-    !crmCore.canUserPerform(session.user, 'edit_reservation_details') &&
-    !crmCore.canUserPerform(session.user, 'pull_reservations') &&
-    !crmCore.canUserPerform(session.user, 'add_followup')
-  ) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية إنشاء حجوزات.');
-  }
-  const idempotencyKey = str(payload.idempotencyKey || payload.idempotency_key);
-  if (idempotencyKey) {
-    const hit = await executor.query<{ response: any }>(
-      `SELECT response FROM idempotency_requests WHERE idempotency_key = $1 LIMIT 1`,
-      [idempotencyKey]
-    ).catch(() => ({ rows: [] }));
-    if (hit.rows[0]?.response) {
-      return hit.rows[0].response;
-    }
-  }
-
-  const reservationNumber = str(payload.reservationNumber) || `RG-${Date.now().toString().slice(-6)}`;
-  const customerName = str(payload.customerName);
-  if (!customerName) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب لإنشاء الحجز.');
-
-  const nowIso = new Date().toISOString();
-  const resId = str(payload.id) || generateId('RES');
-  const initialStatus = str(payload.internalStatus || 'تم الحجز');
-  if (!crmCore.isValidWorkflowStatus(initialStatus)) {
-    throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
-  }
-
-  const out = await executor.withTransaction(async (tx) => {
-    const dupCheck = await tx.query(`SELECT id FROM reservations WHERE reservation_number = $1`, [reservationNumber]);
-    if (dupCheck.rows[0]) {
-      throw new Error('VALIDATION_ERROR: رقم الحجز مسجل مسبقاً.');
-    }
-
-    const totalAmt = num(payload.totalAmount ?? payload.baseAmount, 0);
-    const baseAmt = num(payload.baseAmount ?? totalAmt, 0);
-    const daysCount = Math.max(0, num(payload.daysCount, 1));
-    const statusHistory = crmCore.appendStatusStageEntry([], {
-      source: 'manual_create',
-      previousStatus: '',
-      newStatus: initialStatus,
-      changedAt: nowIso,
-      changedById: session.user.id,
-      changedByName: session.user.name,
-      note: `إنشاء الحجز بواسطة ${session.user.name}`
-    });
-
-    const record: Record<string, any> = {
-      id: resId,
-      sourceReservationId: str(payload.sourceReservationId || resId),
-      reservationNumber,
-      sourceCreatedAt: str(payload.sourceCreatedAt || nowIso),
-      customerName,
-      customerPhone: str(payload.customerPhone),
-      customerEmail: str(payload.customerEmail),
-      customerIdNumber: str(payload.customerIdNumber),
-      companyName: str(payload.companyName),
-      branchName: str(payload.branchName),
-      deliverBranchName: str(payload.deliverBranchName || payload.branchName),
-      carName: str(payload.carName),
-      plateNumber: str(payload.plateNumber),
-      carCategory: str(payload.carCategory),
-      startDate: str(payload.startDate || nowIso.slice(0, 10)),
-      startTime: str(payload.startTime || '12:00'),
-      originalEndDate: str(payload.originalEndDate || payload.endDate || nowIso.slice(0, 10)),
-      originalEndTime: str(payload.originalEndTime || payload.endTime || '12:00'),
-      endDate: str(payload.endDate || nowIso.slice(0, 10)),
-      endTime: str(payload.endTime || '12:00'),
-      extendedUntilDate: str(payload.extendedUntilDate),
-      extendedUntilTime: str(payload.extendedUntilTime),
-      daysCount,
-      extendedDaysCount: num(payload.extendedDaysCount, 0),
-      totalDaysCount: num(payload.totalDaysCount, daysCount),
-      originalStatusCode: str(payload.originalStatusCode || 'booked'),
-      originalStatusAr: str(payload.originalStatusAr || initialStatus),
-      pickupTypeAr: str(payload.pickupTypeAr),
-      returnTypeAr: str(payload.returnTypeAr),
-      paymentMethod: str(payload.paymentMethod),
-      paymentStatus: str(payload.paymentStatus),
-      dailyPrice: num(payload.dailyPrice, 0),
-      discountAmount: num(payload.discountAmount, 0),
-      vatAmount: num(payload.vatAmount, 0),
-      baseAmount: baseAmt,
-      extensionsCount: num(payload.extensionsCount, 0),
-      extensionsAmount: num(payload.extensionsAmount, 0),
-      totalAmount: totalAmt,
-      hasExtensions: Boolean(payload.hasExtensions),
-      internalStatus: initialStatus,
-      priority: str(payload.priority || 'عادي'),
-      assignedEmployeeIds: Array.isArray(payload.assignedEmployeeIds) ? payload.assignedEmployeeIds : [],
-      assignedEmployeeNames: Array.isArray(payload.assignedEmployeeNames) ? payload.assignedEmployeeNames : [],
-      lastUpdateText: str(payload.lastUpdateText || `إنشاء الحجز بواسطة ${session.user.name}`),
-      lastUpdatedById: session.user.id,
-      lastUpdatedByName: session.user.name,
-      lastUpdatedAt: nowIso,
-      hasProblem: Boolean(payload.hasProblem),
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      statusHistory
-    };
-
-    await tx.query(
-      `INSERT INTO reservations (
-         id, source_reservation_id, reservation_number, source_created_at,
-         customer_name, customer_phone, customer_email, customer_id_number,
-         company_name, branch_name, deliver_branch_name, car_name, plate_number, car_category,
-         start_date, start_time, original_end_date, original_end_time, end_date, end_time,
-         extended_until_date, extended_until_time, days_count, extended_days_count, total_days_count,
-         original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
-         payment_method, payment_status, daily_price, discount_amount, vat_amount,
-         base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
-         internal_status, priority, assigned_employee_ids, assigned_employee_names,
-         last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
-         has_problem, created_at, updated_at, status_history, raw_json
-       ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-         $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,
-         $40,$41,$42::jsonb,$43::jsonb,$44,$45,$46,$47,$48,$49::timestamptz,$50::timestamptz,$51::jsonb,$52
-       )`,
-      [
-        record.id,
-        record.sourceReservationId,
-        record.reservationNumber,
-        record.sourceCreatedAt,
-        record.customerName,
-        record.customerPhone,
-        record.customerEmail,
-        record.customerIdNumber,
-        record.companyName,
-        record.branchName,
-        record.deliverBranchName,
-        record.carName,
-        record.plateNumber,
-        record.carCategory,
-        record.startDate,
-        record.startTime,
-        record.originalEndDate,
-        record.originalEndTime,
-        record.endDate,
-        record.endTime,
-        record.extendedUntilDate,
-        record.extendedUntilTime,
-        record.daysCount,
-        record.extendedDaysCount,
-        record.totalDaysCount,
-        record.originalStatusCode,
-        record.originalStatusAr,
-        record.pickupTypeAr,
-        record.returnTypeAr,
-        record.paymentMethod,
-        record.paymentStatus,
-        record.dailyPrice,
-        record.discountAmount,
-        record.vatAmount,
-        record.baseAmount,
-        record.extensionsCount,
-        record.extensionsAmount,
-        record.totalAmount,
-        record.hasExtensions,
-        record.internalStatus,
-        record.priority,
-        JSON.stringify(record.assignedEmployeeIds),
-        JSON.stringify(record.assignedEmployeeNames),
-        record.lastUpdateText,
-        record.lastUpdatedById,
-        record.lastUpdatedByName,
-        record.lastUpdatedAt,
-        record.hasProblem,
-        record.createdAt,
-        record.updatedAt,
-        JSON.stringify(record.statusHistory),
-        ''
-      ]
-    );
-
-    await logActivity(tx, session.user, 'إنشاء حجز', 'Reservation', record.reservationNumber, record.customerName);
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: record.id,
-      recordId: record.id,
-      operation: 'INSERT',
-      action: 'upsertReservation',
-      payload: record,
-      idempotencyKey: idempotencyKey ? `${idempotencyKey}:outbox` : undefined
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:created',
-      entityType: 'Reservation',
-      recordId: record.id,
-      operation: 'INSERT',
-      payload: { reservation: record },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-
-    const response = { reservation: record };
-    if (idempotencyKey) {
-      await tx.query(
-        `INSERT INTO idempotency_requests (idempotency_key, action, response, created_at)
-         VALUES ($1, $2, $3::jsonb, NOW())
-         ON CONFLICT (idempotency_key) DO NOTHING`,
-        [idempotencyKey, 'createReservation', JSON.stringify(response)]
-      ).catch(() => undefined);
-    }
-    return response;
-  });
-
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -1562,7 +1082,7 @@ export async function updateReservationDetails(
   payload: Record<string, any> = {}
 ) {
   requirePermission(session, 'edit_reservation_details');
-  const resId = str(payload.reservationId || payload.id);
+  const resId = str(payload.reservationId);
   if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
 
   const out = await executor.withTransaction(async (tx) => {
@@ -1593,7 +1113,6 @@ export async function updateReservationDetails(
       ...existing,
       customerName: payload.customerName !== undefined ? str(payload.customerName) : existing.customerName,
       customerPhone: payload.customerPhone !== undefined ? str(payload.customerPhone) : existing.customerPhone,
-      customerEmail: payload.customerEmail !== undefined ? str(payload.customerEmail) : existing.customerEmail,
       companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
       branchName: payload.branchName !== undefined ? str(payload.branchName) : existing.branchName,
       carName: payload.carName !== undefined ? str(payload.carName) : existing.carName,
@@ -1601,7 +1120,6 @@ export async function updateReservationDetails(
       endDate: payload.endDate !== undefined ? str(payload.endDate) : existing.endDate,
       priority: payload.priority !== undefined ? str(payload.priority) : existing.priority,
       internalStatus: nextStatus,
-      totalAmount: payload.totalAmount !== undefined ? num(payload.totalAmount, existing.totalAmount) : existing.totalAmount,
       lastUpdateText: payload.lastUpdateText !== undefined ? str(payload.lastUpdateText) : `تعديل بيانات الحجز بواسطة ${session.user.name}`,
       lastUpdatedById: session.user.id,
       lastUpdatedByName: session.user.name,
@@ -1615,8 +1133,7 @@ export async function updateReservationDetails(
        SET customer_name = $2, customer_phone = $3, company_name = $4, branch_name = $5,
            car_name = $6, start_date = $7, end_date = $8, priority = $9, internal_status = $10,
            last_update_text = $11, last_updated_by_id = $12, last_updated_by_name = $13,
-           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb,
-           total_amount = $16, customer_email = $17
+           last_updated_at = $14, updated_at = $14::timestamptz, status_history = $15::jsonb
        WHERE id = $1`,
       [
         resId,
@@ -1633,75 +1150,16 @@ export async function updateReservationDetails(
         nextObj.lastUpdatedById,
         nextObj.lastUpdatedByName,
         nextObj.lastUpdatedAt,
-        JSON.stringify(nextObj.statusHistory),
-        num(nextObj.totalAmount, 0),
-        str(nextObj.customerEmail)
+        JSON.stringify(nextObj.statusHistory)
       ]
     );
 
     await logActivity(tx, session.user, 'تعديل بيانات حجز', 'Reservation', existing.reservationNumber, 'تعديل تفاصيل الحجز بواسطة المشرف / الإدارة');
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: nextObj.id,
-      recordId: nextObj.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: nextObj
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:updated',
-      entityType: 'Reservation',
-      recordId: nextObj.id,
-      operation: 'UPDATE',
-      payload: { reservation: nextObj },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-    return { ...nextObj, reservation: nextObj };
+    await enqueueSheetsMirror(tx, 'Reservation', nextObj.id, 'upsertReservation', nextObj);
+    return nextObj;
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
-  return out;
-}
-
-export async function deleteReservation(
-  executor: DbExecutor,
-  session: AuthSession,
-  payload: Record<string, any> = {}
-) {
-  requirePermission(session, 'edit_reservation_details');
-  const resId = str(payload.reservationId || payload.id);
-  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
-
-  const out = await executor.withTransaction(async (tx) => {
-    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
-    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
-    const resObj = mapReservationRowToClient(resQuery.rows[0], false);
-
-    await tx.query(`DELETE FROM reservations WHERE id = $1`, [resId]);
-
-    await logActivity(tx, session.user, 'حذف حجز', 'Reservation', resObj.reservationNumber, resObj.customerName);
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: resObj.id,
-      recordId: resObj.id,
-      operation: 'DELETE',
-      action: 'deleteReservation',
-      payload: { id: resObj.id, reservationNumber: resObj.reservationNumber }
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:deleted',
-      entityType: 'Reservation',
-      recordId: resObj.id,
-      operation: 'DELETE',
-      payload: { reservationId: resObj.id, reservationNumber: resObj.reservationNumber },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-    return { deleted: true, reservationId: resObj.id };
-  });
-
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -1776,35 +1234,12 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
       statusHistory: nextHistory,
       isFollowed: true
     };
-    await enqueueSyncOperation(tx, {
-      entityType: 'FollowUp',
-      entityId: fuObj.id,
-      recordId: fuObj.id,
-      operation: 'INSERT',
-      action: 'appendFollowUp',
-      payload: fuObj
-    });
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: updatedRes.id,
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: updatedRes
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'followup:created',
-      entityType: 'FollowUp',
-      recordId: fuObj.id,
-      operation: 'INSERT',
-      payload: { followUp: fuObj, reservation: updatedRes },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
     return { followUp: fuObj, reservation: updatedRes };
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -1858,7 +1293,6 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     );
 
     const lastResQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [existing.reservationId]);
-    let updatedResPayload: Record<string, any> | null = null;
     if (lastResQuery.rows[0]) {
       const rObj = mapReservationRowToClient(lastResQuery.rows[0], false);
       const lastText = newAction + (newNotes ? ` — ${newNotes}` : '');
@@ -1882,51 +1316,12 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
          WHERE id = $1`,
         [rObj.id, newStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory)]
       );
-      updatedResPayload = {
-        ...rObj,
-        internalStatus: newStatus,
-        lastUpdateText: lastText,
-        lastUpdatedById: session.user.id,
-        lastUpdatedByName: session.user.name,
-        lastUpdatedAt: nowIso,
-        updatedAt: nowIso,
-        statusHistory: nextHistory
-      };
     }
 
-    const updatedFollowUp = { ...existing, status: newStatus, action: newAction, notes: newNotes };
     await logActivity(tx, session.user, 'تعديل متابعة', 'FollowUp', existing.reservationNumber, `${existing.status} → ${newStatus}`);
-    await enqueueSyncOperation(tx, {
-      entityType: 'FollowUp',
-      entityId: followUpId,
-      recordId: followUpId,
-      operation: 'UPDATE',
-      action: 'appendFollowUp',
-      payload: updatedFollowUp
-    });
-    if (updatedResPayload) {
-      await enqueueSyncOperation(tx, {
-        entityType: 'Reservation',
-        entityId: updatedResPayload.id,
-        recordId: updatedResPayload.id,
-        operation: 'UPDATE',
-        action: 'upsertReservation',
-        payload: updatedResPayload
-      });
-    }
-    await emitRealtimeEvent(tx, {
-      eventType: 'followup:updated',
-      entityType: 'FollowUp',
-      recordId: followUpId,
-      operation: 'UPDATE',
-      payload: { followUp: updatedFollowUp, reservation: updatedResPayload },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-    return { followUp: updatedFollowUp, history: hist };
+    return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes }, history: hist };
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
   return out;
 }
 
@@ -2012,27 +1407,11 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
       lastUpdatedAt: nowIso,
       updatedAt: nowIso
     };
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: updatedRes.id,
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: updatedRes
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:updated',
-      entityType: 'Reservation',
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      payload: { reservation: updatedRes },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
     return updatedRes;
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -2042,7 +1421,7 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
   const employeeId = str(payload.employeeId);
   if (!resId || !employeeId) throw new Error('VALIDATION_ERROR: معرف الحجز والموظف مطلوبان.');
 
-  const out = await executor.withTransaction(async (tx) => {
+  return executor.withTransaction(async (tx) => {
     const nowIso = new Date().toISOString();
     await tx.query(
       `UPDATE assignments SET status = 'inactive', updated_at = $3::timestamptz WHERE reservation_id = $1 AND employee_id = $2`,
@@ -2062,29 +1441,8 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
       [resId, JSON.stringify(ids), JSON.stringify(names), nowIso]
     );
     await logActivity(tx, session.user, 'إلغاء إسناد', 'Reservation', resObj.reservationNumber, `إزالة إسناد الموظف ${employeeId}`);
-    const updatedRes: Record<string, any> = { ...resObj, assignedEmployeeIds: ids, assignedEmployeeNames: names, updatedAt: nowIso };
-    await enqueueSyncOperation(tx, {
-      entityType: 'Reservation',
-      entityId: updatedRes.id,
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      action: 'upsertReservation',
-      payload: updatedRes
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'reservation:updated',
-      entityType: 'Reservation',
-      recordId: updatedRes.id,
-      operation: 'UPDATE',
-      payload: { reservation: updatedRes },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
-    return updatedRes;
+    return { ...resObj, assignedEmployeeIds: ids, assignedEmployeeNames: names, updatedAt: nowIso };
   });
-
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
-  return out;
 }
 
 export async function getMyFollowUps(executor: DbExecutor, session: AuthSession, _payload: Record<string, any> = {}) {
@@ -2225,27 +1583,11 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
     }
 
     await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
-    await enqueueSyncOperation(tx, {
-      entityType: 'Problem',
-      entityId: prb.id,
-      recordId: prb.id,
-      operation: 'INSERT',
-      action: 'upsertProblem',
-      payload: prb
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'problem:created',
-      entityType: 'Problem',
-      recordId: prb.id,
-      operation: 'INSERT',
-      payload: { problem: prb },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
     return { ...prb, updates: [] };
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -2321,27 +1663,11 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
       updatedAt: nowIso,
       updates: updatesRes.rows.map(formatProblemUpdateRow)
     };
-    await enqueueSyncOperation(tx, {
-      entityType: 'Problem',
-      entityId: updatedProblem.id,
-      recordId: updatedProblem.id,
-      operation: 'UPDATE',
-      action: 'upsertProblem',
-      payload: updatedProblem
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'problem:updated',
-      entityType: 'Problem',
-      recordId: updatedProblem.id,
-      operation: 'UPDATE',
-      payload: { problem: updatedProblem },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Problem', updatedProblem.id, 'upsertProblem', updatedProblem);
     return updatedProblem;
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -2480,7 +1806,7 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
     const salt = crypto.randomBytes(8).toString('hex').toUpperCase();
     const pHash = hashPassword(password, salt);
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : [role];
-    const effectivePerms = crmCore.resolveEffectivePermissions({ role, permissions: rawPerms });
+    const effectivePerms = crmCore.resolveEffectivePermissions(role, rawPerms);
     const nowIso = new Date().toISOString();
     const id = generateId('EMP');
 
@@ -2501,27 +1827,11 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
       job_title: str(payload.jobTitle), role, permissions: effectivePerms,
       status: 'active', last_activity: nowIso, created_at: nowIso, updated_at: nowIso
     });
-    await enqueueSyncOperation(tx, {
-      entityType: 'Employee',
-      entityId: id,
-      recordId: id,
-      operation: 'INSERT',
-      action: 'upsertEmployee',
-      payload: { ...emp, passwordHash: pHash, salt }
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'employee:created',
-      entityType: 'Employee',
-      recordId: id,
-      operation: 'INSERT',
-      payload: { employee: emp },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Employee', id, 'upsertEmployee', { ...emp, passwordHash: pHash, salt });
     return emp;
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -2537,7 +1847,7 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
 
     const nextRole = payload.role !== undefined ? str(payload.role) : str(cur.role);
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : parseJsonArray(cur.permissions);
-    const nextPerms = crmCore.resolveEffectivePermissions({ role: nextRole, permissions: rawPerms });
+    const nextPerms = crmCore.resolveEffectivePermissions(nextRole, rawPerms);
 
     let nextSalt = str(cur.salt);
     let nextHash = str(cur.password_hash);
@@ -2579,27 +1889,11 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
       name: nextName, phone: nextPhone, email: nextEmail, job_title: nextJob,
       role: nextRole, permissions: nextPerms, status: nextStatus, updated_at: nowIso
     });
-    await enqueueSyncOperation(tx, {
-      entityType: 'Employee',
-      entityId: empId,
-      recordId: empId,
-      operation: 'UPDATE',
-      action: 'upsertEmployee',
-      payload: { ...emp, passwordHash: nextHash, salt: nextSalt }
-    });
-    await emitRealtimeEvent(tx, {
-      eventType: 'employee:updated',
-      entityType: 'Employee',
-      recordId: empId,
-      operation: 'UPDATE',
-      payload: { employee: emp },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
+    await enqueueSheetsMirror(tx, 'Employee', empId, 'upsertEmployee', { ...emp, passwordHash: nextHash, salt: nextSalt });
     return emp;
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -2688,15 +1982,10 @@ export async function deletePermissionDefinition(executor: DbExecutor, session: 
 // ---------- LOGS, NOTIFICATIONS, REPORTS, SETTINGS & SYNC ----------
 
 export async function getActivityLogs(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  const canViewAll =
-    crmCore.canUserPerform(session.user, 'view_all_logs') ||
-    crmCore.canUserPerform(session.user, 'view_activity');
+  requirePermission(session, 'view_activity');
   const params: any[] = [];
   const clauses: string[] = [];
-  if (!canViewAll) {
-    params.push(session.user.id);
-    clauses.push(`user_id = $${params.length}`);
-  } else if (payload.userId) {
+  if (payload.userId) {
     params.push(str(payload.userId));
     clauses.push(`user_id = $${params.length}`);
   }
@@ -2754,13 +2043,48 @@ export async function markNotificationRead(executor: DbExecutor, session: AuthSe
 
 export async function getSettings(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const map = await getSettingsMap(executor);
+  const [map, serverCfg] = await Promise.all([
+    getSettingsMap(executor),
+    resolveServerConfig(executor)
+  ]);
+  const dbUrl = getDatabaseUrl();
   return {
     ...map,
+    connection_mode: serverCfg.mode || 'neon',
+    gas_webapp_url: serverCfg.gasWebAppUrl,
+    rg_api_base_url: serverCfg.rgApiBaseUrl,
     auto_sync_enabled: map.auto_sync_enabled !== false,
     auto_sync_interval_hours: num(map.auto_sync_interval_hours, 12),
-    hasRgToken: Boolean(getEnv('RG_TOKEN') || getEnv('GAS_WEBAPP_URL'))
+    hasRgToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
+    hasDirectToken: Boolean(serverCfg.rgToken),
+    hasSyncSecret: Boolean(serverCfg.syncApiSecret),
+    hasDatabaseUrl: Boolean(dbUrl),
+    maskedDatabaseUrl: maskDatabaseUrl(dbUrl),
+    writableCoreFiles: isCoreFilesystemWritable()
   };
+}
+
+export async function getSetupCapabilitiesAction(executor: DbExecutor, session: AuthSession) {
+  requireApiAccess(session);
+  return readSetupCapabilities(executor);
+}
+
+export async function applyUnifiedConnectionSetupAction(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_settings');
+  return runUnifiedConnectionSetup({
+    executor,
+    session,
+    payload,
+    skipLiveDbTest: Boolean(payload._skipLiveDbTestForUnit),
+    ensureSeededFn: ensureSeededDatabase,
+    logActivityFn: async (exec, actor, act, target, targetId, details) => {
+      await logActivity(exec, actor, act, target, targetId, details);
+    }
+  });
 }
 
 export async function updateSettings(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -2785,37 +2109,22 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
         [key, value, session.user.name]
       );
-      await enqueueSyncOperation(tx, {
-        entityType: 'Settings',
-        entityId: key,
-        recordId: key,
-        operation: 'UPDATE',
-        action: 'upsertSetting',
-        payload: { key, value, updatedBy: session.user.name }
-      });
+      await enqueueSheetsMirror(tx, 'Settings', key, 'upsertSetting', { key, value, updatedBy: session.user.name });
     }
     await logActivity(tx, session.user, 'تحديث الإعدادات', 'Settings', 'system', 'تحديث إعدادات النظام في قاعدة البيانات');
-    await emitRealtimeEvent(tx, {
-      eventType: 'settings:updated',
-      entityType: 'Settings',
-      recordId: 'system',
-      operation: 'UPDATE',
-      payload: { keys: updates.map(([k]) => k) },
-      actorId: session.user.id,
-      actorName: session.user.name
-    });
   });
 
-  registerBackgroundTask(triggerImmediateSync(executor).catch(() => undefined));
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return getSettings(executor, session);
 }
 
 export async function getSyncStatus(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const [logRes, ckRes, map] = await Promise.all([
+  const [logRes, ckRes, map, serverCfg] = await Promise.all([
     executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 20`),
     executor.query(`SELECT * FROM sync_checkpoints ORDER BY updated_at DESC LIMIT 5`),
-    getSettingsMap(executor)
+    getSettingsMap(executor),
+    resolveServerConfig(executor)
   ]);
   const logs = logRes.rows.map((s) => ({
     id: str(s.id),
@@ -2832,7 +2141,7 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     finishedAt: s.finished_at instanceof Date ? s.finished_at.toISOString() : str(s.finished_at)
   }));
   return {
-    hasToken: Boolean(getEnv('RG_TOKEN') || getEnv('GAS_WEBAPP_URL')),
+    hasToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
     autoSyncEnabled: map.auto_sync_enabled !== false,
     autoSyncIntervalHours: num(map.auto_sync_interval_hours, 12),
     lastSync: logs[0] || null,
@@ -2841,31 +2150,20 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
   };
 }
 
-export async function getTriggerStatus(_executor: DbExecutor, session: AuthSession) {
+export async function getTriggerStatus(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const hasGasUrl = Boolean(getEnv('GAS_WEBAPP_URL'));
-  const hasWorkerCron = Boolean(getEnv('RG_TOKEN'));
-  const triggers: Array<{ id: string; handler: string; eventType: string }> = [];
-  if (hasGasUrl) {
-    triggers.push({ id: 'NEON_HYBRID_SYNC', handler: 'scheduledMinuteSync', eventType: 'CLOCK' });
-  }
-  if (hasWorkerCron) {
-    triggers.push({ id: 'CF_WORKER_CRON', handler: 'scheduled', eventType: 'CLOCK' });
-  }
+  const serverCfg = await resolveServerConfig(executor);
+  const hasGasUrl = Boolean(serverCfg.gasWebAppUrl);
   return {
-    count: triggers.length,
-    triggers
+    count: hasGasUrl ? 1 : 0,
+    triggers: hasGasUrl
+      ? [{ id: 'NEON_HYBRID_SYNC', handler: 'scheduledMinuteSync', eventType: 'CLOCK' }]
+      : []
   };
 }
 
 export async function getReports(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  const canViewReports =
-    crmCore.canUserPerform(session.user, 'export_reports') ||
-    crmCore.canUserPerform(session.user, 'view_dashboard') ||
-    crmCore.canUserPerform(session.user, 'view_reports');
-  if (!canViewReports) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية استعراض التقارير.');
-  }
+  requirePermission(session, 'view_reports');
   const rType = str(payload.reportType || 'all_reservations');
   const params: any[] = [];
   const clauses: string[] = [];
@@ -2971,7 +2269,8 @@ export async function pullOrSyncReservations(
         : {})
     : {};
 
-  if (getEnv('RG_TOKEN')) {
+  const serverCfg = await resolveServerConfig(executor);
+  if (serverCfg.rgToken) {
     const result = await pullFromRentalGateDirect(executor, session.user, rangePayload);
     return {
       ...result,
@@ -2981,10 +2280,10 @@ export async function pullOrSyncReservations(
     };
   }
 
-  // Fallback delegation to Google Apps Script Web App if configured on server
-  const gasUrl = str(getEnv('GAS_WEBAPP_URL'));
+  // Fallback delegation to Google Apps Script Web App if configured in DB or env
+  const gasUrl = str(serverCfg.gasWebAppUrl);
   if (gasUrl) {
-    const syncSecret = str(getEnv('SYNC_API_SECRET'));
+    const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
     const resp = await fetch(gasUrl, {
       method: 'POST',
       redirect: 'follow',
@@ -3002,7 +2301,85 @@ export async function pullOrSyncReservations(
     return parsed.data;
   }
 
-  throw new Error('NO_RG_TOKEN: يرجى إعداد RG_TOKEN أو GAS_WEBAPP_URL في متغيرات البيئة لخادم قاعدة البيانات.');
+  throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate أو رابط Google Apps Script في صفحة الإعدادات.');
+}
+
+export async function saveGlobalConnectionSettings(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_settings');
+  let gasUrl = str(payload.gasWebAppUrl || payload.gasUrl || '');
+  if (gasUrl) {
+    if (crmCore && typeof crmCore.validateGasUrl === 'function') {
+      const check = crmCore.validateGasUrl(gasUrl);
+      if (!check.valid) {
+        throw new Error(`VALIDATION_ERROR: ${check.message}`);
+      }
+      gasUrl = check.normalized;
+    }
+  }
+
+  await upsertServerSetting(executor, 'gas_webapp_url', gasUrl, session.user.name);
+  const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
+  const serverCfg = await resolveServerConfig(executor);
+
+  const rawOrigin = str(payload.siteOrigin).replace(/\/+$/, '');
+  const neonSyncUrl = rawOrigin && /^https?:\/\//i.test(rawOrigin) ? `${rawOrigin}/api/sync` : '';
+
+  let autoBoundGas = false;
+  let autoBindMessage = '';
+
+  if (gasUrl) {
+    try {
+      const resp = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'autoBindFromServer',
+          payload: {
+            syncSecret,
+            neonSyncUrl,
+            rgToken: serverCfg.rgToken || '',
+            autoEveryMinute: true
+          }
+        })
+      });
+      const text = await resp.text();
+      const parsed = JSON.parse(text);
+      if (resp.ok && parsed && parsed.success) {
+        autoBoundGas = true;
+        autoBindMessage = 'تم حفظ الرابط في القاعدة وربط Google Apps Script تلقائيًا للجميع.';
+      } else {
+        autoBindMessage = str(parsed?.message || 'تم حفظ الرابط في القاعدة. لإكمال الربط التلقائي مع Apps Script احفظ RG_TOKEN أولًا أو نفّذ setNeonSyncProperties.');
+      }
+    } catch (err: any) {
+      autoBindMessage = `تم حفظ الرابط عالميًا لكل المستخدمين؛ تعذر الوصول التلقائي لـ Apps Script حاليًا (${str(err?.message || 'NETWORK')}).`;
+    }
+  } else {
+    autoBindMessage = 'تم مسح رابط Apps Script العام من إعدادات الخادم.';
+  }
+
+  await logActivity(
+    executor,
+    session.user,
+    'تحديث الربط التلقائي العام',
+    'Settings',
+    'gas_webapp_url',
+    gasUrl ? `تفعيل الربط التلقائي العام مع Apps Script (${autoBoundGas ? 'ثنائي الاتجاه' : 'محفوظ في Neon'})` : 'إلغاء رابط Apps Script العام'
+  );
+
+  return {
+    saved: true,
+    gasWebAppUrl: gasUrl,
+    neonSyncUrl,
+    hasSyncSecret: Boolean(syncSecret),
+    hasRgToken: Boolean(serverCfg.rgToken || gasUrl),
+    autoBoundGas,
+    message: autoBindMessage
+  };
 }
 
 export async function saveApiToken(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -3012,33 +2389,47 @@ export async function saveApiToken(executor: DbExecutor, session: AuthSession, p
     throw new Error('VALIDATION_ERROR: التوكن غير صالح.');
   }
 
-  const gasUrl = str(getEnv('GAS_WEBAPP_URL'));
-  const syncSecret = str(getEnv('SYNC_API_SECRET'));
+  // Persist AES-256-GCM encrypted token inside Neon settings table so it works across all serverless instances & restarts
+  await upsertServerSetting(executor, 'rg_token_enc', encryptServerSecret(rawToken), session.user.name);
+  process.env.RG_TOKEN = rawToken;
+
+  const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
+  const serverCfg = await resolveServerConfig(executor);
+  const gasUrl = str(serverCfg.gasWebAppUrl);
+  const rawOrigin = str(payload.siteOrigin).replace(/\/+$/, '');
+  const neonSyncUrl = rawOrigin && /^https?:\/\//i.test(rawOrigin) ? `${rawOrigin}/api/sync` : '';
+
   if (gasUrl && syncSecret) {
-    // Forward token securely to GAS Script Properties via shared secret (never store plain RG token in DB rows)
     await fetch(gasUrl, {
       method: 'POST',
       redirect: 'follow',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({
-        action: 'syncFromNeonMirror',
+        action: 'autoBindFromServer',
         payload: {
           syncSecret,
-          items: [{ entityType: 'RgToken', action: 'saveRgToken', payload: { rgToken: rawToken } }]
+          neonSyncUrl,
+          rgToken: rawToken,
+          autoEveryMinute: true
         }
       })
     }).catch(() => undefined);
   }
 
-  setRuntimeEnv('RG_TOKEN', rawToken);
-  await logActivity(executor, session.user, 'تحديث توكن Rental Gate', 'Settings', 'RG_TOKEN', 'تم تحديث توكن الربط بأمان في الذاكرة الخلفية');
-  return { saved: true, hasRgToken: true };
+  let connection: any = null;
+  if (payload.testAfterSave) {
+    connection = await testRentalGateConnection(executor, session).catch(() => null);
+  }
+
+  await logActivity(executor, session.user, 'تحديث توكن Rental Gate', 'Settings', 'RG_TOKEN', 'تم تشفير التوكن وحفظه بأمان في قاعدة البيانات السحابية للربط التلقائي');
+  return { saved: true, hasRgToken: true, hasDirectToken: true, connection };
 }
 
-export async function testRentalGateConnection(_executor: DbExecutor, session: AuthSession) {
+export async function testRentalGateConnection(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const rgToken = str(getEnv('RG_TOKEN')).replace(/^Bearer\s+/i, '');
-  const gasUrl = str(getEnv('GAS_WEBAPP_URL'));
+  const serverCfg = await resolveServerConfig(executor);
+  const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
+  const gasUrl = str(serverCfg.gasWebAppUrl);
   if (!rgToken) {
     return {
       connected: Boolean(gasUrl),
@@ -3046,10 +2437,10 @@ export async function testRentalGateConnection(_executor: DbExecutor, session: A
       hasToken: Boolean(gasUrl),
       message: gasUrl
         ? 'الربط يعمل عبر Google Apps Script المربوط بقاعدة Neon PostgreSQL.'
-        : 'متغير RG_TOKEN غير مضبوط على الخادم.'
+        : 'يرجى إدخال توكن Rental Gate في الإعدادات ليتم حفظه والربط تلقائيًا.'
     };
   }
-  const baseApi = str(getEnv('RG_API_BASE_URL', 'https://api.rentalgate.net/api')).replace(/\/+$/, '');
+  const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
   const resp = await fetch(`${baseApi}/reservations/filter?page=0&size=1`, {
     method: 'GET',
     headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }

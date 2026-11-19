@@ -48,6 +48,12 @@ function handleApiRequest(e, method) {
       return jsonResponse(true, 'تم تنفيذ السحب والمزامنة السحابية.', trigRes);
     }
 
+    if (action === 'autoBindFromServer') {
+      var bindRes = handleAutoBindFromServer_(payload);
+      flushDirtyScriptCaches_();
+      return jsonResponse(true, 'تم الربط التلقائي بين الخادم وGoogle Apps Script بنجاح.', bindRes);
+    }
+
     var session = requireAuth(token);
 
     var result = null;
@@ -72,24 +78,6 @@ function handleApiRequest(e, method) {
         break;
       case 'getReservationDetails':
         result = getReservationDetails(session, payload);
-        break;
-      case 'getCustomers':
-        result = getCustomers(session, payload);
-        break;
-      case 'createCustomer':
-        result = createCustomer(session, payload);
-        break;
-      case 'updateCustomer':
-        result = updateCustomer(session, payload);
-        break;
-      case 'deleteCustomer':
-        result = deleteCustomer(session, payload);
-        break;
-      case 'createReservation':
-        result = createReservation(session, payload);
-        break;
-      case 'deleteReservation':
-        result = deleteReservation(session, payload);
         break;
       case 'claimReservation':
         result = claimReservation(session, payload);
@@ -204,9 +192,6 @@ function handleApiRequest(e, method) {
         break;
       case 'updateSettings':
         result = updateSettings(session, payload);
-        break;
-      case 'applyAutoConnectConfig':
-        result = applyAutoConnectConfig(session, payload);
         break;
       default:
         return jsonResponse(false, 'الإجراء المطلوب غير معروف.', null, 'UNKNOWN_ACTION: ' + action);

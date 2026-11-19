@@ -1,28 +1,32 @@
-import { checkDatabaseHealth } from '../backend/db';
-import { applyApiCorsHeaders } from '../backend/http';
+import { checkDatabaseHealth, createPgExecutor, isDatabaseConfigured } from '../backend/db';
+import { readPublicHealthAutoBind } from '../backend/serverConfig';
 
-export default async function handler(req: any, res: any) {
-  applyApiCorsHeaders(req, res);
+export default async function handler(_req: any, res: any) {
+  const health = await checkDatabaseHealth();
+  let executor: ReturnType<typeof createPgExecutor> | undefined;
 
-  if (req.method === 'OPTIONS') {
-    res.status(204).end();
-    return;
+  if (health.connected && isDatabaseConfigured()) {
+    try {
+      executor = createPgExecutor();
+    } catch {
+      executor = undefined;
+    }
   }
 
-  try {
-    const health = await checkDatabaseHealth();
-    res.status(200).json({
-      ok: true,
-      service: 'RENTAL GATE CRM',
-      timestamp: new Date().toISOString(),
-      ...health
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      ok: false,
-      service: 'RENTAL GATE CRM',
-      timestamp: new Date().toISOString(),
-      error: String(err?.message || 'HEALTH_CHECK_ERROR')
-    });
-  }
+  const autoBind = await readPublicHealthAutoBind(executor);
+  const mode = autoBind.mode || (health.databaseConfigured && health.connected ? 'neon' : '');
+  const backendApiUrl =
+    mode === 'gas' || mode === 'sandbox'
+      ? ''
+      : (health.databaseConfigured && health.connected ? '/api/crm' : '');
+
+  res.status(200).json({
+    ok: true,
+    service: 'RENTAL GATE CRM',
+    timestamp: new Date().toISOString(),
+    ...health,
+    mode,
+    backendApiUrl,
+    gasWebAppUrl: autoBind.gasWebAppUrl
+  });
 }

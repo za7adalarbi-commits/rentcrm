@@ -34,24 +34,38 @@
   var lastWarmUpAt = 0;
   var _cachedConnInfo = null;
   var detectedBackendUrl = '';
+  var detectedGasUrl = '';
+  var detectedMode = '';
   var backendProbeDone = false;
   var backendProbePromise = null;
 
+  function getConfiguredMode() {
+    var search = typeof window !== 'undefined' ? window.location.search : '';
+    if (/(?:\?|&)sandbox=1(?:&|$)/.test(search)) return 'sandbox';
+    if (safeStorageGet(STORAGE_GAS_URL) === SANDBOX_SENTINEL) return 'sandbox';
+    if (detectedMode) return detectedMode;
+    var cfgMode = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.mode) ? String(root.RG_APP_CONFIG.mode).trim().toLowerCase() : '';
+    return (cfgMode === 'neon' || cfgMode === 'gas' || cfgMode === 'sandbox') ? cfgMode : '';
+  }
+
   function getDefaultConfiguredGasUrl() {
-    var cfg = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.gasWebAppUrl) || root.__RG_DEFAULT_GAS_URL__ || '';
+    var mode = getConfiguredMode();
+    if (mode === 'sandbox') return '';
+    var cfg = detectedGasUrl || (root.RG_APP_CONFIG && root.RG_APP_CONFIG.gasWebAppUrl) || root.__RG_DEFAULT_GAS_URL__ || '';
     return String(cfg || '').trim();
   }
 
   function getDefaultConfiguredBackendUrl() {
+    var mode = getConfiguredMode();
+    if (mode === 'sandbox' || mode === 'gas') return '';
     var cfg = (root.RG_APP_CONFIG && root.RG_APP_CONFIG.backendApiUrl) || root.__RG_DEFAULT_BACKEND_API_URL__ || '';
     return String(cfg || '').trim();
   }
 
   function getBackendApiUrl() {
+    var mode = getConfiguredMode();
+    if (mode === 'sandbox' || mode === 'gas') return '';
     var search = typeof window !== 'undefined' ? window.location.search : '';
-    if (/(?:\?|&)sandbox=1(?:&|$)/.test(search)) return '';
-    var storedGas = safeStorageGet(STORAGE_GAS_URL);
-    if (storedGas === SANDBOX_SENTINEL) return '';
 
     var match = search.match(/(?:\?|&)backendUrl=([^&]+)/);
     if (match && match[1]) {
@@ -68,9 +82,8 @@
 
     var storedBackend = safeStorageGet(STORAGE_BACKEND_URL);
     if (storedBackend) return storedBackend;
-    var defBackend = getDefaultConfiguredBackendUrl();
-    if (defBackend) return defBackend;
-    return detectedBackendUrl;
+    if (detectedBackendUrl) return detectedBackendUrl;
+    return getDefaultConfiguredBackendUrl();
   }
 
   function getConnectionInfo() {
@@ -111,13 +124,8 @@
     return getBackendApiUrl() || getGasUrl();
   }
 
-  function probeBackendHealth(forceReprobe) {
-    if (forceReprobe) {
-      backendProbeDone = false;
-      backendProbePromise = null;
-      detectedBackendUrl = '';
-    }
-    if (backendProbeDone) return Promise.resolve(detectedBackendUrl);
+  function probeBackendHealth() {
+    if (backendProbeDone) return Promise.resolve(getBackendApiUrl());
     if (backendProbePromise) return backendProbePromise;
     if (typeof window === 'undefined' || typeof fetch !== 'function') {
       backendProbeDone = true;
@@ -130,10 +138,6 @@
       backendProbeDone = true;
       return Promise.resolve('');
     }
-    if (getBackendApiUrl()) {
-      backendProbeDone = true;
-      return Promise.resolve(getBackendApiUrl());
-    }
 
     backendProbePromise = (async function () {
       var timer = null;
@@ -142,14 +146,27 @@
         if (typeof AbortController !== 'undefined') {
           var ctrl = new AbortController();
           opts.signal = ctrl.signal;
-          timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 1500);
+          timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 1800);
         }
         var resp = await fetch('/api/health', opts);
         if (timer) clearTimeout(timer);
         if (resp && resp.ok) {
           var json = await resp.json();
-          if (json && json.ok && json.databaseConfigured && json.connected !== false) {
-            detectedBackendUrl = '/api/crm';
+          if (json && json.ok) {
+            if (json.mode) {
+              detectedMode = String(json.mode || '').trim().toLowerCase();
+            }
+            if (json.gasWebAppUrl !== undefined) {
+              detectedGasUrl = String(json.gasWebAppUrl || '').trim();
+            }
+            if (json.mode === 'gas' || json.mode === 'sandbox') {
+              detectedBackendUrl = '';
+            } else if (json.databaseConfigured && json.connected !== false) {
+              detectedBackendUrl = json.backendApiUrl || '/api/crm';
+            } else {
+              detectedBackendUrl = '';
+            }
+            _cachedConnInfo = null;
           }
         }
       } catch (e) {
@@ -157,10 +174,17 @@
       } finally {
         backendProbeDone = true;
       }
-      return detectedBackendUrl;
+      return getBackendApiUrl();
     })();
 
     return backendProbePromise;
+  }
+
+  async function refreshGlobalConnection() {
+    backendProbeDone = false;
+    backendProbePromise = null;
+    _cachedConnInfo = null;
+    return probeBackendHealth();
   }
 
   var SESSION_CACHE_KEY = 'rg_crm_swr_v1';
@@ -615,31 +639,6 @@
 
   function getCustomersDirectory() {
     var ns = getCacheNamespace();
-    if (!getTransportUrl() && getToken()) {
-      var db = loadSandboxDb();
-      var explicitCustomers = (db && Array.isArray(db.customers))
-        ? db.customers.filter(function (c) { return c && !c.deletedAt && c.status !== 'deleted'; })
-        : [];
-      var derived = (db && Array.isArray(db.reservations) && root.RGCrmCore && root.RGCrmCore.buildCustomersIndexFromReservations)
-        ? root.RGCrmCore.buildCustomersIndexFromReservations(db.reservations)
-        : [];
-      var seenPhones = {};
-      var merged = [];
-      explicitCustomers.forEach(function (c) {
-        var key = String(c.phone || c.name || '').trim().toLowerCase();
-        if (key) seenPhones[key] = true;
-        merged.push(Object.assign({}, c));
-      });
-      derived.forEach(function (c) {
-        var key = String(c.phone || c.name || '').trim().toLowerCase();
-        if (!key || !seenPhones[key]) {
-          if (key) seenPhones[key] = true;
-          merged.push(c);
-        }
-      });
-      localCustomersByNs[ns] = merged;
-      return merged.slice();
-    }
     if (Array.isArray(localCustomersByNs[ns]) && localCustomersByNs[ns].length > 0) {
       return localCustomersByNs[ns].slice();
     }
@@ -648,6 +647,10 @@
       var built = root.RGCrmCore.buildCustomersIndexFromReservations(bucket.list);
       localCustomersByNs[ns] = built;
       return built.slice();
+    }
+    if (!getGasUrl() && getToken()) {
+      syncSandboxSnapshotToIdb(ns);
+      return (localCustomersByNs[ns] || []).slice();
     }
     return [];
   }
@@ -1200,16 +1203,10 @@
     _cachedConnInfo = null;
     var raw = String(url || '').trim();
     var defUrl = getDefaultConfiguredGasUrl();
-    var hasLiveBackend = Boolean(
-      defUrl ||
-      getDefaultConfiguredBackendUrl() ||
-      detectedBackendUrl ||
-      safeStorageGet(STORAGE_BACKEND_URL)
-    );
     if (raw === '__DEFAULT__') {
       safeStorageSet(STORAGE_GAS_URL, '');
     } else if (!raw) {
-      safeStorageSet(STORAGE_GAS_URL, hasLiveBackend ? SANDBOX_SENTINEL : '');
+      safeStorageSet(STORAGE_GAS_URL, defUrl ? SANDBOX_SENTINEL : '');
     } else if (defUrl && raw === defUrl) {
       safeStorageSet(STORAGE_GAS_URL, '');
     } else {
@@ -1229,115 +1226,6 @@
 
   function isLiveMode() {
     return Boolean(getTransportUrl());
-  }
-
-  function applyRuntimeConnection(cfg) {
-    var nextCfg = cfg && typeof cfg === 'object' ? cfg : {};
-    var nextGas = String(nextCfg.gasWebAppUrl || '').trim();
-    var nextBackend = String(nextCfg.backendApiUrl || '').trim();
-
-    root.RG_APP_CONFIG = Object.assign({}, root.RG_APP_CONFIG || {}, {
-      gasWebAppUrl: nextGas,
-      backendApiUrl: nextBackend
-    });
-
-    _cachedConnInfo = null;
-    safeStorageSet(STORAGE_GAS_URL, '');
-    safeStorageSet(STORAGE_BACKEND_URL, nextBackend);
-    detectedBackendUrl = nextBackend;
-    backendProbeDone = true;
-    backendProbePromise = null;
-    clearCache();
-  }
-
-  async function getAutoConnectFileStatus() {
-    if (typeof fetch !== 'function' || typeof window === 'undefined') {
-      return { supported: false, data: null };
-    }
-    var proto = window.location ? window.location.protocol : '';
-    var host = window.location ? window.location.hostname : '';
-    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host)) {
-      return { supported: false, data: null };
-    }
-    try {
-      var headers = { Accept: 'application/json' };
-      var tok = getToken();
-      if (tok) headers.Authorization = 'Bearer ' + tok;
-      var resp = await fetch('/api/auto-connect/status', { method: 'GET', headers: headers, cache: 'no-store' });
-      if (resp.status === 404) {
-        return { supported: false, data: null };
-      }
-      var json = await resp.json().catch(function () { return null; });
-      if (!resp.ok || !json) {
-        return {
-          supported: true,
-          success: false,
-          status: resp.status,
-          message: (json && json.message) || ('HTTP ' + resp.status),
-          data: null
-        };
-      }
-      return { supported: true, success: Boolean(json.success), data: json.data || null, message: json.message || '' };
-    } catch (err) {
-      return { supported: false, data: null, message: err && err.message ? err.message : String(err) };
-    }
-  }
-
-  async function runAutoConnect(payload) {
-    if (typeof fetch !== 'function' || typeof window === 'undefined') {
-      return { success: false, serverFilesSupported: false, message: 'البيئة الحالية لا تدعم تعديل ملفات الخادم مباشرة.', data: null };
-    }
-    var proto = window.location ? window.location.protocol : '';
-    var host = window.location ? window.location.hostname : '';
-    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host)) {
-      return { success: false, serverFilesSupported: false, message: 'الاستضافة الساكنة لا تملك خادم Node لتعديل الملفات مباشرة.', data: null };
-    }
-    try {
-      var tok = getToken();
-      var reqBody = Object.assign({}, payload || {}, {
-        initialSetup: !getBackendApiUrl()
-      });
-      var headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
-      if (tok) headers.Authorization = 'Bearer ' + tok;
-      var resp = await fetch('/api/auto-connect', {
-        method: 'POST',
-        headers: headers,
-        cache: 'no-store',
-        body: JSON.stringify(reqBody)
-      });
-      if (resp.status === 404) {
-        return { success: false, serverFilesSupported: false, message: 'نقطة /api/auto-connect غير متوفرة على هذه الاستضافة.', data: null };
-      }
-      var json = await resp.json().catch(function () { return null; });
-      if (!resp.ok || !json || !json.success) {
-        return {
-          success: false,
-          serverFilesSupported: true,
-          status: resp.status,
-          message: (json && json.message) || ('فشل الربط التلقائي (HTTP ' + resp.status + ')'),
-          data: (json && json.data) || null,
-          error: (json && json.error) || 'AUTO_CONNECT_ERROR'
-        };
-      }
-      if (json.data && json.data.connectionConfig) {
-        applyRuntimeConnection(json.data.connectionConfig);
-      }
-      return {
-        success: true,
-        serverFilesSupported: true,
-        message: json.message || 'تم الربط التلقائي وتحديث الملفات بنجاح.',
-        data: json.data || null,
-        error: null
-      };
-    } catch (err) {
-      return {
-        success: false,
-        serverFilesSupported: false,
-        message: 'تعذر الوصول إلى خادم الربط التلقائي: ' + (err && err.message ? err.message : err),
-        data: null,
-        error: 'NETWORK_ERROR'
-      };
-    }
   }
 
   function warmUpGas() {
@@ -2050,31 +1938,9 @@
       });
     });
 
-    var seedCustSeen = {};
-    var seedCustomers = [];
-    reservations.forEach(function (r, idx) {
-      var key = String(r.customerPhone || r.customerName || '').trim().toLowerCase();
-      if (!key || seedCustSeen[key]) return;
-      seedCustSeen[key] = true;
-      seedCustomers.push({
-        id: 'CUST_' + (idx + 1),
-        name: r.customerName || '',
-        phone: r.customerPhone || '',
-        email: r.customerEmail || '',
-        idNumber: r.customerIdNumber || '',
-        companyName: r.companyName || '',
-        notes: '',
-        status: 'active',
-        createdAt: r.createdAt || (t0 + 'T09:00:00.000Z'),
-        updatedAt: r.updatedAt || (t0 + 'T09:00:00.000Z'),
-        deletedAt: ''
-      });
-    });
-
     return {
       _schemaV3ExactRg: true,
       employees: employees,
-      customers: seedCustomers,
       reservations: reservations,
       extensions: extensions,
       assignments: assignments,
@@ -2129,7 +1995,7 @@
         });
       }
 
-      ['customers', 'reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'sessions'].forEach(function (k) {
+      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'sessions'].forEach(function (k) {
         if (!Array.isArray(parsed[k])) {
           parsed[k] = defaults[k];
           dirty = true;
@@ -2741,196 +2607,6 @@
         appendSandboxActivity(db, session.user, 'تعديل تفاصيل الحجز', 'Reservation', rEdit.reservationNumber, 'تعديل تفاصيل الحجز بواسطة ' + session.user.name);
         saveSandboxDb(db);
         return { success: true, message: 'تم حفظ تعديلات تفاصيل الحجز.', data: rEdit, error: null };
-      }
-
-      case 'getCustomers': {
-        if (!core.canUserPerform(session.user, 'view_dashboard') && !core.canUserPerform(session.user, 'view_all_reservations') && !core.canUserPerform(session.user, 'add_followup') && !core.canUserPerform(session.user, 'edit_reservation_details')) {
-          return { success: false, message: 'ليس لديك صلاحية استعراض العملاء.', data: null, error: 'FORBIDDEN' };
-        }
-        var searchCust = String(payload.search || '').trim().toLowerCase();
-        var limitCust = Math.max(1, Math.min(500, Number(payload.limit || 200)));
-        var custItems = (db.customers || []).filter(function (c) {
-          if (!c || c.deletedAt || c.status === 'deleted') return false;
-          if (!searchCust) return true;
-          return [c.name, c.phone, c.email, c.idNumber, c.companyName].some(function (f) {
-            return String(f || '').toLowerCase().indexOf(searchCust) !== -1;
-          });
-        }).sort(function (a, b) {
-          return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
-        }).slice(0, limitCust);
-        return { success: true, message: '', data: { items: custItems, total: custItems.length }, error: null };
-      }
-
-      case 'createCustomer': {
-        if (!core.canUserPerform(session.user, 'add_followup') && !core.canUserPerform(session.user, 'edit_reservation_details')) {
-          return { success: false, message: 'ليس لديك صلاحية إضافة عملاء.', data: null, error: 'FORBIDDEN' };
-        }
-        var cName = String(payload.name || payload.customerName || '').trim();
-        if (!cName) return { success: false, message: 'اسم العميل مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        var nowCustIso = new Date().toISOString();
-        var newCust = {
-          id: String(payload.id || '').trim() || genId('CUST'),
-          name: cName,
-          phone: String(payload.phone || payload.customerPhone || '').trim(),
-          email: String(payload.email || payload.customerEmail || '').trim(),
-          idNumber: String(payload.idNumber || payload.customerIdNumber || '').trim(),
-          companyName: String(payload.companyName || '').trim(),
-          notes: String(payload.notes || '').trim(),
-          status: 'active',
-          createdAt: nowCustIso,
-          updatedAt: nowCustIso,
-          deletedAt: ''
-        };
-        db.customers.unshift(newCust);
-        appendSandboxActivity(db, session.user, 'إضافة عميل', 'Customer', newCust.id, newCust.name);
-        saveSandboxDb(db);
-        return { success: true, message: 'تم إضافة العميل بنجاح.', data: { customer: newCust }, error: null };
-      }
-
-      case 'updateCustomer': {
-        if (!core.canUserPerform(session.user, 'add_followup') && !core.canUserPerform(session.user, 'edit_reservation_details')) {
-          return { success: false, message: 'ليس لديك صلاحية تعديل بيانات العملاء.', data: null, error: 'FORBIDDEN' };
-        }
-        var targetCustId = String(payload.customerId || payload.id || '').trim();
-        if (!targetCustId) return { success: false, message: 'معرف العميل مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        if (payload.name !== undefined && !String(payload.name || '').trim()) {
-          return { success: false, message: 'اسم العميل مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        }
-        var custEdit = (db.customers || []).find(function (c) {
-          return c && c.id === targetCustId && !c.deletedAt && c.status !== 'deleted';
-        });
-        if (!custEdit) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
-        var nowCustUpd = new Date().toISOString();
-        if (payload.name !== undefined) custEdit.name = String(payload.name || '').trim();
-        if (payload.phone !== undefined) custEdit.phone = String(payload.phone || '').trim();
-        if (payload.email !== undefined) custEdit.email = String(payload.email || '').trim();
-        if (payload.idNumber !== undefined) custEdit.idNumber = String(payload.idNumber || '').trim();
-        if (payload.companyName !== undefined) custEdit.companyName = String(payload.companyName || '').trim();
-        if (payload.notes !== undefined) custEdit.notes = String(payload.notes || '').trim();
-        if (payload.status !== undefined) custEdit.status = String(payload.status || '').trim() || custEdit.status;
-        custEdit.updatedAt = nowCustUpd;
-        appendSandboxActivity(db, session.user, 'تحديث عميل', 'Customer', targetCustId, custEdit.name);
-        saveSandboxDb(db);
-        return { success: true, message: 'تم تحديث بيانات العميل بنجاح.', data: { customer: custEdit }, error: null };
-      }
-
-      case 'deleteCustomer': {
-        if (!core.canUserPerform(session.user, 'edit_reservation_details')) {
-          return { success: false, message: 'ليس لديك صلاحية حذف العملاء.', data: null, error: 'FORBIDDEN' };
-        }
-        var delCustId = String(payload.customerId || payload.id || '').trim();
-        if (!delCustId) return { success: false, message: 'معرف العميل مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        var custDel = (db.customers || []).find(function (c) {
-          return c && c.id === delCustId && !c.deletedAt && c.status !== 'deleted';
-        });
-        if (!custDel) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
-        var nowCustDel = new Date().toISOString();
-        custDel.status = 'deleted';
-        custDel.deletedAt = nowCustDel;
-        custDel.updatedAt = nowCustDel;
-        appendSandboxActivity(db, session.user, 'حذف عميل', 'Customer', delCustId, custDel.name);
-        saveSandboxDb(db);
-        return { success: true, message: 'تم حذف العميل بنجاح.', data: { deleted: true, customerId: delCustId }, error: null };
-      }
-
-      case 'createReservation': {
-        if (!core.canUserPerform(session.user, 'edit_reservation_details') && !core.canUserPerform(session.user, 'pull_reservations') && !core.canUserPerform(session.user, 'add_followup')) {
-          return { success: false, message: 'ليس لديك صلاحية إنشاء حجوزات.', data: null, error: 'FORBIDDEN' };
-        }
-        var newResCustomer = String(payload.customerName || '').trim();
-        if (!newResCustomer) return { success: false, message: 'اسم العميل مطلوب لإنشاء الحجز.', data: null, error: 'VALIDATION_ERROR' };
-        var newResNumber = String(payload.reservationNumber || '').trim() || ('RG-' + String(Date.now()).slice(-6));
-        if ((db.reservations || []).some(function (r) { return r && r.reservationNumber === newResNumber; })) {
-          return { success: false, message: 'رقم الحجز مسجل مسبقاً.', data: null, error: 'VALIDATION_ERROR' };
-        }
-        var initResStatus = String(payload.internalStatus || 'تم الحجز').trim();
-        if (!core.isValidWorkflowStatus(initResStatus)) {
-          return { success: false, message: 'الحالة المحددة غير معتمدة.', data: null, error: 'VALIDATION_ERROR' };
-        }
-        var nowNewResIso = new Date().toISOString();
-        var newResId = String(payload.id || '').trim() || genId('RES');
-        var newDays = Math.max(0, Number(payload.daysCount !== undefined ? payload.daysCount : 1) || 1);
-        var newTotal = Number(payload.totalAmount !== undefined ? payload.totalAmount : (payload.baseAmount || 0)) || 0;
-        var newBase = Number(payload.baseAmount !== undefined ? payload.baseAmount : newTotal) || 0;
-        var createdRes = {
-          id: newResId,
-          sourceReservationId: String(payload.sourceReservationId || newResId),
-          reservationNumber: newResNumber,
-          sourceCreatedAt: String(payload.sourceCreatedAt || nowNewResIso),
-          customerName: newResCustomer,
-          customerPhone: String(payload.customerPhone || '').trim(),
-          customerEmail: String(payload.customerEmail || '').trim(),
-          customerIdNumber: String(payload.customerIdNumber || '').trim(),
-          companyName: String(payload.companyName || '').trim(),
-          branchName: String(payload.branchName || '').trim(),
-          deliverBranchName: String(payload.deliverBranchName || payload.branchName || '').trim(),
-          carName: String(payload.carName || '').trim(),
-          plateNumber: String(payload.plateNumber || '').trim(),
-          carCategory: String(payload.carCategory || '').trim(),
-          startDate: String(payload.startDate || nowNewResIso.slice(0, 10)),
-          startTime: String(payload.startTime || '12:00'),
-          originalEndDate: String(payload.originalEndDate || payload.endDate || nowNewResIso.slice(0, 10)),
-          originalEndTime: String(payload.originalEndTime || payload.endTime || '12:00'),
-          endDate: String(payload.endDate || nowNewResIso.slice(0, 10)),
-          endTime: String(payload.endTime || '12:00'),
-          extendedUntilDate: String(payload.extendedUntilDate || ''),
-          extendedUntilTime: String(payload.extendedUntilTime || ''),
-          daysCount: newDays,
-          extendedDaysCount: Number(payload.extendedDaysCount || 0) || 0,
-          totalDaysCount: Number(payload.totalDaysCount || newDays) || newDays,
-          originalStatusCode: String(payload.originalStatusCode || 'booked'),
-          originalStatusAr: String(payload.originalStatusAr || initResStatus),
-          pickupTypeAr: String(payload.pickupTypeAr || ''),
-          returnTypeAr: String(payload.returnTypeAr || ''),
-          paymentMethod: String(payload.paymentMethod || ''),
-          paymentStatus: String(payload.paymentStatus || ''),
-          dailyPrice: Number(payload.dailyPrice || 0) || 0,
-          discountAmount: Number(payload.discountAmount || 0) || 0,
-          vatAmount: Number(payload.vatAmount || 0) || 0,
-          baseAmount: newBase,
-          extensionsCount: Number(payload.extensionsCount || 0) || 0,
-          extensionsAmount: Number(payload.extensionsAmount || 0) || 0,
-          totalAmount: newTotal,
-          hasExtensions: Boolean(payload.hasExtensions),
-          internalStatus: initResStatus,
-          priority: String(payload.priority || 'عادي'),
-          assignedEmployeeIds: Array.isArray(payload.assignedEmployeeIds) ? payload.assignedEmployeeIds : [],
-          assignedEmployeeNames: Array.isArray(payload.assignedEmployeeNames) ? payload.assignedEmployeeNames : [],
-          lastUpdateText: String(payload.lastUpdateText || ('إنشاء الحجز بواسطة ' + session.user.name)),
-          lastUpdatedById: session.employeeId,
-          lastUpdatedByName: session.user.name,
-          lastUpdatedAt: nowNewResIso,
-          hasProblem: Boolean(payload.hasProblem),
-          createdAt: nowNewResIso,
-          updatedAt: nowNewResIso,
-          statusHistory: core.appendStatusStageEntry([], {
-            source: 'manual_create',
-            previousStatus: '',
-            newStatus: initResStatus,
-            changedAt: nowNewResIso,
-            changedById: session.employeeId,
-            changedByName: session.user.name,
-            note: 'إنشاء الحجز بواسطة ' + session.user.name
-          })
-        };
-        db.reservations.unshift(createdRes);
-        appendSandboxActivity(db, session.user, 'إنشاء حجز', 'Reservation', createdRes.reservationNumber, createdRes.customerName);
-        saveSandboxDb(db);
-        return { success: true, message: 'تم إنشاء الحجز بنجاح.', data: { reservation: createdRes }, error: null };
-      }
-
-      case 'deleteReservation': {
-        if (!core.canUserPerform(session.user, 'edit_reservation_details')) {
-          return { success: false, message: 'ليس لديك صلاحية حذف الحجوزات.', data: null, error: 'FORBIDDEN' };
-        }
-        var delResId = String(payload.reservationId || payload.id || '').trim();
-        if (!delResId) return { success: false, message: 'معرف الحجز مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        var delResIdx = (db.reservations || []).findIndex(function (r) { return r && r.id === delResId; });
-        if (delResIdx === -1) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
-        var removedRes = db.reservations.splice(delResIdx, 1)[0];
-        appendSandboxActivity(db, session.user, 'حذف حجز', 'Reservation', removedRes.reservationNumber, removedRes.customerName);
-        saveSandboxDb(db);
-        return { success: true, message: 'تم حذف الحجز بنجاح.', data: { deleted: true, reservationId: removedRes.id }, error: null };
       }
 
       case 'addFollowUp': {
@@ -4198,36 +3874,6 @@
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
-        } else if (action === 'createReservation' && parsed.data && parsed.data.reservation) {
-          setLocalReservationsState(ns, [parsed.data.reservation], false);
-          if (!transportUrl) syncSandboxSnapshotToIdb(ns);
-        } else if (action === 'deleteReservation' && parsed.data) {
-          var deletedResId = String(parsed.data.reservationId || (payload && (payload.reservationId || payload.id)) || '').trim();
-          if (deletedResId) {
-            if (localDetailsByNs[ns]) delete localDetailsByNs[ns][deletedResId];
-            if (localReservationsByNs[ns] && Array.isArray(localReservationsByNs[ns].list)) {
-              var nextRemaining = localReservationsByNs[ns].list.filter(function (r) { return r && r.id !== deletedResId; });
-              setLocalReservationsState(ns, nextRemaining, true);
-            }
-          }
-          if (!transportUrl) syncSandboxSnapshotToIdb(ns);
-        } else if (action === 'getCustomers' && parsed.data && Array.isArray(parsed.data.items)) {
-          localCustomersByNs[ns] = parsed.data.items.slice();
-          if (root.RGIdbCache) root.RGIdbCache.upsertCustomers(ns, parsed.data.items).catch(function () {});
-        } else if (action === 'createCustomer' && parsed.data && parsed.data.customer) {
-          var cListNew = (localCustomersByNs[ns] || []).filter(function (c) { return c && c.id !== parsed.data.customer.id; });
-          cListNew.unshift(parsed.data.customer);
-          localCustomersByNs[ns] = cListNew;
-          if (root.RGIdbCache) root.RGIdbCache.upsertCustomers(ns, [parsed.data.customer]).catch(function () {});
-        } else if (action === 'updateCustomer' && parsed.data && parsed.data.customer) {
-          localCustomersByNs[ns] = (localCustomersByNs[ns] || []).map(function (c) {
-            return c && c.id === parsed.data.customer.id ? parsed.data.customer : c;
-          });
-          if (root.RGIdbCache) root.RGIdbCache.upsertCustomers(ns, [parsed.data.customer]).catch(function () {});
-        } else if (action === 'deleteCustomer' && parsed.data && parsed.data.customerId) {
-          localCustomersByNs[ns] = (localCustomersByNs[ns] || []).filter(function (c) {
-            return c && c.id !== parsed.data.customerId;
-          });
         } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
           syncSandboxSnapshotToIdb(ns);
         }
@@ -4355,17 +4001,83 @@
     }
   }
 
+  async function callBackendSetupEndpoint(actionName, payload) {
+    if (typeof window === 'undefined' || typeof fetch !== 'function') {
+      return { success: false, staticHostOnly: true, message: 'غير مدعوم في هذه البيئة.' };
+    }
+    var proto = window.location ? window.location.protocol : '';
+    var host = window.location ? window.location.hostname : '';
+    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host)) {
+      return { success: false, staticHostOnly: true, message: 'استضافة ثابتة بدون خادم Node/Vercel.' };
+    }
+    try {
+      var resp = await fetch('/api/crm', {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: actionName,
+          token: getToken() || '',
+          payload: payload || {}
+        })
+      });
+      if (resp.status === 404 || resp.status === 405) {
+        return { success: false, staticHostOnly: true, message: 'الخادم الخلفي غير متاح على هذه الاستضافة.' };
+      }
+      var text = await resp.text();
+      var parsed = JSON.parse(text);
+      return parsed;
+    } catch (err) {
+      return {
+        success: false,
+        staticHostOnly: true,
+        message: 'تعذر الوصول إلى نقطة الربط الخلفية: ' + (err.message || err)
+      };
+    }
+  }
+
+  async function getSetupCapabilities() {
+    return callBackendSetupEndpoint('getSetupCapabilities', {});
+  }
+
+  async function applyUnifiedSetup(payload) {
+    var nextPayload = Object.assign({
+      siteOrigin: typeof window !== 'undefined' && window.location ? window.location.origin : ''
+    }, payload || {});
+    var res = await callBackendSetupEndpoint('applyUnifiedConnectionSetup', nextPayload);
+    if (res && res.success && res.data) {
+      var nextMode = String(res.data.mode || '').trim().toLowerCase();
+      var nextGas = String(res.data.gasWebAppUrl || '').trim();
+      var nextBackend = nextMode === 'neon' ? '/api/crm' : '';
+      root.RG_APP_CONFIG = Object.assign(root.RG_APP_CONFIG || {}, {
+        mode: nextMode,
+        gasWebAppUrl: nextGas,
+        backendApiUrl: nextBackend
+      });
+      safeStorageSet(STORAGE_GAS_URL, nextMode === 'sandbox' ? '' : '');
+      safeStorageSet(STORAGE_BACKEND_URL, '');
+      detectedMode = nextMode;
+      detectedGasUrl = nextGas;
+      detectedBackendUrl = nextBackend;
+      _cachedConnInfo = null;
+      clearCache();
+      await refreshGlobalConnection().catch(function () {});
+    }
+    return res;
+  }
+
   root.RGApi = {
     ready: ready,
     getGasUrl: getGasUrl,
     getBackendApiUrl: getBackendApiUrl,
-    getTransportUrl: getTransportUrl,
+    getActiveMode: getConfiguredMode,
+    isBackendConnected: function () { return Boolean(getBackendApiUrl()); },
+    refreshGlobalConnection: refreshGlobalConnection,
+    getSetupCapabilities: getSetupCapabilities,
+    applyUnifiedSetup: applyUnifiedSetup,
     getConnectionInfo: getConnectionInfo,
     setGasUrl: setGasUrl,
-    applyRuntimeConnection: applyRuntimeConnection,
-    reprobeBackend: function () { return probeBackendHealth(true); },
-    getAutoConnectFileStatus: getAutoConnectFileStatus,
-    runAutoConnect: runAutoConnect,
     getToken: getToken,
     setToken: setToken,
     isLiveMode: isLiveMode,

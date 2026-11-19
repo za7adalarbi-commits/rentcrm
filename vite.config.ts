@@ -17,7 +17,7 @@ function resolveBasePath(command: 'build' | 'serve'): string {
   if (isGitHubPagesBuild()) {
     return GITHUB_PAGES_BASE;
   }
-  if (process.env.CF_PAGES === '1' || process.env.CLOUDFLARE === '1') {
+  if (process.env.VERCEL === '1') {
     return '/';
   }
   return command === 'build' ? './' : '/';
@@ -99,9 +99,7 @@ export default defineConfig(({command}) => {
           }
           if (fs.existsSync(distDir)) {
             fs.writeFileSync(path.resolve(distDir, '.nojekyll'), '', 'utf8');
-            if (isGitHubPagesBuild()) {
-              fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
-            }
+            fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
           }
         },
       },

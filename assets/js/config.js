@@ -1,11 +1,12 @@
 /**
- * RENTAL GATE CRM — Global Auto-Connection Configuration
- * ضع رابط Google Apps Script Web App (/exec) أو رابط Backend API (/api/crm) ليعمل الموقع تلقائيًا.
- * يمكن تحديث هذا الملف تلقائيًا من داخل الموقع (الإعدادات ← الربط التلقائي الشامل).
+ * RENTAL GATE CRM — Global Fixed Connection Configuration
+ * يتم تحديث هذا الملف تلقائيًا عند الحفظ والربط من صفحة الإعدادات في الموقع.
+ * لا يحتوي على أي توكنات أو أسرار — القيم العامة للوضع وربط الواجهة فقط.
  */
 (function (root) {
   'use strict';
   root.RG_APP_CONFIG = Object.assign({
+    mode: '',
     gasWebAppUrl: '',
     backendApiUrl: ''
   }, root.RG_APP_CONFIG || {});

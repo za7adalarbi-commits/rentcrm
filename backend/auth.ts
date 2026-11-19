@@ -1,11 +1,9 @@
 import crypto from 'node:crypto';
-import * as crmCoreNs from '../assets/js/core.js';
-import type { DbClient, DbExecutor } from './dbCore';
+import { createRequire } from 'node:module';
+import type { DbClient, DbExecutor } from './db';
 
-// In esbuild/Workers CJS interop resolves crmCoreNs.default; in Node ESM UMD attaches globalThis.RGCrmCore.
-export const crmCore: any =
-  (crmCoreNs as any)?.default ||
-  ((crmCoreNs as any)?.ROLES ? crmCoreNs : (globalThis as any).RGCrmCore);
+const require = createRequire(import.meta.url);
+export const crmCore: any = require('../assets/js/core.js');
 
 export interface AuthEmployee {
   id: string;
@@ -79,7 +77,7 @@ export function mapEmployeeRow(row: any): AuthEmployee {
   const role = String(row.role || 'agent');
   const rawPerms = parseJsonArray<string>(row.permissions);
   const resolvedPerms = crmCore && typeof crmCore.resolveEffectivePermissions === 'function'
-    ? crmCore.resolveEffectivePermissions({ role, permissions: rawPerms })
+    ? crmCore.resolveEffectivePermissions(role, rawPerms)
     : rawPerms;
 
   return {

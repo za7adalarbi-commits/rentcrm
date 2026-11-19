@@ -282,26 +282,6 @@ function handleTriggerNeonIncrementalSync_(payload) {
   return runRentalGateSyncInternal(actor, payload || {});
 }
 
-function cloneWithPatchEs5_(baseObj, patchObj) {
-  var out = {};
-  var k;
-  if (baseObj && typeof baseObj === 'object') {
-    for (k in baseObj) {
-      if (Object.prototype.hasOwnProperty.call(baseObj, k)) {
-        out[k] = baseObj[k];
-      }
-    }
-  }
-  if (patchObj && typeof patchObj === 'object') {
-    for (k in patchObj) {
-      if (Object.prototype.hasOwnProperty.call(patchObj, k)) {
-        out[k] = patchObj[k];
-      }
-    }
-  }
-  return out;
-}
-
 function handleNeonMirrorSync_(payload) {
   var cfg = getNeonSyncConfig_();
   var provided = normalizeStr(payload && payload.syncSecret);
@@ -318,24 +298,8 @@ function handleNeonMirrorSync_(payload) {
     var action = normalizeStr(item.action);
     var data = item.payload || {};
 
-    if (action === 'upsertCustomer' && data.id) {
-      var custRec = cloneWithPatchEs5_(data, {
-        status: normalizeStr(data.status) || 'active',
-        updatedAt: data.updatedAt || nowIso()
-      });
-      upsertRecord(RG_SHEETS.CUSTOMERS, 'id', custRec);
-      applied++;
-    } else if (action === 'deleteCustomer' && (data.id || data.customerId)) {
-      var targetCustId = normalizeStr(data.id || data.customerId);
-      var custNow = nowIso();
-      updateRecordByKey(RG_SHEETS.CUSTOMERS, 'id', targetCustId, {
-        status: 'deleted',
-        deletedAt: custNow,
-        updatedAt: custNow
-      });
-      applied++;
-    } else if (action === 'upsertReservation' && data.reservationNumber) {
-      var resRec = cloneWithPatchEs5_(data, {
+    if (action === 'upsertReservation' && data.reservationNumber) {
+      var resRec = Object.assign({}, data, {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
         statusHistory: JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
@@ -344,20 +308,11 @@ function handleNeonMirrorSync_(payload) {
       });
       upsertRecord(RG_SHEETS.RESERVATIONS, 'reservationNumber', resRec);
       applied++;
-    } else if (action === 'deleteReservation' && (data.id || data.reservationNumber)) {
-      var deletedRes = false;
-      if (data.id) {
-        deletedRes = deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'id', normalizeStr(data.id));
-      }
-      if (!deletedRes && data.reservationNumber) {
-        deleteRecordByKey(RG_SHEETS.RESERVATIONS, 'reservationNumber', normalizeStr(data.reservationNumber));
-      }
-      applied++;
     } else if (action === 'appendFollowUp' && data.id) {
       upsertRecord(RG_SHEETS.FOLLOWUPS, 'id', data);
       applied++;
     } else if (action === 'upsertProblem' && data.id) {
-      var prbRec = cloneWithPatchEs5_(data, {
+      var prbRec = Object.assign({}, data, {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
       });
@@ -367,7 +322,7 @@ function handleNeonMirrorSync_(payload) {
       }
       applied++;
     } else if (action === 'upsertEmployee' && data.id) {
-      var empRec = cloneWithPatchEs5_(data, {
+      var empRec = Object.assign({}, data, {
         permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])
       });
       upsertRecord(RG_SHEETS.EMPLOYEES, 'id', empRec);
@@ -403,22 +358,52 @@ function handleNeonMirrorSync_(payload) {
         });
         applied++;
       }
-    } else if (action === 'saveAutoConnectProps') {
-      var propUpdates = {};
-      var pTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
-      if (pTok) {
-        propUpdates.RG_TOKEN = pTok;
-        propUpdates.RENTAL_TOKEN = pTok;
-      }
-      if (data.spreadsheetId) propUpdates.SPREADSHEET_ID = normalizeStr(data.spreadsheetId);
-      if (data.neonSyncUrl) propUpdates.NEON_SYNC_URL = normalizeStr(data.neonSyncUrl);
-      if (data.syncSecret) propUpdates.SYNC_API_SECRET = normalizeStr(data.syncSecret);
-      if (Object.keys(propUpdates).length > 0) {
-        PropertiesService.getScriptProperties().setProperties(propUpdates);
-        applied++;
-      }
     }
   }
 
   return { applied: applied };
 }
+
+function handleAutoBindFromServer_(payload) {
+  var p = payload || {};
+  var props = PropertiesService.getScriptProperties();
+  var cfg = getNeonSyncConfig_();
+  var existingRgToken = normalizeStr(props.getProperty('RG_TOKEN') || props.getProperty('RENTAL_TOKEN')).replace(/^Bearer\s+/i, '');
+
+  var providedSecret = normalizeStr(p.syncSecret);
+  var providedRgToken = normalizeStr(p.rgToken).replace(/^Bearer\s+/i, '');
+  var neonSyncUrl = normalizeStr(p.neonSyncUrl);
+
+  var secretMatches = Boolean(cfg.syncSecret && providedSecret && constantTimeEqual_(providedSecret, cfg.syncSecret));
+  var rgTokenMatches = Boolean(existingRgToken && providedRgToken && constantTimeEqual_(providedRgToken, existingRgToken));
+  var isFreshUnbound = Boolean(!cfg.syncSecret && !cfg.syncUrl && !existingRgToken && providedSecret && (providedRgToken || neonSyncUrl));
+
+  if (!secretMatches && !rgTokenMatches && !isFreshUnbound) {
+    throw new Error('UNAUTHORIZED: تعذر التحقق من الصلاحية للربط التلقائي؛ تأكد من تطابق RG_TOKEN أو SYNC_API_SECRET في Script Properties.');
+  }
+
+  var nextProps = {};
+  if (neonSyncUrl) nextProps.NEON_SYNC_URL = neonSyncUrl;
+  if (providedSecret) nextProps.SYNC_API_SECRET = providedSecret;
+  if (providedRgToken) {
+    nextProps.RG_TOKEN = providedRgToken;
+    nextProps.RENTAL_TOKEN = providedRgToken;
+  }
+  if (Object.keys(nextProps).length > 0) {
+    props.setProperties(nextProps);
+  }
+
+  var triggerInfo = null;
+  if (p.autoEveryMinute !== false && (neonSyncUrl || cfg.syncUrl)) {
+    triggerInfo = setupNeonEveryMinuteSync(true);
+  }
+
+  return {
+    bound: true,
+    neonSyncUrl: normalizeStr(props.getProperty('NEON_SYNC_URL')),
+    hasSyncSecret: Boolean(props.getProperty('SYNC_API_SECRET')),
+    hasRgToken: Boolean(props.getProperty('RG_TOKEN')),
+    trigger: triggerInfo
+  };
+}
+
