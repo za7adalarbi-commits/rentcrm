@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { DbExecutor } from './db';
+import type { DbExecutor } from './dbCore';
 
 const SENSITIVE_KEYS = new Set([
   'password',

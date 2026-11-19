@@ -190,14 +190,7 @@
       export_settings_btn: 'إعدادات التصدير (Excel / PDF)',
       generate_report: 'تحديث التقرير',
       refresh: 'تحديث',
-      refresh_done: 'تم تحديث البيانات',
-      new_reservation: '+ حجز جديد',
-      manage_customers: 'إدارة العملاء',
-      sync_live: 'مباشر',
-      sync_syncing: 'مزامنة',
-      sync_reconnecting: 'إعادة اتصال...',
-      sync_failed: 'فشل',
-      sync_sandbox: 'معاينة'
+      refresh_done: 'تم تحديث البيانات'
     },
     en: {
       brand: 'RENTAL GATE CRM',
@@ -264,14 +257,7 @@
       export_settings_btn: 'Export Settings (Excel / PDF)',
       generate_report: 'Refresh Report',
       refresh: 'Refresh',
-      refresh_done: 'Data refreshed',
-      new_reservation: '+ New Booking',
-      manage_customers: 'Customers',
-      sync_live: 'Live',
-      sync_syncing: 'Syncing',
-      sync_reconnecting: 'Reconnecting...',
-      sync_failed: 'Failed',
-      sync_sandbox: 'Sandbox'
+      refresh_done: 'Data refreshed'
     }
   };
 
@@ -848,10 +834,6 @@
               '<h1 class="page-heading m-0 text-base md:text-lg font-bold text-[#313232] dark:text-white truncate" id="page-heading">' + t('nav_dashboard') + '</h1>' +
             '</div>' +
             '<div class="topbar-actions flex items-center gap-1.5 sm:gap-2 shrink-0">' +
-              '<button type="button" class="sync-live-pill" id="sync-live-indicator" title="' + (state.prefs.lang === 'en' ? 'Real-Time Sync Status' : 'حالة المزامنة الفورية') + '">' +
-                '<span class="sync-live-dot" id="sync-live-dot"></span>' +
-                '<span id="sync-live-text">' + t('sync_sandbox') + '</span>' +
-              '</button>' +
               '<button type="button" class="btn btn-icon" id="refresh-view-btn" aria-label="' + t('refresh') + '" title="' + t('refresh') + '">' +
                 renderIcon('M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15') +
               '</button>' +
@@ -909,23 +891,6 @@
       });
     });
 
-    var syncIndicatorBtn = document.getElementById('sync-live-indicator');
-    if (syncIndicatorBtn) {
-      syncIndicatorBtn.addEventListener('click', function () {
-        var curU = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
-        if (curU && root.RGCrmCore && (root.RGCrmCore.canAccessApi(curU) || root.RGCrmCore.canUserPerform(curU, 'manage_settings'))) {
-          state.route = 'settings';
-          renderRoute();
-          return;
-        }
-        if (root.RGApi && root.RGApi.fetchRealtimeDelta) {
-          root.RGApi.fetchRealtimeDelta().catch(function () {});
-        }
-        refreshCurrentRouteAndNotifications({ manual: true }).catch(function () {});
-      });
-      updateSyncLiveIndicator();
-    }
-
     var refreshBtn = document.getElementById('refresh-view-btn');
     if (refreshBtn) {
       refreshBtn.addEventListener('click', function () {
@@ -961,7 +926,6 @@
 
     document.getElementById('logout-btn').addEventListener('click', async function () {
       stopAutoRefreshLoop();
-      if (root.RGApi && root.RGApi.stopRealtimeStream) root.RGApi.stopRealtimeStream();
       state.route = 'dashboard';
       await root.RGAuth.logout();
       renderLoginScreen();
@@ -1067,96 +1031,13 @@
         }
         if (document.visibilityState === 'visible' && lastHiddenAt && (Date.now() - lastHiddenAt >= 15000)) {
           lastHiddenAt = 0;
-          if (root.RGApi && root.RGApi.fetchRealtimeDelta) {
-            root.RGApi.fetchRealtimeDelta().catch(function () {});
-          }
           refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
         }
       });
       window.addEventListener('online', function () {
-        if (root.RGApi && root.RGApi.startRealtimeStream) {
-          root.RGApi.startRealtimeStream();
-        }
         refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
       });
     }
-  }
-
-  var realtimeListenersBound = false;
-  var realtimeRouteRefreshTimer = null;
-
-  function updateSyncLiveIndicator(detail) {
-    var dot = document.getElementById('sync-live-dot');
-    var label = document.getElementById('sync-live-text');
-    if (!dot || !label) return;
-    var st = detail || (root.RGApi && root.RGApi.getRealtimeStatus ? root.RGApi.getRealtimeStatus() : null);
-    if (!st) return;
-
-    var summary = st.syncSummary || { pending: 0, processing: 0, synced: 0, failed: 0 };
-    var pendingCount = Number(summary.pending || 0) + Number(summary.processing || 0);
-    var failedCount = Number(summary.failed || 0);
-
-    dot.className = 'sync-live-dot';
-    if (failedCount > 0) {
-      dot.classList.add('is-error');
-      label.textContent = t('sync_failed') + ': ' + failedCount;
-    } else if (pendingCount > 0) {
-      dot.classList.add('is-syncing');
-      label.textContent = t('sync_syncing') + ' (' + pendingCount + ')';
-    } else if (st.connected || st.mode === 'sse' || st.mode === 'gas') {
-      dot.classList.add('is-live');
-      label.textContent = st.mode === 'gas' ? 'GAS' : t('sync_live');
-    } else if (st.mode === 'reconnecting' || st.mode === 'connecting') {
-      dot.classList.add('is-syncing');
-      label.textContent = t('sync_reconnecting');
-    } else {
-      label.textContent = t('sync_sandbox');
-    }
-  }
-
-  function handleAppRealtimeEvent(ev) {
-    if (!ev || typeof ev !== 'object') return;
-    if (!root.RGAuth || !root.RGAuth.getUser || !root.RGAuth.getUser()) return;
-
-    if (ev.entityType === 'SyncQueue') {
-      updateSyncLiveIndicator();
-      return;
-    }
-
-    if (ev.entityType === 'Reservation' || ev.entityType === 'Problem' || ev.entityType === 'FollowUp') {
-      refreshNotifications({ silent: true }).catch(function () {});
-    }
-
-    var drawerBackdrop = document.getElementById('res-drawer-backdrop');
-    if (drawerBackdrop && ev.entityType === 'Reservation') {
-      var openId = drawerBackdrop.getAttribute('data-res-id');
-      if (openId && String(ev.recordId) === String(openId) && String(ev.operation || '').toUpperCase() === 'DELETE') {
-        var modalRootEl = document.getElementById('modal-root');
-        if (modalRootEl) modalRootEl.innerHTML = '';
-        toast(state.prefs.lang === 'en' ? 'Reservation was removed.' : 'تم حذف الحجز.', true);
-      }
-    }
-
-    clearTimeout(realtimeRouteRefreshTimer);
-    realtimeRouteRefreshTimer = setTimeout(function () {
-      if (!canRunSilentAutoRefreshNow()) return;
-      var container = document.getElementById('page-content');
-      var slot = container ? container.querySelector('.route-view') : null;
-      if (slot) {
-        renderActiveRouteView(slot, buildAppCtx(), { silent: true }).catch(function () {});
-      }
-    }, 180);
-  }
-
-  function bindRealtimeListeners() {
-    if (realtimeListenersBound) return;
-    realtimeListenersBound = true;
-    window.addEventListener('rg:sync-state', function (e) {
-      updateSyncLiveIndicator(e && e.detail);
-    });
-    window.addEventListener('rg:realtime-event', function (e) {
-      handleAppRealtimeEvent(e && e.detail);
-    });
   }
 
   function prefetchRouteData(routeId) {
@@ -1238,7 +1119,6 @@
     if (root.RGApi && root.RGApi.ready) {
       await root.RGApi.ready();
     }
-    bindRealtimeListeners();
     var dashRange = (state.dashboard && state.dashboard.range) || '30d';
     var consumed = root.RGAuth.consumeBootstrap ? root.RGAuth.consumeBootstrap() : null;
     var user = root.RGAuth.getUser ? root.RGAuth.getUser() : null;
@@ -1252,7 +1132,6 @@
       await renderRoute();
       scheduleBackgroundPrefetch(user);
       startAutoRefreshLoop();
-      if (root.RGApi && root.RGApi.startRealtimeStream) root.RGApi.startRealtimeStream();
       return;
     }
 
@@ -1269,14 +1148,12 @@
         await renderRoute();
         scheduleBackgroundPrefetch(user);
         startAutoRefreshLoop();
-        if (root.RGApi && root.RGApi.startRealtimeStream) root.RGApi.startRealtimeStream();
         return;
       }
       if (bootRes && bootRes.error === 'UNAUTHORIZED') {
         root.RGApi.setToken('');
         if (root.RGAuth.setUser) root.RGAuth.setUser(null);
         stopAutoRefreshLoop();
-        if (root.RGApi && root.RGApi.stopRealtimeStream) root.RGApi.stopRealtimeStream();
         renderLoginScreen();
         return;
       }
@@ -1287,7 +1164,6 @@
     }
     if (!user) {
       stopAutoRefreshLoop();
-      if (root.RGApi && root.RGApi.stopRealtimeStream) root.RGApi.stopRealtimeStream();
       renderLoginScreen();
       return;
     }
@@ -1299,19 +1175,16 @@
     ]);
     scheduleBackgroundPrefetch(user);
     startAutoRefreshLoop();
-    if (root.RGApi && root.RGApi.startRealtimeStream) root.RGApi.startRealtimeStream();
   }
 
   root.RGApp = {
     withActionLock: withActionLock,
     applyNotificationsState: applyNotificationsState,
-    refreshNotifications: refreshNotifications,
-    updateSyncLiveIndicator: updateSyncLiveIndicator
+    refreshNotifications: refreshNotifications
   };
 
   document.addEventListener('rg:unauthorized', function () {
     stopAutoRefreshLoop();
-    if (root.RGApi && root.RGApi.stopRealtimeStream) root.RGApi.stopRealtimeStream();
     renderLoginScreen();
   });
 

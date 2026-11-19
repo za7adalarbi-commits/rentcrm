@@ -6,12 +6,19 @@ import {defineConfig} from 'vite';
 
 const GITHUB_PAGES_BASE = '/RENT-CRM/';
 
+function isGitHubPagesBuild(): boolean {
+  return process.env.GITHUB_ACTIONS === 'true' || process.env.GITHUB_PAGES === 'true';
+}
+
 function resolveBasePath(command: 'build' | 'serve'): string {
   if (process.env.VITE_BASE_PATH) {
     return process.env.VITE_BASE_PATH;
   }
-  if (process.env.GITHUB_ACTIONS === 'true' || process.env.GITHUB_PAGES === 'true') {
+  if (isGitHubPagesBuild()) {
     return GITHUB_PAGES_BASE;
+  }
+  if (process.env.CF_PAGES === '1' || process.env.CLOUDFLARE === '1') {
+    return '/';
   }
   return command === 'build' ? './' : '/';
 }
@@ -62,20 +69,7 @@ export default defineConfig(({command}) => {
         transformIndexHtml(html) {
           const normalizedBase = base === './' ? './' : (base.endsWith('/') ? base : `${base}/`);
           const defaultGasUrl = String(process.env.VITE_GAS_WEBAPP_URL || '').trim();
-          const rawBackendUrl = String(process.env.VITE_BACKEND_API_URL || '').trim().replace(/\/+$/, '');
-          let defaultBackendUrl = rawBackendUrl;
-          if (rawBackendUrl && !/\/api\/crm$/i.test(rawBackendUrl)) {
-            if (/\/api$/i.test(rawBackendUrl)) {
-              defaultBackendUrl = `${rawBackendUrl}/crm`;
-            } else if (/^https?:\/\//i.test(rawBackendUrl)) {
-              try {
-                const parsed = new URL(rawBackendUrl);
-                if (!parsed.pathname || parsed.pathname === '/') {
-                  defaultBackendUrl = `${parsed.origin}/api/crm`;
-                }
-              } catch { /* ignore */ }
-            }
-          }
+          const defaultBackendUrl = String(process.env.VITE_BACKEND_API_URL || '').trim();
           const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};window.__RG_DEFAULT_BACKEND_API_URL__ = ${JSON.stringify(defaultBackendUrl)};</script>\n`;
           let nextHtml = html.replace('</head>', `${baseInject}  </head>`);
           if (normalizedBase !== './') {
@@ -105,7 +99,9 @@ export default defineConfig(({command}) => {
           }
           if (fs.existsSync(distDir)) {
             fs.writeFileSync(path.resolve(distDir, '.nojekyll'), '', 'utf8');
-            fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
+            if (isGitHubPagesBuild()) {
+              fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
+            }
           }
         },
       },

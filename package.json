@@ -9,10 +9,16 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "cf:dev": "wrangler dev",
+    "cf:build": "VITE_BASE_PATH=/ vite build",
+    "cf:deploy": "npm run cf:build && wrangler deploy"
   },
   "dependencies": {
+    "@cloudflare/workers-types": "^5.20261119.1",
     "@google/genai": "^2.4.0",
+    "@neondatabase/serverless": "^1.2.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/pg": "^8.23.1",
     "@vitejs/plugin-react": "^6.1.1",

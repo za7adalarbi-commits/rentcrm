@@ -2,18 +2,6 @@
   "version": 2,
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "functions": {
-    "api/**/*.ts": {
-      "maxDuration": 60,
-      "includeFiles": "{assets/js/core.js,database/schema.sql}"
-    }
-  },
-  "crons": [
-    {
-      "path": "/api/cron/sync",
-      "schedule": "* * * * *"
-    }
-  ],
   "rewrites": [
     {
       "source": "/api/(.*)",

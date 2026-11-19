@@ -36,24 +36,10 @@ function handleApiRequest(e, method) {
       return jsonResponse(true, 'تم تسجيل الدخول بنجاح.', loginData);
     }
 
-    if (action === 'syncFromNeonMirror' || action === 'realtimeSync') {
-      var syncTargetPayload = payload && typeof payload === 'object' && Object.keys(payload).length > 0 ? payload : body;
-      if (!syncTargetPayload.syncSecret && body.syncSecret) syncTargetPayload.syncSecret = body.syncSecret;
-      var mirrorRes = handleNeonMirrorSync_(syncTargetPayload);
+    if (action === 'syncFromNeonMirror') {
+      var mirrorRes = handleNeonMirrorSync_(payload);
       flushDirtyScriptCaches_();
-      var syncOut = {
-        success: mirrorRes.success !== false,
-        message: mirrorRes.success !== false ? 'تمت المزامنة الفورية مع Google Sheets بنجاح.' : (mirrorRes.error || 'فشل المزامنة الجزئية.'),
-        operation: mirrorRes.operation,
-        recordId: mirrorRes.recordId,
-        syncedAt: mirrorRes.syncedAt,
-        error: mirrorRes.error || null,
-        results: mirrorRes.results,
-        data: mirrorRes
-      };
-      return ContentService
-        .createTextOutput(JSON.stringify(syncOut))
-        .setMimeType(ContentService.MimeType.JSON);
+      return jsonResponse(true, 'تم تحديث نسخة Google Sheets الاحتياطية.', mirrorRes);
     }
 
     if (action === 'triggerNeonIncrementalSync') {

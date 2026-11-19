@@ -1,7 +1,7 @@
 import { crmCore, generateId, parseJsonArray } from './auth';
-import type { DbClient, DbExecutor } from './db';
+import type { DbClient, DbExecutor } from './dbCore';
+import { getEnv } from './env';
 import { logBackendError } from './logger';
-import { emitRealtimeEvent } from './realtimeBus';
 
 export interface SyncActor {
   id: string;
@@ -733,23 +733,6 @@ export async function ingestIncrementalSyncBatch(
     });
 
     const finishedAt = new Date().toISOString();
-    if (changedReservations.length > 0) {
-      await emitRealtimeEvent(executor, {
-        eventType: 'sync:batch',
-        entityType: 'Reservation',
-        recordId: changedReservations[0]?.id || '',
-        operation: 'UPDATE',
-        payload: {
-          count: changedReservations.length,
-          importedCount,
-          updatedCount,
-          extensionsCount,
-          reservations: changedReservations.slice(0, 25)
-        },
-        actorId: actor.id,
-        actorName: actor.name
-      }).catch(() => undefined);
-    }
     return {
       syncId,
       status: 'success',
@@ -800,264 +783,52 @@ export async function ingestIncrementalSyncBatch(
   }
 }
 
-export type SyncOperation = 'INSERT' | 'UPDATE' | 'DELETE';
-
-export interface EnqueueSyncInput {
-  entityType: string;
-  entityId: string;
-  recordId?: string;
-  operation?: SyncOperation | string;
-  action: string;
-  payload: Record<string, any>;
-  idempotencyKey?: string;
-  maxRetries?: number;
-}
-
-export interface FlushOutboxResult {
-  sent: number;
-  synced: number;
-  failed: number;
-  retried: number;
-  skipped: boolean;
-  reason?: string;
-  results?: any[];
-}
-
-const STALE_LOCK_SECONDS = 90;
-const DEFAULT_MAX_RETRIES = 8;
-
-let activeFlushPromise: Promise<FlushOutboxResult> | null = null;
-let retriggerRequested = false;
-
-export function mapOutboxRowToClient(row: any): Record<string, any> {
-  const rawStatus = str(row.status || 'pending').toLowerCase();
-  const normalizedStatus = crmCore.normalizeOutboxStatus(rawStatus);
-  return {
-    id: str(row.id),
-    entityType: str(row.entity_type ?? row.entityType),
-    entityId: str(row.entity_id ?? row.entityId),
-    recordId: str(row.record_id ?? row.recordId ?? row.entity_id),
-    operation: crmCore.normalizeSyncOperation(row.operation, row.action),
-    action: str(row.action),
-    idempotencyKey: str(row.idempotency_key ?? row.idempotencyKey),
-    status: normalizedStatus,
-    rawStatus,
-    retryCount: num(row.retry_count ?? row.retryCount, 0),
-    maxRetries: num(row.max_retries ?? row.maxRetries, DEFAULT_MAX_RETRIES),
-    nextRetryAt: row.next_retry_at instanceof Date ? row.next_retry_at.toISOString() : str(row.next_retry_at ?? row.nextRetryAt),
-    lockedAt: row.locked_at instanceof Date ? row.locked_at.toISOString() : str(row.locked_at ?? row.lockedAt),
-    workerId: str(row.worker_id ?? row.workerId),
-    lastError: str(row.last_error ?? row.lastError),
-    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at ?? row.createdAt),
-    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at ?? row.updatedAt),
-    syncedAt: row.synced_at instanceof Date ? row.synced_at.toISOString() : (row.processed_at instanceof Date ? row.processed_at.toISOString() : str(row.synced_at ?? row.processed_at))
-  };
-}
-
-export async function enqueueSyncOperation(
-  client: DbClient,
-  input: EnqueueSyncInput
-): Promise<string | null> {
-  const outboxId = generateId('MIR');
-  const operation = crmCore.normalizeSyncOperation(input.operation, input.action);
-  const recordId = str(input.recordId || input.entityId);
-  const maxRetries = Math.max(1, Math.min(20, num(input.maxRetries, DEFAULT_MAX_RETRIES)));
-  const idempotencyKey = str(input.idempotencyKey) || null;
-  const payloadObj = input.payload && typeof input.payload === 'object' ? input.payload : {};
-
-  try {
-    const res = await client.query<{ id: string }>(
-      `INSERT INTO sheets_mirror_outbox (
-         id, entity_type, entity_id, record_id, operation, action, payload,
-         idempotency_key, status, retry_count, max_retries, next_retry_at, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,'pending',0,$9,NOW(),NOW(),NOW())
-       ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> '' DO NOTHING
-       RETURNING id`,
-      [
-        outboxId,
-        str(input.entityType),
-        str(input.entityId),
-        recordId,
-        operation,
-        str(input.action),
-        JSON.stringify(payloadObj),
-        idempotencyKey,
-        maxRetries
-      ]
-    );
-    return res.rows[0]?.id || outboxId;
-  } catch {
-    // Non-blocking fallback for simplified mock DB drivers
-    try {
-      await client.query(
-        `INSERT INTO sheets_mirror_outbox (
-           id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, created_at
-         ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), NOW())`,
-        [outboxId, str(input.entityType), str(input.entityId), str(input.action), JSON.stringify(payloadObj)]
-      );
-      return outboxId;
-    } catch {
-      return null;
-    }
-  }
-}
-
 export async function enqueueSheetsMirror(
   client: DbClient,
   entityType: string,
   entityId: string,
   action: string,
-  payload: Record<string, any>,
-  options: { operation?: SyncOperation | string; recordId?: string; idempotencyKey?: string } = {}
-): Promise<string | null> {
-  return enqueueSyncOperation(client, {
-    entityType,
-    entityId,
-    recordId: options.recordId || entityId,
-    operation: options.operation || crmCore.normalizeSyncOperation('', action),
-    action,
-    payload,
-    idempotencyKey: options.idempotencyKey
-  });
-}
-
-async function recoverStaleOutboxLocks(executor: DbExecutor): Promise<number> {
-  try {
-    const res = await executor.query(
-      `UPDATE sheets_mirror_outbox
-       SET status = 'retry',
-           locked_at = NULL,
-           worker_id = '',
-           updated_at = NOW(),
-           last_error = CASE WHEN last_error = '' THEN 'Recovered stale processing lock' ELSE last_error END
-       WHERE status = 'processing'
-         AND locked_at IS NOT NULL
-         AND locked_at < NOW() - ($1 || ' seconds')::interval`,
-      [String(STALE_LOCK_SECONDS)]
-    );
-    return Number(res.rowCount || 0);
-  } catch {
-    return 0;
-  }
-}
-
-async function claimOutboxBatch(
-  executor: DbExecutor,
-  workerId: string,
-  batchSize = 50
-): Promise<any[]> {
-  await recoverStaleOutboxLocks(executor);
-
-  return executor.withTransaction(async (tx) => {
-    try {
-      const claimRes = await tx.query(
-        `WITH due AS (
-           SELECT id FROM sheets_mirror_outbox
-           WHERE status IN ('pending', 'retry') AND next_retry_at <= NOW()
-           ORDER BY created_at ASC
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         )
-         UPDATE sheets_mirror_outbox o
-         SET status = 'processing',
-             locked_at = NOW(),
-             worker_id = $2,
-             updated_at = NOW()
-         FROM due
-         WHERE o.id = due.id
-         RETURNING o.*`,
-        [batchSize, workerId]
-      );
-      return claimRes.rows;
-    } catch {
-      // Fallback for test mocks that don't support CTE FOR UPDATE SKIP LOCKED
-      const selRes = await tx.query(
-        `SELECT * FROM sheets_mirror_outbox
-         WHERE status IN ('pending', 'retry') AND next_retry_at <= NOW()
-         ORDER BY created_at ASC
-         LIMIT $1`,
-        [batchSize]
-      );
-      if (selRes.rows.length > 0) {
-        const ids = selRes.rows.map((r) => r.id);
-        await tx.query(
-          `UPDATE sheets_mirror_outbox
-           SET status = 'processing', locked_at = NOW(), worker_id = $2, updated_at = NOW()
-           WHERE id = ANY($1::text[])`,
-          [ids, workerId]
-        ).catch(() => undefined);
-      }
-      return selRes.rows;
-    }
-  });
-}
-
-async function stampEntityLastSync(
-  executor: DbExecutor,
-  items: Array<{ entityType: string; entityId: string; recordId?: string }>
+  payload: Record<string, any>
 ): Promise<void> {
-  const byTable: Record<string, string[]> = {
-    customers: [],
-    reservations: [],
-    follow_ups: [],
-    problems: [],
-    employees: []
-  };
-
-  for (const item of items) {
-    const et = str(item.entityType).toLowerCase();
-    const id = str(item.recordId || item.entityId);
-    if (!id) continue;
-    if (et === 'customer') byTable.customers.push(id);
-    else if (et === 'reservation') byTable.reservations.push(id);
-    else if (et === 'followup' || et === 'follow_up') byTable.follow_ups.push(id);
-    else if (et === 'problem' || et === 'issue') byTable.problems.push(id);
-    else if (et === 'employee' || et === 'user') byTable.employees.push(id);
-  }
-
-  for (const [table, ids] of Object.entries(byTable)) {
-    if (ids.length === 0) continue;
-    await executor.query(
-      `UPDATE ${table} SET last_sync_at = NOW() WHERE id = ANY($1::text[])`,
-      [Array.from(new Set(ids))]
-    ).catch(() => undefined);
+  try {
+    await client.query(
+      `INSERT INTO sheets_mirror_outbox (
+         id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, created_at
+       ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), NOW())`,
+      [generateId('MIR'), entityType, entityId, action, JSON.stringify(payload || {})]
+    );
+  } catch {
+    // Non-blocking mirror enqueue
   }
 }
 
-export async function flushSyncQueue(
+export async function flushSheetsMirrorOutbox(
   executor: DbExecutor,
-  fetchFn: typeof fetch = fetch,
-  options: { batchSize?: number; workerId?: string } = {}
-): Promise<FlushOutboxResult> {
-  const gasUrl = str(process.env.GAS_WEBAPP_URL);
-  const syncSecret = str(process.env.SYNC_API_SECRET);
+  fetchFn: typeof fetch = fetch
+): Promise<{ sent: number; failed: number; skipped: boolean }> {
+  const gasUrl = str(getEnv('GAS_WEBAPP_URL'));
+  const syncSecret = str(getEnv('SYNC_API_SECRET'));
   if (!gasUrl || !syncSecret) {
-    return { sent: 0, synced: 0, failed: 0, retried: 0, skipped: true, reason: 'GAS_OR_SECRET_UNCONFIGURED' };
+    return { sent: 0, failed: 0, skipped: true };
   }
 
-  const workerId = str(options.workerId) || generateId('WRK');
-  const batchSize = Math.min(100, Math.max(1, num(options.batchSize, 50)));
-  const claimedRows = await claimOutboxBatch(executor, workerId, batchSize);
-  if (claimedRows.length === 0) {
-    return { sent: 0, synced: 0, failed: 0, retried: 0, skipped: false };
+  const pendingRes = await executor.query(
+    `SELECT * FROM sheets_mirror_outbox
+     WHERE status IN ('pending', 'retry') AND next_retry_at <= NOW()
+     ORDER BY created_at ASC
+     LIMIT 50`
+  );
+  if (pendingRes.rows.length === 0) {
+    return { sent: 0, failed: 0, skipped: false };
   }
 
-  const items = claimedRows.map((r) => {
-    const payloadObj = typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {});
-    const op = crmCore.normalizeSyncOperation(r.operation, r.action);
-    const recId = str(r.record_id || r.entity_id || payloadObj?.id || payloadObj?.reservationNumber || payloadObj?.key);
-    return {
-      id: str(r.id),
-      outboxId: str(r.id),
-      idempotencyKey: str(r.idempotency_key) || str(r.id),
-      entityType: str(r.entity_type),
-      entityId: str(r.entity_id),
-      recordId: recId,
-      operation: op,
-      action: str(r.action),
-      payload: payloadObj
-    };
-  });
+  const items = pendingRes.rows.map((r) => ({
+    id: r.id,
+    entityType: r.entity_type,
+    entityId: r.entity_id,
+    action: r.action,
+    payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {})
+  }));
 
   try {
     const resp = await fetchFn(gasUrl, {
@@ -1066,454 +837,41 @@ export async function flushSyncQueue(
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({
         action: 'syncFromNeonMirror',
-        payload: {
-          syncSecret,
-          workerId,
-          batchSize: items.length,
-          items
-        }
+        payload: { syncSecret, items }
       })
     });
     const text = await resp.text();
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error(`GAS_INVALID_JSON (HTTP ${resp.status}): ${text.slice(0, 160)}`);
-    }
-
+    const parsed = JSON.parse(text);
     if (!resp.ok || !parsed?.success) {
-      throw new Error(parsed?.error || parsed?.message || `GAS HTTP ${resp.status}`);
+      throw new Error(parsed?.message || `GAS HTTP ${resp.status}`);
     }
 
-    const perResults = Array.isArray(parsed?.data?.results)
-      ? parsed.data.results
-      : (Array.isArray(parsed?.results) ? parsed.results : null);
-
-    const syncedRows: any[] = [];
-    const failedItems: Array<{ row: any; errMsg: string }> = [];
-
-    if (perResults && perResults.length > 0) {
-      const resultByOutboxId = new Map<string, any>();
-      for (const resItem of perResults) {
-        const key = str(resItem?.outboxId || resItem?.id);
-        if (key) resultByOutboxId.set(key, resItem);
-      }
-      for (const row of claimedRows) {
-        const resItem = resultByOutboxId.get(str(row.id));
-        if (!resItem || resItem.success !== false) {
-          syncedRows.push(row);
-        } else {
-          failedItems.push({ row, errMsg: str(resItem.error || 'ITEM_SYNC_FAILED').slice(0, 400) });
-        }
-      }
-    } else {
-      syncedRows.push(...claimedRows);
-    }
-
-    if (syncedRows.length > 0) {
-      const syncedIds = syncedRows.map((r) => str(r.id));
-      await executor.query(
-        `UPDATE sheets_mirror_outbox
-         SET status = 'synced',
-             locked_at = NULL,
-             worker_id = '',
-             last_error = '',
-             processed_at = NOW(),
-             synced_at = NOW(),
-             updated_at = NOW()
-         WHERE id = ANY($1::text[])`,
-        [syncedIds]
-      );
-      await stampEntityLastSync(
-        executor,
-        syncedRows.map((r) => ({ entityType: str(r.entity_type), entityId: str(r.entity_id), recordId: str(r.record_id) }))
-      );
-    }
-
-    let failedCount = 0;
-    let retriedCount = 0;
-    for (const f of failedItems) {
-      const nextRetryCount = num(f.row.retry_count, 0) + 1;
-      const maxRetries = Math.max(1, num(f.row.max_retries, DEFAULT_MAX_RETRIES));
-      const dead = nextRetryCount >= maxRetries;
-      const delaySeconds = crmCore.computeExponentialBackoffSeconds(nextRetryCount, 5, 900);
-      await executor.query(
-        `UPDATE sheets_mirror_outbox
-         SET status = $2,
-             retry_count = $3,
-             last_error = $4,
-             locked_at = NULL,
-             worker_id = '',
-             updated_at = NOW(),
-             next_retry_at = NOW() + ($5 || ' seconds')::interval
-         WHERE id = $1`,
-        [f.row.id, dead ? 'failed' : 'retry', nextRetryCount, f.errMsg, String(delaySeconds)]
-      ).catch(() => undefined);
-      if (dead) failedCount++;
-      else retriedCount++;
-    }
-
-    await emitRealtimeEvent(executor, {
-      eventType: 'sync:queue_updated',
-      entityType: 'SyncQueue',
-      operation: 'UPDATE',
-      payload: {
-        synced: syncedRows.length,
-        failed: failedCount,
-        retried: retriedCount,
-        syncedAt: new Date().toISOString()
-      }
-    }).catch(() => undefined);
-
-    return {
-      sent: syncedRows.length,
-      synced: syncedRows.length,
-      failed: failedCount,
-      retried: retriedCount,
-      skipped: false,
-      results: perResults || undefined
-    };
+    const ids = items.map((x) => x.id);
+    await executor.query(
+      `UPDATE sheets_mirror_outbox
+       SET status = 'sent', processed_at = NOW(), last_error = ''
+       WHERE id = ANY($1::text[])`,
+      [ids]
+    );
+    return { sent: ids.length, failed: 0, skipped: false };
   } catch (err: any) {
     const errMsg = String(err?.message || 'MIRROR_FAILED').slice(0, 400);
-    let failedCount = 0;
-    let retriedCount = 0;
-    for (const row of claimedRows) {
+    for (const row of pendingRes.rows) {
       const nextRetryCount = num(row.retry_count, 0) + 1;
-      const maxRetries = Math.max(1, num(row.max_retries, DEFAULT_MAX_RETRIES));
-      const dead = nextRetryCount >= maxRetries;
-      const delaySeconds = crmCore.computeExponentialBackoffSeconds(nextRetryCount, 5, 900);
+      const dead = nextRetryCount >= 8;
+      const delaySeconds = Math.min(3600, Math.pow(2, nextRetryCount) * 15);
       await executor.query(
         `UPDATE sheets_mirror_outbox
          SET status = $2,
              retry_count = $3,
              last_error = $4,
-             locked_at = NULL,
-             worker_id = '',
-             updated_at = NOW(),
              next_retry_at = NOW() + ($5 || ' seconds')::interval
          WHERE id = $1`,
         [row.id, dead ? 'failed' : 'retry', nextRetryCount, errMsg, String(delaySeconds)]
       ).catch(() => undefined);
-      if (dead) failedCount++;
-      else retriedCount++;
     }
-    await emitRealtimeEvent(executor, {
-      eventType: 'sync:queue_updated',
-      entityType: 'SyncQueue',
-      operation: 'UPDATE',
-      payload: {
-        synced: 0,
-        failed: failedCount,
-        retried: retriedCount,
-        error: errMsg
-      }
-    }).catch(() => undefined);
-    return {
-      sent: 0,
-      synced: 0,
-      failed: failedCount,
-      retried: retriedCount,
-      skipped: false,
-      reason: errMsg
-    };
+    return { sent: 0, failed: pendingRes.rows.length, skipped: false };
   }
-}
-
-export async function flushSheetsMirrorOutbox(
-  executor: DbExecutor,
-  fetchFn: typeof fetch = fetch
-): Promise<FlushOutboxResult> {
-  return flushSyncQueue(executor, fetchFn);
-}
-
-export function triggerImmediateSync(
-  executor: DbExecutor,
-  fetchFn: typeof fetch = fetch
-): Promise<FlushOutboxResult> {
-  if (activeFlushPromise) {
-    retriggerRequested = true;
-    return activeFlushPromise;
-  }
-
-  activeFlushPromise = (async () => {
-    let aggregate: FlushOutboxResult = { sent: 0, synced: 0, failed: 0, retried: 0, skipped: false };
-    try {
-      do {
-        retriggerRequested = false;
-        const pass = await flushSyncQueue(executor, fetchFn, { batchSize: 50 });
-        aggregate = {
-          sent: aggregate.sent + pass.sent,
-          synced: aggregate.synced + pass.synced,
-          failed: aggregate.failed + pass.failed,
-          retried: aggregate.retried + pass.retried,
-          skipped: pass.skipped,
-          reason: pass.reason || aggregate.reason
-        };
-        if (pass.skipped || (pass.sent === 0 && !retriggerRequested)) break;
-      } while (retriggerRequested);
-    } finally {
-      activeFlushPromise = null;
-      retriggerRequested = false;
-    }
-    return aggregate;
-  })();
-
-  return activeFlushPromise;
-}
-
-export async function retryFailedSyncItems(
-  executor: DbExecutor,
-  ids?: string[],
-  fetchFn: typeof fetch = fetch
-): Promise<{ resetCount: number; flush: FlushOutboxResult }> {
-  const cleanIds = Array.isArray(ids) ? ids.map((x) => str(x)).filter(Boolean) : [];
-  const res = cleanIds.length > 0
-    ? await executor.query(
-        `UPDATE sheets_mirror_outbox
-         SET status = 'pending',
-             retry_count = 0,
-             next_retry_at = NOW(),
-             locked_at = NULL,
-             worker_id = '',
-             last_error = '',
-             updated_at = NOW()
-         WHERE id = ANY($1::text[])`,
-        [cleanIds]
-      )
-    : await executor.query(
-        `UPDATE sheets_mirror_outbox
-         SET status = 'pending',
-             retry_count = 0,
-             next_retry_at = NOW(),
-             locked_at = NULL,
-             worker_id = '',
-             last_error = '',
-             updated_at = NOW()
-         WHERE status IN ('failed', 'retry')`
-      );
-
-  const resetCount = Number(res.rowCount || 0);
-  const flush = await flushSyncQueue(executor, fetchFn);
-  return { resetCount, flush };
-}
-
-export async function getSyncQueueSummary(
-  executor: DbExecutor,
-  limit = 60
-): Promise<Record<string, any>> {
-  const safeLimit = Math.min(200, Math.max(10, num(limit, 60)));
-  try {
-    const [countsRes, itemsRes] = await Promise.all([
-      executor.query<{ status: string; cnt: string }>(
-        `SELECT status, COUNT(*)::text AS cnt FROM sheets_mirror_outbox GROUP BY status`
-      ),
-      executor.query(
-        `SELECT id, entity_type, entity_id, record_id, operation, action, status,
-                retry_count, max_retries, next_retry_at, locked_at, last_error,
-                created_at, updated_at, processed_at, synced_at
-         FROM sheets_mirror_outbox
-         ORDER BY created_at DESC
-         LIMIT $1`,
-        [safeLimit]
-      )
-    ]);
-
-    const counts = {
-      pending: 0,
-      processing: 0,
-      synced: 0,
-      failed: 0,
-      total: 0
-    };
-
-    for (const row of countsRes.rows) {
-      const c = Number(row.cnt || 0);
-      const norm = crmCore.normalizeOutboxStatus(row.status);
-      if (norm === 'synced') counts.synced += c;
-      else if (norm === 'processing') counts.processing += c;
-      else if (norm === 'failed') counts.failed += c;
-      else counts.pending += c;
-      counts.total += c;
-    }
-
-    return {
-      counts,
-      items: itemsRes.rows.map(mapOutboxRowToClient),
-      gasConfigured: Boolean(str(process.env.GAS_WEBAPP_URL) && str(process.env.SYNC_API_SECRET))
-    };
-  } catch {
-    return {
-      counts: { pending: 0, processing: 0, synced: 0, failed: 0, total: 0 },
-      items: [],
-      gasConfigured: Boolean(str(process.env.GAS_WEBAPP_URL) && str(process.env.SYNC_API_SECRET))
-    };
-  }
-}
-
-export async function runBackupDeltaSync(
-  executor: DbExecutor,
-  actor: SyncActor = { id: 'CRON_1M', name: 'المزامنة الاحتياطية (كل دقيقة)', role: 'system' },
-  options: { pullRentalGate?: boolean; fetchFn?: typeof fetch } = {}
-): Promise<Record<string, any>> {
-  const fetchFn = options.fetchFn || fetch;
-  const startedAt = new Date().toISOString();
-  let enqueuedMissed = 0;
-
-  // 1) Scan only unsynced/modified Neon delta rows (never full-table dump)
-  try {
-    const [missedRes, missedCust, missedPrb] = await Promise.all([
-      executor.query(
-        `SELECT r.* FROM reservations r
-         WHERE r.deleted_at IS NULL
-           AND (r.last_sync_at IS NULL OR r.updated_at > r.last_sync_at)
-           AND NOT EXISTS (
-             SELECT 1 FROM sheets_mirror_outbox o
-             WHERE o.entity_type = 'Reservation' AND o.entity_id = r.id AND o.status IN ('pending', 'processing', 'retry')
-           )
-         ORDER BY r.updated_at ASC
-         LIMIT 50`
-      ),
-      executor.query(
-        `SELECT c.* FROM customers c
-         WHERE c.deleted_at IS NULL
-           AND (c.last_sync_at IS NULL OR c.updated_at > c.last_sync_at)
-           AND NOT EXISTS (
-             SELECT 1 FROM sheets_mirror_outbox o
-             WHERE o.entity_type = 'Customer' AND o.entity_id = c.id AND o.status IN ('pending', 'processing', 'retry')
-           )
-         ORDER BY c.updated_at ASC
-         LIMIT 50`
-      ),
-      executor.query(
-        `SELECT p.* FROM problems p
-         WHERE p.deleted_at IS NULL
-           AND (p.last_sync_at IS NULL OR p.updated_at > p.last_sync_at)
-           AND NOT EXISTS (
-             SELECT 1 FROM sheets_mirror_outbox o
-             WHERE o.entity_type = 'Problem' AND o.entity_id = p.id AND o.status IN ('pending', 'processing', 'retry')
-           )
-         ORDER BY p.updated_at ASC
-         LIMIT 50`
-      )
-    ]);
-
-    for (const row of missedCust.rows) {
-      const custObj = {
-        id: str(row.id),
-        name: str(row.name),
-        phone: str(row.phone),
-        email: str(row.email),
-        idNumber: str(row.id_number),
-        companyName: str(row.company_name),
-        notes: str(row.notes),
-        status: str(row.status || 'active'),
-        createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at),
-        updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at)
-      };
-      await enqueueSyncOperation(executor, {
-        entityType: 'Customer',
-        entityId: custObj.id,
-        recordId: custObj.id,
-        operation: 'UPDATE',
-        action: 'upsertCustomer',
-        payload: custObj,
-        idempotencyKey: `DELTA:Customer:${custObj.id}:${custObj.updatedAt}`
-      });
-      enqueuedMissed++;
-    }
-
-    for (const row of missedRes.rows) {
-      const resObj = mapReservationRowToClient(row, false);
-      await enqueueSyncOperation(executor, {
-        entityType: 'Reservation',
-        entityId: resObj.id,
-        recordId: resObj.reservationNumber || resObj.id,
-        operation: 'UPDATE',
-        action: 'upsertReservation',
-        payload: resObj,
-        idempotencyKey: `DELTA:Reservation:${resObj.id}:${resObj.updatedAt}`
-      });
-      enqueuedMissed++;
-    }
-
-    for (const row of missedPrb.rows) {
-      const prbObj = {
-        id: str(row.id),
-        problemNumber: str(row.problem_number),
-        reservationId: str(row.reservation_id),
-        reservationNumber: str(row.reservation_number),
-        customerName: str(row.customer_name),
-        createdById: str(row.created_by_id),
-        createdByName: str(row.created_by_name),
-        assignedEmployeeIds: parseJsonArray<string>(row.assigned_employee_ids),
-        assignedEmployeeNames: parseJsonArray<string>(row.assigned_employee_names),
-        description: str(row.description),
-        priority: str(row.priority || 'متوسط'),
-        status: str(row.status || 'جديدة'),
-        createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at),
-        updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at)
-      };
-      await enqueueSyncOperation(executor, {
-        entityType: 'Problem',
-        entityId: prbObj.id,
-        recordId: prbObj.id,
-        operation: 'UPDATE',
-        action: 'upsertProblem',
-        payload: prbObj,
-        idempotencyKey: `DELTA:Problem:${prbObj.id}:${prbObj.updatedAt}`
-      });
-      enqueuedMissed++;
-    }
-  } catch {
-    // Non-fatal if tables are not yet migrated in mocks
-  }
-
-  // 2) Flush due outbox items (pending + exponential backoff retries)
-  const flushResult = await flushSyncQueue(executor, fetchFn, { batchSize: 50 });
-
-  // 3) Optional Rental Gate delta pull when requested & configured
-  let rgPull: SyncIngestResult | null = null;
-  if (options.pullRentalGate && process.env.RG_TOKEN) {
-    try {
-      rgPull = await pullFromRentalGateDirect(executor, actor, { preset: '3d', maxPages: 5 }, fetchFn);
-    } catch {
-      // Logged in pullFromRentalGateDirect
-    }
-  }
-
-  const finishedAt = new Date().toISOString();
-  await executor.query(
-    `INSERT INTO sync_checkpoints (
-       source, last_sync_at, last_successful_at, last_cursor, last_batch_count,
-       last_status, last_error, meta, updated_at
-     ) VALUES ('backup_delta_sync',$1::timestamptz,$1::timestamptz,$2,$3,$4,$5,$6::jsonb,$1::timestamptz)
-     ON CONFLICT (source) DO UPDATE SET
-       last_sync_at = EXCLUDED.last_sync_at,
-       last_successful_at = CASE WHEN EXCLUDED.last_status = 'success' THEN EXCLUDED.last_sync_at ELSE sync_checkpoints.last_successful_at END,
-       last_cursor = EXCLUDED.last_cursor,
-       last_batch_count = EXCLUDED.last_batch_count,
-       last_status = EXCLUDED.last_status,
-       last_error = EXCLUDED.last_error,
-       meta = EXCLUDED.meta,
-       updated_at = EXCLUDED.updated_at`,
-    [
-      finishedAt,
-      startedAt,
-      enqueuedMissed + flushResult.synced,
-      flushResult.failed > 0 && flushResult.synced === 0 ? 'error' : 'success',
-      str(flushResult.reason),
-      JSON.stringify({ enqueuedMissed, flushResult, rgPull: rgPull ? { importedCount: rgPull.importedCount, updatedCount: rgPull.updatedCount } : null })
-    ]
-  ).catch(() => undefined);
-
-  return {
-    startedAt,
-    finishedAt,
-    enqueuedMissed,
-    flushResult,
-    rgPull
-  };
 }
 
 export async function pullFromRentalGateDirect(
@@ -1522,12 +880,12 @@ export async function pullFromRentalGateDirect(
   payload: Record<string, any> = {},
   fetchFn: typeof fetch = fetch
 ): Promise<SyncIngestResult> {
-  const rgToken = str(process.env.RG_TOKEN).replace(/^Bearer\s+/i, '');
+  const rgToken = str(getEnv('RG_TOKEN')).replace(/^Bearer\s+/i, '');
   if (!rgToken) {
     throw new Error('NO_RG_TOKEN: متغير RG_TOKEN غير مضبوط على الخادم.');
   }
 
-  const baseApi = str(process.env.RG_API_BASE_URL || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
+  const baseApi = str(getEnv('RG_API_BASE_URL', 'https://api.rentalgate.net/api')).replace(/\/+$/, '');
   const appliedRange = crmCore.resolvePullDateRange(payload || {});
   const pageSize = 100;
   const maxPages = Math.min(50, Math.max(1, num(payload?.maxPages, 25)));
@@ -1548,16 +906,7 @@ export async function pullFromRentalGateDirect(
         const errBody = await resp.text().catch(() => '');
         throw new Error(`RG_API_HTTP_${resp.status}: ${errBody.slice(0, 200)}`);
       }
-      const rawText = await resp.text();
-      let json: any = null;
-      try {
-        json = rawText ? JSON.parse(rawText) : null;
-      } catch {
-        throw new Error(`RG_API_INVALID_JSON (HTTP ${resp.status}): تعذر قراءة بيانات Rental Gate API.`);
-      }
-      if (!json || typeof json !== 'object') {
-        throw new Error(`RG_API_EMPTY_RESPONSE (HTTP ${resp.status}): أعادت واجهة Rental Gate استجابة فارغة.`);
-      }
+      const json: any = await resp.json();
       pages++;
       const list = Array.isArray(json)
         ? json

@@ -1,46 +1,25 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import pg from 'pg';
+import {
+  ensureSchemaInitialized,
+  getDatabaseUrl,
+  isDatabaseConfigured,
+  type DbClient,
+  type DbExecutor,
+  type QueryResult,
+  type QueryResultRow
+} from './dbCore';
+import { getEnv } from './env';
+
+export { ensureSchemaInitialized, getDatabaseUrl, isDatabaseConfigured };
+export type { DbClient, DbExecutor, QueryResult, QueryResultRow };
 
 const { Pool } = pg;
 
-export interface QueryResultRow {
-  [column: string]: any;
-}
-
-export interface QueryResult<T extends QueryResultRow = any> {
-  rows: T[];
-  rowCount: number | null;
-}
-
-export interface DbClient {
-  query<T extends QueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<T>>;
-}
-
-export interface DbExecutor extends DbClient {
-  withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T>;
-}
-
 let cachedPool: pg.Pool | null = null;
-let schemaInitialized = false;
-let schemaInitPromise: Promise<void> | null = null;
-
-export function getDatabaseUrl(): string {
-  return String(
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.NEON_DATABASE_URL ||
-    ''
-  ).trim();
-}
-
-export function isDatabaseConfigured(): boolean {
-  return Boolean(getDatabaseUrl());
-}
 
 function shouldUseSsl(connectionString: string): boolean {
   const lower = connectionString.toLowerCase();
-  if (lower.includes('sslmode=disable') || process.env.PGSSLMODE === 'disable') {
+  if (lower.includes('sslmode=disable') || getEnv('PGSSLMODE') === 'disable') {
     return false;
   }
   if (lower.includes('localhost') || lower.includes('127.0.0.1')) {
@@ -58,7 +37,7 @@ export function getPool(): pg.Pool {
   cachedPool = new Pool({
     connectionString,
     ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined,
-    max: Number(process.env.PG_POOL_MAX || 10),
+    max: Number(getEnv('PG_POOL_MAX', '10')) || 10,
     idleTimeoutMillis: 20000,
     connectionTimeoutMillis: 10000,
     allowExitOnIdle: true
@@ -97,58 +76,6 @@ export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
       }
     }
   };
-}
-
-function loadSchemaSql(): string {
-  const candidates = [
-    path.resolve(process.cwd(), 'database/schema.sql'),
-    path.resolve(import.meta.dirname || process.cwd(), '../database/schema.sql'),
-    path.resolve(process.cwd(), '../database/schema.sql'),
-    '/var/task/database/schema.sql'
-  ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      return fs.readFileSync(p, 'utf8');
-    }
-  }
-  throw new Error('SCHEMA_FILE_NOT_FOUND: لم يتم العثور على database/schema.sql');
-}
-
-export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {
-  if (schemaInitialized) return;
-  if (schemaInitPromise) return schemaInitPromise;
-
-  schemaInitPromise = (async () => {
-    try {
-      const check = await executor.query<{
-        emp_reg: string | null;
-        cust_reg: string | null;
-        evt_reg: string | null;
-        has_op_col: boolean;
-      }>(
-        `SELECT to_regclass('public.employees') AS emp_reg,
-                to_regclass('public.customers') AS cust_reg,
-                to_regclass('public.realtime_events') AS evt_reg,
-                EXISTS (
-                  SELECT 1 FROM information_schema.columns
-                  WHERE table_schema = 'public'
-                    AND table_name = 'sheets_mirror_outbox'
-                    AND column_name = 'operation'
-                ) AS has_op_col`
-      );
-      const row = check.rows[0];
-      const upToDate = Boolean(row && row.emp_reg && row.cust_reg && row.evt_reg && row.has_op_col);
-      if (!upToDate) {
-        const sql = loadSchemaSql();
-        await executor.query(sql);
-      }
-      schemaInitialized = true;
-    } finally {
-      schemaInitPromise = null;
-    }
-  })();
-
-  return schemaInitPromise;
 }
 
 export async function checkDatabaseHealth(): Promise<{

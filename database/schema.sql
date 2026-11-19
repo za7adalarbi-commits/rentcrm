@@ -1,5 +1,5 @@
 -- ============================================================================
--- RENTAL GATE CRM — Neon PostgreSQL Schema (18 Core Tables + 5 Ops Tables)
+-- RENTAL GATE CRM — Neon PostgreSQL Schema (17 Exact Core Tables + 3 Ops Tables)
 -- Preserves 100% of fields from google-apps-script/Database.gs (RG_SHEETS_SCHEMA)
 -- Designed for 100,000+ reservations, trigram full-text search, FKs & transactions
 -- ============================================================================
@@ -36,26 +36,8 @@ CREATE TABLE IF NOT EXISTS employees (
   permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
   status TEXT NOT NULL DEFAULT 'active',
   last_activity TEXT NOT NULL DEFAULT '',
-  last_sync_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  deleted_at TIMESTAMPTZ
-);
-
--- 2b. Customers (mirrors RG_SHEETS.CUSTOMERS)
-CREATE TABLE IF NOT EXISTS customers (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL DEFAULT '',
-  phone TEXT NOT NULL DEFAULT '',
-  email TEXT NOT NULL DEFAULT '',
-  id_number TEXT NOT NULL DEFAULT '',
-  company_name TEXT NOT NULL DEFAULT '',
-  notes TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
-  last_sync_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  deleted_at TIMESTAMPTZ
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 3. Reservations (mirrors RG_SHEETS.RESERVATIONS — 52 columns)
@@ -111,8 +93,6 @@ CREATE TABLE IF NOT EXISTS reservations (
   has_problem BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_sync_at TIMESTAMPTZ,
-  deleted_at TIMESTAMPTZ,
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
   raw_json TEXT NOT NULL DEFAULT ''
 );
@@ -172,9 +152,7 @@ CREATE TABLE IF NOT EXISTS follow_ups (
   notes TEXT NOT NULL DEFAULT '',
   follow_up_date TEXT NOT NULL DEFAULT '',
   follow_up_time TEXT NOT NULL DEFAULT '',
-  last_sync_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 7. FollowUpHistory (mirrors RG_SHEETS.FOLLOWUP_HISTORY)
@@ -210,9 +188,7 @@ CREATE TABLE IF NOT EXISTS problems (
   priority TEXT NOT NULL DEFAULT 'متوسط',
   status TEXT NOT NULL DEFAULT 'جديدة',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_sync_at TIMESTAMPTZ,
-  deleted_at TIMESTAMPTZ
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 9. Issues (mirrors RG_SHEETS.ISSUES — identical schema to Problems for Sheets compatibility)
@@ -351,27 +327,19 @@ CREATE TABLE IF NOT EXISTS sync_checkpoints (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 19. CRM -> Google Sheets Write-Back Outbox Queue (Transactional Outbox Pattern)
+-- 19. CRM -> Google Sheets Write-Back Outbox Queue (for backup mirror resilience)
 CREATE TABLE IF NOT EXISTS sheets_mirror_outbox (
   id TEXT PRIMARY KEY,
   entity_type TEXT NOT NULL,
   entity_id TEXT NOT NULL,
-  record_id TEXT NOT NULL DEFAULT '',
-  operation TEXT NOT NULL DEFAULT 'UPDATE',
   action TEXT NOT NULL,
   payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  idempotency_key TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   retry_count INTEGER NOT NULL DEFAULT 0,
-  max_retries INTEGER NOT NULL DEFAULT 8,
   next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  locked_at TIMESTAMPTZ,
-  worker_id TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  processed_at TIMESTAMPTZ,
-  synced_at TIMESTAMPTZ
+  processed_at TIMESTAMPTZ
 );
 
 -- 20. Server Error & Diagnostics Log (sanitized, never stores secrets)
@@ -384,46 +352,6 @@ CREATE TABLE IF NOT EXISTS error_logs (
   meta JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- 21. Real-Time Broadcast Events Cursor (multi-worker SSE + delta poll replay)
-CREATE TABLE IF NOT EXISTS realtime_events (
-  seq BIGSERIAL PRIMARY KEY,
-  id TEXT NOT NULL UNIQUE,
-  event_type TEXT NOT NULL,
-  entity_type TEXT NOT NULL,
-  record_id TEXT NOT NULL DEFAULT '',
-  operation TEXT NOT NULL DEFAULT 'UPDATE',
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  actor_id TEXT NOT NULL DEFAULT '',
-  actor_name TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- 22. Request-Level Idempotency Deduplication Store
-CREATE TABLE IF NOT EXISTS idempotency_requests (
-  idempotency_key TEXT PRIMARY KEY,
-  action TEXT NOT NULL DEFAULT '',
-  response JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Idempotent forward migrations for existing Neon installations
-ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
-ALTER TABLE employees ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE reservations ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
-ALTER TABLE reservations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
-ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE problems ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ;
-ALTER TABLE problems ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS record_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'UPDATE';
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 8;
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ;
 
 -- ============================================================================
 -- Performance Indexes for 100,000+ Reservations & Fast Faceted Queries
@@ -474,11 +402,5 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_user_date ON activity_log (user_id, 
 CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_employee_id, is_read, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_employee_active ON sessions (employee_id, is_revoked, expires_at);
 CREATE INDEX IF NOT EXISTS idx_sync_log_started_at ON sync_log (started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_mirror_outbox_pending ON sheets_mirror_outbox (status, next_retry_at) WHERE status IN ('pending', 'retry', 'failed', 'processing');
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mirror_outbox_idempotency ON sheets_mirror_outbox (idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';
-CREATE INDEX IF NOT EXISTS idx_customers_phone ON customers (phone);
-CREATE INDEX IF NOT EXISTS idx_customers_updated_at_desc ON customers (updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_customers_name_trgm ON customers USING GIN (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_realtime_events_created_at ON realtime_events (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_idempotency_requests_created ON idempotency_requests (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mirror_outbox_pending ON sheets_mirror_outbox (status, next_retry_at) WHERE status IN ('pending', 'retry');
 CREATE INDEX IF NOT EXISTS idx_error_logs_created_at ON error_logs (created_at DESC);

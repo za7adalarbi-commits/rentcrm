@@ -1548,66 +1548,6 @@ svg.rg-spinning {
   flex-wrap: wrap;
 }
 
-/* ==========================================================================
-   Real-Time Sync Status Indicator
-   ========================================================================== */
-.sync-live-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 32px;
-  padding: 0 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-hairline);
-  background: var(--bg-surface-subtle);
-  color: var(--text-primary);
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color var(--transition-fast), background-color var(--transition-fast);
-}
-
-.sync-live-pill:hover {
-  border-color: var(--border-strong);
-  background: var(--bg-hover);
-}
-
-.sync-live-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 9999px;
-  background: var(--text-muted);
-  flex-shrink: 0;
-}
-
-.sync-live-dot.is-live {
-  background: #16a34a;
-  animation: rgSyncDotPulse 2.2s ease-in-out infinite;
-}
-
-.sync-live-dot.is-syncing {
-  background: #d97706;
-  animation: rgPulse 0.9s ease-in-out infinite;
-}
-
-.sync-live-dot.is-error {
-  background: var(--brand-primary);
-}
-
-@keyframes rgSyncDotPulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.35); }
-  50% { box-shadow: 0 0 0 4px rgba(22, 163, 74, 0); }
-}
-
-@media (max-width: 640px) {
-  .sync-live-pill {
-    padding: 0 8px;
-    font-size: 11px;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .route-view,
   .toast-item,
@@ -1617,8 +1557,7 @@ svg.rg-spinning {
   .rg-skeleton-line,
   .rg-skeleton-box,
   .rg-spinning svg,
-  svg.rg-spinning,
-  .sync-live-dot {
+  svg.rg-spinning {
     animation: none !important;
   }
   *,
