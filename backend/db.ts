@@ -3,6 +3,7 @@ import {
   ensureSchemaInitialized,
   getDatabaseUrl,
   isDatabaseConfigured,
+  resetSchemaInitState,
   type DbClient,
   type DbExecutor,
   type QueryResult,
@@ -10,12 +11,13 @@ import {
 } from './dbCore';
 import { getEnv } from './env';
 
-export { ensureSchemaInitialized, getDatabaseUrl, isDatabaseConfigured };
+export { ensureSchemaInitialized, getDatabaseUrl, isDatabaseConfigured, resetSchemaInitState };
 export type { DbClient, DbExecutor, QueryResult, QueryResultRow };
 
 const { Pool } = pg;
 
 let cachedPool: pg.Pool | null = null;
+let cachedPoolUrl = '';
 
 function shouldUseSsl(connectionString: string): boolean {
   const lower = connectionString.toLowerCase();
@@ -28,11 +30,41 @@ function shouldUseSsl(connectionString: string): boolean {
   return true;
 }
 
+export async function resetPool(): Promise<void> {
+  const prev = cachedPool;
+  cachedPool = null;
+  cachedPoolUrl = '';
+  resetSchemaInitState();
+  if (prev) {
+    try {
+      await prev.end();
+    } catch {
+      // ignore close errors during dynamic pool swap
+    }
+  }
+}
+
 export function getPool(): pg.Pool {
-  if (cachedPool) return cachedPool;
   const connectionString = getDatabaseUrl();
   if (!connectionString) {
+    if (cachedPool) {
+      const stale = cachedPool;
+      cachedPool = null;
+      cachedPoolUrl = '';
+      resetSchemaInitState();
+      void stale.end().catch(() => undefined);
+    }
     throw new Error('DATABASE_UNCONFIGURED: متغير DATABASE_URL غير مضبوط في بيئة الخادم.');
+  }
+  if (cachedPool && cachedPoolUrl === connectionString) {
+    return cachedPool;
+  }
+  if (cachedPool && cachedPoolUrl !== connectionString) {
+    const prev = cachedPool;
+    cachedPool = null;
+    cachedPoolUrl = '';
+    resetSchemaInitState();
+    void prev.end().catch(() => undefined);
   }
   cachedPool = new Pool({
     connectionString,
@@ -42,6 +74,7 @@ export function getPool(): pg.Pool {
     connectionTimeoutMillis: 10000,
     allowExitOnIdle: true
   });
+  cachedPoolUrl = connectionString;
   return cachedPool;
 }
 

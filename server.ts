@@ -5,6 +5,7 @@ import path from 'node:path';
 import crmHandler from './api/crm';
 import healthHandler from './api/health';
 import syncHandler from './api/sync';
+import autoConnectHandler from './api/auto-connect';
 
 async function startServer() {
   const app = express();
@@ -24,6 +25,10 @@ async function startServer() {
 
   app.all('/api/sync', (req, res) => {
     void syncHandler(req, res);
+  });
+
+  app.all(['/api/auto-connect', '/api/auto-connect/status'], (req, res) => {
+    void autoConnectHandler(req, res, rootDir);
   });
 
   if (process.env.NODE_ENV !== 'production') {

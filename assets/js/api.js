@@ -111,7 +111,12 @@
     return getBackendApiUrl() || getGasUrl();
   }
 
-  function probeBackendHealth() {
+  function probeBackendHealth(forceReprobe) {
+    if (forceReprobe) {
+      backendProbeDone = false;
+      backendProbePromise = null;
+      detectedBackendUrl = '';
+    }
     if (backendProbeDone) return Promise.resolve(detectedBackendUrl);
     if (backendProbePromise) return backendProbePromise;
     if (typeof window === 'undefined' || typeof fetch !== 'function') {
@@ -1197,6 +1202,115 @@
 
   function isLiveMode() {
     return Boolean(getTransportUrl());
+  }
+
+  function applyRuntimeConnection(cfg) {
+    var nextCfg = cfg && typeof cfg === 'object' ? cfg : {};
+    var nextGas = String(nextCfg.gasWebAppUrl || '').trim();
+    var nextBackend = String(nextCfg.backendApiUrl || '').trim();
+
+    root.RG_APP_CONFIG = Object.assign({}, root.RG_APP_CONFIG || {}, {
+      gasWebAppUrl: nextGas,
+      backendApiUrl: nextBackend
+    });
+
+    _cachedConnInfo = null;
+    safeStorageSet(STORAGE_GAS_URL, nextGas ? '' : '');
+    safeStorageSet(STORAGE_BACKEND_URL, nextBackend ? nextBackend : '');
+    detectedBackendUrl = nextBackend;
+    backendProbeDone = true;
+    backendProbePromise = null;
+    clearCache();
+  }
+
+  async function getAutoConnectFileStatus() {
+    if (typeof fetch !== 'function' || typeof window === 'undefined') {
+      return { supported: false, data: null };
+    }
+    var proto = window.location ? window.location.protocol : '';
+    var host = window.location ? window.location.hostname : '';
+    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host)) {
+      return { supported: false, data: null };
+    }
+    try {
+      var headers = { Accept: 'application/json' };
+      var tok = getToken();
+      if (tok) headers.Authorization = 'Bearer ' + tok;
+      var resp = await fetch('/api/auto-connect/status', { method: 'GET', headers: headers, cache: 'no-store' });
+      if (resp.status === 404) {
+        return { supported: false, data: null };
+      }
+      var json = await resp.json().catch(function () { return null; });
+      if (!resp.ok || !json) {
+        return {
+          supported: true,
+          success: false,
+          status: resp.status,
+          message: (json && json.message) || ('HTTP ' + resp.status),
+          data: null
+        };
+      }
+      return { supported: true, success: Boolean(json.success), data: json.data || null, message: json.message || '' };
+    } catch (err) {
+      return { supported: false, data: null, message: err && err.message ? err.message : String(err) };
+    }
+  }
+
+  async function runAutoConnect(payload) {
+    if (typeof fetch !== 'function' || typeof window === 'undefined') {
+      return { success: false, serverFilesSupported: false, message: 'البيئة الحالية لا تدعم تعديل ملفات الخادم مباشرة.', data: null };
+    }
+    var proto = window.location ? window.location.protocol : '';
+    var host = window.location ? window.location.hostname : '';
+    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host)) {
+      return { success: false, serverFilesSupported: false, message: 'الاستضافة الساكنة لا تملك خادم Node لتعديل الملفات مباشرة.', data: null };
+    }
+    try {
+      var tok = getToken();
+      var reqBody = Object.assign({}, payload || {}, {
+        initialSetup: !getBackendApiUrl()
+      });
+      var headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+      if (tok) headers.Authorization = 'Bearer ' + tok;
+      var resp = await fetch('/api/auto-connect', {
+        method: 'POST',
+        headers: headers,
+        cache: 'no-store',
+        body: JSON.stringify(reqBody)
+      });
+      if (resp.status === 404) {
+        return { success: false, serverFilesSupported: false, message: 'نقطة /api/auto-connect غير متوفرة على هذه الاستضافة.', data: null };
+      }
+      var json = await resp.json().catch(function () { return null; });
+      if (!resp.ok || !json || !json.success) {
+        return {
+          success: false,
+          serverFilesSupported: true,
+          status: resp.status,
+          message: (json && json.message) || ('فشل الربط التلقائي (HTTP ' + resp.status + ')'),
+          data: (json && json.data) || null,
+          error: (json && json.error) || 'AUTO_CONNECT_ERROR'
+        };
+      }
+      if (json.data && json.data.connectionConfig) {
+        applyRuntimeConnection(json.data.connectionConfig);
+      }
+      return {
+        success: true,
+        serverFilesSupported: true,
+        message: json.message || 'تم الربط التلقائي وتحديث الملفات بنجاح.',
+        data: json.data || null,
+        error: null
+      };
+    } catch (err) {
+      return {
+        success: false,
+        serverFilesSupported: false,
+        message: 'تعذر الوصول إلى خادم الربط التلقائي: ' + (err && err.message ? err.message : err),
+        data: null,
+        error: 'NETWORK_ERROR'
+      };
+    }
   }
 
   function warmUpGas() {
@@ -3975,8 +4089,14 @@
   root.RGApi = {
     ready: ready,
     getGasUrl: getGasUrl,
+    getBackendApiUrl: getBackendApiUrl,
+    getTransportUrl: getTransportUrl,
     getConnectionInfo: getConnectionInfo,
     setGasUrl: setGasUrl,
+    applyRuntimeConnection: applyRuntimeConnection,
+    reprobeBackend: function () { return probeBackendHealth(true); },
+    getAutoConnectFileStatus: getAutoConnectFileStatus,
+    runAutoConnect: runAutoConnect,
     getToken: getToken,
     setToken: setToken,
     isLiveMode: isLiveMode,

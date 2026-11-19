@@ -187,6 +187,9 @@ function handleApiRequest(e, method) {
       case 'updateSettings':
         result = updateSettings(session, payload);
         break;
+      case 'applyAutoConnectConfig':
+        result = applyAutoConnectConfig(session, payload);
+        break;
       default:
         return jsonResponse(false, 'الإجراء المطلوب غير معروف.', null, 'UNKNOWN_ACTION: ' + action);
     }

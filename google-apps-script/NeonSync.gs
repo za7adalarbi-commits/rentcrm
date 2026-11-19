@@ -358,6 +358,20 @@ function handleNeonMirrorSync_(payload) {
         });
         applied++;
       }
+    } else if (action === 'saveAutoConnectProps') {
+      var propUpdates = {};
+      var pTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
+      if (pTok) {
+        propUpdates.RG_TOKEN = pTok;
+        propUpdates.RENTAL_TOKEN = pTok;
+      }
+      if (data.spreadsheetId) propUpdates.SPREADSHEET_ID = normalizeStr(data.spreadsheetId);
+      if (data.neonSyncUrl) propUpdates.NEON_SYNC_URL = normalizeStr(data.neonSyncUrl);
+      if (data.syncSecret) propUpdates.SYNC_API_SECRET = normalizeStr(data.syncSecret);
+      if (Object.keys(propUpdates).length > 0) {
+        PropertiesService.getScriptProperties().setProperties(propUpdates);
+        applied++;
+      }
     }
   }
 

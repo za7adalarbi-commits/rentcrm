@@ -68,7 +68,11 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
   return schemaInitPromise;
 }
 
-export function resetSchemaInitFlagForTesting(): void {
+export function resetSchemaInitState(): void {
   schemaInitialized = false;
   schemaInitPromise = null;
+}
+
+export function resetSchemaInitFlagForTesting(): void {
+  resetSchemaInitState();
 }
