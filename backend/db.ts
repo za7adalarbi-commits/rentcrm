@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import pg from 'pg';
 import { FIXED_SERVER_CONFIG } from './fixedConfig';
+import { SCHEMA_SQL } from './schemaSql';
 
 const { Pool } = pg;
 
@@ -148,20 +149,15 @@ export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
 }
 
 function loadSchemaSql(): string {
-  const metaDir = typeof import.meta !== 'undefined' && (import.meta as any).dirname
-    ? String((import.meta as any).dirname)
-    : process.cwd();
-  const candidates = [
-    path.resolve(process.cwd(), 'database/schema.sql'),
-    path.resolve(metaDir, '../database/schema.sql'),
-    path.resolve(metaDir, 'database/schema.sql')
-  ];
-  for (const filePath of candidates) {
-    if (fs.existsSync(filePath)) {
-      return fs.readFileSync(filePath, 'utf8');
+  const diskPath = path.resolve(process.cwd(), 'database/schema.sql');
+  try {
+    if (fs.existsSync(diskPath)) {
+      return fs.readFileSync(diskPath, 'utf8');
     }
+  } catch {
+    // Fall back to embedded schema on serverless deployments
   }
-  throw new Error('SCHEMA_FILE_MISSING: لم يتم العثور على database/schema.sql');
+  return SCHEMA_SQL;
 }
 
 export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {

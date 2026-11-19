@@ -204,18 +204,23 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
     }
   }
 
-  const rawOrigin = str(payload.siteOrigin).replace(/\/+$/, '');
-  const neonSyncUrl = mode === 'neon' && rawOrigin && /^https?:\/\//i.test(rawOrigin)
+  const explicitOrigin = str(payload.siteOrigin).replace(/\/+$/, '');
+  const vercelHost = str(process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL).replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  const rawOrigin = (explicitOrigin && /^https?:\/\//i.test(explicitOrigin)) ? explicitOrigin : (vercelHost ? `https://${vercelHost}` : '');
+  const neonSyncUrl = mode === 'neon' && rawOrigin
     ? `${rawOrigin}/api/sync`
     : '';
 
   let autoBoundGas = false;
   let autoBindNote = '';
   if (gasUrl && mode !== 'sandbox') {
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000) : null;
     try {
       const resp = await fetch(gasUrl, {
         method: 'POST',
         redirect: 'follow',
+        signal: ctrl?.signal,
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({
           action: 'autoBindFromServer',
@@ -228,14 +233,22 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
         })
       });
       const text = await resp.text();
-      const parsed = JSON.parse(text);
+      let parsed: any = null;
+      try {
+        const trimmed = String(text || '').trim();
+        if (trimmed && !trimmed.startsWith('<')) parsed = JSON.parse(trimmed);
+      } catch {
+        parsed = null;
+      }
       if (resp.ok && parsed && parsed.success) {
         autoBoundGas = true;
       } else {
-        autoBindNote = str(parsed?.message);
+        autoBindNote = str(parsed?.message || `HTTP ${resp.status}`);
       }
     } catch (err: any) {
       autoBindNote = str(err?.message || 'NETWORK');
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

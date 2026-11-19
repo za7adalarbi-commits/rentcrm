@@ -65,7 +65,24 @@ function loadNeonHashMap_() {
   } catch (e) {}
 
   try {
-    var raw = PropertiesService.getScriptProperties().getProperty('NEON_INC_HASHES_V1');
+    var props = PropertiesService.getScriptProperties();
+    var chunkCount = Number(props.getProperty('NEON_HASH_CHUNK_COUNT') || 0);
+    if (chunkCount > 0) {
+      var joined = '';
+      for (var c = 0; c < chunkCount; c++) {
+        var part = props.getProperty(NEON_HASH_PROP_PREFIX + c);
+        if (!part) {
+          joined = '';
+          break;
+        }
+        joined += part;
+      }
+      if (joined) {
+        var fromChunks = safeJsonParse(joined, null);
+        if (fromChunks && typeof fromChunks === 'object') return fromChunks;
+      }
+    }
+    var raw = props.getProperty('NEON_INC_HASHES_V1');
     if (raw) {
       var fromProps = safeJsonParse(raw, null);
       if (fromProps && typeof fromProps === 'object') return fromProps;
@@ -75,11 +92,11 @@ function loadNeonHashMap_() {
 }
 
 function saveNeonHashMap_(hashMap) {
-  // Keep latest ~3500 entries safely under CacheService 100KB / Properties limit
+  // Keep latest ~3000 entries safely under CacheService 100KB & chunked PropertiesService (8KB per prop)
   var keys = Object.keys(hashMap || {});
-  if (keys.length > 3500) {
+  if (keys.length > 3000) {
     var trimmed = {};
-    var start = keys.length - 3000;
+    var start = keys.length - 2500;
     for (var i = start; i < keys.length; i++) {
       trimmed[keys[i]] = hashMap[keys[i]];
     }
@@ -90,8 +107,20 @@ function saveNeonHashMap_(hashMap) {
     CacheService.getScriptCache().put('NEON_INC_HASHES_V1', json, 21600);
   } catch (e) {}
   try {
-    if (json.length < 450000) {
-      PropertiesService.getScriptProperties().setProperty('NEON_INC_HASHES_V1', json);
+    var props = PropertiesService.getScriptProperties();
+    var chunkSize = 8000;
+    var maxChunks = 25;
+    if (json.length <= chunkSize * maxChunks) {
+      var prevCount = Number(props.getProperty('NEON_HASH_CHUNK_COUNT') || 0);
+      var totalChunks = Math.ceil(json.length / chunkSize) || 1;
+      var nextProps = { NEON_HASH_CHUNK_COUNT: String(totalChunks) };
+      for (var c = 0; c < totalChunks; c++) {
+        nextProps[NEON_HASH_PROP_PREFIX + c] = json.substring(c * chunkSize, (c + 1) * chunkSize);
+      }
+      props.setProperties(nextProps);
+      for (var oldIdx = totalChunks; oldIdx < prevCount; oldIdx++) {
+        props.deleteProperty(NEON_HASH_PROP_PREFIX + oldIdx);
+      }
     }
   } catch (e2) {}
 }
@@ -175,7 +204,7 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
 
   for (var offset = 0; offset < maxLen; offset += NEON_BATCH_SIZE) {
     var resChunk = deltaRes.slice(offset, offset + NEON_BATCH_SIZE);
-    var extChunk = deltaExt.slice(offset, offset + NEON_BATCH_SIZE * 2);
+    var extChunk = deltaExt.slice(offset, offset + NEON_BATCH_SIZE);
     if (resChunk.length === 0 && extChunk.length === 0) continue;
 
     fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, {
@@ -236,16 +265,42 @@ function scheduledMinuteSync() {
     var enabled = enabledRec ? toBool(enabledRec.value) : true;
     if (!enabled) return;
 
-    // Pull recent 7 days incrementally on every 1-minute tick to stay fast within GAS execution quota
-    runRentalGateSyncInternal(
+    var props = PropertiesService.getScriptProperties();
+    var lastFullAt = Number(props.getProperty('NEON_LAST_FULL_SYNC_MS') || 0);
+    var shouldFullSync = !lastFullAt || (Date.now() - lastFullAt) >= 600000;
+    var rangeOpts = shouldFullSync
+      ? { preset: 'all', datePreset: 'all' }
+      : { preset: '7d', datePreset: '7d' };
+
+    var syncMeta = runRentalGateSyncInternal(
       {
         id: 'SYSTEM_1M',
         employeeId: 'SYSTEM_1M',
         name: 'المزامنة السحابية الدقيقة (Neon)',
         role: 'system'
       },
-      { datePreset: '7d' }
+      rangeOpts
     );
+
+    if (shouldFullSync) {
+      props.setProperty('NEON_LAST_FULL_SYNC_MS', String(Date.now()));
+    }
+
+    // If no incremental delta was pushed to Neon (so Neon didn't auto-flush outbox), trigger flushOutbox every ~3 mins
+    if (syncMeta && syncMeta.neonSync && syncMeta.neonSync.noChanges) {
+      var lastFlushAt = Number(props.getProperty('NEON_LAST_FLUSH_MS') || 0);
+      if (!lastFlushAt || (Date.now() - lastFlushAt) >= 180000) {
+        var cfg = getNeonSyncConfig_();
+        if (cfg.syncUrl && cfg.syncSecret) {
+          props.setProperty('NEON_LAST_FLUSH_MS', String(Date.now()));
+          try {
+            fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, { action: 'flushOutbox' });
+          } catch (flushErr) {
+            Logger.log('Neon flushOutbox warning: ' + (flushErr && flushErr.message ? flushErr.message : flushErr));
+          }
+        }
+      }
+    }
   } catch (err) {
     Logger.log('scheduledMinuteSync error: ' + (err && err.message ? err.message : err));
   } finally {
@@ -292,6 +347,13 @@ function handleNeonMirrorSync_(payload) {
   var items = Array.isArray(payload && payload.items) ? payload.items : [];
   var applied = 0;
 
+  var resBatch = [];
+  var fuBatch = [];
+  var prbBatch = [];
+  var empBatch = [];
+  var usrBatch = [];
+  var setBatch = [];
+
   for (var i = 0; i < items.length; i++) {
     var item = items[i];
     if (!item || typeof item !== 'object') continue;
@@ -299,34 +361,26 @@ function handleNeonMirrorSync_(payload) {
     var data = item.payload || {};
 
     if (action === 'upsertReservation' && data.reservationNumber) {
-      var resRec = Object.assign({}, data, {
+      resBatch.push(Object.assign({}, data, {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
         statusHistory: JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
         hasExtensions: data.hasExtensions ? 'true' : 'false',
         hasProblem: data.hasProblem ? 'true' : 'false'
-      });
-      upsertRecord(RG_SHEETS.RESERVATIONS, 'reservationNumber', resRec);
-      applied++;
+      }));
     } else if (action === 'appendFollowUp' && data.id) {
-      upsertRecord(RG_SHEETS.FOLLOWUPS, 'id', data);
-      applied++;
+      fuBatch.push(data);
     } else if (action === 'upsertProblem' && data.id) {
-      var prbRec = Object.assign({}, data, {
+      prbBatch.push(Object.assign({}, data, {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
-      });
-      upsertRecord(RG_SHEETS.PROBLEMS, 'id', prbRec);
-      if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
-        upsertRecord(RG_SHEETS.ISSUES, 'id', prbRec);
-      }
-      applied++;
+      }));
     } else if (action === 'upsertEmployee' && data.id) {
       var empRec = Object.assign({}, data, {
         permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])
       });
-      upsertRecord(RG_SHEETS.EMPLOYEES, 'id', empRec);
-      upsertRecord(RG_SHEETS.USERS, 'id', {
+      empBatch.push(empRec);
+      usrBatch.push({
         id: empRec.id,
         name: empRec.name,
         username: empRec.username,
@@ -340,15 +394,13 @@ function handleNeonMirrorSync_(payload) {
         createdAt: empRec.createdAt,
         updatedAt: empRec.updatedAt
       });
-      applied++;
     } else if (action === 'upsertSetting' && data.key) {
-      upsertRecord(RG_SHEETS.SETTINGS, 'key', {
+      setBatch.push({
         key: data.key,
         value: String(data.value),
         updatedBy: normalizeStr(data.updatedBy || 'NEON_MIRROR'),
         updatedAt: nowIso()
       });
-      applied++;
     } else if (action === 'saveRgToken' && data.rgToken) {
       var cleanTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
       if (cleanTok) {
@@ -359,6 +411,31 @@ function handleNeonMirrorSync_(payload) {
         applied++;
       }
     }
+  }
+
+  if (resBatch.length > 0) {
+    batchUpsertRecords(RG_SHEETS.RESERVATIONS, 'reservationNumber', resBatch);
+    applied += resBatch.length;
+  }
+  if (fuBatch.length > 0) {
+    batchUpsertRecords(RG_SHEETS.FOLLOWUPS, 'id', fuBatch);
+    applied += fuBatch.length;
+  }
+  if (prbBatch.length > 0) {
+    batchUpsertRecords(RG_SHEETS.PROBLEMS, 'id', prbBatch);
+    if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
+      batchUpsertRecords(RG_SHEETS.ISSUES, 'id', prbBatch);
+    }
+    applied += prbBatch.length;
+  }
+  if (empBatch.length > 0) {
+    batchUpsertRecords(RG_SHEETS.EMPLOYEES, 'id', empBatch);
+    batchUpsertRecords(RG_SHEETS.USERS, 'id', usrBatch);
+    applied += empBatch.length;
+  }
+  if (setBatch.length > 0) {
+    batchUpsertRecords(RG_SHEETS.SETTINGS, 'key', setBatch);
+    applied += setBatch.length;
   }
 
   return { applied: applied };

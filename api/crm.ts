@@ -32,7 +32,14 @@ export default async function handler(req: any, res: any) {
     const authHeader = String(req.headers?.authorization || '');
     const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
     const token = String(body.token || bearerToken || query.token || '').trim();
-    const payload = body.payload && typeof body.payload === 'object' ? body.payload : {};
+    const payload = body.payload && typeof body.payload === 'object' ? { ...body.payload } : {};
+    if (!payload.siteOrigin) {
+      const xfProto = String(req.headers?.['x-forwarded-proto'] || 'https').split(',')[0].trim();
+      const xfHost = String(req.headers?.['x-forwarded-host'] || req.headers?.host || '').split(',')[0].trim();
+      if (xfHost) {
+        payload.siteOrigin = `${xfProto}://${xfHost}`;
+      }
+    }
 
     if (!isDatabaseConfigured()) {
       if (action === 'getSetupCapabilities') {

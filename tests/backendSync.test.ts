@@ -1521,6 +1521,14 @@ test('API handlers (/api/crm and /api/health) always return valid JSON and suppo
     assert.equal(crmCaps.out.statusCode, 200);
     assert.equal(crmCaps.out.body.success, true);
     assert.equal(crmCaps.out.body.data.databaseConfigured, false);
+
+    // 4. /api/sync without DB returns structured 503 JSON
+    const { default: syncHandler } = await import('../api/sync');
+    const syncMock503 = makeMockRes();
+    await syncHandler({ method: 'POST', headers: {}, body: {} }, syncMock503.res);
+    assert.equal(syncMock503.out.statusCode, 503);
+    assert.equal(syncMock503.out.body.success, false);
+    assert.equal(syncMock503.out.body.error, 'DATABASE_UNCONFIGURED');
   } finally {
     if (prevDb !== undefined) process.env.DATABASE_URL = prevDb;
     if (prevPg !== undefined) process.env.POSTGRES_URL = prevPg;
@@ -1528,3 +1536,46 @@ test('API handlers (/api/crm and /api/health) always return valid JSON and suppo
     FIXED_SERVER_CONFIG.databaseUrl = prevFixedDb;
   }
 });
+
+test('embedded SCHEMA_SQL and coreBridge.cjs stay synced with source files and load helpers cleanly', async () => {
+  const { SCHEMA_SQL } = await import('../backend/schemaSql');
+  const diskSql = fs.readFileSync(path.resolve(process.cwd(), 'database/schema.sql'), 'utf8');
+  assert.equal(SCHEMA_SQL.trim(), diskSql.trim());
+
+  const diskCoreJs = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/core.js'), 'utf8');
+  const bridgeCjs = fs.readFileSync(path.resolve(process.cwd(), 'backend/coreBridge.cjs'), 'utf8');
+  assert.equal(bridgeCjs.trim(), diskCoreJs.trim());
+
+  const { crmCore } = await import('../backend/auth');
+  assert.equal(typeof crmCore.resolvePullDateRange, 'function');
+  assert.equal(typeof crmCore.mergeSyncedReservation, 'function');
+  assert.equal(typeof crmCore.parseBackendResponseText, 'function');
+
+  const range7d = crmCore.resolvePullDateRange({ datePreset: '7d' }, '2026-11-18');
+  assert.equal(range7d.preset, '7d');
+  assert.equal(range7d.dateFrom, '2026-11-12');
+  assert.equal(range7d.dateTo, '2026-11-18');
+  assert.equal(range7d.hasCustomRange, true);
+
+  // mutatedReservations only includes genuinely changed records on subsequent sync
+  const db = createInMemoryMockExecutor();
+  const resPayload = {
+    reservationId: 4040,
+    reservationNumber: 'RG-4040',
+    clientName: 'ماجد الحربي',
+    reservationStatus: 'CONFIRMED',
+    total: 500
+  };
+  const first = await ingestIncrementalSyncBatch(db, {
+    source: 'rental_gate_direct',
+    reservations: [resPayload]
+  });
+  assert.equal(first.mutatedReservations?.length, 1);
+
+  const second = await ingestIncrementalSyncBatch(db, {
+    source: 'rental_gate_direct',
+    reservations: [resPayload]
+  });
+  assert.equal(second.mutatedReservations?.length, 0);
+});
+

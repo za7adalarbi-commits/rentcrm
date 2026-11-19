@@ -332,7 +332,7 @@
     var today = /^\d{4}-\d{2}-\d{2}$/.test(normalizeStr(todayStr))
       ? normalizeStr(todayStr)
       : formatDisplayDate(new Date());
-    var preset = normalizeStr(opts.preset).toLowerCase() || 'all';
+    var preset = normalizeStr(opts.preset || opts.datePreset).toLowerCase() || 'all';
     var rawFrom = /^\d{4}-\d{2}-\d{2}$/.test(normalizeStr(opts.dateFrom)) ? normalizeStr(opts.dateFrom) : '';
     var rawTo = /^\d{4}-\d{2}-\d{2}$/.test(normalizeStr(opts.dateTo)) ? normalizeStr(opts.dateTo) : '';
 

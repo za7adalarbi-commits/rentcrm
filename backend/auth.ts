@@ -1,23 +1,8 @@
 import crypto from 'node:crypto';
-import { createRequire } from 'node:module';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import crmCoreModule from './coreBridge.cjs';
 import type { DbClient, DbExecutor } from './db';
 
-function loadCrmCore(): any {
-  const reqUrl =
-    (typeof import.meta !== 'undefined' && import.meta.url)
-      ? import.meta.url
-      : pathToFileURL(path.resolve(process.cwd(), 'backend/auth.ts')).href;
-  const localRequire = createRequire(reqUrl);
-  try {
-    return localRequire('../assets/js/core.js');
-  } catch {
-    return localRequire(path.resolve(process.cwd(), 'assets/js/core.js'));
-  }
-}
-
-export const crmCore: any = loadCrmCore();
+export const crmCore: any = (crmCoreModule as any)?.default || crmCoreModule;
 
 export interface AuthEmployee {
   id: string;

@@ -2557,6 +2557,25 @@ export async function exportReportData(executor: DbExecutor, session: AuthSessio
   return data;
 }
 
+function safeParseGasJson(rawText: string, status: number): any {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed || trimmed.startsWith('<')) {
+    throw new Error(`تعذر قراءة استجابة Google Apps Script كـ JSON (HTTP ${status || 0}).`);
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error(`استجابة غير صالحة من Google Apps Script (HTTP ${status || 0}).`);
+  }
+}
+
+function resolveDefaultSiteOrigin(explicitOrigin: unknown): string {
+  const direct = str(explicitOrigin).replace(/\/+$/, '');
+  if (direct && /^https?:\/\//i.test(direct)) return direct;
+  const prodHost = str(process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL).replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  return prodHost ? `https://${prodHost}` : '';
+}
+
 export async function pullOrSyncReservations(
   executor: DbExecutor,
   session: AuthSession,
@@ -2570,7 +2589,7 @@ export async function pullOrSyncReservations(
   }
 
   // Only users with sync_data or manage_settings may apply custom pull date ranges
-  const rangePayload = payload?.datePreset || payload?.dateFrom || payload?.dateTo
+  const rangePayload = payload?.preset || payload?.datePreset || payload?.dateFrom || payload?.dateTo
     ? (crmCore.canUserPerform(session.user, 'sync_data') || crmCore.canUserPerform(session.user, 'manage_settings')
         ? payload
         : {})
@@ -2591,21 +2610,28 @@ export async function pullOrSyncReservations(
   const gasUrl = str(serverCfg.gasWebAppUrl);
   if (gasUrl) {
     const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
-    const resp = await fetch(gasUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'triggerNeonIncrementalSync',
-        payload: { syncSecret, ...rangePayload, actor: { id: session.user.id, name: session.user.name, role: session.user.role } }
-      })
-    });
-    const text = await resp.text();
-    const parsed = JSON.parse(text);
-    if (!parsed?.success) {
-      throw new Error(parsed?.message || 'فشلت المزامنة عبر Google Apps Script.');
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 15000) : null;
+    try {
+      const resp = await fetch(gasUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        signal: ctrl?.signal,
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'triggerNeonIncrementalSync',
+          payload: { syncSecret, ...rangePayload, actor: { id: session.user.id, name: session.user.name, role: session.user.role } }
+        })
+      });
+      const text = await resp.text();
+      const parsed = safeParseGasJson(text, resp.status);
+      if (!parsed?.success) {
+        throw new Error(parsed?.message || 'فشلت المزامنة عبر Google Apps Script.');
+      }
+      return parsed.data;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    return parsed.data;
   }
 
   throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate أو رابط Google Apps Script في صفحة الإعدادات.');
@@ -2632,17 +2658,20 @@ export async function saveGlobalConnectionSettings(
   const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
   const serverCfg = await resolveServerConfig(executor);
 
-  const rawOrigin = str(payload.siteOrigin).replace(/\/+$/, '');
-  const neonSyncUrl = rawOrigin && /^https?:\/\//i.test(rawOrigin) ? `${rawOrigin}/api/sync` : '';
+  const rawOrigin = resolveDefaultSiteOrigin(payload.siteOrigin);
+  const neonSyncUrl = rawOrigin ? `${rawOrigin}/api/sync` : '';
 
   let autoBoundGas = false;
   let autoBindMessage = '';
 
   if (gasUrl) {
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000) : null;
     try {
       const resp = await fetch(gasUrl, {
         method: 'POST',
         redirect: 'follow',
+        signal: ctrl?.signal,
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({
           action: 'autoBindFromServer',
@@ -2655,7 +2684,7 @@ export async function saveGlobalConnectionSettings(
         })
       });
       const text = await resp.text();
-      const parsed = JSON.parse(text);
+      const parsed = safeParseGasJson(text, resp.status);
       if (resp.ok && parsed && parsed.success) {
         autoBoundGas = true;
         autoBindMessage = 'تم حفظ الرابط في القاعدة وربط Google Apps Script تلقائيًا للجميع.';
@@ -2664,6 +2693,8 @@ export async function saveGlobalConnectionSettings(
       }
     } catch (err: any) {
       autoBindMessage = `تم حفظ الرابط عالميًا لكل المستخدمين؛ تعذر الوصول التلقائي لـ Apps Script حاليًا (${str(err?.message || 'NETWORK')}).`;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   } else {
     autoBindMessage = 'تم مسح رابط Apps Script العام من إعدادات الخادم.';
@@ -2703,8 +2734,8 @@ export async function saveApiToken(executor: DbExecutor, session: AuthSession, p
   const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
   const serverCfg = await resolveServerConfig(executor);
   const gasUrl = str(serverCfg.gasWebAppUrl);
-  const rawOrigin = str(payload.siteOrigin).replace(/\/+$/, '');
-  const neonSyncUrl = rawOrigin && /^https?:\/\//i.test(rawOrigin) ? `${rawOrigin}/api/sync` : '';
+  const rawOrigin = resolveDefaultSiteOrigin(payload.siteOrigin);
+  const neonSyncUrl = rawOrigin ? `${rawOrigin}/api/sync` : '';
 
   if (gasUrl && syncSecret) {
     await fetch(gasUrl, {

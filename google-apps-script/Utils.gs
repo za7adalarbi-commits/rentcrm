@@ -337,7 +337,7 @@ function shiftIsoDateDays_(isoDate, deltaDays) {
 function resolvePullDateRange_(options) {
   var opts = (options && typeof options === 'object') ? options : {};
   var today = formatDateOnly(new Date());
-  var preset = normalizeStr(opts.preset).toLowerCase() || 'all';
+  var preset = normalizeStr(opts.preset || opts.datePreset).toLowerCase() || 'all';
   var rawFrom = /^\d{4}-\d{2}-\d{2}$/.test(normalizeStr(opts.dateFrom)) ? normalizeStr(opts.dateFrom) : '';
   var rawTo = /^\d{4}-\d{2}-\d{2}$/.test(normalizeStr(opts.dateTo)) ? normalizeStr(opts.dateTo) : '';
   var dateFrom = rawFrom;

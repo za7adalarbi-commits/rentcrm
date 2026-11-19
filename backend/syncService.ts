@@ -35,6 +35,7 @@ export interface SyncIngestResult {
   checkpointAt: string;
   appliedRange?: Record<string, any>;
   changedReservations: any[];
+  mutatedReservations?: any[];
 }
 
 function str(v: unknown, fallback = ''): string {
@@ -411,6 +412,7 @@ export async function ingestIncrementalSyncBatch(
   let updatedCount = 0;
   let extensionsCount = 0;
   const changedReservations: any[] = [];
+  const mutatedReservations: any[] = [];
 
   try {
     await executor.withTransaction(async (tx) => {
@@ -620,6 +622,17 @@ export async function ingestIncrementalSyncBatch(
         for (const r of chunk) {
           const { rawJson: _omitRaw, ...clientRes } = r;
           changedReservations.push(clientRes);
+          const prev = existingByNumber.get(r.reservationNumber);
+          const genuinelyChanged =
+            !prev ||
+            str(prev.originalStatusCode) !== str(r.originalStatusCode) ||
+            str(prev.internalStatus) !== str(r.internalStatus) ||
+            str(prev.endDate) !== str(r.endDate) ||
+            num(prev.extensionsCount, 0) !== num(r.extensionsCount, 0) ||
+            num(prev.totalAmount, 0) !== num(r.totalAmount, 0);
+          if (genuinelyChanged) {
+            mutatedReservations.push(clientRes);
+          }
         }
       }
 
@@ -799,7 +812,8 @@ export async function ingestIncrementalSyncBatch(
       finishedAt,
       checkpointAt: finishedAt,
       appliedRange: payload?.appliedRange,
-      changedReservations
+      changedReservations,
+      mutatedReservations
     };
   } catch (err: any) {
     const finishedAt = new Date().toISOString();
@@ -885,18 +899,27 @@ export async function flushSheetsMirrorOutbox(
     payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {})
   }));
 
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 6500) : null;
   try {
     const resp = await fetchFn(gasUrl, {
       method: 'POST',
       redirect: 'follow',
+      signal: ctrl?.signal,
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({
         action: 'syncFromNeonMirror',
         payload: { syncSecret, items }
       })
     });
+    if (timer) clearTimeout(timer);
     const text = await resp.text();
-    const parsed = JSON.parse(text);
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(String(text || '').trim());
+    } catch {
+      parsed = null;
+    }
     if (!resp.ok || !parsed?.success) {
       throw new Error(parsed?.message || `GAS HTTP ${resp.status}`);
     }
@@ -910,6 +933,7 @@ export async function flushSheetsMirrorOutbox(
     );
     return { sent: ids.length, failed: 0, skipped: false };
   } catch (err: any) {
+    if (timer) clearTimeout(timer);
     const errMsg = String(err?.message || 'MIRROR_FAILED').slice(0, 400);
     for (const row of pendingRes.rows) {
       const nextRetryCount = num(row.retry_count, 0) + 1;
@@ -1003,7 +1027,7 @@ export async function pullFromRentalGateDirect(
 
   const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.items);
 
-  return ingestIncrementalSyncBatch(executor, {
+  const syncResult = await ingestIncrementalSyncBatch(executor, {
     source: 'rental_gate_direct',
     actor,
     pagesFetched: resPaged.pages + extPaged.pages,
@@ -1011,4 +1035,14 @@ export async function pullFromRentalGateDirect(
     reservations: filteredRes,
     extensions: dedupedExt
   });
+
+  if (serverCfg.gasWebAppUrl && Array.isArray(syncResult.mutatedReservations) && syncResult.mutatedReservations.length > 0) {
+    const toMirror = syncResult.mutatedReservations.slice(0, 100);
+    for (const r of toMirror) {
+      await enqueueSheetsMirror(executor, 'Reservation', r.id, 'upsertReservation', r);
+    }
+    void flushSheetsMirrorOutbox(executor, fetchFn).catch(() => undefined);
+  }
+
+  return syncResult;
 }
