@@ -108,7 +108,7 @@
         '</div>' +
         '<div class="table-wrap"><table class="data-table"><thead><tr>' +
           '<th>الموظف والنشاط</th><th>المستخدم</th><th>الوظيفة</th><th>الدور والصلاحيات</th><th>الحالة</th><th>حجوزات</th><th>متابعات</th><th>مشكلات</th><th>آخر نشاط</th><th>العملاء</th>' +
-          (canManage ? '<th>تعديل</th>' : '') +
+          (canManage ? '<th>الإجراءات</th>' : '') +
         '</tr></thead><tbody>' +
           items.map(function (e) {
             var isActive = e.status === 'active';
@@ -139,7 +139,14 @@
               '<td class="mono tabular-nums" style="white-space:nowrap;">' + (e.lastActivity ? esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16))) : '-') + '</td>' +
               '<td><button type="button" class="btn btn-sm btn-primary emp-view-btn" data-id="' + esc(e.id) + '">العملاء</button></td>' +
               (canManage ? (
-                '<td><button type="button" class="btn btn-sm emp-edit-btn" data-id="' + esc(e.id) + '">تعديل</button></td>'
+                '<td style="white-space:nowrap;">' +
+                  '<div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
+                    '<button type="button" class="btn btn-sm emp-edit-btn" data-id="' + esc(e.id) + '" aria-label="تعديل بيانات ' + esc(e.name) + '">تعديل</button>' +
+                    (!isSelf ? (
+                      '<button type="button" class="btn btn-sm btn-danger emp-del-btn" data-id="' + esc(e.id) + '" data-name="' + esc(e.name) + '" data-confirm="0" aria-label="حذف الموظف ' + esc(e.name) + '">حذف</button>'
+                    ) : '') +
+                  '</div>' +
+                '</td>'
               ) : '') +
             '</tr>';
           }).join('') +
@@ -243,6 +250,39 @@
             }
             ctx.toast('تعذر الاتصال بالخادم أثناء تحديث حالة الموظف.', true);
           });
+        });
+      });
+    });
+
+    container.querySelectorAll('.emp-del-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.getAttribute('data-confirm') !== '1') {
+          btn.setAttribute('data-confirm', '1');
+          btn.textContent = 'تأكيد الحذف؟';
+          setTimeout(function () {
+            if (document.body.contains(btn)) {
+              btn.setAttribute('data-confirm', '0');
+              btn.textContent = 'حذف';
+            }
+          }, 4000);
+          return;
+        }
+        var empId = btn.getAttribute('data-id');
+        var empName = btn.getAttribute('data-name') || '';
+        runWithLock(btn, 'deleteEmployee:' + empId, async function () {
+          var prevText = btn.textContent;
+          btn.textContent = 'جاري الحذف...';
+          var delResp = await root.RGApi.callApi('deleteEmployee', { employeeId: empId });
+          if (delResp && delResp.success) {
+            ctx.toast(delResp.message || ('تم حذف الموظف ' + empName + ' بنجاح.'));
+            render(container, ctx);
+          } else {
+            ctx.toast((delResp && delResp.message) || 'تعذر حذف الموظف.', true);
+            if (btn.isConnected !== false) {
+              btn.setAttribute('data-confirm', '0');
+              btn.textContent = prevText === 'جاري الحذف...' ? 'حذف' : prevText;
+            }
+          }
         });
       });
     });

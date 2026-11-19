@@ -914,3 +914,29 @@ test('parseBackendResponseText prevents Unexpected end of JSON input on empty, H
   assert.equal(validOk.success, true);
   assert.equal(validOk.data.ok, true);
 });
+
+test('dedupe helpers retain Rental Gate DTOs keyed only by reservationId/extendId and deleteEmployee scopes/locks are registered', () => {
+  const rgDtos = core.dedupeReservationsByNumber([
+    { reservationId: 9101, clientName: 'محمد', reservationStatus: 'CONFIRMED', total: 450 },
+    { reservationId: 9102, clientName: 'نورة', reservationStatus: 'STARTED', total: 650 },
+    { reservation_id: 9101, clientName: 'محمد المحدث', reservationStatus: 'ACTIVE', total: 500 }
+  ]);
+  assert.equal(rgDtos.length, 2);
+  assert.equal(rgDtos[0].clientName, 'محمد المحدث');
+  assert.equal(rgDtos[1].reservationId, 9102);
+
+  const extDtos = core.dedupeExtensionsByNumber([
+    { extendId: 301, reservationId: 9101, total: 150 },
+    { extend_id: 301, reservationId: 9101, total: 200 },
+    { extendId: 302, reservationId: 9102, total: 300 }
+  ]);
+  assert.equal(extDtos.length, 2);
+  assert.equal(extDtos[0].total, 200);
+  assert.equal(extDtos[1].extendId, 302);
+
+  const delScopes = core.getCacheInvalidationScopes('deleteEmployee');
+  assert.equal(delScopes.includes('employees'), true);
+  assert.equal(delScopes.includes('dashboard'), true);
+  assert.equal(core.buildMutationLockKey('deleteEmployee', { employeeId: 'EMP_42' }), 'deleteEmployee:EMP_42');
+});
+

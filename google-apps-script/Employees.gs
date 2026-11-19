@@ -298,3 +298,36 @@ function disableEmployee(session, payload) {
     return sanitizeEmployeeForClient(updated);
   });
 }
+
+function deleteEmployee(session, payload) {
+  requirePermission(session, 'manage_employees');
+
+  var p = payload || {};
+  var employeeId = normalizeStr(p.employeeId);
+  if (!employeeId) throw new Error('معرف الموظف مطلوب.');
+  if (employeeId === session.employeeId) {
+    throw new Error('لا يمكنك حذف حسابك الشخصي أثناء تسجيل الدخول.');
+  }
+
+  return withScriptLock(function () {
+    var existing = findRecordById(RG_SHEETS.EMPLOYEES, 'id', employeeId);
+    if (!existing) throw new Error('الموظف غير موجود.');
+
+    if (normalizeStr(existing.role) === RG_ROLES.GENERAL_MANAGER && normalizeStr(existing.status) === 'active') {
+      var allEmps = readAllRecords(RG_SHEETS.EMPLOYEES, true);
+      var otherActiveGms = allEmps.filter(function (e) {
+        return e.id !== employeeId && e.role === RG_ROLES.GENERAL_MANAGER && e.status === 'active';
+      });
+      if (otherActiveGms.length < 1) {
+        throw new Error('لا يمكن حذف آخر مدير عام نشط في النظام.');
+      }
+    }
+
+    revokeEmployeeSessions(employeeId);
+    clearEmployeeSessionCache_(employeeId);
+    deleteRecordByKey(RG_SHEETS.EMPLOYEES, 'id', employeeId);
+    deleteRecordByKey(RG_SHEETS.USERS, 'id', employeeId);
+    logActivity(session.user, 'حذف موظف', 'Employee', employeeId, existing.name + ' (' + existing.username + ')');
+    return { id: employeeId, deleted: true, name: existing.name };
+  });
+}

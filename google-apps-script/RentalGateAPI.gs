@@ -43,28 +43,58 @@ function extractPagePayload_(body, pageIndex) {
 
   if (Array.isArray(body)) {
     rows = body;
-  } else if (body && Array.isArray(body.content)) {
-    rows = body.content;
-    totalPages = toNumber(body.totalPages, 1);
-    isLast = body.last === true || (pageIndex + 1) >= totalPages;
-  } else if (body && body.data) {
-    if (Array.isArray(body.data)) {
-      rows = body.data;
-      totalPages = toNumber((body.meta && body.meta.last_page) || (body.pagination && body.pagination.last_page) || body.last_page, 1);
-      isLast = (pageIndex + 1) >= totalPages;
-    } else if (Array.isArray(body.data.content)) {
-      rows = body.data.content;
-      totalPages = toNumber(body.data.totalPages, 1);
-      isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
-    } else if (Array.isArray(body.data.data)) {
-      rows = body.data.data;
-      totalPages = toNumber(body.data.last_page || (body.data.meta && body.data.meta.last_page) || (body.data.pagination && body.data.pagination.last_page), 1);
-      isLast = (pageIndex + 1) >= totalPages;
+  } else if (body && typeof body === 'object') {
+    if (Array.isArray(body.content)) {
+      rows = body.content;
+      totalPages = toNumber(body.totalPages, 1);
+      isLast = body.last === true || (pageIndex + 1) >= totalPages;
+    } else if (Array.isArray(body.items)) {
+      rows = body.items;
+      totalPages = toNumber((body.meta && body.meta.last_page) || (body.pagination && body.pagination.last_page) || body.last_page || body.totalPages, 1);
+      isLast = body.last === true || (pageIndex + 1) >= totalPages;
+    } else if (Array.isArray(body.results)) {
+      rows = body.results;
+      totalPages = toNumber(body.totalPages || body.last_page || (body.meta && body.meta.last_page), 1);
+      isLast = body.last === true || (pageIndex + 1) >= totalPages;
+    } else if (Array.isArray(body.reservations)) {
+      rows = body.reservations;
+      totalPages = toNumber(body.totalPages || body.last_page, 1);
+      isLast = body.last === true || (pageIndex + 1) >= totalPages;
+    } else if (Array.isArray(body.extensions)) {
+      rows = body.extensions;
+      totalPages = toNumber(body.totalPages || body.last_page, 1);
+      isLast = body.last === true || (pageIndex + 1) >= totalPages;
+    } else if (body.data) {
+      if (Array.isArray(body.data)) {
+        rows = body.data;
+        totalPages = toNumber((body.meta && body.meta.last_page) || (body.pagination && body.pagination.last_page) || body.last_page || body.totalPages, 1);
+        isLast = body.last === true || (pageIndex + 1) >= totalPages;
+      } else if (Array.isArray(body.data.content)) {
+        rows = body.data.content;
+        totalPages = toNumber(body.data.totalPages, 1);
+        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+      } else if (Array.isArray(body.data.data)) {
+        rows = body.data.data;
+        totalPages = toNumber(body.data.last_page || (body.data.meta && body.data.meta.last_page) || (body.data.pagination && body.data.pagination.last_page), 1);
+        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+      } else if (Array.isArray(body.data.items)) {
+        rows = body.data.items;
+        totalPages = toNumber(body.data.totalPages || body.data.last_page || (body.data.meta && body.data.meta.last_page), 1);
+        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+      } else if (Array.isArray(body.data.results)) {
+        rows = body.data.results;
+        totalPages = toNumber(body.data.totalPages || body.data.last_page, 1);
+        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+      } else if (Array.isArray(body.data.reservations)) {
+        rows = body.data.reservations;
+        totalPages = toNumber(body.data.totalPages || body.data.last_page, 1);
+        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+      } else if (Array.isArray(body.data.extensions)) {
+        rows = body.data.extensions;
+        totalPages = toNumber(body.data.totalPages || body.data.last_page, 1);
+        isLast = body.data.last === true || (pageIndex + 1) >= totalPages;
+      }
     }
-  } else if (body && Array.isArray(body.items)) {
-    rows = body.items;
-    totalPages = toNumber((body.meta && body.meta.last_page) || (body.pagination && body.pagination.last_page) || body.last_page, 1);
-    isLast = (pageIndex + 1) >= totalPages;
   }
   return { rows: rows, totalPages: totalPages, isLast: isLast };
 }
@@ -341,6 +371,9 @@ function pullReservations(session, payload) {
     updatedCount: syncResult.updatedCount || 0,
     extensionsCount: syncResult.extensionsCount || 0,
     pagesFetched: syncResult.pagesFetched || 0,
+    fetchedCount: syncResult.fetchedCount || 0,
+    excludedFilteredCount: syncResult.excludedFilteredCount || 0,
+    rangeFilteredCount: syncResult.rangeFilteredCount || 0,
     durationMs: syncResult.durationMs || 0,
     finishedAt: syncResult.finishedAt || nowIso(),
     appliedRange: syncResult.appliedRange || { preset: 'all', dateFrom: '', dateTo: '', hasCustomRange: false },
@@ -429,7 +462,7 @@ function runRentalGateSyncInternal(actor, options) {
           id: prevExt ? prevExt.id : generateId('EXT'),
           extensionNumber: extNum,
           sequenceNumber: prevExt ? toNumber(prevExt.sequenceNumber, 1) : 1,
-          reservationId: prevExt && prevExt.reservationId ? prevExt.reservationId : resIdForExt,
+          reservationId: prevExt && prevExt.reservationId ? prevExt.reservationId : '',
           reservationNumber: resNumForExt || resIdForExt,
           sourceReservationId: resIdForExt || resNumForExt,
           extensionType: extTypeRaw,
@@ -463,7 +496,10 @@ function runRentalGateSyncInternal(actor, options) {
       }
 
       // 2. Apply Manager custom pull date filter (if requested), deduplicate, preserve & advance statusHistory
+      var rawFetchedCount = parallelFetch.reservations.length;
       var resItems = filterSourceReservationsByPullRange_(parallelFetch.reservations, appliedRange);
+      var rangeFilteredCount = Math.max(0, rawFetchedCount - resItems.length);
+      var excludedFilteredCount = 0;
 
       var existingReservations = readAllRecords(RG_SHEETS.RESERVATIONS, true);
       var existingByNumber = {};
@@ -486,7 +522,10 @@ function runRentalGateSyncInternal(actor, options) {
         resSeenMap[resNumber] = true;
 
         var statusCode = normalizeStr(item.reservationStatus || item.status || item.status_code).toLowerCase().replace(/\s+/g, '_');
-        if (excludedSet[statusCode]) continue;
+        if (excludedSet[statusCode]) {
+          excludedFilteredCount++;
+          continue;
+        }
 
         var combinedExts = [];
         var extSeenForRes = {};
@@ -756,6 +795,9 @@ function runRentalGateSyncInternal(actor, options) {
         updatedCount: syncRecord.updatedCount,
         extensionsCount: syncRecord.extensionsCount,
         pagesFetched: syncRecord.pagesFetched,
+        fetchedCount: rawFetchedCount,
+        excludedFilteredCount: excludedFilteredCount,
+        rangeFilteredCount: rangeFilteredCount,
         errorMessage: syncRecord.errorMessage,
         durationMs: syncRecord.durationMs,
         startedAt: syncRecord.startedAt,

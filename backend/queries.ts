@@ -25,6 +25,7 @@ import {
 } from './setupService.js';
 import {
   enqueueSheetsMirror,
+  extractRentalGatePagePayload,
   flushSheetsMirrorOutbox,
   getLastSyncBatchMutatedAt,
   ingestIncrementalSyncBatch,
@@ -2176,6 +2177,97 @@ export async function disableEmployee(executor: DbExecutor, session: AuthSession
   return updateEmployee(executor, session, { employeeId: empId, status });
 }
 
+export async function deleteEmployee(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'manage_employees');
+  const empId = str(payload.employeeId);
+  if (!empId) throw new Error('VALIDATION_ERROR: معرف الموظف مطلوب.');
+  if (empId === session.user.id) {
+    throw new Error('FORBIDDEN: لا يمكن حذف حسابك الشخصي أثناء تسجيل الدخول.');
+  }
+
+  const out = await executor.withTransaction(async (tx) => {
+    const res = await tx.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [empId]);
+    const cur = res.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الموظف غير موجود.');
+
+    if (str(cur.role) === 'general_manager' && str(cur.status) === 'active') {
+      const activeGmRes = await tx.query<{ cnt: string }>(
+        `SELECT COUNT(*)::text AS cnt FROM employees WHERE role = 'general_manager' AND status = 'active' AND id <> $1`,
+        [empId]
+      );
+      const remainingActiveGms = Number(activeGmRes.rows[0]?.cnt || 0);
+      if (remainingActiveGms < 1) {
+        throw new Error('FORBIDDEN: لا يمكن حذف آخر مدير عام نشط في النظام.');
+      }
+    }
+
+    await tx.query(`DELETE FROM sessions WHERE employee_id = $1`, [empId]);
+    await tx.query(`DELETE FROM assignments WHERE employee_id = $1`, [empId]);
+
+    const affectedRes = await tx.query(
+      `SELECT id, assigned_employee_ids, assigned_employee_names FROM reservations WHERE assigned_employee_ids @> $1::jsonb`,
+      [JSON.stringify([empId])]
+    );
+    for (const r of affectedRes.rows) {
+      const ids = parseJsonArray<string>(r.assigned_employee_ids);
+      const names = parseJsonArray<string>(r.assigned_employee_names);
+      const nextIds: string[] = [];
+      const nextNames: string[] = [];
+      for (let i = 0; i < ids.length; i++) {
+        if (ids[i] !== empId) {
+          nextIds.push(ids[i]);
+          if (names[i] !== undefined) nextNames.push(names[i]);
+        }
+      }
+      await tx.query(
+        `UPDATE reservations SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb WHERE id = $1`,
+        [r.id, JSON.stringify(nextIds), JSON.stringify(nextNames)]
+      );
+    }
+
+    const affectedPrb = await tx.query(
+      `SELECT id, assigned_employee_ids, assigned_employee_names FROM problems WHERE assigned_employee_ids @> $1::jsonb`,
+      [JSON.stringify([empId])]
+    );
+    for (const p of affectedPrb.rows) {
+      const ids = parseJsonArray<string>(p.assigned_employee_ids);
+      const names = parseJsonArray<string>(p.assigned_employee_names);
+      const nextIds: string[] = [];
+      const nextNames: string[] = [];
+      for (let i = 0; i < ids.length; i++) {
+        if (ids[i] !== empId) {
+          nextIds.push(ids[i]);
+          if (names[i] !== undefined) nextNames.push(names[i]);
+        }
+      }
+      await tx.query(
+        `UPDATE problems SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb WHERE id = $1`,
+        [p.id, JSON.stringify(nextIds), JSON.stringify(nextNames)]
+      );
+    }
+
+    await tx.query(`DELETE FROM users WHERE id = $1`, [empId]);
+    await tx.query(`DELETE FROM employees WHERE id = $1`, [empId]);
+
+    await logActivity(tx, session.user, 'حذف موظف', 'Employee', str(cur.username || empId), `حذف الموظف ${str(cur.name)} (${str(cur.username)})`);
+    await enqueueSheetsMirror(tx, 'Employee', empId, 'deleteEmployee', {
+      id: empId,
+      username: str(cur.username),
+      name: str(cur.name)
+    });
+
+    return {
+      id: empId,
+      deleted: true,
+      name: str(cur.name),
+      username: str(cur.username)
+    };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
 export async function saveRolePreset(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
   requirePermission(session, 'manage_employees');
   const current = await getRolePresetsFromDb(executor);
@@ -2611,7 +2703,7 @@ export async function pullOrSyncReservations(
   if (gasUrl) {
     const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 15000) : null;
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 50000) : null;
     try {
       const resp = await fetch(gasUrl, {
         method: 'POST',
@@ -2783,10 +2875,30 @@ export async function testRentalGateConnection(executor: DbExecutor, session: Au
     method: 'GET',
     headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }
   });
+  let parsed: any = null;
+  let totalElements = 0;
+  let sampleCount = 0;
+  try {
+    const raw = await resp.text();
+    parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === 'object') {
+      const pageInfo = extractRentalGatePagePayload(parsed, 0, 1);
+      sampleCount = pageInfo.rows.length;
+      totalElements = pageInfo.totalElements;
+    }
+  } catch {
+    parsed = null;
+  }
+  const apiRejected = Boolean(parsed && !Array.isArray(parsed) && parsed.success === false && !parsed.data && !parsed.content && !parsed.items);
+  const ok = resp.ok && !apiRejected && parsed !== null;
   return {
-    connected: resp.ok,
+    connected: ok,
     statusCode: resp.status,
     hasToken: true,
-    message: resp.ok ? 'الاتصال بواجهة Rental Gate API يعمل بنجاح.' : `فشل الاتصال (HTTP ${resp.status})`
+    sampleCount,
+    totalElements,
+    message: ok
+      ? `الاتصال بواجهة Rental Gate API يعمل بنجاح (${totalElements > 0 ? `إجمالي الحجوزات بالمنصة: ${totalElements}` : `عينة الفحص: ${sampleCount}`}).`
+      : (apiRejected && parsed?.message ? String(parsed.message) : `فشل الاتصال (HTTP ${resp.status})`)
   };
 }

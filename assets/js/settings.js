@@ -625,7 +625,22 @@
           }
           var res = await root.RGApi.callApi('syncRentalGate', syncPayload);
           if (res.success) {
-            ctx.toast('اكتملت المزامنة بنجاح.');
+            var d = res.data || {};
+            var imported = d.importedCount || 0;
+            var updated = d.updatedCount || 0;
+            var exts = d.extensionsCount || 0;
+            var diagHint = '';
+            if (imported === 0 && updated === 0) {
+              var fetched = d.fetchedCount || 0;
+              if (fetched > 0 && d.excludedFilteredCount === fetched) {
+                diagHint = ' — تم جلب ' + fetched + ' سجل ولكن استُبعدت جميعها حسب الحالات المستبعدة';
+              } else if (fetched > 0 && d.rangeFilteredCount > 0) {
+                diagHint = ' — تم جلب ' + fetched + ' سجل ولكن استُبعد ' + d.rangeFilteredCount + ' خارج النطاق المحدد';
+              } else if (fetched === 0) {
+                diagHint = ' — أرجعت الواجهة 0 حجز لهذا الحساب/الفترة';
+              }
+            }
+            ctx.toast('اكتملت المزامنة بنجاح: ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + diagHint);
             render(container, ctx);
           } else {
             var msg = document.getElementById('sync-action-msg');

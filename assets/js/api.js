@@ -1217,6 +1217,20 @@
         }
         return undefined;
       });
+      return;
+    }
+
+    if (action === 'deleteEmployee') {
+      var delEmpId = String(p.employeeId || '').trim();
+      if (!delEmpId) return;
+      patchCachedScopes(['employees'], function (data, actName) {
+        if (actName === 'getEmployees' && Array.isArray(data.items)) {
+          return Object.assign({}, data, {
+            items: data.items.filter(function (emp) { return emp.id !== delEmpId; })
+          });
+        }
+        return undefined;
+      });
     }
   }
 
@@ -1997,11 +2011,20 @@
       var defaults = seedSandboxDb();
       var dirty = false;
 
-      if (!Array.isArray(parsed.employees) || parsed.employees.length === 0) {
+      if (!Array.isArray(parsed.employees) || (parsed.employees.length === 0 && !Array.isArray(parsed._deletedSeedUsernames))) {
         parsed.employees = defaults.employees;
         dirty = true;
       } else {
+        var deletedSeedSet = {};
+        if (Array.isArray(parsed._deletedSeedUsernames)) {
+          parsed._deletedSeedUsernames.forEach(function (u) {
+            if (u) deletedSeedSet[String(u).toLowerCase()] = true;
+          });
+        }
         defaults.employees.forEach(function (defEmp) {
+          if (deletedSeedSet[String(defEmp.username || '').toLowerCase()]) {
+            return;
+          }
           var existingEmp = parsed.employees.find(function (e) {
             return e && String(e.username || '').toLowerCase() === defEmp.username;
           });
@@ -3080,6 +3103,11 @@
           updatedAt: new Date().toISOString()
         };
         db.employees.push(newEmp);
+        if (Array.isArray(db._deletedSeedUsernames)) {
+          db._deletedSeedUsernames = db._deletedSeedUsernames.filter(function (u) {
+            return String(u || '').toLowerCase() !== unameNew;
+          });
+        }
         appendSandboxActivity(db, session.user, 'إنشاء موظف', 'Employee', newEmp.id, 'إنشاء حساب للموظف: ' + newEmp.name);
         saveSandboxDb(db);
         return { success: true, message: 'تم إنشاء حساب الموظف بنجاح.', data: sanitizeEmp(newEmp), error: null };
@@ -3134,6 +3162,60 @@
         appendSandboxActivity(db, session.user, empDis.status === 'disabled' ? 'إيقاف نشاط موظف' : 'تشغيل نشاط موظف', 'Employee', empDis.id, empDis.name);
         saveSandboxDb(db);
         return { success: true, message: empDis.status === 'disabled' ? 'تم إيقاف نشاط الموظف بنجاح.' : 'تم تشغيل نشاط الموظف بنجاح.', data: sanitizeEmp(empDis), error: null };
+      }
+
+      case 'deleteEmployee': {
+        if (!core.canUserPerform(session.user, 'manage_employees')) {
+          return { success: false, message: 'FORBIDDEN: صلاحية المدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var delEmpId = String(payload.employeeId || '').trim();
+        if (!delEmpId) {
+          return { success: false, message: 'معرف الموظف مطلوب.', data: null, error: 'VALIDATION' };
+        }
+        if (delEmpId === session.employeeId) {
+          return { success: false, message: 'لا يمكنك حذف حسابك الشخصي أثناء تسجيل الدخول.', data: null, error: 'FORBIDDEN' };
+        }
+        var empDel = db.employees.find(function (e) { return e.id === delEmpId; });
+        if (!empDel) return { success: false, message: 'الموظف غير موجود.', data: null, error: 'NOT_FOUND' };
+        if (empDel.role === 'general_manager' && empDel.status === 'active') {
+          var remainingGms = db.employees.filter(function (e) {
+            return e.id !== delEmpId && e.role === 'general_manager' && e.status === 'active';
+          });
+          if (remainingGms.length < 1) {
+            return { success: false, message: 'لا يمكن حذف آخر مدير عام نشط في النظام.', data: null, error: 'FORBIDDEN' };
+          }
+        }
+        db.sessions.forEach(function (s) {
+          if (s.employeeId === delEmpId) s.isRevoked = true;
+        });
+        db.employees = db.employees.filter(function (e) { return e.id !== delEmpId; });
+        if (!Array.isArray(db._deletedSeedUsernames)) db._deletedSeedUsernames = [];
+        var delUsername = String(empDel.username || '').toLowerCase();
+        if (delUsername && db._deletedSeedUsernames.indexOf(delUsername) === -1) {
+          db._deletedSeedUsernames.push(delUsername);
+        }
+        var scrubAssigned = function (rec) {
+          if (!Array.isArray(rec.assignedEmployeeIds)) return;
+          var idx = rec.assignedEmployeeIds.indexOf(delEmpId);
+          if (idx === -1) return;
+          var nextIds = [];
+          var nextNames = [];
+          for (var i = 0; i < rec.assignedEmployeeIds.length; i++) {
+            if (rec.assignedEmployeeIds[i] !== delEmpId) {
+              nextIds.push(rec.assignedEmployeeIds[i]);
+              if (Array.isArray(rec.assignedEmployeeNames) && rec.assignedEmployeeNames[i] !== undefined) {
+                nextNames.push(rec.assignedEmployeeNames[i]);
+              }
+            }
+          }
+          rec.assignedEmployeeIds = nextIds;
+          rec.assignedEmployeeNames = nextNames;
+        };
+        (db.reservations || []).forEach(scrubAssigned);
+        (db.problems || []).forEach(scrubAssigned);
+        appendSandboxActivity(db, session.user, 'حذف موظف', 'Employee', delEmpId, empDel.name + ' (' + empDel.username + ')');
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حذف الموظف بنجاح.', data: { id: delEmpId, deleted: true, name: empDel.name }, error: null };
       }
 
       case 'saveRolePreset': {
@@ -3785,6 +3867,25 @@
           parsed = (core && core.parseBackendResponseText)
             ? core.parseBackendResponseText(bText, bResponse.status, bContentType)
             : (bText ? JSON.parse(bText) : { success: false, message: 'استجابة فارغة من خادم قاعدة البيانات السحابية.', data: null, error: 'EMPTY_RESPONSE' });
+          if ((action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus') && typeof console !== 'undefined' && typeof console.info === 'function') {
+            var bRawJson = null;
+            try { bRawJson = bText ? JSON.parse(bText) : null; } catch (bJsonErr) { bRawJson = { _parseError: String(bJsonErr && bJsonErr.message ? bJsonErr.message : bJsonErr) }; }
+            var bRawData = bRawJson && typeof bRawJson === 'object' ? bRawJson.data : null;
+            console.info('[RGApi:SyncBackendDiag]', {
+              action: action,
+              endpoint: backendUrl,
+              status: bResponse.status,
+              statusText: bResponse.statusText,
+              ok: bResponse.ok,
+              contentType: bContentType,
+              rawTextLength: bText ? bText.length : 0,
+              rawTopLevelKeys: bRawJson && typeof bRawJson === 'object' ? Object.keys(bRawJson) : typeof bRawJson,
+              rawDataKeys: bRawData && typeof bRawData === 'object' ? Object.keys(bRawData) : typeof bRawData,
+              rawDataStructure: bRawData || bRawJson,
+              parsedSuccess: Boolean(parsed && parsed.success),
+              parsedError: parsed && parsed.error ? parsed.error : null
+            });
+          }
           if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
             setToken('');
             document.dispatchEvent(new CustomEvent('rg:unauthorized'));
@@ -3814,6 +3915,7 @@
           }
         }
 
+        var isGasSyncDiag = action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus';
         var timeoutId = null;
         try {
           var opts = (core && core.buildGasFetchOptions)
@@ -3843,12 +3945,51 @@
             ? core.parseGasResponseText(text, response.status)
             : JSON.parse(text);
 
+          if (isGasSyncDiag && typeof console !== 'undefined' && typeof console.info === 'function') {
+            var gasContentType = response.headers && response.headers.get ? (response.headers.get('content-type') || '') : '';
+            var rawJsonStruct = null;
+            try {
+              rawJsonStruct = text ? JSON.parse(text) : null;
+            } catch (jsonDiagErr) {
+              rawJsonStruct = {
+                _parseError: jsonDiagErr && jsonDiagErr.message ? jsonDiagErr.message : String(jsonDiagErr)
+              };
+            }
+            var rawDataObj = rawJsonStruct && typeof rawJsonStruct === 'object' ? rawJsonStruct.data : null;
+            console.info('[RGApi:GasSyncDiag]', {
+              action: action,
+              gasUrl: gasUrl,
+              status: response.status,
+              statusText: response.statusText,
+              ok: response.ok,
+              redirected: Boolean(response.redirected),
+              finalUrl: response.url || '',
+              contentType: gasContentType,
+              rawTextLength: text ? text.length : 0,
+              rawTextPreview: text ? text.slice(0, 1200) : '',
+              rawTopLevelKeys: rawJsonStruct && typeof rawJsonStruct === 'object' ? Object.keys(rawJsonStruct) : typeof rawJsonStruct,
+              rawDataKeys: rawDataObj && typeof rawDataObj === 'object' ? Object.keys(rawDataObj) : typeof rawDataObj,
+              rawDataStructure: rawDataObj !== undefined && rawDataObj !== null ? rawDataObj : rawJsonStruct,
+              parsedSuccess: Boolean(parsed && parsed.success),
+              parsedError: parsed && parsed.error ? parsed.error : null,
+              parsedMessage: parsed && parsed.message ? parsed.message : ''
+            });
+          }
+
           if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
             setToken('');
             document.dispatchEvent(new CustomEvent('rg:unauthorized'));
           }
         } catch (err) {
           if (timeoutId) clearTimeout(timeoutId);
+          if (isGasSyncDiag && typeof console !== 'undefined' && typeof console.error === 'function') {
+            console.error('[RGApi:GasSyncDiag] Fetch error:', {
+              action: action,
+              gasUrl: gasUrl,
+              errorName: err && err.name ? err.name : '',
+              errorMessage: err && err.message ? err.message : String(err)
+            });
+          }
           var isAbort = err && (err.name === 'AbortError' || String(err.message || '').indexOf('abort') !== -1);
           return {
             success: false,
@@ -3899,7 +4040,7 @@
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
-        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem' || action === 'deleteEmployee' || action === 'createEmployee' || action === 'updateEmployee' || action === 'disableEmployee')) {
           syncSandboxSnapshotToIdb(ns);
         }
 

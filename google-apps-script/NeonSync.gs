@@ -200,12 +200,13 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
 
   var totalSentRes = 0;
   var totalSentExt = 0;
-  var maxLen = Math.max(deltaRes.length, deltaExt.length);
 
-  for (var offset = 0; offset < maxLen; offset += NEON_BATCH_SIZE) {
-    var resChunk = deltaRes.slice(offset, offset + NEON_BATCH_SIZE);
-    var extChunk = deltaExt.slice(offset, offset + NEON_BATCH_SIZE);
-    if (resChunk.length === 0 && extChunk.length === 0) continue;
+  for (var resOff = 0; resOff < deltaRes.length; resOff += NEON_BATCH_SIZE) {
+    var resChunk = deltaRes.slice(resOff, resOff + NEON_BATCH_SIZE);
+    if (resChunk.length === 0) continue;
+    var pairedExtChunk = (resOff + NEON_BATCH_SIZE >= deltaRes.length && deltaExt.length <= NEON_BATCH_SIZE)
+      ? deltaExt
+      : [];
 
     fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, {
       source: 'google_apps_script',
@@ -214,10 +215,27 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
       pagesFetched: (meta && meta.pagesFetched) || 0,
       appliedRange: (meta && meta.appliedRange) || null,
       reservations: resChunk,
-      extensions: extChunk
+      extensions: pairedExtChunk
     });
 
     totalSentRes += resChunk.length;
+    totalSentExt += pairedExtChunk.length;
+  }
+
+  for (var extOff = totalSentExt; extOff < deltaExt.length; extOff += NEON_BATCH_SIZE) {
+    var extChunk = deltaExt.slice(extOff, extOff + NEON_BATCH_SIZE);
+    if (extChunk.length === 0) continue;
+
+    fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, {
+      source: 'google_apps_script',
+      triggeredById: (meta && meta.triggeredById) || 'GAS_SYNC',
+      triggeredByName: (meta && meta.triggeredByName) || 'Google Apps Script Incremental Sync',
+      pagesFetched: (meta && meta.pagesFetched) || 0,
+      appliedRange: (meta && meta.appliedRange) || null,
+      reservations: [],
+      extensions: extChunk
+    });
+
     totalSentExt += extChunk.length;
   }
 
@@ -394,6 +412,13 @@ function handleNeonMirrorSync_(payload) {
         createdAt: empRec.createdAt,
         updatedAt: empRec.updatedAt
       });
+    } else if (action === 'deleteEmployee' && data.id) {
+      if (typeof revokeEmployeeSessions === 'function') revokeEmployeeSessions(data.id);
+      if (typeof deleteRecordByKey === 'function') {
+        deleteRecordByKey(RG_SHEETS.EMPLOYEES, 'id', data.id);
+        deleteRecordByKey(RG_SHEETS.USERS, 'id', data.id);
+      }
+      applied++;
     } else if (action === 'upsertSetting' && data.key) {
       setBatch.push({
         key: data.key,

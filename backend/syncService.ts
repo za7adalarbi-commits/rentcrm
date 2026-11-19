@@ -36,6 +36,9 @@ export interface SyncIngestResult {
   appliedRange?: Record<string, any>;
   changedReservations: any[];
   mutatedReservations?: any[];
+  fetchedCount?: number;
+  excludedFilteredCount?: number;
+  rangeFilteredCount?: number;
 }
 
 function str(v: unknown, fallback = ''): string {
@@ -148,10 +151,12 @@ function normalizeIncomingExtension(raw: any, resIdLookup: Map<string, string>, 
   const extNum = str(raw.extensionNumber || raw.extendId || raw.id);
   const resNum = str(raw.reservationNumber || raw.reservation_number || raw.reservationId || '');
   const srcResId = str(raw.sourceReservationId || raw.reservationId || resNum);
+  const rawResId = str(raw.reservationId);
   const matchedResId = str(
-    raw.reservationId && String(raw.reservationId).startsWith('RES_')
-      ? raw.reservationId
-      : (resIdLookup.get(resNum) || resIdLookup.get(srcResId) || '')
+    resIdLookup.get(resNum) ||
+    resIdLookup.get(srcResId) ||
+    resIdLookup.get(rawResId) ||
+    ''
   );
 
   const extType = str(raw.extensionType || raw.extension_type || '').toUpperCase();
@@ -416,20 +421,47 @@ export async function ingestIncrementalSyncBatch(
 
   try {
     await executor.withTransaction(async (tx) => {
-      const existingResRes = incomingRes.length > 0
+      const lookupNums = Array.from(new Set([
+        ...incomingRes.map((r) => str(r.reservationNumber || r.reservation_number || r.reservationId || r.id)),
+        ...incomingRes.map((r) => str(r.sourceReservationId || r.reservationId || r.id)),
+        ...incomingExt.map((e) => str(e.reservationNumber || e.reservation_number || e.reservationId)),
+        ...incomingExt.map((e) => str(e.sourceReservationId || e.reservationId))
+      ].filter(Boolean)));
+      const lookupIds = Array.from(new Set([
+        ...incomingRes.map((r) => str(r.id)),
+        ...incomingExt.map((e) => str(e.reservationId))
+      ].filter((id) => id && id.startsWith('RES_'))));
+
+      const existingResRes = (lookupNums.length > 0 || lookupIds.length > 0)
         ? await tx.query(
-            `SELECT * FROM reservations WHERE reservation_number = ANY($1::text[])`,
-            [incomingRes.map((r) => str(r.reservationNumber || r.reservation_number || r.reservationId || r.id)).filter(Boolean)]
+            `SELECT * FROM reservations
+             WHERE reservation_number = ANY($1::text[])
+                OR source_reservation_id = ANY($1::text[])
+                OR id = ANY($2::text[])`,
+            [lookupNums, lookupIds]
           )
         : { rows: [] };
 
       const existingByNumber = new Map<string, Record<string, any>>();
+      const existingBySourceId = new Map<string, Record<string, any>>();
+      const existingById = new Map<string, Record<string, any>>();
       const resIdByRef = new Map<string, string>();
+      const knownDbResIds = new Set<string>();
       for (const row of existingResRes.rows) {
         const clientObj = mapReservationRowToClient(row);
-        existingByNumber.set(clientObj.reservationNumber, clientObj);
-        if (clientObj.reservationNumber) resIdByRef.set(clientObj.reservationNumber, clientObj.id);
-        if (clientObj.sourceReservationId) resIdByRef.set(clientObj.sourceReservationId, clientObj.id);
+        if (clientObj.id) {
+          knownDbResIds.add(clientObj.id);
+          existingById.set(clientObj.id, clientObj);
+          resIdByRef.set(clientObj.id, clientObj.id);
+        }
+        if (clientObj.reservationNumber) {
+          existingByNumber.set(clientObj.reservationNumber, clientObj);
+          resIdByRef.set(clientObj.reservationNumber, clientObj.id);
+        }
+        if (clientObj.sourceReservationId) {
+          existingBySourceId.set(clientObj.sourceReservationId, clientObj);
+          resIdByRef.set(clientObj.sourceReservationId, clientObj.id);
+        }
       }
 
       // Pre-resolve reservation IDs for incoming reservations before linking extensions
@@ -437,10 +469,12 @@ export async function ingestIncrementalSyncBatch(
         const resNum = str(raw.reservationNumber || raw.reservation_number || raw.reservationId || raw.id);
         if (!resNum) continue;
         const srcId = str(raw.sourceReservationId || raw.reservationId || raw.id || resNum);
-        const existing = existingByNumber.get(resNum);
+        const existing = existingByNumber.get(resNum) || existingBySourceId.get(srcId) || existingById.get(str(raw.id));
         const resId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
+        knownDbResIds.add(resId);
         resIdByRef.set(resNum, resId);
         if (srcId) resIdByRef.set(srcId, resId);
+        if (str(raw.id)) resIdByRef.set(str(raw.id), resId);
       }
 
       // Group extensions by reservation number / source ID and deduplicate by extensionNumber for safe batch upsert
@@ -451,7 +485,7 @@ export async function ingestIncrementalSyncBatch(
         if (!ext.extensionNumber) continue;
         extDedupMap.set(ext.extensionNumber, ext);
         if (ext.isAcceptedAndPaid) {
-          const keys = [ext.reservationNumber, ext.sourceReservationId].filter(Boolean);
+          const keys = Array.from(new Set([ext.reservationNumber, ext.sourceReservationId].filter(Boolean)));
           for (const k of keys) {
             const list = extsByResKey.get(k) || [];
             list.push(ext);
@@ -470,7 +504,14 @@ export async function ingestIncrementalSyncBatch(
         if (!resNum) continue;
         const srcId = str(raw.sourceReservationId || raw.reservationId || raw.id || resNum);
         const existing = existingByNumber.get(resNum) || null;
-        const relExts = extsByResKey.get(resNum) || extsByResKey.get(srcId) || [];
+        const seenExtNums = new Set<string>();
+        const relExts: any[] = [];
+        for (const candidate of [...(extsByResKey.get(resNum) || []), ...(srcId && srcId !== resNum ? (extsByResKey.get(srcId) || []) : [])]) {
+          if (candidate?.extensionNumber && !seenExtNums.has(candidate.extensionNumber)) {
+            seenExtNums.add(candidate.extensionNumber);
+            relExts.push(candidate);
+          }
+        }
 
         const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt);
         resDedupMap.set(record.reservationNumber, record);
@@ -636,6 +677,54 @@ export async function ingestIncrementalSyncBatch(
         }
       }
 
+      // Verify exact existing reservation IDs in PostgreSQL before inserting extensions to eliminate FK violations
+      if (normalizedExts.length > 0) {
+        const extCandidateIds = Array.from(new Set(
+          normalizedExts.map((e) => str(e.reservationId)).filter(Boolean)
+        ));
+        const extCandidateRefs = Array.from(new Set([
+          ...normalizedExts.map((e) => str(e.reservationNumber)),
+          ...normalizedExts.map((e) => str(e.sourceReservationId))
+        ].filter(Boolean)));
+        if (extCandidateIds.length > 0 || extCandidateRefs.length > 0) {
+          const verifiedResRows = await tx.query<{ id: string; reservation_number: string; source_reservation_id: string }>(
+            `SELECT id, reservation_number, source_reservation_id FROM reservations
+             WHERE id = ANY($1::text[])
+                OR reservation_number = ANY($2::text[])
+                OR source_reservation_id = ANY($2::text[])`,
+            [extCandidateIds, extCandidateRefs]
+          );
+          knownDbResIds.clear();
+          for (const vr of verifiedResRows.rows) {
+            const vid = str(vr.id);
+            if (!vid) continue;
+            knownDbResIds.add(vid);
+            resIdByRef.set(vid, vid);
+            if (str(vr.reservation_number)) resIdByRef.set(str(vr.reservation_number), vid);
+            if (str(vr.source_reservation_id)) resIdByRef.set(str(vr.source_reservation_id), vid);
+          }
+        }
+      }
+
+      // Backfill any previously orphaned extensions whose parent reservations arrived in this batch
+      if (reservationBatch.length > 0) {
+        const batchResIds = reservationBatch.map((r) => r.id).filter(Boolean);
+        if (batchResIds.length > 0) {
+          await tx.query(
+            `UPDATE extensions e
+             SET reservation_id = r.id
+             FROM reservations r
+             WHERE e.reservation_id IS NULL
+               AND r.id = ANY($1::text[])
+               AND (
+                 (e.reservation_number <> '' AND e.reservation_number = r.reservation_number)
+                 OR (e.source_reservation_id <> '' AND e.source_reservation_id = r.source_reservation_id)
+               )`,
+            [batchResIds]
+          ).catch(() => undefined);
+        }
+      }
+
       // Chunked UNNEST upserts for Extensions
       for (const extChunk of chunkList(normalizedExts, 250)) {
         await tx.query(
@@ -677,7 +766,14 @@ export async function ingestIncrementalSyncBatch(
             extChunk.map((ext) => ext.id),
             extChunk.map((ext) => ext.extensionNumber),
             extChunk.map((ext) => ext.sequenceNumber),
-            extChunk.map((ext) => ext.reservationId || resIdByRef.get(ext.reservationNumber) || resIdByRef.get(ext.sourceReservationId) || null),
+            extChunk.map((ext) => {
+              const cand = str(
+                resIdByRef.get(ext.reservationNumber) ||
+                resIdByRef.get(ext.sourceReservationId) ||
+                ext.reservationId
+              );
+              return (cand && knownDbResIds.has(cand)) ? cand : null;
+            }),
             extChunk.map((ext) => ext.reservationNumber),
             extChunk.map((ext) => ext.sourceReservationId),
             extChunk.map((ext) => ext.extensionType),
@@ -953,6 +1049,113 @@ export async function flushSheetsMirrorOutbox(
   }
 }
 
+export function extractRentalGatePagePayload(
+  json: any,
+  pageIndex = 0,
+  pageSize = 100
+): { rows: any[]; totalPages: number; totalElements: number; isLast: boolean } {
+  if (!json || typeof json !== 'object') {
+    return { rows: [], totalPages: 1, totalElements: 0, isLast: true };
+  }
+
+  if (Array.isArray(json)) {
+    return {
+      rows: json,
+      totalPages: 1,
+      totalElements: json.length,
+      isLast: json.length < pageSize
+    };
+  }
+
+  const pickRowsFromObj = (obj: any): any[] | null => {
+    if (!obj || typeof obj !== 'object') return null;
+    if (Array.isArray(obj)) return obj;
+    const candidateKeys = ['content', 'items', 'results', 'reservations', 'extensions', 'records', 'rows', 'list', 'data'];
+    for (const k of candidateKeys) {
+      if (Array.isArray(obj[k])) return obj[k];
+    }
+    return null;
+  };
+
+  let metaHolder: any = json;
+  let rows = pickRowsFromObj(json);
+
+  if (!rows) {
+    const nestedContainers = [json.data, json.result, json.payload, json.response, json.body];
+    for (const container of nestedContainers) {
+      if (container && typeof container === 'object') {
+        const nestedRows = pickRowsFromObj(container);
+        if (nestedRows) {
+          rows = nestedRows;
+          metaHolder = container;
+          break;
+        }
+        if (container.data && typeof container.data === 'object') {
+          const deepRows = pickRowsFromObj(container.data);
+          if (deepRows) {
+            rows = deepRows;
+            metaHolder = container.data;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const rawTotalPages =
+    metaHolder?.totalPages ??
+    metaHolder?.total_pages ??
+    metaHolder?.last_page ??
+    metaHolder?.meta?.last_page ??
+    metaHolder?.pagination?.last_page ??
+    json?.totalPages ??
+    json?.total_pages ??
+    json?.last_page ??
+    json?.meta?.last_page ??
+    json?.pagination?.last_page;
+
+  const hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
+  const totalPages = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : 1;
+
+  const rawTotalElements =
+    metaHolder?.totalElements ??
+    metaHolder?.total ??
+    metaHolder?.total_count ??
+    metaHolder?.meta?.total ??
+    json?.totalElements ??
+    json?.total ??
+    json?.total_count;
+  const totalElements =
+    rawTotalElements !== undefined && rawTotalElements !== null && !isNaN(Number(rawTotalElements))
+      ? Number(rawTotalElements)
+      : safeRows.length;
+
+  const explicitLast =
+    metaHolder?.last !== undefined
+      ? metaHolder.last
+      : (json?.last !== undefined ? json.last : undefined);
+  const explicitHasMore =
+    metaHolder?.hasMore !== undefined
+      ? metaHolder.hasMore
+      : (metaHolder?.has_more !== undefined ? metaHolder.has_more : (json?.hasMore ?? json?.has_more));
+
+  let isLast: boolean;
+  if (safeRows.length === 0) {
+    isLast = true;
+  } else if (explicitLast === true || explicitHasMore === false) {
+    isLast = true;
+  } else if (hasTotalPages) {
+    isLast = pageIndex + 1 >= totalPages;
+  } else if (explicitLast === false || explicitHasMore === true) {
+    isLast = false;
+  } else {
+    isLast = safeRows.length < pageSize;
+  }
+
+  return { rows: safeRows, totalPages, totalElements, isLast };
+}
+
 export async function pullFromRentalGateDirect(
   executor: DbExecutor,
   actor: SyncActor,
@@ -970,7 +1173,7 @@ export async function pullFromRentalGateDirect(
   const pageSize = 100;
   const maxPages = Math.min(50, Math.max(1, num(payload?.maxPages, 25)));
 
-  const fetchPaged = async (endpoint: string) => {
+  const fetchPaged = async (endpoint: string, optional = false) => {
     const items: any[] = [];
     let pages = 0;
     for (let page = 0; page < maxPages; page++) {
@@ -984,23 +1187,27 @@ export async function pullFromRentalGateDirect(
       });
       if (!resp.ok) {
         const errBody = await resp.text().catch(() => '');
+        if (optional && resp.status !== 401 && resp.status !== 403) {
+          return { items, pages };
+        }
         throw new Error(`RG_API_HTTP_${resp.status}: ${errBody.slice(0, 200)}`);
       }
       const json: any = await resp.json();
+      if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
+        if (optional) return { items, pages };
+        throw new Error(str(json.message || json.error || 'RG_API_ERROR: رفضت واجهة Rental Gate الطلب.'));
+      }
       pages++;
-      const list = Array.isArray(json)
-        ? json
-        : (json?.content || json?.items || json?.data || json?.results || []);
-      const arr = Array.isArray(list) ? list : [];
-      items.push(...arr);
-      if (json?.last === true || arr.length < pageSize) break;
+      const parsedPage = extractRentalGatePagePayload(json, page, pageSize);
+      items.push(...parsedPage.rows);
+      if (parsedPage.isLast) break;
     }
     return { items, pages };
   };
 
   const [resPaged, extPaged] = await Promise.all([
-    fetchPaged('reservations/filter'),
-    fetchPaged('reservation-extends/filter')
+    fetchPaged('reservations/filter', false),
+    fetchPaged('reservation-extends/filter', true)
   ]);
 
   const settingsRes = await executor.query<{ value: string }>(
@@ -1016,14 +1223,17 @@ export async function pullFromRentalGateDirect(
   }
   const excludedSet = new Set(excludedStatuses.map((s) => str(s).toLowerCase()));
 
-  const dedupedRes = crmCore.dedupeReservationsByNumber(resPaged.items).filter((item: any) => {
+  const dedupedAllRes = crmCore.dedupeReservationsByNumber(resPaged.items);
+  const afterExcludedRes = dedupedAllRes.filter((item: any) => {
     const code = str(item.reservationStatus || item.status || item.status_code).toLowerCase();
     return !excludedSet.has(code);
   });
+  const excludedFilteredCount = dedupedAllRes.length - afterExcludedRes.length;
 
   const filteredRes = appliedRange?.hasCustomRange
-    ? crmCore.filterSourceReservationsByPullRange(dedupedRes, appliedRange)
-    : dedupedRes;
+    ? crmCore.filterSourceReservationsByPullRange(afterExcludedRes, appliedRange)
+    : afterExcludedRes;
+  const rangeFilteredCount = afterExcludedRes.length - filteredRes.length;
 
   const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.items);
 
@@ -1044,5 +1254,10 @@ export async function pullFromRentalGateDirect(
     void flushSheetsMirrorOutbox(executor, fetchFn).catch(() => undefined);
   }
 
-  return syncResult;
+  return {
+    ...syncResult,
+    fetchedCount: resPaged.items.length,
+    excludedFilteredCount,
+    rangeFilteredCount
+  };
 }

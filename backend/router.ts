@@ -149,6 +149,9 @@ export async function dispatchCrmRequest(
       case 'disableEmployee':
         result = await queries.disableEmployee(executor, session, payload);
         break;
+      case 'deleteEmployee':
+        result = await queries.deleteEmployee(executor, session, payload);
+        break;
       case 'saveRolePreset':
         result = await queries.saveRolePreset(executor, session, payload);
         break;

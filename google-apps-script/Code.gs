@@ -139,6 +139,9 @@ function handleApiRequest(e, method) {
       case 'disableEmployee':
         result = disableEmployee(session, payload);
         break;
+      case 'deleteEmployee':
+        result = deleteEmployee(session, payload);
+        break;
       case 'saveRolePreset':
         result = saveRolePreset(session, payload);
         break;

@@ -1352,7 +1352,15 @@
     for (var i = 0; i < list.length; i++) {
       var item = list[i];
       if (!item || typeof item !== 'object') continue;
-      var key = normalizeStr(item.reservation_number || item.reservationNumber || item.code || item.reference || item.id);
+      var key = normalizeStr(
+        item.reservation_number ||
+        item.reservationNumber ||
+        item.reservationId ||
+        item.reservation_id ||
+        item.code ||
+        item.reference ||
+        item.id
+      );
       if (!key) continue;
       if (!Object.prototype.hasOwnProperty.call(map, key)) {
         order.push(key);
@@ -1369,7 +1377,14 @@
     for (var i = 0; i < list.length; i++) {
       var ext = list[i];
       if (!ext || typeof ext !== 'object') continue;
-      var key = normalizeStr(ext.extensionNumber || ext.extension_number || ext.code || ext.id);
+      var key = normalizeStr(
+        ext.extensionNumber ||
+        ext.extension_number ||
+        ext.extendId ||
+        ext.extend_id ||
+        ext.code ||
+        ext.id
+      );
       if (!key) continue;
       if (!Object.prototype.hasOwnProperty.call(map, key)) {
         order.push(key);
@@ -1693,6 +1708,7 @@
     createEmployee: ['employees', 'dashboard', 'activity', 'reports'],
     updateEmployee: ['employees', 'dashboard', 'activity', 'reports'],
     disableEmployee: ['employees', 'dashboard', 'activity', 'reports'],
+    deleteEmployee: ['employees', 'reservations', 'problems', 'dashboard', 'activity', 'reports'],
     saveRolePreset: ['employees', 'activity'],
     deleteRolePreset: ['employees', 'activity'],
     resetRolePresets: ['employees', 'activity'],
@@ -2069,6 +2085,7 @@
         return act + ':' + normalizeLoginUsername(p.username || p.name);
       case 'updateEmployee':
       case 'disableEmployee':
+      case 'deleteEmployee':
         return act + ':' + normalizeStr(p.employeeId);
       case 'saveRolePreset':
       case 'deleteRolePreset':

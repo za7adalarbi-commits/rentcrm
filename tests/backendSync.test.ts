@@ -16,7 +16,11 @@ import {
   resolveServerConfig
 } from '../backend/serverConfig';
 import { applyUnifiedConnectionSetup, getSetupCapabilities } from '../backend/setupService';
-import { ingestIncrementalSyncBatch } from '../backend/syncService';
+import {
+  extractRentalGatePagePayload,
+  ingestIncrementalSyncBatch,
+  pullFromRentalGateDirect
+} from '../backend/syncService';
 
 function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[]> } {
   const state: Record<string, any[]> = {
@@ -175,6 +179,12 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: [{ reg: 'employees' }] as any[], rowCount: 1 };
     }
 
+    if (sql.startsWith('SELECT COUNT(*)::text AS cnt FROM employees WHERE role')) {
+      const excludeId = params[0];
+      const cnt = state.employees.filter((e) => e.role === 'general_manager' && e.status === 'active' && e.id !== excludeId).length;
+      return { rows: [{ cnt: String(cnt) }] as any[], rowCount: 1 };
+    }
+
     if (sql.startsWith('SELECT COUNT(*)::text AS cnt FROM employees')) {
       return { rows: [{ cnt: String(state.employees.length) }] as any[], rowCount: 1 };
     }
@@ -329,6 +339,56 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: [], rowCount: 1 };
     }
 
+    if (sql.startsWith('DELETE FROM sessions WHERE employee_id')) {
+      state.sessions = state.sessions.filter((s) => s.employee_id !== params[0]);
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('DELETE FROM assignments WHERE employee_id')) {
+      state.assignments = state.assignments.filter((a) => a.employee_id !== params[0]);
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('DELETE FROM users WHERE id = $1')) {
+      state.users = state.users.filter((u) => u.id !== params[0]);
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('DELETE FROM employees WHERE id = $1')) {
+      state.employees = state.employees.filter((e) => e.id !== params[0]);
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('SELECT id, assigned_employee_ids, assigned_employee_names FROM reservations WHERE assigned_employee_ids @>')) {
+      const targetArr = JSON.parse(params[0]);
+      const rows = state.reservations.filter((r) => targetArr.every((id: string) => (r.assigned_employee_ids || []).includes(id)));
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
+    if (sql.startsWith('UPDATE reservations SET assigned_employee_ids = $2::jsonb')) {
+      const r = state.reservations.find((x) => x.id === params[0]);
+      if (r) {
+        r.assigned_employee_ids = JSON.parse(params[1]);
+        r.assigned_employee_names = JSON.parse(params[2]);
+      }
+      return { rows: [], rowCount: r ? 1 : 0 };
+    }
+
+    if (sql.startsWith('SELECT id, assigned_employee_ids, assigned_employee_names FROM problems WHERE assigned_employee_ids @>')) {
+      const targetArr = JSON.parse(params[0]);
+      const rows = state.problems.filter((p) => targetArr.every((id: string) => (p.assigned_employee_ids || []).includes(id)));
+      return { rows: rows as any[], rowCount: rows.length };
+    }
+
+    if (sql.startsWith('UPDATE problems SET assigned_employee_ids = $2::jsonb')) {
+      const p = state.problems.find((x) => x.id === params[0]);
+      if (p) {
+        p.assigned_employee_ids = JSON.parse(params[1]);
+        p.assigned_employee_names = JSON.parse(params[2]);
+      }
+      return { rows: [], rowCount: p ? 1 : 0 };
+    }
+
     if (sql.startsWith('INSERT INTO activity_log')) {
       state.activity_log.push({
         id: params[0], user_id: params[1], user_name: params[2], user_role: params[3],
@@ -344,8 +404,20 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
 
     if (sql.startsWith('SELECT * FROM reservations WHERE reservation_number = ANY')) {
       const nums: string[] = params[0] || [];
-      const rows = state.reservations.filter((r) => nums.includes(r.reservation_number));
+      const ids: string[] = params[1] || [];
+      const rows = state.reservations.filter(
+        (r) => nums.includes(r.reservation_number) || nums.includes(r.source_reservation_id) || ids.includes(r.id)
+      );
       return { rows, rowCount: rows.length };
+    }
+
+    if (sql.startsWith('SELECT id, reservation_number, source_reservation_id FROM reservations')) {
+      const ids: string[] = params[0] || [];
+      const refs: string[] = params[1] || [];
+      const rows = state.reservations
+        .filter((r) => ids.includes(r.id) || refs.includes(r.reservation_number) || refs.includes(r.source_reservation_id))
+        .map((r) => ({ id: r.id, reservation_number: r.reservation_number, source_reservation_id: r.source_reservation_id }));
+      return { rows: rows as any[], rowCount: rows.length };
     }
 
     if (sql.startsWith('SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1')) {
@@ -429,14 +501,37 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: outRows as any[], rowCount: outRows.length };
     }
 
+    if (sql.startsWith('UPDATE extensions e SET reservation_id = r.id')) {
+      const batchIds: string[] = params[0] || [];
+      let updated = 0;
+      for (const ext of state.extensions) {
+        if (ext.reservation_id) continue;
+        const parent = state.reservations.find(
+          (r) =>
+            batchIds.includes(r.id) &&
+            ((ext.reservation_number && ext.reservation_number === r.reservation_number) ||
+              (ext.source_reservation_id && ext.source_reservation_id === r.source_reservation_id))
+        );
+        if (parent) {
+          ext.reservation_id = parent.id;
+          updated++;
+        }
+      }
+      return { rows: [], rowCount: updated };
+    }
+
     if (sql.startsWith('INSERT INTO extensions (') && sql.includes('unnest(')) {
       const count = Array.isArray(params[0]) ? params[0].length : 0;
       for (let i = 0; i < count; i++) {
+        const targetResId = params[3][i];
+        if (targetResId !== null && targetResId !== undefined && !state.reservations.some((r) => r.id === targetResId)) {
+          throw new Error('insert or update on table "extensions" violates foreign key constraint "extensions_reservation_id_fkey"');
+        }
         const ext = {
           id: params[0][i],
           extension_number: params[1][i],
           sequence_number: params[2][i],
-          reservation_id: params[3][i],
+          reservation_id: targetResId,
           reservation_number: params[4][i],
           source_reservation_id: params[5][i],
           extension_type: params[6][i],
@@ -1674,5 +1769,290 @@ test('/api/crm Sandbox/GAS -> Neon switch verifies GM password cleanly on Vercel
     FIXED_SERVER_CONFIG.databaseUrl = prevFixedDb;
   }
 });
+
+test('pullFromRentalGateDirect ingests reservationId-only DTOs inside nested payloads and tolerates optional extension endpoint errors', async () => {
+  const prevRg = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_live_test_token_1234567890';
+  const db = createInMemoryMockExecutor();
+
+  try {
+    // Verify extractRentalGatePagePayload across nested wrapper shapes
+    const nested = extractRentalGatePagePayload({
+      data: {
+        content: [{ reservationId: 501 }, { reservationId: 502 }],
+        totalPages: 2,
+        totalElements: 4,
+        last: false
+      }
+    }, 0, 100);
+    assert.equal(nested.rows.length, 2);
+    assert.equal(nested.totalPages, 2);
+    assert.equal(nested.isLast, false);
+
+    // Mock multi-page nested Rental Gate responses with reservationId-only items (no id or reservationNumber)
+    const mockFetch = (async (url: any) => {
+      const u = String(url);
+      if (u.includes('reservations/filter')) {
+        if (u.includes('page=0')) {
+          return new Response(JSON.stringify({
+            data: {
+              content: [
+                {
+                  reservationId: 6001,
+                  clientName: 'عبدالله الغامدي',
+                  clientMobile: '0501122334',
+                  reservationStatus: 'CONFIRMED',
+                  total: 800
+                },
+                {
+                  reservationId: 6002,
+                  clientName: 'خالد الشهري',
+                  clientMobile: '0509988776',
+                  reservationStatus: 'CANCELLED',
+                  total: 300
+                }
+              ],
+              totalPages: 2,
+              last: false
+            }
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({
+          data: {
+            content: [
+              {
+                reservationId: 6003,
+                clientName: 'فيصل العتيبي',
+                clientMobile: '0554433221',
+                reservationStatus: 'STARTED',
+                total: 1200
+              }
+            ],
+            totalPages: 2,
+            last: true
+          }
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (u.includes('reservation-extends/filter')) {
+        return new Response(JSON.stringify({
+          data: {
+            data: [
+              {
+                extendId: 7001,
+                reservationId: 6001,
+                reservationStatus: 'PAID',
+                extendDays: 1,
+                total: 250
+              }
+            ],
+            last_page: 1
+          }
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    }) as any;
+
+    // Seed excluded_statuses setting like production DB
+    db.state.settings.push({ key: 'excluded_statuses', value: JSON.stringify(['cancelled', 'canceled']) });
+
+    const pullRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'المدير العام', role: 'general_manager' },
+      {},
+      mockFetch
+    );
+    assert.equal(pullRes.importedCount, 2);
+    assert.equal(pullRes.extensionsCount, 1);
+    assert.equal(pullRes.fetchedCount, 3);
+    assert.equal(pullRes.excludedFilteredCount, 1);
+    assert.equal(db.state.reservations.length, 2);
+    const res6001 = db.state.reservations.find((r) => r.reservation_number === '6001');
+    assert.ok(res6001);
+    assert.equal(res6001.total_amount, 1050);
+
+    // Optional extensions endpoint 404 does not abort reservations pull
+    const mockNoExtFetch = (async (url: any) => {
+      const u = String(url);
+      if (u.includes('reservations/filter')) {
+        return new Response(JSON.stringify([
+          { reservationId: 6004, clientName: 'راشد الدوسري', reservationStatus: 'CONFIRMED', total: 500 }
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('Not Found', { status: 404 });
+    }) as any;
+
+    const pullNoExt = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'المدير العام', role: 'general_manager' },
+      {},
+      mockNoExtFetch
+    );
+    assert.equal(pullNoExt.importedCount, 1);
+  } finally {
+    if (prevRg === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRg;
+  }
+});
+
+test('deleteEmployee deletes target employee, revokes sessions, scrubs assignments, and protects self & last general manager', async () => {
+  const db = createInMemoryMockExecutor();
+  const adminLogin = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'admin', password: 'Admin@123' }
+  });
+  const adminToken = adminLogin.data.token;
+  const adminId = adminLogin.data.user.id;
+
+  const agentLogin = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'agent1', password: 'Agent@123' }
+  });
+  const agentToken = agentLogin.data.token;
+
+  // Create a temporary employee, log them in, and assign them to a reservation
+  const created = await dispatchCrmRequest(db, {
+    action: 'createEmployee',
+    token: adminToken,
+    payload: {
+      name: 'موظف مؤقت',
+      username: 'temp_agent_del',
+      password: 'TempPass123',
+      role: 'agent',
+      jobTitle: 'ممثل خدمة'
+    }
+  });
+  assert.equal(created.success, true);
+  const targetId = created.data.id;
+
+  db.state.reservations.push({
+    id: 'RES_DEL_CHECK',
+    reservation_number: 'RG-DEL-1',
+    assigned_employee_ids: [targetId, adminId],
+    assigned_employee_names: ['موظف مؤقت', 'المدير العام']
+  });
+
+  // 1) Agent cannot delete employees
+  const agentDenied = await dispatchCrmRequest(db, {
+    action: 'deleteEmployee',
+    token: agentToken,
+    payload: { employeeId: targetId }
+  });
+  assert.equal(agentDenied.success, false);
+  assert.ok(String(agentDenied.error).startsWith('FORBIDDEN'));
+
+  // 2) Manager cannot delete self
+  const selfDenied = await dispatchCrmRequest(db, {
+    action: 'deleteEmployee',
+    token: adminToken,
+    payload: { employeeId: adminId }
+  });
+  assert.equal(selfDenied.success, false);
+  assert.ok(String(selfDenied.error).startsWith('FORBIDDEN'));
+
+  // 3) Manager deletes target employee cleanly
+  const delRes = await dispatchCrmRequest(db, {
+    action: 'deleteEmployee',
+    token: adminToken,
+    payload: { employeeId: targetId }
+  });
+  assert.equal(delRes.success, true);
+  assert.equal(delRes.data.deleted, true);
+  assert.equal(db.state.employees.some((e) => e.id === targetId), false);
+  assert.equal(db.state.users.some((u) => u.id === targetId), false);
+  assert.deepEqual(db.state.reservations[0].assigned_employee_ids, [adminId]);
+  assert.deepEqual(db.state.reservations[0].assigned_employee_names, ['المدير العام']);
+  assert.equal(db.state.sheets_mirror_outbox.some((m) => m.action === 'deleteEmployee' && m.entity_id === targetId), true);
+});
+
+test('ingestIncrementalSyncBatch prevents extensions_reservation_id_fkey violations on mismatched/missing reservations and auto-links late parents', async () => {
+  const db = createInMemoryMockExecutor();
+
+  // Pre-seed Neon reservation with a different id than Google Sheets generated
+  db.state.reservations.push({
+    id: 'RES_NEON_7001',
+    source_reservation_id: '7001',
+    reservation_number: 'RG-7001',
+    customer_name: 'أحمد العلي',
+    internal_status: 'مؤكد',
+    original_status_code: 'confirmed',
+    assigned_employee_ids: [],
+    assigned_employee_names: [],
+    status_history: [],
+    created_at: new Date(),
+    updated_at: new Date()
+  });
+
+  // Batch 1: incoming extension carries an unmatched Sheets ID ("RES_SHEETS_STALE") and another extension references a reservation not in Neon yet
+  const batch1 = await ingestIncrementalSyncBatch(db, {
+    source: 'google_apps_script',
+    actor: { id: 'SYSTEM_1M', name: 'المزامنة السحابية الدقيقة (Neon)', role: 'system' },
+    pagesFetched: 7,
+    reservations: [
+      {
+        id: 'RES_SHEETS_9001',
+        sourceReservationId: '9001',
+        reservationNumber: 'RG-9001',
+        customerName: 'سعد الشهري',
+        originalStatusCode: 'started',
+        total: 500
+      }
+    ],
+    extensions: [
+      {
+        extensionNumber: 'EXT_REMAP_1',
+        reservationId: 'RES_SHEETS_STALE',
+        reservationNumber: 'RG-7001',
+        sourceReservationId: '7001',
+        statusCode: 'paid',
+        paymentStatus: 'paid',
+        amount: 200
+      },
+      {
+        extensionNumber: 'EXT_ORPHAN_88',
+        reservationId: 'RES_MISSING_888',
+        reservationNumber: 'RG-8888',
+        sourceReservationId: '8888',
+        statusCode: 'paid',
+        paymentStatus: 'paid',
+        amount: 350
+      }
+    ]
+  });
+
+  assert.equal(batch1.status, 'success');
+  assert.equal(batch1.importedCount, 1);
+  assert.equal(batch1.extensionsCount, 2);
+
+  const remappedExt = db.state.extensions.find((e) => e.extension_number === 'EXT_REMAP_1');
+  assert.ok(remappedExt);
+  assert.equal(remappedExt.reservation_id, 'RES_NEON_7001');
+
+  const orphanExt = db.state.extensions.find((e) => e.extension_number === 'EXT_ORPHAN_88');
+  assert.ok(orphanExt);
+  assert.equal(orphanExt.reservation_id, null);
+
+  // Batch 2: parent reservation RG-8888 arrives later -> orphan extension automatically links to it
+  const batch2 = await ingestIncrementalSyncBatch(db, {
+    source: 'google_apps_script',
+    actor: { id: 'SYSTEM_1M', name: 'المزامنة السحابية الدقيقة (Neon)', role: 'system' },
+    reservations: [
+      {
+        sourceReservationId: '8888',
+        reservationNumber: 'RG-8888',
+        customerName: 'ماجد السالم',
+        originalStatusCode: 'confirmed',
+        total: 900
+      }
+    ],
+    extensions: []
+  });
+
+  assert.equal(batch2.status, 'success');
+  const linkedParent = db.state.reservations.find((r) => r.reservation_number === 'RG-8888');
+  assert.ok(linkedParent);
+  assert.equal(orphanExt.reservation_id, linkedParent.id);
+});
+
+
 
 

@@ -586,9 +586,23 @@
               var rangeNote = (d.appliedRange && d.appliedRange.hasCustomRange && d.appliedRange.dateFrom)
                 ? (' (' + d.appliedRange.dateFrom + (d.appliedRange.dateTo ? ' → ' + d.appliedRange.dateTo : '') + ')')
                 : '';
+              var imported = d.importedCount || 0;
+              var updated = d.updatedCount || 0;
+              var exts = d.extensionsCount || 0;
+              var diagHint = '';
+              if (imported === 0 && updated === 0) {
+                var fetched = d.fetchedCount || 0;
+                if (fetched > 0 && d.excludedFilteredCount === fetched) {
+                  diagHint = ' — تم جلب ' + fetched + ' سجل ولكن استُبعدت جميعها حسب الحالات المستبعدة في الإعدادات';
+                } else if (fetched > 0 && d.rangeFilteredCount > 0) {
+                  diagHint = ' — تم جلب ' + fetched + ' سجل ولكن استُبعد ' + d.rangeFilteredCount + ' خارج النطاق الزمني المحدد';
+                } else if (fetched === 0) {
+                  diagHint = ' — أرجعت الواجهة 0 حجز لهذا الحساب/الفترة';
+                }
+              }
               var msg = ctx.lang === 'en'
-                ? ('Pulled reservations' + rangeNote + ': ' + (d.importedCount || 0) + ' new · ' + (d.updatedCount || 0) + ' updated · ' + (d.extensionsCount || 0) + ' extensions')
-                : ('تم سحب الحجوزات بنجاح' + rangeNote + ': ' + (d.importedCount || 0) + ' جديد · ' + (d.updatedCount || 0) + ' محدث · ' + (d.extensionsCount || 0) + ' تمديد');
+                ? ('Pulled reservations' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + exts + ' extensions')
+                : ('تم سحب الحجوزات بنجاح' + rangeNote + ': ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + diagHint);
               ctx.toast(msg);
               ctx.refreshNotifications();
               refreshTableRegion();
