@@ -101,6 +101,15 @@ export async function dispatchCrmRequest(
       case 'updateReservationDetails':
         result = await queries.updateReservationDetails(executor, session, payload);
         break;
+      case 'saveReservationPinnedNote':
+        result = await queries.saveReservationPinnedNote(executor, session, payload);
+        break;
+      case 'recordNoAnswerFollowUp':
+        result = await queries.recordNoAnswerFollowUp(executor, session, payload);
+        break;
+      case 'togglePinnedCriticalReservation':
+        result = await queries.togglePinnedCriticalReservation(executor, session, payload);
+        break;
       case 'addFollowUp':
         result = await queries.addFollowUp(executor, session, payload);
         break;
@@ -214,6 +223,18 @@ export async function dispatchCrmRequest(
         break;
       case 'updateSettings':
         result = await queries.updateSettings(executor, session, payload);
+        break;
+      case 'saveUserLayoutPrefs':
+        result = await queries.saveUserLayoutPrefs(executor, session, payload);
+        break;
+      case 'previewDeleteReservations':
+        result = await queries.previewDeleteReservations(executor, session, payload);
+        break;
+      case 'deleteAllReservations':
+        result = await queries.deleteAllReservations(executor, session, payload);
+        break;
+      case 'importReservationsFromExcel':
+        result = await queries.importReservationsFromExcel(executor, session, payload);
         break;
       default:
         return {

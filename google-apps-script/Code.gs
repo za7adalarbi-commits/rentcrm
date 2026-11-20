@@ -91,6 +91,15 @@ function handleApiRequest(e, method) {
       case 'updateReservationDetails':
         result = updateReservationDetails(session, payload);
         break;
+      case 'saveReservationPinnedNote':
+        result = saveReservationPinnedNote(session, payload);
+        break;
+      case 'recordNoAnswerFollowUp':
+        result = recordNoAnswerFollowUp(session, payload);
+        break;
+      case 'togglePinnedCriticalReservation':
+        result = togglePinnedCriticalReservation(session, payload);
+        break;
       case 'addFollowUp':
         result = addFollowUp(session, payload);
         break;
@@ -195,6 +204,18 @@ function handleApiRequest(e, method) {
         break;
       case 'updateSettings':
         result = updateSettings(session, payload);
+        break;
+      case 'saveUserLayoutPrefs':
+        result = saveUserLayoutPrefs(session, payload);
+        break;
+      case 'previewDeleteReservations':
+        result = previewDeleteReservations(session, payload);
+        break;
+      case 'deleteAllReservations':
+        result = deleteAllReservations(session, payload);
+        break;
+      case 'importReservationsFromExcel':
+        result = importReservationsFromExcel(session, payload);
         break;
       default:
         return jsonResponse(false, 'الإجراء المطلوب غير معروف.', null, 'UNKNOWN_ACTION: ' + action);

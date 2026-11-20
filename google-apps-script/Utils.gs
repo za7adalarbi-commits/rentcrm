@@ -646,6 +646,123 @@ function computeTotalAmount(baseAmount, extensionsList) {
   return Math.round(total * 100) / 100;
 }
 
+function extractMentionedEmployees_(text, employees, excludeEmployeeId) {
+  var raw = normalizeStr(text);
+  if (!raw || raw.indexOf('@') === -1) return [];
+  var list = Array.isArray(employees) ? employees : [];
+  var exId = normalizeStr(excludeEmployeeId);
+  var candidates = [];
+  for (var i = 0; i < list.length; i++) {
+    var emp = list[i];
+    if (!emp || typeof emp !== 'object') continue;
+    if (normalizeStr(emp.status).toLowerCase() === 'disabled') continue;
+    var id = normalizeStr(emp.id);
+    var name = normalizeStr(emp.name);
+    var username = normalizeStr(emp.username);
+    if (!id || (!name && !username)) continue;
+    if (exId && id === exId) continue;
+    candidates.push({ id: id, name: name, username: username, role: normalizeStr(emp.role) });
+  }
+  candidates.sort(function (a, b) {
+    var la = (a.name || '').length;
+    var lb = (b.name || '').length;
+    if (lb !== la) return lb - la;
+    return (b.username || '').length - (a.username || '').length;
+  });
+
+  function isPrefixBoundary(ch) {
+    return !ch || /[\s,،.(:;\[{"'«\-\n\r]/.test(ch);
+  }
+  function isSuffixBoundary(ch) {
+    return !ch || /[\s,،.!?;:)\]'"»\-@#\n\r]/.test(ch);
+  }
+
+  var found = [];
+  var seen = {};
+  var idx = 0;
+  while (idx < raw.length) {
+    if (raw.charAt(idx) === '@' && isPrefixBoundary(idx === 0 ? '' : raw.charAt(idx - 1))) {
+      var after = raw.slice(idx + 1);
+      var afterLower = after.toLowerCase();
+      var matched = null;
+      var matchedLen = 0;
+      for (var cIdx = 0; cIdx < candidates.length; cIdx++) {
+        var c = candidates[cIdx];
+        if (c.name) {
+          var nmLower = c.name.toLowerCase();
+          if (afterLower.indexOf(nmLower) === 0 && isSuffixBoundary(raw.charAt(idx + 1 + c.name.length))) {
+            matched = c;
+            matchedLen = 1 + c.name.length;
+            break;
+          }
+          var uName = c.name.replace(/\s+/g, '_');
+          if (uName !== c.name && afterLower.indexOf(uName.toLowerCase()) === 0 && isSuffixBoundary(raw.charAt(idx + 1 + uName.length))) {
+            matched = c;
+            matchedLen = 1 + uName.length;
+            break;
+          }
+        }
+      }
+      if (!matched) {
+        for (var uIdx = 0; uIdx < candidates.length; uIdx++) {
+          var cu = candidates[uIdx];
+          if (cu.username && afterLower.indexOf(cu.username.toLowerCase()) === 0 && isSuffixBoundary(raw.charAt(idx + 1 + cu.username.length))) {
+            matched = cu;
+            matchedLen = 1 + cu.username.length;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        if (!seen[matched.id]) {
+          seen[matched.id] = true;
+          found.push(matched);
+        }
+        idx += matchedLen;
+        continue;
+      }
+    }
+    idx += 1;
+  }
+  return found;
+}
+
+function dispatchMentionNotifications_(texts, sender, entityType, entityId, label) {
+  var parts = [];
+  var list = Array.isArray(texts) ? texts : [];
+  for (var i = 0; i < list.length; i++) {
+    var clean = normalizeStr(list[i]);
+    if (clean) parts.push(clean);
+  }
+  var combined = parts.join('\n');
+  if (!combined || combined.indexOf('@') === -1) return [];
+
+  var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
+  var senderId = (sender && (sender.id || sender.employeeId)) || '';
+  var senderName = (sender && sender.name) || 'موظف';
+  var mentioned = extractMentionedEmployees_(combined, employees, senderId);
+  if (!mentioned.length) return [];
+
+  var snippet = combined.replace(/\s+/g, ' ').trim().slice(0, 120);
+  var titlePrefix = entityType === 'Problem'
+    ? ('إشارة لك في المشكلة ' + (label || '')).trim()
+    : ('إشارة لك في الحجز ' + (label || '')).trim();
+  var batch = [];
+  for (var m = 0; m < mentioned.length; m++) {
+    batch.push({
+      recipientEmployeeId: mentioned[m].id,
+      recipientRole: mentioned[m].role || '',
+      type: 'mention',
+      title: titlePrefix + ' (@' + senderName + ')',
+      message: senderName + ' أشار إليك: "' + snippet + '"',
+      entityType: entityType,
+      entityId: entityId
+    });
+  }
+  if (batch.length > 0) createNotificationsBatch_(batch);
+  return mentioned;
+}
+
 function escapeCsvCell(val) {
   var s = val === null || val === undefined ? '' : String(val);
   if (/[",\r\n]/.test(s)) {

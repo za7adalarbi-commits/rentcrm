@@ -23,6 +23,9 @@
     if (bs.employees) root.RGApi.primeCache('getEmployees', {}, bs.employees);
     if (bs.notifications) root.RGApi.primeCache('getNotifications', {}, bs.notifications);
     if (bs.problems) root.RGApi.primeCache('getProblems', {}, bs.problems);
+    if (bs.uiSimplification && root.RGApp && root.RGApp.applyUiSimplification) {
+      root.RGApp.applyUiSimplification(bs.uiSimplification);
+    }
   }
 
   function consumeBootstrap() {
@@ -75,9 +78,6 @@
           primeBootstrapCaches(res.data.bootstrap, range);
         } else {
           pendingBootstrap = null;
-        }
-        if (root.RGApi.warmLocalReservationsCache) {
-          root.RGApi.warmLocalReservationsCache().catch(function () {});
         }
       }
       return res || { success: false, message: 'تعذر إتمام تسجيل الدخول.' };

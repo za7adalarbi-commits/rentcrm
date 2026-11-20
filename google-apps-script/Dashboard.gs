@@ -176,12 +176,17 @@ function getDashboard(session, params) {
 }
 
 function getAppBootstrap(session, params) {
+  var map = getSettingsMap_(false);
+  var canDash = hasPermission(session, 'view_dashboard');
   return {
     user: session.user,
-    dashboard: getDashboard(session, params || { range: '30d' }),
+    dashboard: canDash ? getDashboard(session, params || { range: '30d' }) : null,
     notifications: getNotifications(session),
     employees: getEmployees(session),
-    problems: getProblems(session, {})
+    problems: getProblems(session, {}),
+    uiSimplification: normalizeUiSimplificationSettings_(map.ui_simplification),
+    layoutPrefs: normalizeUserLayoutPrefs_(map['layout_prefs_u_' + session.employeeId]),
+    pinnedCriticalIds: getUserPinnedCriticalIds_(session.employeeId)
   };
 }
 

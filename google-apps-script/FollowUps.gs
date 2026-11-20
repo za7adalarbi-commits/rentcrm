@@ -317,6 +317,14 @@ function addFollowUp(session, payload) {
     }
     if (notifBatch.length > 0) createNotificationsBatch_(notifBatch);
 
+    dispatchMentionNotifications_(
+      [action, notes],
+      { id: session.employeeId, name: session.user.name },
+      'Reservation',
+      reservation.id,
+      reservation.reservationNumber
+    );
+
     return followUp;
   });
 }
@@ -385,15 +393,104 @@ function updateFollowUp(session, payload) {
     }
 
     logActivity(session.user, 'تحديث متابعة', 'FollowUp', followUpId, 'تحديث سجل متابعة الحجز ' + existing.reservationNumber);
+    dispatchMentionNotifications_(
+      [patch.action || existing.action || '', patch.notes !== undefined ? patch.notes : (existing.notes || '')],
+      { id: session.employeeId, name: session.user.name },
+      'Reservation',
+      existing.reservationId,
+      existing.reservationNumber
+    );
     return updated;
   });
 }
 
+function getUserPinnedCriticalIds_(employeeId) {
+  var map = getSettingsMap_(false);
+  var raw = safeJsonParse(map['pinned_res_u_' + normalizeStr(employeeId)], []);
+  if (!Array.isArray(raw)) return [];
+  var out = [];
+  var seen = {};
+  for (var i = 0; i < raw.length && out.length < 3; i++) {
+    var val = normalizeStr(raw[i]);
+    if (val && !seen[val]) {
+      seen[val] = true;
+      out.push(val);
+    }
+  }
+  return out;
+}
+
+function togglePinnedCriticalReservation(session, payload) {
+  var p = payload || {};
+  var reservationId = normalizeStr(p.reservationId);
+  if (!reservationId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+  var maxPins = 3;
+  var settingKey = 'pinned_res_u_' + session.employeeId;
+
+  return withScriptLock(function () {
+    var reservation = findRecordById(RG_SHEETS.RESERVATIONS, 'id', reservationId);
+    if (!reservation) throw new Error('NOT_FOUND: الحجز غير موجود.');
+
+    var currentIds = getUserPinnedCriticalIds_(session.employeeId);
+    var exists = currentIds.indexOf(reservationId) !== -1;
+    var shouldPin = typeof p.pin === 'boolean' ? p.pin : !exists;
+    var nextIds;
+
+    if (shouldPin) {
+      if (exists) {
+        nextIds = currentIds;
+      } else if (currentIds.length >= maxPins) {
+        throw new Error('VALIDATION_ERROR: الحد الأقصى لتثبيت الحجوزات الحرجة هو ' + maxPins + ' حجوزات فقط — قم بإلغاء تثبيت حجز أولاً.');
+      } else {
+        nextIds = [reservationId].concat(currentIds);
+      }
+    } else {
+      nextIds = currentIds.filter(function (id) { return id !== reservationId; });
+    }
+
+    upsertRecordByKey(RG_SHEETS.SETTINGS, 'key', settingKey, {
+      key: settingKey,
+      value: JSON.stringify(nextIds),
+      updatedBy: session.user.name,
+      updatedAt: nowIso()
+    });
+
+    logActivity(
+      session.user,
+      shouldPin ? 'تثبيت حجز حرج' : 'إلغاء تثبيت حجز حرج',
+      'Reservation',
+      reservation.reservationNumber,
+      shouldPin ? ('تثبيت الحجز (' + nextIds.length + '/' + maxPins + ')') : 'إلغاء التثبيت من متابعاتي'
+    );
+
+    return { pinnedCriticalIds: nextIds, isPinned: shouldPin };
+  });
+}
+
 function getMyFollowUps(session, params) {
-  var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false).filter(function (f) {
+  var allFollowUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
+  var followUps = allFollowUps.filter(function (f) {
     return f.employeeId === session.employeeId;
   });
   followUps.sort(function (a, b) {
+    return String(b.createdAt).localeCompare(String(a.createdAt));
+  });
+
+  var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
+  var mentionFollowUps = [];
+  var myId = normalizeStr(session.employeeId);
+  var myUsername = normalizeStr(session.user && session.user.username).toLowerCase();
+  for (var m = 0; m < allFollowUps.length; m++) {
+    var fu = allFollowUps[m];
+    var combined = [normalizeStr(fu.action), normalizeStr(fu.notes)].filter(Boolean).join('\n');
+    if (!combined || combined.indexOf('@') === -1) continue;
+    var mentioned = extractMentionedEmployees_(combined, employees, '');
+    var hitsMe = mentioned.some(function (t) {
+      return (myId && t.id === myId) || (myUsername && t.username && String(t.username).toLowerCase() === myUsername);
+    });
+    if (hitsMe) mentionFollowUps.push(fu);
+  }
+  mentionFollowUps.sort(function (a, b) {
     return String(b.createdAt).localeCompare(String(a.createdAt));
   });
 
@@ -404,22 +501,10 @@ function getMyFollowUps(session, params) {
 
   return {
     followUps: followUps,
+    mentionFollowUps: mentionFollowUps,
+    pinnedCriticalIds: getUserPinnedCriticalIds_(session.employeeId),
     assignedReservations: reservations.map(function (r) {
-      return {
-        id: r.id,
-        reservationNumber: r.reservationNumber,
-        customerName: r.customerName,
-        customerPhone: r.customerPhone,
-        companyName: r.companyName,
-        branchName: r.branchName,
-        carName: r.carName,
-        startDate: r.startDate,
-        endDate: r.endDate,
-        internalStatus: r.internalStatus,
-        priority: r.priority,
-        lastUpdateText: r.lastUpdateText,
-        lastUpdatedAt: r.lastUpdatedAt
-      };
+      return serializeReservationForClient_(r, false);
     })
   };
 }

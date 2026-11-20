@@ -726,9 +726,36 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       };
     }
 
-    if (sql.startsWith('SELECT * FROM reservations r')) {
+    if (
+      sql.startsWith('SELECT * FROM reservations r') ||
+      sql === 'SELECT * FROM reservations' ||
+      sql.startsWith('SELECT * FROM reservations ORDER BY') ||
+      sql.startsWith('SELECT id, source_reservation_id, reservation_number')
+    ) {
+      if (sql.includes('LOWER(TRIM(reservation_number)) = ANY')) {
+        const wanted: string[] = Array.isArray(params[0]) ? params[0] : [];
+        const rows = state.reservations.filter((r) => wanted.includes(String(r.reservation_number || '').trim().toLowerCase()));
+        return { rows: rows as any[], rowCount: rows.length };
+      }
+      if (sql.includes('LIKE $1')) {
+        const prefix = String(params[0] || '').replace(/%/g, '');
+        const rows = state.reservations.filter((r) => {
+          const d = String(r.start_date || r.source_created_at || (r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at) || '');
+          return !prefix || d.startsWith(prefix) || !/^\d{4}-/.test(d);
+        });
+        return { rows: rows as any[], rowCount: rows.length };
+      }
       const list = sortMockReservations(sql, filterMockReservations(sql, params));
       return { rows: list as any[], rowCount: list.length };
+    }
+
+    if (sql.startsWith('SELECT id, start_date, source_created_at, created_at FROM reservations')) {
+      const prefix = String(params[0] || '').replace(/%/g, '');
+      const rows = state.reservations.filter((r) => {
+        const d = String(r.start_date || r.source_created_at || (r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at) || '');
+        return !prefix || d.startsWith(prefix) || !/^\d{4}-/.test(d);
+      });
+      return { rows: rows as any[], rowCount: rows.length };
     }
 
     if (sql.startsWith('SELECT r.* FROM reservations r')) {
@@ -915,7 +942,10 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: list as any[], rowCount: list.length };
     }
 
-    if (sql.startsWith("SELECT id, name, status FROM employees WHERE status = 'active'")) {
+    if (
+      sql.startsWith("SELECT id, name, status FROM employees WHERE status = 'active'") ||
+      sql.startsWith("SELECT id, name, username, role, job_title, status FROM employees WHERE status = 'active'")
+    ) {
       return { rows: state.employees.filter((e) => e.status === 'active') as any[], rowCount: 1 };
     }
 
@@ -935,6 +965,58 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
 
     if (sql.startsWith('SELECT * FROM sync_log ORDER BY')) {
       return { rows: state.sync_log as any[], rowCount: state.sync_log.length };
+    }
+
+    if (sql.startsWith('SELECT id, password_hash, salt FROM employees WHERE id = $1')) {
+      const found = state.employees.find((e) => e.id === params[0]);
+      return { rows: found ? [found] : ([] as any[]), rowCount: found ? 1 : 0 };
+    }
+
+    if (sql.startsWith('SELECT COUNT(*)::int AS cnt FROM reservations')) {
+      return { rows: [{ cnt: state.reservations.length }] as any[], rowCount: 1 };
+    }
+
+    if (sql.startsWith('UPDATE problems SET reservation_id = NULL')) {
+      const ids = Array.isArray(params[0]) ? params[0] : null;
+      state.problems.forEach((p) => {
+        if (!ids || ids.includes(p.reservation_id)) p.reservation_id = null;
+      });
+      return { rows: [], rowCount: state.problems.length };
+    }
+
+    if (sql.startsWith('DELETE FROM follow_up_history')) {
+      const ids = Array.isArray(params[0]) ? params[0] : null;
+      const before = state.follow_up_history.length;
+      state.follow_up_history = ids ? state.follow_up_history.filter((x) => !ids.includes(x.reservation_id)) : [];
+      return { rows: [], rowCount: before - state.follow_up_history.length };
+    }
+
+    if (sql.startsWith('DELETE FROM follow_ups')) {
+      const ids = Array.isArray(params[0]) ? params[0] : null;
+      const before = state.follow_ups.length;
+      state.follow_ups = ids ? state.follow_ups.filter((x) => !ids.includes(x.reservation_id)) : [];
+      return { rows: [], rowCount: before - state.follow_ups.length };
+    }
+
+    if (sql.startsWith('DELETE FROM assignments')) {
+      const ids = Array.isArray(params[0]) ? params[0] : null;
+      const before = state.assignments.length;
+      state.assignments = ids ? state.assignments.filter((x) => !ids.includes(x.reservation_id)) : [];
+      return { rows: [], rowCount: before - state.assignments.length };
+    }
+
+    if (sql.startsWith('DELETE FROM extensions')) {
+      const ids = Array.isArray(params[0]) ? params[0] : null;
+      const before = state.extensions.length;
+      state.extensions = ids ? state.extensions.filter((x) => !ids.includes(x.reservation_id)) : [];
+      return { rows: [], rowCount: before - state.extensions.length };
+    }
+
+    if (sql.startsWith('DELETE FROM reservations')) {
+      const ids = Array.isArray(params[0]) ? params[0] : null;
+      const before = state.reservations.length;
+      state.reservations = ids ? state.reservations.filter((x) => !ids.includes(x.id)) : [];
+      return { rows: [], rowCount: before - state.reservations.length };
     }
 
     return { rows: [], rowCount: 0 };
@@ -2162,6 +2244,85 @@ test('pullFromRentalGateDirect fetches multi-page results when totalPages is omi
     else process.env.RG_TOKEN = prevRg;
   }
 });
+
+test('backend updateSettings supports minutes interval and deleteAllReservations enforces security confirmation and clears reservations', async () => {
+  const db = createInMemoryMockExecutor();
+  const loginRes = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'admin', password: process.env.INITIAL_ADMIN_PASS || 'Admin@123' }
+  });
+  assert.equal(loginRes.success, true);
+  const adminToken = loginRes.data.token;
+
+  // Save 0 hours and 15 minutes
+  const updRes = await dispatchCrmRequest(db, {
+    action: 'updateSettings',
+    token: adminToken,
+    payload: {
+      auto_sync_enabled: true,
+      auto_sync_interval_hours: 0,
+      auto_sync_interval_minutes: 15
+    }
+  });
+  assert.equal(updRes.success, true);
+  assert.equal(updRes.data.auto_sync_interval_hours, 0);
+  assert.equal(updRes.data.auto_sync_interval_minutes, 15);
+
+  const syncStatusRes = await dispatchCrmRequest(db, {
+    action: 'getSyncStatus',
+    token: adminToken,
+    payload: {}
+  });
+  assert.equal(syncStatusRes.success, true);
+  assert.equal(syncStatusRes.data.autoSyncIntervalHours, 0);
+  assert.equal(syncStatusRes.data.autoSyncIntervalMinutes, 15);
+
+  // Seed reservation + related records
+  db.state.reservations.push({
+    id: 'RES_DEL_1',
+    reservation_number: 'RG-DEL-1',
+    customer_name: 'عميل اختبار',
+    internal_status: 'تم الحجز',
+    priority: 'عادي'
+  });
+  db.state.extensions.push({ id: 'EXT_DEL_1', reservation_id: 'RES_DEL_1' });
+  db.state.follow_ups.push({ id: 'FU_DEL_1', reservation_id: 'RES_DEL_1' });
+  db.state.assignments.push({ id: 'ASG_DEL_1', reservation_id: 'RES_DEL_1' });
+
+  // Wrong phrase rejected
+  const badPhrase = await dispatchCrmRequest(db, {
+    action: 'deleteAllReservations',
+    token: adminToken,
+    payload: { acknowledged: true, confirmPhrase: 'حذف', password: process.env.INITIAL_ADMIN_PASS || 'Admin@123' }
+  });
+  assert.equal(badPhrase.success, false);
+  assert.equal(db.state.reservations.length, 1);
+
+  // Wrong password rejected
+  const badPass = await dispatchCrmRequest(db, {
+    action: 'deleteAllReservations',
+    token: adminToken,
+    payload: { acknowledged: true, confirmPhrase: 'حذف جميع الحجوزات', password: 'WrongPassword!' }
+  });
+  assert.equal(badPass.success, false);
+  assert.equal(db.state.reservations.length, 1);
+
+  // Valid security confirmation deletes all reservations & child rows
+  const okDel = await dispatchCrmRequest(db, {
+    action: 'deleteAllReservations',
+    token: adminToken,
+    payload: { acknowledged: true, confirmPhrase: 'حذف جميع الحجوزات', password: process.env.INITIAL_ADMIN_PASS || 'Admin@123' }
+  });
+  assert.equal(okDel.success, true);
+  assert.equal(okDel.data.deleted, true);
+  assert.equal(okDel.data.deletedReservationsCount, 1);
+  assert.equal(db.state.reservations.length, 0);
+  assert.equal(db.state.extensions.length, 0);
+  assert.equal(db.state.follow_ups.length, 0);
+  assert.equal(db.state.assignments.length, 0);
+  assert.ok(db.state.sheets_mirror_outbox.some((m) => m.action === 'deleteAllReservations'));
+});
+
 
 
 

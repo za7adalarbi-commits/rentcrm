@@ -62,7 +62,20 @@
     var lastSync = syncData.lastSync;
 
     var autoSyncEnabled = settings.auto_sync_enabled !== undefined ? Boolean(settings.auto_sync_enabled) : (syncData.autoSyncEnabled !== false);
-    var autoSyncHours = Number(settings.auto_sync_interval_hours || syncData.autoSyncIntervalHours || 12);
+    var rawSyncHours = settings.auto_sync_interval_hours !== undefined ? settings.auto_sync_interval_hours : syncData.autoSyncIntervalHours;
+    var rawSyncMinutes = settings.auto_sync_interval_minutes !== undefined ? settings.auto_sync_interval_minutes : syncData.autoSyncIntervalMinutes;
+    var autoSyncInterval = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncInterval)
+      ? root.RGCrmCore.normalizeAutoSyncInterval(rawSyncHours, rawSyncMinutes)
+      : { hours: Number(rawSyncHours !== undefined ? rawSyncHours : 12), minutes: Number(rawSyncMinutes || 0), totalMinutes: 720 };
+    var autoSyncHours = autoSyncInterval.hours;
+    var autoSyncMinutes = autoSyncInterval.minutes;
+    var formatIntervalAr = function (h, m) {
+      if (root.RGCrmCore && root.RGCrmCore.formatAutoSyncIntervalAr) {
+        return root.RGCrmCore.formatAutoSyncIntervalAr(h, m);
+      }
+      return 'كل ' + h + ' ساعة' + (m > 0 ? (' و' + m + ' دقيقة') : '');
+    };
+    var autoSyncBadgeText = autoSyncEnabled ? ('مفعل — ' + formatIntervalAr(autoSyncHours, autoSyncMinutes)) : 'متوقف حاليًا';
 
     var isBackendConnected = Boolean(root.RGApi.isBackendConnected && root.RGApi.isBackendConnected());
     var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
@@ -101,6 +114,24 @@
     var isGeneralManager = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var cacheStats = (root.RGApi && root.RGApi.getLocalCacheStats) ? root.RGApi.getLocalCacheStats() : { reservationsCount: 0, customersCount: 0, detailsCount: 0 };
+    var uiPresetsMap = (root.RGCrmCore && root.RGCrmCore.TEAM_UI_PRESETS) || {};
+    var uiGroupsList = (root.RGCrmCore && Array.isArray(root.RGCrmCore.UI_SIMPLIFICATION_GROUPS))
+      ? root.RGCrmCore.UI_SIMPLIFICATION_GROUPS
+      : [];
+    var uiOptionsList = (root.RGCrmCore && Array.isArray(root.RGCrmCore.UI_SIMPLIFICATION_OPTIONS))
+      ? root.RGCrmCore.UI_SIMPLIFICATION_OPTIONS
+      : [
+          { key: 'hideSecondaryCarMeta', legacyId: 'set-ui-hide-car-meta', group: 'drawer', labelAr: 'إخفاء فئة السيارة وتفاصيل الاستلام/التسليم الثانوية' },
+          { key: 'hideCustomerContactExtras', legacyId: 'set-ui-hide-customer-extra', group: 'drawer', labelAr: 'إخفاء البريد الإلكتروني ورقم الهوية من رأس الحجز' },
+          { key: 'hideFinancialBreakdown', legacyId: 'set-ui-hide-finance', group: 'drawer', labelAr: 'إخفاء التفصيل المالي اليومي والضريبة والخصم' },
+          { key: 'hideDrawerCharts', legacyId: 'set-ui-hide-drawer-charts', group: 'drawer', labelAr: 'إخفاء الرسوم البيانية داخل تفاصيل الحجز' },
+          { key: 'hideDashboardRadar', legacyId: 'set-ui-hide-dash-radar', group: 'dashboard', labelAr: 'إخفاء رادار 24 ساعة في لوحة التحكم' },
+          { key: 'hideDashboardHeatmap', legacyId: 'set-ui-hide-dash-heatmap', group: 'dashboard', labelAr: 'إخفاء مصفوفة ساعات الذروة من لوحة التحكم والتقارير' }
+        ];
+    var uiSimp = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+      ? root.RGCrmCore.normalizeUiSimplificationSettings(settings.ui_simplification)
+      : { preset: 'full', hideSecondaryCarMeta: false, hideCustomerContactExtras: false, hideFinancialBreakdown: false, hideDrawerCharts: false, hideDashboardRadar: false, hideDashboardHeatmap: false };
+    var initialHiddenCount = uiOptionsList.filter(function (opt) { return Boolean(uiSimp[opt.key]); }).length;
 
     container.innerHTML =
       '<div class="surface-card">' +
@@ -234,14 +265,14 @@
                 }).join('') +
               '</select>' +
               '<div class="gm-pull-dates hidden" id="sync-pull-custom-dates">' +
-                '<label class="gm-pull-date-field"><span>من تاريخ</span><input type="date" class="input" id="sync-pull-from" aria-label="من تاريخ للسحب"></label>' +
-                '<label class="gm-pull-date-field"><span>إلى تاريخ</span><input type="date" class="input" id="sync-pull-to" aria-label="إلى تاريخ للسحب"></label>' +
+                '<label class="gm-pull-date-field"><span>من تاريخ</span><input type="date" class="input" id="sync-pull-from" data-rg-range-pair="sync-pull-range" data-rg-range-role="start" aria-label="من تاريخ للسحب"></label>' +
+                '<label class="gm-pull-date-field"><span>إلى تاريخ</span><input type="date" class="input" id="sync-pull-to" data-rg-range-pair="sync-pull-range" data-rg-range-role="end" aria-label="إلى تاريخ للسحب"></label>' +
               '</div>' +
             '</div>'
           ) : '') +
           '<div class="detail-summary-grid" style="margin-bottom:16px;">' +
             '<div class="detail-kv"><span class="detail-k">حالة الاتصال</span><span class="detail-v" id="sync-conn-status">' + (isBackendConnected || root.RGApi.isLiveMode() ? (hasRgToken ? 'RG_TOKEN محفوظ ومربوط تلقائيًا' : 'يرجى حفظ RG_TOKEN') : (settings.sandbox_has_rg_token ? 'تم التحقق من صيغة التوكن (وضع المعاينة)' : 'وضع المعاينة المحلية')) + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">جدولة التحديث التلقائي</span><span class="detail-v" id="sync-auto-badge">' + (autoSyncEnabled ? ('مفعل — كل ' + autoSyncHours + ' ساعة') : 'متوقف حاليًا') + '</span></div>' +
+            '<div class="detail-kv"><span class="detail-k">جدولة التحديث التلقائي</span><span class="detail-v" id="sync-auto-badge">' + escapeHtml(autoSyncBadgeText) + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono">' + (lastSync ? String(lastSync.finishedAt).replace('T', ' ').substring(0, 19) : 'لم يتم السحب بعد') + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">الحجوزات المستوردة / المحدثة / التمديدات</span><span class="detail-v tabular-nums">' + (lastSync ? (lastSync.importedCount + ' مستورد · ' + lastSync.updatedCount + ' محدث · ' + lastSync.extensionsCount + ' تمديد') : '0 / 0 / 0') + '</span></div>' +
           '</div>' +
@@ -293,29 +324,108 @@
           '<div style="margin-top:16px;padding:14px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
             '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">' +
               '<div><strong style="font-size:14px;">إعدادات التحديث التلقائي من Rental Gate API</strong>' +
-              '<div style="font-size:12px;color:var(--text-muted);">يعمل تلقائيًا كل 12 ساعة افتراضيًا عبر Trigger في Google Apps Script، ويمكنك تعديل الفترة هنا.</div></div>' +
+              '<div style="font-size:12px;color:var(--text-muted);">يعمل تلقائيًا كل 12 ساعة افتراضيًا عبر Trigger في Google Apps Script، ويمكنك تعديل الفترة بالساعات والدقائق هنا.</div></div>' +
               '<label class="checkbox-item" style="font-weight:700;"><input type="checkbox" id="set-auto-sync-enabled"' + (autoSyncEnabled ? ' checked' : '') + '> تفعيل التحديث التلقائي</label>' +
             '</div>' +
             '<div class="form-grid-2" style="align-items:end;">' +
-              '<div class="form-group">' +
-                '<label class="form-label" for="set-auto-sync-hours">فترة التحديث التلقائي (بالساعات)</label>' +
-                '<input class="input tabular-nums" type="number" min="1" max="168" id="set-auto-sync-hours" value="' + autoSyncHours + '">' +
+              '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">' +
+                '<div class="form-group">' +
+                  '<label class="form-label" for="set-auto-sync-hours">فترة التحديث (الساعات)</label>' +
+                  '<input class="input tabular-nums" type="number" min="0" max="168" id="set-auto-sync-hours" value="' + autoSyncHours + '">' +
+                '</div>' +
+                '<div class="form-group">' +
+                  '<label class="form-label" for="set-auto-sync-minutes">فترة التحديث (الدقائق)</label>' +
+                  '<input class="input tabular-nums" type="number" min="0" max="59" id="set-auto-sync-minutes" value="' + autoSyncMinutes + '">' +
+                '</div>' +
               '</div>' +
               '<div class="form-group">' +
                 '<span class="form-label">اختيارات سريعة</span>' +
                 '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset" data-hours="1">كل ساعة</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset" data-hours="4">كل 4 ساعات</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset" data-hours="6">كل 6 ساعات</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset" data-hours="12">كل 12 ساعة (الافتراضي)</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset" data-hours="24">كل 24 ساعة</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 5 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="5">كل 5 دقائق</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 15 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="15">كل 15 دقيقة</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 30 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="30">كل 30 دقيقة</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 1 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="1" data-minutes="0">كل ساعة</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 6 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="6" data-minutes="0">كل 6 ساعات</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 12 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="12" data-minutes="0">كل 12 ساعة (الافتراضي)</button>' +
+                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 24 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="24" data-minutes="0">كل 24 ساعة</button>' +
                 '</div>' +
               '</div>' +
             '</div>' +
           '</div>' +
 
+          '<div class="rg-ui-simp-panel" id="set-ui-simplification-panel">' +
+            '<div class="rg-ui-simp-header">' +
+              '<div>' +
+                '<strong style="font-size:14px;">خيارات تبسيط الواجهة وإظهار/إخفاء الأقسام والميزات (UI Simplification)</strong>' +
+                '<div style="font-size:12px;color:var(--text-muted);">تحكم كامل في إظهار أو إخفاء أي صفحة، أداة، حقل، أو قسم في الموقع لجميع الموظفين (مع بقاء صفحة الإعدادات متاحة دائماً).</div>' +
+              '</div>' +
+              '<span class="status-tag status-info tabular-nums" id="set-ui-hidden-summary">مخفي حاليًا: ' + initialHiddenCount + ' / ' + uiOptionsList.length + '</span>' +
+            '</div>' +
+            '<div class="rg-ui-simp-controls">' +
+              '<div class="form-group" style="flex:1;min-width:240px;">' +
+                '<label class="form-label" for="set-ui-preset">نمط حجم الفريق أو التخصيص</label>' +
+                '<select class="select" id="set-ui-preset">' +
+                  ['full', 'medium', 'small', 'custom'].map(function (pid) {
+                    var pr = uiPresetsMap[pid] || { id: pid, labelAr: pid };
+                    return '<option value="' + escapeHtml(pid) + '"' + (uiSimp.preset === pid ? ' selected' : '') + '>' + escapeHtml(pr.labelAr || pid) + '</option>';
+                  }).join('') +
+                '</select>' +
+              '</div>' +
+              '<div class="form-group" style="flex:1;min-width:200px;">' +
+                '<label class="form-label" for="set-ui-filter-input">بحث في الأقسام والميزات</label>' +
+                '<input type="search" class="input" id="set-ui-filter-input" placeholder="ابحث مثل: رادار، PDF، مصفوفة، لم يرد، القوالب...">' +
+              '</div>' +
+              '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
+                '<button type="button" class="btn btn-sm" id="btn-ui-show-all">إظهار الكل</button>' +
+                '<button type="button" class="btn btn-sm btn-danger" id="btn-ui-hide-all">إخفاء الكل</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="rg-ui-groups-stack" id="set-ui-flags-grid">' +
+              (uiGroupsList.length ? uiGroupsList : [{ id: 'all', labelAr: 'كافة خيارات الواجهة' }]).map(function (grp, gIdx) {
+                var grpOpts = uiOptionsList.filter(function (o) { return grp.id === 'all' || o.group === grp.id; });
+                if (!grpOpts.length) return '';
+                var grpHiddenCount = grpOpts.filter(function (o) { return Boolean(uiSimp[o.key]); }).length;
+                return '<details class="rg-ui-group-card" data-ui-group-card="' + escapeHtml(grp.id) + '"' + (gIdx < 2 || grpHiddenCount > 0 ? ' open' : '') + '>' +
+                  '<summary class="rg-ui-group-summary">' +
+                    '<span class="rg-ui-group-title">' + escapeHtml(grp.labelAr) + '</span>' +
+                    '<span class="rg-ui-group-count tabular-nums" data-ui-group-count="' + escapeHtml(grp.id) + '">مخفي: ' + grpHiddenCount + ' / ' + grpOpts.length + '</span>' +
+                  '</summary>' +
+                  '<div class="rg-ui-group-body">' +
+                    '<div class="rg-ui-group-actions">' +
+                      '<button type="button" class="btn btn-sm rg-ui-group-show-btn" data-group="' + escapeHtml(grp.id) + '">إظهار هذه المجموعة</button>' +
+                      '<button type="button" class="btn btn-sm rg-ui-group-hide-btn" data-group="' + escapeHtml(grp.id) + '">إخفاء هذه المجموعة</button>' +
+                    '</div>' +
+                    '<div class="checkbox-grid">' +
+                      grpOpts.map(function (opt) {
+                        var inputId = opt.legacyId || ('set-ui-flag-' + opt.key);
+                        var isChecked = Boolean(uiSimp[opt.key]);
+                        var searchText = (opt.labelAr || '') + ' ' + (opt.labelEn || '') + ' ' + opt.key;
+                        return '<label class="checkbox-item rg-ui-opt-item" data-search-text="' + escapeHtml(searchText.toLowerCase()) + '">' +
+                          '<input type="checkbox" id="' + escapeHtml(inputId) + '" class="ui-simp-flag" data-ui-key="' + escapeHtml(opt.key) + '" data-ui-group="' + escapeHtml(grp.id) + '"' + (isChecked ? ' checked' : '') + '> ' +
+                          '<span>' + escapeHtml(opt.labelAr) + '</span>' +
+                        '</label>';
+                      }).join('') +
+                    '</div>' +
+                  '</div>' +
+                '</details>';
+              }).join('') +
+            '</div>' +
+          '</div>' +
+
           '<div style="margin-top:14px;"><button type="submit" class="btn btn-primary" id="btn-save-sys-settings">حفظ الإعدادات وتحديث المزامنة التلقائية</button></div>' +
-        '</form>'
+        '</form>' +
+        '<div class="surface-card" id="danger-zone-reservations-card" style="border-top:3px solid var(--status-danger-text, #f43f5e);">' +
+          '<div class="section-header" style="margin-bottom:8px;">' +
+            '<div>' +
+              '<h2 class="section-title" style="color:var(--status-danger-text, #f43f5e);">إدارة بيانات الحجوزات (الاستيراد والحذف الآمن)</h2>' +
+              '<p class="section-subtitle">استورد الحجوزات مباشرة من ملف Excel، أو احذف الحجوزات حسب شهر محدد أو سنة محددة أو الكل مع تصدير نسخة Excel احتياطية تلقائياً قبل المسح.</p>' +
+            '</div>' +
+            '<div class="toolbar-row" style="margin-bottom:0;">' +
+              '<button type="button" class="btn" id="btn-import-excel-reservations">استيراد حجوزات من Excel</button>' +
+              '<button type="button" class="btn btn-danger" id="btn-delete-all-reservations">حذف الحجوزات (شهر / سنة / الكل)</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>'
       ) : '');
 
     bindPasswordToggle('setup-database-url', 'toggle-setup-db-url');
@@ -325,6 +435,7 @@
     bindPasswordToggle('set-rg-token', 'toggle-rg-token');
 
     var saveGasBtn = document.getElementById('btn-save-gas-url');
+    if (saveGasBtn) {
     saveGasBtn.addEventListener('click', function () {
       var modeEl = document.getElementById('setup-mode');
       var selectedMode = modeEl ? modeEl.value : (isBackendConnected ? 'neon' : 'gas');
@@ -472,13 +583,17 @@
         }
       });
     });
+    }
 
-    document.getElementById('btn-clear-gas-url').addEventListener('click', function () {
-      root.RGApi.setGasUrl('');
-      root.RGApi.setToken('');
-      ctx.toast('تم التبديل إلى وضع المعاينة المحلية.');
-      ctx.onAuthChanged();
-    });
+    var clearGasBtn = document.getElementById('btn-clear-gas-url');
+    if (clearGasBtn) {
+      clearGasBtn.addEventListener('click', function () {
+        root.RGApi.setGasUrl('');
+        root.RGApi.setToken('');
+        ctx.toast('تم التبديل إلى وضع المعاينة المحلية.');
+        ctx.onAuthChanged();
+      });
+    }
 
     var restoreGlobalBtn = document.getElementById('btn-restore-global-gas');
     if (restoreGlobalBtn) {
@@ -490,51 +605,56 @@
       });
     }
 
-    document.getElementById('btn-copy-autoconnect-link').addEventListener('click', async function () {
-      var raw = document.getElementById('set-gas-url').value.trim();
-      var out = document.getElementById('gas-ping-result');
-      var shareUrl = (root.RGCrmCore && root.RGCrmCore.buildAutoConnectShareUrl)
-        ? root.RGCrmCore.buildAutoConnectShareUrl(window.location.origin, window.location.pathname, raw)
-        : '';
-      if (!shareUrl) {
-        out.className = 'form-error';
-        out.textContent = 'أدخل رابط Google Apps Script (/exec) صالحاً أولاً لتوليد رابط الربط التلقائي.';
-        return;
-      }
-      var wrap = document.getElementById('autoconnect-share-wrap');
-      var shareInput = document.getElementById('autoconnect-share-url');
-      if (wrap && shareInput) {
-        shareInput.value = shareUrl;
-        wrap.classList.remove('hidden');
-      }
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(shareUrl);
-        } else if (shareInput) {
-          shareInput.select();
-          document.execCommand('copy');
+    var copyAutoconnectBtn = document.getElementById('btn-copy-autoconnect-link');
+    if (copyAutoconnectBtn) {
+      copyAutoconnectBtn.addEventListener('click', async function () {
+        var raw = document.getElementById('set-gas-url').value.trim();
+        var out = document.getElementById('gas-ping-result');
+        var shareUrl = (root.RGCrmCore && root.RGCrmCore.buildAutoConnectShareUrl)
+          ? root.RGCrmCore.buildAutoConnectShareUrl(window.location.origin, window.location.pathname, raw)
+          : '';
+        if (!shareUrl) {
+          out.className = 'form-error';
+          out.textContent = 'أدخل رابط Google Apps Script (/exec) صالحاً أولاً لتوليد رابط الربط التلقائي.';
+          return;
         }
-        ctx.toast('تم نسخ رابط الربط التلقائي! أي موظف يفتحه يتصل بالخادم مباشرة.');
-      } catch (e) {
-        ctx.toast('تم توليد رابط الربط التلقائي — انسخه من الحقل أسفله.');
-      }
-    });
+        var wrap = document.getElementById('autoconnect-share-wrap');
+        var shareInput = document.getElementById('autoconnect-share-url');
+        if (wrap && shareInput) {
+          shareInput.value = shareUrl;
+          wrap.classList.remove('hidden');
+        }
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(shareUrl);
+          } else if (shareInput) {
+            shareInput.select();
+            document.execCommand('copy');
+          }
+          ctx.toast('تم نسخ رابط الربط التلقائي! أي موظف يفتحه يتصل بالخادم مباشرة.');
+        } catch (e) {
+          ctx.toast('تم توليد رابط الربط التلقائي — انسخه من الحقل أسفله.');
+        }
+      });
+    }
 
     var pingGasBtn = document.getElementById('btn-ping-gas-url');
-    pingGasBtn.addEventListener('click', function () {
-      var val = document.getElementById('set-gas-url').value.trim();
-      var out = document.getElementById('gas-ping-result');
-      if (!val) {
-        out.className = 'form-error';
-        out.textContent = 'يرجى إدخال رابط Web App (/exec) أولاً.';
-        return;
-      }
-      runWithLock(pingGasBtn, 'pingGasUrl', async function () {
-        var res = await root.RGApi.pingGasUrl(val);
-        out.className = res.success ? 'form-success' : 'form-error';
-        out.textContent = res.message || (res.success ? 'الاتصال ناجح!' : 'فشل الاتصال.');
+    if (pingGasBtn) {
+      pingGasBtn.addEventListener('click', function () {
+        var val = document.getElementById('set-gas-url').value.trim();
+        var out = document.getElementById('gas-ping-result');
+        if (!val) {
+          out.className = 'form-error';
+          out.textContent = 'يرجى إدخال رابط Web App (/exec) أولاً.';
+          return;
+        }
+        runWithLock(pingGasBtn, 'pingGasUrl', async function () {
+          var res = await root.RGApi.pingGasUrl(val);
+          out.className = res.success ? 'form-success' : 'form-error';
+          out.textContent = res.message || (res.success ? 'الاتصال ناجح!' : 'فشل الاتصال.');
+        });
       });
-    });
+    }
 
     var saveRgTokenBtn = document.getElementById('btn-save-rg-token');
     if (saveRgTokenBtn) {
@@ -612,10 +732,20 @@
             var spPreset = syncPresetEl.value || 'all';
             var spFrom = syncFromEl ? syncFromEl.value : '';
             var spTo = syncToEl ? syncToEl.value : '';
-            if (spPreset === 'custom' && !spFrom && !spTo) {
-              ctx.toast('يرجى تحديد تاريخ البداية عند اختيار السحب من تاريخ معين.', true);
-              syncNowBtn.textContent = prevText;
-              return;
+            if (spPreset === 'custom') {
+              if (root.RGCrmDatePicker && root.RGCrmDatePicker.validateContainerDates && syncDatesWrap) {
+                var syncCheck = root.RGCrmDatePicker.validateContainerDates(syncDatesWrap);
+                if (!syncCheck.valid) {
+                  ctx.toast(syncCheck.message || 'يرجى التحقق من صحة تواريخ السحب.', true);
+                  syncNowBtn.textContent = prevText;
+                  return;
+                }
+              }
+              if (!spFrom && !spTo) {
+                ctx.toast('يرجى تحديد تاريخ البداية عند اختيار السحب من تاريخ معين.', true);
+                syncNowBtn.textContent = prevText;
+                return;
+              }
             }
             syncPayload = {
               preset: spPreset,
@@ -654,9 +784,11 @@
 
     container.querySelectorAll('.auto-sync-preset').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        var inp = document.getElementById('set-auto-sync-hours');
+        var inpH = document.getElementById('set-auto-sync-hours');
+        var inpM = document.getElementById('set-auto-sync-minutes');
         var chk = document.getElementById('set-auto-sync-enabled');
-        if (inp) inp.value = btn.getAttribute('data-hours');
+        if (inpH) inpH.value = btn.getAttribute('data-hours') || '0';
+        if (inpM) inpM.value = btn.getAttribute('data-minutes') || '0';
         if (chk) chk.checked = true;
         container.querySelectorAll('.auto-sync-preset').forEach(function (b) {
           b.classList.toggle('btn-primary', b === btn);
@@ -664,28 +796,414 @@
       });
     });
 
+    var uiPresetSelect = document.getElementById('set-ui-preset');
+    var uiFlagEls = Array.prototype.slice.call(container.querySelectorAll('.ui-simp-flag'));
+    var uiSummaryBadge = document.getElementById('set-ui-hidden-summary');
+    var uiFilterInput = document.getElementById('set-ui-filter-input');
+
+    function updateUiSimpCounters() {
+      var totalCount = uiFlagEls.length;
+      var checkedCount = uiFlagEls.filter(function (c) { return c.checked; }).length;
+      if (uiSummaryBadge) {
+        uiSummaryBadge.textContent = 'مخفي حاليًا: ' + checkedCount + ' / ' + totalCount;
+      }
+      container.querySelectorAll('[data-ui-group-count]').forEach(function (badge) {
+        var grpId = badge.getAttribute('data-ui-group-count');
+        var grpFlags = uiFlagEls.filter(function (c) { return c.getAttribute('data-ui-group') === grpId; });
+        var grpChecked = grpFlags.filter(function (c) { return c.checked; }).length;
+        badge.textContent = 'مخفي: ' + grpChecked + ' / ' + grpFlags.length;
+      });
+    }
+
+    if (uiPresetSelect) {
+      uiPresetSelect.addEventListener('change', function () {
+        var pid = uiPresetSelect.value;
+        var presetDef = uiPresetsMap[pid];
+        if (!presetDef || pid === 'custom') return;
+        uiFlagEls.forEach(function (chk) {
+          var key = chk.getAttribute('data-ui-key');
+          if (key) chk.checked = Boolean(presetDef[key]);
+        });
+        updateUiSimpCounters();
+      });
+    }
+
+    uiFlagEls.forEach(function (chk) {
+      chk.addEventListener('change', function () {
+        if (uiPresetSelect && uiPresetSelect.value !== 'custom') {
+          uiPresetSelect.value = 'custom';
+        }
+        updateUiSimpCounters();
+      });
+    });
+
+    var uiShowAllBtn = document.getElementById('btn-ui-show-all');
+    if (uiShowAllBtn) {
+      uiShowAllBtn.addEventListener('click', function () {
+        uiFlagEls.forEach(function (chk) { chk.checked = false; });
+        if (uiPresetSelect) uiPresetSelect.value = 'full';
+        updateUiSimpCounters();
+      });
+    }
+
+    var uiHideAllBtn = document.getElementById('btn-ui-hide-all');
+    if (uiHideAllBtn) {
+      uiHideAllBtn.addEventListener('click', function () {
+        uiFlagEls.forEach(function (chk) { chk.checked = true; });
+        if (uiPresetSelect) uiPresetSelect.value = 'custom';
+        updateUiSimpCounters();
+      });
+    }
+
+    container.querySelectorAll('.rg-ui-group-show-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var grpId = btn.getAttribute('data-group');
+        uiFlagEls.forEach(function (chk) {
+          if (chk.getAttribute('data-ui-group') === grpId) chk.checked = false;
+        });
+        var anyChecked = uiFlagEls.some(function (c) { return c.checked; });
+        if (uiPresetSelect) uiPresetSelect.value = anyChecked ? 'custom' : 'full';
+        updateUiSimpCounters();
+      });
+    });
+
+    container.querySelectorAll('.rg-ui-group-hide-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var grpId = btn.getAttribute('data-group');
+        uiFlagEls.forEach(function (chk) {
+          if (chk.getAttribute('data-ui-group') === grpId) chk.checked = true;
+        });
+        if (uiPresetSelect) uiPresetSelect.value = 'custom';
+        updateUiSimpCounters();
+      });
+    });
+
+    if (uiFilterInput) {
+      uiFilterInput.addEventListener('input', function () {
+        var q = String(uiFilterInput.value || '').trim().toLowerCase();
+        container.querySelectorAll('[data-ui-group-card]').forEach(function (card) {
+          var items = Array.prototype.slice.call(card.querySelectorAll('.rg-ui-opt-item'));
+          var visibleCount = 0;
+          items.forEach(function (item) {
+            var txt = item.getAttribute('data-search-text') || '';
+            var match = !q || txt.indexOf(q) !== -1;
+            item.classList.toggle('hidden', !match);
+            if (match) visibleCount += 1;
+          });
+          card.classList.toggle('hidden', Boolean(q) && visibleCount === 0);
+          if (q && visibleCount > 0) card.open = true;
+        });
+      });
+    }
+
     var sysForm = document.getElementById('sys-settings-form');
     if (sysForm) {
       sysForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
+        var hoursEl = document.getElementById('set-auto-sync-hours');
+        var minutesEl = document.getElementById('set-auto-sync-minutes');
+        var rawHours = Number(hoursEl && hoursEl.value !== '' ? hoursEl.value : 0);
+        var rawMinutes = Number(minutesEl && minutesEl.value !== '' ? minutesEl.value : 0);
+        var autoEnabled = document.getElementById('set-auto-sync-enabled').checked;
+
+        if (autoEnabled && (!isFinite(rawHours) || rawHours <= 0) && (!isFinite(rawMinutes) || rawMinutes <= 0)) {
+          ctx.toast('يرجى تحديد مدة لا تقل عن دقيقة واحدة للتحديث التلقائي.', true);
+          if (minutesEl) minutesEl.focus();
+          return;
+        }
+
+        var normInterval = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncInterval)
+          ? root.RGCrmCore.normalizeAutoSyncInterval(rawHours, rawMinutes)
+          : { hours: Math.max(0, Math.min(168, Math.round(rawHours || 0))), minutes: Math.max(0, Math.min(59, Math.round(rawMinutes || 0))) };
+
+        var nextUiRaw = {
+          preset: uiPresetSelect ? uiPresetSelect.value : 'full'
+        };
+        uiFlagEls.forEach(function (chk) {
+          var key = chk.getAttribute('data-ui-key');
+          if (key) nextUiRaw[key] = Boolean(chk.checked);
+        });
+        var normUiSimp = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+          ? root.RGCrmCore.normalizeUiSimplificationSettings(nextUiRaw)
+          : nextUiRaw;
+
         var submitBtn = document.getElementById('btn-save-sys-settings');
         runWithLock(submitBtn, 'updateSettings', async function () {
           var excluded = document.getElementById('set-excluded').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-          var autoEnabled = document.getElementById('set-auto-sync-enabled').checked;
-          var autoHours = Math.max(1, Math.min(168, Number(document.getElementById('set-auto-sync-hours').value || 12)));
           var res = await root.RGApi.callApi('updateSettings', {
             company_name: document.getElementById('set-company').value,
             session_ttl_hours: Number(document.getElementById('set-ttl').value || 24),
             excluded_statuses: excluded,
             allow_agent_view_all: document.getElementById('set-agent-all').checked,
             auto_sync_enabled: autoEnabled,
-            auto_sync_interval_hours: autoHours
+            auto_sync_interval_hours: normInterval.hours,
+            auto_sync_interval_minutes: normInterval.minutes,
+            ui_simplification: normUiSimp
           });
           if (res.success) {
-            ctx.toast('تم حفظ الإعدادات وتحديث جدول التحديث التلقائي (' + (autoEnabled ? ('كل ' + autoHours + ' ساعة') : 'متوقف') + ').');
+            var appliedUi = (res.data && res.data.ui_simplification) ? res.data.ui_simplification : normUiSimp;
+            if (ctx.applyUiSimplification) ctx.applyUiSimplification(appliedUi);
+            else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(appliedUi);
+            ctx.toast('تم حفظ الإعدادات وتبسيط الواجهة وتحديث المزامنة التلقائية (' + (autoEnabled ? formatIntervalAr(normInterval.hours, normInterval.minutes) : 'متوقف') + ').');
             render(container, ctx);
           } else {
             ctx.toast(res.message, true);
+          }
+        });
+      });
+    }
+
+    var deleteAllBtn = document.getElementById('btn-delete-all-reservations');
+    if (deleteAllBtn) {
+      deleteAllBtn.addEventListener('click', function () {
+        openDeleteAllReservationsModal(container, ctx);
+      });
+    }
+    var importExcelBtn = document.getElementById('btn-import-excel-reservations');
+    if (importExcelBtn) {
+      importExcelBtn.addEventListener('click', function () {
+        if (root.RGReservations && typeof root.RGReservations.openImportExcelModal === 'function') {
+          root.RGReservations.openImportExcelModal(ctx, function () {
+            render(container, ctx);
+          });
+        }
+      });
+    }
+  }
+
+  function openDeleteAllReservationsModal(container, ctx) {
+    var modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+    var requiredPhrase = (root.RGCrmCore && root.RGCrmCore.DELETE_ALL_RESERVATIONS_PHRASE) || 'حذف جميع الحجوزات';
+    var nowDate = new Date();
+    var curYear = String(nowDate.getFullYear());
+    var curMonth = curYear + '-' + String(nowDate.getMonth() + 1).padStart(2, '0');
+
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" id="delete-all-reservations-modal" role="dialog" aria-modal="true" aria-labelledby="del-all-res-title">' +
+        '<form class="modal-panel" id="del-all-res-form" style="max-width:560px;">' +
+          '<div class="modal-header">' +
+            '<h3 class="modal-title" id="del-all-res-title" style="color:var(--status-danger-text, #f43f5e);">تأكيد أمان: حذف الحجوزات وتصدير نسخة Excel تلقائياً</h3>' +
+            '<button type="button" class="btn btn-sm" id="del-all-res-close" data-modal-close aria-label="إغلاق">إغلاق</button>' +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;gap:14px;">' +
+            '<div style="padding:12px 14px;border-radius:var(--radius-sm);border:1px solid var(--status-danger-border);background:var(--status-danger-bg);font-size:13px;line-height:1.7;">' +
+              '<strong style="color:var(--status-danger-text, #f43f5e);display:block;margin-bottom:4px;">تحذير أمني هام — سيتم تصدير نسخة Excel تلقائياً قبل الحذف النهائي</strong>' +
+              'اختر نطاق الحذف (شهر محدد أو سنة محددة أو جميع الحجوزات). يتم تنزيل ملف Excel بالحجوزات المحذوفة تلقائياً عند إتمام الحذف.' +
+            '</div>' +
+
+            '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);display:flex;flex-direction:column;gap:10px;">' +
+              '<label class="form-label" style="margin:0;">نطاق الحذف المطلوب</label>' +
+              '<div style="display:flex;gap:10px;flex-wrap:wrap;">' +
+                '<label class="checkbox-item" style="margin:0;"><input type="radio" name="del-res-scope" value="all" checked> <span>حذف جميع الحجوزات</span></label>' +
+                '<label class="checkbox-item" style="margin:0;"><input type="radio" name="del-res-scope" value="month"> <span>حذف شهر محدد</span></label>' +
+                '<label class="checkbox-item" style="margin:0;"><input type="radio" name="del-res-scope" value="year"> <span>حذف سنة محددة</span></label>' +
+              '</div>' +
+              '<div id="del-res-month-wrap" class="form-group hidden" style="margin:0;">' +
+                '<label class="form-label" for="del-res-month">اختر الشهر (YYYY-MM)</label>' +
+                '<input type="month" class="input mono" id="del-res-month" dir="ltr" value="' + curMonth + '">' +
+              '</div>' +
+              '<div id="del-res-year-wrap" class="form-group hidden" style="margin:0;">' +
+                '<label class="form-label" for="del-res-year">أدخل السنة (YYYY)</label>' +
+                '<input type="number" class="input mono" id="del-res-year" dir="ltr" min="2000" max="2100" value="' + curYear + '">' +
+              '</div>' +
+              '<div id="del-res-scope-preview" style="font-size:12.5px;font-weight:700;color:var(--brand-primary);">جاري احتساب السجلات المطابقة...</div>' +
+            '</div>' +
+
+            '<label class="checkbox-item" style="font-weight:600;align-items:flex-start;line-height:1.6;">' +
+              '<input type="checkbox" id="del-all-res-ack">' +
+              '<span>أقر بأنني أتحمل مسؤولية حذف الحجوزات ضمن النطاق المحدد وأدرك أنه لا يمكن التراجع عن هذا الإجراء.</span>' +
+            '</label>' +
+            '<div class="form-group">' +
+              '<label class="form-label" for="del-all-res-phrase">اكتب عبارة التأكيد التالية بدقة: <strong class="mono" style="color:var(--status-danger-text, #f43f5e);user-select:all;">' + escapeHtml(requiredPhrase) + '</strong></label>' +
+              '<input type="text" class="input" id="del-all-res-phrase" autocomplete="off" spellcheck="false" placeholder="اكتب: ' + escapeHtml(requiredPhrase) + '">' +
+            '</div>' +
+            '<div class="form-group">' +
+              '<label class="form-label" for="del-all-res-password">كلمة مرور حسابك الحالي (للتحقق الأمني)</label>' +
+              '<div class="password-field-wrap">' +
+                '<input type="password" class="input mono" id="del-all-res-password" dir="ltr" autocomplete="current-password" placeholder="أدخل كلمة مرور حسابك">' +
+                '<button type="button" class="password-toggle-btn" id="toggle-del-all-res-password" aria-label="إظهار كلمة المرور">إظهار</button>' +
+              '</div>' +
+            '</div>' +
+            '<div id="del-all-res-error" class="form-error hidden" role="alert"></div>' +
+          '</div>' +
+          '<div class="modal-footer">' +
+            '<button type="button" class="btn" id="del-all-res-cancel" data-modal-close>إلغاء</button>' +
+            '<button type="submit" class="btn btn-danger" id="del-all-res-confirm" disabled>تأكيد الحذف وتصدير Excel</button>' +
+          '</div>' +
+        '</form>' +
+      '</div>';
+
+    bindPasswordToggle('del-all-res-password', 'toggle-del-all-res-password');
+
+    var ackEl = document.getElementById('del-all-res-ack');
+    var phraseEl = document.getElementById('del-all-res-phrase');
+    var pwdEl = document.getElementById('del-all-res-password');
+    var errEl = document.getElementById('del-all-res-error');
+    var confirmBtn = document.getElementById('del-all-res-confirm');
+    var formEl = document.getElementById('del-all-res-form');
+    var monthWrap = document.getElementById('del-res-month-wrap');
+    var yearWrap = document.getElementById('del-res-year-wrap');
+    var monthInput = document.getElementById('del-res-month');
+    var yearInput = document.getElementById('del-res-year');
+    var previewEl = document.getElementById('del-res-scope-preview');
+    var previewSeq = 0;
+    var hasZeroMatches = false;
+
+    function getScopePayload() {
+      var checkedRadio = formEl.querySelector('input[name="del-res-scope"]:checked');
+      var sc = checkedRadio ? checkedRadio.value : 'all';
+      var ymVal = monthInput ? String(monthInput.value || '').trim() : '';
+      return {
+        scope: sc,
+        yearMonth: sc === 'month' ? ymVal : '',
+        month: ymVal,
+        year: yearInput ? String(yearInput.value || '').trim() : ''
+      };
+    }
+
+    async function refreshScopePreview() {
+      var seq = ++previewSeq;
+      var sc = getScopePayload();
+      if (monthWrap) monthWrap.classList.toggle('hidden', sc.scope !== 'month');
+      if (yearWrap) yearWrap.classList.toggle('hidden', sc.scope !== 'year');
+      if (previewEl) {
+        previewEl.style.color = 'var(--brand-primary)';
+        previewEl.textContent = 'جاري احتساب السجلات المطابقة...';
+      }
+      try {
+        var prevRes = await root.RGApi.callApi('previewDeleteReservations', sc);
+        if (seq !== previewSeq || !previewEl || !previewEl.isConnected) return;
+        if (prevRes && prevRes.success && prevRes.data) {
+          var c = Number(prevRes.data.count || 0);
+          var tot = Number(prevRes.data.totalReservations || 0);
+          var scopeTxt = sc.scope === 'month' ? ('لشهر ' + (sc.month || '-')) : (sc.scope === 'year' ? ('لسنة ' + (sc.year || '-')) : 'الكل');
+          hasZeroMatches = c <= 0;
+          if (hasZeroMatches) {
+            previewEl.style.color = 'var(--status-warning-text, #d97706)';
+            previewEl.textContent = 'لا توجد حجوزات مطابقة (' + scopeTxt + ') من أصل ' + tot + ' حجز — لا يوجد ما يتم حذفه.';
+          } else {
+            previewEl.style.color = 'var(--brand-primary)';
+            previewEl.textContent = 'السجلات المطابقة (' + scopeTxt + '): ' + c + ' من أصل ' + tot + ' حجز — سيتم تصدير نسخة Excel تلقائياً عند الحذف.';
+          }
+        } else {
+          hasZeroMatches = false;
+          previewEl.style.color = 'var(--text-muted)';
+          previewEl.textContent = 'تعذر معاينة عدد السجلات.';
+        }
+      } catch (_e) {
+        if (seq === previewSeq && previewEl) {
+          hasZeroMatches = false;
+          previewEl.style.color = 'var(--text-muted)';
+          previewEl.textContent = 'تعذر معاينة عدد السجلات.';
+        }
+      }
+      updateConfirmValidity(false);
+    }
+
+    formEl.querySelectorAll('input[name="del-res-scope"]').forEach(function (rad) {
+      rad.addEventListener('change', refreshScopePreview);
+    });
+    if (monthInput) monthInput.addEventListener('change', refreshScopePreview);
+    if (yearInput) yearInput.addEventListener('input', refreshScopePreview);
+    refreshScopePreview();
+
+    function closeModal() {
+      if (modalRoot) modalRoot.innerHTML = '';
+    }
+
+    var closeBtn = document.getElementById('del-all-res-close');
+    var cancelBtn = document.getElementById('del-all-res-cancel');
+    if (closeBtn) closeBtn.addEventListener('click', closeModal);
+    if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
+
+    function updateConfirmValidity(clearError) {
+      var isAck = Boolean(ackEl && ackEl.checked);
+      var phraseVal = phraseEl ? String(phraseEl.value || '').trim() : '';
+      var pwdVal = pwdEl ? String(pwdEl.value || '') : '';
+      var ready = !hasZeroMatches && isAck && phraseVal === requiredPhrase && pwdVal.length > 0;
+      if (confirmBtn) confirmBtn.disabled = !ready;
+      if (clearError && errEl && !errEl.classList.contains('hidden')) {
+        errEl.classList.add('hidden');
+        errEl.textContent = '';
+      }
+    }
+
+    if (ackEl) ackEl.addEventListener('change', function () { updateConfirmValidity(true); });
+    if (phraseEl) phraseEl.addEventListener('input', function () { updateConfirmValidity(true); });
+    if (pwdEl) pwdEl.addEventListener('input', function () { updateConfirmValidity(true); });
+
+    if (formEl) {
+      formEl.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var scPayload = getScopePayload();
+        var payload = Object.assign({}, scPayload, {
+          acknowledged: Boolean(ackEl && ackEl.checked),
+          confirmPhrase: phraseEl ? String(phraseEl.value || '').trim() : '',
+          password: pwdEl ? String(pwdEl.value || '') : ''
+        });
+        if (root.RGCrmCore && root.RGCrmCore.validateDeleteAllReservationsConfirmation) {
+          var check = root.RGCrmCore.validateDeleteAllReservationsConfirmation(payload);
+          if (!check.valid) {
+            if (errEl) {
+              errEl.textContent = check.message;
+              errEl.classList.remove('hidden');
+            }
+            return;
+          }
+        }
+
+        runWithLock(confirmBtn, 'deleteAllReservations', async function () {
+          var prevText = confirmBtn ? confirmBtn.textContent : '';
+          if (confirmBtn) {
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = 'جاري الحذف وتصدير Excel...';
+          }
+          try {
+            var res = await root.RGApi.callApi('deleteAllReservations', payload);
+            if (res && res.success) {
+              var count = (res.data && res.data.deletedReservationsCount) || 0;
+              var exportedRows = (res.data && Array.isArray(res.data.exportedRows)) ? res.data.exportedRows : [];
+              var autoExported = false;
+              var exportFailed = false;
+              if (exportedRows.length > 0 && root.RGReports && typeof root.RGReports.exportExcelWorkbook === 'function') {
+                try {
+                  var tag = scPayload.scope === 'month' ? ('month-' + scPayload.month) : (scPayload.scope === 'year' ? ('year-' + scPayload.year) : 'all');
+                  var fname = 'rental-gate-deleted-' + tag + '-' + new Date().toISOString().slice(0, 10) + '.xlsx';
+                  var cols = Array.isArray(root.RGReports.RESERVATION_COLUMNS) ? root.RGReports.RESERVATION_COLUMNS.slice() : Object.keys(exportedRows[0] || {});
+                  await root.RGReports.exportExcelWorkbook([{
+                    name: 'Deleted_Reservations',
+                    headers: cols,
+                    rows: exportedRows
+                  }], fname);
+                  autoExported = true;
+                } catch (_expErr) {
+                  exportFailed = true;
+                }
+              }
+              closeModal();
+              if (exportFailed) {
+                ctx.toast('تم حذف ' + count + ' حجز، لكن تعذر تنزيل ملف Excel التلقائي.', true);
+              } else {
+                ctx.toast(
+                  autoExported
+                    ? ('تم حذف ' + count + ' حجز وتصدير نسخة Excel الاحتياطية تلقائياً.')
+                    : ('تم حذف ' + count + ' حجز وتنظيف الذاكرة المؤقتة بنجاح.')
+                );
+              }
+              render(container, ctx);
+              return;
+            }
+            if (errEl) {
+              var rawMsg = String((res && res.message) || 'تعذر تنفيذ عملية الحذف.');
+              errEl.textContent = rawMsg.replace(/^(VALIDATION_ERROR|UNAUTHORIZED|FORBIDDEN):\s*/i, '');
+              errEl.classList.remove('hidden');
+            }
+          } finally {
+            if (confirmBtn && confirmBtn.isConnected !== false) {
+              confirmBtn.textContent = prevText;
+              updateConfirmValidity(false);
+            }
           }
         });
       });

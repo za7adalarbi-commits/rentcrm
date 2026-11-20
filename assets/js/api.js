@@ -478,7 +478,14 @@
       }
 
       if (typeof sessionStorage === 'undefined') return;
-      var keys = idbEntries.map(function (e) { return e.key; });
+      var keys = idbEntries.map(function (e) { return e.key; }).filter(function (k) {
+        try {
+          var s = JSON.stringify(apiResponseCache[k]);
+          return !s || s.length <= 200000;
+        } catch (_e) {
+          return false;
+        }
+      });
       if (keys.length > 35) {
         keys.sort(function (a, b) {
           return (apiResponseCache[b].storedAt || 0) - (apiResponseCache[a].storedAt || 0);
@@ -509,13 +516,13 @@
       persistIdleId = requestIdleCallback(function () {
         persistIdleId = null;
         flushPersistApiCache();
-      }, { timeout: 200 });
+      }, { timeout: 1500 });
       return;
     }
     persistTimer = setTimeout(function () {
       persistTimer = null;
       flushPersistApiCache();
-    }, 60);
+    }, 800);
   }
 
   hydrateApiCache();
@@ -1042,6 +1049,126 @@
       return;
     }
 
+    if (action === 'saveReservationPinnedNote') {
+      var resIdPin = String(p.reservationId || '').trim();
+      var notePin = String(p.note || '').trim();
+      if (!resIdPin) return;
+      var patchPinned = function (rec) {
+        if (!rec || rec.id !== resIdPin) return rec;
+        return Object.assign({}, rec, {
+          pinnedNote: notePin,
+          pinnedNoteById: notePin ? (actUser.id || '') : '',
+          pinnedNoteByName: notePin ? (actUser.name || '') : '',
+          pinnedNoteUpdatedAt: notePin ? nowIso : ''
+        });
+      };
+      var nsPin = getCacheNamespace();
+      if (localReservationsByNs[nsPin] && localReservationsByNs[nsPin].byId[resIdPin]) {
+        setLocalReservationsState(nsPin, [patchPinned(localReservationsByNs[nsPin].byId[resIdPin])], false);
+      }
+      if (localDetailsByNs[nsPin] && localDetailsByNs[nsPin][resIdPin] && localDetailsByNs[nsPin][resIdPin].reservation) {
+        setLocalDetailState(nsPin, Object.assign({}, localDetailsByNs[nsPin][resIdPin], {
+          reservation: patchPinned(localDetailsByNs[nsPin][resIdPin].reservation)
+        }));
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchPinned) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdPin) {
+          return Object.assign({}, data, { reservation: patchPinned(data.reservation) });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, { assignedReservations: data.assignedReservations.map(patchPinned) });
+        }
+        return undefined;
+      });
+      return;
+    }
+
+    if (action === 'recordNoAnswerFollowUp') {
+      var resIdNa = String(p.reservationId || '').trim();
+      var noteNa = String(p.note || p.notes || '').trim();
+      if (!resIdNa) return;
+      var patchNa = function (rec) {
+        if (!rec || rec.id !== resIdNa) return rec;
+        var nextCnt = Math.max(0, Math.floor(Number(rec.noAnswerCount || 0))) + 1;
+        var actionTxt = (core && core.buildNoAnswerActionText)
+          ? core.buildNoAnswerActionText(nextCnt, 'ar')
+          : ('محاولة اتصال — لم يرد (المحاولة #' + nextCnt + ')');
+        var lastTxt = noteNa ? (actionTxt + ' — ' + noteNa) : actionTxt;
+        return Object.assign({}, rec, {
+          noAnswerCount: nextCnt,
+          lastUpdateText: lastTxt,
+          lastUpdatedById: actUser.id || rec.lastUpdatedById,
+          lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
+          lastUpdatedAt: nowIso,
+          isFollowed: true
+        });
+      };
+      var nsNa = getCacheNamespace();
+      if (localReservationsByNs[nsNa] && localReservationsByNs[nsNa].byId[resIdNa]) {
+        setLocalReservationsState(nsNa, [patchNa(localReservationsByNs[nsNa].byId[resIdNa])], false);
+      }
+      if (localDetailsByNs[nsNa] && localDetailsByNs[nsNa][resIdNa] && localDetailsByNs[nsNa][resIdNa].reservation) {
+        var curNaDet = localDetailsByNs[nsNa][resIdNa];
+        var nextResNa = patchNa(curNaDet.reservation);
+        var actTxtDet = (core && core.buildNoAnswerActionText)
+          ? core.buildNoAnswerActionText(nextResNa.noAnswerCount, 'ar')
+          : ('محاولة اتصال — لم يرد (المحاولة #' + nextResNa.noAnswerCount + ')');
+        setLocalDetailState(nsNa, Object.assign({}, curNaDet, {
+          reservation: nextResNa,
+          followUps: [{
+            id: 'FU_OPT_' + Date.now(),
+            reservationId: resIdNa,
+            reservationNumber: curNaDet.reservation.reservationNumber,
+            customerName: curNaDet.reservation.customerName,
+            employeeId: actUser.id,
+            employeeName: actUser.name,
+            status: curNaDet.reservation.internalStatus || 'تم الإنشاء',
+            action: actTxtDet,
+            notes: noteNa,
+            followUpDate: nowIso.substring(0, 10),
+            followUpTime: new Date().toTimeString().substring(0, 8),
+            createdAt: nowIso
+          }].concat(curNaDet.followUps || [])
+        }));
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchNa) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdNa) {
+          var nextRNa = patchNa(data.reservation);
+          var actTxtC = (core && core.buildNoAnswerActionText)
+            ? core.buildNoAnswerActionText(nextRNa.noAnswerCount, 'ar')
+            : ('محاولة اتصال — لم يرد (المحاولة #' + nextRNa.noAnswerCount + ')');
+          return Object.assign({}, data, {
+            reservation: nextRNa,
+            followUps: [{
+              id: 'FU_OPT_' + Date.now(),
+              reservationId: resIdNa,
+              reservationNumber: data.reservation.reservationNumber,
+              customerName: data.reservation.customerName,
+              employeeId: actUser.id,
+              employeeName: actUser.name,
+              status: data.reservation.internalStatus || 'تم الإنشاء',
+              action: actTxtC,
+              notes: noteNa,
+              followUpDate: nowIso.substring(0, 10),
+              followUpTime: new Date().toTimeString().substring(0, 8),
+              createdAt: nowIso
+            }].concat(data.followUps || [])
+          });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, { assignedReservations: data.assignedReservations.map(patchNa) });
+        }
+        return undefined;
+      });
+      return;
+    }
+
     if (action === 'updateProblem') {
       var prbId = String(p.problemId || '').trim();
       if (!prbId || !core) return;
@@ -1303,11 +1430,27 @@
     return d.toISOString().substring(0, 10);
   }
 
+  function localOffsetDateTime(hoursOffset) {
+    var d = new Date(Date.now() + (Number(hoursOffset || 0) * 3600000));
+    var p = function (n) { return n < 10 ? '0' + n : String(n); };
+    return {
+      date: d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()),
+      time: p(d.getHours()) + ':' + p(d.getMinutes()),
+      iso: d.toISOString()
+    };
+  }
+
   function seedSandboxDb() {
     var t0 = todayIso(0);
     var t1 = todayIso(-1);
     var t2 = todayIso(-2);
     var t5 = todayIso(-5);
+    var closedRecent = localOffsetDateTime(-2);
+    var expPlus4h = localOffsetDateTime(4);
+    var expPlus16h = localOffsetDateTime(16);
+    var expMinus2h = localOffsetDateTime(-2);
+    var startMinus2d = localOffsetDateTime(-44);
+    var startMinus3d = localOffsetDateTime(-68);
 
     var employees = [
       {
@@ -1580,10 +1723,10 @@
         lastUpdateText: 'تم استلام السيارة وإغلاق العقد بنجاح',
         lastUpdatedById: 'EMP_AG2',
         lastUpdatedByName: 'نورة القحطاني',
-        lastUpdatedAt: t1 + 'T16:20:00.000Z',
+        lastUpdatedAt: closedRecent.iso,
         hasProblem: false,
         createdAt: t2 + 'T11:00:00.000Z',
-        updatedAt: t1 + 'T16:20:00.000Z'
+        updatedAt: closedRecent.iso
       },
       {
         id: 'RES_1005',
@@ -1688,6 +1831,162 @@
         hasProblem: false,
         createdAt: t5 + 'T10:00:00.000Z',
         updatedAt: t5 + 'T15:10:00.000Z'
+      },
+      {
+        id: 'RES_1007',
+        sourceReservationId: '884701',
+        reservationNumber: 'RG-2026-8847',
+        sourceCreatedAt: startMinus2d.iso,
+        customerName: 'فيصل عبدالعزيز المطيري',
+        customerPhone: '0557788991',
+        customerEmail: 'f.almutairi@example.sa',
+        customerIdNumber: '1072345611',
+        companyName: 'ذيب لتأجير السيارات',
+        branchName: 'الرياض - حي الملقا',
+        deliverBranchName: 'الرياض - حي الملقا',
+        carName: 'تويوتا راف 4 2026',
+        carCategory: 'SUV متوسطة',
+        plateNumber: 'د هـ و 6621',
+        startDate: startMinus2d.date,
+        startTime: startMinus2d.time,
+        originalEndDate: expPlus4h.date,
+        originalEndTime: expPlus4h.time,
+        endDate: expPlus4h.date,
+        endTime: expPlus4h.time,
+        extendedUntilDate: '',
+        extendedUntilTime: '',
+        daysCount: 2,
+        extendedDaysCount: 0,
+        totalDaysCount: 2,
+        originalStatusCode: 'delivered',
+        originalStatusAr: 'تم التسليم',
+        pickupTypeAr: 'استلام من الفرع',
+        returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'مدى (Mada)',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 310,
+        discountAmount: 0,
+        vatAmount: 93,
+        baseAmount: 713,
+        extensionsCount: 0,
+        extensionsAmount: 0,
+        totalAmount: 713,
+        hasExtensions: false,
+        internalStatus: 'تم التسليم',
+        priority: 'مرتفع',
+        assignedEmployeeIds: ['EMP_AG1'],
+        assignedEmployeeNames: ['خالد الحربي'],
+        lastUpdateText: 'ينتهي العقد خلال ساعات — يلزم التواصل لعرض التمديد',
+        lastUpdatedById: 'EMP_AG1',
+        lastUpdatedByName: 'خالد الحربي',
+        lastUpdatedAt: closedRecent.iso,
+        hasProblem: false,
+        createdAt: startMinus2d.iso,
+        updatedAt: closedRecent.iso
+      },
+      {
+        id: 'RES_1008',
+        sourceReservationId: '884801',
+        reservationNumber: 'RG-2026-8848',
+        sourceCreatedAt: startMinus3d.iso,
+        customerName: 'سلمان راشد الدوسري',
+        customerPhone: '0503344558',
+        customerEmail: 's.aldossary@example.sa',
+        customerIdNumber: '1066881234',
+        companyName: 'بدجت السعودية',
+        branchName: 'مطار الملك عبدالعزيز - جدة',
+        deliverBranchName: 'مطار الملك عبدالعزيز - جدة',
+        carName: 'هيونداي إلنترا 2026',
+        carCategory: 'سيدان اقتصادية',
+        plateNumber: 'ع س ق 2408',
+        startDate: startMinus3d.date,
+        startTime: startMinus3d.time,
+        originalEndDate: t0,
+        originalEndTime: expPlus16h.time,
+        endDate: expPlus16h.date,
+        endTime: expPlus16h.time,
+        extendedUntilDate: expPlus16h.date,
+        extendedUntilTime: expPlus16h.time,
+        daysCount: 2,
+        extendedDaysCount: 1,
+        totalDaysCount: 3,
+        originalStatusCode: 'confirmed',
+        originalStatusAr: 'مؤكد',
+        pickupTypeAr: 'توصيل للمطار',
+        returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'Apple Pay',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 220,
+        discountAmount: 0,
+        vatAmount: 66,
+        baseAmount: 506,
+        extensionsCount: 1,
+        extensionsAmount: 253,
+        totalAmount: 759,
+        hasExtensions: true,
+        internalStatus: 'تم التمديد',
+        priority: 'متوسط',
+        assignedEmployeeIds: ['EMP_AG2'],
+        assignedEmployeeNames: ['نورة القحطاني'],
+        lastUpdateText: 'تم تمديد العقد يوماً إضافياً وتنتهي الفترة الممددة قريباً',
+        lastUpdatedById: 'EMP_AG2',
+        lastUpdatedByName: 'نورة القحطاني',
+        lastUpdatedAt: closedRecent.iso,
+        hasProblem: false,
+        createdAt: startMinus3d.iso,
+        updatedAt: closedRecent.iso
+      },
+      {
+        id: 'RES_1009',
+        sourceReservationId: '884901',
+        reservationNumber: 'RG-2026-8849',
+        sourceCreatedAt: startMinus2d.iso,
+        customerName: 'نواف حمد القحطاني',
+        customerPhone: '0541199882',
+        customerEmail: 'n.alqahtani@example.sa',
+        customerIdNumber: '1088990044',
+        companyName: 'مفتاح لتأجير السيارات',
+        branchName: 'الدمام - طريق الخليج',
+        deliverBranchName: 'الدمام - طريق الخليج',
+        carName: 'نيسان التيما 2026',
+        carCategory: 'سيدان متوسطة',
+        plateNumber: 'ل م ن 7822',
+        startDate: startMinus2d.date,
+        startTime: startMinus2d.time,
+        originalEndDate: expMinus2h.date,
+        originalEndTime: expMinus2h.time,
+        endDate: expMinus2h.date,
+        endTime: expMinus2h.time,
+        extendedUntilDate: '',
+        extendedUntilTime: '',
+        daysCount: 2,
+        extendedDaysCount: 0,
+        totalDaysCount: 2,
+        originalStatusCode: 'pending',
+        originalStatusAr: 'قيد الانتظار',
+        pickupTypeAr: 'استلام من الفرع',
+        returnTypeAr: 'تسليم في الفرع',
+        paymentMethod: 'بطاقة ائتمانية',
+        paymentStatus: 'مدفوع',
+        dailyPrice: 260,
+        discountAmount: 0,
+        vatAmount: 78,
+        baseAmount: 598,
+        extensionsCount: 0,
+        extensionsAmount: 0,
+        totalAmount: 598,
+        hasExtensions: false,
+        internalStatus: 'قيد الانتظار',
+        priority: 'مرتفع',
+        assignedEmployeeIds: [],
+        assignedEmployeeNames: [],
+        lastUpdateText: 'تجاوز وقت الانتهاء دون إغلاق أو تمديد — بانتظار التواصل العاجل',
+        lastUpdatedById: 'EMP_SUP1',
+        lastUpdatedByName: 'سارة العتيبي',
+        lastUpdatedAt: closedRecent.iso,
+        hasProblem: false,
+        createdAt: startMinus2d.iso,
+        updatedAt: closedRecent.iso
       }
     ];
 
@@ -1741,6 +2040,31 @@
         amount: 520,
         isAcceptedAndPaid: true,
         syncedAt: t0 + 'T11:15:00.000Z'
+      },
+      {
+        id: 'EXT_503',
+        sequenceNumber: 1,
+        extensionNumber: 'EXT-8848-1',
+        reservationId: 'RES_1008',
+        reservationNumber: 'RG-2026-8848',
+        sourceReservationId: '884801',
+        extensionType: 'CLIENT',
+        extensionTypeAr: 'تمديد بواسطة العميل',
+        statusCode: 'accepted',
+        statusAr: 'مقبول',
+        paymentStatus: 'paid',
+        paymentMethod: 'Apple Pay',
+        paymentDate: closedRecent.iso,
+        extendDays: 1,
+        startDate: t0,
+        startTime: expPlus16h.time,
+        endDate: expPlus16h.date,
+        endTime: expPlus16h.time,
+        subTotal: 220,
+        vatAmount: 33,
+        amount: 253,
+        isAcceptedAndPaid: true,
+        syncedAt: closedRecent.iso
       }
     ];
 
@@ -1795,7 +2119,7 @@
         employeeName: 'نورة القحطاني',
         status: 'تم التمديد',
         action: 'إصدار رابط سداد التمديد ومتابعة التأكيد',
-        notes: 'تم الدفع بنجاح وتحديث عقد الإيجار',
+        notes: 'تم الدفع بنجاح وتحديث عقد الإيجار — للمتابعة @خالد الحربي',
         followUpDate: t0,
         followUpTime: '11:15:00',
         createdAt: t0 + 'T11:15:00.000Z'
@@ -1937,12 +2261,22 @@
       default_language: 'ar',
       auto_sync_enabled: true,
       auto_sync_interval_hours: 12,
+      auto_sync_interval_minutes: 0,
+      ui_simplification: (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+        ? root.RGCrmCore.normalizeUiSimplificationSettings({ preset: 'full' })
+        : { preset: 'full', hideSecondaryCarMeta: false, hideCustomerContactExtras: false, hideFinancialBreakdown: false, hideDrawerCharts: false, hideDashboardRadar: false, hideDashboardHeatmap: false },
       job_role_presets: (root.RGCrmCore && root.RGCrmCore.JOB_ROLE_PRESETS) ? root.RGCrmCore.JOB_ROLE_PRESETS.slice() : [],
       permissions_catalog_custom: []
     };
 
     reservations = reservations.map(function (r) {
+      var isSamplePinned = r.id === 'RES_1001';
       return Object.assign({}, r, {
+        pinnedNote: isSamplePinned ? 'عميل VIP — يرجى تأكيد جاهزية المركبة وغسيلها قبل الموعد بساعة.' : '',
+        pinnedNoteById: isSamplePinned ? 'EMP_SUP1' : '',
+        pinnedNoteByName: isSamplePinned ? 'سارة العتيبي' : '',
+        pinnedNoteUpdatedAt: isSamplePinned ? (t0 + 'T09:05:00.000Z') : '',
+        noAnswerCount: r.id === 'RES_1002' ? 1 : 0,
         statusHistory: [
           {
             stageNumber: 1,
@@ -2108,7 +2442,14 @@
         dirty = true;
       } else {
         if (parsed.settings.auto_sync_enabled === undefined) { parsed.settings.auto_sync_enabled = true; dirty = true; }
-        if (!parsed.settings.auto_sync_interval_hours) { parsed.settings.auto_sync_interval_hours = 12; dirty = true; }
+        if (parsed.settings.auto_sync_interval_hours === undefined || parsed.settings.auto_sync_interval_hours === null || parsed.settings.auto_sync_interval_hours === '') {
+          parsed.settings.auto_sync_interval_hours = 12;
+          dirty = true;
+        }
+        if (parsed.settings.auto_sync_interval_minutes === undefined || parsed.settings.auto_sync_interval_minutes === null || parsed.settings.auto_sync_interval_minutes === '') {
+          parsed.settings.auto_sync_interval_minutes = 0;
+          dirty = true;
+        }
         if (!Array.isArray(parsed.settings.job_role_presets) || parsed.settings.job_role_presets.length === 0) {
           parsed.settings.job_role_presets = defaults.settings.job_role_presets;
           dirty = true;
@@ -2117,6 +2458,21 @@
           parsed.settings.permissions_catalog_custom = [];
           dirty = true;
         }
+        if (!parsed.settings.ui_simplification || typeof parsed.settings.ui_simplification !== 'object') {
+          parsed.settings.ui_simplification = defaults.settings.ui_simplification;
+          dirty = true;
+        }
+      }
+
+      if (Array.isArray(parsed.reservations)) {
+        parsed.reservations.forEach(function (resRec) {
+          if (!resRec || typeof resRec !== 'object') return;
+          if (resRec.pinnedNote === undefined) { resRec.pinnedNote = ''; dirty = true; }
+          if (resRec.pinnedNoteById === undefined) { resRec.pinnedNoteById = ''; dirty = true; }
+          if (resRec.pinnedNoteByName === undefined) { resRec.pinnedNoteByName = ''; dirty = true; }
+          if (resRec.pinnedNoteUpdatedAt === undefined) { resRec.pinnedNoteUpdatedAt = ''; dirty = true; }
+          if (resRec.noAnswerCount === undefined) { resRec.noAnswerCount = 0; dirty = true; }
+        });
       }
 
       if (dirty) saveSandboxDb(parsed);
@@ -2184,6 +2540,35 @@
       isRead: false,
       createdAt: new Date().toISOString()
     });
+  }
+
+  function dispatchSandboxMentionNotifications(db, senderUser, texts, entityType, entityId, label) {
+    var core = root.RGCrmCore;
+    if (!core || !core.extractMentionedEmployees) return [];
+    var combined = (texts || []).map(function (t) { return String(t || '').trim(); }).filter(Boolean).join('\n');
+    if (!combined || combined.indexOf('@') === -1) return [];
+    var mentioned = core.extractMentionedEmployees(combined, db.employees || [], {
+      excludeEmployeeId: (senderUser && senderUser.id) || ''
+    });
+    if (!mentioned.length) return [];
+    var snippet = combined.replace(/\s+/g, ' ').trim().slice(0, 120);
+    var senderName = (senderUser && senderUser.name) || 'موظف';
+    var titlePrefix = entityType === 'Problem'
+      ? ('إشارة لك في المشكلة ' + (label || '')).trim()
+      : ('إشارة لك في الحجز ' + (label || '')).trim();
+    mentioned.forEach(function (target) {
+      pushSandboxNotification(
+        db,
+        target.id,
+        '',
+        'mention',
+        titlePrefix + ' (@' + senderName + ')',
+        senderName + ' أشار إليك: "' + snippet + '"',
+        entityType,
+        entityId
+      );
+    });
+    return mentioned;
   }
 
   function requireSandboxSession(db, token) {
@@ -2279,6 +2664,15 @@
         var bsNotif = sandboxExecute('getNotifications', token, {});
         var bsEmp = sandboxExecute('getEmployees', token, {});
         var bsPrb = sandboxExecute('getProblems', token, {});
+        var uiSimpBoot = core && core.normalizeUiSimplificationSettings
+          ? core.normalizeUiSimplificationSettings(db.settings.ui_simplification)
+          : (db.settings.ui_simplification || { preset: 'full' });
+        var rawPinnedBoot = db.settings['pinned_res_u_' + session.employeeId];
+        var parsedPinnedBoot = Array.isArray(rawPinnedBoot) ? rawPinnedBoot : [];
+        var rawLayoutBoot = db.settings['layout_prefs_u_' + session.employeeId];
+        var layoutPrefsBoot = (core && core.normalizeUserLayoutPrefs)
+          ? core.normalizeUserLayoutPrefs(rawLayoutBoot)
+          : { navOrder: [], hiddenRoutes: [], dashOrder: [], dashHidden: [] };
         return {
           success: true,
           message: '',
@@ -2287,7 +2681,10 @@
             dashboard: bsDash.success ? bsDash.data : null,
             notifications: bsNotif.success ? bsNotif.data : { items: [], unreadCount: 0 },
             employees: bsEmp.success ? bsEmp.data : { items: [], total: 0 },
-            problems: bsPrb.success ? bsPrb.data : { items: [], total: 0 }
+            problems: bsPrb.success ? bsPrb.data : { items: [], total: 0 },
+            uiSimplification: uiSimpBoot,
+            pinnedCriticalIds: parsedPinnedBoot.slice(0, (core && core.MAX_PINNED_CRITICAL_RESERVATIONS) || 3),
+            layoutPrefs: layoutPrefsBoot
           },
           error: null
         };
@@ -2592,6 +2989,7 @@
         var empQst = db.employees.find(function (e) { return e.id === session.employeeId; });
         if (empQst) empQst.lastActivity = fuQst.createdAt;
         appendSandboxActivity(db, session.user, 'تعديل حالة', 'Reservation', rQst.reservationNumber, 'تحديث مباشر إلى: ' + payload.status + (noteQst ? ' | ' + noteQst : ''));
+        dispatchSandboxMentionNotifications(db, session.user, [noteQst], 'Reservation', rQst.id, rQst.reservationNumber);
         saveSandboxDb(db);
         return { success: true, message: 'تم تحديث حالة الحجز بنجاح.', data: { reservation: rQst, followUp: fuQst }, error: null };
       }
@@ -2651,6 +3049,149 @@
         appendSandboxActivity(db, session.user, 'تعديل تفاصيل الحجز', 'Reservation', rEdit.reservationNumber, 'تعديل تفاصيل الحجز بواسطة ' + session.user.name);
         saveSandboxDb(db);
         return { success: true, message: 'تم حفظ تعديلات تفاصيل الحجز.', data: rEdit, error: null };
+      }
+
+      case 'saveReservationPinnedNote': {
+        if (!core.canUserPerform(session.user, 'pin_reservation_note') ||
+            (session.role !== 'general_manager' && session.role !== 'supervisor')) {
+          return { success: false, message: 'FORBIDDEN: إضافة الملاحظة المثبتة متاحة للمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var rPinTarget = db.reservations.find(function (r) { return r.id === payload.reservationId; });
+        if (!rPinTarget) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        var cleanPinNote = String(payload.note || '').trim();
+        var nowPinIso = new Date().toISOString();
+        rPinTarget.pinnedNote = cleanPinNote;
+        rPinTarget.pinnedNoteById = cleanPinNote ? session.employeeId : '';
+        rPinTarget.pinnedNoteByName = cleanPinNote ? session.user.name : '';
+        rPinTarget.pinnedNoteUpdatedAt = cleanPinNote ? nowPinIso : '';
+        rPinTarget.updatedAt = nowPinIso;
+        appendSandboxActivity(
+          db,
+          session.user,
+          cleanPinNote ? 'تثبيت ملاحظة على الحجز' : 'إزالة الملاحظة المثبتة',
+          'Reservation',
+          rPinTarget.reservationNumber,
+          cleanPinNote ? cleanPinNote.slice(0, 140) : 'إزالة الملاحظة المثبتة'
+        );
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: cleanPinNote ? 'تم حفظ الملاحظة المثبتة على الحجز.' : 'تمت إزالة الملاحظة المثبتة.',
+          data: { reservation: rPinTarget },
+          error: null
+        };
+      }
+
+      case 'recordNoAnswerFollowUp': {
+        if (!core.canUserPerform(session.user, 'add_followup')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية تسجيل المتابعة.', data: null, error: 'FORBIDDEN' };
+        }
+        var rNa = db.reservations.find(function (r) { return r.id === payload.reservationId; });
+        if (!rNa) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        var nextNaCount = Math.max(0, Math.floor(Number(rNa.noAnswerCount || 0))) + 1;
+        var nowNa = new Date();
+        var nowNaIso = nowNa.toISOString();
+        var naStatus = String(rNa.internalStatus || 'تم الإنشاء');
+        var naAction = core.buildNoAnswerActionText(nextNaCount, 'ar');
+        var naNotes = String(payload.note || payload.notes || '').trim();
+        var naFu = {
+          id: genId('FU'),
+          reservationId: rNa.id,
+          reservationNumber: rNa.reservationNumber,
+          customerName: rNa.customerName,
+          employeeId: session.employeeId,
+          employeeName: session.user.name,
+          status: naStatus,
+          action: naAction,
+          notes: naNotes,
+          followUpDate: nowNaIso.substring(0, 10),
+          followUpTime: nowNa.toTimeString().substring(0, 8),
+          createdAt: nowNaIso
+        };
+        db.followUps.unshift(naFu);
+        db.followUpHistory.unshift({
+          id: genId('FUH'),
+          followUpId: naFu.id,
+          reservationId: rNa.id,
+          reservationNumber: rNa.reservationNumber,
+          employeeId: session.employeeId,
+          employeeName: session.user.name,
+          changeType: 'no_answer_attempt',
+          previousStatus: naStatus,
+          newStatus: naStatus,
+          previousAction: '',
+          newAction: naAction,
+          previousNotes: '',
+          newNotes: naNotes,
+          changedAt: nowNaIso
+        });
+        rNa.noAnswerCount = nextNaCount;
+        rNa.lastUpdateText = naNotes ? (naAction + ' — ' + naNotes) : naAction;
+        rNa.lastUpdatedById = session.employeeId;
+        rNa.lastUpdatedByName = session.user.name;
+        rNa.lastUpdatedAt = nowNaIso;
+        rNa.updatedAt = nowNaIso;
+        rNa.isFollowed = true;
+        var empNa = db.employees.find(function (e) { return e.id === session.employeeId; });
+        if (empNa) empNa.lastActivity = nowNaIso;
+        appendSandboxActivity(db, session.user, 'تسجيل محاولة اتصال - لم يرد', 'FollowUp', rNa.reservationNumber, rNa.lastUpdateText);
+        if (naNotes) {
+          dispatchSandboxMentionNotifications(db, session.user, [naNotes], 'Reservation', rNa.id, rNa.reservationNumber);
+        }
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: 'تم تسجيل محاولة الاتصال (لم يرد #' + nextNaCount + ').',
+          data: { reservation: rNa, followUp: naFu, noAnswerCount: nextNaCount },
+          error: null
+        };
+      }
+
+      case 'togglePinnedCriticalReservation': {
+        var pinResId = String(payload.reservationId || '').trim();
+        if (!pinResId) return { success: false, message: 'VALIDATION_ERROR: معرف الحجز مطلوب.', data: null, error: 'VALIDATION_ERROR' };
+        var rPinCrit = db.reservations.find(function (r) { return r.id === pinResId; });
+        if (!rPinCrit) return { success: false, message: 'NOT_FOUND: الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        var maxCriticalPins = (core && core.MAX_PINNED_CRITICAL_RESERVATIONS) || 3;
+        var pinSettingKey = 'pinned_res_u_' + session.employeeId;
+        var curPinArr = Array.isArray(db.settings[pinSettingKey])
+          ? db.settings[pinSettingKey].map(function (x) { return String(x || '').trim(); }).filter(Boolean)
+          : [];
+        var alreadyPinned = curPinArr.indexOf(pinResId) !== -1;
+        var shouldPinCrit = typeof payload.pin === 'boolean' ? payload.pin : (typeof payload.pinned === 'boolean' ? payload.pinned : !alreadyPinned);
+        var nextPinArr;
+        if (shouldPinCrit) {
+          if (alreadyPinned) {
+            nextPinArr = curPinArr;
+          } else if (curPinArr.length >= maxCriticalPins) {
+            return {
+              success: false,
+              message: 'VALIDATION_ERROR: الحد الأقصى لتثبيت الحجوزات الحرجة هو ' + maxCriticalPins + ' حجوزات فقط — قم بإلغاء تثبيت حجز أولاً.',
+              data: null,
+              error: 'VALIDATION_ERROR'
+            };
+          } else {
+            nextPinArr = [pinResId].concat(curPinArr);
+          }
+        } else {
+          nextPinArr = curPinArr.filter(function (id) { return id !== pinResId; });
+        }
+        db.settings[pinSettingKey] = nextPinArr;
+        appendSandboxActivity(
+          db,
+          session.user,
+          shouldPinCrit ? 'تثبيت حجز حرج' : 'إلغاء تثبيت حجز حرج',
+          'Reservation',
+          rPinCrit.reservationNumber,
+          shouldPinCrit ? ('تثبيت (' + nextPinArr.length + '/' + maxCriticalPins + ')') : 'إلغاء التثبيت'
+        );
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: shouldPinCrit ? 'تم تثبيت الحجز في أعلى متابعاتي.' : 'تم إلغاء تثبيت الحجز.',
+          data: { pinnedCriticalIds: nextPinArr, isPinned: shouldPinCrit },
+          error: null
+        };
       }
 
       case 'addFollowUp': {
@@ -2731,6 +3272,7 @@
             );
           }
         });
+        dispatchSandboxMentionNotifications(db, session.user, [newFu.action, newFu.notes], 'Reservation', rFu.id, rFu.reservationNumber);
         saveSandboxDb(db);
         return { success: true, message: 'تم حفظ المتابعة بنجاح.', data: newFu, error: null };
       }
@@ -2769,16 +3311,26 @@
           }
         }
         appendSandboxActivity(db, session.user, 'تحديث متابعة', 'FollowUp', fuEdit.id, 'تعديل متابعة الحجز ' + fuEdit.reservationNumber);
+        dispatchSandboxMentionNotifications(db, session.user, [fuEdit.action, fuEdit.notes], 'Reservation', fuEdit.reservationId, fuEdit.reservationNumber);
         saveSandboxDb(db);
         return { success: true, message: 'تم تعديل المتابعة بنجاح.', data: fuEdit, error: null };
       }
 
       case 'getMyFollowUps': {
+        var myMentionFus = (core && core.filterMentionFollowUps)
+          ? core.filterMentionFollowUps(db.followUps, session.user, db.employees)
+          : [];
+        var rawUserPins = db.settings['pinned_res_u_' + session.employeeId];
+        var myPinnedIds = Array.isArray(rawUserPins)
+          ? rawUserPins.slice(0, (core && core.MAX_PINNED_CRITICAL_RESERVATIONS) || 3)
+          : [];
         return {
           success: true,
           message: '',
           data: {
             followUps: db.followUps.filter(function (f) { return f.employeeId === session.employeeId; }),
+            mentionFollowUps: myMentionFus,
+            pinnedCriticalIds: myPinnedIds,
             assignedReservations: db.reservations.filter(function (r) { return (r.assignedEmployeeIds || []).indexOf(session.employeeId) !== -1; })
           },
           error: null
@@ -2863,6 +3415,7 @@
             }
           });
         }
+        dispatchSandboxMentionNotifications(db, session.user, [desc], 'Problem', newProblem.id, newProblem.problemNumber);
         saveSandboxDb(db);
         return { success: true, message: 'تم تحويل الحجز إلى مشكلة.', data: newProblem, error: null };
       }
@@ -2923,6 +3476,30 @@
           });
           linkedRes.hasProblem = stillOpen;
         }
+        if (prb.status === 'تم الحل' && prevStatus !== 'تم الحل') {
+          var resolvedRecipients = {};
+          if (linkedRes && Array.isArray(linkedRes.assignedEmployeeIds)) {
+            linkedRes.assignedEmployeeIds.forEach(function (eid) { if (eid) resolvedRecipients[eid] = true; });
+          }
+          if (Array.isArray(prb.assignedEmployeeIds)) {
+            prb.assignedEmployeeIds.forEach(function (eid) { if (eid) resolvedRecipients[eid] = true; });
+          }
+          if (prb.createdById) resolvedRecipients[prb.createdById] = true;
+          delete resolvedRecipients[session.employeeId];
+          Object.keys(resolvedRecipients).forEach(function (targetEid) {
+            pushSandboxNotification(
+              db,
+              targetEid,
+              '',
+              'problem_resolved',
+              'تم حل مشكلة على حجز مسند إليك',
+              'تم تغيير حالة المشكلة ' + prb.problemNumber + ' (الحجز ' + (prb.reservationNumber || '-') + ') إلى "تم الحل" بواسطة ' + session.user.name + '.',
+              'Problem',
+              prb.id
+            );
+          });
+        }
+        dispatchSandboxMentionNotifications(db, session.user, [String(payload.note || ''), prb.description !== prevDesc ? prb.description : ''], 'Problem', prb.id, prb.problemNumber);
         saveSandboxDb(db);
         return {
           success: true,
@@ -2973,6 +3550,30 @@
       }
 
       case 'getEmployees': {
+        if (!core.canUserPerform(session.user, 'view_employees')) {
+          var dirRows = db.employees
+            .filter(function (e) { return e && String(e.status || 'active').toLowerCase() === 'active'; })
+            .map(function (e) {
+              return {
+                id: e.id,
+                name: e.name,
+                username: e.username,
+                role: e.role,
+                jobTitle: e.jobTitle,
+                status: e.status
+              };
+            });
+          return {
+            success: true,
+            message: '',
+            data: {
+              items: dirRows,
+              total: dirRows.length,
+              directoryOnly: true
+            },
+            error: null
+          };
+        }
         var empRows = db.employees.map(function (e) {
           var c = sanitizeEmp(e);
           c.reservationsCount = db.reservations.filter(function (r) { return (r.assignedEmployeeIds || []).indexOf(e.id) !== -1; }).length;
@@ -3609,6 +4210,7 @@
         if (!core.canAccessApi(session.user) || !core.canUserPerform(session.user, 'sync_data')) {
           return { success: false, message: 'FORBIDDEN: صلاحيات API مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
+        var syncIv = core.normalizeAutoSyncInterval(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
         return {
           success: true,
           message: '',
@@ -3616,7 +4218,8 @@
             hasToken: false,
             mode: 'sandbox',
             autoSyncEnabled: db.settings.auto_sync_enabled !== false,
-            autoSyncIntervalHours: Number(db.settings.auto_sync_interval_hours || 12),
+            autoSyncIntervalHours: syncIv.hours,
+            autoSyncIntervalMinutes: syncIv.minutes,
             lastSync: db.syncLog[0] || null,
             logs: db.syncLog
           },
@@ -3726,12 +4329,15 @@
         if (!core.canAccessApi(session.user)) {
           return { success: false, message: 'FORBIDDEN: إعدادات النظام وAPI مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
+        var getIv = core.normalizeAutoSyncInterval(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
         return {
           success: true,
           message: '',
           data: Object.assign({}, db.settings, {
+            ui_simplification: core.normalizeUiSimplificationSettings(db.settings.ui_simplification),
             auto_sync_enabled: db.settings.auto_sync_enabled !== false,
-            auto_sync_interval_hours: Number(db.settings.auto_sync_interval_hours || 12),
+            auto_sync_interval_hours: getIv.hours,
+            auto_sync_interval_minutes: getIv.minutes,
             hasRgToken: Boolean(db.settings.sandbox_has_rg_token)
           }),
           error: null
@@ -3748,9 +4354,16 @@
         if (typeof payload.allow_agent_view_all === 'boolean') db.settings.allow_agent_view_all = payload.allow_agent_view_all;
         if (payload.default_language) db.settings.default_language = payload.default_language;
         if (typeof payload.auto_sync_enabled === 'boolean') db.settings.auto_sync_enabled = payload.auto_sync_enabled;
-        if (payload.auto_sync_interval_hours !== undefined) {
-          var hVal = Math.max(1, Math.min(168, Math.round(Number(payload.auto_sync_interval_hours) || 12)));
-          db.settings.auto_sync_interval_hours = hVal;
+        if (payload.ui_simplification !== undefined) {
+          db.settings.ui_simplification = core.normalizeUiSimplificationSettings(payload.ui_simplification);
+        }
+        if (payload.auto_sync_interval_hours !== undefined || payload.auto_sync_interval_minutes !== undefined) {
+          var nextIv = core.normalizeAutoSyncInterval(
+            payload.auto_sync_interval_hours !== undefined ? payload.auto_sync_interval_hours : db.settings.auto_sync_interval_hours,
+            payload.auto_sync_interval_minutes !== undefined ? payload.auto_sync_interval_minutes : db.settings.auto_sync_interval_minutes
+          );
+          db.settings.auto_sync_interval_hours = nextIv.hours;
+          db.settings.auto_sync_interval_minutes = nextIv.minutes;
         }
         appendSandboxActivity(
           db,
@@ -3758,10 +4371,190 @@
           'تحديث الإعدادات',
           'Settings',
           'system',
-          'تحديث إعدادات النظام (التحديث التلقائي: ' + (db.settings.auto_sync_enabled ? ('كل ' + db.settings.auto_sync_interval_hours + ' ساعة') : 'متوقف') + ')'
+          'تحديث إعدادات النظام (التحديث التلقائي: ' + (db.settings.auto_sync_enabled ? core.formatAutoSyncIntervalAr(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes) : 'متوقف') + ')'
         );
         saveSandboxDb(db);
-        return { success: true, message: 'تم حفظ الإعدادات.', data: db.settings, error: null };
+        return {
+          success: true,
+          message: 'تم حفظ الإعدادات.',
+          data: Object.assign({}, db.settings, {
+            ui_simplification: core.normalizeUiSimplificationSettings(db.settings.ui_simplification)
+          }),
+          error: null
+        };
+      }
+
+      case 'saveUserLayoutPrefs': {
+        var normPrefs = (core && core.normalizeUserLayoutPrefs)
+          ? core.normalizeUserLayoutPrefs(payload)
+          : { navOrder: [], hiddenRoutes: [], dashOrder: [], dashHidden: [] };
+        db.settings['layout_prefs_u_' + session.employeeId] = normPrefs;
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: 'تم حفظ ترتيب وظهور الشاشات ولوحة التحكم.',
+          data: { layoutPrefs: normPrefs },
+          error: null
+        };
+      }
+
+      case 'previewDeleteReservations': {
+        if (!core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: صلاحية المدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var pScope = (core && core.normalizeDeleteReservationsScope)
+          ? core.normalizeDeleteReservationsScope(payload)
+          : { scope: 'all', year: '', month: '' };
+        var pTargets = (core && core.filterReservationsForDeleteScope)
+          ? core.filterReservationsForDeleteScope(db.reservations || [], pScope)
+          : (Array.isArray(db.reservations) ? db.reservations : []);
+        return {
+          success: true,
+          message: '',
+          data: {
+            count: pTargets.length,
+            totalReservations: Array.isArray(db.reservations) ? db.reservations.length : 0,
+            scope: pScope
+          },
+          error: null
+        };
+      }
+
+      case 'deleteAllReservations': {
+        if (!core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: صلاحية المدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var delCheck = core.validateDeleteAllReservationsConfirmation(payload);
+        if (!delCheck.valid) {
+          return { success: false, message: delCheck.message, data: null, error: 'VALIDATION_ERROR' };
+        }
+        var actorEmp = db.employees.find(function (e) { return e && e.id === session.employeeId; });
+        if (!actorEmp) {
+          return { success: false, message: 'UNAUTHORIZED: تعذر التحقق من حساب المستخدم الحالي.', data: null, error: 'UNAUTHORIZED' };
+        }
+        if (simpleHash(actorEmp.salt + ':' + String(payload.password || '')) !== actorEmp.passwordHash) {
+          return { success: false, message: 'كلمة المرور المدخلة غير صحيحة.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var delScope = delCheck.scope || (core && core.normalizeDeleteReservationsScope
+          ? core.normalizeDeleteReservationsScope(payload)
+          : { scope: 'all', year: '', month: '', ym: '', periodLabelAr: 'جميع الحجوزات' });
+        var allResList = Array.isArray(db.reservations) ? db.reservations : [];
+        var targets = (core && core.filterReservationsForDeleteScope)
+          ? core.filterReservationsForDeleteScope(allResList, delScope)
+          : allResList.slice();
+        var removedTotal = targets.length;
+        if (delScope.scope === 'all') {
+          db.reservations = [];
+          db.extensions = [];
+          db.assignments = [];
+          db.followUps = [];
+          db.followUpHistory = [];
+          if (Array.isArray(db.problems)) {
+            db.problems = db.problems.map(function (pr) {
+              return pr && pr.reservationId ? Object.assign({}, pr, { reservationId: '' }) : pr;
+            });
+          }
+        } else {
+          var targetIdMap = {};
+          targets.forEach(function (tr) { if (tr && tr.id) targetIdMap[tr.id] = true; });
+          db.reservations = allResList.filter(function (r) { return !r || !targetIdMap[r.id]; });
+          if (Array.isArray(db.extensions)) {
+            db.extensions = db.extensions.filter(function (x) { return !x || !targetIdMap[x.reservationId]; });
+          }
+          if (Array.isArray(db.assignments)) {
+            db.assignments = db.assignments.filter(function (x) { return !x || !targetIdMap[x.reservationId]; });
+          }
+          if (Array.isArray(db.followUps)) {
+            db.followUps = db.followUps.filter(function (x) { return !x || !targetIdMap[x.reservationId]; });
+          }
+          if (Array.isArray(db.followUpHistory)) {
+            db.followUpHistory = db.followUpHistory.filter(function (x) { return !x || !targetIdMap[x.reservationId]; });
+          }
+          if (Array.isArray(db.problems)) {
+            db.problems = db.problems.map(function (pr) {
+              return (pr && pr.reservationId && targetIdMap[pr.reservationId])
+                ? Object.assign({}, pr, { reservationId: '' })
+                : pr;
+            });
+          }
+        }
+        db._schemaV3ExactRg = true;
+        var scopeText = delScope.periodLabelAr || (delScope.scope === 'month'
+          ? ('شهر ' + (delScope.ym || delScope.month))
+          : (delScope.scope === 'year' ? ('سنة ' + delScope.year) : 'جميع الحجوزات'));
+        appendSandboxActivity(
+          db,
+          session.user,
+          'حذف حجوزات (' + scopeText + ')',
+          'Reservation',
+          delScope.scope === 'all' ? 'ALL' : (delScope.ym || delScope.year || 'SCOPE'),
+          'حذف ' + removedTotal + ' حجز (' + scopeText + ') مع تصدير Excel بواسطة ' + session.user.name
+        );
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: 'تم حذف ' + removedTotal + ' حجز (' + scopeText + ') بنجاح.',
+          data: {
+            deleted: true,
+            deletedReservationsCount: removedTotal,
+            scope: delScope,
+            exportedRows: targets
+          },
+          error: null
+        };
+      }
+
+      case 'importReservationsFromExcel': {
+        if (!core.canUserPerform(session.user, 'pull_reservations') && !core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: لا تملك صلاحية استيراد الحجوزات.', data: null, error: 'FORBIDDEN' };
+        }
+        var rawImportRows = Array.isArray(payload && payload.rows) ? payload.rows : [];
+        if (!rawImportRows.length) {
+          return { success: false, message: 'ملف Excel فارغ أو لا يحتوي على صفوف بيانات.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var parsedImport = core.parseImportedReservationRows(rawImportRows, db.reservations || [], session.user);
+        if (!parsedImport.validRows.length) {
+          return { success: false, message: 'لا توجد صفوف صالحة للاستيراد في ملف Excel.', data: { errors: parsedImport.errors }, error: 'VALIDATION_ERROR' };
+        }
+        var existingByNum = {};
+        if (!Array.isArray(db.reservations)) db.reservations = [];
+        db.reservations.forEach(function (r, idx) {
+          if (r && r.reservationNumber) {
+            existingByNum[String(r.reservationNumber).trim().toLowerCase()] = idx;
+          }
+        });
+        parsedImport.validRows.forEach(function (rec) {
+          var cleanRec = Object.assign({}, rec);
+          delete cleanRec._isUpdate;
+          var key = String(cleanRec.reservationNumber || '').trim().toLowerCase();
+          if (key && existingByNum[key] !== undefined) {
+            db.reservations[existingByNum[key]] = Object.assign({}, db.reservations[existingByNum[key]], cleanRec);
+          } else {
+            existingByNum[key] = db.reservations.length;
+            db.reservations.unshift(cleanRec);
+          }
+        });
+        appendSandboxActivity(
+          db,
+          session.user,
+          'استيراد حجوزات من Excel',
+          'Reservation',
+          'EXCEL_IMPORT',
+          'استيراد ' + parsedImport.newCount + ' حجز جديد وتحديث ' + parsedImport.updateCount + ' حجز بواسطة ' + session.user.name
+        );
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: 'تم استيراد ' + parsedImport.newCount + ' حجز جديد وتحديث ' + parsedImport.updateCount + ' حجز من ملف Excel.',
+          data: {
+            importedCount: parsedImport.newCount,
+            updatedCount: parsedImport.updateCount,
+            skippedRows: parsedImport.skippedRows,
+            totalProcessed: parsedImport.validRows.length,
+            errors: parsedImport.errors
+          },
+          error: null
+        };
       }
 
       default:
@@ -3804,9 +4597,6 @@
         allowAgentViewAll: !(localMetaByNs[ns] && localMetaByNs[ns].allowAgentViewAll === false)
       } : null);
       if (fastLocalRes) {
-        if (fastLocalRes.isStale && transportUrl && !inFlightWarm[ns]) {
-          warmLocalReservationsCache().catch(function () {});
-        }
         return fastLocalRes.response;
       }
     }
@@ -4022,8 +4812,6 @@
                 if (root.RGIdbCache) root.RGIdbCache.upsertReservationDetail(ns, localDetailsByNs[ns][cr.id]).catch(function () {});
               }
             });
-          } else if (transportUrl) {
-            warmLocalReservationsCache({ force: true }).catch(function () {});
           }
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
         } else if (action === 'quickUpdateReservationStatus' && parsed.data && parsed.data.reservation) {
@@ -4040,7 +4828,10 @@
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
-        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem' || action === 'deleteEmployee' || action === 'createEmployee' || action === 'updateEmployee' || action === 'disableEmployee')) {
+        } else if (action === 'deleteAllReservations' || action === 'importReservationsFromExcel') {
+          clearCache(['*']);
+          if (!transportUrl) syncSandboxSnapshotToIdb(ns);
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem' || action === 'deleteEmployee' || action === 'createEmployee' || action === 'updateEmployee' || action === 'disableEmployee')) {
           syncSandboxSnapshotToIdb(ns);
         }
 

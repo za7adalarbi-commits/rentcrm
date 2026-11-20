@@ -24,20 +24,60 @@
     return Promise.resolve().then(fn);
   }
 
-  async function render(container, ctx) {
-    var t = ctx.t;
-    var user = root.RGAuth.getUser();
-    var canManage = root.RGCrmCore.canUserPerform(user, 'manage_employees');
+  var activeEmployeeManagerUnsubscribe = null;
 
-    var res = await root.RGApi.callApi('getEmployees', {});
-    if (!res.success) {
-      container.innerHTML = '<div class="form-error">' + esc(res.message) + '</div>';
-      return;
+  function EmployeeManager(options) {
+    this.opts = options || {};
+    this.container = this.opts.container;
+    this.ctx = this.opts.ctx || {};
+    this.appStore = this.opts.appState || (this.ctx && this.ctx.appState) || root.RGApp || null;
+    this.unsubscribe = null;
+  }
+
+  EmployeeManager.prototype.mount = function () {
+    var self = this;
+    if (typeof activeEmployeeManagerUnsubscribe === 'function') {
+      try { activeEmployeeManagerUnsubscribe(); } catch (e) {}
+      activeEmployeeManagerUnsubscribe = null;
     }
+    this.renderFromState();
+    if (this.appStore && typeof this.appStore.subscribeEmployees === 'function') {
+      this.unsubscribe = this.appStore.subscribeEmployees(function () {
+        if (!self.container || self.container.isConnected === false) {
+          self.destroy();
+          return;
+        }
+        self.renderFromState();
+      });
+      activeEmployeeManagerUnsubscribe = this.unsubscribe;
+    }
+    return this;
+  };
 
-    var items = res.data.items || [];
-    var rolePresets = root.RGCrmCore.normalizeRolePresets(res.data.rolePresets);
-    var customPermissions = Array.isArray(res.data.customPermissions) ? res.data.customPermissions : [];
+  EmployeeManager.prototype.destroy = function () {
+    if (typeof this.unsubscribe === 'function') {
+      try { this.unsubscribe(); } catch (e) {}
+      this.unsubscribe = null;
+    }
+  };
+
+  EmployeeManager.prototype.renderFromState = function () {
+    var self = this;
+    var container = this.container;
+    if (!container) return;
+
+    var ctx = this.ctx;
+    var t = ctx.t || function (k) { return k; };
+    var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var canManage = Boolean(user && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'manage_employees'));
+
+    var empState = (this.appStore && typeof this.appStore.getEmployeesState === 'function')
+      ? this.appStore.getEmployeesState()
+      : (this.opts.initialState || { items: [], rolePresets: [], customPermissions: [] });
+
+    var items = Array.isArray(empState.items) ? empState.items : [];
+    var rolePresets = root.RGCrmCore.normalizeRolePresets(empState.rolePresets || []);
+    var customPermissions = Array.isArray(empState.customPermissions) ? empState.customPermissions : [];
     var catalog = root.RGCrmCore.mergePermissionsCatalog(customPermissions);
     var catalogMap = {};
     catalog.forEach(function (c) { catalogMap[c.key] = c; });
@@ -45,19 +85,19 @@
     var roleLabels = root.RGCrmCore.ROLE_LABELS[ctx.lang] || root.RGCrmCore.ROLE_LABELS.ar;
 
     var presetsSectionHtml = canManage ? (
-      '<div class="surface-card" id="role-presets-section">' +
+      '<section class="surface-card" id="role-presets-section">' +
         '<div class="section-header">' +
           '<div>' +
             '<h2 class="section-title">إدارة الصلاحيات الجاهزة (القوالب الوظيفية)</h2>' +
-            '<p class="section-subtitle">أضف قوالب صلاحيات جاهزة، عدّل أسماءها وصلاحياتها، أو عدّل وأضف مسميات الصلاحيات الفردية (<strong class="tabular-nums">' + rolePresets.length + '</strong> قوالب نشطة)</p>' +
+            '<p class="section-subtitle">أضف قوالب صلاحيات جاهزة، عدّل أسماءها وصلاحياتها، أو عدّل وأضف مسميات الصلاحيات الفردية (<strong class="tabular-nums" style="color:var(--text-primary);">' + rolePresets.length + '</strong> قوالب نشطة)</p>' +
           '</div>' +
-          '<div class="toolbar-row" style="margin-bottom:0;">' +
+          '<div class="toolbar-actions">' +
             '<button type="button" class="btn btn-primary" id="preset-add-btn">+ إضافة صلاحية جاهزة</button>' +
             '<button type="button" class="btn" id="perms-catalog-btn">إدارة وتعديل الصلاحيات الفردية</button>' +
             '<button type="button" class="btn btn-sm" id="preset-reset-btn" data-confirm="0">استعادة الافتراضي</button>' +
           '</div>' +
         '</div>' +
-        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px;">' +
+        '<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">' +
           rolePresets.map(function (pr) {
             var permKeys = Array.isArray(pr.permissions) ? pr.permissions : [];
             var previewLabels = permKeys.slice(0, 4).map(function (k) {
@@ -68,23 +108,23 @@
               ? 'status-danger'
               : (pr.role === 'supervisor' ? 'status-warning' : 'status-info');
 
-            return '<div class="surface-card" style="padding:14px;background:var(--bg-surface-subtle);display:flex;flex-direction:column;justify-content:space-between;gap:10px;" data-preset-card="' + esc(pr.id) + '">' +
-              '<div style="display:flex;flex-direction:column;gap:6px;">' +
-                '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
-                  '<strong style="font-size:14px;line-height:1.4;">' + esc(pr.label) + '</strong>' +
+            return '<div class="glass-subcard p-3.5 flex flex-col justify-between gap-2.5 transition-all hover:-translate-y-0.5" data-preset-card="' + esc(pr.id) + '">' +
+              '<div class="flex flex-col gap-1.5">' +
+                '<div class="flex items-start justify-between gap-2">' +
+                  '<strong class="text-sm leading-snug" style="color:var(--text-primary);">' + esc(pr.label) + '</strong>' +
                   '<span class="status-tag ' + roleTagClass + '">' + esc(roleLabels[pr.role] || pr.role) + '</span>' +
                 '</div>' +
-                '<div class="meta-inline">' +
-                  '<span>المسمى: <strong>' + esc(pr.jobTitle) + '</strong></span>' +
+                '<div class="flex items-center gap-1.5 text-xs" style="color:var(--text-muted);">' +
+                  '<span>المسمى: <strong style="color:var(--text-primary);">' + esc(pr.jobTitle) + '</strong></span>' +
                   '<span>·</span>' +
                   '<span class="tabular-nums">' + permKeys.length + ' صلاحية</span>' +
                 '</div>' +
-                '<div style="font-size:12px;color:var(--text-secondary);line-height:1.6;">' +
+                '<div class="text-xs leading-relaxed" style="color:var(--text-secondary);">' +
                   (previewLabels.length ? esc(previewLabels.join(' · ')) : 'لا توجد صلاحيات محددة') +
                   (extraCount > 0 ? ' <strong style="color:var(--brand-primary);">+' + extraCount + ' أخرى</strong>' : '') +
                 '</div>' +
               '</div>' +
-              '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--border-hairline);">' +
+              '<div class="flex items-center gap-1.5 flex-wrap pt-2 border-t" style="border-color:var(--border-hairline);">' +
                 '<button type="button" class="btn btn-sm preset-edit-btn" data-id="' + esc(pr.id) + '">تعديل الاسم والصلاحيات</button>' +
                 '<button type="button" class="btn btn-sm btn-primary preset-use-btn" data-id="' + esc(pr.id) + '">تعيين لموظف</button>' +
                 '<button type="button" class="btn btn-sm btn-danger preset-del-btn" data-id="' + esc(pr.id) + '" data-confirm="0">حذف</button>' +
@@ -92,67 +132,122 @@
             '</div>';
           }).join('') +
         '</div>' +
-      '</div>'
+      '</section>'
     ) : '';
 
-    container.innerHTML =
-      '<div class="surface-card">' +
-        '<div class="section-header">' +
-          '<div><h2 class="section-title">' + t('nav_employees') + '</h2><p class="section-subtitle">إجمالي الموظفين: <strong class="tabular-nums">' + items.length + '</strong></p></div>' +
-          (canManage ? (
-            '<div class="toolbar-row" style="margin-bottom:0;">' +
-              '<button type="button" class="btn" id="emp-scroll-presets-btn">الصلاحيات الجاهزة (' + rolePresets.length + ')</button>' +
-              '<button type="button" class="btn btn-primary" id="emp-add-btn">إضافة موظف جديد</button>' +
-            '</div>'
-          ) : '') +
-        '</div>' +
-        '<div class="table-wrap"><table class="data-table"><thead><tr>' +
-          '<th>الموظف والنشاط</th><th>المستخدم</th><th>الوظيفة</th><th>الدور والصلاحيات</th><th>الحالة</th><th>حجوزات</th><th>متابعات</th><th>مشكلات</th><th>آخر نشاط</th><th>العملاء</th>' +
-          (canManage ? '<th>الإجراءات</th>' : '') +
-        '</tr></thead><tbody>' +
-          items.map(function (e) {
-            var isActive = e.status === 'active';
-            var isSelf = user && e.id === user.id;
-            var permsList = root.RGCrmCore.resolveEffectivePermissions(e);
-            return '<tr>' +
-              '<td>' +
-                '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
-                  '<button type="button" class="btn-link-inline emp-view-btn" data-id="' + esc(e.id) + '">' + esc(e.name) + '</button>' +
-                  (canManage && !isSelf ? (
-                    '<button type="button" class="btn btn-sm ' + (isActive ? 'btn-danger' : '') + ' emp-toggle-btn" data-id="' + esc(e.id) + '" data-next="' + (isActive ? 'disabled' : 'active') + '" title="' + (isActive ? 'إيقاف نشاط الموظف فوراً' : 'تشغيل نشاط الموظف') + '">' +
-                      (isActive ? 'إيقاف النشاط' : 'تشغيل النشاط') +
-                    '</button>'
-                  ) : '') +
+    var stateErrorHtml = empState.error
+      ? '<div class="form-error mb-3" role="alert">' + esc(empState.error) + '</div>'
+      : '';
+
+    var rowsHtml = (empState.loading && items.length === 0)
+      ? '<tr><td colspan="' + (canManage ? 11 : 10) + '" class="px-4 py-8 text-center text-sm" style="color:var(--text-muted);">جاري تحميل بيانات الموظفين...</td></tr>'
+      : (items.length === 0
+        ? '<tr><td colspan="' + (canManage ? 11 : 10) + '" class="px-4 py-8 text-center text-sm" style="color:var(--text-muted);">لا يوجد موظفون مسجلون حاليًا.</td></tr>'
+        : items.map(function (e) {
+          var isActive = e.status === 'active';
+          var isSelf = Boolean(user && e.id === user.id);
+          var permsList = root.RGCrmCore.resolveEffectivePermissions(e);
+          var initialChar = String(e.name || 'م').trim().charAt(0) || 'م';
+          var resCnt = e.reservationsCount !== undefined ? e.reservationsCount : ((e.stats && e.stats.assignedCount) || 0);
+          var fuCnt = e.followUpsCount !== undefined ? e.followUpsCount : ((e.stats && e.stats.followUpsCount) || 0);
+          var prbCnt = e.problemsCount !== undefined ? e.problemsCount : ((e.stats && e.stats.openProblemsCount) || 0);
+          var lastActText = e.lastActivity
+            ? esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16)))
+            : '-';
+
+          return '<tr data-emp-row="' + esc(e.id) + '">' +
+            '<td>' +
+              '<div class="flex items-center gap-2 flex-wrap">' +
+                '<span class="inline-flex items-center justify-center w-7 h-7 rounded-lg font-bold text-xs shrink-0" style="background:var(--brand-soft);color:var(--brand-primary);border:1px solid rgba(217,31,43,0.26);">' + esc(initialChar) + '</span>' +
+                '<button type="button" class="btn-link-inline emp-view-btn" data-id="' + esc(e.id) + '">' + esc(e.name) + '</button>' +
+                (isSelf ? '<span class="status-tag status-neutral">أنت</span>' : '') +
+                (canManage && !isSelf ? (
+                  '<button type="button" class="btn btn-sm btn-danger emp-del-btn" data-id="' + esc(e.id) + '" data-name="' + esc(e.name) + '" data-confirm="0" aria-label="حذف الموظف ' + esc(e.name) + '">حذف</button>'
+                ) : '') +
+              '</div>' +
+              (e.phone ? '<div class="text-[11px] mt-1 font-mono cell-phone" style="color:var(--text-muted);" dir="ltr">' + esc(e.phone) + '</div>' : '') +
+            '</td>' +
+            '<td class="mono text-xs" style="color:var(--text-secondary);" dir="ltr">' + esc(e.username) + '</td>' +
+            '<td class="text-xs" style="color:var(--text-primary);">' + esc(e.jobTitle) + '</td>' +
+            '<td>' +
+              '<div class="text-xs font-semibold" style="color:var(--text-primary);">' + esc(roleLabels[e.role] || e.role) + '</div>' +
+              '<div class="text-[11px] tabular-nums" style="color:var(--text-muted);">' + permsList.length + ' صلاحية</div>' +
+            '</td>' +
+            '<td>' +
+              '<div class="flex items-center gap-1.5 flex-wrap">' +
+                '<span class="status-tag emp-status-tag ' + (isActive ? 'status-success' : 'status-danger') + '">' +
+                  (isActive ? 'نشط' : 'متوقف عن النشاط') +
+                '</span>' +
+                (canManage && !isSelf ? (
+                  '<button type="button" class="btn btn-sm emp-toggle-btn ' + (isActive ? 'btn-danger' : 'btn-primary') + '" data-id="' + esc(e.id) + '" data-next="' + (isActive ? 'disabled' : 'active') + '" title="' + (isActive ? 'إيقاف نشاط الموظف فوراً' : 'تشغيل نشاط الموظف') + '">' +
+                    (isActive ? 'إيقاف' : 'تفعيل') +
+                  '</button>'
+                ) : '') +
+              '</div>' +
+            '</td>' +
+            '<td class="tabular-nums text-xs font-semibold">' + resCnt + '</td>' +
+            '<td class="tabular-nums text-xs font-semibold">' + fuCnt + '</td>' +
+            '<td class="tabular-nums text-xs font-semibold">' + prbCnt + '</td>' +
+            '<td class="mono tabular-nums text-xs whitespace-nowrap" style="color:var(--text-muted);">' + lastActText + '</td>' +
+            '<td><button type="button" class="btn btn-sm btn-primary emp-view-btn" data-id="' + esc(e.id) + '">العملاء</button></td>' +
+            (canManage ? (
+              '<td class="whitespace-nowrap">' +
+                '<div class="flex items-center gap-1.5">' +
+                  '<button type="button" class="btn btn-sm emp-edit-btn" data-id="' + esc(e.id) + '" aria-label="تعديل بيانات ' + esc(e.name) + '">تعديل</button>' +
                 '</div>' +
-                '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;" class="mono cell-phone" dir="ltr">' + esc(e.phone || '') + '</div>' +
-              '</td>' +
-              '<td class="mono">' + esc(e.username) + '</td>' +
-              '<td>' + esc(e.jobTitle) + '</td>' +
-              '<td>' +
-                '<div>' + esc(roleLabels[e.role] || e.role) + '</div>' +
-                '<div style="font-size:11px;color:var(--text-muted);" class="tabular-nums">' + permsList.length + ' صلاحية</div>' +
-              '</td>' +
-              '<td><span class="status-tag emp-status-tag ' + (isActive ? 'status-success' : 'status-danger') + '">' + (isActive ? 'نشط' : 'متوقف عن النشاط') + '</span></td>' +
-              '<td class="tabular-nums">' + (e.reservationsCount !== undefined ? e.reservationsCount : ((e.stats && e.stats.assignedCount) || 0)) + '</td>' +
-              '<td class="tabular-nums">' + (e.followUpsCount !== undefined ? e.followUpsCount : ((e.stats && e.stats.followUpsCount) || 0)) + '</td>' +
-              '<td class="tabular-nums">' + (e.problemsCount !== undefined ? e.problemsCount : ((e.stats && e.stats.openProblemsCount) || 0)) + '</td>' +
-              '<td class="mono tabular-nums" style="white-space:nowrap;">' + (e.lastActivity ? esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16))) : '-') + '</td>' +
-              '<td><button type="button" class="btn btn-sm btn-primary emp-view-btn" data-id="' + esc(e.id) + '">العملاء</button></td>' +
-              (canManage ? (
-                '<td style="white-space:nowrap;">' +
-                  '<div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
-                    '<button type="button" class="btn btn-sm emp-edit-btn" data-id="' + esc(e.id) + '" aria-label="تعديل بيانات ' + esc(e.name) + '">تعديل</button>' +
-                    (!isSelf ? (
-                      '<button type="button" class="btn btn-sm btn-danger emp-del-btn" data-id="' + esc(e.id) + '" data-name="' + esc(e.name) + '" data-confirm="0" aria-label="حذف الموظف ' + esc(e.name) + '">حذف</button>'
-                    ) : '') +
-                  '</div>' +
-                '</td>'
-              ) : '') +
-            '</tr>';
-          }).join('') +
-        '</tbody></table></div>' +
-      '</div>' +
-      presetsSectionHtml;
+              '</td>'
+            ) : '') +
+          '</tr>';
+        }).join(''));
+
+    container.innerHTML =
+      '<div class="flex flex-col gap-5" data-component="EmployeeManager">' +
+        '<section class="surface-card" id="employee-manager-card">' +
+          '<div class="section-header">' +
+            '<div>' +
+              '<h2 class="section-title">' + t('nav_employees') + '</h2>' +
+              '<p class="section-subtitle">إجمالي الموظفين الحاليين: <strong class="tabular-nums" style="color:var(--text-primary);" id="emp-total-count">' + items.length + '</strong> · تحديث لحظي مباشر مع نظام الحالة</p>' +
+            '</div>' +
+            (canManage ? (
+              '<div class="toolbar-actions">' +
+                '<button type="button" class="btn" id="emp-scroll-presets-btn">الصلاحيات الجاهزة (' + rolePresets.length + ')</button>' +
+                '<button type="button" class="btn btn-primary" id="emp-add-btn">إضافة موظف جديد</button>' +
+              '</div>'
+            ) : '') +
+          '</div>' +
+          stateErrorHtml +
+          '<div class="table-wrap">' +
+            '<table class="data-table" id="employee-manager-table">' +
+              '<thead>' +
+                '<tr>' +
+                  '<th>الموظف والنشاط</th>' +
+                  '<th>المستخدم</th>' +
+                  '<th>الوظيفة</th>' +
+                  '<th>الدور والصلاحيات</th>' +
+                  '<th>الحالة</th>' +
+                  '<th>حجوزات</th>' +
+                  '<th>متابعات</th>' +
+                  '<th>مشكلات</th>' +
+                  '<th>آخر نشاط</th>' +
+                  '<th>العملاء</th>' +
+                  (canManage ? '<th>الإجراءات</th>' : '') +
+                '</tr>' +
+              '</thead>' +
+              '<tbody>' +
+                rowsHtml +
+              '</tbody>' +
+            '</table>' +
+          '</div>' +
+        '</section>' +
+        presetsSectionHtml +
+      '</div>';
+
+    function reloadEmployeesFromServer() {
+      if (self.appStore && typeof self.appStore.loadEmployeesState === 'function') {
+        return self.appStore.loadEmployeesState({});
+      }
+      return render(container, ctx);
+    }
 
     var scrollPresetsBtn = document.getElementById('emp-scroll-presets-btn');
     if (scrollPresetsBtn) {
@@ -165,7 +260,7 @@
     var addBtn = document.getElementById('emp-add-btn');
     if (addBtn) {
       addBtn.addEventListener('click', function () {
-        openEmployeeModal(null, ctx, function () { render(container, ctx); }, {
+        openEmployeeModal(null, ctx, reloadEmployeesFromServer, {
           rolePresets: rolePresets,
           customPermissions: customPermissions
         });
@@ -174,9 +269,7 @@
 
     container.querySelectorAll('.emp-view-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        openEmployeeDetailsDrawer(btn.getAttribute('data-id'), ctx, items, function () {
-          render(container, ctx);
-        });
+        openEmployeeDetailsDrawer(btn.getAttribute('data-id'), ctx, items, reloadEmployeesFromServer);
       });
     });
 
@@ -184,7 +277,7 @@
       btn.addEventListener('click', function () {
         var emp = items.find(function (x) { return x.id === btn.getAttribute('data-id'); });
         if (emp) {
-          openEmployeeModal(emp, ctx, function () { render(container, ctx); }, {
+          openEmployeeModal(emp, ctx, reloadEmployeesFromServer, {
             rolePresets: rolePresets,
             customPermissions: customPermissions
           });
@@ -196,60 +289,14 @@
       btn.addEventListener('click', function () {
         var empId = btn.getAttribute('data-id');
         var nextStatus = btn.getAttribute('data-next');
-        var isNowActive = nextStatus === 'active';
-        runWithLock(btn, 'disableEmployee:' + empId, function () {
-          var row = btn.closest('tr');
-          var statusTag = row ? row.querySelector('.emp-status-tag') : null;
-          var prevBtnText = btn.textContent;
-          var prevNext = nextStatus;
-          var prevBtnDanger = btn.classList.contains('btn-danger');
-          var prevTagText = statusTag ? statusTag.textContent : '';
-          var prevTagCls = statusTag ? statusTag.className : '';
-
-          btn.setAttribute('data-next', isNowActive ? 'disabled' : 'active');
-          btn.textContent = isNowActive ? 'إيقاف النشاط' : 'تشغيل النشاط';
-          btn.classList.toggle('btn-danger', isNowActive);
-          if (statusTag) {
-            statusTag.className = 'status-tag emp-status-tag ' + (isNowActive ? 'status-success' : 'status-danger');
-            statusTag.textContent = isNowActive ? 'نشط' : 'متوقف عن النشاط';
-          }
-          if (root.RGApi.applyOptimisticMutation) {
-            root.RGApi.applyOptimisticMutation('disableEmployee', {
-              employeeId: empId,
-              status: nextStatus
-            }, user);
-          }
+        runWithLock(btn, 'disableEmployee:' + empId, async function () {
           ctx.toast(nextStatus === 'disabled' ? 'تم إيقاف نشاط الموظف وإلغاء جلساته.' : 'تم تشغيل نشاط الموظف بنجاح.');
-
-          return root.RGApi.callApi('disableEmployee', {
-            employeeId: empId,
-            status: nextStatus,
-            _keepOptimisticCache: true
-          }).then(function (resToggle) {
-            if (!resToggle || !resToggle.success) {
-              if (btn.isConnected !== false) {
-                btn.setAttribute('data-next', prevNext);
-                btn.textContent = prevBtnText;
-                btn.classList.toggle('btn-danger', prevBtnDanger);
-              }
-              if (statusTag && statusTag.isConnected !== false) {
-                statusTag.className = prevTagCls;
-                statusTag.textContent = prevTagText;
-              }
-              ctx.toast((resToggle && resToggle.message) || 'تعذر تحديث حالة الموظف.', true);
-            }
-          }).catch(function () {
-            if (btn.isConnected !== false) {
-              btn.setAttribute('data-next', prevNext);
-              btn.textContent = prevBtnText;
-              btn.classList.toggle('btn-danger', prevBtnDanger);
-            }
-            if (statusTag && statusTag.isConnected !== false) {
-              statusTag.className = prevTagCls;
-              statusTag.textContent = prevTagText;
-            }
-            ctx.toast('تعذر الاتصال بالخادم أثناء تحديث حالة الموظف.', true);
-          });
+          var resToggle = (self.appStore && typeof self.appStore.toggleEmployeeStatusInState === 'function')
+            ? await self.appStore.toggleEmployeeStatusInState(empId, nextStatus, user)
+            : await root.RGApi.callApi('disableEmployee', { employeeId: empId, status: nextStatus });
+          if (!resToggle || !resToggle.success) {
+            ctx.toast((resToggle && resToggle.message) || 'تعذر تحديث حالة الموظف.', true);
+          }
         });
       });
     });
@@ -270,17 +317,19 @@
         var empId = btn.getAttribute('data-id');
         var empName = btn.getAttribute('data-name') || '';
         runWithLock(btn, 'deleteEmployee:' + empId, async function () {
-          var prevText = btn.textContent;
-          btn.textContent = 'جاري الحذف...';
-          var delResp = await root.RGApi.callApi('deleteEmployee', { employeeId: empId });
+          var delResp = (self.appStore && typeof self.appStore.deleteEmployeeFromState === 'function')
+            ? await self.appStore.deleteEmployeeFromState(empId, user)
+            : await root.RGApi.callApi('deleteEmployee', { employeeId: empId });
           if (delResp && delResp.success) {
             ctx.toast(delResp.message || ('تم حذف الموظف ' + empName + ' بنجاح.'));
-            render(container, ctx);
+            if (!self.appStore || typeof self.appStore.deleteEmployeeFromState !== 'function') {
+              render(container, ctx);
+            }
           } else {
             ctx.toast((delResp && delResp.message) || 'تعذر حذف الموظف.', true);
             if (btn.isConnected !== false) {
               btn.setAttribute('data-confirm', '0');
-              btn.textContent = prevText === 'جاري الحذف...' ? 'حذف' : prevText;
+              btn.textContent = 'حذف';
             }
           }
         });
@@ -288,52 +337,60 @@
     });
 
     if (canManage) {
-      document.getElementById('preset-add-btn').addEventListener('click', function () {
-        openRolePresetModal(null, customPermissions, ctx, function () { render(container, ctx); });
-      });
+      var presetAddBtn = document.getElementById('preset-add-btn');
+      if (presetAddBtn) {
+        presetAddBtn.addEventListener('click', function () {
+          openRolePresetModal(null, customPermissions, ctx, reloadEmployeesFromServer);
+        });
+      }
 
-      document.getElementById('perms-catalog-btn').addEventListener('click', function () {
-        openPermissionsCatalogModal(customPermissions, ctx, function () { render(container, ctx); });
-      });
+      var permsCatBtn = document.getElementById('perms-catalog-btn');
+      if (permsCatBtn) {
+        permsCatBtn.addEventListener('click', function () {
+          openPermissionsCatalogModal(customPermissions, ctx, reloadEmployeesFromServer);
+        });
+      }
 
       var resetBtn = document.getElementById('preset-reset-btn');
-      resetBtn.addEventListener('click', function () {
-        if (resetBtn.getAttribute('data-confirm') !== '1') {
-          resetBtn.setAttribute('data-confirm', '1');
-          resetBtn.textContent = 'تأكيد استعادة الافتراضي؟';
-          resetBtn.classList.add('btn-danger');
-          setTimeout(function () {
-            if (document.body.contains(resetBtn)) {
-              resetBtn.setAttribute('data-confirm', '0');
-              resetBtn.textContent = 'استعادة الافتراضي';
-              resetBtn.classList.remove('btn-danger');
-            }
-          }, 3500);
-          return;
-        }
-        runWithLock(resetBtn, 'resetRolePresets', async function () {
-          var resp = await root.RGApi.callApi('resetRolePresets', {});
-          if (resp.success) {
-            ctx.toast(resp.message || 'تمت استعادة القوالب الافتراضية.');
-            render(container, ctx);
-          } else {
-            ctx.toast(resp.message, true);
+      if (resetBtn) {
+        resetBtn.addEventListener('click', function () {
+          if (resetBtn.getAttribute('data-confirm') !== '1') {
+            resetBtn.setAttribute('data-confirm', '1');
+            resetBtn.textContent = 'تأكيد استعادة الافتراضي؟';
+            resetBtn.classList.add('btn-danger');
+            setTimeout(function () {
+              if (document.body.contains(resetBtn)) {
+                resetBtn.setAttribute('data-confirm', '0');
+                resetBtn.textContent = 'استعادة الافتراضي';
+                resetBtn.classList.remove('btn-danger');
+              }
+            }, 3500);
+            return;
           }
+          runWithLock(resetBtn, 'resetRolePresets', async function () {
+            var resp = await root.RGApi.callApi('resetRolePresets', {});
+            if (resp.success) {
+              ctx.toast(resp.message || 'تمت استعادة القوالب الافتراضية.');
+              await reloadEmployeesFromServer();
+            } else {
+              ctx.toast(resp.message, true);
+            }
+          });
         });
-      });
+      }
 
       container.querySelectorAll('.preset-edit-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var found = rolePresets.find(function (p) { return p.id === btn.getAttribute('data-id'); });
           if (found) {
-            openRolePresetModal(found, customPermissions, ctx, function () { render(container, ctx); });
+            openRolePresetModal(found, customPermissions, ctx, reloadEmployeesFromServer);
           }
         });
       });
 
       container.querySelectorAll('.preset-use-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
-          openEmployeeModal(null, ctx, function () { render(container, ctx); }, {
+          openEmployeeModal(null, ctx, reloadEmployeesFromServer, {
             rolePresets: rolePresets,
             customPermissions: customPermissions,
             initialPresetId: btn.getAttribute('data-id')
@@ -359,7 +416,7 @@
             var delResp = await root.RGApi.callApi('deleteRolePreset', { presetId: pId });
             if (delResp.success) {
               ctx.toast(delResp.message || 'تم حذف الصلاحية الجاهزة.');
-              render(container, ctx);
+              await reloadEmployeesFromServer();
             } else {
               ctx.toast(delResp.message, true);
               btn.setAttribute('data-confirm', '0');
@@ -369,7 +426,30 @@
         });
       });
     }
+  };
+
+  async function render(container, ctx) {
+    var appStore = (ctx && ctx.appState) || root.RGApp || null;
+    var res = await root.RGApi.callApi('getEmployees', {});
+    if (!res.success) {
+      container.innerHTML = '<div class="form-error">' + esc(res.message) + '</div>';
+      return;
+    }
+
+    if (appStore && typeof appStore.syncEmployeesStateFromPayload === 'function') {
+      appStore.syncEmployeesStateFromPayload(res.data || {});
+    }
+
+    var manager = new EmployeeManager({
+      container: container,
+      ctx: ctx,
+      appState: appStore,
+      initialState: res.data || {}
+    });
+    manager.mount();
   }
+
+
 
   function openRolePresetModal(existingPreset, customPermissions, ctx, onSaved) {
     var modalRoot = document.getElementById('modal-root');
@@ -435,12 +515,24 @@
     function renderGrid() {
       var roleVal = roleSelect.value;
       var isAgent = roleVal === 'agent';
+      var dashKeys = (root.RGCrmCore && root.RGCrmCore.DASHBOARD_PERMISSION_KEYS) || [];
       catalog = root.RGCrmCore.mergePermissionsCatalog(liveCustomPerms);
       groups = groupCatalogItems(catalog);
       permsGrid.innerHTML = groups.map(function (g) {
         var groupItems = catalog.filter(function (c) { return c.group === g; });
+        var selectableItems = groupItems.filter(function (item) {
+          return !((item.key === 'sync_data' || item.key === 'manage_api_connection') && isAgent);
+        });
+        var checkedInGroup = selectableItems.filter(function (item) { return Boolean(selectedSet[item.key]); }).length;
+        var allGroupChecked = selectableItems.length > 0 && checkedInGroup === selectableItems.length;
+        var isDashGroup = g === 'لوحة التحكم';
+        var dashViewDisabled = isDashGroup && !selectedSet.view_dashboard;
         return '<div style="padding:10px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-          '<div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--brand-primary);">' + esc(g) + '</div>' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:8px;">' +
+            '<div style="font-size:12px;font-weight:700;color:var(--brand-primary);">' + esc(g) + ' <span class="tabular-nums" style="font-weight:600;color:var(--text-muted);font-size:11px;">(' + checkedInGroup + '/' + groupItems.length + ')</span></div>' +
+            '<button type="button" class="btn btn-sm pr-group-toggle-btn" data-group="' + esc(g) + '" style="min-height:24px;padding:2px 8px;font-size:11px;">' + (allGroupChecked ? 'إلغاء الكل' : 'تحديد الكل') + '</button>' +
+          '</div>' +
+          (dashViewDisabled ? '<div style="font-size:11px;padding:5px 8px;margin-bottom:8px;border-radius:4px;background:var(--status-warning-bg);color:var(--status-warning-text);border:1px solid var(--status-warning-border);">عرض لوحة التحكم معطل — عند تحديد أي عنصر هنا سيتم تفعيله تلقائياً أو فعّله من مجموعة (عام).</div>' : '') +
           '<div style="display:flex;flex-direction:column;gap:6px;">' +
             groupItems.map(function (item) {
               var isApiPerm = item.key === 'sync_data' || item.key === 'manage_api_connection';
@@ -457,8 +549,35 @@
 
       permsGrid.querySelectorAll('.pr-perm-checkbox').forEach(function (cb) {
         cb.addEventListener('change', function () {
-          if (cb.checked) selectedSet[cb.value] = true;
-          else delete selectedSet[cb.value];
+          if (cb.checked) {
+            selectedSet[cb.value] = true;
+            if (dashKeys.indexOf(cb.value) !== -1 && !selectedSet.view_dashboard) {
+              selectedSet.view_dashboard = true;
+            }
+          } else {
+            delete selectedSet[cb.value];
+          }
+          renderGrid();
+        });
+      });
+
+      permsGrid.querySelectorAll('.pr-group-toggle-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var gName = btn.getAttribute('data-group');
+          var groupItems = catalog.filter(function (c) {
+            if (c.group !== gName) return false;
+            if (isAgent && (c.key === 'sync_data' || c.key === 'manage_api_connection')) return false;
+            return true;
+          });
+          var allChecked = groupItems.length > 0 && groupItems.every(function (c) { return Boolean(selectedSet[c.key]); });
+          groupItems.forEach(function (c) {
+            if (allChecked) delete selectedSet[c.key];
+            else selectedSet[c.key] = true;
+          });
+          if (!allChecked && gName === 'لوحة التحكم') {
+            selectedSet.view_dashboard = true;
+          }
+          renderGrid();
         });
       });
     }
@@ -529,6 +648,9 @@
       var saveBtn = document.getElementById('pr-save-btn');
       runWithLock(saveBtn, 'saveRolePreset:' + (isEdit ? existingPreset.id : 'new'), async function () {
         var perms = Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; });
+        if (perms.indexOf('dash_perms_configured') === -1) {
+          perms.push('dash_perms_configured');
+        }
         var resp = await root.RGApi.callApi('saveRolePreset', {
           id: isEdit ? existingPreset.id : '',
           label: document.getElementById('pr-label').value,
@@ -770,29 +892,72 @@
 
     var chartEl = document.getElementById('emp-drawer-chart');
     if (chartEl && root.Chart) {
+      if (typeof root.Chart.getChart === 'function') {
+        var existingEmpChart = root.Chart.getChart(chartEl);
+        if (existingEmpChart) existingEmpChart.destroy();
+      }
       var statusMap = stats.statusCounts || {};
       var labels = Object.keys(statusMap);
       var values = Object.values(statusMap);
       var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-      new root.Chart(chartEl.getContext('2d'), {
+      var reduced = Boolean(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches);
+      var txt = isDark ? '#E5E7EB' : '#292929';
+      var mutedTxt = isDark ? '#9CA3AF' : '#686868';
+      var gridCol = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(41,41,41,0.08)';
+      var empCtx2d = chartEl.getContext('2d');
+      var empGrad = empCtx2d.createLinearGradient(0, 0, 0, 180);
+      empGrad.addColorStop(0, '#D91F2B');
+      empGrad.addColorStop(1, 'rgba(153, 19, 28, 0.72)');
+      new root.Chart(empCtx2d, {
         type: 'bar',
         data: {
           labels: labels.length ? labels : ['لا توجد بيانات'],
           datasets: [{
             label: 'عدد الحجوزات',
             data: values.length ? values : [0],
-            backgroundColor: '#d32228',
-            borderRadius: 6
+            backgroundColor: empGrad,
+            hoverBackgroundColor: '#B81722',
+            borderRadius: 8,
+            borderSkipped: false,
+            maxBarThickness: 36
           }]
         },
         options: {
           responsive: true,
           maintainAspectRatio: false,
-          animation: false,
-          plugins: { legend: { display: false } },
+          animation: reduced ? false : {
+            duration: 620,
+            easing: 'easeOutQuart',
+            delay: function (context) {
+              return (context.type === 'data' && context.mode === 'default') ? context.dataIndex * 70 : 0;
+            }
+          },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: 'rgba(41, 41, 41, 0.96)',
+              titleColor: '#FFFFFF',
+              bodyColor: '#F3F4F6',
+              borderColor: 'rgba(217, 31, 43, 0.45)',
+              borderWidth: 1,
+              cornerRadius: 11,
+              padding: 10,
+              titleFont: { family: "'IBM Plex Sans Arabic', sans-serif", weight: '700' },
+              bodyFont: { family: "'IBM Plex Sans Arabic', sans-serif" },
+              callbacks: {
+                label: function (ctxItem) {
+                  var arr = (ctxItem.dataset && Array.isArray(ctxItem.dataset.data)) ? ctxItem.dataset.data : [];
+                  var total = arr.reduce(function (acc, val) { return acc + Math.max(0, Number(val || 0)); }, 0);
+                  var val = Number(ctxItem.raw !== undefined ? ctxItem.raw : 0);
+                  var pct = total > 0 ? Math.round((val / total) * 100) : 0;
+                  return ' ' + (ctxItem.dataset.label || '') + ': ' + val + ' (' + pct + '%)';
+                }
+              }
+            }
+          },
           scales: {
-            x: { ticks: { color: isDark ? '#cfd1d3' : '#313232' }, grid: { display: false } },
-            y: { ticks: { color: isDark ? '#cfd1d3' : '#313232', precision: 0 }, beginAtZero: true }
+            x: { ticks: { color: txt, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } }, grid: { display: false } },
+            y: { ticks: { color: mutedTxt, precision: 0, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } }, grid: { color: gridCol }, beginAtZero: true }
           }
         }
       });
@@ -875,26 +1040,39 @@
 
             '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);">' +
               '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
-                '<div><strong style="font-size:13.5px;">الصلاحيات المخصصة لهذا الموظف</strong>' +
-                '<div id="ef-api-lock-note" style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">صلاحيات API والربط محصورة تلقائيًا بدور المشرف أو المدير العام فقط.</div></div>' +
+                '<div><strong style="font-size:13.5px;">الصلاحيات المخصصة لهذا الموظف (بما فيها عناصر لوحة التحكم)</strong>' +
+                '<div id="ef-api-lock-note" style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">صلاحيات API والربط محصورة بدور المشرف أو المدير العام · يمكنك تحديد ما يظهر في لوحة التحكم بدقة.</div></div>' +
                 '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
                   '<button type="button" class="btn btn-sm" id="ef-manage-perms-btn">+ إضافة / تعديل صلاحية</button>' +
                   '<button type="button" class="btn btn-sm" id="ef-perm-defaults">افتراضي الدور</button>' +
                   '<button type="button" class="btn btn-sm" id="ef-perm-all">تحديد الكل</button>' +
+                  '<button type="button" class="btn btn-sm" id="ef-perm-clear">إلغاء الكل</button>' +
                 '</div>' +
               '</div>' +
               '<div id="ef-permissions-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;">' +
                 groups.map(function (g) {
                   var groupItems = catalog.filter(function (c) { return c.group === g; });
-                  return '<div style="padding:10px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-                    '<div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--brand-primary);">' + esc(g) + '</div>' +
+                  var isAgentRole = draftState.role === 'agent';
+                  var selectableItems = groupItems.filter(function (item) {
+                    return !((item.key === 'sync_data' || item.key === 'manage_api_connection') && isAgentRole);
+                  });
+                  var checkedInGroup = selectableItems.filter(function (item) { return draftState.permissions.indexOf(item.key) !== -1; }).length;
+                  var allGroupChecked = selectableItems.length > 0 && checkedInGroup === selectableItems.length;
+                  var isDashGroup = g === 'لوحة التحكم';
+                  var dashViewDisabled = isDashGroup && draftState.permissions.indexOf('view_dashboard') === -1;
+                  return '<div class="ef-perm-group-card" data-group="' + esc(g) + '" style="padding:10px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
+                    '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:8px;">' +
+                      '<div style="font-size:12px;font-weight:700;color:var(--brand-primary);">' + esc(g) + ' <span class="ef-group-count tabular-nums" data-group="' + esc(g) + '" style="font-weight:600;color:var(--text-muted);font-size:11px;">(' + checkedInGroup + '/' + groupItems.length + ')</span></div>' +
+                      '<button type="button" class="btn btn-sm ef-group-toggle-btn" data-group="' + esc(g) + '" style="min-height:24px;padding:2px 8px;font-size:11px;">' + (allGroupChecked ? 'إلغاء الكل' : 'تحديد الكل') + '</button>' +
+                    '</div>' +
+                    (isDashGroup ? '<div id="ef-dash-view-hint" class="' + (dashViewDisabled ? '' : 'hidden') + '" style="font-size:11px;padding:5px 8px;margin-bottom:8px;border-radius:4px;background:var(--status-warning-bg);color:var(--status-warning-text);border:1px solid var(--status-warning-border);">صلاحية عرض لوحة التحكم معطلة حالياً — فعّلها لتظهر اللوحة للموظف (تُفعل تلقائياً عند تحديد أي قسم).</div>' : '') +
                     '<div style="display:flex;flex-direction:column;gap:6px;">' +
                       groupItems.map(function (item) {
                         var checked = draftState.permissions.indexOf(item.key) !== -1;
                         var isApiPerm = item.key === 'sync_data' || item.key === 'manage_api_connection';
-                        var disabledAttr = (isApiPerm && draftState.role === 'agent') ? ' disabled' : '';
+                        var disabledAttr = (isApiPerm && isAgentRole) ? ' disabled' : '';
                         return '<label class="checkbox-item" style="font-size:12.5px;">' +
-                          '<input type="checkbox" class="ef-perm-checkbox" value="' + esc(item.key) + '"' + (checked && !disabledAttr ? ' checked' : '') + disabledAttr + '> ' +
+                          '<input type="checkbox" class="ef-perm-checkbox" data-group="' + esc(g) + '" value="' + esc(item.key) + '"' + (checked && !disabledAttr ? ' checked' : '') + disabledAttr + '> ' +
                           '<span>' + esc(item.label) + '</span>' +
                         '</label>';
                       }).join('') +
@@ -948,6 +1126,28 @@
         });
       }
 
+      var dashKeys = (root.RGCrmCore && root.RGCrmCore.DASHBOARD_PERMISSION_KEYS) || [];
+
+      function refreshGroupBadgesAndDashHint() {
+        modalRoot.querySelectorAll('.ef-perm-group-card').forEach(function (card) {
+          var gName = card.getAttribute('data-group');
+          var cbs = Array.prototype.slice.call(card.querySelectorAll('.ef-perm-checkbox'));
+          var enabledCbs = cbs.filter(function (c) { return !c.disabled; });
+          var checkedCnt = enabledCbs.filter(function (c) { return c.checked; }).length;
+          var countEl = card.querySelector('.ef-group-count');
+          if (countEl) countEl.textContent = '(' + checkedCnt + '/' + cbs.length + ')';
+          var togBtn = card.querySelector('.ef-group-toggle-btn');
+          if (togBtn) {
+            togBtn.textContent = (enabledCbs.length > 0 && checkedCnt === enabledCbs.length) ? 'إلغاء الكل' : 'تحديد الكل';
+          }
+        });
+        var viewDashCb = modalRoot.querySelector('.ef-perm-checkbox[value="view_dashboard"]');
+        var dashHint = document.getElementById('ef-dash-view-hint');
+        if (dashHint) {
+          dashHint.classList.toggle('hidden', Boolean(viewDashCb && viewDashCb.checked));
+        }
+      }
+
       function applyPermissionsList(perms, roleVal) {
         syncApiLockForRole(roleVal);
         modalRoot.querySelectorAll('.ef-perm-checkbox').forEach(function (cb) {
@@ -957,6 +1157,7 @@
             cb.checked = perms.indexOf(cb.value) !== -1;
           }
         });
+        refreshGroupBadgesAndDashHint();
       }
 
       function applyPresetById(presetId) {
@@ -1096,6 +1297,39 @@
         modalRoot.querySelectorAll('.ef-perm-checkbox').forEach(function (cb) {
           if (!cb.disabled) cb.checked = true;
         });
+        refreshGroupBadgesAndDashHint();
+      });
+
+      var clearPermsBtn = document.getElementById('ef-perm-clear');
+      if (clearPermsBtn) {
+        clearPermsBtn.addEventListener('click', function () {
+          presetSelect.value = 'custom';
+          draftState.presetId = 'custom';
+          syncPresetButtonsState();
+          modalRoot.querySelectorAll('.ef-perm-checkbox').forEach(function (cb) {
+            if (!cb.disabled) cb.checked = false;
+          });
+          refreshGroupBadgesAndDashHint();
+        });
+      }
+
+      modalRoot.querySelectorAll('.ef-group-toggle-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var gName = btn.getAttribute('data-group');
+          var card = modalRoot.querySelector('.ef-perm-group-card[data-group="' + gName + '"]');
+          if (!card) return;
+          presetSelect.value = 'custom';
+          draftState.presetId = 'custom';
+          syncPresetButtonsState();
+          var enabledCbs = Array.prototype.slice.call(card.querySelectorAll('.ef-perm-checkbox')).filter(function (c) { return !c.disabled; });
+          var allChecked = enabledCbs.length > 0 && enabledCbs.every(function (c) { return c.checked; });
+          enabledCbs.forEach(function (c) { c.checked = !allChecked; });
+          if (!allChecked && gName === 'لوحة التحكم') {
+            var vd = modalRoot.querySelector('.ef-perm-checkbox[value="view_dashboard"]');
+            if (vd && !vd.disabled) vd.checked = true;
+          }
+          refreshGroupBadgesAndDashHint();
+        });
       });
 
       modalRoot.querySelectorAll('.ef-perm-checkbox').forEach(function (cb) {
@@ -1103,6 +1337,11 @@
           presetSelect.value = 'custom';
           draftState.presetId = 'custom';
           syncPresetButtonsState();
+          if (cb.checked && dashKeys.indexOf(cb.value) !== -1) {
+            var vd = modalRoot.querySelector('.ef-perm-checkbox[value="view_dashboard"]');
+            if (vd && !vd.disabled && !vd.checked) vd.checked = true;
+          }
+          refreshGroupBadgesAndDashHint();
         });
       });
 
@@ -1122,6 +1361,9 @@
         modalRoot.querySelectorAll('.ef-perm-checkbox:checked').forEach(function (cb) {
           if (!cb.disabled) selectedPerms.push(cb.value);
         });
+        if (selectedPerms.indexOf('dash_perms_configured') === -1) {
+          selectedPerms.push('dash_perms_configured');
+        }
 
         var payload = {
           name: document.getElementById('ef-name').value,
@@ -1147,6 +1389,9 @@
             errEl.classList.remove('hidden');
             return;
           }
+          if (res.data && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
+            ctx.appState.upsertEmployeeInState(res.data);
+          }
           ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
           modalRoot.innerHTML = '';
           if (onSaved) onSaved();
@@ -1157,8 +1402,10 @@
     drawModal();
   }
 
+  root.EmployeeManager = EmployeeManager;
   root.RGEmployees = {
     render: render,
+    EmployeeManager: EmployeeManager,
     openEmployeeDetailsDrawer: openEmployeeDetailsDrawer
   };
 })(window);

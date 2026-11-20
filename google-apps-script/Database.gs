@@ -27,7 +27,8 @@ var RG_SHEETS_SCHEMA = {
     'baseAmount', 'extensionsCount', 'extensionsAmount', 'totalAmount', 'hasExtensions',
     'internalStatus', 'priority', 'assignedEmployeeIds', 'assignedEmployeeNames',
     'lastUpdateText', 'lastUpdatedById', 'lastUpdatedByName', 'lastUpdatedAt',
-    'hasProblem', 'createdAt', 'updatedAt', 'statusHistory', 'rawJson'
+    'hasProblem', 'pinnedNote', 'pinnedNoteById', 'pinnedNoteByName', 'pinnedNoteUpdatedAt', 'noAnswerCount',
+    'createdAt', 'updatedAt', 'statusHistory', 'rawJson'
   ],
   Extensions: [
     'id', 'extensionNumber', 'sequenceNumber', 'reservationId', 'reservationNumber',
@@ -490,6 +491,7 @@ function initDatabaseCore_() {
       default_language: 'ar',
       auto_sync_enabled: 'true',
       auto_sync_interval_hours: '12',
+      auto_sync_interval_minutes: '0',
       job_role_presets: JSON.stringify(RG_DEFAULT_ROLE_PRESETS),
       permissions_catalog_custom: JSON.stringify([])
     };
@@ -1083,4 +1085,22 @@ function deleteRecordByKey(sheetName, keyField, keyValue) {
     }
   }
   return false;
+}
+
+function clearSheetRecords(sheetName) {
+  var ss = getSpreadsheet();
+  var sheet = getSheetOrCreate(ss, sheetName);
+  var lastRow = sheet.getLastRow();
+  var removedCount = Math.max(0, lastRow - 1);
+  if (lastRow > 1) {
+    sheet.deleteRows(2, lastRow - 1);
+  }
+  if (Array.isArray(_rgRecordsCache[sheetName])) {
+    _rgRecordsCache[sheetName] = [];
+  }
+  if (RG_HOT_PERSIST_CACHE_SHEETS[sheetName]) {
+    _rgDirtyCacheSheets[sheetName] = true;
+  }
+  invalidateCache(sheetName, true);
+  return removedCount;
 }

@@ -53,45 +53,156 @@ var DATA_HEADERS = [
 ];
 
 var STATUS_AR = {
-  ACTIVE: "نشط الآن", STARTED: "نشط الآن",
-  CONFIRMED: "مؤكد", IN_PROGRESS: "مؤكد",
-  COMPLETED: "منتهي", FINISHED: "منتهي", CLOSED: "منتهي", ENDED: "منتهي",
+  PENDING: "قيد الانتظار",
+  NEW: "جديد",
+  CREATED: "قيد الانتظار",
+  CONFIRMED: "مؤكد",
+  BOOKED: "تم الحجز",
+  RESERVED: "تم الحجز",
+  ACTIVE: "نشط الآن",
+  STARTED: "نشط الآن",
+  IN_PROGRESS: "مؤكد",
+  ON_THE_WAY: "في الطريق",
+  READY: "جاهز للاستلام",
+  READY_FOR_PICKUP: "جاهز للاستلام",
+  READY_TO_PICKUP: "جاهز للاستلام",
+  HOLD: "معلق",
+  ON_HOLD: "معلق",
+  ONHOLD: "معلق",
+  SUSPENDED: "معلق",
+  SUSPEND: "معلق",
+  PAUSED: "معلق",
+  PAUSE: "معلق",
+  FROZEN: "معلق",
+  HOLD_BY_ADMIN: "معلق",
+  ADMIN_HOLD: "معلق",
+  WAITING_APPROVAL: "معلق",
+  WAITING_CONFIRMATION: "معلق",
+  PENDING_APPROVAL: "معلق",
+  PENDING_CONFIRMATION: "معلق",
+  UNDER_REVIEW: "معلق",
+  DELIVERED: "تم التسليم",
+  PICKED_UP: "نشط الآن",
+  RECEIVED: "نشط الآن",
+  ON_RENT: "نشط الآن",
+  RENTED: "نشط الآن",
+  CAR_RECEIVED: "نشط الآن",
+  ONGOING: "نشط الآن",
+  RETURNED: "تم الإرجاع",
+  EXTENDED: "تم التمديد",
+  AUTOMATICALLY_EXTENDED: "تم التمديد تلقائيًا",
+  COMPLETED: "منتهي",
+  FINISHED: "منتهي",
+  CLOSED: "منتهي",
+  ENDED: "منتهي",
   FINISHED_BY_DRIVER: "تم التسليم من قبل السائق",
-  CANCELLED: "ملغي", CANCELED: "ملغي",
-  PENDING: "قيد الانتظار", CREATED: "قيد الانتظار",
-  PAID: "مدفوع", ADMIN_APPROVED: "مقبول", APPROVED: "مقبول", ACCEPTED: "مقبول",
-  DECLINED: "مرفوض", REJECTED: "مرفوض",
-  PAID_BY_WALLET: "مدفوع عن طريق المحفظة", WALLET_PAID: "مدفوع عن طريق المحفظة",
-  PAID_WALLET: "مدفوع عن طريق المحفظة"
+  CANCELLED: "ملغي",
+  CANCELED: "ملغي",
+  DECLINED: "مرفوض",
+  REJECTED: "مرفوض",
+  EXPIRED: "منتهي",
+  NO_SHOW: "لم يحضر",
+  DRAFT: "مسودة",
+  UNPAID: "غير مدفوع",
+  WAITING_PAYMENT: "بانتظار الدفع",
+  AWAITING_PAYMENT: "بانتظار الدفع",
+  PENDING_PAYMENT: "بانتظار الدفع",
+  PAID: "مدفوع",
+  WALLET_PAID: "مدفوع عن طريق المحفظة",
+  PAID_BY_WALLET: "مدفوع عن طريق المحفظة",
+  PAID_WALLET: "مدفوع عن طريق المحفظة",
+  ADMIN_APPROVED: "مقبول",
+  LOCATION_CHANGED: "تم تغيير الموقع",
+  ACCEPTED: "مقبول",
+  APPROVED: "مقبول",
+  IN_RENT: "نشط الآن",
+  CHECKED_OUT: "نشط الآن",
+  CANCELLED_BY_USER: "ملغي",
+  CANCELLED_BY_ADMIN: "ملغي",
+  CANCELED_BY_USER: "ملغي",
+  CANCELED_BY_ADMIN: "ملغي"
 };
 var HANDOVER_AR = {
-  BRANCH: "فرع", AIRPORT: "مطار",
+  BRANCH: "فرع", OFFICE: "فرع", PICKUP: "فرع",
+  AIRPORT: "مطار",
   MY_LOCATION: "موقع خاص",
   CUSTOM: "موقع خاص", CUSTOM_LOCATION: "موقع خاص", DELIVERY: "موقع خاص",
-  LOCATION: "موقع خاص", PRIVATE_LOCATION: "موقع خاص", PRIVATE: "موقع خاص"
+  LOCATION: "موقع خاص", PRIVATE_LOCATION: "موقع خاص", PRIVATE: "موقع خاص",
+  HOME: "موقع خاص", HOTEL: "موقع خاص"
 };
-var EXT_TYPE_AR = { CLIENT: "التمديد بواسطة العميل", AUTOMATIC: "تمديد تلقائي" };
+var EXT_TYPE_AR = {
+  CLIENT: "التمديد بواسطة العميل",
+  CUSTOMER: "التمديد بواسطة العميل",
+  USER: "التمديد بواسطة العميل",
+  AUTOMATIC: "تمديد تلقائي",
+  AUTO: "تمديد تلقائي",
+  SYSTEM: "تمديد تلقائي",
+  ADMIN: "تمديد إداري",
+  MANUAL: "تمديد إداري"
+};
 
 var UNMAPPED = {};
 
 /* ---------- أدوات ---------- */
 
-function notify_(msg) {
+function notify_(msg, opts) {
+  var options = opts || {};
   Logger.log(msg);
+  if (options.toastOnly) {
+    try {
+      var activeSs = SpreadsheetApp.getActiveSpreadsheet();
+      if (activeSs && typeof activeSs.toast === "function") {
+        activeSs.toast(String(msg), options.title || "Rental Gate", options.duration || 8);
+      }
+    } catch (e) {}
+    return;
+  }
+  try {
+    var activeSsAlert = SpreadsheetApp.getActiveSpreadsheet();
+    if (activeSsAlert && typeof activeSsAlert.toast === "function") {
+      activeSsAlert.toast(String(msg).split("\n")[0], options.title || "Rental Gate", 6);
+    }
+  } catch (eToast) {}
+  if (options.noAlert) return;
   try { SpreadsheetApp.getUi().alert(msg); } catch (e) {}
 }
 
+function normalizeToken_(raw) {
+  return String(raw === null || raw === undefined ? "" : raw)
+    .trim()
+    .replace(/^Bearer(?:\s+|$)/i, "")
+    .trim();
+}
+
+function isValidJwtLikeToken_(token) {
+  var t = normalizeToken_(token);
+  if (!t || t.indexOf("eyJ") !== 0) return false;
+  if (/\s/.test(t)) return false;
+  return t.split(".").length >= 2;
+}
+
 function getToken_() {
-  var props = PropertiesService.getScriptProperties();
-  return String(props.getProperty("RG_TOKEN") || props.getProperty("RENTAL_TOKEN") || "").trim();
+  try {
+    var props = PropertiesService.getScriptProperties();
+    if (!props) return "";
+    var rgToken = normalizeToken_(props.getProperty("RG_TOKEN"));
+    if (rgToken) return rgToken;
+    return normalizeToken_(props.getProperty("RENTAL_TOKEN"));
+  } catch (e) {
+    Logger.log("getToken_ error: " + e.message);
+    return "";
+  }
 }
 
 function setToken() {
   var ui = SpreadsheetApp.getUi();
   var r = ui.prompt("حفظ التوكن", "الصق التوكن (يبدأ بـ eyJ). كلمة Bearer ما تضر، بتنشال تلقائياً", ui.ButtonSet.OK_CANCEL);
   if (r.getSelectedButton() !== ui.Button.OK) return;
-  var t = r.getResponseText().trim().replace(/^Bearer\s+/i, "");
-  if (t.indexOf("eyJ") !== 0) { notify_("التوكن غير صحيح، لازم يبدأ بـ eyJ"); return; }
+  var t = normalizeToken_(r.getResponseText());
+  if (!isValidJwtLikeToken_(t)) {
+    notify_("التوكن غير صحيح أو فارغ، لازم يبدأ بـ eyJ", { toastOnly: true, title: "تنبيه التوكن" });
+    return;
+  }
   PropertiesService.getScriptProperties().setProperties({
     RG_TOKEN: t,
     RENTAL_TOKEN: t
@@ -133,12 +244,23 @@ function durationText_(days) {
   return n + " يوم";
 }
 
+function normalizeEnumKey_(v) {
+  return String(v === null || v === undefined ? "" : v)
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, "_");
+}
+
 function map_(dict, v, label) {
   if (v === "" || v == null) return "";
-  var t = dict[String(v).toUpperCase()];
+  var strVal = String(v).trim();
+  if (!strVal) return "";
+  if (/[\u0600-\u06FF]/.test(strVal)) return strVal;
+  var key = normalizeEnumKey_(strVal);
+  var t = dict[key];
   if (t) return t;
-  UNMAPPED[label + ": " + v] = true;
-  return v;
+  UNMAPPED[label + ": " + strVal] = true;
+  return strVal;
 }
 
 function round2_(x) { return Math.round(x * 100) / 100; }
@@ -155,59 +277,226 @@ function buildApiReq_(url, token) {
 }
 
 function parseApiRes_(res) {
-  var code = res.getResponseCode();
-  if (code !== 200) throw new Error("كود " + code + " | " + res.getContentText().substring(0, 300));
-  return JSON.parse(res.getContentText());
+  if (!res) {
+    var emptyResErr = new Error("لم يتم استلام استجابة من الخادم.");
+    emptyResErr.code = "EMPTY_RESPONSE";
+    throw emptyResErr;
+  }
+  var code = Number(res.getResponseCode());
+  var rawText = String(res.getContentText() || "");
+  if (code === 401 || code === 403) {
+    var authErr = new Error("التوكن منتهي الصلاحية أو غير مصرح له (كود " + code + ").");
+    authErr.code = "INVALID_TOKEN";
+    authErr.httpStatus = code;
+    throw authErr;
+  }
+  if (code !== 200) {
+    var httpErr = new Error("كود " + code + " | " + rawText.substring(0, 300));
+    httpErr.code = "HTTP_ERROR";
+    httpErr.httpStatus = code;
+    throw httpErr;
+  }
+  try {
+    return JSON.parse(rawText);
+  } catch (parseErr) {
+    var badJsonErr = new Error("تعذر قراءة استجابة API كـ JSON: " + rawText.substring(0, 200));
+    badJsonErr.code = "INVALID_JSON";
+    throw badJsonErr;
+  }
 }
 
 function itemsOf_(result) {
+  if (!result) return [];
   if (Array.isArray(result)) return result;
-  var r = result.content || result.items || result.data || result.results || [];
-  if (r && !Array.isArray(r)) r = r.content || r.items || r.data || [];
+  var r = result.content || result.items || result.data || result.results || result.rows || result.reservations || result.extensions || result.records || result.list || result.payload || result.result || [];
+  if (r && !Array.isArray(r)) {
+    r = r.content || r.items || r.data || r.results || r.rows || r.reservations || r.extensions || r.records || r.list || [];
+  }
+  if (r && !Array.isArray(r)) {
+    r = r.content || r.items || r.results || r.rows || r.reservations || r.records || r.list || [];
+  }
   return Array.isArray(r) ? r : [];
 }
 
+function extractPageInfo_(result, requestedSize, currentPage) {
+  var root = (result && typeof result === "object" && !Array.isArray(result)) ? result : {};
+  var dataObj = (root.data && typeof root.data === "object" && !Array.isArray(root.data))
+    ? root.data
+    : ((root.payload && typeof root.payload === "object" && !Array.isArray(root.payload))
+      ? root.payload
+      : ((root.result && typeof root.result === "object" && !Array.isArray(root.result)) ? root.result : {}));
+  var metaObj = (root.meta && typeof root.meta === "object")
+    ? root.meta
+    : ((dataObj.meta && typeof dataObj.meta === "object") ? dataObj.meta : {});
+  var pagObj = (root.pagination && typeof root.pagination === "object")
+    ? root.pagination
+    : ((dataObj.pagination && typeof dataObj.pagination === "object") ? dataObj.pagination : {});
+
+  var items = itemsOf_(result);
+  var pageSize = Number(
+    root.size || root.pageSize || root.per_page ||
+    dataObj.size || dataObj.pageSize || dataObj.per_page ||
+    pagObj.per_page || pagObj.pageSize ||
+    requestedSize || PAGE_SIZE
+  ) || PAGE_SIZE;
+
+  var rawTotalPages =
+    root.totalPages || root.total_pages || root.last_page || root.pages || root.pageCount ||
+    dataObj.totalPages || dataObj.total_pages || dataObj.last_page || dataObj.pages || dataObj.pageCount ||
+    metaObj.totalPages || metaObj.total_pages || metaObj.last_page ||
+    pagObj.totalPages || pagObj.total_pages || pagObj.last_page || 0;
+
+  var totalPages = Number(rawTotalPages) || 0;
+  if (totalPages <= 0) {
+    var totalElements = Number(
+      root.totalElements || root.totalCount || root.total_items || root.total ||
+      dataObj.totalElements || dataObj.totalCount || dataObj.total_items || dataObj.total ||
+      metaObj.totalElements || metaObj.total || pagObj.total || 0
+    );
+    if (totalElements > 0 && pageSize > 0) {
+      totalPages = Math.ceil(totalElements / pageSize);
+    }
+  }
+
+  var explicitLast = (root.last === true) || (dataObj.last === true) || (metaObj.last === true) || (pagObj.last === true) ||
+    (root.hasMore === false) || (root.hasNext === false) ||
+    (dataObj.hasMore === false) || (dataObj.hasNext === false) ||
+    (metaObj.hasMore === false) || (metaObj.hasNext === false) ||
+    (pagObj.hasMore === false) || (pagObj.hasNext === false);
+  var explicitNotLast = (root.last === false) || (dataObj.last === false) || (metaObj.last === false) || (pagObj.last === false);
+  var explicitHasMore = (root.hasMore === true) || (root.hasNext === true) ||
+    (dataObj.hasMore === true) || (dataObj.hasNext === true) ||
+    (metaObj.hasMore === true) || (metaObj.hasNext === true) ||
+    (pagObj.hasMore === true) || (pagObj.hasNext === true);
+
+  var hasMore = false;
+  if (explicitLast || items.length === 0) {
+    hasMore = false;
+  } else if (totalPages > 0) {
+    var pageOffset = currentPage - FIRST_PAGE + 1;
+    hasMore = pageOffset < totalPages || explicitHasMore || explicitNotLast;
+  } else if (explicitHasMore || explicitNotLast) {
+    hasMore = items.length > 0;
+  } else if (items.length >= pageSize) {
+    hasMore = true;
+  }
+
+  return {
+    items: items,
+    totalPages: totalPages > 0 ? Math.min(totalPages, MAX_PAGES) : 0,
+    last: explicitLast,
+    hasMore: hasMore
+  };
+}
+
+function appendPageQuery_(baseUrl, pageNum, pageSize) {
+  var sep = baseUrl.indexOf("?") === -1 ? "?" : "&";
+  return baseUrl + sep + "page=" + pageNum + "&size=" + pageSize;
+}
+
+function collectExtraPages_(baseUrl, token, page0Info, initialItems, idKeys) {
+  var pages = [initialItems || []];
+  var seen = {};
+  var countAdded = function (list) {
+    var added = 0;
+    for (var k = 0; k < list.length; k++) {
+      var id = String(pick_(list[k], idKeys));
+      if (id && seen[id]) continue;
+      if (id) seen[id] = true;
+      added++;
+    }
+    return added;
+  };
+  countAdded(pages[0]);
+
+  if (!pages[0].length || page0Info.last) {
+    return pages;
+  }
+
+  var nextPageToFetch = FIRST_PAGE + 1;
+  if (page0Info.totalPages > 1) {
+    var reqs = [];
+    var pageIndices = [];
+    for (var rp = FIRST_PAGE + 1; rp < FIRST_PAGE + page0Info.totalPages && rp < FIRST_PAGE + MAX_PAGES; rp++) {
+      reqs.push(buildApiReq_(appendPageQuery_(baseUrl, rp, PAGE_SIZE), token));
+      pageIndices.push(rp - FIRST_PAGE);
+    }
+    var batchSize = 12;
+    var stopAfterBatch = false;
+    var lastBatchInfo = null;
+    for (var i = 0; i < reqs.length && !stopAfterBatch; i += batchSize) {
+      var chunkReqs = reqs.slice(i, i + batchSize);
+      var chunkIdx = pageIndices.slice(i, i + batchSize);
+      var chunkRes = UrlFetchApp.fetchAll(chunkReqs);
+      for (var j = 0; j < chunkRes.length; j++) {
+        var parsedChunk = parseApiRes_(chunkRes[j]);
+        var chunkInfo = extractPageInfo_(parsedChunk, PAGE_SIZE, FIRST_PAGE + chunkIdx[j]);
+        pages[chunkIdx[j]] = chunkInfo.items;
+        lastBatchInfo = chunkInfo;
+        if (chunkInfo.items.length === 0) {
+          stopAfterBatch = true;
+        } else if (countAdded(chunkInfo.items) === 0) {
+          stopAfterBatch = true;
+        }
+      }
+    }
+    nextPageToFetch = FIRST_PAGE + page0Info.totalPages;
+    if (stopAfterBatch || (lastBatchInfo && lastBatchInfo.last)) {
+      return pages;
+    }
+    if (lastBatchInfo && !lastBatchInfo.hasMore) {
+      return pages;
+    }
+  } else if (!page0Info.hasMore) {
+    return pages;
+  }
+
+  // Fallback sequential paging when totalPages is omitted/inaccurate or hasMore/last=false indicates more pages
+  for (var seqPage = nextPageToFetch; seqPage < FIRST_PAGE + MAX_PAGES; seqPage++) {
+    var seqRes = UrlFetchApp.fetch(appendPageQuery_(baseUrl, seqPage, PAGE_SIZE), {
+      method: "get",
+      headers: { "Authorization": "Bearer " + token, "Accept": "application/json", "lang": "ar" },
+      muteHttpExceptions: true
+    });
+    var seqPayload = parseApiRes_(seqRes);
+    var seqInfo = extractPageInfo_(seqPayload, PAGE_SIZE, seqPage);
+    if (!seqInfo.items.length) break;
+    var newlyAdded = countAdded(seqInfo.items);
+    if (newlyAdded === 0) break;
+    pages.push(seqInfo.items);
+    if (seqInfo.last || !seqInfo.hasMore) break;
+  }
+
+  return pages;
+}
+
 function fetchBothParallel_(token) {
+  var cleanToken = normalizeToken_(token);
+  if (!isValidJwtLikeToken_(cleanToken)) {
+    var tokenErr = new Error("التوكن غير محفوظ أو فارغ أو غير صالح.");
+    tokenErr.code = cleanToken ? "INVALID_TOKEN" : "EMPTY_TOKEN";
+    throw tokenErr;
+  }
+
   var firstBatch = UrlFetchApp.fetchAll([
-    buildApiReq_(RES_URL + "?page=" + FIRST_PAGE + "&size=" + PAGE_SIZE, token),
-    buildApiReq_(EXT_URL + "?page=" + FIRST_PAGE + "&size=" + PAGE_SIZE, token)
+    buildApiReq_(RES_URL + "?page=" + FIRST_PAGE + "&size=" + PAGE_SIZE, cleanToken),
+    buildApiReq_(EXT_URL + "?page=" + FIRST_PAGE + "&size=" + PAGE_SIZE, cleanToken)
   ]);
 
   var res0 = parseApiRes_(firstBatch[0]);
-  var ext0 = parseApiRes_(firstBatch[1]);
+  var res0Info = extractPageInfo_(res0, PAGE_SIZE, FIRST_PAGE);
+  var resPages = collectExtraPages_(RES_URL, cleanToken, res0Info, res0Info.items, ["reservationId", "id"]);
 
-  var resPages = [itemsOf_(res0)];
-  var extPages = [itemsOf_(ext0)];
-
-  var totalResPages = Math.min(Number(res0.totalPages || 1), MAX_PAGES);
-  var totalExtPages = Math.min(Number(ext0.totalPages || 1), MAX_PAGES);
-
-  var reqs = [];
-  var meta = [];
-
-  if (res0.last !== true && totalResPages > 1 && resPages[0].length > 0) {
-    for (var rp = FIRST_PAGE + 1; rp < FIRST_PAGE + totalResPages; rp++) {
-      reqs.push(buildApiReq_(RES_URL + "?page=" + rp + "&size=" + PAGE_SIZE, token));
-      meta.push({ kind: "res", idx: rp - FIRST_PAGE });
+  var extPages = [[]];
+  try {
+    var ext0 = parseApiRes_(firstBatch[1]);
+    var ext0Info = extractPageInfo_(ext0, PAGE_SIZE, FIRST_PAGE);
+    extPages = collectExtraPages_(EXT_URL, cleanToken, ext0Info, ext0Info.items, ["extendId", "id"]);
+  } catch (extErr) {
+    if (extErr && (extErr.code === "INVALID_TOKEN" || extErr.httpStatus === 401 || extErr.httpStatus === 403)) {
+      throw extErr;
     }
-  }
-  if (ext0.last !== true && totalExtPages > 1 && extPages[0].length > 0) {
-    for (var ep = FIRST_PAGE + 1; ep < FIRST_PAGE + totalExtPages; ep++) {
-      reqs.push(buildApiReq_(EXT_URL + "?page=" + ep + "&size=" + PAGE_SIZE, token));
-      meta.push({ kind: "ext", idx: ep - FIRST_PAGE });
-    }
-  }
-
-  var batchSize = 12;
-  for (var i = 0; i < reqs.length; i += batchSize) {
-    var chunkReqs = reqs.slice(i, i + batchSize);
-    var chunkMeta = meta.slice(i, i + batchSize);
-    var chunkRes = UrlFetchApp.fetchAll(chunkReqs);
-    for (var j = 0; j < chunkRes.length; j++) {
-      var arr = itemsOf_(parseApiRes_(chunkRes[j]));
-      if (chunkMeta[j].kind === "res") resPages[chunkMeta[j].idx] = arr;
-      else extPages[chunkMeta[j].idx] = arr;
-    }
+    Logger.log("تحذير سحب التمديدات: " + (extErr && extErr.message ? extErr.message : extErr));
   }
 
   var dedupe = function (pages, idKeys) {
@@ -234,10 +523,30 @@ function fetchBothParallel_(token) {
 /* ---------- تحويل إلى صفوف ---------- */
 
 function resId_(r) { return pick_(r, ["reservationId", "id"]); }
+function resDisplayId_(r) {
+  return pick_(r, [
+    "reservationNumber", "reservation_number", "reservationNo", "reservation_no",
+    "reservationCode", "reservation_code", "bookingNumber", "booking_number",
+    "contractNumber", "contract_number", "reference", "code", "reservationId", "id"
+  ]);
+}
+function rawStatusOf_(obj) {
+  var val = pick_(obj, [
+    "reservationStatus", "status", "status_code", "bookingStatus",
+    "contractStatus", "statusEn", "reservationStatusCode",
+    "reservation.reservationStatus", "reservation.status",
+    "status.code", "status.key", "status.value", "status.name"
+  ]);
+  if (val && typeof val === "object") {
+    return pick_(val, ["code", "key", "value", "status", "name", "en"]);
+  }
+  return val;
+}
 function extId_(e) { return pick_(e, ["extendId", "id"]); }
 function extDate_(e) { return pick_(e, ["extendDate", "createdAt"]); }
 function extAllowed_(e) {
-  return EXT_ALLOWED.indexOf(String(e.reservationStatus || "").toUpperCase()) !== -1;
+  var st = normalizeEnumKey_(rawStatusOf_(e));
+  return EXT_ALLOWED.indexOf(st) !== -1;
 }
 
 function resRow_(r, idx, exts, flagExt) {
@@ -245,13 +554,13 @@ function resRow_(r, idx, exts, flagExt) {
   exts.forEach(function (e) { amount += Number(e.total) || 0; });
   return [
     idx,
-    resId_(r),
-    fmtDate_(r.reservationDate),
-    pick_(r, ["clientName"]),
-    pick_(r, ["clientMobile"]),
-    pick_(r, ["companyArName", "companyEnName"]),
-    pick_(r, ["receiveBranchArName", "receiveBranchEnName"]),
-    pick_(r, ["carNameAr", "carNameEn"]),
+    resDisplayId_(r),
+    fmtDate_(pick_(r, ["reservationDate", "createdAt", "created_at", "startDate"])),
+    pick_(r, ["clientName", "customerName"]),
+    pick_(r, ["clientMobile", "customerPhone", "mobile"]),
+    pick_(r, ["companyArName", "companyEnName", "companyName"]),
+    pick_(r, ["receiveBranchArName", "receiveBranchEnName", "branchName"]),
+    pick_(r, ["carNameAr", "carNameEn", "carName"]),
     fmtDate_(r.startDate),
     fmtTime_(r.startDate),
     fmtDate_(r.endDate),
@@ -259,7 +568,7 @@ function resRow_(r, idx, exts, flagExt) {
     durationText_(r.reservationDays),
     map_(HANDOVER_AR, r.receiveType, "نوع الاستلام"),
     map_(HANDOVER_AR, r.deliverType, "نوع التسليم"),
-    map_(STATUS_AR, r.reservationStatus, "حالة الحجز"),
+    map_(STATUS_AR, rawStatusOf_(r), "حالة الحجز"),
     flagExt ? "نعم" : "لا",
     "",
     round2_(amount)
@@ -269,16 +578,16 @@ function resRow_(r, idx, exts, flagExt) {
 function extRow_(e, full) {
   return [
     "",
-    pick_(e, ["reservationId"]),
+    pick_(e, ["reservationNumber", "reservation_number", "reservationId"]),
     fmtDate_(extDate_(e)),
-    "تمديد #" + extId_(e) + (full ? " - " + pick_(e, ["clientName"]) : ""),
-    full ? pick_(e, ["clientMobile"]) : "",
+    "تمديد #" + extId_(e) + (full ? " - " + pick_(e, ["clientName", "customerName"]) : ""),
+    full ? pick_(e, ["clientMobile", "customerPhone"]) : "",
     full ? pick_(e, ["companyArabicName", "companyName"]) : "",
     full ? pick_(e, ["branchArabicName", "branchName"]) : "",
     full ? pick_(e, ["carName"]) : "",
     fmtDate_(extDate_(e)),
     "", "", "", "", "", "",
-    map_(STATUS_AR, e.reservationStatus, "حالة التمديد"),
+    map_(STATUS_AR, rawStatusOf_(e), "حالة التمديد"),
     "",
     map_(EXT_TYPE_AR, e.extensionType, "نوع التمديد"),
     Number(e.total) || 0
@@ -289,12 +598,12 @@ function extRow_(e, full) {
 
 function fuSysCols_(r) {
   return [
-    String(resId_(r)),
-    pick_(r, ["clientName"]),
-    String(pick_(r, ["clientMobile"])),
-    pick_(r, ["companyArName", "companyEnName"]),
-    pick_(r, ["receiveBranchArName", "receiveBranchEnName"]),
-    pick_(r, ["carNameAr", "carNameEn"]),
+    String(resDisplayId_(r)),
+    pick_(r, ["clientName", "customerName"]),
+    String(pick_(r, ["clientMobile", "customerPhone", "mobile"])),
+    pick_(r, ["companyArName", "companyEnName", "companyName"]),
+    pick_(r, ["receiveBranchArName", "receiveBranchEnName", "branchName"]),
+    pick_(r, ["carNameAr", "carNameEn", "carName"]),
     fmtDate_(r.startDate),
     fmtTime_(r.startDate),
     fmtDate_(r.endDate),
@@ -302,7 +611,7 @@ function fuSysCols_(r) {
     durationText_(r.reservationDays),
     map_(HANDOVER_AR, r.receiveType, "نوع الاستلام"),
     map_(HANDOVER_AR, r.deliverType, "نوع التسليم"),
-    map_(STATUS_AR, r.reservationStatus, "حالة الحجز")
+    map_(STATUS_AR, rawStatusOf_(r), "حالة الحجز")
   ];
 }
 
@@ -401,7 +710,12 @@ function updateFollowUps_(ss, filtered) {
   migrateFollowUps_(sheet);
 
   var byId = {};
-  filtered.forEach(function (r) { byId[String(resId_(r))] = r; });
+  filtered.forEach(function (r) {
+    var dispId = String(resDisplayId_(r));
+    var rawId = String(resId_(r));
+    if (dispId) byId[dispId] = r;
+    if (rawId && !byId[rawId]) byId[rawId] = r;
+  });
 
   var last = sheet.getLastRow();
   var existing = {};
@@ -413,12 +727,23 @@ function updateFollowUps_(ss, filtered) {
         var id = String(row[0]).trim();
         if (!id) return;
         existing[id] = true;
-        if (byId[id]) refreshed[i] = fuSysCols_(byId[id]);
+        if (byId[id]) {
+          var matched = byId[id];
+          existing[String(resDisplayId_(matched))] = true;
+          existing[String(resId_(matched))] = true;
+          refreshed[i] = fuSysCols_(matched);
+        }
       });
     } else {
       sheet.getRange(2, 1, last - 1, 1).getValues().forEach(function (row) {
         var id = String(row[0]).trim();
-        if (id) existing[id] = true;
+        if (id) {
+          existing[id] = true;
+          if (byId[id]) {
+            existing[String(resDisplayId_(byId[id]))] = true;
+            existing[String(resId_(byId[id]))] = true;
+          }
+        }
       });
     }
   }
@@ -426,9 +751,11 @@ function updateFollowUps_(ss, filtered) {
   var emptyAgent = FU_AGENT.map(function () { return ""; });
   var newRows = [];
   filtered.forEach(function (r) {
-    var id = String(resId_(r));
-    if (!id || existing[id]) return;
-    existing[id] = true;
+    var dispId = String(resDisplayId_(r));
+    var rawId = String(resId_(r));
+    if ((!dispId && !rawId) || existing[dispId] || existing[rawId]) return;
+    if (dispId) existing[dispId] = true;
+    if (rawId) existing[rawId] = true;
     newRows.push(fuSysCols_(r).concat(emptyAgent));
   });
 
@@ -486,38 +813,64 @@ function onEdit(e) {
 
 /* ---------- الرئيسية ---------- */
 
-function fetchBookingsFromAPI(customStartKey) {
+function fetchBookingsFromAPI(customStartKey, opts) {
+  var options = (opts && typeof opts === "object") ? opts : {};
   var token = getToken_();
-  if (token.indexOf("eyJ") !== 0) {
-    notify_("التوكن غير محفوظ أو غير صحيح. من القائمة اختر: حفظ التوكن، والصقه (يبدأ بـ eyJ)");
-    return;
+  if (!token) {
+    var emptyMsg = "التوكن فارغ أو غير محفوظ في إعدادات السكربت. من القائمة اختر: حفظ التوكن، ثم الصق توكن Rental Gate.";
+    notify_(emptyMsg, { toastOnly: true, title: "تنبيه التوكن", noAlert: true });
+    return { success: false, error: "EMPTY_TOKEN", message: emptyMsg };
   }
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!isValidJwtLikeToken_(token)) {
+    var invalidMsg = "صيغة التوكن غير صحيحة (يجب أن يبدأ بـ eyJ). من القائمة اختر: حفظ التوكن وأعد لصقه.";
+    notify_(invalidMsg, { toastOnly: true, title: "تنبيه التوكن", noAlert: true });
+    return { success: false, error: "INVALID_TOKEN", message: invalidMsg };
+  }
+
+  var ss = null;
+  try {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  } catch (ssErr) {
+    ss = null;
+  }
+  if (!ss) {
+    var ssMsg = "تعذر الوصول إلى جدول البيانات النشط.";
+    Logger.log(ssMsg);
+    return { success: false, error: "NO_SPREADSHEET", message: ssMsg };
+  }
+
   UNMAPPED = {};
   var t0 = Date.now();
   var effectiveStartKey = Number(customStartKey) || START_KEY;
 
   try {
     var fetched = fetchBothParallel_(token);
-    var reservations = fetched.reservations;
-    var allExt = fetched.extensions;
+    var reservations = fetched.reservations || [];
+    var allExt = fetched.extensions || [];
 
     var hasAnyExt = {};
     allExt.forEach(function (e) { hasAnyExt[String(pick_(e, ["reservationId"]))] = true; });
 
     var extensions = allExt.filter(extAllowed_);
 
-    var excluded = EXCLUDE_STATUSES.map(function (s) { return String(s).toUpperCase(); });
+    var excluded = EXCLUDE_STATUSES.map(function (s) { return normalizeEnumKey_(s); });
     var filtered = reservations.filter(function (r) {
-      if (dateKey_(r.reservationDate) < effectiveStartKey) return false;
-      return excluded.indexOf(String(r.reservationStatus || "").toUpperCase()) === -1;
+      var resDateVal = pick_(r, ["reservationDate", "createdAt", "created_at", "startDate"]);
+      if (effectiveStartKey > 0 && dateKey_(resDateVal) < effectiveStartKey) return false;
+      var stKey = normalizeEnumKey_(rawStatusOf_(r));
+      return excluded.indexOf(stKey) === -1;
     });
     filtered.sort(function (a, b) { return Number(resId_(b)) - Number(resId_(a)); });
 
     var statusCount = {};
+    var statusCountAr = {};
     filtered.forEach(function (r) {
-      var s = String(r.reservationStatus || "?");
-      statusCount[s] = (statusCount[s] || 0) + 1;
+      var rawVal = rawStatusOf_(r);
+      var rawSt = String(rawVal || "").trim();
+      var arSt = rawSt ? (map_(STATUS_AR, rawSt, "حالة الحجز") || rawSt) : "غير محدد";
+      var statKey = rawSt || "?";
+      statusCount[statKey] = (statusCount[statKey] || 0) + 1;
+      statusCountAr[arSt] = (statusCountAr[arSt] || 0) + 1;
     });
 
     var extByRes = {};
@@ -549,7 +902,7 @@ function fetchBookingsFromAPI(customStartKey) {
     dataSheet.getRange(1, 1, 1, DATA_HEADERS.length).setValues([DATA_HEADERS]).setFontWeight("bold");
     dataSheet.setFrozenRows(1);
     if (rows.length > 0) {
-      [3, 9, 10, 11, 12, 13].forEach(function (c) {
+      [2, 3, 9, 10, 11, 12, 13].forEach(function (c) {
         dataSheet.getRange(2, c, rows.length, 1).setNumberFormat("@");
       });
       dataSheet.getRange(2, 1, rows.length, DATA_HEADERS.length).setValues(rows);
@@ -558,17 +911,36 @@ function fetchBookingsFromAPI(customStartKey) {
     var added = updateFollowUps_(ss, filtered);
     var sec = ((Date.now() - t0) / 1000).toFixed(1);
 
+    var statusLines = Object.keys(statusCount).map(function (k) {
+      var arLabel = STATUS_AR[normalizeEnumKey_(k)] || k;
+      return (arLabel !== k ? (arLabel + " (" + k + ")") : arLabel) + " = " + statusCount[k];
+    });
+
     var msg = "تم السحب والتحديث خلال " + sec + " ثانية ⚡\n" +
               "مسحوب من الـ API (الكل): " + reservations.length + " حجز و " + allExt.length + " تمديد\n" +
               "تابة Data: " + filtered.length + " حجز + " + extCount + " تمديد\n" +
               "تابة المتابعة: أضيف " + added + " حجز جديد (في الأعلى)\n\n" +
               "الحجوزات حسب الحالة:\n" +
-              Object.keys(statusCount).map(function (k) { return k + " = " + statusCount[k]; }).join("\n");
+              statusLines.join("\n");
     var un = Object.keys(UNMAPPED);
     if (un.length) msg += "\n\nقيم إنجليزية بدون ترجمة (أرسلها لي):\n" + un.join("\n");
-    notify_(msg);
+    notify_(msg, { noAlert: Boolean(options.silent), toastOnly: Boolean(options.silent) });
+    return {
+      success: true,
+      totalFetched: reservations.length,
+      extensionsFetched: allExt.length,
+      filteredCount: filtered.length,
+      addedFollowUps: added,
+      statusCounts: statusCount,
+      statusCountsAr: statusCountAr,
+      unmapped: un,
+      durationSeconds: Number(sec)
+    };
   } catch (e) {
-    notify_("خطأ: " + e.message);
+    var errCode = (e && e.code) ? e.code : "SYNC_ERROR";
+    var errMsg = "خطأ أثناء السحب: " + (e && e.message ? e.message : String(e));
+    notify_(errMsg, { toastOnly: true, title: "فشل السحب", noAlert: true });
+    return { success: false, error: errCode, message: errMsg };
   }
 }
 
@@ -583,20 +955,25 @@ function fetchBookingsCustomDateFromUI() {
   var raw = String(resp.getResponseText() || "").trim();
   var m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) {
-    notify_("صيغة التاريخ غير صحيحة. يجب أن تكون YYYY-MM-DD مثل 2026-11-10");
+    notify_("صيغة التاريخ غير صحيحة. يجب أن تكون YYYY-MM-DD مثل 2026-11-10", { toastOnly: true, noAlert: true });
     return;
   }
   var key = Number(m[1]) * 10000 + Number(m[2]) * 100 + Number(m[3]);
-  fetchBookingsFromAPI(key);
+  return fetchBookingsFromAPI(key);
 }
 
 /* ---------- للتشخيص فقط ---------- */
 
 function debugRaw() {
+  var token = getToken_();
+  if (!isValidJwtLikeToken_(token)) {
+    Logger.log("debugRaw skipped: token missing or invalid");
+    return { success: false, error: token ? "INVALID_TOKEN" : "EMPTY_TOKEN" };
+  }
   [RES_URL, EXT_URL].forEach(function (u) {
     var res = UrlFetchApp.fetch(u + "?page=" + FIRST_PAGE + "&size=2", {
       method: "get",
-      headers: { "Authorization": "Bearer " + getToken_(), "Accept": "application/json", "lang": "ar" },
+      headers: { "Authorization": "Bearer " + token, "Accept": "application/json", "lang": "ar" },
       muteHttpExceptions: true
     });
     Logger.log(u + "\nكود: " + res.getResponseCode() + "\n" + res.getContentText().substring(0, 4000));

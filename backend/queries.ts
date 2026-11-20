@@ -194,6 +194,48 @@ async function createNotification(
   );
 }
 
+async function dispatchMentionNotifications(
+  client: DbClient,
+  opts: {
+    texts: string[];
+    sender: AuthSession['user'];
+    entityType: 'Reservation' | 'Problem';
+    entityId: string;
+    label: string;
+  }
+): Promise<any[]> {
+  const combined = (opts.texts || []).map((t) => str(t)).filter(Boolean).join('\n');
+  if (!combined || combined.indexOf('@') === -1) return [];
+  const empRes = await client.query(`SELECT * FROM employees`);
+  const candidates = (empRes.rows || []).map((r: any) => ({
+    id: str(r.id),
+    name: str(r.name),
+    username: str(r.username),
+    role: str(r.role),
+    status: str(r.status || 'active')
+  }));
+  const mentioned = crmCore.extractMentionedEmployees(combined, candidates, {
+    excludeEmployeeId: opts.sender?.id || ''
+  });
+  if (!mentioned.length) return [];
+
+  const snippet = combined.replace(/\s+/g, ' ').trim().slice(0, 120);
+  const titlePrefix = opts.entityType === 'Problem'
+    ? `إشارة لك في المشكلة ${opts.label || ''}`.trim()
+    : `إشارة لك في الحجز ${opts.label || ''}`.trim();
+  for (const target of mentioned) {
+    await createNotification(client, {
+      recipientEmployeeId: target.id,
+      type: 'mention',
+      title: `${titlePrefix} (@${opts.sender?.name || 'موظف'})`,
+      message: `${opts.sender?.name || 'موظف'} أشار إليك: "${snippet}"`,
+      entityType: opts.entityType,
+      entityId: opts.entityId
+    });
+  }
+  return mentioned;
+}
+
 const INTERNAL_SECRET_SETTING_KEYS = new Set([
   'rg_token_enc',
   'sync_api_secret_enc',
@@ -358,7 +400,8 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       ['allow_agent_view_all', 'true'],
       ['default_language', 'ar'],
       ['auto_sync_enabled', 'true'],
-      ['auto_sync_interval_hours', '12']
+      ['auto_sync_interval_hours', '12'],
+      ['auto_sync_interval_minutes', '0']
     ];
     for (const [key, value] of defaultSettings) {
       await tx.query(
@@ -656,24 +699,38 @@ export async function getAppBootstrap(
   payload: Record<string, any> = {}
 ) {
   const range = str(payload.range || '30d');
+  const canDashboard = crmCore.canUserPerform(session.user, 'view_dashboard');
   const canEmployees = crmCore.canUserPerform(session.user, 'view_employees');
   const canSync = crmCore.canAccessApi(session.user);
 
   const [dashboard, notifications, settings, serverCfg, employeesData] = await Promise.all([
-    getDashboard(executor, session, { range }),
+    canDashboard ? getDashboard(executor, session, { range }) : Promise.resolve(null),
     getNotifications(executor, session),
     getSettingsMap(executor),
     resolveServerConfig(executor),
     canEmployees ? getEmployees(executor, session) : Promise.resolve(null)
   ]);
 
+  const uiSimplification = crmCore.normalizeUiSimplificationSettings(settings.ui_simplification);
+  const layoutPrefs = crmCore.normalizeUserLayoutPrefs(parseJsonValue(settings[`layout_prefs_u_${session.user.id}`], {}));
+  const rawPinnedCritical = parseJsonValue<any[]>(settings[`pinned_res_u_${session.user.id}`], []);
+  const pinnedCriticalIds = Array.isArray(rawPinnedCritical)
+    ? rawPinnedCritical.map((x) => str(x)).filter(Boolean).slice(0, crmCore.MAX_PINNED_CRITICAL_RESERVATIONS || 3)
+    : [];
+
   let settingsOut: any = null;
   if (canSync) {
+    const syncInterval = crmCore.normalizeAutoSyncInterval(
+      settings.auto_sync_interval_hours,
+      settings.auto_sync_interval_minutes
+    );
     settingsOut = {
       ...settings,
+      ui_simplification: uiSimplification,
       gas_webapp_url: serverCfg.gasWebAppUrl,
       auto_sync_enabled: settings.auto_sync_enabled !== false,
-      auto_sync_interval_hours: num(settings.auto_sync_interval_hours, 12),
+      auto_sync_interval_hours: syncInterval.hours,
+      auto_sync_interval_minutes: syncInterval.minutes,
       hasRgToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
       hasDirectToken: Boolean(serverCfg.rgToken),
       hasSyncSecret: Boolean(serverCfg.syncApiSecret)
@@ -686,7 +743,10 @@ export async function getAppBootstrap(
     dashboard,
     notifications,
     employees: employeesData,
-    settings: settingsOut
+    settings: settingsOut,
+    uiSimplification,
+    layoutPrefs,
+    pinnedCriticalIds
   };
 }
 
@@ -868,7 +928,8 @@ export async function syncLocalCache(
               r.base_amount, r.extensions_count, r.extensions_amount, r.total_amount, r.has_extensions,
               r.internal_status, r.priority, r.assigned_employee_ids, r.assigned_employee_names,
               r.last_update_text, r.last_updated_by_id, r.last_updated_by_name, r.last_updated_at,
-              r.has_problem, r.created_at, r.updated_at, r.status_history,
+              r.has_problem, r.pinned_note, r.pinned_note_by_id, r.pinned_note_by_name, r.pinned_note_updated_at, r.no_answer_count,
+              r.created_at, r.updated_at, r.status_history,
               EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
        ${resWhere}
@@ -1177,6 +1238,13 @@ export async function quickUpdateReservationStatus(
     );
 
     await logActivity(tx, session.user, 'تحديث حالة سريع', 'Reservation', resObj.reservationNumber, `${prevStatus} → ${newStatus}${note ? ` (${note})` : ''}`);
+    await dispatchMentionNotifications(tx, {
+      texts: [note],
+      sender: session.user,
+      entityType: 'Reservation',
+      entityId: resObj.id,
+      label: resObj.reservationNumber
+    });
 
     const updatedRes: Record<string, any> = {
       ...resObj,
@@ -1346,6 +1414,217 @@ export async function updateReservationDetails(
   return out;
 }
 
+export async function saveReservationPinnedNote(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'pin_reservation_note');
+  if (session.user.role !== 'general_manager' && session.user.role !== 'supervisor') {
+    throw new Error('FORBIDDEN: إضافة الملاحظة المثبتة متاحة للمشرف والمدير العام فقط.');
+  }
+  const resId = str(payload.reservationId);
+  const note = str(payload.note);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
+    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const existing = mapReservationRowToClient(resQuery.rows[0], false);
+
+    const nowIso = new Date().toISOString();
+    const byId = note ? session.user.id : '';
+    const byName = note ? session.user.name : '';
+    const noteUpdatedAt = note ? nowIso : '';
+
+    await tx.query(
+      `UPDATE reservations
+       SET pinned_note = $2, pinned_note_by_id = $3, pinned_note_by_name = $4,
+           pinned_note_updated_at = $5, updated_at = $6::timestamptz
+       WHERE id = $1`,
+      [resId, note, byId, byName, noteUpdatedAt, nowIso]
+    );
+
+    await logActivity(
+      tx,
+      session.user,
+      note ? 'تثبيت ملاحظة على الحجز' : 'إزالة الملاحظة المثبتة',
+      'Reservation',
+      existing.reservationNumber,
+      note ? note.slice(0, 140) : 'إزالة الملاحظة المثبتة'
+    );
+
+    const updatedRes: Record<string, any> = {
+      ...existing,
+      pinnedNote: note,
+      pinnedNoteById: byId,
+      pinnedNoteByName: byName,
+      pinnedNoteUpdatedAt: noteUpdatedAt,
+      updatedAt: nowIso
+    };
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    return { reservation: updatedRes };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
+export async function recordNoAnswerFollowUp(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'add_followup');
+  const resId = str(payload.reservationId);
+  const notes = str(payload.note || payload.notes);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
+    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+
+    const nextCount = Math.max(0, Math.floor(num(resObj.noAnswerCount, 0))) + 1;
+    const nowIso = new Date().toISOString();
+    const status = str(resObj.internalStatus) || 'تم الإنشاء';
+    const action = crmCore.buildNoAnswerActionText(nextCount, 'ar');
+
+    const fuObj = {
+      id: generateId('FU'),
+      reservationId: resObj.id,
+      reservationNumber: resObj.reservationNumber,
+      customerName: resObj.customerName,
+      employeeId: session.user.id,
+      employeeName: session.user.name,
+      status,
+      action,
+      notes,
+      followUpDate: nowIso.slice(0, 10),
+      followUpTime: nowIso.slice(11, 19),
+      createdAt: nowIso
+    };
+
+    await tx.query(
+      `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
+      [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
+    );
+
+    await tx.query(
+      `INSERT INTO follow_up_history (id, follow_up_id, reservation_id, reservation_number, employee_id, employee_name, change_type, previous_status, new_status, previous_action, new_action, previous_notes, new_notes, changed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::timestamptz)`,
+      [generateId('FUH'), fuObj.id, resObj.id, resObj.reservationNumber, session.user.id, session.user.name, 'no_answer_attempt', status, status, '', action, '', notes, nowIso]
+    );
+
+    const lastText = notes ? `${action} — ${notes}` : action;
+    await tx.query(
+      `UPDATE reservations
+       SET no_answer_count = $2,
+           last_update_text = $3,
+           last_updated_by_id = $4,
+           last_updated_by_name = $5,
+           last_updated_at = $6,
+           updated_at = $6::timestamptz
+       WHERE id = $1`,
+      [resId, nextCount, lastText, session.user.id, session.user.name, nowIso]
+    );
+
+    await logActivity(tx, session.user, 'تسجيل محاولة اتصال - لم يرد', 'FollowUp', resObj.reservationNumber, `${action}${notes ? ` — ${notes}` : ''}`);
+    if (notes) {
+      await dispatchMentionNotifications(tx, {
+        texts: [notes],
+        sender: session.user,
+        entityType: 'Reservation',
+        entityId: resObj.id,
+        label: resObj.reservationNumber
+      });
+    }
+
+    const updatedRes: Record<string, any> = {
+      ...resObj,
+      noAnswerCount: nextCount,
+      lastUpdateText: lastText,
+      lastUpdatedById: session.user.id,
+      lastUpdatedByName: session.user.name,
+      lastUpdatedAt: nowIso,
+      updatedAt: nowIso,
+      isFollowed: true
+    };
+    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    return { reservation: updatedRes, followUp: fuObj, noAnswerCount: nextCount };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
+export async function togglePinnedCriticalReservation(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  const resId = str(payload.reservationId);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+  const maxPins = crmCore.MAX_PINNED_CRITICAL_RESERVATIONS || 3;
+  const settingKey = `pinned_res_u_${session.user.id}`;
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resCheck = await tx.query(`SELECT id, reservation_number FROM reservations WHERE id = $1 LIMIT 1`, [resId]);
+    if (!resCheck.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const resNumber = str(resCheck.rows[0].reservation_number || resId);
+
+    const curRow = await tx.query<{ value: string }>(`SELECT value FROM settings WHERE key = $1 FOR UPDATE`, [settingKey]);
+    const parsed = curRow.rows[0] ? parseJsonValue<any[]>(curRow.rows[0].value, []) : [];
+    const currentIds = Array.isArray(parsed)
+      ? Array.from(new Set(parsed.map((x) => str(x)).filter(Boolean)))
+      : [];
+
+    const currentlyPinned = currentIds.includes(resId);
+    const shouldPin = typeof payload.pin === 'boolean' ? payload.pin : (typeof payload.pinned === 'boolean' ? payload.pinned : !currentlyPinned);
+
+    let nextIds: string[];
+    if (shouldPin) {
+      if (currentlyPinned) {
+        nextIds = currentIds;
+      } else if (currentIds.length >= maxPins) {
+        throw new Error(`VALIDATION_ERROR: الحد الأقصى لتثبيت الحجوزات الحرجة هو ${maxPins} حجوزات فقط — قم بإلغاء تثبيت حجز أولاً.`);
+      } else {
+        nextIds = [resId, ...currentIds];
+      }
+    } else {
+      nextIds = currentIds.filter((id) => id !== resId);
+    }
+
+    const encoded = JSON.stringify(nextIds);
+    await tx.query(
+      `INSERT INTO settings (key, value, updated_by, updated_at)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [settingKey, encoded, session.user.name]
+    );
+    await enqueueSheetsMirror(tx, 'Settings', settingKey, 'upsertSetting', {
+      key: settingKey,
+      value: encoded,
+      updatedBy: session.user.name
+    });
+    await logActivity(
+      tx,
+      session.user,
+      shouldPin ? 'تثبيت حجز حرج' : 'إلغاء تثبيت حجز حرج',
+      'Reservation',
+      resNumber,
+      shouldPin ? `تثبيت الحجز (${nextIds.length}/${maxPins})` : 'إلغاء التثبيت من متابعاتي'
+    );
+
+    return { pinnedCriticalIds: nextIds, isPinned: shouldPin };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
 // ---------- FOLLOW-UPS & ASSIGNMENTS ----------
 
 export async function addFollowUp(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -1405,6 +1684,13 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
     );
 
     await logActivity(tx, session.user, 'إضافة متابعة', 'FollowUp', resObj.reservationNumber, `الحالة: ${status} — ${action}`);
+    await dispatchMentionNotifications(tx, {
+      texts: [action, notes],
+      sender: session.user,
+      entityType: 'Reservation',
+      entityId: resObj.id,
+      label: resObj.reservationNumber
+    });
 
     const updatedRes: Record<string, any> = {
       ...resObj,
@@ -1502,6 +1788,13 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     }
 
     await logActivity(tx, session.user, 'تعديل متابعة', 'FollowUp', existing.reservationNumber, `${existing.status} → ${newStatus}`);
+    await dispatchMentionNotifications(tx, {
+      texts: [newAction, newNotes],
+      sender: session.user,
+      entityType: 'Reservation',
+      entityId: existing.reservationId,
+      label: existing.reservationNumber
+    });
     return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes }, history: hist };
   });
 
@@ -1629,7 +1922,7 @@ export async function removeAssignment(executor: DbExecutor, session: AuthSessio
 }
 
 export async function getMyFollowUps(executor: DbExecutor, session: AuthSession, _payload: Record<string, any> = {}) {
-  const [resRows, fuRows] = await Promise.all([
+  const [resRows, fuRows, allFuRows, empRows, settingsMap] = await Promise.all([
     executor.query(
       `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
@@ -1641,12 +1934,34 @@ export async function getMyFollowUps(executor: DbExecutor, session: AuthSession,
     executor.query(
       `SELECT * FROM follow_ups WHERE employee_id = $1 ORDER BY created_at DESC LIMIT 300`,
       [session.user.id]
-    )
+    ),
+    executor.query(
+      `SELECT * FROM follow_ups WHERE action LIKE '%@%' OR notes LIKE '%@%' ORDER BY created_at DESC LIMIT 600`
+    ),
+    executor.query(`SELECT id, name, username, role, status FROM employees`),
+    getSettingsMap(executor)
   ]);
+
+  const employeesList = empRows.rows.map((e) => ({
+    id: str(e.id),
+    name: str(e.name),
+    username: str(e.username),
+    role: str(e.role),
+    status: str(e.status || 'active')
+  }));
+  const allFollowUpsWithMentions = allFuRows.rows.map(formatFollowUpRow);
+  const mentionFollowUps = crmCore.filterMentionFollowUps(allFollowUpsWithMentions, session.user, employeesList);
+
+  const rawPinned = parseJsonValue<any[]>(settingsMap[`pinned_res_u_${session.user.id}`], []);
+  const pinnedCriticalIds = Array.isArray(rawPinned)
+    ? Array.from(new Set(rawPinned.map((x) => str(x)).filter(Boolean))).slice(0, crmCore.MAX_PINNED_CRITICAL_RESERVATIONS || 3)
+    : [];
 
   return {
     assignedReservations: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
-    followUps: fuRows.rows.map(formatFollowUpRow)
+    followUps: fuRows.rows.map(formatFollowUpRow),
+    mentionFollowUps,
+    pinnedCriticalIds
   };
 }
 
@@ -1769,6 +2084,14 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
       });
     }
 
+    await dispatchMentionNotifications(tx, {
+      texts: [description],
+      sender: session.user,
+      entityType: 'Problem',
+      entityId: prb.id,
+      label: prb.problemNumber
+    });
+
     await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
     await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
     return { ...prb, updates: [] };
@@ -1833,10 +2156,50 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
       );
     }
 
+    if (nextStatus === 'تم الحل' && existing.status !== 'تم الحل') {
+      const recipientIds = new Set<string>();
+      if (existing.reservationId) {
+        const resAssignQ = await tx.query<{ assigned_employee_ids: any }>(
+          `SELECT assigned_employee_ids FROM reservations WHERE id = $1 LIMIT 1`,
+          [existing.reservationId]
+        );
+        if (resAssignQ.rows[0]) {
+          for (const eid of parseJsonArray<string>(resAssignQ.rows[0].assigned_employee_ids)) {
+            const cleanId = str(eid);
+            if (cleanId) recipientIds.add(cleanId);
+          }
+        }
+      }
+      for (const peid of nextEmpIds) {
+        const cleanPid = str(peid);
+        if (cleanPid) recipientIds.add(cleanPid);
+      }
+      if (existing.createdById) recipientIds.add(str(existing.createdById));
+      recipientIds.delete(session.user.id);
+
+      for (const targetEmpId of recipientIds) {
+        await createNotification(tx, {
+          recipientEmployeeId: targetEmpId,
+          type: 'problem_resolved',
+          title: 'تم حل مشكلة على حجز مسند إليك',
+          message: `تم تغيير حالة المشكلة ${existing.problemNumber} (الحجز ${existing.reservationNumber || '-'}) إلى "تم الحل" بواسطة ${session.user.name}.`,
+          entityType: 'Problem',
+          entityId: problemId
+        });
+      }
+    }
+
     const updatesRes = await tx.query(
       `SELECT * FROM problem_updates WHERE problem_id = $1 ORDER BY created_at DESC`,
       [problemId]
     );
+    await dispatchMentionNotifications(tx, {
+      texts: [note, nextDesc !== existing.description ? nextDesc : ''],
+      sender: session.user,
+      entityType: 'Problem',
+      entityId: problemId,
+      label: existing.problemNumber
+    });
     await logActivity(tx, session.user, 'تحديث مشكلة', 'Problem', existing.problemNumber, `${existing.status} → ${nextStatus}`);
 
     const updatedProblem: Record<string, any> = {
@@ -1911,7 +2274,27 @@ export async function getProblemDetails(executor: DbExecutor, _session: AuthSess
 // ---------- EMPLOYEES, ROLES & PERMISSIONS ----------
 
 export async function getEmployees(executor: DbExecutor, session: AuthSession) {
-  requirePermission(session, 'view_employees');
+  if (!crmCore.canUserPerform(session.user, 'view_employees')) {
+    const dirRes = await executor.query(
+      `SELECT id, name, username, role, job_title, status
+       FROM employees
+       WHERE status = 'active'
+       ORDER BY name ASC`
+    );
+    const dirItems = dirRes.rows.map((r: any) => ({
+      id: str(r.id),
+      name: str(r.name),
+      username: str(r.username),
+      role: str(r.role || 'agent'),
+      jobTitle: str(r.job_title),
+      status: str(r.status || 'active')
+    }));
+    return {
+      items: dirItems,
+      total: dirItems.length,
+      directoryOnly: true
+    };
+  }
   const [empRes, resCountsRes, fuCountsRes, prbCountsRes, presets, customPerms] = await Promise.all([
     executor.query(`SELECT * FROM employees ORDER BY created_at ASC`),
     executor.query<{ emp_id: string; cnt: number }>(
@@ -2412,13 +2795,19 @@ export async function getSettings(executor: DbExecutor, session: AuthSession) {
     resolveServerConfig(executor)
   ]);
   const dbUrl = getDatabaseUrl();
+  const syncInterval = crmCore.normalizeAutoSyncInterval(
+    map.auto_sync_interval_hours,
+    map.auto_sync_interval_minutes
+  );
   return {
     ...map,
+    ui_simplification: crmCore.normalizeUiSimplificationSettings(map.ui_simplification),
     connection_mode: serverCfg.mode || 'neon',
     gas_webapp_url: serverCfg.gasWebAppUrl,
     rg_api_base_url: serverCfg.rgApiBaseUrl,
     auto_sync_enabled: map.auto_sync_enabled !== false,
-    auto_sync_interval_hours: num(map.auto_sync_interval_hours, 12),
+    auto_sync_interval_hours: syncInterval.hours,
+    auto_sync_interval_minutes: syncInterval.minutes,
     hasRgToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
     hasDirectToken: Boolean(serverCfg.rgToken),
     hasSyncSecret: Boolean(serverCfg.syncApiSecret),
@@ -2460,9 +2849,18 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   if (typeof payload.allow_agent_view_all === 'boolean') updates.push(['allow_agent_view_all', String(payload.allow_agent_view_all)]);
   if (payload.default_language) updates.push(['default_language', str(payload.default_language)]);
   if (typeof payload.auto_sync_enabled === 'boolean') updates.push(['auto_sync_enabled', String(payload.auto_sync_enabled)]);
-  if (payload.auto_sync_interval_hours !== undefined) {
-    const hVal = Math.max(1, Math.min(168, Math.round(num(payload.auto_sync_interval_hours, 12))));
-    updates.push(['auto_sync_interval_hours', String(hVal)]);
+  if (payload.ui_simplification !== undefined) {
+    const normUi = crmCore.normalizeUiSimplificationSettings(payload.ui_simplification);
+    updates.push(['ui_simplification', JSON.stringify(normUi)]);
+  }
+  if (payload.auto_sync_interval_hours !== undefined || payload.auto_sync_interval_minutes !== undefined) {
+    const curMap = await getSettingsMap(executor);
+    const interval = crmCore.normalizeAutoSyncInterval(
+      payload.auto_sync_interval_hours !== undefined ? payload.auto_sync_interval_hours : curMap.auto_sync_interval_hours,
+      payload.auto_sync_interval_minutes !== undefined ? payload.auto_sync_interval_minutes : curMap.auto_sync_interval_minutes
+    );
+    updates.push(['auto_sync_interval_hours', String(interval.hours)]);
+    updates.push(['auto_sync_interval_minutes', String(interval.minutes)]);
   }
 
   await executor.withTransaction(async (tx) => {
@@ -2480,6 +2878,384 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
 
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return getSettings(executor, session);
+}
+
+export async function saveUserLayoutPrefs(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  const normalized = crmCore.normalizeUserLayoutPrefs(payload);
+  const key = `layout_prefs_u_${session.user.id}`;
+  const value = JSON.stringify(normalized);
+  await executor.query(
+    `INSERT INTO settings (key, value, updated_by, updated_at)
+     VALUES ($1,$2,$3,NOW())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+    [key, value, session.user.name]
+  );
+  return { layoutPrefs: normalized };
+}
+
+const RESERVATION_CLIENT_COLUMNS = `
+  id, source_reservation_id, reservation_number, source_created_at,
+  customer_name, customer_phone, customer_email, customer_id_number,
+  company_name, branch_name, deliver_branch_name,
+  car_name, plate_number, car_category,
+  start_date, start_time, original_end_date, original_end_time,
+  end_date, end_time, extended_until_date, extended_until_time,
+  days_count, extended_days_count, total_days_count,
+  original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
+  payment_method, payment_status, daily_price, discount_amount, vat_amount,
+  base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
+  internal_status, priority, assigned_employee_ids, assigned_employee_names,
+  last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
+  has_problem, pinned_note, pinned_note_by_id, pinned_note_by_name, pinned_note_updated_at, no_answer_count,
+  created_at, updated_at, status_history
+`;
+
+function buildScopeDatePreFilterSql(scopeInfo: any): { whereSql: string; params: any[] } {
+  const prefix = scopeInfo.scope === 'month' ? str(scopeInfo.ym) : (scopeInfo.year ? String(scopeInfo.year) : '');
+  if (!prefix) return { whereSql: '', params: [] };
+  return {
+    whereSql: `WHERE (
+      COALESCE(
+        NULLIF(start_date, ''),
+        NULLIF(source_created_at, ''),
+        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')
+      ) LIKE $1
+      OR COALESCE(NULLIF(start_date, ''), NULLIF(source_created_at, ''), '') !~ '^[0-9]{4}-'
+    )`,
+    params: [`${prefix}%`]
+  };
+}
+
+export async function previewDeleteReservations(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_settings');
+  const scopeInfo = crmCore.normalizeDeleteReservationsScope(payload);
+  const totRes = await executor.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM reservations`);
+  const totalReservations = num(totRes.rows[0]?.cnt, 0);
+  let count = 0;
+  if (scopeInfo.scope === 'all') {
+    count = totalReservations;
+  } else {
+    const pre = buildScopeDatePreFilterSql(scopeInfo);
+    const rowsRes = await executor.query(
+      `SELECT id, start_date, source_created_at, created_at FROM reservations ${pre.whereSql}`,
+      pre.params
+    );
+    const mapped = rowsRes.rows.map((r: any) => ({
+      id: str(r.id),
+      startDate: str(r.start_date),
+      sourceCreatedAt: str(r.source_created_at),
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : str(r.created_at)
+    }));
+    count = crmCore.filterReservationsForDeleteScope(mapped, scopeInfo).length;
+  }
+  return {
+    count,
+    totalReservations,
+    scope: scopeInfo.scope,
+    year: scopeInfo.year,
+    month: scopeInfo.month,
+    ym: scopeInfo.ym,
+    periodLabelAr: scopeInfo.periodLabelAr,
+    periodLabelEn: scopeInfo.periodLabelEn
+  };
+}
+
+export async function deleteAllReservations(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_settings');
+  const scopeInfo = crmCore.normalizeDeleteReservationsScope(payload);
+  const check = crmCore.validateDeleteAllReservationsConfirmation(payload);
+  if (!check.valid) {
+    throw new Error(`VALIDATION_ERROR: ${check.message}`);
+  }
+
+  const out = await executor.withTransaction(async (tx) => {
+    const empRes = await tx.query(
+      `SELECT id, password_hash, salt FROM employees WHERE id = $1 LIMIT 1`,
+      [session.employeeId]
+    );
+    const empRow = empRes.rows[0];
+    if (!empRow) {
+      throw new Error('UNAUTHORIZED: تعذر التحقق من حساب المستخدم الحالي.');
+    }
+    const expectedHash = hashPassword(String(payload.password || ''), str(empRow.salt));
+    if (expectedHash !== str(empRow.password_hash)) {
+      throw new Error('VALIDATION_ERROR: كلمة المرور المدخلة غير صحيحة.');
+    }
+
+    const pre = scopeInfo.scope === 'all' ? { whereSql: '', params: [] } : buildScopeDatePreFilterSql(scopeInfo);
+    const allRowsRes = await tx.query(
+      `SELECT ${RESERVATION_CLIENT_COLUMNS} FROM reservations ${pre.whereSql} ORDER BY updated_at DESC`,
+      pre.params
+    );
+    const allMapped = allRowsRes.rows.map((r: any) => mapReservationRowToClient(r, false));
+    const targets = scopeInfo.scope === 'all'
+      ? allMapped
+      : crmCore.filterReservationsForDeleteScope(allMapped, scopeInfo);
+    const targetIds = targets.map((t: any) => str(t.id)).filter(Boolean);
+    const deletedCount = targetIds.length;
+
+    if (scopeInfo.scope === 'all') {
+      await tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id IS NOT NULL`).catch(() => undefined);
+      await tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id IS NOT NULL`).catch(() => undefined);
+      await tx.query(`DELETE FROM follow_up_history`);
+      await tx.query(`DELETE FROM follow_ups`);
+      await tx.query(`DELETE FROM assignments`);
+      await tx.query(`DELETE FROM extensions`);
+      await tx.query(`DELETE FROM reservations`);
+      await tx.query(
+        `UPDATE sync_checkpoints SET last_cursor = '', last_batch_count = 0, last_status = 'cleared', meta = '{}'::jsonb, updated_at = NOW()`
+      ).catch(() => undefined);
+    } else if (deletedCount > 0) {
+      await tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]).catch(() => undefined);
+      await tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]).catch(() => undefined);
+      await tx.query(`DELETE FROM follow_up_history WHERE reservation_id = ANY($1::text[])`, [targetIds]);
+      await tx.query(`DELETE FROM follow_ups WHERE reservation_id = ANY($1::text[])`, [targetIds]);
+      await tx.query(`DELETE FROM assignments WHERE reservation_id = ANY($1::text[])`, [targetIds]);
+      await tx.query(`DELETE FROM extensions WHERE reservation_id = ANY($1::text[])`, [targetIds]);
+      await tx.query(`DELETE FROM reservations WHERE id = ANY($1::text[])`, [targetIds]);
+    }
+
+    const scopeEntityKey = scopeInfo.scope === 'all' ? 'ALL' : (scopeInfo.ym || String(scopeInfo.year || 'SCOPE'));
+    await logActivity(
+      tx,
+      session.user,
+      scopeInfo.scope === 'all' ? 'حذف جميع الحجوزات' : `حذف حجوزات (${scopeInfo.periodLabelAr})`,
+      'Reservation',
+      scopeEntityKey,
+      `حذف حجوزات (${scopeInfo.periodLabelAr}) نهائياً (${deletedCount} حجز) بواسطة ${session.user.name}`
+    );
+    await enqueueSheetsMirror(tx, 'Reservation', scopeEntityKey, 'deleteAllReservations', {
+      deletedBy: session.user.name,
+      deletedCount,
+      scope: scopeInfo.scope,
+      periodLabel: scopeInfo.periodLabelAr
+    });
+
+    return {
+      deleted: true,
+      scope: scopeInfo.scope,
+      year: scopeInfo.year,
+      month: scopeInfo.month,
+      ym: scopeInfo.ym,
+      periodLabelAr: scopeInfo.periodLabelAr,
+      deletedReservationsCount: deletedCount,
+      exportedRows: targets
+    };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
+export async function importReservationsFromExcel(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  if (!crmCore.canUserPerform(session.user, 'pull_reservations') && !crmCore.canUserPerform(session.user, 'manage_settings')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية استيراد الحجوزات.');
+  }
+  const rawRows = Array.isArray(payload.rows) ? payload.rows : [];
+  if (!rawRows.length) {
+    throw new Error('VALIDATION_ERROR: ملف Excel لا يحتوي على صفوف للاستيراد.');
+  }
+
+  const candidateResNums = Array.from(
+    new Set(
+      rawRows
+        .map((row: any) => {
+          if (!row || typeof row !== 'object') return '';
+          const v =
+            row.reservationNumber ??
+            row.reservation_number ??
+            row['رقم الحجز'] ??
+            row['رقم العقد'] ??
+            row['Reservation #'] ??
+            row['Reservation No'] ??
+            row['Booking #'] ??
+            row['Booking Number'] ??
+            row['Res No'] ??
+            row['المرجع'] ??
+            '';
+          return crmCore.convertEasternDigitsToAscii(str(v)).toLowerCase();
+        })
+        .filter(Boolean)
+    )
+  );
+
+  const out = await executor.withTransaction(async (tx) => {
+    let existingList: Record<string, any>[] = [];
+    if (candidateResNums.length > 0) {
+      const existingRes = await tx.query(
+        `SELECT ${RESERVATION_CLIENT_COLUMNS} FROM reservations WHERE LOWER(TRIM(reservation_number)) = ANY($1::text[])`,
+        [candidateResNums]
+      );
+      existingList = existingRes.rows.map((r: any) => mapReservationRowToClient(r, false));
+    }
+    const parsed = crmCore.parseImportedReservationRows(rawRows, existingList, session.user);
+    if (!parsed.validRows.length) {
+      throw new Error('VALIDATION_ERROR: لم يتم العثور على صفوف حجوزات صالحة داخل الملف.');
+    }
+
+    const rowsToSave = parsed.validRows;
+    for (let start = 0; start < rowsToSave.length; start += 200) {
+      const chunk = rowsToSave.slice(start, start + 200);
+      await tx.query(
+        `INSERT INTO reservations (
+           id, source_reservation_id, reservation_number, source_created_at,
+           customer_name, customer_phone, customer_email, customer_id_number,
+           company_name, branch_name, deliver_branch_name, car_name, plate_number, car_category,
+           start_date, start_time, original_end_date, original_end_time, end_date, end_time,
+           extended_until_date, extended_until_time, days_count, extended_days_count, total_days_count,
+           original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
+           payment_method, payment_status, daily_price, discount_amount, vat_amount,
+           base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
+           internal_status, priority, assigned_employee_ids, assigned_employee_names,
+           last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
+           has_problem, created_at, updated_at, status_history, raw_json
+         )
+         SELECT * FROM unnest(
+           $1::text[], $2::text[], $3::text[], $4::text[],
+           $5::text[], $6::text[], $7::text[], $8::text[],
+           $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
+           $15::text[], $16::text[], $17::text[], $18::text[], $19::text[], $20::text[],
+           $21::text[], $22::text[], $23::int4[], $24::int4[], $25::int4[],
+           $26::text[], $27::text[], $28::text[], $29::text[],
+           $30::text[], $31::text[], $32::numeric[], $33::numeric[], $34::numeric[],
+           $35::numeric[], $36::int4[], $37::numeric[], $38::numeric[], $39::boolean[],
+           $40::text[], $41::text[], $42::jsonb[], $43::jsonb[],
+           $44::text[], $45::text[], $46::text[], $47::text[],
+           $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[]
+         )
+         ON CONFLICT (reservation_number) DO UPDATE SET
+           customer_name = EXCLUDED.customer_name,
+           customer_phone = EXCLUDED.customer_phone,
+           customer_email = EXCLUDED.customer_email,
+           customer_id_number = EXCLUDED.customer_id_number,
+           company_name = EXCLUDED.company_name,
+           branch_name = EXCLUDED.branch_name,
+           deliver_branch_name = EXCLUDED.deliver_branch_name,
+           car_name = EXCLUDED.car_name,
+           plate_number = EXCLUDED.plate_number,
+           car_category = EXCLUDED.car_category,
+           start_date = EXCLUDED.start_date,
+           start_time = EXCLUDED.start_time,
+           original_end_date = EXCLUDED.original_end_date,
+           original_end_time = EXCLUDED.original_end_time,
+           end_date = EXCLUDED.end_date,
+           end_time = EXCLUDED.end_time,
+           extended_until_date = EXCLUDED.extended_until_date,
+           extended_until_time = EXCLUDED.extended_until_time,
+           days_count = EXCLUDED.days_count,
+           extended_days_count = EXCLUDED.extended_days_count,
+           total_days_count = EXCLUDED.total_days_count,
+           original_status_ar = EXCLUDED.original_status_ar,
+           payment_method = EXCLUDED.payment_method,
+           payment_status = EXCLUDED.payment_status,
+           daily_price = EXCLUDED.daily_price,
+           discount_amount = EXCLUDED.discount_amount,
+           vat_amount = EXCLUDED.vat_amount,
+           base_amount = EXCLUDED.base_amount,
+           extensions_count = EXCLUDED.extensions_count,
+           extensions_amount = EXCLUDED.extensions_amount,
+           total_amount = EXCLUDED.total_amount,
+           has_extensions = EXCLUDED.has_extensions,
+           internal_status = EXCLUDED.internal_status,
+           priority = EXCLUDED.priority,
+           last_update_text = EXCLUDED.last_update_text,
+           last_updated_by_id = EXCLUDED.last_updated_by_id,
+           last_updated_by_name = EXCLUDED.last_updated_by_name,
+           last_updated_at = EXCLUDED.last_updated_at,
+           updated_at = EXCLUDED.updated_at,
+           status_history = EXCLUDED.status_history`,
+        [
+          chunk.map((r: any) => str(r.id)),
+          chunk.map((r: any) => str(r.sourceReservationId)),
+          chunk.map((r: any) => str(r.reservationNumber)),
+          chunk.map((r: any) => str(r.sourceCreatedAt)),
+          chunk.map((r: any) => str(r.customerName)),
+          chunk.map((r: any) => str(r.customerPhone)),
+          chunk.map((r: any) => str(r.customerEmail)),
+          chunk.map((r: any) => str(r.customerIdNumber)),
+          chunk.map((r: any) => str(r.companyName)),
+          chunk.map((r: any) => str(r.branchName)),
+          chunk.map((r: any) => str(r.deliverBranchName)),
+          chunk.map((r: any) => str(r.carName)),
+          chunk.map((r: any) => str(r.plateNumber)),
+          chunk.map((r: any) => str(r.carCategory)),
+          chunk.map((r: any) => str(r.startDate)),
+          chunk.map((r: any) => str(r.startTime)),
+          chunk.map((r: any) => str(r.originalEndDate)),
+          chunk.map((r: any) => str(r.originalEndTime)),
+          chunk.map((r: any) => str(r.endDate)),
+          chunk.map((r: any) => str(r.endTime)),
+          chunk.map((r: any) => str(r.extendedUntilDate)),
+          chunk.map((r: any) => str(r.extendedUntilTime)),
+          chunk.map((r: any) => Math.max(1, Math.round(num(r.daysCount, 1)))),
+          chunk.map((r: any) => Math.max(0, Math.round(num(r.extendedDaysCount, 0)))),
+          chunk.map((r: any) => Math.max(1, Math.round(num(r.totalDaysCount, 1)))),
+          chunk.map((r: any) => str(r.originalStatusCode || 'excel_import')),
+          chunk.map((r: any) => str(r.originalStatusAr)),
+          chunk.map((r: any) => str(r.pickupTypeAr)),
+          chunk.map((r: any) => str(r.returnTypeAr)),
+          chunk.map((r: any) => str(r.paymentMethod)),
+          chunk.map((r: any) => str(r.paymentStatus)),
+          chunk.map((r: any) => num(r.dailyPrice, 0)),
+          chunk.map((r: any) => num(r.discountAmount, 0)),
+          chunk.map((r: any) => num(r.vatAmount, 0)),
+          chunk.map((r: any) => num(r.baseAmount, 0)),
+          chunk.map((r: any) => Math.max(0, Math.round(num(r.extensionsCount, 0)))),
+          chunk.map((r: any) => num(r.extensionsAmount, 0)),
+          chunk.map((r: any) => num(r.totalAmount, 0)),
+          chunk.map((r: any) => Boolean(r.hasExtensions)),
+          chunk.map((r: any) => str(r.internalStatus)),
+          chunk.map((r: any) => str(r.priority || 'عادي')),
+          chunk.map((r: any) => JSON.stringify(Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [])),
+          chunk.map((r: any) => JSON.stringify(Array.isArray(r.assignedEmployeeNames) ? r.assignedEmployeeNames : [])),
+          chunk.map((r: any) => str(r.lastUpdateText)),
+          chunk.map((r: any) => str(r.lastUpdatedById)),
+          chunk.map((r: any) => str(r.lastUpdatedByName)),
+          chunk.map((r: any) => str(r.lastUpdatedAt)),
+          chunk.map((r: any) => Boolean(r.hasProblem)),
+          chunk.map((r: any) => str(r.createdAt || new Date().toISOString())),
+          chunk.map((r: any) => str(r.updatedAt || new Date().toISOString())),
+          chunk.map((r: any) => JSON.stringify(Array.isArray(r.statusHistory) ? r.statusHistory : [])),
+          chunk.map((r: any) => JSON.stringify({ importedFromExcel: true }))
+        ]
+      );
+    }
+
+    await logActivity(
+      tx,
+      session.user,
+      'استيراد حجوزات من Excel',
+      'Reservation',
+      'EXCEL',
+      `استيراد ${parsed.newCount} حجز جديد وتحديث ${parsed.updateCount} حجز من Excel (${parsed.skippedRows} صفوف متخطاة)`
+    );
+
+    return {
+      importedCount: parsed.newCount,
+      updatedCount: parsed.updateCount,
+      skippedCount: parsed.skippedRows,
+      totalProcessed: rowsToSave.length,
+      errors: parsed.errors
+    };
+  });
+
+  return out;
 }
 
 export async function getSyncStatus(executor: DbExecutor, session: AuthSession) {
@@ -2504,10 +3280,15 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     startedAt: s.started_at instanceof Date ? s.started_at.toISOString() : str(s.started_at),
     finishedAt: s.finished_at instanceof Date ? s.finished_at.toISOString() : str(s.finished_at)
   }));
+  const syncInterval = crmCore.normalizeAutoSyncInterval(
+    map.auto_sync_interval_hours,
+    map.auto_sync_interval_minutes
+  );
   return {
     hasToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
     autoSyncEnabled: map.auto_sync_enabled !== false,
-    autoSyncIntervalHours: num(map.auto_sync_interval_hours, 12),
+    autoSyncIntervalHours: syncInterval.hours,
+    autoSyncIntervalMinutes: syncInterval.minutes,
     lastSync: logs[0] || null,
     logs,
     checkpoints: ckRes.rows

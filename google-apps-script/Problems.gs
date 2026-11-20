@@ -123,6 +123,13 @@ function createProblem(session, payload) {
       }
     }
     if (notifBatch.length > 0) createNotificationsBatch_(notifBatch);
+    dispatchMentionNotifications_(
+      [description],
+      { id: session.employeeId, name: session.user.name },
+      'Problem',
+      problem.id,
+      problem.problemNumber
+    );
     bumpCacheVersion_('PRB');
 
     var clientProblem = formatProblemForClient(problem);
@@ -235,6 +242,51 @@ function updateProblem(session, payload) {
         updatedAt: now
       });
     }
+
+    if (newStatus === 'تم الحل' && existing.status !== 'تم الحل') {
+      var resolvedRecipientSet = {};
+      var resAssignedIds = resRow ? safeJsonParse(resRow.assignedEmployeeIds, []) : [];
+      if (Array.isArray(resAssignedIds)) {
+        for (var rIdx = 0; rIdx < resAssignedIds.length; rIdx++) {
+          var ridVal = normalizeStr(resAssignedIds[rIdx]);
+          if (ridVal) resolvedRecipientSet[ridVal] = true;
+        }
+      }
+      var ticketAssignedIds = patch.assignedEmployeeIds
+        ? safeJsonParse(patch.assignedEmployeeIds, [])
+        : safeJsonParse(existing.assignedEmployeeIds, []);
+      if (Array.isArray(ticketAssignedIds)) {
+        for (var pIdx = 0; pIdx < ticketAssignedIds.length; pIdx++) {
+          var pidVal = normalizeStr(ticketAssignedIds[pIdx]);
+          if (pidVal) resolvedRecipientSet[pidVal] = true;
+        }
+      }
+      if (existing.createdById) resolvedRecipientSet[normalizeStr(existing.createdById)] = true;
+      delete resolvedRecipientSet[session.employeeId];
+
+      var resolvedBatch = [];
+      var rKeys = Object.keys(resolvedRecipientSet);
+      for (var nIdx = 0; nIdx < rKeys.length; nIdx++) {
+        resolvedBatch.push({
+          recipientEmployeeId: rKeys[nIdx],
+          recipientRole: '',
+          type: 'problem_resolved',
+          title: 'تم حل مشكلة على حجز مسند إليك',
+          message: 'تم تغيير حالة المشكلة ' + existing.problemNumber + ' (الحجز ' + (existing.reservationNumber || '-') + ') إلى "تم الحل" بواسطة ' + session.user.name + '.',
+          entityType: 'Problem',
+          entityId: problemId
+        });
+      }
+      if (resolvedBatch.length > 0) createNotificationsBatch_(resolvedBatch);
+    }
+
+    dispatchMentionNotifications_(
+      [note, (patch.description && patch.description !== existing.description) ? patch.description : ''],
+      { id: session.employeeId, name: session.user.name },
+      'Problem',
+      problemId,
+      existing.problemNumber
+    );
 
     bumpCacheVersion_('PRB');
     var clientProblem = formatProblemForClient(updated);

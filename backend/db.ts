@@ -174,9 +174,14 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
         const schemaSql = loadSchemaSql();
         await executor.query(schemaSql);
       } else {
-        // Idempotent index check for existing databases without altering mock tests
+        // Idempotent index & column migration for existing databases without altering mock tests
         await executor.query(
-          `CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);
+          `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note TEXT NOT NULL DEFAULT '';
+           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_id TEXT NOT NULL DEFAULT '';
+           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_name TEXT NOT NULL DEFAULT '';
+           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_updated_at TEXT NOT NULL DEFAULT '';
+           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS no_answer_count INTEGER NOT NULL DEFAULT 0;
+           CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_reservations_company_updated ON reservations (company_name, updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);`
         ).catch(() => undefined);

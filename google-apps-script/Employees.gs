@@ -3,6 +3,31 @@
  */
 
 function getEmployees(session) {
+  if (!hasPermission(session, 'view_employees')) {
+    var allDirEmps = readAllRecords(RG_SHEETS.EMPLOYEES, false);
+    var dirList = [];
+    for (var d = 0; d < allDirEmps.length; d++) {
+      var empD = allDirEmps[d];
+      if (!empD || empD.status !== 'active') continue;
+      dirList.push({
+        id: empD.id,
+        name: empD.name,
+        username: empD.username,
+        role: empD.role || RG_ROLES.AGENT,
+        jobTitle: empD.jobTitle || '',
+        status: 'active'
+      });
+    }
+    dirList.sort(function (a, b) {
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+    return {
+      items: dirList,
+      total: dirList.length,
+      directoryOnly: true
+    };
+  }
+
   var empCacheKey = 'RG_EMP_SUMMARY_V' + getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + getCacheVersion_('PRB') + '_' + getCacheVersion_('EMP');
   try {
     var cachedRaw = CacheService.getScriptCache().get(empCacheKey);

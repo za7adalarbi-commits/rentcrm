@@ -2,47 +2,75 @@
  * RENTAL GATE CRM — Role-Based Access Control (RBAC), Presets & Permissions Catalog
  */
 
+var RG_DASHBOARD_PERMISSION_KEYS = [
+  'dash_view_hero_kpis',
+  'dash_view_strip_kpis',
+  'dash_view_daily_chart',
+  'dash_view_recent_activity',
+  'dash_view_charts_grid',
+  'dash_view_radar',
+  'dash_view_heatmap',
+  'dash_view_bottom_bento',
+  'dash_view_handover'
+];
+
 var RG_ROLE_PERMISSIONS = {
   general_manager: [
-    'view_dashboard', 'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
+    'view_dashboard', 'dash_perms_configured'
+  ].concat(RG_DASHBOARD_PERMISSION_KEYS).concat([
+    'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
     'claim_reservation', 'unclaim_reservation', 'quick_update_status',
-    'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details',
+    'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
     'create_problem', 'update_problem', 'view_employees', 'manage_employees',
     'view_all_logs', 'sync_data', 'manage_settings', 'export_reports'
-  ],
+  ]),
   supervisor: [
-    'view_dashboard', 'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
+    'view_dashboard', 'dash_perms_configured'
+  ].concat(RG_DASHBOARD_PERMISSION_KEYS).concat([
+    'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
     'claim_reservation', 'unclaim_reservation', 'quick_update_status',
-    'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details',
+    'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
     'create_problem', 'update_problem', 'view_employees', 'view_all_logs',
     'sync_data', 'export_reports'
-  ],
+  ]),
   agent: [
-    'view_dashboard', 'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
+    'view_dashboard', 'dash_perms_configured'
+  ].concat(RG_DASHBOARD_PERMISSION_KEYS).concat([
+    'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
     'quick_update_status', 'create_problem', 'update_problem', 'export_reports'
-  ]
+  ])
 };
 
 var RG_BUILTIN_PERMISSIONS_CATALOG = [
-  { key: 'view_dashboard', label: 'عرض لوحة التحكم', group: 'عام' },
-  { key: 'view_all_reservations', label: 'عرض جميع الحجوزات', group: 'الحجوزات' },
-  { key: 'pull_reservations', label: 'جلب الحجوزات من Rental Gate (صفحة الحجوزات)', group: 'الحجوزات' },
-  { key: 'claim_reservation', label: 'استلام حجز ذاتياً للمتابعة', group: 'الحجوزات' },
-  { key: 'unclaim_reservation', label: 'إلغاء استلام حجز', group: 'الحجوزات' },
-  { key: 'quick_update_status', label: 'تغيير حالة الحجز مباشرة', group: 'الحجوزات' },
-  { key: 'assign_employees', label: 'توزيع وإعادة إسناد الحجوزات', group: 'الحجوزات' },
-  { key: 'add_followup', label: 'إضافة متابعة وملاحظات', group: 'المتابعات' },
-  { key: 'edit_any_followup', label: 'تعديل متابعات الآخرين', group: 'المتابعات' },
-  { key: 'edit_reservation_details', label: 'تعديل تفاصيل الحجز والمبالغ', group: 'الحجوزات' },
-  { key: 'edit_ticket_details', label: 'تعديل وصف وبيانات تذاكر المشاكل', group: 'المشاكل' },
-  { key: 'create_problem', label: 'إنشاء تذكرة مشكلة', group: 'المشاكل' },
-  { key: 'update_problem', label: 'تحديث حالة/أولوية المشكلة', group: 'المشاكل' },
-  { key: 'view_employees', label: 'عرض قائمة وملفات الموظفين', group: 'الفريق' },
-  { key: 'manage_employees', label: 'إدارة الموظفين والصلاحيات', group: 'الفريق' },
-  { key: 'view_all_logs', label: 'عرض سجل نشاطات الفريق', group: 'التقارير' },
-  { key: 'export_reports', label: 'تصدير التقارير (Excel / PDF)', group: 'التقارير' },
-  { key: 'sync_data', label: 'إدارة API والمزامنة التلقائية', group: 'الإعدادات' },
-  { key: 'manage_settings', label: 'تعديل إعدادات النظام', group: 'الإعدادات' }
+  { key: 'view_dashboard', label: 'عرض لوحة التحكم والإحصائيات', group: 'عام' },
+  { key: 'dash_view_hero_kpis', label: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', group: 'لوحة التحكم' },
+  { key: 'dash_view_strip_kpis', label: 'شريط مؤشرات الحالات التفصيلية (KPI Strip)', group: 'لوحة التحكم' },
+  { key: 'dash_view_daily_chart', label: 'رسم المتابعات اليومية', group: 'لوحة التحكم' },
+  { key: 'dash_view_recent_activity', label: 'بطاقة أحدث النشاطات', group: 'لوحة التحكم' },
+  { key: 'dash_view_charts_grid', label: 'شبكة الرسوم البيانية التحليلية (6 مخططات)', group: 'لوحة التحكم' },
+  { key: 'dash_view_radar', label: 'رادار انتهاء الحجوزات (24 ساعة)', group: 'لوحة التحكم' },
+  { key: 'dash_view_heatmap', label: 'مصفوفة ساعات الذروة (تخطيط الورديات)', group: 'لوحة التحكم' },
+  { key: 'dash_view_bottom_bento', label: 'أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة', group: 'لوحة التحكم' },
+  { key: 'dash_view_handover', label: 'زر تسليم الوردية (PDF) داخل لوحة التحكم', group: 'لوحة التحكم' },
+  { key: 'view_all_reservations', label: 'استعراض جميع الحجوزات', group: 'الحجوزات' },
+  { key: 'pull_reservations', label: 'سحب واستيراد وتحديث الحجوزات من قائمة الحجوزات', group: 'الحجوزات' },
+  { key: 'claim_reservation', label: 'استلام الحجوزات ذاتيًا', group: 'الحجوزات' },
+  { key: 'unclaim_reservation', label: 'إلغاء استلام الحجز', group: 'الحجوزات' },
+  { key: 'quick_update_status', label: 'التحديث السريع لحالة الحجز', group: 'الحجوزات' },
+  { key: 'assign_employees', label: 'إسناد وإزالة الموظفين عن الحجوزات', group: 'الإشراف' },
+  { key: 'add_followup', label: 'إضافة متابعات وملاحظات', group: 'المتابعات' },
+  { key: 'edit_any_followup', label: 'تعديل متابعات وتحديثات الفريق', group: 'المتابعات' },
+  { key: 'edit_reservation_details', label: 'تعديل تفاصيل الحجوزات والأسعار', group: 'الإشراف' },
+  { key: 'pin_reservation_note', label: 'تثبيت وتعديل الملاحظات المثبتة أعلى الحجز', group: 'الإشراف' },
+  { key: 'edit_ticket_details', label: 'تعديل بيانات ووصف التذاكر', group: 'الإشراف' },
+  { key: 'create_problem', label: 'تحويل الحجز إلى مشكلة / تذكرة', group: 'المشكلات' },
+  { key: 'update_problem', label: 'تحديث حالة التذاكر والمشكلات', group: 'المشكلات' },
+  { key: 'view_employees', label: 'عرض الموظفين وملفات عملائهم', group: 'الإشراف' },
+  { key: 'manage_employees', label: 'إدارة حسابات الموظفين وصلاحياتهم', group: 'الإدارة والربط (API)' },
+  { key: 'view_all_logs', label: 'الاطلاع على سجل نشاطات الفريق', group: 'التقارير والرقابة' },
+  { key: 'export_reports', label: 'تصدير تقارير Excel وPDF', group: 'التقارير والرقابة' },
+  { key: 'sync_data', label: 'الوصول إلى Rental Gate API والمزامنة', group: 'الإدارة والربط (API)' },
+  { key: 'manage_settings', label: 'تعديل إعدادات النظام والتحديث التلقائي', group: 'الإدارة والربط (API)' }
 ];
 
 var RG_DEFAULT_ROLE_PRESETS = [
@@ -65,7 +93,13 @@ var RG_DEFAULT_ROLE_PRESETS = [
     label: 'مسؤول جودة وتقارير (قراءة وتصدير)',
     jobTitle: 'أخصائي جودة وتقارير',
     role: RG_ROLES.AGENT,
-    permissions: ['view_dashboard', 'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports']
+    permissions: [
+      'view_dashboard', 'dash_perms_configured',
+      'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
+      'dash_view_recent_activity', 'dash_view_charts_grid', 'dash_view_radar',
+      'dash_view_heatmap', 'dash_view_bottom_bento',
+      'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports'
+    ]
   },
   {
     id: 'supervisor_ops',
@@ -118,6 +152,19 @@ function hasPermission(sessionOrUser, action) {
   }
   var perms = resolveEffectivePermissions(userObj);
   return perms.indexOf(action) !== -1;
+}
+
+function canUserViewDashboardSection(sessionOrUser, permKey) {
+  if (!sessionOrUser || !permKey) return false;
+  var userObj = sessionOrUser.user ? sessionOrUser.user : sessionOrUser;
+  var allowed = resolveEffectivePermissions(userObj);
+  if (allowed.indexOf('view_dashboard') === -1) return false;
+  var hasGranularConfig = allowed.indexOf('dash_perms_configured') !== -1 ||
+    RG_DASHBOARD_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
+  if (hasGranularConfig) {
+    return allowed.indexOf(permKey) !== -1;
+  }
+  return true;
 }
 
 function sanitizeEmployeeForClient(emp) {

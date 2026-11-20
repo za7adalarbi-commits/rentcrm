@@ -1008,4 +1008,29 @@ test('extractReservationNumber prefers full booking code over numeric id and rec
   assert.equal(preserved.originalStatusAr, 'معلق');
 });
 
+test('normalizeAutoSyncInterval, formatAutoSyncIntervalAr, and validateDeleteAllReservationsConfirmation handle minutes and security checks', () => {
+  // Hours + minutes normalization
+  assert.deepEqual(core.normalizeAutoSyncInterval(undefined, undefined), { hours: 12, minutes: 0, totalMinutes: 720 });
+  assert.deepEqual(core.normalizeAutoSyncInterval(0, 15), { hours: 0, minutes: 15, totalMinutes: 15 });
+  assert.deepEqual(core.normalizeAutoSyncInterval(0, 90), { hours: 1, minutes: 30, totalMinutes: 90 });
+  assert.deepEqual(core.normalizeAutoSyncInterval(0, 0), { hours: 0, minutes: 1, totalMinutes: 1 });
+  assert.deepEqual(core.normalizeAutoSyncInterval(200, 30), { hours: 168, minutes: 0, totalMinutes: 10080 });
+
+  // Arabic labels
+  assert.equal(core.formatAutoSyncIntervalAr(0, 5), 'كل 5 دقائق');
+  assert.equal(core.formatAutoSyncIntervalAr(0, 15), 'كل 15 دقيقة');
+  assert.equal(core.formatAutoSyncIntervalAr(1, 30), 'كل ساعة و30 دقيقة');
+  assert.equal(core.formatAutoSyncIntervalAr(12, 0), 'كل 12 ساعة');
+
+  // Cache invalidation scope
+  assert.deepEqual(core.getCacheInvalidationScopes('deleteAllReservations'), ['*']);
+
+  // Security confirmation validation
+  assert.equal(core.validateDeleteAllReservationsConfirmation({ acknowledged: false, confirmPhrase: 'حذف جميع الحجوزات', password: 'secret' }).valid, false);
+  assert.equal(core.validateDeleteAllReservationsConfirmation({ acknowledged: true, confirmPhrase: 'حذف', password: 'secret' }).valid, false);
+  assert.equal(core.validateDeleteAllReservationsConfirmation({ acknowledged: true, confirmPhrase: 'حذف جميع الحجوزات', password: '' }).valid, false);
+  assert.equal(core.validateDeleteAllReservationsConfirmation({ acknowledged: true, confirmPhrase: 'حذف جميع الحجوزات', password: 'Admin@123' }).valid, true);
+});
+
+
 

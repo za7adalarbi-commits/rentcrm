@@ -933,31 +933,58 @@
     return order.map(function (id) { return map[id]; });
   }
 
+  var DASHBOARD_PERMISSION_KEYS = [
+    'dash_view_hero_kpis',
+    'dash_view_strip_kpis',
+    'dash_view_daily_chart',
+    'dash_view_recent_activity',
+    'dash_view_charts_grid',
+    'dash_view_radar',
+    'dash_view_heatmap',
+    'dash_view_bottom_bento',
+    'dash_view_handover'
+  ];
+
   var ROLE_PERMISSION_MATRIX = {
     general_manager: [
-      'view_dashboard', 'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
+      'view_dashboard', 'dash_perms_configured'
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat([
+      'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
       'claim_reservation', 'unclaim_reservation', 'quick_update_status',
-      'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details',
+      'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
       'create_problem', 'update_problem', 'view_employees', 'manage_employees',
       'view_all_logs', 'sync_data', 'manage_settings', 'export_reports'
-    ],
+    ]),
     supervisor: [
-      'view_dashboard', 'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
+      'view_dashboard', 'dash_perms_configured'
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat([
+      'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
       'claim_reservation', 'unclaim_reservation', 'quick_update_status',
-      'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details',
+      'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
       'create_problem', 'update_problem', 'view_employees', 'view_all_logs',
       'sync_data', 'export_reports'
-    ],
+    ]),
     agent: [
-      'view_dashboard', 'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
+      'view_dashboard', 'dash_perms_configured'
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat([
+      'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
       'quick_update_status', 'create_problem', 'update_problem', 'export_reports'
-    ]
+    ])
   };
 
   var PERMISSIONS_CATALOG = [
     { key: 'view_dashboard', label: 'عرض لوحة التحكم والإحصائيات', group: 'عام' },
+    { key: 'dash_view_hero_kpis', label: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', group: 'لوحة التحكم' },
+    { key: 'dash_view_strip_kpis', label: 'شريط مؤشرات الحالات التفصيلية (KPI Strip)', group: 'لوحة التحكم' },
+    { key: 'dash_view_daily_chart', label: 'رسم المتابعات اليومية', group: 'لوحة التحكم' },
+    { key: 'dash_view_recent_activity', label: 'بطاقة أحدث النشاطات', group: 'لوحة التحكم' },
+    { key: 'dash_view_charts_grid', label: 'شبكة الرسوم البيانية التحليلية (6 مخططات)', group: 'لوحة التحكم' },
+    { key: 'dash_view_radar', label: 'رادار انتهاء الحجوزات (24 ساعة)', group: 'لوحة التحكم' },
+    { key: 'dash_view_heatmap', label: 'مصفوفة ساعات الذروة (تخطيط الورديات)', group: 'لوحة التحكم' },
+    { key: 'dash_view_bottom_bento', label: 'أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة', group: 'لوحة التحكم' },
+    { key: 'dash_view_handover', label: 'زر تسليم الوردية (PDF) داخل لوحة التحكم', group: 'لوحة التحكم' },
     { key: 'view_all_reservations', label: 'استعراض جميع الحجوزات', group: 'الحجوزات' },
-    { key: 'pull_reservations', label: 'سحب وتحديث الحجوزات من قائمة الحجوزات', group: 'الحجوزات' },
+    { key: 'pull_reservations', label: 'سحب واستيراد وتحديث الحجوزات من قائمة الحجوزات', group: 'الحجوزات' },
     { key: 'claim_reservation', label: 'استلام الحجوزات ذاتيًا', group: 'الحجوزات' },
     { key: 'unclaim_reservation', label: 'إلغاء استلام الحجز', group: 'الحجوزات' },
     { key: 'quick_update_status', label: 'التحديث السريع لحالة الحجز', group: 'الحجوزات' },
@@ -965,6 +992,7 @@
     { key: 'edit_any_followup', label: 'تعديل متابعات وتحديثات الفريق', group: 'المتابعات' },
     { key: 'assign_employees', label: 'إسناد وإزالة الموظفين عن الحجوزات', group: 'الإشراف' },
     { key: 'edit_reservation_details', label: 'تعديل تفاصيل الحجوزات والأسعار', group: 'الإشراف' },
+    { key: 'pin_reservation_note', label: 'تثبيت وتعديل الملاحظات المثبتة أعلى الحجز', group: 'الإشراف' },
     { key: 'create_problem', label: 'تحويل الحجز إلى مشكلة / تذكرة', group: 'المشكلات' },
     { key: 'update_problem', label: 'تحديث حالة التذاكر والمشكلات', group: 'المشكلات' },
     { key: 'edit_ticket_details', label: 'تعديل بيانات ووصف التذاكر', group: 'الإشراف' },
@@ -996,7 +1024,13 @@
       label: 'مسؤول جودة وتقارير (قراءة وتصدير)',
       jobTitle: 'أخصائي جودة وتقارير',
       role: ROLES.AGENT,
-      permissions: ['view_dashboard', 'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports']
+      permissions: [
+        'view_dashboard', 'dash_perms_configured',
+        'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
+        'dash_view_recent_activity', 'dash_view_charts_grid', 'dash_view_radar',
+        'dash_view_heatmap', 'dash_view_bottom_bento',
+        'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports'
+      ]
     },
     {
       id: 'supervisor_ops',
@@ -1014,10 +1048,13 @@
     }
   ];
 
-  function resolveEffectivePermissions(roleOrUser) {
+  function resolveEffectivePermissions(roleOrUser, optionalPerms) {
     if (!roleOrUser) return [];
     if (typeof roleOrUser === 'string') {
-      return (ROLE_PERMISSION_MATRIX[roleOrUser] || []).slice();
+      if (!Array.isArray(optionalPerms)) {
+        return (ROLE_PERMISSION_MATRIX[roleOrUser] || []).slice();
+      }
+      roleOrUser = { role: roleOrUser, permissions: optionalPerms };
     }
     var role = roleOrUser.role || ROLES.AGENT;
     var rawPerms = Array.isArray(roleOrUser.permissions) ? roleOrUser.permissions : [];
@@ -1046,6 +1083,18 @@
     }
     var allowed = resolveEffectivePermissions(roleOrUser);
     return allowed.indexOf(action) !== -1;
+  }
+
+  function canUserViewDashboardSection(roleOrUser, permKey) {
+    if (!roleOrUser || !permKey) return false;
+    var allowed = resolveEffectivePermissions(roleOrUser);
+    if (allowed.indexOf('view_dashboard') === -1) return false;
+    var hasGranularConfig = allowed.indexOf('dash_perms_configured') !== -1 ||
+      DASHBOARD_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
+    if (hasGranularConfig) {
+      return allowed.indexOf(permKey) !== -1;
+    }
+    return true;
   }
 
   function mergePermissionsCatalog(customItems) {
@@ -1815,6 +1864,9 @@
     unclaimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
     quickUpdateReservationStatus: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     updateReservationDetails: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
+    saveReservationPinnedNote: ['reservations', 'followUps', 'activity'],
+    togglePinnedCriticalReservation: ['followUps', 'reservations'],
+    recordNoAnswerFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     addFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     updateFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     assignEmployees: ['reservations', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
@@ -1832,11 +1884,14 @@
     deletePermissionDefinition: ['employees', 'activity'],
     markNotificationRead: ['notifications'],
     pullReservations: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    importReservationsFromExcel: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     syncRentalGate: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     saveApiToken: ['settings', 'sync', 'activity'],
     saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
     applyUnifiedConnectionSetup: ['*'],
-    updateSettings: ['settings', 'sync', 'reservations', 'activity']
+    updateSettings: ['settings', 'sync', 'reservations', 'dashboard', 'activity'],
+    saveUserLayoutPrefs: ['dashboard'],
+    deleteAllReservations: ['*']
   };
 
   function getApiCachePolicy(action) {
@@ -2185,6 +2240,9 @@
       case 'unclaimReservation':
       case 'quickUpdateReservationStatus':
       case 'updateReservationDetails':
+      case 'saveReservationPinnedNote':
+      case 'togglePinnedCriticalReservation':
+      case 'recordNoAnswerFollowUp':
       case 'assignEmployees':
       case 'addFollowUp':
       case 'createProblem':
@@ -2229,7 +2287,7 @@
     if (!entityId) {
       return { kind: 'none', entityId: '', route: '' };
     }
-    if (entityType === 'Problem' || type === 'new_problem' || type === 'high_priority_problem') {
+    if (entityType === 'Problem' || type === 'new_problem' || type === 'high_priority_problem' || type === 'problem_resolved') {
       return { kind: 'problem', entityId: entityId, route: 'problems' };
     }
     if (entityType === 'Reservation' || type === 'new_assignment' || type === 'reassignment' || type === 'status_change' || type === 'reservation_update') {
@@ -2335,9 +2393,3147 @@
     return !f.isModalOpen && !f.isInputFocused && !f.isOffline && !f.isHidden && !f.hasActiveLocks;
   }
 
+  var DELETE_ALL_RESERVATIONS_PHRASE = 'حذف جميع الحجوزات';
+
+  function normalizeAutoSyncInterval(hoursVal, minutesVal, totalMinutesVal) {
+    var hasHours = hoursVal !== undefined && hoursVal !== null && String(hoursVal).trim() !== '';
+    var hasMinutes = minutesVal !== undefined && minutesVal !== null && String(minutesVal).trim() !== '';
+    var hasTotal = totalMinutesVal !== undefined && totalMinutesVal !== null && String(totalMinutesVal).trim() !== '';
+
+    var totalMinutes;
+    if (hasTotal && !hasHours && !hasMinutes) {
+      var parsedTotal = Number(totalMinutesVal);
+      totalMinutes = isFinite(parsedTotal) ? Math.round(parsedTotal) : 720;
+    } else if (!hasHours && !hasMinutes) {
+      totalMinutes = 720;
+    } else {
+      var rawH = hasHours ? Number(hoursVal) : 0;
+      var rawM = hasMinutes ? Number(minutesVal) : 0;
+      if (!isFinite(rawH)) rawH = 0;
+      if (!isFinite(rawM)) rawM = 0;
+      totalMinutes = Math.round(Math.max(0, rawH) * 60 + Math.max(0, rawM));
+    }
+
+    if (!isFinite(totalMinutes) || totalMinutes < 1) totalMinutes = 1;
+    if (totalMinutes > 10080) totalMinutes = 10080;
+
+    return {
+      hours: Math.floor(totalMinutes / 60),
+      minutes: totalMinutes % 60,
+      totalMinutes: totalMinutes
+    };
+  }
+
+  function formatAutoSyncIntervalAr(hoursVal, minutesVal) {
+    var norm = normalizeAutoSyncInterval(hoursVal, minutesVal);
+    var h = norm.hours;
+    var m = norm.minutes;
+    var hText = '';
+    if (h > 0) {
+      hText = h === 1 ? 'ساعة' : (h === 2 ? 'ساعتين' : (h + ' ساعة'));
+    }
+    var mText = '';
+    if (m > 0) {
+      mText = m === 1 ? 'دقيقة' : (m === 2 ? 'دقيقتين' : (m <= 10 ? (m + ' دقائق') : (m + ' دقيقة')));
+    }
+    if (hText && mText) return 'كل ' + hText + ' و' + mText;
+    if (hText) return 'كل ' + hText;
+    return 'كل ' + mText;
+  }
+
+  function normalizeDeleteReservationsScope(payload) {
+    var p = (payload && typeof payload === 'object') ? payload : {};
+    var rawScope = normalizeStr(p.scope).toLowerCase();
+    var scope = (rawScope === 'month' || rawScope === 'year' || rawScope === 'all') ? rawScope : 'all';
+    var y = parseInt(convertEasternDigitsToAscii(p.year !== undefined ? p.year : ''), 10);
+    var m = parseInt(convertEasternDigitsToAscii(p.month !== undefined ? p.month : ''), 10);
+
+    var rawYm = p.yearMonth || (typeof p.month === 'string' && p.month.indexOf('-') !== -1 ? p.month : '');
+    if (scope === 'month' && rawYm) {
+      var ymMatch = /^(\d{4})-(\d{1,2})$/.exec(convertEasternDigitsToAscii(rawYm).trim());
+      if (ymMatch) {
+        y = parseInt(ymMatch[1], 10);
+        m = parseInt(ymMatch[2], 10);
+      }
+    }
+
+    var year = (!isNaN(y) && y >= 2000 && y <= 2100) ? y : null;
+    var month = (!isNaN(m) && m >= 1 && m <= 12) ? m : null;
+    var ym = (year && month) ? (String(year) + '-' + (month < 10 ? ('0' + month) : String(month))) : '';
+    var periodLabelAr = 'جميع الحجوزات';
+    var periodLabelEn = 'All Reservations';
+    if (scope === 'month') {
+      periodLabelAr = ym ? ('شهر ' + ym) : 'شهر محدد';
+      periodLabelEn = ym ? ('Month ' + ym) : 'Selected Month';
+    } else if (scope === 'year') {
+      periodLabelAr = year ? ('سنة ' + year) : 'سنة محددة';
+      periodLabelEn = year ? ('Year ' + year) : 'Selected Year';
+    }
+    return {
+      scope: scope,
+      year: year,
+      month: month,
+      ym: ym,
+      periodLabelAr: periodLabelAr,
+      periodLabelEn: periodLabelEn
+    };
+  }
+
+  function matchesReservationDeleteScope(reservation, scopeInfo) {
+    if (!reservation || typeof reservation !== 'object') return false;
+    var info = (scopeInfo && scopeInfo.scope) ? scopeInfo : normalizeDeleteReservationsScope(scopeInfo);
+    if (info.scope === 'all') return true;
+    var iso = formatDisplayDate(reservation.startDate || reservation.sourceCreatedAt || reservation.createdAt || '');
+    if (!iso || iso.length < 4) return false;
+    if (info.scope === 'year') {
+      return info.year ? (iso.slice(0, 4) === String(info.year)) : false;
+    }
+    if (info.scope === 'month') {
+      return info.ym ? (iso.slice(0, 7) === info.ym) : false;
+    }
+    return false;
+  }
+
+  function filterReservationsForDeleteScope(reservations, scopeOrPayload) {
+    var list = Array.isArray(reservations) ? reservations : [];
+    var info = (scopeOrPayload && scopeOrPayload.scope && scopeOrPayload.periodLabelAr)
+      ? scopeOrPayload
+      : normalizeDeleteReservationsScope(scopeOrPayload);
+    if (info.scope === 'all') return list.slice();
+    return list.filter(function (r) {
+      return matchesReservationDeleteScope(r, info);
+    });
+  }
+
+  function validateDeleteAllReservationsConfirmation(payload) {
+    var p = payload || {};
+    var scopeInfo = normalizeDeleteReservationsScope(p);
+    var acknowledged = p.acknowledged === true || p.acknowledged === 'true';
+    var confirmPhrase = normalizeStr(p.confirmPhrase);
+    var password = String(p.password === undefined || p.password === null ? '' : p.password);
+
+    if (scopeInfo.scope === 'month' && (!scopeInfo.year || !scopeInfo.month)) {
+      return {
+        valid: false,
+        message: 'يرجى تحديد الشهر والسنة المطلوب حذف حجوزاتهما بشكل صحيح.'
+      };
+    }
+    if (scopeInfo.scope === 'year' && !scopeInfo.year) {
+      return {
+        valid: false,
+        message: 'يرجى تحديد السنة المطلوب حذف حجوزاتها بشكل صحيح (2000–2100).'
+      };
+    }
+    if (!acknowledged) {
+      return {
+        valid: false,
+        message: 'يرجى تأكيد الموافقة على حذف الحجوزات المحددة نهائياً أولاً.'
+      };
+    }
+    if (confirmPhrase !== DELETE_ALL_RESERVATIONS_PHRASE) {
+      return {
+        valid: false,
+        message: 'يرجى كتابة عبارة التأكيد بدقة: ' + DELETE_ALL_RESERVATIONS_PHRASE
+      };
+    }
+    if (!password) {
+      return {
+        valid: false,
+        message: 'يرجى إدخال كلمة مرور حسابك لتأكيد الأمان.'
+      };
+    }
+    return { valid: true, message: '', scope: scopeInfo };
+  }
+
+  function padTwoDigits(n) {
+    return n < 10 ? ('0' + n) : String(n);
+  }
+
+  function formatIsoDateParts(year, month, day) {
+    var y = Number(year);
+    var m = Number(month);
+    var d = Number(day);
+    if (!isFinite(y) || !isFinite(m) || !isFinite(d)) return '';
+    return String(Math.floor(y)).padStart(4, '0') + '-' + padTwoDigits(Math.floor(m)) + '-' + padTwoDigits(Math.floor(d));
+  }
+
+  function getDaysInMonth(year, month) {
+    var y = Number(year);
+    var m = Number(month);
+    if (!isFinite(y) || !isFinite(m) || m < 1 || m > 12) return 30;
+    if (m === 2) {
+      var isLeap = (y % 4 === 0 && y % 100 !== 0) || (y % 400 === 0);
+      return isLeap ? 29 : 28;
+    }
+    if (m === 4 || m === 6 || m === 9 || m === 11) return 30;
+    return 31;
+  }
+
+  function convertEasternDigitsToAscii(str) {
+    return String(str === undefined || str === null ? '' : str)
+      .replace(/[٠-٩]/g, function (d) { return String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)); })
+      .replace(/[۰-۹]/g, function (d) { return String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)); });
+  }
+
+  function sanitizeManualDateInput(raw, prevRaw) {
+    var ascii = convertEasternDigitsToAscii(raw).replace(/[^0-9-]/g, '');
+    // Collapse duplicate hyphens or leading hyphens
+    ascii = ascii.replace(/^-+/, '').replace(/-+/g, '-');
+    // Limit to YYYY-MM-DD shape progressively while allowing free editing
+    var parts = ascii.split('-');
+    if (parts.length > 3) {
+      parts = [parts[0], parts[1], parts.slice(2).join('')];
+    }
+    if (parts[0] && parts[0].length > 4) {
+      var overflow0 = parts[0].slice(4);
+      parts[0] = parts[0].slice(0, 4);
+      parts[1] = overflow0 + (parts[1] || '');
+    }
+    if (parts[1] && parts[1].length > 2) {
+      var overflow1 = parts[1].slice(2);
+      parts[1] = parts[1].slice(0, 2);
+      parts[2] = overflow1 + (parts[2] || '');
+    }
+    if (parts[2] && parts[2].length > 2) {
+      parts[2] = parts[2].slice(0, 2);
+    }
+    var out = parts.join('-');
+    var prev = convertEasternDigitsToAscii(prevRaw || '');
+    var isInserting = out.length > prev.length;
+    if (isInserting && parts.length === 1 && out.length === 4) {
+      out = out + '-';
+    } else if (isInserting && parts.length === 2 && parts[0].length === 4 && parts[1].length === 2) {
+      out = out + '-';
+    }
+    return out.slice(0, 10);
+  }
+
+  function parseIsoDateStrict(raw) {
+    var cleaned = convertEasternDigitsToAscii(raw).trim();
+    if (!cleaned) return null;
+    var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cleaned);
+    if (!match) return null;
+    var year = parseInt(match[1], 10);
+    var month = parseInt(match[2], 10);
+    var day = parseInt(match[3], 10);
+    if (year < 1900 || year > 2100) return null;
+    if (month < 1 || month > 12) return null;
+    var maxDays = getDaysInMonth(year, month);
+    if (day < 1 || day > maxDays) return null;
+    return {
+      iso: cleaned,
+      year: year,
+      month: month,
+      day: day
+    };
+  }
+
+  function validateIsoDateInput(raw, options) {
+    var opts = options || {};
+    var lang = opts.lang === 'en' ? 'en' : 'ar';
+    var cleaned = convertEasternDigitsToAscii(raw).trim();
+    if (!cleaned) {
+      if (opts.required) {
+        return {
+          valid: false,
+          empty: true,
+          normalized: '',
+          code: 'REQUIRED',
+          message: lang === 'en' ? 'Date is required' : 'التاريخ مطلوب'
+        };
+      }
+      return { valid: true, empty: true, normalized: '', code: '', message: '' };
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+      return {
+        valid: false,
+        empty: false,
+        normalized: '',
+        code: 'INVALID_FORMAT',
+        message: lang === 'en' ? 'Use YYYY-MM-DD format' : 'استخدم الصيغة YYYY-MM-DD'
+      };
+    }
+
+    var parsed = parseIsoDateStrict(cleaned);
+    if (!parsed) {
+      return {
+        valid: false,
+        empty: false,
+        normalized: '',
+        code: 'INVALID_DATE',
+        message: lang === 'en' ? 'Invalid calendar date' : 'تاريخ غير صالح'
+      };
+    }
+
+    if (opts.minDate && parseIsoDateStrict(opts.minDate) && parsed.iso < opts.minDate) {
+      return {
+        valid: false,
+        empty: false,
+        normalized: '',
+        code: 'BEFORE_MIN',
+        message: lang === 'en' ? ('Date must be on or after ' + opts.minDate) : ('يجب أن يكون التاريخ من ' + opts.minDate + ' أو بعده')
+      };
+    }
+
+    if (opts.maxDate && parseIsoDateStrict(opts.maxDate) && parsed.iso > opts.maxDate) {
+      return {
+        valid: false,
+        empty: false,
+        normalized: '',
+        code: 'AFTER_MAX',
+        message: lang === 'en' ? ('Date must be on or before ' + opts.maxDate) : ('يجب أن يكون التاريخ في ' + opts.maxDate + ' أو قبله')
+      };
+    }
+
+    if (typeof opts.isDateDisabled === 'function' && opts.isDateDisabled(parsed.iso)) {
+      return {
+        valid: false,
+        empty: false,
+        normalized: '',
+        code: 'DISABLED_DATE',
+        message: lang === 'en' ? 'This date is unavailable' : 'هذا التاريخ غير متاح'
+      };
+    }
+
+    return {
+      valid: true,
+      empty: false,
+      normalized: parsed.iso,
+      year: parsed.year,
+      month: parsed.month,
+      day: parsed.day,
+      code: '',
+      message: ''
+    };
+  }
+
+  function shiftCalendarMonth(year, month, deltaMonths) {
+    var y = Number(year);
+    var m = Number(month);
+    var delta = Number(deltaMonths || 0);
+    if (!isFinite(y) || !isFinite(m)) {
+      var now = new Date();
+      y = now.getFullYear();
+      m = now.getMonth() + 1;
+    }
+    var zeroBased = (y * 12) + (m - 1) + delta;
+    var nextYear = Math.floor(zeroBased / 12);
+    var nextMonth = ((zeroBased % 12) + 12) % 12 + 1;
+    return { year: nextYear, month: nextMonth };
+  }
+
+  function buildCalendarMonthGrid(year, month, options) {
+    var opts = options || {};
+    var weekStartsOn = opts.weekStartsOn === 6 ? 6 : 0; // 0 = Sunday, 6 = Saturday
+    var firstDayOfWeek = new Date(Date.UTC(year, month - 1, 1)).getUTCDay();
+    var leadingCount = (firstDayOfWeek - weekStartsOn + 7) % 7;
+
+    var prevYM = shiftCalendarMonth(year, month, -1);
+    var prevMonthDays = getDaysInMonth(prevYM.year, prevYM.month);
+    var currMonthDays = getDaysInMonth(year, month);
+    var nextYM = shiftCalendarMonth(year, month, 1);
+
+    var selectedIso = parseIsoDateStrict(opts.selectedDate) ? opts.selectedDate : '';
+    var startIso = parseIsoDateStrict(opts.rangeStart) ? opts.rangeStart : '';
+    var endIso = parseIsoDateStrict(opts.rangeEnd) ? opts.rangeEnd : '';
+    var hoverIso = parseIsoDateStrict(opts.hoverDate) ? opts.hoverDate : '';
+    var minIso = parseIsoDateStrict(opts.minDate) ? opts.minDate : '';
+    var maxIso = parseIsoDateStrict(opts.maxDate) ? opts.maxDate : '';
+    var todayIso = parseIsoDateStrict(opts.todayIso) ? opts.todayIso : '';
+
+    var effStart = startIso;
+    var effEnd = endIso;
+    if (opts.isRange && effStart && !effEnd && hoverIso) {
+      if (hoverIso < effStart) {
+        effEnd = effStart;
+        effStart = hoverIso;
+      } else {
+        effEnd = hoverIso;
+      }
+    } else if (effStart && effEnd && effStart > effEnd) {
+      var tmp = effStart;
+      effStart = effEnd;
+      effEnd = tmp;
+    }
+
+    var cells = [];
+    for (var i = 0; i < 42; i++) {
+      var cYear;
+      var cMonth;
+      var cDay;
+      var isCurrentMonth = false;
+      if (i < leadingCount) {
+        cYear = prevYM.year;
+        cMonth = prevYM.month;
+        cDay = prevMonthDays - leadingCount + i + 1;
+      } else if (i < leadingCount + currMonthDays) {
+        cYear = year;
+        cMonth = month;
+        cDay = i - leadingCount + 1;
+        isCurrentMonth = true;
+      } else {
+        cYear = nextYM.year;
+        cMonth = nextYM.month;
+        cDay = i - (leadingCount + currMonthDays) + 1;
+      }
+
+      var iso = formatIsoDateParts(cYear, cMonth, cDay);
+      var disabled = false;
+      if (minIso && iso < minIso) disabled = true;
+      if (maxIso && iso > maxIso) disabled = true;
+      if (!disabled && typeof opts.isDateDisabled === 'function' && opts.isDateDisabled(iso)) {
+        disabled = true;
+      }
+
+      var isRangeStart = Boolean(effStart && iso === effStart);
+      var isRangeEnd = Boolean(effEnd && iso === effEnd);
+      var isInRange = Boolean(effStart && effEnd && iso > effStart && iso < effEnd);
+      var isSelected = Boolean(selectedIso && iso === selectedIso) || isRangeStart || isRangeEnd;
+
+      cells.push({
+        iso: iso,
+        year: cYear,
+        month: cMonth,
+        day: cDay,
+        isCurrentMonth: isCurrentMonth,
+        isToday: Boolean(todayIso && iso === todayIso),
+        isSelected: isSelected,
+        isRangeStart: isRangeStart,
+        isRangeEnd: isRangeEnd,
+        isInRange: isInRange,
+        isDisabled: disabled
+      });
+    }
+
+    return cells;
+  }
+
+  function resolveRangeSelectionClick(currentStart, currentEnd, clickedIso, activeRole) {
+    var clicked = parseIsoDateStrict(clickedIso) ? clickedIso : '';
+    var start = parseIsoDateStrict(currentStart) ? currentStart : '';
+    var end = parseIsoDateStrict(currentEnd) ? currentEnd : '';
+    if (!clicked) return { start: start, end: end, nextRole: activeRole === 'end' ? 'end' : 'start', completed: false };
+
+    if (activeRole === 'end' && start) {
+      if (clicked < start) {
+        return { start: clicked, end: start, nextRole: 'end', completed: true };
+      }
+      return { start: start, end: clicked, nextRole: 'end', completed: true };
+    }
+
+    // Picking start (or starting fresh range)
+    if (end && clicked > end) {
+      return { start: clicked, end: '', nextRole: 'end', completed: false };
+    }
+    return { start: clicked, end: end, nextRole: 'end', completed: Boolean(end) };
+  }
+
+  function clampPdfPage(page, totalPages) {
+    var total = Math.max(1, Math.floor(Number(totalPages || 1)));
+    var p = Math.floor(Number(page || 1));
+    if (!isFinite(p) || p < 1) return 1;
+    if (p > total) return total;
+    return p;
+  }
+
+  var PDF_ZOOM_MIN = 0.25;
+  var PDF_ZOOM_MAX = 2.5;
+  var PDF_ZOOM_STEPS = [0.25, 0.4, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5];
+
+  function clampPdfZoom(scale) {
+    var num = Number(scale);
+    if (!isFinite(num) || num <= 0) return 1;
+    var clamped = Math.min(PDF_ZOOM_MAX, Math.max(PDF_ZOOM_MIN, num));
+    return Math.round(clamped * 100) / 100;
+  }
+
+  function computePdfZoom(action, currentScale, metrics) {
+    var cur = clampPdfZoom(currentScale || 1);
+    var m = metrics || {};
+    var padX = Number(m.padX !== undefined ? m.padX : 40);
+    var padY = Number(m.padY !== undefined ? m.padY : 40);
+    var vw = Math.max(120, Number(m.viewportWidth || 800) - padX);
+    var vh = Math.max(120, Number(m.viewportHeight || 600) - padY);
+    var pw = Math.max(1, Number(m.pageWidth || 794));
+    var ph = Math.max(1, Number(m.pageHeight || 1123));
+
+    if (action === 'reset') {
+      return { scale: 1, mode: 'custom' };
+    }
+    if (action === 'fit-width') {
+      return { scale: clampPdfZoom(vw / pw), mode: 'fit-width' };
+    }
+    if (action === 'fit-page') {
+      return { scale: clampPdfZoom(Math.min(vw / pw, vh / ph)), mode: 'fit-page' };
+    }
+    if (action === 'in') {
+      for (var i = 0; i < PDF_ZOOM_STEPS.length; i++) {
+        if (PDF_ZOOM_STEPS[i] > cur + 0.02) {
+          return { scale: PDF_ZOOM_STEPS[i], mode: 'custom' };
+        }
+      }
+      return { scale: PDF_ZOOM_MAX, mode: 'custom' };
+    }
+    if (action === 'out') {
+      for (var j = PDF_ZOOM_STEPS.length - 1; j >= 0; j--) {
+        if (PDF_ZOOM_STEPS[j] < cur - 0.02) {
+          return { scale: PDF_ZOOM_STEPS[j], mode: 'custom' };
+        }
+      }
+      return { scale: PDF_ZOOM_MIN, mode: 'custom' };
+    }
+    return { scale: clampPdfZoom(action), mode: 'custom' };
+  }
+
+  var PDF_LAYOUT_PRESETS = {
+    compact: {
+      id: 'compact',
+      defaultTargetPages: 1,
+      marginPt: 18,
+      headerH: 52,
+      contHeaderH: 30,
+      footerReserve: 26,
+      baseFont: 8.1,
+      cellPadX: 4,
+      cellPadY: 3,
+      lineRatio: 1.24,
+      kpiH: 35,
+      kpiGap: 6,
+      kpiPerRow: 5,
+      sectionGap: 7,
+      extraLineH: 11.5,
+      extraBlockPad: 3,
+      chartH: 118,
+      chartGap: 8,
+      maxCellLines: 2
+    },
+    balanced: {
+      id: 'balanced',
+      defaultTargetPages: 3,
+      marginPt: 30,
+      headerH: 70,
+      contHeaderH: 42,
+      footerReserve: 36,
+      baseFont: 9.3,
+      cellPadX: 6,
+      cellPadY: 5.5,
+      lineRatio: 1.38,
+      kpiH: 46,
+      kpiGap: 10,
+      kpiPerRow: 4,
+      sectionGap: 12,
+      extraLineH: 14.5,
+      extraBlockPad: 6,
+      chartH: 160,
+      chartGap: 12,
+      maxCellLines: 3
+    },
+    comfortable: {
+      id: 'comfortable',
+      defaultTargetPages: 6,
+      marginPt: 40,
+      headerH: 80,
+      contHeaderH: 50,
+      footerReserve: 42,
+      baseFont: 10.6,
+      cellPadX: 8.5,
+      cellPadY: 8,
+      lineRatio: 1.54,
+      kpiH: 56,
+      kpiGap: 13,
+      kpiPerRow: 3,
+      sectionGap: 18,
+      extraLineH: 17.5,
+      extraBlockPad: 9,
+      chartH: 196,
+      chartGap: 16,
+      maxCellLines: 4
+    }
+  };
+
+  var PDF_QUALITY_PROFILES = {
+    small: {
+      id: 'small',
+      renderScale: 1.15,
+      jpegQuality: 0.56,
+      chartCaptureQuality: 0.72,
+      chartCaptureMaxW: 720,
+      imageCompression: 'SLOW',
+      stripMetadata: true,
+      compressStreams: true,
+      downsampleLogoPx: 72,
+      bytesPerPixel: 0.042
+    },
+    balanced: {
+      id: 'balanced',
+      renderScale: 1.45,
+      jpegQuality: 0.76,
+      chartCaptureQuality: 0.84,
+      chartCaptureMaxW: 960,
+      imageCompression: 'MEDIUM',
+      stripMetadata: true,
+      compressStreams: true,
+      downsampleLogoPx: 96,
+      bytesPerPixel: 0.075
+    },
+    high: {
+      id: 'high',
+      renderScale: 1.85,
+      jpegQuality: 0.90,
+      chartCaptureQuality: 0.92,
+      chartCaptureMaxW: 1280,
+      imageCompression: 'MEDIUM',
+      stripMetadata: false,
+      compressStreams: true,
+      downsampleLogoPx: 144,
+      bytesPerPixel: 0.132
+    },
+    unoptimized: {
+      id: 'unoptimized',
+      renderScale: 2.0,
+      jpegQuality: 0.95,
+      chartCaptureQuality: 0.95,
+      chartCaptureMaxW: 1600,
+      imageCompression: 'FAST',
+      stripMetadata: false,
+      compressStreams: false,
+      downsampleLogoPx: 192,
+      bytesPerPixel: 0.205
+    }
+  };
+
+  function clampPdfTargetPages(val) {
+    var n = Math.round(Number(val));
+    if (!isFinite(n) || n < 1) return 1;
+    if (n > 10) return 10;
+    return n;
+  }
+
+  function resolvePdfExportSettings(opts) {
+    var o = (opts && typeof opts === 'object') ? opts : {};
+    var presetRaw = normalizeStr(o.preset).toLowerCase();
+    var preset = (presetRaw === 'compact' || presetRaw === 'balanced' || presetRaw === 'comfortable' || presetRaw === 'custom')
+      ? presetRaw
+      : 'balanced';
+    var qualityRaw = normalizeStr(o.quality).toLowerCase();
+    var quality = (qualityRaw === 'small' || qualityRaw === 'balanced' || qualityRaw === 'high')
+      ? qualityRaw
+      : 'balanced';
+    var defaultTp = (PDF_LAYOUT_PRESETS[preset] && PDF_LAYOUT_PRESETS[preset].defaultTargetPages) || 3;
+    var targetPages = o.targetPages !== undefined ? clampPdfTargetPages(o.targetPages) : defaultTp;
+    var optimizeFileSize = o.optimizeFileSize === undefined ? true : Boolean(o.optimizeFileSize);
+    var paperSize = normalizeStr(o.paperSize).toLowerCase() === 'letter' ? 'letter' : 'a4';
+    var orientation = normalizeStr(o.orientation).toLowerCase() === 'portrait' ? 'portrait' : 'landscape';
+    return {
+      targetPages: targetPages,
+      preset: preset,
+      optimizeFileSize: optimizeFileSize,
+      quality: quality,
+      paperSize: paperSize,
+      orientation: orientation
+    };
+  }
+
+  function getPaperDimensionsMm(paperSize, orientation) {
+    var isLetter = normalizeStr(paperSize).toLowerCase() === 'letter';
+    var baseW = isLetter ? 215.9 : 210;
+    var baseH = isLetter ? 279.4 : 297;
+    if (normalizeStr(orientation).toLowerCase() === 'portrait') {
+      return { widthMm: baseW, heightMm: baseH };
+    }
+    return { widthMm: baseH, heightMm: baseW };
+  }
+
+  function lerpNum(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function simulatePdfPagination(m, stats) {
+    var pageWpt = m.pageWpt;
+    var pageHpt = m.pageHpt;
+    var pad = m.marginPt;
+    var footerReserve = m.footerReserve;
+    var headerGap = m.headerGap;
+    var firstUsable = Math.max(120, pageHpt - m.headerH - headerGap - footerReserve);
+    var contUsable = Math.max(120, pageHpt - m.contHeaderH - headerGap - footerReserve);
+
+    var pages = 1;
+    var y = m.headerH + headerGap;
+    var limitY = pageHpt - footerReserve;
+
+    function ensure(needed) {
+      if (y + needed > limitY) {
+        pages += 1;
+        y = m.contHeaderH + headerGap;
+      }
+    }
+
+    var kpiCount = Math.max(0, Number(stats.kpiCount !== undefined ? stats.kpiCount : (stats.summaryCount || 0)));
+    var wideCount = Math.max(0, Number(stats.wideSummaryCount || 0));
+
+    if (kpiCount > 0) {
+      var perRow = Math.min(m.kpiPerRow, kpiCount);
+      var kpiRows = Math.ceil(kpiCount / Math.max(1, perRow));
+      for (var kr = 0; kr < kpiRows; kr++) {
+        ensure(m.kpiH + m.kpiGap);
+        y += m.kpiH + m.kpiGap;
+      }
+    }
+    if (wideCount > 0) {
+      var colsWide = (pageWpt > 900 && wideCount > 1) ? 2 : 1;
+      var wideRows = Math.ceil(wideCount / colsWide);
+      var wideCardH = Math.round(24 + m.extraLineH * 1.8 + 8);
+      for (var wr = 0; wr < wideRows; wr++) {
+        ensure(wideCardH + m.kpiGap);
+        y += wideCardH + m.kpiGap;
+      }
+      y += Math.round(m.sectionGap * 0.4);
+    }
+
+    var colCount = Math.max(0, Number(stats.columnCount || 0));
+    var rowCount = Math.max(0, Number(stats.rowCount || 0));
+    var avgChars = Math.max(8, Number(stats.avgCharsPerCell || 18));
+    var contentW = Math.max(200, pageWpt - pad * 2);
+
+    if (colCount > 0) {
+      var avgColW = Math.max(32, contentW / colCount - m.cellPadX * 2);
+      var charsPerLine = Math.max(6, Math.floor(avgColW / (m.baseFont * 0.56)));
+      var estLines = Math.min(m.maxCellLines, Math.max(1, Math.ceil(avgChars / charsPerLine)));
+      var headerRowH = Math.max(Math.round(m.baseFont * 2.2), Math.round(m.cellLineH + m.cellPadY * 2));
+      var estRowH = Math.max(Math.round(m.baseFont * 1.9), Math.round(estLines * m.cellLineH + m.cellPadY * 2));
+
+      if (rowCount === 0) {
+        ensure(headerRowH + 28);
+        y += headerRowH + 32;
+      } else {
+        ensure(headerRowH + estRowH);
+        y += headerRowH;
+        var rowsOnThisPage = 0;
+        for (var r = 0; r < rowCount; r++) {
+          var forceBreak = (m.maxRowsPerPage > 0 && rowsOnThisPage >= m.maxRowsPerPage);
+          if (forceBreak || (y + estRowH > limitY)) {
+            pages += 1;
+            y = m.contHeaderH + headerGap;
+            y += headerRowH;
+            rowsOnThisPage = 0;
+          }
+          y += estRowH;
+          rowsOnThisPage += 1;
+        }
+        y += m.sectionGap;
+      }
+    }
+
+    var extraSecCount = Math.max(0, Number(stats.extraSectionsCount || 0));
+    var extraLinesCount = Math.max(0, Number(stats.extraLinesCount || 0));
+    if (extraLinesCount > 0) {
+      if (m.breakBeforeExtra && y > (m.headerH + headerGap + 40)) {
+        pages += 1;
+        y = m.contHeaderH + headerGap;
+      }
+      var avgLinesPerSec = Math.max(1, Math.ceil(extraLinesCount / Math.max(1, extraSecCount || 1)));
+      var lineBoxH = Math.round(m.extraLineH * 1.35 + m.extraBlockPad * 2);
+      var linesRemaining = extraLinesCount;
+      var secTotal = Math.max(1, extraSecCount || 1);
+      for (var s = 0; s < secTotal && linesRemaining > 0; s++) {
+        ensure(Math.round(m.baseFont * 3.4));
+        y += Math.round(m.baseFont * 2.2);
+        var take = Math.min(linesRemaining, avgLinesPerSec);
+        var extraRowsOnPage = 0;
+        for (var li = 0; li < take; li++) {
+          if ((m.maxExtraPerPage > 0 && extraRowsOnPage >= m.maxExtraPerPage) || (y + lineBoxH > limitY)) {
+            pages += 1;
+            y = m.contHeaderH + headerGap;
+            extraRowsOnPage = 0;
+          }
+          y += lineBoxH;
+          extraRowsOnPage += 1;
+        }
+        linesRemaining -= take;
+        y += Math.round(m.sectionGap * 0.75);
+      }
+    }
+
+    var chartCount = Math.max(0, Number(stats.chartCount || 0));
+    if (chartCount > 0) {
+      if (m.breakBeforeCharts && y > (m.headerH + headerGap + 40)) {
+        pages += 1;
+        y = m.contHeaderH + headerGap;
+      }
+      var cCols = Math.min(chartCount, m.chartCols || 2);
+      var chartRows = Math.ceil(chartCount / Math.max(1, cCols));
+      for (var chR = 0; chR < chartRows; chR++) {
+        ensure(m.chartH + m.chartGap);
+        y += m.chartH + m.chartGap;
+      }
+    }
+
+    return {
+      pages: Math.max(1, pages),
+      firstUsable: firstUsable,
+      contUsable: contUsable
+    };
+  }
+
+  function estimatePdfFileSizeBytes(plan, stats) {
+    var p = plan || {};
+    var s = stats || {};
+    var pages = Math.max(1, Number(p.estimatedPages || 1));
+    var scale = Number(p.renderScale || 1.45);
+    var pxPerPage = Math.round(Number(p.pageWpt || 1123) * scale) * Math.round(Number(p.pageHpt || 794) * scale);
+    var bpp = Number(p.bytesPerPixel || 0.075);
+    var chartBoost = Math.max(0, Number(s.chartCount || 0)) * (p.optimizeFileSize ? 5500 : 12000);
+    var rowDensityBoost = Math.min(60, Math.max(0, Number(s.rowCount || 0))) * (p.optimizeFileSize ? 380 : 620);
+    var metaOverhead = p.stripMetadata ? 1600 : 4200;
+    return Math.round(pages * pxPerPage * bpp + chartBoost + rowDensityBoost + metaOverhead);
+  }
+
+  function computePdfLayoutPlan(params) {
+    var cfg = resolvePdfExportSettings(params);
+    var p = params || {};
+    var lang = normalizeStr(p.lang) === 'en' ? 'en' : 'ar';
+    var dims = getPaperDimensionsMm(cfg.paperSize, cfg.orientation);
+    var pageWpt = Math.round(dims.widthMm * 3.78);
+    var pageHpt = Math.round(dims.heightMm * 3.78);
+    var colCount = Math.max(0, Number(p.columnCount || 0));
+    var rowCount = Math.max(0, Number(p.rowCount || 0));
+    var chartCount = Math.max(0, Number(p.chartCount || 0));
+    var extraSectionsCount = Math.max(0, Number(p.extraSectionsCount || 0));
+    var extraLinesCount = Math.max(0, Number(p.extraLinesCount || 0));
+    var kpiCount = Math.max(0, Number(p.kpiCount !== undefined ? p.kpiCount : (p.summaryCount || 0)));
+    var wideSummaryCount = Math.max(0, Number(p.wideSummaryCount || 0));
+
+    var stats = {
+      rowCount: rowCount,
+      columnCount: colCount,
+      kpiCount: kpiCount,
+      wideSummaryCount: wideSummaryCount,
+      extraSectionsCount: extraSectionsCount,
+      extraLinesCount: extraLinesCount,
+      chartCount: chartCount,
+      avgCharsPerCell: Number(p.avgCharsPerCell || 18)
+    };
+
+    var presetKey = PDF_LAYOUT_PRESETS[cfg.preset] ? cfg.preset : 'balanced';
+    var baseProfile = PDF_LAYOUT_PRESETS[presetKey];
+
+    // Strict readability floor (never shrunk below legible thresholds)
+    var minReadableFont = colCount >= 10 ? 7.3 : (colCount >= 8 ? 7.6 : 8.0);
+    var floorProfile = {
+      marginPt: 16,
+      headerH: 48,
+      contHeaderH: 26,
+      footerReserve: 24,
+      baseFont: minReadableFont,
+      cellPadX: 3.4,
+      cellPadY: 2.5,
+      lineRatio: 1.18,
+      kpiH: 32,
+      kpiGap: 5,
+      kpiPerRow: 5,
+      sectionGap: 5,
+      extraLineH: 11,
+      extraBlockPad: 2.5,
+      chartH: 106,
+      chartGap: 6,
+      maxCellLines: 2
+    };
+
+    var ceilProfile = {
+      marginPt: 46,
+      headerH: 86,
+      contHeaderH: 54,
+      footerReserve: 46,
+      baseFont: colCount >= 9 ? 10.2 : 11.4,
+      cellPadX: 10,
+      cellPadY: 9.5,
+      lineRatio: 1.62,
+      kpiH: 60,
+      kpiGap: 14,
+      kpiPerRow: 3,
+      sectionGap: 22,
+      extraLineH: 19,
+      extraBlockPad: 10,
+      chartH: 220,
+      chartGap: 18,
+      maxCellLines: 4
+    };
+
+    function buildMetricsFromProfile(prof, extraOpts) {
+      var eo = extraOpts || {};
+      var baseFont = colCount >= 10
+        ? Math.min(prof.baseFont, 8.8)
+        : (colCount >= 8 ? Math.min(prof.baseFont, 9.5) : prof.baseFont);
+      baseFont = Math.max(minReadableFont, Math.round(baseFont * 10) / 10);
+      var cellLineH = Math.round((baseFont * prof.lineRatio + 1.2) * 10) / 10;
+      return {
+        pageWpt: pageWpt,
+        pageHpt: pageHpt,
+        marginPt: Math.round(prof.marginPt),
+        headerH: Math.round(prof.headerH),
+        contHeaderH: Math.round(prof.contHeaderH),
+        headerGap: Math.round(Math.max(8, prof.sectionGap * 1.15)),
+        footerReserve: Math.round(prof.footerReserve),
+        baseFont: baseFont,
+        headerFont: Math.round(Math.max(baseFont, baseFont * 1.02) * 10) / 10,
+        cellPadX: Math.round(prof.cellPadX * 10) / 10,
+        cellPadY: Math.round(prof.cellPadY * 10) / 10,
+        cellLineH: cellLineH,
+        kpiH: Math.round(prof.kpiH),
+        kpiGap: Math.round(prof.kpiGap),
+        kpiPerRow: Math.round(prof.kpiPerRow),
+        sectionGap: Math.round(prof.sectionGap),
+        extraLineH: Math.round(prof.extraLineH * 10) / 10,
+        extraBlockPad: Math.round(prof.extraBlockPad * 10) / 10,
+        chartH: Math.round(prof.chartH),
+        chartGap: Math.round(prof.chartGap),
+        chartCols: eo.chartCols || (chartCount > 1 ? 2 : 1),
+        maxCellLines: Math.round(prof.maxCellLines),
+        maxRowsPerPage: eo.maxRowsPerPage || 0,
+        maxExtraPerPage: eo.maxExtraPerPage || 0,
+        breakBeforeExtra: Boolean(eo.breakBeforeExtra),
+        breakBeforeCharts: Boolean(eo.breakBeforeCharts)
+      };
+    }
+
+    function blendProfiles(a, b, t) {
+      return {
+        marginPt: lerpNum(a.marginPt, b.marginPt, t),
+        headerH: lerpNum(a.headerH, b.headerH, t),
+        contHeaderH: lerpNum(a.contHeaderH, b.contHeaderH, t),
+        footerReserve: lerpNum(a.footerReserve, b.footerReserve, t),
+        baseFont: lerpNum(a.baseFont, b.baseFont, t),
+        cellPadX: lerpNum(a.cellPadX, b.cellPadX, t),
+        cellPadY: lerpNum(a.cellPadY, b.cellPadY, t),
+        lineRatio: lerpNum(a.lineRatio, b.lineRatio, t),
+        kpiH: lerpNum(a.kpiH, b.kpiH, t),
+        kpiGap: lerpNum(a.kpiGap, b.kpiGap, t),
+        kpiPerRow: t >= 0.65 ? b.kpiPerRow : a.kpiPerRow,
+        sectionGap: lerpNum(a.sectionGap, b.sectionGap, t),
+        extraLineH: lerpNum(a.extraLineH, b.extraLineH, t),
+        extraBlockPad: lerpNum(a.extraBlockPad, b.extraBlockPad, t),
+        chartH: lerpNum(a.chartH, b.chartH, t),
+        chartGap: lerpNum(a.chartGap, b.chartGap, t),
+        maxCellLines: t >= 0.65 ? b.maxCellLines : a.maxCellLines
+      };
+    }
+
+    var naturalMetrics = buildMetricsFromProfile(baseProfile, {});
+    var naturalSim = simulatePdfPagination(naturalMetrics, stats);
+    var chosenMetrics = naturalMetrics;
+    var chosenSim = naturalSim;
+    var readabilityWarning = false;
+    var warningCode = '';
+    var warningMessageAr = '';
+    var warningMessageEn = '';
+
+    if (cfg.targetPages < naturalSim.pages) {
+      // Compress gradually from baseProfile toward floorProfile until targetPages is reached
+      var foundFit = false;
+      var steps = 16;
+      for (var st = 1; st <= steps; st++) {
+        var frac = st / steps;
+        var candidateProf = blendProfiles(baseProfile, floorProfile, frac);
+        var candMetrics = buildMetricsFromProfile(candidateProf, {
+          chartCols: chartCount >= 3 ? 3 : (chartCount > 1 ? 2 : 1)
+        });
+        var candSim = simulatePdfPagination(candMetrics, stats);
+        chosenMetrics = candMetrics;
+        chosenSim = candSim;
+        if (candSim.pages <= cfg.targetPages) {
+          foundFit = true;
+          break;
+        }
+      }
+      if (!foundFit && chosenSim.pages > cfg.targetPages) {
+        readabilityWarning = true;
+        warningCode = 'MIN_PAGES_EXCEEDED';
+        warningMessageEn = 'Some content requires additional pages (' + chosenSim.pages + ' pages minimum) to maintain readability.';
+        warningMessageAr = 'بعض المحتوى يتطلب صفحات إضافية (' + chosenSim.pages + ' صفحات على الأقل) للحفاظ على وضوح القراءة.';
+      }
+    } else if (cfg.targetPages > naturalSim.pages) {
+      // Expand toward comfortable spacing + balanced distribution across targetPages
+      var expandRatio = Math.min(1, (cfg.targetPages - naturalSim.pages) / Math.max(2, 10 - naturalSim.pages));
+      var expProf = blendProfiles(baseProfile, ceilProfile, expandRatio);
+      var useSingleChartCol = (cfg.targetPages >= 6 && chartCount > 1);
+      var breakCharts = (chartCount > 0 && cfg.targetPages >= naturalSim.pages + 1);
+      var breakExtra = (extraLinesCount > 0 && cfg.targetPages >= naturalSim.pages + 2);
+
+      // Estimate reserved pages for charts & extra sections so table rows spread harmoniously
+      var chartPageReserve = chartCount > 0 ? (useSingleChartCol ? Math.min(chartCount, 2) : 1) : 0;
+      var extraPageReserve = extraLinesCount > 0 ? (breakExtra ? Math.max(1, Math.ceil(extraLinesCount / 14)) : 0) : 0;
+      var tablePageBudget = Math.max(1, cfg.targetPages - (breakCharts ? chartPageReserve : 0) - extraPageReserve);
+
+      var maxRowsPerPage = 0;
+      if (rowCount > 1 && tablePageBudget > 1) {
+        maxRowsPerPage = Math.max(2, Math.ceil(rowCount / tablePageBudget));
+      }
+      var maxExtraPerPage = 0;
+      if (rowCount === 0 && extraLinesCount > 2 && cfg.targetPages >= 2) {
+        var extraBudget = Math.max(1, cfg.targetPages - (breakCharts ? chartPageReserve : 0));
+        maxExtraPerPage = Math.max(2, Math.ceil(extraLinesCount / extraBudget));
+      }
+
+      var expMetrics = buildMetricsFromProfile(expProf, {
+        chartCols: useSingleChartCol ? 1 : (chartCount > 1 ? 2 : 1),
+        maxRowsPerPage: maxRowsPerPage,
+        maxExtraPerPage: maxExtraPerPage,
+        breakBeforeExtra: breakExtra,
+        breakBeforeCharts: breakCharts
+      });
+      var expSim = simulatePdfPagination(expMetrics, stats);
+
+      // If still slightly under targetPages and we have rows, refine maxRowsPerPage down to 1-2 if needed
+      if (expSim.pages < cfg.targetPages && rowCount > 1) {
+        for (var mr = Math.max(1, maxRowsPerPage - 1); mr >= 1; mr--) {
+          var refinedMetrics = buildMetricsFromProfile(expProf, {
+            chartCols: useSingleChartCol ? 1 : (chartCount > 1 ? 2 : 1),
+            maxRowsPerPage: mr,
+            maxExtraPerPage: maxExtraPerPage,
+            breakBeforeExtra: breakExtra,
+            breakBeforeCharts: breakCharts
+          });
+          var refinedSim = simulatePdfPagination(refinedMetrics, stats);
+          if (refinedSim.pages <= cfg.targetPages) {
+            expMetrics = refinedMetrics;
+            expSim = refinedSim;
+          }
+          if (refinedSim.pages >= cfg.targetPages) break;
+        }
+      }
+
+      chosenMetrics = expMetrics;
+      chosenSim = expSim;
+    }
+
+    var qualityProfile = cfg.optimizeFileSize
+      ? (PDF_QUALITY_PROFILES[cfg.quality] || PDF_QUALITY_PROFILES.balanced)
+      : PDF_QUALITY_PROFILES.unoptimized;
+
+    var plan = Object.assign({}, chosenMetrics, {
+      targetPages: cfg.targetPages,
+      preset: cfg.preset,
+      optimizeFileSize: cfg.optimizeFileSize,
+      quality: cfg.quality,
+      paperSize: cfg.paperSize,
+      orientation: cfg.orientation,
+      widthMm: dims.widthMm,
+      heightMm: dims.heightMm,
+      estimatedPages: chosenSim.pages,
+      readabilityWarning: readabilityWarning,
+      warningCode: warningCode,
+      warningMessageAr: warningMessageAr,
+      warningMessageEn: warningMessageEn,
+      warningMessage: lang === 'en' ? warningMessageEn : warningMessageAr,
+      renderScale: qualityProfile.renderScale,
+      jpegQuality: qualityProfile.jpegQuality,
+      chartCaptureQuality: qualityProfile.chartCaptureQuality,
+      chartCaptureMaxW: qualityProfile.chartCaptureMaxW,
+      imageCompression: qualityProfile.imageCompression,
+      stripMetadata: qualityProfile.stripMetadata,
+      compressStreams: qualityProfile.compressStreams,
+      downsampleLogoPx: qualityProfile.downsampleLogoPx,
+      bytesPerPixel: qualityProfile.bytesPerPixel
+    });
+
+    plan.estimatedBytes = estimatePdfFileSizeBytes(plan, stats);
+    return plan;
+  }
+
+  // =========================================================================
+  // 24-HOUR RESERVATION EXPIRY RADAR & SHIFT HANDOVER SUMMARY
+  // =========================================================================
+
+  function parseReservationEndTimestampMs(dateStr, timeStr) {
+    var rawDate = convertEasternDigitsToAscii(normalizeStr(dateStr));
+    if (!rawDate) return null;
+
+    var rawTime = convertEasternDigitsToAscii(normalizeStr(timeStr));
+    // Full ISO timestamp with time zone / T when no separate time override is provided
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(rawDate) && !rawTime) {
+      var parsedIso = Date.parse(rawDate);
+      if (!isNaN(parsedIso)) return parsedIso;
+    }
+
+    var dateOnlyMatch = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/.exec(rawDate);
+    if (!dateOnlyMatch) {
+      var fallbackMs = Date.parse(rawDate);
+      return isNaN(fallbackMs) ? null : fallbackMs;
+    }
+
+    var year = parseInt(dateOnlyMatch[1], 10);
+    var month = parseInt(dateOnlyMatch[2], 10);
+    var day = parseInt(dateOnlyMatch[3], 10);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+    var hh = 23;
+    var mm = 59;
+    var timeMatch = /^(\d{1,2}):(\d{2})/.exec(rawTime);
+    if (timeMatch) {
+      hh = Math.min(23, Math.max(0, parseInt(timeMatch[1], 10)));
+      mm = Math.min(59, Math.max(0, parseInt(timeMatch[2], 10)));
+    } else {
+      var embeddedTime = /T(\d{2}):(\d{2})/.exec(rawDate);
+      if (embeddedTime) {
+        hh = Math.min(23, Math.max(0, parseInt(embeddedTime[1], 10)));
+        mm = Math.min(59, Math.max(0, parseInt(embeddedTime[2], 10)));
+      }
+    }
+
+    var dt = new Date(year, month - 1, day, hh, mm, 0, 0);
+    var ms = dt.getTime();
+    return isNaN(ms) ? null : ms;
+  }
+
+  function resolveReservationEffectiveEnd(res) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var extDate = normalizeStr(r.extendedUntilDate);
+    var extTime = normalizeStr(r.extendedUntilTime);
+    var endDate = normalizeStr(r.endDate || r.originalEndDate);
+    var endTime = normalizeStr(r.endTime || r.originalEndTime);
+
+    var useExt = Boolean(extDate);
+    var effDate = useExt ? extDate : endDate;
+    var effTime = useExt ? (extTime || endTime || '23:59') : (endTime || '23:59');
+    var cleanTime = '';
+    var tm = /^(\d{1,2}):(\d{2})/.exec(convertEasternDigitsToAscii(effTime));
+    if (tm) {
+      cleanTime = padTwoDigits(parseInt(tm[1], 10)) + ':' + padTwoDigits(parseInt(tm[2], 10));
+    }
+
+    var tsMs = parseReservationEndTimestampMs(effDate, cleanTime || effTime);
+    return {
+      date: effDate.substring(0, 10),
+      time: cleanTime || '',
+      isExtended: useExt || Number(r.extensionsCount || 0) > 0 || Boolean(r.hasExtensions),
+      timestampMs: tsMs
+    };
+  }
+
+  var CLOSED_RESERVATION_STATUSES = [
+    'تم الإلغاء', 'ملغي', 'cancelled', 'canceled', 'لم يتم الحجز', 'مرفوض', 'rejected',
+    'تم الإرجاع', 'تم الاستلام', 'منتهي', 'مكتمل', 'completed', 'returned', 'closed', 'لم يحضر', 'no_show'
+  ];
+
+  function isReservationClosedStatus(res) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var internal = normalizeStr(r.internalStatus).toLowerCase();
+    var origAr = normalizeStr(r.originalStatusAr).toLowerCase();
+    var origCode = normalizeStr(r.originalStatusCode).toLowerCase();
+    for (var i = 0; i < CLOSED_RESERVATION_STATUSES.length; i++) {
+      var st = CLOSED_RESERVATION_STATUSES[i].toLowerCase();
+      if (internal === st || origAr === st || origCode === st) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function formatRemainingDurationLabels(diffMs) {
+    var isPast = diffMs < 0;
+    var absMin = Math.round(Math.abs(diffMs) / 60000);
+    var hrs = Math.floor(absMin / 60);
+    var mins = absMin % 60;
+
+    if (absMin < 1) {
+      return {
+        ar: isPast ? 'انتهى للتو' : 'أقل من دقيقة',
+        en: isPast ? 'Just expired' : '< 1m left'
+      };
+    }
+
+    var partsAr = [];
+    var partsEn = [];
+    if (hrs > 0) {
+      partsAr.push(hrs + ' س');
+      partsEn.push(hrs + 'h');
+    }
+    if (mins > 0) {
+      partsAr.push(mins + ' د');
+      partsEn.push(mins + 'm');
+    }
+    var bodyAr = partsAr.join(' ');
+    var bodyEn = partsEn.join(' ');
+    return {
+      ar: isPast ? ('منتهي منذ ' + bodyAr) : ('باقي ' + bodyAr),
+      en: isPast ? ('Overdue ' + bodyEn) : (bodyEn + ' left')
+    };
+  }
+
+  function classifyExpiryRadarItem(res, nowMs, options) {
+    var opts = options || {};
+    var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+    var windowHours = Math.max(1, Number(opts.windowHours || 24));
+    var gracePastHours = Math.max(0, Number(opts.gracePastHours !== undefined ? opts.gracePastHours : 12));
+
+    if (!res || typeof res !== 'object') return null;
+    if (isReservationClosedStatus(res)) return null;
+
+    var eff = resolveReservationEffectiveEnd(res);
+    if (eff.timestampMs === null || !isFinite(eff.timestampMs)) return null;
+
+    var diffMs = eff.timestampMs - now;
+    var maxFutureMs = windowHours * 3600000;
+    var maxPastMs = gracePastHours * 3600000;
+    if (diffMs > maxFutureMs || diffMs < -maxPastMs) return null;
+
+    var bucket = 'soon_24h';
+    var urgencyRank = 2;
+    if (diffMs < 0) {
+      bucket = 'expired_unclosed';
+      urgencyRank = 0;
+    } else if (diffMs <= 6 * 3600000) {
+      bucket = 'critical_6h';
+      urgencyRank = 1;
+    }
+
+    var labels = formatRemainingDurationLabels(diffMs);
+    return {
+      reservation: res,
+      effectiveEndDate: eff.date,
+      effectiveEndTime: eff.time,
+      effectiveEndTimestampMs: eff.timestampMs,
+      isExtended: eff.isExtended,
+      diffMs: diffMs,
+      diffMinutes: Math.round(diffMs / 60000),
+      bucket: bucket,
+      urgencyRank: urgencyRank,
+      remainingLabelAr: labels.ar,
+      remainingLabelEn: labels.en
+    };
+  }
+
+  function computeExpiryRadarSummary(reservations, nowMs, options) {
+    var list = Array.isArray(reservations) ? reservations : [];
+    var opts = options || {};
+    var subFilter = normalizeStr(opts.subFilter || 'all').toLowerCase();
+    var search = normalizeStr(opts.search).toLowerCase();
+
+    var allMatches = [];
+    var critical6hCount = 0;
+    var soon24hCount = 0;
+    var expiredUnclosedCount = 0;
+    var extendedInRadarCount = 0;
+
+    for (var i = 0; i < list.length; i++) {
+      var item = classifyExpiryRadarItem(list[i], nowMs, opts);
+      if (!item) continue;
+      if (item.bucket === 'expired_unclosed') expiredUnclosedCount += 1;
+      else if (item.bucket === 'critical_6h') critical6hCount += 1;
+      else soon24hCount += 1;
+      if (item.isExtended) extendedInRadarCount += 1;
+      allMatches.push(item);
+    }
+
+    allMatches.sort(function (a, b) {
+      if (a.urgencyRank !== b.urgencyRank) return a.urgencyRank - b.urgencyRank;
+      return a.effectiveEndTimestampMs - b.effectiveEndTimestampMs;
+    });
+
+    var filtered = allMatches.filter(function (entry) {
+      if (subFilter === 'critical_6h' && entry.bucket !== 'critical_6h') return false;
+      if (subFilter === 'soon_24h' && entry.bucket === 'expired_unclosed') return false;
+      if (subFilter === 'expired_unclosed' && entry.bucket !== 'expired_unclosed') return false;
+      if (search) {
+        var r = entry.reservation;
+        var hay = (
+          normalizeStr(r.reservationNumber) + ' ' +
+          normalizeStr(r.customerName) + ' ' +
+          normalizeStr(r.customerPhone) + ' ' +
+          normalizeStr(r.carName) + ' ' +
+          normalizeStr(r.companyName) + ' ' +
+          normalizeStr(r.branchName)
+        ).toLowerCase();
+        if (hay.indexOf(search) === -1) return false;
+      }
+      return true;
+    });
+
+    return {
+      items: filtered,
+      allItems: allMatches,
+      totalCount: allMatches.length,
+      upcoming24hCount: critical6hCount + soon24hCount,
+      critical6hCount: critical6hCount,
+      soon24hCount: soon24hCount,
+      expiredUnclosedCount: expiredUnclosedCount,
+      extendedInRadarCount: extendedInRadarCount
+    };
+  }
+
+  function normalizeWhatsappPhone(phone) {
+    var digits = convertEasternDigitsToAscii(normalizeStr(phone)).replace(/[^0-9]/g, '');
+    if (!digits) return '';
+    if (digits.indexOf('00') === 0) digits = digits.slice(2);
+    if (digits.indexOf('05') === 0 && digits.length === 10) return '966' + digits.slice(1);
+    if (digits.indexOf('5') === 0 && digits.length === 9) return '966' + digits;
+    return digits;
+  }
+
+  function buildExtensionOfferMessage(res, lang, options) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var isEn = lang === 'en';
+    var eff = resolveReservationEffectiveEnd(r);
+    var endDisp = formatDisplayDate(eff.date || r.endDate || '');
+    var timeDisp = eff.time ? (' ' + eff.time) : '';
+    var custName = normalizeStr(r.customerName) || (isEn ? 'Valued Customer' : 'عميلنا الكريم');
+    var resNum = normalizeStr(r.reservationNumber || r.id) || '-';
+    var carName = normalizeStr(r.carName) || (isEn ? 'your vehicle' : 'مركبتك');
+    var company = normalizeStr(r.companyName);
+    var agentName = normalizeStr(options && options.agentName);
+
+    if (isEn) {
+      return 'Hello ' + custName + ',\n' +
+        'This is Rental Gate Customer Care' + (agentName ? (' (' + agentName + ')') : '') + '.\n' +
+        'Your rental reservation #' + resNum + ' (' + carName + (company ? ' - ' + company : '') + ') is scheduled to end on ' +
+        endDisp + timeDisp + '.\n' +
+        'Would you like us to extend your contract smoothly before expiry, or confirm your return details?';
+    }
+    return 'السلام عليكم أ/ ' + custName + '،\n' +
+      'معك فريق خدمة العملاء في Rental Gate' + (agentName ? (' (' + agentName + ')') : '') + '.\n' +
+      'نود تذكيركم بأن حجزكم رقم ' + resNum + ' (' + carName + (company ? ' - ' + company : '') + ') يقترب من موعد الانتهاء بتاريخ ' +
+      endDisp + timeDisp + '.\n' +
+      'هل ترغبون في تمديد مدة الإيجار قبل انتهاء العقد لنجهز لكم الإجراء فوراً أم تأكيد موعد التسليم؟';
+  }
+
+  var SHIFT_HANDOVER_PRESETS = [
+    { key: '8h', labelAr: 'آخر 8 ساعات', labelEn: 'Last 8 Hours' },
+    { key: '12h', labelAr: 'آخر 12 ساعة', labelEn: 'Last 12 Hours' },
+    { key: 'today', labelAr: 'وردية اليوم', labelEn: "Today's Shift" },
+    { key: 'yesterday', labelAr: 'وردية الأمس', labelEn: "Yesterday's Shift" },
+    { key: 'custom', labelAr: 'نطاق مخصص', labelEn: 'Custom Range' }
+  ];
+
+  function resolveShiftWindow(preset, customFrom, customTo, nowMs) {
+    var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+    var key = normalizeStr(preset || '8h').toLowerCase();
+    var nowDate = new Date(now);
+    var todayStr = formatIsoDateParts(nowDate.getFullYear(), nowDate.getMonth() + 1, nowDate.getDate());
+
+    var startMs;
+    var endMs = now;
+    var labelAr = 'آخر 8 ساعات';
+    var labelEn = 'Last 8 Hours';
+
+    if (key === '12h') {
+      startMs = now - 12 * 3600000;
+      labelAr = 'آخر 12 ساعة';
+      labelEn = 'Last 12 Hours';
+    } else if (key === 'today') {
+      startMs = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate(), 0, 0, 0, 0).getTime();
+      endMs = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate(), 23, 59, 59, 999).getTime();
+      labelAr = 'وردية اليوم (' + formatDisplayDate(todayStr) + ')';
+      labelEn = "Today's Shift (" + formatDisplayDate(todayStr) + ')';
+    } else if (key === 'yesterday') {
+      var yDate = new Date(now - 86400000);
+      var yStr = formatIsoDateParts(yDate.getFullYear(), yDate.getMonth() + 1, yDate.getDate());
+      startMs = new Date(yDate.getFullYear(), yDate.getMonth(), yDate.getDate(), 0, 0, 0, 0).getTime();
+      endMs = new Date(yDate.getFullYear(), yDate.getMonth(), yDate.getDate(), 23, 59, 59, 999).getTime();
+      labelAr = 'وردية الأمس (' + formatDisplayDate(yStr) + ')';
+      labelEn = "Yesterday's Shift (" + formatDisplayDate(yStr) + ')';
+    } else if (key === 'custom') {
+      var parsedFrom = parseIsoDateStrict(customFrom);
+      var parsedTo = parseIsoDateStrict(customTo);
+      var fromObj = parsedFrom
+        ? new Date(parsedFrom.year, parsedFrom.month - 1, parsedFrom.day, 0, 0, 0, 0)
+        : new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate(), 0, 0, 0, 0);
+      var toObj = parsedTo
+        ? new Date(parsedTo.year, parsedTo.month - 1, parsedTo.day, 23, 59, 59, 999)
+        : new Date(now);
+      if (fromObj.getTime() > toObj.getTime()) {
+        var swapTmp = fromObj;
+        fromObj = toObj;
+        toObj = new Date(swapTmp.getFullYear(), swapTmp.getMonth(), swapTmp.getDate(), 23, 59, 59, 999);
+      }
+      startMs = fromObj.getTime();
+      endMs = toObj.getTime();
+      var fStr = formatIsoDateParts(fromObj.getFullYear(), fromObj.getMonth() + 1, fromObj.getDate());
+      var tStr = formatIsoDateParts(toObj.getFullYear(), toObj.getMonth() + 1, toObj.getDate());
+      labelAr = 'نطاق مخصص (' + formatDisplayDate(fStr) + ' ← ' + formatDisplayDate(tStr) + ')';
+      labelEn = 'Custom (' + formatDisplayDate(fStr) + ' -> ' + formatDisplayDate(tStr) + ')';
+    } else {
+      key = '8h';
+      startMs = now - 8 * 3600000;
+    }
+
+    return {
+      preset: key,
+      startMs: startMs,
+      endMs: endMs,
+      startIso: new Date(startMs).toISOString(),
+      endIso: new Date(endMs).toISOString(),
+      labelAr: labelAr,
+      labelEn: labelEn
+    };
+  }
+
+  function parseTimestampLooseMs(val) {
+    var s = normalizeStr(val);
+    if (!s) return null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+      return parseReservationEndTimestampMs(s, '12:00');
+    }
+    var ms = Date.parse(s);
+    if (!isNaN(ms)) return ms;
+    return parseReservationEndTimestampMs(s.substring(0, 10), '');
+  }
+
+  function isRecordInShiftWindow(tsValues, win) {
+    for (var i = 0; i < tsValues.length; i++) {
+      var ms = parseTimestampLooseMs(tsValues[i]);
+      if (ms !== null && ms >= win.startMs && ms <= win.endMs) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  var PENDING_WORKFLOW_STATUSES = [
+    'تم الإنشاء', 'جديد', 'قيد الانتظار', 'معلق', 'بانتظار الدفع', 'تم الحجز'
+  ];
+
+  function computeShiftHandoverSummary(input) {
+    var cfg = (input && typeof input === 'object') ? input : {};
+    var reservations = Array.isArray(cfg.reservations) ? cfg.reservations : [];
+    var problems = Array.isArray(cfg.problems) ? cfg.problems : [];
+    var followUps = Array.isArray(cfg.followUps) ? cfg.followUps : [];
+    var nowMs = (typeof cfg.nowMs === 'number' && isFinite(cfg.nowMs)) ? cfg.nowMs : Date.now();
+    var win = cfg.shiftWindow && typeof cfg.shiftWindow.startMs === 'number'
+      ? cfg.shiftWindow
+      : resolveShiftWindow(cfg.preset || '8h', cfg.dateFrom, cfg.dateTo, nowMs);
+
+    var followedSet = {};
+    var shiftFollowUps = [];
+    for (var fi = 0; fi < followUps.length; fi++) {
+      var fu = followUps[fi];
+      if (!fu) continue;
+      if (fu.reservationId) followedSet[fu.reservationId] = true;
+      if (isRecordInShiftWindow([fu.createdAt, fu.followUpDate], win)) {
+        shiftFollowUps.push(fu);
+      }
+    }
+
+    var closedReservations = [];
+    var pendingReservations = [];
+    var activeHealthyCount = 0;
+
+    for (var ri = 0; ri < reservations.length; ri++) {
+      var r = reservations[ri];
+      if (!r) continue;
+      var enriched = Object.assign({}, r, { isFollowed: Boolean(r.isFollowed || followedSet[r.id]) });
+      var isClosed = isReservationClosedStatus(enriched);
+
+      if (isClosed) {
+        if (isRecordInShiftWindow([enriched.lastUpdatedAt, enriched.updatedAt, enriched.endDate], win)) {
+          closedReservations.push(enriched);
+        }
+        continue;
+      }
+
+      var st = normalizeStr(enriched.internalStatus);
+      var origSt = normalizeStr(enriched.originalStatusAr);
+      var assigned = Array.isArray(enriched.assignedEmployeeIds) ? enriched.assignedEmployeeIds : [];
+      var needsFollow = PENDING_WORKFLOW_STATUSES.indexOf(st) !== -1 ||
+        PENDING_WORKFLOW_STATUSES.indexOf(origSt) !== -1 ||
+        !enriched.isFollowed ||
+        assigned.length === 0 ||
+        Boolean(enriched.hasProblem);
+
+      if (needsFollow) {
+        pendingReservations.push(enriched);
+      } else {
+        activeHealthyCount += 1;
+      }
+    }
+
+    // Sort closed newest first, pending by problem/priority/unassigned then newest
+    closedReservations.sort(function (a, b) {
+      return String(b.lastUpdatedAt || b.updatedAt || '').localeCompare(String(a.lastUpdatedAt || a.updatedAt || ''));
+    });
+
+    var prioOrder = { 'مرتفع': 0, 'متوسط': 1, 'عادي': 2 };
+    pendingReservations.sort(function (a, b) {
+      var pa = a.hasProblem ? -1 : (prioOrder[a.priority] !== undefined ? prioOrder[a.priority] : 2);
+      var pb = b.hasProblem ? -1 : (prioOrder[b.priority] !== undefined ? prioOrder[b.priority] : 2);
+      if (pa !== pb) return pa - pb;
+      return String(b.lastUpdatedAt || b.createdAt || '').localeCompare(String(a.lastUpdatedAt || a.createdAt || ''));
+    });
+
+    var openProblems = problems.filter(function (p) {
+      return p && !isProblemClosedStatus(p.status);
+    }).sort(function (a, b) {
+      var pa = prioOrder[a.priority] !== undefined ? prioOrder[a.priority] : 2;
+      var pb = prioOrder[b.priority] !== undefined ? prioOrder[b.priority] : 2;
+      if (pa !== pb) return pa - pb;
+      return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
+    });
+
+    var closedProblemsInShift = problems.filter(function (p) {
+      return p && isProblemClosedStatus(p.status) && isRecordInShiftWindow([p.updatedAt, p.createdAt], win);
+    });
+
+    var radar = computeExpiryRadarSummary(reservations, nowMs, { windowHours: 24, gracePastHours: 12 });
+    var highPriorityProblemsCount = openProblems.filter(function (p) { return p.priority === 'مرتفع'; }).length;
+
+    return {
+      shiftWindow: win,
+      generatedAtIso: new Date(nowMs).toISOString(),
+      staffName: normalizeStr(cfg.staffName) || 'مشرف الوردية',
+      notes: normalizeStr(cfg.notes),
+      closedReservations: closedReservations,
+      pendingReservations: pendingReservations,
+      openProblems: openProblems,
+      closedProblemsInShift: closedProblemsInShift,
+      expiring24h: radar.items,
+      shiftFollowUps: shiftFollowUps,
+      counts: {
+        closedCount: closedReservations.length,
+        pendingCount: pendingReservations.length,
+        activeHealthyCount: activeHealthyCount,
+        openProblemsCount: openProblems.length,
+        highPriorityProblemsCount: highPriorityProblemsCount,
+        closedProblemsCount: closedProblemsInShift.length,
+        expiring24hCount: radar.totalCount,
+        followUpsCount: shiftFollowUps.length
+      }
+    };
+  }
+
+  function buildShiftHandoverPdfPayload(summary, lang) {
+    var s = (summary && typeof summary === 'object') ? summary : computeShiftHandoverSummary({});
+    var isEn = lang === 'en';
+    var win = s.shiftWindow || {};
+    var counts = s.counts || {};
+    var winLabel = isEn ? (win.labelEn || '') : (win.labelAr || '');
+
+    var title = isEn
+      ? ('Shift Handover Report — ' + winLabel)
+      : ('ملخص تسليم الوردية — ' + winLabel);
+
+    var summaryItems = [
+      { label: isEn ? 'Shift Supervisor' : 'مسؤول التسليم', value: s.staffName || '-' },
+      { label: isEn ? 'Closed Bookings' : 'الحجوزات المغلقة', value: String(counts.closedCount || 0) },
+      { label: isEn ? 'Pending / Action Needed' : 'قيد الانتظار / المتابعة', value: String(counts.pendingCount || 0) },
+      { label: isEn ? 'Open Problems' : 'المشكلات المفتوحة', value: String(counts.openProblemsCount || 0) },
+      { label: isEn ? 'Expiring ≤ 24h' : 'تنتهي خلال 24 ساعة', value: String(counts.expiring24hCount || 0) },
+      { label: isEn ? 'Shift Follow-Ups' : 'متابعات الوردية', value: String(counts.followUpsCount || 0) }
+    ];
+    if (s.notes) {
+      summaryItems.push({
+        label: isEn ? 'Handover Notes for Next Shift' : 'ملاحظات التسليم للوردية التالية',
+        value: s.notes
+      });
+    }
+
+    var columns = [
+      { key: 'category', label: 'التصنيف', labelEn: 'Category', widthWeight: 1.0 },
+      { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Booking #', formatType: 'ltr', widthWeight: 1.05 },
+      { key: 'customerName', label: 'العميل', labelEn: 'Customer', widthWeight: 1.25 },
+      { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.15 },
+      { key: 'internalStatus', label: 'الحالة', labelEn: 'Status', widthWeight: 1.0 },
+      { key: 'priority', label: 'الأولوية', labelEn: 'Priority', widthWeight: 0.75 },
+      { key: 'lastUpdateText', label: 'آخر تحديث / إجراء مطلوب', labelEn: 'Last Update / Next Action', widthWeight: 1.75 }
+    ];
+
+    var rows = [];
+    (s.pendingReservations || []).forEach(function (r) {
+      rows.push({
+        category: isEn ? 'Pending' : 'قيد الانتظار',
+        reservationNumber: r.reservationNumber || '-',
+        customerName: (r.customerName || '-') + (r.customerPhone ? (' (' + r.customerPhone + ')') : ''),
+        carName: r.carName || '-',
+        internalStatus: r.internalStatus || r.originalStatusAr || '-',
+        priority: r.priority || 'عادي',
+        lastUpdateText: r.lastUpdateText || (isEn ? 'Needs follow-up' : 'تحتاج متابعة')
+      });
+    });
+    (s.closedReservations || []).forEach(function (r) {
+      rows.push({
+        category: isEn ? 'Closed' : 'مغلق في الوردية',
+        reservationNumber: r.reservationNumber || '-',
+        customerName: r.customerName || '-',
+        carName: r.carName || '-',
+        internalStatus: r.internalStatus || r.originalStatusAr || '-',
+        priority: r.priority || 'عادي',
+        lastUpdateText: r.lastUpdateText || '-'
+      });
+    });
+
+    var extraSections = [];
+    var openPrbs = s.openProblems || [];
+    if (openPrbs.length > 0) {
+      extraSections.push({
+        title: (isEn ? 'Open Problems to Hand Over (' : 'المشكلات المفتوحة المسلّمة للوردية التالية (') + openPrbs.length + ')',
+        lines: openPrbs.map(function (p) {
+          return (p.problemNumber || '-') + ' | ' + (p.reservationNumber || '-') + ' | ' + (p.customerName || '-') +
+            ' [' + (p.priority || 'عادي') + ' - ' + (p.status || '-') + ']: ' + (p.description || '-');
+        })
+      });
+    }
+
+    var expList = s.expiring24h || [];
+    if (expList.length > 0) {
+      extraSections.push({
+        title: (isEn ? '24h Expiry Radar Alerts (' : 'تنبيهات انتهاء الحجوزات خلال 24 ساعة (') + expList.length + ')',
+        lines: expList.map(function (it) {
+          var r = it.reservation || {};
+          var rem = isEn ? it.remainingLabelEn : it.remainingLabelAr;
+          return (r.reservationNumber || '-') + ' | ' + (r.customerName || '-') + ' (' + (r.customerPhone || '-') + ') | ' +
+            (r.carName || '-') + ' — ' + rem + ' (' + formatDisplayDate(it.effectiveEndDate) + (it.effectiveEndTime ? ' ' + it.effectiveEndTime : '') + ')';
+        })
+      });
+    }
+
+    var dateSlug = String(s.generatedAtIso || '').substring(0, 10) || 'shift';
+    return {
+      title: title,
+      filename: 'rental-gate-shift-handover-' + dateSlug + '.pdf',
+      summaryItems: summaryItems,
+      columns: columns,
+      rows: rows,
+      extraSections: extraSections
+    };
+  }
+
+  // ---------- TODAY'S PICKUPS & RETURNS RADAR ----------
+
+  var EXCLUDED_TODAY_STATUSES = [
+    'تم الإلغاء', 'ملغي', 'cancelled', 'canceled', 'مرفوض', 'rejected',
+    'لم يتم الحجز', 'لم يحضر', 'no_show'
+  ];
+
+  var PICKUP_COMPLETED_STATUSES = [
+    'تم التسليم', 'نشط الآن', 'نشط', 'active', 'delivered', 'picked_up',
+    'تم الاستلام', 'تم الإرجاع', 'منتهي', 'مكتمل', 'completed', 'returned', 'closed'
+  ];
+
+  function isExcludedMovementStatus(res) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var internal = normalizeStr(r.internalStatus).toLowerCase();
+    var origAr = normalizeStr(r.originalStatusAr).toLowerCase();
+    var origCode = normalizeStr(r.originalStatusCode).toLowerCase();
+    for (var i = 0; i < EXCLUDED_TODAY_STATUSES.length; i++) {
+      var st = EXCLUDED_TODAY_STATUSES[i].toLowerCase();
+      if (internal === st || origAr === st || origCode === st) return true;
+    }
+    return false;
+  }
+
+  function isPickupCompletedStatus(res) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var internal = normalizeStr(r.internalStatus).toLowerCase();
+    var origAr = normalizeStr(r.originalStatusAr).toLowerCase();
+    var origCode = normalizeStr(r.originalStatusCode).toLowerCase();
+    for (var i = 0; i < PICKUP_COMPLETED_STATUSES.length; i++) {
+      var st = PICKUP_COMPLETED_STATUSES[i].toLowerCase();
+      if (internal === st || origAr === st || origCode === st) return true;
+    }
+    return false;
+  }
+
+  function parseMinutesOfDay(timeStr) {
+    var clean = convertEasternDigitsToAscii(normalizeStr(timeStr));
+    var m = /^(\d{1,2}):(\d{2})/.exec(clean);
+    if (!m) return null;
+    var hh = parseInt(m[1], 10);
+    var mm = parseInt(m[2], 10);
+    if (isNaN(hh) || isNaN(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+    return hh * 60 + mm;
+  }
+
+  function normalizeTimeHHmm(timeStr, fallback) {
+    var mins = parseMinutesOfDay(timeStr);
+    if (mins === null) return fallback || '';
+    return padTwoDigits(Math.floor(mins / 60)) + ':' + padTwoDigits(mins % 60);
+  }
+
+  function resolveReservationStartInfo(res) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var dateStr = formatDisplayDate(r.startDate || r.pickupDate || '');
+    var rawTime = normalizeStr(r.startTime) || extractTimeOnly(r.startDate) || '09:00';
+    var cleanTime = normalizeTimeHHmm(rawTime, '09:00');
+    var tsMs = dateStr ? parseReservationEndTimestampMs(dateStr, cleanTime) : null;
+    return {
+      date: dateStr,
+      time: cleanTime,
+      minutesOfDay: parseMinutesOfDay(cleanTime),
+      timestampMs: tsMs
+    };
+  }
+
+  function computeTodayMovementsSummary(reservations, nowMs, options) {
+    var list = Array.isArray(reservations) ? reservations : [];
+    var opts = options || {};
+    var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+    var nowDt = new Date(now);
+    var todayDate = formatDisplayDate(opts.todayDate) || formatIsoDateParts(nowDt.getFullYear(), nowDt.getMonth() + 1, nowDt.getDate());
+    var subFilter = normalizeStr(opts.subFilter || 'all').toLowerCase();
+    var search = normalizeStr(opts.search).toLowerCase();
+
+    var allItems = [];
+    var pickupCount = 0;
+    var returnCount = 0;
+    var pendingPickupCount = 0;
+    var pendingReturnCount = 0;
+    var overdueCount = 0;
+    var completedCount = 0;
+
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (!r || typeof r !== 'object') continue;
+      if (isExcludedMovementStatus(r)) continue;
+
+      var startInfo = resolveReservationStartInfo(r);
+      if (startInfo.date && startInfo.date === todayDate) {
+        var pickupDone = isPickupCompletedStatus(r);
+        var pickupOverdue = !pickupDone && startInfo.timestampMs !== null && startInfo.timestampMs < now;
+        pickupCount += 1;
+        if (pickupDone) completedCount += 1;
+        else pendingPickupCount += 1;
+        if (pickupOverdue) overdueCount += 1;
+        allItems.push({
+          key: String(r.id || r.reservationNumber || i) + ':pickup',
+          movementType: 'pickup',
+          reservation: r,
+          scheduledDate: todayDate,
+          scheduledTime: startInfo.time,
+          scheduledMinutes: startInfo.minutesOfDay !== null ? startInfo.minutesOfDay : 540,
+          scheduledTimestampMs: startInfo.timestampMs,
+          isCompleted: pickupDone,
+          isOverdue: pickupOverdue,
+          isExtended: false
+        });
+      }
+
+      var effEnd = resolveReservationEffectiveEnd(r);
+      if (effEnd.date && effEnd.date === todayDate) {
+        var retTime = normalizeTimeHHmm(effEnd.time, '23:59');
+        var retMins = parseMinutesOfDay(retTime);
+        var retDone = isReservationClosedStatus(r);
+        var retOverdue = !retDone && effEnd.timestampMs !== null && effEnd.timestampMs < now;
+        returnCount += 1;
+        if (retDone) completedCount += 1;
+        else pendingReturnCount += 1;
+        if (retOverdue) overdueCount += 1;
+        allItems.push({
+          key: String(r.id || r.reservationNumber || i) + ':return',
+          movementType: 'return',
+          reservation: r,
+          scheduledDate: todayDate,
+          scheduledTime: retTime,
+          scheduledMinutes: retMins !== null ? retMins : 1439,
+          scheduledTimestampMs: effEnd.timestampMs,
+          isCompleted: retDone,
+          isOverdue: retOverdue,
+          isExtended: effEnd.isExtended
+        });
+      }
+    }
+
+    allItems.sort(function (a, b) {
+      if (a.scheduledMinutes !== b.scheduledMinutes) return a.scheduledMinutes - b.scheduledMinutes;
+      if (a.movementType !== b.movementType) return a.movementType === 'pickup' ? -1 : 1;
+      var ra = normalizeStr(a.reservation && a.reservation.reservationNumber);
+      var rb = normalizeStr(b.reservation && b.reservation.reservationNumber);
+      return ra < rb ? -1 : (ra > rb ? 1 : 0);
+    });
+
+    var filtered = allItems.filter(function (item) {
+      if (subFilter === 'pickup' && item.movementType !== 'pickup') return false;
+      if (subFilter === 'return' && item.movementType !== 'return') return false;
+      if (search) {
+        var r = item.reservation || {};
+        var hay = (
+          normalizeStr(r.reservationNumber) + ' ' +
+          normalizeStr(r.customerName) + ' ' +
+          normalizeStr(r.customerPhone) + ' ' +
+          normalizeStr(r.carName) + ' ' +
+          normalizeStr(r.plateNumber) + ' ' +
+          normalizeStr(r.companyName) + ' ' +
+          normalizeStr(r.branchName)
+        ).toLowerCase();
+        if (hay.indexOf(search) === -1) return false;
+      }
+      return true;
+    });
+
+    return {
+      todayDate: todayDate,
+      items: filtered,
+      allItems: allItems,
+      totalCount: allItems.length,
+      pickupCount: pickupCount,
+      returnCount: returnCount,
+      pendingPickupCount: pendingPickupCount,
+      pendingReturnCount: pendingReturnCount,
+      overdueCount: overdueCount,
+      completedCount: completedCount
+    };
+  }
+
+  // ---------- EXTENSION COMPARISON SUMMARY ----------
+
+  function computeExtensionComparisonSummary(res, extensions) {
+    var r = (res && typeof res === 'object') ? res : {};
+    var extList = Array.isArray(extensions) ? extensions : (Array.isArray(r.extensions) ? r.extensions : []);
+    var origEndDate = formatDisplayDate(r.originalEndDate || r.endDate || '');
+    var origEndTime = normalizeTimeHHmm(
+      normalizeStr(r.originalEndTime) || extractTimeOnly(r.originalEndDate) || normalizeStr(r.endTime) || extractTimeOnly(r.endDate),
+      ''
+    );
+
+    var extSummary = summarizeReservationExtensions(extList, r, origEndDate, origEndTime);
+    var effEndDate = formatDisplayDate(r.extendedUntilDate || extSummary.extendedUntilDate || r.endDate || origEndDate);
+    var effEndTime = normalizeTimeHHmm(
+      normalizeStr(r.extendedUntilTime) || extSummary.extendedUntilTime || normalizeStr(r.endTime) || origEndTime,
+      origEndTime
+    );
+
+    var baseDays = Math.max(0, Math.round(toNum(r.daysCount, 0)));
+    var extendedDays = Math.max(
+      Math.round(toNum(r.extendedDaysCount, 0)),
+      Math.round(toNum(extSummary.extendedDaysCount, 0))
+    );
+    if (extendedDays === 0 && origEndDate && effEndDate && effEndDate > origEndDate) {
+      extendedDays = computeDateDiffDays(origEndDate, effEndDate);
+    }
+    var totalDays = Math.max(baseDays + extendedDays, Math.round(toNum(r.totalDaysCount, 0)));
+
+    var baseAmount = Math.round(toNum(r.baseAmount, 0) * 100) / 100;
+    var extensionsAmount = Math.round(
+      Math.max(toNum(r.extensionsAmount, 0), toNum(extSummary.extensionsAmount, 0)) * 100
+    ) / 100;
+    var totalAmount = Math.round(
+      toNum(r.totalAmount, baseAmount + extensionsAmount) * 100
+    ) / 100;
+    if (baseAmount === 0 && totalAmount > extensionsAmount) {
+      baseAmount = Math.round((totalAmount - extensionsAmount) * 100) / 100;
+    }
+
+    var extensionsCount = Math.max(
+      Math.round(toNum(r.extensionsCount, 0)),
+      Math.round(toNum(extSummary.extensionsCount, 0))
+    );
+    var amountDeltaPct = baseAmount > 0 ? Math.round((extensionsAmount / baseAmount) * 100) : 0;
+    var hasExtensions = Boolean(
+      extensionsCount > 0 ||
+      extendedDays > 0 ||
+      extensionsAmount > 0 ||
+      (origEndDate && effEndDate && effEndDate > origEndDate) ||
+      r.hasExtensions
+    );
+
+    return {
+      hasExtensions: hasExtensions,
+      extensionsCount: extensionsCount,
+      originalEndDate: origEndDate,
+      originalEndTime: origEndTime,
+      effectiveEndDate: effEndDate,
+      effectiveEndTime: effEndTime,
+      baseDays: baseDays,
+      extendedDays: extendedDays,
+      totalDays: totalDays,
+      baseAmount: baseAmount,
+      extensionsAmount: extensionsAmount,
+      totalAmount: totalAmount,
+      amountDeltaPct: amountDeltaPct,
+      extensions: extSummary.extensions || []
+    };
+  }
+
+  // ---------- PEAK HOURS HEATMAP ----------
+
+  var HEATMAP_DAY_ORDER = [
+    { dayIndex: 6, labelAr: 'السبت', labelEn: 'Sat' },
+    { dayIndex: 0, labelAr: 'الأحد', labelEn: 'Sun' },
+    { dayIndex: 1, labelAr: 'الاثنين', labelEn: 'Mon' },
+    { dayIndex: 2, labelAr: 'الثلاثاء', labelEn: 'Tue' },
+    { dayIndex: 3, labelAr: 'الأربعاء', labelEn: 'Wed' },
+    { dayIndex: 4, labelAr: 'الخميس', labelEn: 'Thu' },
+    { dayIndex: 5, labelAr: 'الجمعة', labelEn: 'Fri' }
+  ];
+
+  function extractDayAndHourFromDateValue(rawDateStr, explicitTimeStr) {
+    var dateOnly = formatDisplayDate(rawDateStr);
+    var timeClean = normalizeTimeHHmm(normalizeStr(explicitTimeStr) || extractTimeOnly(rawDateStr), '');
+    if (dateOnly && timeClean) {
+      var parts = dateOnly.split('-');
+      var tParts = timeClean.split(':');
+      var dtLocal = new Date(
+        parseInt(parts[0], 10),
+        parseInt(parts[1], 10) - 1,
+        parseInt(parts[2], 10),
+        parseInt(tParts[0], 10),
+        parseInt(tParts[1], 10),
+        0
+      );
+      if (!isNaN(dtLocal.getTime())) {
+        return { dayIndex: dtLocal.getDay(), hour: dtLocal.getHours() };
+      }
+    }
+
+    var strVal = normalizeStr(rawDateStr);
+    if (strVal) {
+      var parsed = new Date(strVal);
+      if (!isNaN(parsed.getTime())) {
+        return { dayIndex: parsed.getDay(), hour: parsed.getHours() };
+      }
+    }
+
+    if (dateOnly) {
+      var dp = dateOnly.split('-');
+      var dOnly = new Date(parseInt(dp[0], 10), parseInt(dp[1], 10) - 1, parseInt(dp[2], 10), 10, 0, 0);
+      if (!isNaN(dOnly.getTime())) {
+        return { dayIndex: dOnly.getDay(), hour: 10 };
+      }
+    }
+    return null;
+  }
+
+  function computePeakHoursHeatmap(reservations, problems, options) {
+    var resList = Array.isArray(reservations) ? reservations : [];
+    var prbList = Array.isArray(problems) ? problems : [];
+    var opts = options || {};
+    var mode = normalizeStr(opts.mode || 'all').toLowerCase();
+    if (mode !== 'reservations' && mode !== 'problems') mode = 'all';
+
+    var gridByDay = {};
+    for (var d = 0; d < HEATMAP_DAY_ORDER.length; d++) {
+      var info = HEATMAP_DAY_ORDER[d];
+      var hours = [];
+      for (var h = 0; h < 24; h++) {
+        hours.push({
+          hour: h,
+          hourLabel: padTwoDigits(h) + ':00',
+          reservations: 0,
+          problems: 0,
+          count: 0,
+          intensity: 0
+        });
+      }
+      gridByDay[info.dayIndex] = {
+        dayIndex: info.dayIndex,
+        labelAr: info.labelAr,
+        labelEn: info.labelEn,
+        hours: hours,
+        rowTotal: 0,
+        reservationsTotal: 0,
+        problemsTotal: 0
+      };
+    }
+
+    var reservationEvents = 0;
+    var problemEvents = 0;
+
+    for (var i = 0; i < resList.length; i++) {
+      var r = resList[i];
+      if (!r || typeof r !== 'object') continue;
+      var rSlot = extractDayAndHourFromDateValue(r.startDate || r.sourceCreatedAt || r.createdAt, r.startTime);
+      if (!rSlot && (r.sourceCreatedAt || r.createdAt)) {
+        rSlot = extractDayAndHourFromDateValue(r.sourceCreatedAt || r.createdAt, '');
+      }
+      if (!rSlot || !gridByDay[rSlot.dayIndex]) continue;
+      var cellR = gridByDay[rSlot.dayIndex].hours[rSlot.hour];
+      if (!cellR) continue;
+      cellR.reservations += 1;
+      gridByDay[rSlot.dayIndex].reservationsTotal += 1;
+      reservationEvents += 1;
+    }
+
+    for (var j = 0; j < prbList.length; j++) {
+      var p = prbList[j];
+      if (!p || typeof p !== 'object') continue;
+      var pSlot = extractDayAndHourFromDateValue(p.createdAt || p.updatedAt, '');
+      if (!pSlot || !gridByDay[pSlot.dayIndex]) continue;
+      var cellP = gridByDay[pSlot.dayIndex].hours[pSlot.hour];
+      if (!cellP) continue;
+      cellP.problems += 1;
+      gridByDay[pSlot.dayIndex].problemsTotal += 1;
+      problemEvents += 1;
+    }
+
+    var maxCount = 0;
+    var totalEvents = 0;
+    var hourTotals = [];
+    for (var hi = 0; hi < 24; hi++) hourTotals.push(0);
+
+    var days = HEATMAP_DAY_ORDER.map(function (meta) {
+      var row = gridByDay[meta.dayIndex];
+      var rowSum = 0;
+      for (var hr = 0; hr < 24; hr++) {
+        var cell = row.hours[hr];
+        var val = mode === 'reservations'
+          ? cell.reservations
+          : (mode === 'problems' ? cell.problems : (cell.reservations + cell.problems));
+        cell.count = val;
+        rowSum += val;
+        hourTotals[hr] += val;
+        totalEvents += val;
+        if (val > maxCount) maxCount = val;
+      }
+      row.rowTotal = rowSum;
+      return row;
+    });
+
+    var busiestDay = days[0] || null;
+    var peakSlot = null;
+    for (var di = 0; di < days.length; di++) {
+      var dayRow = days[di];
+      if (!busiestDay || dayRow.rowTotal > busiestDay.rowTotal) {
+        busiestDay = dayRow;
+      }
+      for (var hrIdx = 0; hrIdx < 24; hrIdx++) {
+        var c = dayRow.hours[hrIdx];
+        if (maxCount > 0 && c.count > 0) {
+          var ratio = c.count / maxCount;
+          c.intensity = ratio >= 0.78 ? 4 : (ratio >= 0.52 ? 3 : (ratio >= 0.26 ? 2 : 1));
+        } else {
+          c.intensity = 0;
+        }
+        if (!peakSlot || c.count > peakSlot.count) {
+          peakSlot = {
+            dayIndex: dayRow.dayIndex,
+            labelAr: dayRow.labelAr,
+            labelEn: dayRow.labelEn,
+            hour: c.hour,
+            hourLabel: c.hourLabel,
+            count: c.count,
+            reservations: c.reservations,
+            problems: c.problems
+          };
+        }
+      }
+    }
+
+    var peakHour = 0;
+    for (var ph = 1; ph < 24; ph++) {
+      if (hourTotals[ph] > hourTotals[peakHour]) peakHour = ph;
+    }
+
+    return {
+      mode: mode,
+      days: days,
+      hourTotals: hourTotals,
+      maxCount: maxCount,
+      totalEvents: totalEvents,
+      reservationEvents: reservationEvents,
+      problemEvents: problemEvents,
+      busiestDay: busiestDay
+        ? { dayIndex: busiestDay.dayIndex, labelAr: busiestDay.labelAr, labelEn: busiestDay.labelEn, total: busiestDay.rowTotal }
+        : null,
+      peakHour: peakHour,
+      peakHourLabel: padTwoDigits(peakHour) + ':00',
+      peakHourTotal: hourTotals[peakHour] || 0,
+      peakSlot: peakSlot
+    };
+  }
+
+  // ---------- @MENTIONS EXTRACTION & SEGMENTATION ----------
+
+  function normalizeMentionCandidates(employees, excludeEmployeeId) {
+    var list = Array.isArray(employees) ? employees : [];
+    var exId = normalizeStr(excludeEmployeeId);
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var emp = list[i];
+      if (!emp || typeof emp !== 'object') continue;
+      if (normalizeStr(emp.status).toLowerCase() === 'disabled') continue;
+      var id = normalizeStr(emp.id);
+      var name = normalizeStr(emp.name);
+      var username = normalizeStr(emp.username);
+      if (!id || (!name && !username)) continue;
+      if (exId && id === exId) continue;
+      out.push({
+        id: id,
+        name: name,
+        username: username,
+        role: normalizeStr(emp.role)
+      });
+    }
+    out.sort(function (a, b) {
+      var la = (a.name || '').length;
+      var lb = (b.name || '').length;
+      if (lb !== la) return lb - la;
+      return (b.username || '').length - (a.username || '').length;
+    });
+    return out;
+  }
+
+  function isMentionPrefixBoundary(ch) {
+    return !ch || /[\s,،.(:;\[{"'«\-\n\r]/.test(ch);
+  }
+
+  function isMentionSuffixBoundary(ch) {
+    return !ch || /[\s,،.!?;:)\]'"»\-@#\n\r]/.test(ch);
+  }
+
+  function matchMentionAtIndex(raw, atIdx, candidates) {
+    var after = raw.slice(atIdx + 1);
+    if (!after) return null;
+    var afterLower = after.toLowerCase();
+
+    for (var i = 0; i < candidates.length; i++) {
+      var c = candidates[i];
+      if (c.name) {
+        var nmLower = c.name.toLowerCase();
+        if (afterLower.indexOf(nmLower) === 0) {
+          var nextChar = raw.charAt(atIdx + 1 + c.name.length);
+          if (isMentionSuffixBoundary(nextChar)) {
+            return { employee: c, length: 1 + c.name.length, matchedText: raw.slice(atIdx, atIdx + 1 + c.name.length) };
+          }
+        }
+        var underscoreName = c.name.replace(/\s+/g, '_');
+        if (underscoreName !== c.name) {
+          var uLower = underscoreName.toLowerCase();
+          if (afterLower.indexOf(uLower) === 0) {
+            var nextU = raw.charAt(atIdx + 1 + underscoreName.length);
+            if (isMentionSuffixBoundary(nextU)) {
+              return { employee: c, length: 1 + underscoreName.length, matchedText: raw.slice(atIdx, atIdx + 1 + underscoreName.length) };
+            }
+          }
+        }
+      }
+    }
+
+    for (var j = 0; j < candidates.length; j++) {
+      var cu = candidates[j];
+      if (cu.username) {
+        var unLower = cu.username.toLowerCase();
+        if (afterLower.indexOf(unLower) === 0) {
+          var nextUn = raw.charAt(atIdx + 1 + cu.username.length);
+          if (isMentionSuffixBoundary(nextUn)) {
+            return { employee: cu, length: 1 + cu.username.length, matchedText: raw.slice(atIdx, atIdx + 1 + cu.username.length) };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function findMentionSegments(text, employees) {
+    var raw = String(text === undefined || text === null ? '' : text);
+    if (!raw) return [];
+    var candidates = normalizeMentionCandidates(employees, '');
+    if (candidates.length === 0 || raw.indexOf('@') === -1) {
+      return [{ type: 'text', text: raw }];
+    }
+
+    var segments = [];
+    var cursor = 0;
+    var idx = 0;
+    while (idx < raw.length) {
+      if (raw.charAt(idx) === '@' && isMentionPrefixBoundary(idx === 0 ? '' : raw.charAt(idx - 1))) {
+        var hit = matchMentionAtIndex(raw, idx, candidates);
+        if (hit) {
+          if (idx > cursor) {
+            segments.push({ type: 'text', text: raw.slice(cursor, idx) });
+          }
+          segments.push({
+            type: 'mention',
+            text: hit.matchedText,
+            employee: hit.employee
+          });
+          idx += hit.length;
+          cursor = idx;
+          continue;
+        }
+      }
+      idx += 1;
+    }
+    if (cursor < raw.length) {
+      segments.push({ type: 'text', text: raw.slice(cursor) });
+    }
+    return segments;
+  }
+
+  function extractMentionedEmployees(text, employees, options) {
+    var opts = options || {};
+    var segments = findMentionSegments(text, employees);
+    var exId = normalizeStr(opts.excludeEmployeeId);
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (seg.type !== 'mention' || !seg.employee) continue;
+      var emp = seg.employee;
+      if (exId && emp.id === exId) continue;
+      if (seen[emp.id]) continue;
+      seen[emp.id] = true;
+      out.push(emp);
+    }
+    return out;
+  }
+
+  var MAX_PINNED_CRITICAL_RESERVATIONS = 3;
+
+  var UI_SIMPLIFICATION_GROUPS = [
+    {
+      id: 'nav_topbar',
+      labelAr: 'القائمة الجانبية والشريط العلوي',
+      labelEn: 'Sidebar Navigation & Topbar'
+    },
+    {
+      id: 'dashboard',
+      labelAr: 'أقسام لوحة التحكم',
+      labelEn: 'Dashboard Sections'
+    },
+    {
+      id: 'reservations',
+      labelAr: 'صفحة الحجوزات والأدوات',
+      labelEn: 'Reservations Page & Toolbar'
+    },
+    {
+      id: 'drawer',
+      labelAr: 'تفاصيل الحجز (النافذة الجانبية)',
+      labelEn: 'Reservation Details Drawer'
+    },
+    {
+      id: 'modules',
+      labelAr: 'متابعاتي والمشكلات والتقارير والموظفون',
+      labelEn: 'Follow-Ups, Problems, Reports & Staff'
+    }
+  ];
+
+  var UI_SIMPLIFICATION_OPTIONS = [
+    // Group 1: Sidebar Navigation & Topbar
+    { key: 'hideNavTeamFollowups', legacyId: 'set-ui-hide-nav-team-followups', cssClass: 'rg-ui-hide-nav-team-followups', group: 'nav_topbar', labelAr: 'إخفاء صفحة «متابعات الفريق» من القائمة الجانبية', labelEn: 'Hide "Team Follow-Ups" from sidebar navigation' },
+    { key: 'hideNavProblems', legacyId: 'set-ui-hide-nav-problems', cssClass: 'rg-ui-hide-nav-problems', group: 'nav_topbar', labelAr: 'إخفاء صفحة «المشكلات» من القائمة الجانبية', labelEn: 'Hide "Problems" from sidebar navigation' },
+    { key: 'hideNavReports', legacyId: 'set-ui-hide-nav-reports', cssClass: 'rg-ui-hide-nav-reports', group: 'nav_topbar', labelAr: 'إخفاء صفحة «التقارير والإحصائيات» من القائمة الجانبية', labelEn: 'Hide "Reports & Analytics" from sidebar navigation' },
+    { key: 'hideNavEmployees', legacyId: 'set-ui-hide-nav-employees', cssClass: 'rg-ui-hide-nav-employees', group: 'nav_topbar', labelAr: 'إخفاء صفحة «الموظفون» من القائمة الجانبية', labelEn: 'Hide "Employees" from sidebar navigation' },
+    { key: 'hideNavActivity', legacyId: 'set-ui-hide-nav-activity', cssClass: 'rg-ui-hide-nav-activity', group: 'nav_topbar', labelAr: 'إخفاء صفحة «سجل النشاطات» من القائمة الجانبية', labelEn: 'Hide "Activity Log" from sidebar navigation' },
+    { key: 'hideTopbarSearch', legacyId: 'set-ui-hide-topbar-search', cssClass: 'rg-ui-hide-topbar-search', group: 'nav_topbar', labelAr: 'إخفاء شريط البحث السريع (Ctrl+K) من الشريط العلوي', labelEn: 'Hide topbar quick search (Ctrl+K)' },
+    { key: 'hideTopbarRefresh', legacyId: 'set-ui-hide-topbar-refresh', cssClass: 'rg-ui-hide-topbar-refresh', group: 'nav_topbar', labelAr: 'إخفاء زر التحديث اليدوي من الشريط العلوي', labelEn: 'Hide topbar manual refresh button' },
+    { key: 'hideTopbarNotifications', legacyId: 'set-ui-hide-topbar-notif', cssClass: 'rg-ui-hide-topbar-notif', group: 'nav_topbar', labelAr: 'إخفاء جرس الإشعارات من الشريط العلوي', labelEn: 'Hide topbar notifications bell' },
+    { key: 'hideTopbarThemeToggle', legacyId: 'set-ui-hide-topbar-theme', cssClass: 'rg-ui-hide-topbar-theme', group: 'nav_topbar', labelAr: 'إخفاء زر الوضع الليلي/النهاري من الشريط العلوي', labelEn: 'Hide topbar theme toggle button' },
+    { key: 'hideTopbarLangToggle', legacyId: 'set-ui-hide-topbar-lang', cssClass: 'rg-ui-hide-topbar-lang', group: 'nav_topbar', labelAr: 'إخفاء زر تبديل اللغة (EN / عربي) من الشريط العلوي', labelEn: 'Hide topbar language toggle button' },
+
+    // Group 2: Dashboard Sections
+    { key: 'hideDashHeroKpis', legacyId: 'set-ui-hide-dash-hero-kpis', cssClass: 'rg-ui-hide-dash-hero-kpis', group: 'dashboard', labelAr: 'إخفاء بطاقات المؤشرات الرئيسية (Hero KPIs) في لوحة التحكم', labelEn: 'Hide Dashboard Hero KPI cards' },
+    { key: 'hideDashStripKpis', legacyId: 'set-ui-hide-dash-strip-kpis', cssClass: 'rg-ui-hide-dash-strip-kpis', group: 'dashboard', labelAr: 'إخفاء شريط مؤشرات الحالات التفصيلية (KPI Strip) في لوحة التحكم', labelEn: 'Hide Dashboard detailed status KPI strip' },
+    { key: 'hideDashDailyChart', legacyId: 'set-ui-hide-dash-daily-chart', cssClass: 'rg-ui-hide-dash-daily-chart', group: 'dashboard', labelAr: 'إخفاء رسم «المتابعات اليومية» من لوحة التحكم', labelEn: 'Hide Dashboard "Daily Follow-Ups" chart' },
+    { key: 'hideDashRecentActivity', legacyId: 'set-ui-hide-dash-recent-activity', cssClass: 'rg-ui-hide-dash-recent-activity', group: 'dashboard', labelAr: 'إخفاء بطاقة «أحدث النشاطات» من لوحة التحكم', labelEn: 'Hide Dashboard "Recent Activity" card' },
+    { key: 'hideDashChartsGrid', legacyId: 'set-ui-hide-dash-charts-grid', cssClass: 'rg-ui-hide-dash-charts-grid', group: 'dashboard', labelAr: 'إخفاء شبكة الرسوم البيانية التحليلية (توزيع الحالات، الشركات، الموظفين، المشكلات)', labelEn: 'Hide Dashboard analytics charts grid' },
+    { key: 'hideDashboardRadar', legacyId: 'set-ui-hide-dash-radar', cssClass: 'rg-ui-hide-dash-radar', group: 'dashboard', labelAr: 'إخفاء رادار 24 ساعة في لوحة التحكم', labelEn: 'Hide 24h Expiry Radar section on Dashboard' },
+    { key: 'hideDashboardHeatmap', legacyId: 'set-ui-hide-dash-heatmap', cssClass: 'rg-ui-hide-dash-heatmap', group: 'dashboard', labelAr: 'إخفاء مصفوفة ساعات الذروة من لوحة التحكم والتقارير', labelEn: 'Hide Peak Hours Heatmap from Dashboard & Reports' },
+    { key: 'hideDashBottomBento', legacyId: 'set-ui-hide-dash-bottom', cssClass: 'rg-ui-hide-dash-bottom', group: 'dashboard', labelAr: 'إخفاء بطاقات أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة أسفل لوحة التحكم', labelEn: 'Hide Dashboard bottom bookings/problems/actions cards' },
+    { key: 'hideDashCustomizeBtn', legacyId: 'set-ui-hide-dash-customize', cssClass: 'rg-ui-hide-dash-customize', group: 'dashboard', labelAr: 'إخفاء زر «تخصيص وترتيب الشاشات» في لوحة التحكم والشريط الجانبي', labelEn: 'Hide "Customize & Reorder Layout" buttons' },
+    { key: 'hideShiftHandoverBtn', legacyId: 'set-ui-hide-handover-btn', cssClass: 'rg-ui-hide-handover-btn', group: 'dashboard', labelAr: 'إخفاء أزرار «تسليم الوردية (PDF)» من لوحة التحكم والحجوزات والتقارير', labelEn: 'Hide "Shift Handover (PDF)" buttons across pages' },
+
+    // Group 3: Reservations Page & Toolbar
+    { key: 'hideResTodayTab', legacyId: 'set-ui-hide-res-today-tab', cssClass: 'rg-ui-hide-res-today-tab', group: 'reservations', labelAr: 'إخفاء تبويب وزر «التسليم والاستلام اليوم»', labelEn: 'Hide "Today\'s Pickups & Returns" tab & button' },
+    { key: 'hideResRadarTab', legacyId: 'set-ui-hide-res-radar-tab', cssClass: 'rg-ui-hide-res-radar-tab', group: 'reservations', labelAr: 'إخفاء تبويب وزر «رادار انتهاء الحجوزات (24 ساعة)»', labelEn: 'Hide "24h Expiry Radar" tab & button' },
+    { key: 'hideResPullBtn', legacyId: 'set-ui-hide-res-pull-btn', cssClass: 'rg-ui-hide-res-pull-btn', group: 'reservations', labelAr: 'إخفاء زر وشريط سحب الحجوزات من Rental Gate API في صفحة الحجوزات', labelEn: 'Hide Rental Gate API pull bar & button on Reservations' },
+    { key: 'hideResImportExcel', legacyId: 'set-ui-hide-res-import-btn', cssClass: 'rg-ui-hide-res-import-btn', group: 'reservations', labelAr: 'إخفاء زر «استيراد من Excel» في صفحة الحجوزات', labelEn: 'Hide "Import Excel" button in Reservations' },
+    { key: 'hideResColsToggle', legacyId: 'set-ui-hide-res-cols-btn', cssClass: 'rg-ui-hide-res-cols-btn', group: 'reservations', labelAr: 'إخفاء زر «إظهار/إخفاء الأعمدة» في جدول الحجوزات', labelEn: 'Hide "Toggle Columns" button in Reservations' },
+    { key: 'hideResExportExcel', legacyId: 'set-ui-hide-res-export-btn', cssClass: 'rg-ui-hide-res-export-btn', group: 'reservations', labelAr: 'إخفاء زر «تصدير Excel» في صفحة الحجوزات', labelEn: 'Hide "Export Excel" button in Reservations' },
+    { key: 'hideResFiltersExtras', legacyId: 'set-ui-hide-res-filters-extras', cssClass: 'rg-ui-hide-res-filters-extras', group: 'reservations', labelAr: 'إخفاء فلاتر التاريخ والأولوية وخيارات «لم تتم متابعتها / بها مشكلات»', labelEn: 'Hide extra date/priority/checkbox filters in Reservations' },
+
+    // Group 4: Reservation Details Drawer
+    { key: 'hideDrawerCopySummary', legacyId: 'set-ui-hide-drawer-copy', cssClass: 'rg-ui-hide-drawer-copy', group: 'drawer', labelAr: 'إخفاء زر «نسخ ملخص الحجز» داخل التفاصيل', labelEn: 'Hide "Copy Summary" button in Drawer' },
+    { key: 'hideDirectCallBtn', legacyId: 'set-ui-hide-direct-call', cssClass: 'rg-ui-hide-direct-call', group: 'drawer', labelAr: 'إخفاء أزرار «اتصال 90» المباشرة', labelEn: 'Hide "Call 90" direct call buttons' },
+    { key: 'hideDrawerEditBtn', legacyId: 'set-ui-hide-drawer-edit', cssClass: 'rg-ui-hide-drawer-edit', group: 'drawer', labelAr: 'إخفاء زر «تعديل تفاصيل الحجز» داخل التفاصيل', labelEn: 'Hide "Edit Booking" button in Drawer' },
+    { key: 'hideDrawerPdfBtn', legacyId: 'set-ui-hide-drawer-pdf', cssClass: 'rg-ui-hide-drawer-pdf', group: 'drawer', labelAr: 'إخفاء زر «تصدير PDF» داخل تفاصيل الحجز', labelEn: 'Hide "Export PDF" button in Drawer' },
+    { key: 'hideDrawerReportProblemBtn', legacyId: 'set-ui-hide-drawer-problem', cssClass: 'rg-ui-hide-drawer-problem', group: 'drawer', labelAr: 'إخفاء زر «تحويل إلى مشكلة» داخل تفاصيل الحجز', labelEn: 'Hide "Report Problem" button in Drawer' },
+    { key: 'hideDrawerPinnedNote', legacyId: 'set-ui-hide-drawer-pinned-note', cssClass: 'rg-ui-hide-drawer-pinned-note', group: 'drawer', labelAr: 'إخفاء قسم «الملاحظة المثبتة» أعلى تفاصيل الحجز', labelEn: 'Hide "Pinned Note" card in Drawer' },
+    { key: 'hideNoAnswerBtn', legacyId: 'set-ui-hide-no-answer-btn', cssClass: 'rg-ui-hide-no-answer-btn', group: 'drawer', labelAr: 'إخفاء زر وعداد «لم يرد» في الحجز ومتابعاتي', labelEn: 'Hide "No Answer" button & counter' },
+    { key: 'hideSharedBadge', legacyId: 'set-ui-hide-shared-badge', cssClass: 'rg-ui-hide-shared-badge', group: 'drawer', labelAr: 'إخفاء شارة «حصري لك / مشترك مع»', labelEn: 'Hide "Exclusive / Shared" collaboration badges' },
+    { key: 'hideCustomerContactExtras', legacyId: 'set-ui-hide-customer-extra', cssClass: 'rg-ui-hide-customer-extra', group: 'drawer', labelAr: 'إخفاء البريد الإلكتروني ورقم الهوية من رأس الحجز', labelEn: 'Hide customer email & ID in Drawer header' },
+    { key: 'hideSecondaryCarMeta', legacyId: 'set-ui-hide-car-meta', cssClass: 'rg-ui-hide-car-meta', group: 'drawer', labelAr: 'إخفاء فئة السيارة وتفاصيل الاستلام/التسليم الثانوية', labelEn: 'Hide car category & secondary pickup/return metadata' },
+    { key: 'hideFinancialBreakdown', legacyId: 'set-ui-hide-finance', cssClass: 'rg-ui-hide-finance', group: 'drawer', labelAr: 'إخفاء التفصيل المالي اليومي والضريبة والخصم والمبالغ الأساسية', labelEn: 'Hide daily/tax/discount financial breakdown' },
+    { key: 'hideDrawerStatusStages', legacyId: 'set-ui-hide-drawer-stages', cssClass: 'rg-ui-hide-drawer-stages', group: 'drawer', labelAr: 'إخفاء قسم «مراحل الحالة وتطور الحجز» داخل الحجز', labelEn: 'Hide "Status Stages" timeline in Drawer' },
+    { key: 'hideDrawerCollabSection', legacyId: 'set-ui-hide-drawer-collab', cssClass: 'rg-ui-hide-drawer-collab', group: 'drawer', labelAr: 'إخفاء قسم «الموظفون المشاركون» وإدارة الإسناد داخل الحجز', labelEn: 'Hide "Assigned Staff" & supervisor assignment panel in Drawer' },
+    { key: 'hideDrawerKpiGrid', legacyId: 'set-ui-hide-drawer-kpis', cssClass: 'rg-ui-hide-drawer-kpis', group: 'drawer', labelAr: 'إخفاء بطاقات الملخص الرقمي (الأيام / المتابعات / المشكلات) داخل الحجز', labelEn: 'Hide numeric KPI summary cards in Drawer' },
+    { key: 'hideDrawerExtensions', legacyId: 'set-ui-hide-drawer-extensions', cssClass: 'rg-ui-hide-drawer-extensions', group: 'drawer', labelAr: 'إخفاء قسم «سجل التمديدات» داخل تفاصيل الحجز', labelEn: 'Hide "Extensions History" section in Drawer' },
+    { key: 'hideDrawerCharts', legacyId: 'set-ui-hide-drawer-charts', cssClass: 'rg-ui-hide-drawer-charts', group: 'drawer', labelAr: 'إخفاء الرسوم البيانية داخل تفاصيل الحجز', labelEn: 'Hide secondary charts in Drawer' },
+    { key: 'hideDrawerTimeline', legacyId: 'set-ui-hide-drawer-timeline', cssClass: 'rg-ui-hide-drawer-timeline', group: 'drawer', labelAr: 'إخفاء سجل المتابعات والمشكلات المرتبطة داخل الحجز', labelEn: 'Hide follow-up log & linked tickets in Drawer' },
+
+    // Group 5: Other Modules
+    { key: 'hideMyfuPinnedStrip', legacyId: 'set-ui-hide-myfu-pinned', cssClass: 'rg-ui-hide-myfu-pinned', group: 'modules', labelAr: 'إخفاء شريط وأزرار تثبيت «الحجوزات الحرجة» في متابعاتي', labelEn: 'Hide "Pinned Critical Bookings" strip & pin buttons' },
+    { key: 'hideMyfuMentionsTab', legacyId: 'set-ui-hide-myfu-mentions', cssClass: 'rg-ui-hide-myfu-mentions', group: 'modules', labelAr: 'إخفاء تبويب «إشارات @Mention» في متابعاتي', labelEn: 'Hide "@Mentions" tab in My Follow-Ups' },
+    { key: 'hideMyfuHistoryCard', legacyId: 'set-ui-hide-myfu-history', cssClass: 'rg-ui-hide-myfu-history', group: 'modules', labelAr: 'إخفاء قسم «سجل متابعاتي السابقة» في متابعاتي', labelEn: 'Hide "My Previous Follow-Ups" history card' },
+    { key: 'hideProblemsRateIndicator', legacyId: 'set-ui-hide-prb-rates', cssClass: 'rg-ui-hide-prb-rates', group: 'modules', labelAr: 'إخفاء مؤشر «نسبة المشكلات لكل 100 حجز» في المشكلات والتقارير', labelEn: 'Hide "Problems per 100 Bookings" indicator & toggle' },
+    { key: 'hideReportsCharts', legacyId: 'set-ui-hide-reports-charts', cssClass: 'rg-ui-hide-reports-charts', group: 'modules', labelAr: 'إخفاء الرسوم البيانية في صفحة التقارير', labelEn: 'Hide charts section in Reports page' },
+    { key: 'hideReportsExportModalBtn', legacyId: 'set-ui-hide-reports-export', cssClass: 'rg-ui-hide-reports-export', group: 'modules', labelAr: 'إخفاء زر «إعدادات التصدير (PDF / Excel)» في التقارير', labelEn: 'Hide "Export Settings (PDF / Excel)" button in Reports' },
+    { key: 'hideRolePresetsSection', legacyId: 'set-ui-hide-role-presets', cssClass: 'rg-ui-hide-role-presets', group: 'modules', labelAr: 'إخفاء قسم «إدارة الصلاحيات الجاهزة (القوالب الوظيفية)» في الموظفين', labelEn: 'Hide "Role Presets" section in Employees page' }
+  ];
+
+  var TEAM_UI_PRESETS = {
+    full: {
+      id: 'full',
+      labelAr: 'فريق متكامل (11+ موظف) — عرض كافة الحقول والتحليلات',
+      labelEn: 'Full Team (11+) — Show All Fields & Analytics',
+      hideSecondaryCarMeta: false,
+      hideCustomerContactExtras: false,
+      hideFinancialBreakdown: false,
+      hideDrawerCharts: false,
+      hideDashboardRadar: false,
+      hideDashboardHeatmap: false
+    },
+    medium: {
+      id: 'medium',
+      labelAr: 'فريق متوسط (4–10 موظفين) — إخفاء الحقول الثانوية للعميل والرسوم داخل الحجز',
+      labelEn: 'Medium Team (4–10) — Hide Customer Extras & Drawer Charts',
+      hideSecondaryCarMeta: false,
+      hideCustomerContactExtras: true,
+      hideFinancialBreakdown: false,
+      hideDrawerCharts: true,
+      hideDashboardRadar: false,
+      hideDashboardHeatmap: false
+    },
+    small: {
+      id: 'small',
+      labelAr: 'فريق صغير (1–3 موظفين) — واجهة مركزة للمتابعة السريعة',
+      labelEn: 'Small Team (1–3) — Focused Rapid Follow-Up UI',
+      hideSecondaryCarMeta: true,
+      hideCustomerContactExtras: true,
+      hideFinancialBreakdown: true,
+      hideDrawerCharts: true,
+      hideDashboardRadar: false,
+      hideDashboardHeatmap: true
+    },
+    custom: {
+      id: 'custom',
+      labelAr: 'تخصيص يدوي للحقول والأقسام الظاهرة',
+      labelEn: 'Custom Field & Section Visibility',
+      hideSecondaryCarMeta: false,
+      hideCustomerContactExtras: false,
+      hideFinancialBreakdown: false,
+      hideDrawerCharts: false,
+      hideDashboardRadar: false,
+      hideDashboardHeatmap: false
+    }
+  };
+
+  function normalizeUiSimplificationSettings(raw) {
+    var input = raw;
+    if (typeof raw === 'string') {
+      try {
+        input = JSON.parse(raw);
+      } catch (_e) {
+        input = {};
+      }
+    }
+    var obj = (input && typeof input === 'object' && !Array.isArray(input)) ? input : {};
+    var rawPreset = normalizeStr(obj.preset).toLowerCase();
+    var presetId = (rawPreset === 'small' || rawPreset === 'medium' || rawPreset === 'full' || rawPreset === 'custom')
+      ? rawPreset
+      : 'full';
+    var base = TEAM_UI_PRESETS[presetId] || TEAM_UI_PRESETS.full;
+
+    function pickBool(key) {
+      if (presetId !== 'custom' && obj[key] === undefined) {
+        return Boolean(base[key]);
+      }
+      if (obj[key] !== undefined) {
+        return obj[key] === true || obj[key] === 'true' || obj[key] === 1;
+      }
+      return Boolean(base[key]);
+    }
+
+    var normalized = { preset: presetId };
+    for (var i = 0; i < UI_SIMPLIFICATION_OPTIONS.length; i++) {
+      var k = UI_SIMPLIFICATION_OPTIONS[i].key;
+      normalized[k] = pickBool(k);
+    }
+    return normalized;
+  }
+
+  function formatDirectCallTelHref(phone, prefix) {
+    var ascii = convertEasternDigitsToAscii(phone === undefined || phone === null ? '' : String(phone));
+    var digitsOnly = ascii.replace(/\D/g, '');
+    if (!digitsOnly) return '';
+
+    var pfx = convertEasternDigitsToAscii(prefix === undefined || prefix === null ? '90' : String(prefix)).replace(/\D/g, '');
+    if (!pfx) pfx = '90';
+
+    var local = digitsOnly;
+    if (local.indexOf('00966') === 0 && local.length >= 14) {
+      local = local.slice(5);
+    } else if (local.indexOf('966') === 0 && local.length >= 11) {
+      local = local.slice(3);
+    }
+
+    if (/^5\d{8}$/.test(local)) {
+      local = '0' + local;
+    }
+
+    if (!local) return '';
+    return 'tel:' + pfx + local;
+  }
+
+  function formatDirectCallDisplayNumber(phone, prefix) {
+    var href = formatDirectCallTelHref(phone, prefix);
+    return href ? href.replace(/^tel:/, '') : '';
+  }
+
+  function formatBookingSummaryText(reservation, lang) {
+    var r = (reservation && typeof reservation === 'object') ? reservation : {};
+    var isEn = lang === 'en';
+    var resNum = normalizeStr(r.reservationNumber || r.id) || '-';
+    var customer = normalizeStr(r.customerName) || '-';
+    var phone = normalizeStr(r.customerPhone) || '-';
+    var car = normalizeStr(r.carName) || '-';
+    var plate = normalizeStr(r.plateNumber) || '-';
+    var company = normalizeStr(r.companyName) || '-';
+    var branch = normalizeStr(r.branchName) || '-';
+    var startD = formatDisplayDate(r.startDate) || '-';
+    var endD = formatDisplayDate(r.extendedUntilDate || r.endDate) || '-';
+    var totalAmt = Number(r.totalAmount || 0);
+    var status = normalizeStr(r.internalStatus || r.originalStatusAr) || '-';
+
+    if (isEn) {
+      return [
+        'Booking #: ' + resNum,
+        'Customer: ' + customer + (phone !== '-' ? (' (' + phone + ')') : ''),
+        'Vehicle: ' + car + (plate !== '-' ? (' | Plate: ' + plate) : ''),
+        'Company / Branch: ' + company + ' — ' + branch,
+        'Dates: ' + startD + ' → ' + endD,
+        'Status: ' + status + ' | Total: ' + totalAmt + ' SAR'
+      ].join('\n');
+    }
+
+    return [
+      'رقم الحجز: ' + resNum,
+      'العميل: ' + customer + (phone !== '-' ? (' (' + phone + ')') : ''),
+      'السيارة: ' + car + (plate !== '-' ? (' | اللوحة: ' + plate) : ''),
+      'الشركة / الفرع: ' + company + ' — ' + branch,
+      'الفترة: ' + startD + ' إلى ' + endD,
+      'الحالة: ' + status + ' | الإجمالي: ' + totalAmt + ' ر.س'
+    ].join('\n');
+  }
+
+  function buildNoAnswerActionText(attemptNumber, lang) {
+    var n = Math.max(1, Math.floor(Number(attemptNumber || 1)));
+    return lang === 'en'
+      ? ('Call attempt — No Answer (Attempt #' + n + ')')
+      : ('محاولة اتصال — لم يرد (المحاولة #' + n + ')');
+  }
+
+  function computeSharedAssignmentInfo(assignedIds, assignedNames, currentEmpId, lang) {
+    var rawIds = Array.isArray(assignedIds) ? assignedIds : [];
+    var rawNames = Array.isArray(assignedNames) ? assignedNames : [];
+    var seen = {};
+    var ids = [];
+    var names = [];
+    for (var i = 0; i < rawIds.length; i++) {
+      var idVal = normalizeStr(rawIds[i]);
+      if (!idVal || seen[idVal]) continue;
+      seen[idVal] = true;
+      ids.push(idVal);
+      names.push(normalizeStr(rawNames[i]) || idVal);
+    }
+
+    var curId = normalizeStr(currentEmpId);
+    if (ids.length === 0) {
+      return {
+        status: 'unassigned',
+        isAssignedToCurrent: false,
+        totalAssignees: 0,
+        colleagueIds: [],
+        colleagueNames: [],
+        colleagueCount: 0,
+        badgeAr: 'غير مستلم بعد',
+        badgeEn: 'Unassigned',
+        badge: lang === 'en' ? 'Unassigned' : 'غير مستلم بعد'
+      };
+    }
+
+    var isMine = Boolean(curId && ids.indexOf(curId) !== -1);
+    var colleagueIds = [];
+    var colleagueNames = [];
+    for (var j = 0; j < ids.length; j++) {
+      if (!curId || ids[j] !== curId) {
+        colleagueIds.push(ids[j]);
+        colleagueNames.push(names[j]);
+      }
+    }
+
+    if (isMine && ids.length === 1) {
+      return {
+        status: 'exclusive',
+        isAssignedToCurrent: true,
+        totalAssignees: 1,
+        colleagueIds: [],
+        colleagueNames: [],
+        colleagueCount: 0,
+        badgeAr: 'حصري لك',
+        badgeEn: 'Exclusive to you',
+        badge: lang === 'en' ? 'Exclusive to you' : 'حصري لك'
+      };
+    }
+
+    if (isMine && ids.length > 1) {
+      var cCount = colleagueIds.length;
+      var badgeArShared = cCount === 1
+        ? ('مشترك مع ' + colleagueNames[0])
+        : ('مشترك مع ' + cCount + ' زملاء');
+      var badgeEnShared = cCount === 1
+        ? ('Shared with ' + colleagueNames[0])
+        : ('Shared with ' + cCount + ' colleagues');
+      return {
+        status: 'shared',
+        isAssignedToCurrent: true,
+        totalAssignees: ids.length,
+        colleagueIds: colleagueIds,
+        colleagueNames: colleagueNames,
+        colleagueCount: cCount,
+        badgeAr: badgeArShared,
+        badgeEn: badgeEnShared,
+        badge: lang === 'en' ? badgeEnShared : badgeArShared
+      };
+    }
+
+    if (!isMine && ids.length === 1) {
+      var ownerName = names[0] || ids[0];
+      return {
+        status: 'exclusive_other',
+        isAssignedToCurrent: false,
+        totalAssignees: 1,
+        colleagueIds: colleagueIds,
+        colleagueNames: colleagueNames,
+        colleagueCount: 1,
+        badgeAr: 'حصري لـ ' + ownerName,
+        badgeEn: 'Exclusive: ' + ownerName,
+        badge: lang === 'en' ? ('Exclusive: ' + ownerName) : ('حصري لـ ' + ownerName)
+      };
+    }
+
+    var sharedOthersAr = 'مشترك (' + ids.length + ' موظفين)';
+    var sharedOthersEn = 'Shared (' + ids.length + ' staff)';
+    return {
+      status: 'shared',
+      isAssignedToCurrent: false,
+      totalAssignees: ids.length,
+      colleagueIds: colleagueIds,
+      colleagueNames: colleagueNames,
+      colleagueCount: colleagueIds.length,
+      badgeAr: sharedOthersAr,
+      badgeEn: sharedOthersEn,
+      badge: lang === 'en' ? sharedOthersEn : sharedOthersAr
+    };
+  }
+
+  function classifyProblemRateSeverity(ratePer100) {
+    var rate = Number(ratePer100 || 0);
+    if (rate >= 15) return 'danger';
+    if (rate >= 5) return 'warning';
+    return 'normal';
+  }
+
+  function computeProblemsPer100Bookings(reservations, problems) {
+    var resList = Array.isArray(reservations) ? reservations : [];
+    var prbList = Array.isArray(problems) ? problems : [];
+
+    var resById = {};
+    var resByNum = {};
+    var companyMap = {};
+    var branchMap = {};
+
+    function ensureCompany(comp) {
+      var name = normalizeStr(comp) || 'غير محدد';
+      if (!companyMap[name]) {
+        companyMap[name] = {
+          companyName: name,
+          totalBookings: 0,
+          problemsCount: 0,
+          openProblemsCount: 0,
+          resolvedProblemsCount: 0,
+          ratePer100: 0,
+          severity: 'normal'
+        };
+      }
+      return companyMap[name];
+    }
+
+    function ensureBranch(comp, br) {
+      var cName = normalizeStr(comp) || 'غير محدد';
+      var bName = normalizeStr(br) || 'الفرع الرئيسي';
+      var key = cName + '||' + bName;
+      if (!branchMap[key]) {
+        branchMap[key] = {
+          key: key,
+          companyName: cName,
+          branchName: bName,
+          totalBookings: 0,
+          problemsCount: 0,
+          openProblemsCount: 0,
+          resolvedProblemsCount: 0,
+          ratePer100: 0,
+          severity: 'normal'
+        };
+      }
+      return branchMap[key];
+    }
+
+    for (var i = 0; i < resList.length; i++) {
+      var r = resList[i];
+      if (!r || typeof r !== 'object') continue;
+      if (r.id) resById[String(r.id)] = r;
+      if (r.reservationNumber) resByNum[String(r.reservationNumber)] = r;
+      ensureCompany(r.companyName).totalBookings += 1;
+      ensureBranch(r.companyName, r.branchName).totalBookings += 1;
+    }
+
+    var totalOpen = 0;
+    var totalResolved = 0;
+    for (var j = 0; j < prbList.length; j++) {
+      var p = prbList[j];
+      if (!p || typeof p !== 'object') continue;
+      var matchedRes = (p.reservationId && resById[String(p.reservationId)]) ||
+        (p.reservationNumber && resByNum[String(p.reservationNumber)]) ||
+        null;
+      var cName = normalizeStr(p.companyName || (matchedRes && matchedRes.companyName)) || 'غير محدد';
+      var bName = normalizeStr(p.branchName || (matchedRes && matchedRes.branchName)) || 'الفرع الرئيسي';
+      var closed = isProblemClosedStatus(p.status);
+      if (closed) totalResolved += 1;
+      else totalOpen += 1;
+
+      var cBucket = ensureCompany(cName);
+      cBucket.problemsCount += 1;
+      if (closed) cBucket.resolvedProblemsCount += 1;
+      else cBucket.openProblemsCount += 1;
+
+      var bBucket = ensureBranch(cName, bName);
+      bBucket.problemsCount += 1;
+      if (closed) bBucket.resolvedProblemsCount += 1;
+      else bBucket.openProblemsCount += 1;
+    }
+
+    function finalizeBucket(bucket) {
+      var rate = bucket.totalBookings > 0
+        ? Math.round((bucket.problemsCount / bucket.totalBookings) * 1000) / 10
+        : (bucket.problemsCount > 0 ? 100 : 0);
+      bucket.ratePer100 = rate;
+      bucket.severity = classifyProblemRateSeverity(rate);
+      return bucket;
+    }
+
+    var byCompany = Object.keys(companyMap).map(function (k) {
+      return finalizeBucket(companyMap[k]);
+    }).sort(function (a, b) {
+      if (b.ratePer100 !== a.ratePer100) return b.ratePer100 - a.ratePer100;
+      if (b.problemsCount !== a.problemsCount) return b.problemsCount - a.problemsCount;
+      return b.totalBookings - a.totalBookings;
+    });
+
+    var byBranch = Object.keys(branchMap).map(function (k) {
+      return finalizeBucket(branchMap[k]);
+    }).sort(function (a, b) {
+      if (b.ratePer100 !== a.ratePer100) return b.ratePer100 - a.ratePer100;
+      if (b.problemsCount !== a.problemsCount) return b.problemsCount - a.problemsCount;
+      return b.totalBookings - a.totalBookings;
+    });
+
+    var overallRate = resList.length > 0
+      ? Math.round((prbList.length / resList.length) * 1000) / 10
+      : (prbList.length > 0 ? 100 : 0);
+
+    return {
+      overall: {
+        totalBookings: resList.length,
+        problemsCount: prbList.length,
+        openProblemsCount: totalOpen,
+        resolvedProblemsCount: totalResolved,
+        ratePer100: overallRate,
+        severity: classifyProblemRateSeverity(overallRate)
+      },
+      byCompany: byCompany,
+      byBranch: byBranch
+    };
+  }
+
+  function filterMentionFollowUps(followUps, currentUser, allEmployees) {
+    var list = Array.isArray(followUps) ? followUps : [];
+    var me = (currentUser && typeof currentUser === 'object') ? currentUser : {};
+    var myId = normalizeStr(me.id);
+    if (!myId && !normalizeStr(me.name) && !normalizeStr(me.username)) return [];
+
+    var pool = Array.isArray(allEmployees) ? allEmployees.slice() : [];
+    if (myId && !pool.some(function (e) { return e && e.id === myId; })) {
+      pool.push({
+        id: myId,
+        name: normalizeStr(me.name),
+        username: normalizeStr(me.username),
+        status: 'active'
+      });
+    }
+
+    var matches = [];
+    for (var i = 0; i < list.length; i++) {
+      var f = list[i];
+      if (!f || typeof f !== 'object') continue;
+      var combined = [normalizeStr(f.action), normalizeStr(f.notes)].filter(Boolean).join('\n');
+      if (!combined || combined.indexOf('@') === -1) continue;
+      var mentioned = extractMentionedEmployees(combined, pool, {});
+      var hitsMe = mentioned.some(function (m) {
+        return (myId && m.id === myId) ||
+          (me.username && m.username && m.username.toLowerCase() === String(me.username).toLowerCase());
+      });
+      if (hitsMe) {
+        matches.push(f);
+      }
+    }
+
+    matches.sort(function (a, b) {
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    });
+    return matches;
+  }
+
+  var PROBLEM_RATE_VISIBILITY_STORAGE_KEY = 'rg_crm_problems_rate_visible_v1';
+
+  function normalizeProblemRateVisibility(raw) {
+    if (raw === false || raw === 0) return false;
+    var s = normalizeStr(raw).toLowerCase();
+    if (s === 'false' || s === '0' || s === 'hidden' || s === 'off' || s === 'no') {
+      return false;
+    }
+    return true;
+  }
+
+  function formatProblemRateToggleLabel(isVisible, lang) {
+    var visible = Boolean(isVisible);
+    if (lang === 'en') {
+      return visible ? 'Hide Problems / 100 Rate' : 'Show Problems / 100 Rate';
+    }
+    return visible ? 'إخفاء مؤشر نسبة المشكلات' : 'إظهار مؤشر نسبة المشكلات';
+  }
+
+  var NAV_ROUTE_IDS = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var PROTECTED_NAV_ROUTES = ['dashboard', 'settings'];
+
+  var DASHBOARD_SECTION_DEFS = [
+    { id: 'hero_kpis', domId: 'dash-kpis-hero', permKey: 'dash_view_hero_kpis', uiSimpKey: 'hideDashHeroKpis', labelAr: 'المؤشرات الرئيسية (Hero KPIs)', labelEn: 'Hero KPIs' },
+    { id: 'strip_kpis', domId: 'dash-kpis-strip', permKey: 'dash_view_strip_kpis', uiSimpKey: 'hideDashStripKpis', labelAr: 'شريط مؤشرات الحالات التفصيلية', labelEn: 'Status Strip KPIs' },
+    { id: 'daily_chart', domId: 'dash-daily-chart-card', permKey: 'dash_view_daily_chart', uiSimpKey: 'hideDashDailyChart', labelAr: 'رسم المتابعات اليومية', labelEn: 'Daily Follow-Ups Chart' },
+    { id: 'recent_activity', domId: 'dash-recent-activity-card', permKey: 'dash_view_recent_activity', uiSimpKey: 'hideDashRecentActivity', labelAr: 'بطاقة أحدث النشاطات', labelEn: 'Recent Activity Feed' },
+    { id: 'charts_grid', domId: 'dash-charts-grid', permKey: 'dash_view_charts_grid', uiSimpKey: 'hideDashChartsGrid', labelAr: 'شبكة الرسوم البيانية التحليلية', labelEn: 'Analytics Charts Grid' },
+    { id: 'expiry_radar', domId: 'dash-expiry-radar-section', permKey: 'dash_view_radar', uiSimpKey: 'hideDashboardRadar', labelAr: 'رادار انتهاء الحجوزات (24 ساعة)', labelEn: '24h Expiry Radar' },
+    { id: 'peak_heatmap', domId: 'dash-peak-heatmap-section', permKey: 'dash_view_heatmap', uiSimpKey: 'hideDashboardHeatmap', labelAr: 'مصفوفة ساعات الذروة', labelEn: 'Peak Hours Heatmap' },
+    { id: 'bottom_bento', domId: 'dash-bottom-bento', permKey: 'dash_view_bottom_bento', uiSimpKey: 'hideDashBottomBento', labelAr: 'أحدث الحجوزات والمشكلات والإجراءات', labelEn: 'Recent Bookings, Problems & Actions' }
+  ];
+
+  function normalizePermutationList(rawList, canonicalIds) {
+    var seen = {};
+    var out = [];
+    var allowed = {};
+    for (var i = 0; i < canonicalIds.length; i++) {
+      allowed[canonicalIds[i]] = true;
+    }
+    var src = Array.isArray(rawList) ? rawList : [];
+    for (var j = 0; j < src.length; j++) {
+      var id = normalizeStr(src[j]);
+      if (!id || !allowed[id] || seen[id]) continue;
+      seen[id] = true;
+      out.push(id);
+    }
+    for (var k = 0; k < canonicalIds.length; k++) {
+      if (!seen[canonicalIds[k]]) {
+        out.push(canonicalIds[k]);
+      }
+    }
+    return out;
+  }
+
+  function normalizeUserLayoutPrefs(raw) {
+    var input = raw;
+    if (typeof raw === 'string') {
+      try {
+        input = JSON.parse(raw);
+      } catch (_e) {
+        input = {};
+      }
+    }
+    var obj = (input && typeof input === 'object' && !Array.isArray(input)) ? input : {};
+    var dashIds = DASHBOARD_SECTION_DEFS.map(function (d) { return d.id; });
+    var navOrder = normalizePermutationList(obj.navOrder, NAV_ROUTE_IDS);
+    var dashOrder = normalizePermutationList(obj.dashOrder, dashIds);
+
+    var hiddenNavSeen = {};
+    var hiddenRoutes = (Array.isArray(obj.hiddenRoutes) ? obj.hiddenRoutes : []).map(normalizeStr).filter(function (id) {
+      if (!id || NAV_ROUTE_IDS.indexOf(id) === -1 || PROTECTED_NAV_ROUTES.indexOf(id) !== -1 || hiddenNavSeen[id]) return false;
+      hiddenNavSeen[id] = true;
+      return true;
+    });
+
+    var hiddenDashSeen = {};
+    var dashHidden = (Array.isArray(obj.dashHidden) ? obj.dashHidden : []).map(normalizeStr).filter(function (id) {
+      if (!id || dashIds.indexOf(id) === -1 || hiddenDashSeen[id]) return false;
+      hiddenDashSeen[id] = true;
+      return true;
+    });
+
+    return {
+      navOrder: navOrder,
+      hiddenRoutes: hiddenRoutes,
+      dashOrder: dashOrder,
+      dashHidden: dashHidden
+    };
+  }
+
+  function reorderListByDragDrop(orderList, draggedId, targetId) {
+    var list = Array.isArray(orderList) ? orderList.slice() : [];
+    var fromId = normalizeStr(draggedId);
+    var toId = normalizeStr(targetId);
+    if (!fromId || !toId || fromId === toId) return list;
+    var fromIdx = list.indexOf(fromId);
+    var toIdx = list.indexOf(toId);
+    if (fromIdx === -1 || toIdx === -1) return list;
+    list.splice(fromIdx, 1);
+    list.splice(toIdx, 0, fromId);
+    return list;
+  }
+
+  function moveOrderItem(orderList, itemId, direction) {
+    var list = Array.isArray(orderList) ? orderList.slice() : [];
+    var id = normalizeStr(itemId);
+    var idx = list.indexOf(id);
+    if (idx === -1) return list;
+    var step = (direction === 'up' || direction === -1) ? -1 : 1;
+    var nextIdx = idx + step;
+    if (nextIdx < 0 || nextIdx >= list.length) return list;
+    list.splice(idx, 1);
+    list.splice(nextIdx, 0, id);
+    return list;
+  }
+
+  function computeDashboardSectionSpans(visibleIds) {
+    var list = Array.isArray(visibleIds) ? visibleIds.map(normalizeStr).filter(Boolean) : [];
+    var idxDaily = list.indexOf('daily_chart');
+    var idxActivity = list.indexOf('recent_activity');
+    var adjacentTopBento = idxDaily !== -1 && idxActivity !== -1 && Math.abs(idxDaily - idxActivity) === 1;
+    var spans = {};
+    for (var i = 0; i < list.length; i++) {
+      var id = list[i];
+      if (adjacentTopBento && id === 'daily_chart') {
+        spans[id] = 'dash-sec-half-wide';
+      } else if (adjacentTopBento && id === 'recent_activity') {
+        spans[id] = 'dash-sec-half-narrow';
+      } else {
+        spans[id] = 'dash-sec-full';
+      }
+    }
+    return spans;
+  }
+
+  function getFirstAllowedRoute(user, layoutPrefs, candidateOrder) {
+    var lp = normalizeUserLayoutPrefs(layoutPrefs);
+    var hiddenSet = {};
+    for (var h = 0; h < lp.hiddenRoutes.length; h++) {
+      hiddenSet[lp.hiddenRoutes[h]] = true;
+    }
+
+    function isAllowed(routeId) {
+      if (!user || !routeId) return false;
+      if (routeId === 'dashboard') {
+        return canUserPerform(user, 'view_dashboard');
+      }
+      if (routeId === 'employees') {
+        return canUserPerform(user, 'view_employees') || user.role === ROLES.GENERAL_MANAGER;
+      }
+      if (routeId === 'settings') {
+        return canAccessApi(user) || canUserPerform(user, 'manage_settings');
+      }
+      return NAV_ROUTE_IDS.indexOf(routeId) !== -1;
+    }
+
+    var searchOrder = [];
+    var seed = Array.isArray(candidateOrder) && candidateOrder.length ? candidateOrder : lp.navOrder;
+    var seen = {};
+    for (var i = 0; i < seed.length; i++) {
+      var r1 = normalizeStr(seed[i]);
+      if (r1 && !seen[r1]) { seen[r1] = true; searchOrder.push(r1); }
+    }
+    for (var j = 0; j < NAV_ROUTE_IDS.length; j++) {
+      var r2 = NAV_ROUTE_IDS[j];
+      if (!seen[r2]) { seen[r2] = true; searchOrder.push(r2); }
+    }
+
+    for (var k = 0; k < searchOrder.length; k++) {
+      var cid = searchOrder[k];
+      if (!isAllowed(cid)) continue;
+      if (cid !== 'settings' && hiddenSet[cid]) continue;
+      return cid;
+    }
+    for (var m = 0; m < searchOrder.length; m++) {
+      if (isAllowed(searchOrder[m])) return searchOrder[m];
+    }
+    return 'reservations';
+  }
+
+  function normalizeExcelCellDate(val) {
+    if (val === undefined || val === null || val === '') return '';
+    if (val instanceof Date && !isNaN(val.getTime())) {
+      return val.toISOString().slice(0, 10);
+    }
+    if (typeof val === 'number' && isFinite(val) && val > 20000 && val < 90000) {
+      var utcMs = Math.round((val - 25569) * 86400 * 1000);
+      var dt = new Date(utcMs);
+      if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
+    }
+    var raw = convertEasternDigitsToAscii(String(val)).trim();
+    if (!raw || raw === '-') return '';
+    if (/^\d{4,5}$/.test(raw)) {
+      var serial = Number(raw);
+      if (serial > 20000 && serial < 90000) {
+        var utcMs2 = Math.round((serial - 25569) * 86400 * 1000);
+        var dt2 = new Date(utcMs2);
+        if (!isNaN(dt2.getTime())) return dt2.toISOString().slice(0, 10);
+      }
+    }
+    var slashDmy = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/.exec(raw);
+    if (slashDmy) {
+      return slashDmy[3] + '-' + String(Number(slashDmy[2])).padStart(2, '0') + '-' + String(Number(slashDmy[1])).padStart(2, '0');
+    }
+    var slashYmd = /^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/.exec(raw);
+    if (slashYmd) {
+      return slashYmd[1] + '-' + String(Number(slashYmd[2])).padStart(2, '0') + '-' + String(Number(slashYmd[3])).padStart(2, '0');
+    }
+    return formatDisplayDate(raw) || '';
+  }
+
+  function normalizeImportHeaderName(h) {
+    return convertEasternDigitsToAscii(String(h || ''))
+      .trim()
+      .toLowerCase()
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ى/g, 'ي')
+      .replace(/ة/g, 'ه')
+      .replace(/[\s_\-#().\/]+/g, '');
+  }
+
+  var EXCEL_IMPORT_HEADER_MAP = (function () {
+    var specs = {
+      reservationNumber: ['رقم الحجز', 'رقم العقد', 'reservationNumber', 'reservation_number', 'Reservation #', 'Reservation No', 'Booking #', 'Booking Number', 'Res No', 'المرجع'],
+      customerName: ['اسم العميل', 'العميل', 'customerName', 'customer_name', 'Customer Name', 'Customer', 'Client Name', 'Client'],
+      customerPhone: ['الجوال', 'رقم الجوال', 'الهاتف', 'رقم الهاتف', 'customerPhone', 'customer_phone', 'Phone', 'Mobile', 'Client Mobile', 'Phone Number'],
+      customerEmail: ['البريد الإلكتروني', 'البريد الالكتروني', 'الإيميل', 'الايميل', 'customerEmail', 'customer_email', 'Email'],
+      customerIdNumber: ['رقم الهوية', 'الهوية', 'رقم الهوية الوطنية', 'customerIdNumber', 'customer_id_number', 'ID Number', 'National ID'],
+      companyName: ['الشركة', 'اسم الشركة', 'شركة التأجير', 'companyName', 'company_name', 'Company', 'Company Name'],
+      branchName: ['الفرع', 'فرع الاستلام', 'branchName', 'branch_name', 'Branch', 'Pickup Branch'],
+      deliverBranchName: ['فرع التسليم', 'deliverBranchName', 'deliver_branch_name', 'Return Branch', 'Deliver Branch'],
+      carName: ['السيارة', 'اسم السيارة', 'المركبة', 'carName', 'car_name', 'Vehicle', 'Car', 'Car Name'],
+      plateNumber: ['اللوحة', 'رقم اللوحة', 'plateNumber', 'plate_number', 'Plate', 'Plate Number'],
+      carCategory: ['الفئة', 'فئة السيارة', 'carCategory', 'car_category', 'Category', 'Car Category'],
+      startDate: ['بداية الحجز', 'تاريخ البداية', 'تاريخ الاستلام', 'startDate', 'start_date', 'Start Date', 'Pickup Date'],
+      startTime: ['وقت البداية', 'وقت الاستلام', 'startTime', 'start_time', 'Start Time'],
+      endDate: ['نهاية الحجز', 'تاريخ النهاية', 'تاريخ التسليم', 'endDate', 'end_date', 'End Date', 'Return Date'],
+      endTime: ['وقت النهاية', 'وقت التسليم', 'endTime', 'end_time', 'End Time'],
+      extendedUntilDate: ['التمديد لحد', 'تاريخ التمديد', 'نهاية التمديد', 'extendedUntilDate', 'extended_until_date', 'Extended Until'],
+      extensionsCount: ['مرات التمديد', 'عدد التمديدات', 'extensionsCount', 'extensions_count', 'Extensions #', 'Extensions Count'],
+      extensionsAmount: ['سعر التمديد', 'مبلغ التمديد', 'قيمة التمديد', 'extensionsAmount', 'extensions_amount', 'Ext. Amount', 'Extensions Amount'],
+      daysCount: ['الأيام', 'عدد الأيام', 'daysCount', 'days_count', 'Days', 'Days Count'],
+      dailyPrice: ['السعر اليومي', 'الإيجار اليومي', 'dailyPrice', 'daily_price', 'Daily Price'],
+      discountAmount: ['الخصم', 'مبلغ الخصم', 'discountAmount', 'discount_amount', 'Discount'],
+      vatAmount: ['الضريبة', 'ضريبة القيمة المضافة', 'vatAmount', 'vat_amount', 'VAT', 'Tax'],
+      baseAmount: ['المبلغ الأساسي', 'السعر الأساسي', 'baseAmount', 'base_amount', 'Base Amount'],
+      totalAmount: ['الإجمالي', 'المبلغ الإجمالي', 'إجمالي المبلغ', 'totalAmount', 'total_amount', 'Total (SAR)', 'Total', 'Total Amount'],
+      originalStatusAr: ['حالة الحجز الأصلية', 'الحالة الأصلية', 'originalStatusAr', 'original_status_ar', 'Original Status'],
+      internalStatus: ['حالة المتابعة الداخلية', 'المتابعة الداخلية', 'الحالة', 'حالة الحجز', 'internalStatus', 'internal_status', 'Internal Status', 'Status'],
+      priority: ['الأولوية', 'الاولوية', 'priority', 'Priority'],
+      paymentMethod: ['طريقة الدفع', 'paymentMethod', 'payment_method', 'Payment Method'],
+      paymentStatus: ['حالة الدفع', 'paymentStatus', 'payment_status', 'Payment Status'],
+      lastUpdateText: ['آخر تحديث', 'ملاحظات', 'الوصف', 'lastUpdateText', 'last_update_text', 'Last Update', 'Notes']
+    };
+    var map = {};
+    Object.keys(specs).forEach(function (fieldKey) {
+      specs[fieldKey].forEach(function (alias) {
+        map[normalizeImportHeaderName(alias)] = fieldKey;
+      });
+    });
+    return map;
+  })();
+
+  function parseImportedReservationRows(rawRows, existingReservations, actor) {
+    var rows = Array.isArray(rawRows) ? rawRows : [];
+    var existingList = Array.isArray(existingReservations) ? existingReservations : [];
+    var existingByNumber = {};
+    for (var e = 0; e < existingList.length; e++) {
+      var ex = existingList[e];
+      if (ex && ex.reservationNumber) {
+        existingByNumber[String(ex.reservationNumber).trim().toLowerCase()] = ex;
+      }
+    }
+
+    var nowIso = new Date().toISOString();
+    var actorId = normalizeStr(actor && actor.id) || 'SYSTEM';
+    var actorName = normalizeStr(actor && actor.name) || 'النظام';
+    var seenBatchNums = {};
+    var validRows = [];
+    var errors = [];
+    var skippedRows = 0;
+    var newCount = 0;
+    var updateCount = 0;
+
+    for (var i = 0; i < rows.length; i++) {
+      var raw = rows[i];
+      if (!raw || typeof raw !== 'object') {
+        skippedRows += 1;
+        continue;
+      }
+
+      var mapped = {};
+      var keys = Object.keys(raw);
+      for (var k = 0; k < keys.length; k++) {
+        var rawKey = keys[k];
+        var canonField = EXCEL_IMPORT_HEADER_MAP[normalizeImportHeaderName(rawKey)];
+        if (canonField && raw[rawKey] !== undefined && raw[rawKey] !== null && String(raw[rawKey]).trim() !== '') {
+          mapped[canonField] = raw[rawKey];
+        }
+      }
+
+      var customerName = normalizeStr(mapped.customerName);
+      var resNum = convertEasternDigitsToAscii(normalizeStr(mapped.reservationNumber));
+      var carName = normalizeStr(mapped.carName);
+      var startDate = normalizeExcelCellDate(mapped.startDate);
+      var endDate = normalizeExcelCellDate(mapped.endDate);
+      var extUntilDate = normalizeExcelCellDate(mapped.extendedUntilDate);
+
+      if (!resNum && !customerName && !carName && !startDate) {
+        skippedRows += 1;
+        continue;
+      }
+      if (!customerName && !resNum) {
+        skippedRows += 1;
+        errors.push({ rowIndex: i + 2, reason: 'الصف يفتقد اسم العميل ورقم الحجز.' });
+        continue;
+      }
+
+      if (!resNum) {
+        resNum = 'RG-XLS-' + nowIso.slice(0, 10).replace(/-/g, '') + '-' + String(i + 1).padStart(3, '0');
+      }
+
+      var dedupeKey = resNum.toLowerCase();
+      var existing = existingByNumber[dedupeKey] || null;
+      var effectiveStart = startDate || (existing && existing.startDate) || nowIso.slice(0, 10);
+      var effectiveEnd = endDate || (existing && existing.endDate) || effectiveStart;
+      var effectiveExtUntil = extUntilDate || (existing && existing.extendedUntilDate) || effectiveEnd;
+
+      var daysCount = Math.max(1, Math.round(toNum(mapped.daysCount, 0)));
+      if (mapped.daysCount === undefined && effectiveStart && effectiveEnd) {
+        var sMs = Date.parse(effectiveStart + 'T00:00:00Z');
+        var eMs = Date.parse(effectiveEnd + 'T00:00:00Z');
+        if (!isNaN(sMs) && !isNaN(eMs) && eMs >= sMs) {
+          daysCount = Math.max(1, Math.round((eMs - sMs) / 86400000) || 1);
+        }
+      }
+
+      var extCount = Math.max(0, Math.round(toNum(mapped.extensionsCount, existing ? existing.extensionsCount : 0)));
+      var extAmount = Math.max(0, Math.round(toNum(mapped.extensionsAmount, existing ? existing.extensionsAmount : 0) * 100) / 100);
+      var dailyPrice = Math.max(0, Math.round(toNum(mapped.dailyPrice, existing ? existing.dailyPrice : 0) * 100) / 100);
+      var discountAmount = Math.max(0, Math.round(toNum(mapped.discountAmount, existing ? existing.discountAmount : 0) * 100) / 100);
+      var vatAmount = Math.max(0, Math.round(toNum(mapped.vatAmount, existing ? existing.vatAmount : 0) * 100) / 100);
+      var totalRaw = mapped.totalAmount !== undefined ? toNum(mapped.totalAmount, 0) : (existing ? toNum(existing.totalAmount, 0) : 0);
+      var baseAmount = mapped.baseAmount !== undefined
+        ? Math.max(0, Math.round(toNum(mapped.baseAmount, 0) * 100) / 100)
+        : Math.max(0, Math.round((totalRaw - extAmount) * 100) / 100);
+      var totalAmount = totalRaw > 0
+        ? Math.round(totalRaw * 100) / 100
+        : Math.round((baseAmount + extAmount) * 100) / 100;
+
+      var rawInternal = normalizeStr(mapped.internalStatus);
+      var internalStatus = isValidWorkflowStatus(rawInternal)
+        ? rawInternal
+        : (existing ? normalizeStr(existing.internalStatus) : 'جديد');
+      var rawOrig = normalizeStr(mapped.originalStatusAr);
+      var originalStatusAr = (rawOrig && rawOrig !== '-')
+        ? rawOrig
+        : (existing ? normalizeStr(existing.originalStatusAr) : internalStatus);
+      var rawPrio = normalizeStr(mapped.priority);
+      var priority = PROBLEM_PRIORITIES.indexOf(rawPrio) !== -1
+        ? rawPrio
+        : (existing ? normalizeStr(existing.priority, 'عادي') : 'عادي');
+
+      var cleanPhone = convertEasternDigitsToAscii(normalizeStr(mapped.customerPhone));
+      if (cleanPhone === '-') cleanPhone = '';
+      if (!cleanPhone && existing) cleanPhone = normalizeStr(existing.customerPhone);
+
+      var cleanNote = normalizeStr(mapped.lastUpdateText);
+      if (cleanNote === '-') cleanNote = '';
+
+      var rec = {
+        id: existing ? existing.id : ('RES_IMP_' + Date.now().toString(36).toUpperCase() + '_' + String(i + 1)),
+        sourceReservationId: existing ? normalizeStr(existing.sourceReservationId) : '',
+        reservationNumber: resNum,
+        sourceCreatedAt: existing ? normalizeStr(existing.sourceCreatedAt) : (effectiveStart + 'T09:00:00Z'),
+        customerName: customerName || (existing && existing.customerName) || 'عميل مستورد',
+        customerPhone: cleanPhone,
+        customerEmail: normalizeStr(mapped.customerEmail) !== '-' ? (normalizeStr(mapped.customerEmail) || (existing && existing.customerEmail) || '') : '',
+        customerIdNumber: normalizeStr(mapped.customerIdNumber) !== '-' ? (normalizeStr(mapped.customerIdNumber) || (existing && existing.customerIdNumber) || '') : '',
+        companyName: normalizeStr(mapped.companyName) !== '-' ? (normalizeStr(mapped.companyName) || (existing && existing.companyName) || 'مستورد من Excel') : 'مستورد من Excel',
+        branchName: normalizeStr(mapped.branchName) !== '-' ? (normalizeStr(mapped.branchName) || (existing && existing.branchName) || 'الفرع الرئيسي') : 'الفرع الرئيسي',
+        deliverBranchName: normalizeStr(mapped.deliverBranchName) !== '-' ? (normalizeStr(mapped.deliverBranchName) || (existing && existing.deliverBranchName) || normalizeStr(mapped.branchName) || 'الفرع الرئيسي') : 'الفرع الرئيسي',
+        carName: (carName && carName !== '-') ? carName : ((existing && existing.carName) || 'غير محدد'),
+        plateNumber: normalizeStr(mapped.plateNumber) !== '-' ? (normalizeStr(mapped.plateNumber) || (existing && existing.plateNumber) || '') : '',
+        carCategory: normalizeStr(mapped.carCategory) !== '-' ? (normalizeStr(mapped.carCategory) || (existing && existing.carCategory) || '') : '',
+        startDate: effectiveStart,
+        startTime: normalizeStr(mapped.startTime) || (existing && existing.startTime) || '10:00',
+        originalEndDate: existing ? normalizeStr(existing.originalEndDate || effectiveEnd) : effectiveEnd,
+        originalEndTime: (existing && existing.originalEndTime) || normalizeStr(mapped.endTime) || '10:00',
+        endDate: effectiveEnd,
+        endTime: normalizeStr(mapped.endTime) || (existing && existing.endTime) || '10:00',
+        extendedUntilDate: effectiveExtUntil,
+        extendedUntilTime: (existing && existing.extendedUntilTime) || normalizeStr(mapped.endTime) || '10:00',
+        daysCount: daysCount,
+        extendedDaysCount: existing ? Number(existing.extendedDaysCount || 0) : 0,
+        totalDaysCount: daysCount + (existing ? Number(existing.extendedDaysCount || 0) : 0),
+        originalStatusCode: (existing && existing.originalStatusCode) || 'excel_import',
+        originalStatusAr: originalStatusAr,
+        pickupTypeAr: (existing && existing.pickupTypeAr) || 'الفرع',
+        returnTypeAr: (existing && existing.returnTypeAr) || 'الفرع',
+        paymentMethod: normalizeStr(mapped.paymentMethod) !== '-' ? (normalizeStr(mapped.paymentMethod) || (existing && existing.paymentMethod) || '') : '',
+        paymentStatus: normalizeStr(mapped.paymentStatus) !== '-' ? (normalizeStr(mapped.paymentStatus) || (existing && existing.paymentStatus) || '') : '',
+        dailyPrice: dailyPrice,
+        discountAmount: discountAmount,
+        vatAmount: vatAmount,
+        baseAmount: baseAmount,
+        extensionsCount: extCount,
+        extensionsAmount: extAmount,
+        totalAmount: totalAmount,
+        hasExtensions: extCount > 0 || extAmount > 0 || (effectiveExtUntil > effectiveEnd),
+        internalStatus: internalStatus,
+        priority: priority,
+        assignedEmployeeIds: existing && Array.isArray(existing.assignedEmployeeIds) ? existing.assignedEmployeeIds.slice() : [],
+        assignedEmployeeNames: existing && Array.isArray(existing.assignedEmployeeNames) ? existing.assignedEmployeeNames.slice() : [],
+        lastUpdateText: cleanNote || (existing ? normalizeStr(existing.lastUpdateText) : ('تم الاستيراد من ملف Excel بواسطة ' + actorName)),
+        lastUpdatedById: actorId,
+        lastUpdatedByName: actorName,
+        lastUpdatedAt: nowIso,
+        statusHistory: existing && Array.isArray(existing.statusHistory) && existing.statusHistory.length
+          ? existing.statusHistory.slice()
+          : [{ status: internalStatus, originalStatusAr: originalStatusAr, source: 'excel_import', updatedById: actorId, updatedByName: actorName, at: nowIso }],
+        hasProblem: existing ? Boolean(existing.hasProblem) : false,
+        pinnedNote: existing ? normalizeStr(existing.pinnedNote) : '',
+        pinnedNoteBy: existing ? normalizeStr(existing.pinnedNoteBy) : '',
+        pinnedNoteAt: existing ? normalizeStr(existing.pinnedNoteAt) : '',
+        noAnswerCount: existing ? Number(existing.noAnswerCount || 0) : 0,
+        createdAt: existing ? normalizeStr(existing.createdAt || nowIso) : nowIso,
+        updatedAt: nowIso,
+        _isUpdate: Boolean(existing || seenBatchNums[dedupeKey])
+      };
+
+      if (rec._isUpdate) updateCount += 1;
+      else newCount += 1;
+      seenBatchNums[dedupeKey] = true;
+      existingByNumber[dedupeKey] = rec;
+      validRows.push(rec);
+    }
+
+    return {
+      totalRead: rows.length,
+      validRows: validRows,
+      skippedRows: skippedRows,
+      newCount: newCount,
+      updateCount: updateCount,
+      errors: errors
+    };
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
+    DASHBOARD_PERMISSION_KEYS: DASHBOARD_PERMISSION_KEYS,
     ROLE_PERMISSION_MATRIX: ROLE_PERMISSION_MATRIX,
     PERMISSIONS_CATALOG: PERMISSIONS_CATALOG,
     JOB_ROLE_PRESETS: JOB_ROLE_PRESETS,
@@ -2371,6 +5567,7 @@
     resolveEffectivePermissions: resolveEffectivePermissions,
     canAccessApi: canAccessApi,
     canUserPerform: canUserPerform,
+    canUserViewDashboardSection: canUserViewDashboardSection,
     mergePermissionsCatalog: mergePermissionsCatalog,
     normalizeRolePresets: normalizeRolePresets,
     upsertRolePreset: upsertRolePreset,
@@ -2412,6 +5609,77 @@
     resolveNotificationTarget: resolveNotificationTarget,
     applyOptimisticProblemPatch: applyOptimisticProblemPatch,
     computeDataFingerprint: computeDataFingerprint,
-    shouldAutoRefreshNow: shouldAutoRefreshNow
+    shouldAutoRefreshNow: shouldAutoRefreshNow,
+    DELETE_ALL_RESERVATIONS_PHRASE: DELETE_ALL_RESERVATIONS_PHRASE,
+    normalizeAutoSyncInterval: normalizeAutoSyncInterval,
+    formatAutoSyncIntervalAr: formatAutoSyncIntervalAr,
+    normalizeDeleteReservationsScope: normalizeDeleteReservationsScope,
+    matchesReservationDeleteScope: matchesReservationDeleteScope,
+    filterReservationsForDeleteScope: filterReservationsForDeleteScope,
+    validateDeleteAllReservationsConfirmation: validateDeleteAllReservationsConfirmation,
+    formatIsoDateParts: formatIsoDateParts,
+    getDaysInMonth: getDaysInMonth,
+    convertEasternDigitsToAscii: convertEasternDigitsToAscii,
+    sanitizeManualDateInput: sanitizeManualDateInput,
+    parseIsoDateStrict: parseIsoDateStrict,
+    validateIsoDateInput: validateIsoDateInput,
+    shiftCalendarMonth: shiftCalendarMonth,
+    buildCalendarMonthGrid: buildCalendarMonthGrid,
+    resolveRangeSelectionClick: resolveRangeSelectionClick,
+    clampPdfPage: clampPdfPage,
+    clampPdfZoom: clampPdfZoom,
+    computePdfZoom: computePdfZoom,
+    PDF_LAYOUT_PRESETS: PDF_LAYOUT_PRESETS,
+    PDF_QUALITY_PROFILES: PDF_QUALITY_PROFILES,
+    clampPdfTargetPages: clampPdfTargetPages,
+    resolvePdfExportSettings: resolvePdfExportSettings,
+    getPaperDimensionsMm: getPaperDimensionsMm,
+    simulatePdfPagination: simulatePdfPagination,
+    estimatePdfFileSizeBytes: estimatePdfFileSizeBytes,
+    computePdfLayoutPlan: computePdfLayoutPlan,
+    parseReservationEndTimestampMs: parseReservationEndTimestampMs,
+    resolveReservationEffectiveEnd: resolveReservationEffectiveEnd,
+    isReservationClosedStatus: isReservationClosedStatus,
+    classifyExpiryRadarItem: classifyExpiryRadarItem,
+    computeExpiryRadarSummary: computeExpiryRadarSummary,
+    normalizeWhatsappPhone: normalizeWhatsappPhone,
+    buildExtensionOfferMessage: buildExtensionOfferMessage,
+    SHIFT_HANDOVER_PRESETS: SHIFT_HANDOVER_PRESETS,
+    resolveShiftWindow: resolveShiftWindow,
+    computeShiftHandoverSummary: computeShiftHandoverSummary,
+    buildShiftHandoverPdfPayload: buildShiftHandoverPdfPayload,
+    parseMinutesOfDay: parseMinutesOfDay,
+    resolveReservationStartInfo: resolveReservationStartInfo,
+    computeTodayMovementsSummary: computeTodayMovementsSummary,
+    computeExtensionComparisonSummary: computeExtensionComparisonSummary,
+    HEATMAP_DAY_ORDER: HEATMAP_DAY_ORDER,
+    computePeakHoursHeatmap: computePeakHoursHeatmap,
+    findMentionSegments: findMentionSegments,
+    extractMentionedEmployees: extractMentionedEmployees,
+    MAX_PINNED_CRITICAL_RESERVATIONS: MAX_PINNED_CRITICAL_RESERVATIONS,
+    UI_SIMPLIFICATION_GROUPS: UI_SIMPLIFICATION_GROUPS,
+    UI_SIMPLIFICATION_OPTIONS: UI_SIMPLIFICATION_OPTIONS,
+    TEAM_UI_PRESETS: TEAM_UI_PRESETS,
+    normalizeUiSimplificationSettings: normalizeUiSimplificationSettings,
+    formatDirectCallTelHref: formatDirectCallTelHref,
+    formatDirectCallDisplayNumber: formatDirectCallDisplayNumber,
+    formatBookingSummaryText: formatBookingSummaryText,
+    buildNoAnswerActionText: buildNoAnswerActionText,
+    computeSharedAssignmentInfo: computeSharedAssignmentInfo,
+    computeProblemsPer100Bookings: computeProblemsPer100Bookings,
+    filterMentionFollowUps: filterMentionFollowUps,
+    PROBLEM_RATE_VISIBILITY_STORAGE_KEY: PROBLEM_RATE_VISIBILITY_STORAGE_KEY,
+    normalizeProblemRateVisibility: normalizeProblemRateVisibility,
+    formatProblemRateToggleLabel: formatProblemRateToggleLabel,
+    NAV_ROUTE_IDS: NAV_ROUTE_IDS,
+    PROTECTED_NAV_ROUTES: PROTECTED_NAV_ROUTES,
+    DASHBOARD_SECTION_DEFS: DASHBOARD_SECTION_DEFS,
+    normalizeUserLayoutPrefs: normalizeUserLayoutPrefs,
+    reorderListByDragDrop: reorderListByDragDrop,
+    moveOrderItem: moveOrderItem,
+    computeDashboardSectionSpans: computeDashboardSectionSpans,
+    getFirstAllowedRoute: getFirstAllowedRoute,
+    normalizeExcelCellDate: normalizeExcelCellDate,
+    parseImportedReservationRows: parseImportedReservationRows
   };
 }));

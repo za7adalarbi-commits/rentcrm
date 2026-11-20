@@ -12,6 +12,13 @@
       .replace(/"/g, '&quot;');
   }
 
+  function fmtMention(text, employees) {
+    if (root.RGCrmMentions && root.RGCrmMentions.renderHighlightedText) {
+      return root.RGCrmMentions.renderHighlightedText(text, employees, esc);
+    }
+    return esc(text);
+  }
+
   function prioBadge(p) {
     if (p === 'مرتفع') return '<span class="status-tag status-danger">مرتفع</span>';
     if (p === 'متوسط') return '<span class="status-tag status-warning">متوسط</span>';
@@ -58,17 +65,59 @@
     var state = ctx.state.problems || { status: '', priority: '', employeeId: '', search: '' };
     ctx.state.problems = state;
 
-    var [prbRes, empRes] = await Promise.all([
+    var isEn = ctx.lang === 'en';
+    var core = root.RGCrmCore || {};
+    var RATES_VISIBLE_STORAGE_KEY = core.PROBLEM_RATE_VISIBILITY_STORAGE_KEY || 'rg_crm_problems_rate_visible_v1';
+    var isRatesVisible = (function () {
+      if (typeof ctx.state.problemsRateVisible === 'boolean') return ctx.state.problemsRateVisible;
+      try {
+        var rawSaved = localStorage.getItem(RATES_VISIBLE_STORAGE_KEY);
+        return core.normalizeProblemRateVisibility ? core.normalizeProblemRateVisibility(rawSaved) : (rawSaved !== 'false');
+      } catch (_e) {
+        return true;
+      }
+    })();
+    ctx.state.problemsRateVisible = isRatesVisible;
+
+    var empState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
+    var hasPreloadedEmps = Boolean(empState && empState.loaded && Array.isArray(empState.items) && empState.items.length > 0);
+    var hasPrbFilter = Boolean(state.status || state.priority || state.employeeId || state.search);
+
+    var [prbRes, empRes, resListRes, allPrbRes] = await Promise.all([
       root.RGApi.callApi('getProblems', state),
-      root.RGApi.callApi('getEmployees', {})
+      hasPreloadedEmps ? Promise.resolve({ success: true, data: { items: empState.items } }) : root.RGApi.callApi('getEmployees', {}),
+      isRatesVisible ? root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true }) : Promise.resolve(null),
+      (isRatesVisible && hasPrbFilter)
+        ? root.RGApi.callApi('getProblems', { silentRefresh: true })
+        : Promise.resolve(null)
     ]);
     var items = (prbRes.success && prbRes.data.items) || [];
     var employees = (empRes.success && empRes.data.items) || [];
+    var resItems = (resListRes && resListRes.success && resListRes.data && Array.isArray(resListRes.data.items)) ? resListRes.data.items : [];
+    var allProblemsForRate = (allPrbRes && allPrbRes.success && allPrbRes.data && Array.isArray(allPrbRes.data.items)) ? allPrbRes.data.items : items;
+    var ratesLoaded = Boolean(isRatesVisible);
+
+    function getToggleBtnHtml(visible) {
+      var lbl = core.formatProblemRateToggleLabel
+        ? core.formatProblemRateToggleLabel(visible, ctx.lang)
+        : (isEn ? (visible ? 'Hide Problems / 100 Rate' : 'Show Problems / 100 Rate') : (visible ? 'إخفاء مؤشر نسبة المشكلات' : 'إظهار مؤشر نسبة المشكلات'));
+      return '<span class="rg-rate-toggle-icon" aria-hidden="true">' + (visible ? '▾' : '▸') + '</span> ' +
+        '<span class="rg-rate-toggle-text">' + esc(lbl) + '</span>';
+    }
 
     container.innerHTML =
+      '<div class="surface-card rg-problem-rate-card' + (isRatesVisible ? '' : ' hidden') + '" id="prb-rates-card"></div>' +
       '<div class="surface-card">' +
         '<div class="section-header">' +
-          '<div><h2 class="section-title">' + t('nav_problems') + '</h2><p class="section-subtitle">إجمالي المشكلات المطابقة: <strong class="tabular-nums" id="prb-total-count">' + items.length + '</strong></p></div>' +
+          '<div>' +
+            '<h2 class="section-title">' + t('nav_problems') + '</h2>' +
+            '<p class="section-subtitle">' + (isEn ? 'Matching problems total: ' : 'إجمالي المشكلات المطابقة: ') + '<strong class="tabular-nums" id="prb-total-count">' + items.length + '</strong></p>' +
+          '</div>' +
+          '<div class="toolbar-row" style="margin-bottom:0;">' +
+            '<button type="button" class="btn btn-sm rg-rate-toggle-btn' + (isRatesVisible ? ' is-visible' : '') + '" id="prb-toggle-rates-btn" aria-expanded="' + (isRatesVisible ? 'true' : 'false') + '" aria-controls="prb-rates-card">' +
+              getToggleBtnHtml(isRatesVisible) +
+            '</button>' +
+          '</div>' +
         '</div>' +
         '<div class="filter-grid">' +
           '<input type="search" class="input" id="prb-search" placeholder="بحث برقم المشكلة أو الحجز أو العميل..." value="' + esc(state.search || '') + '">' +
@@ -88,8 +137,111 @@
 
     var activePrbSeq = 0;
 
+    async function ensureRatesLoadedAndPaint() {
+      if (ratesLoaded) {
+        paintProblemRatesCard(allProblemsForRate);
+        return;
+      }
+      var [rRes, pAllRes] = await Promise.all([
+        root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true }),
+        (state.status || state.priority || state.employeeId || state.search)
+          ? root.RGApi.callApi('getProblems', { silentRefresh: true })
+          : Promise.resolve(null)
+      ]);
+      if (!container.isConnected) return;
+      resItems = (rRes && rRes.success && rRes.data && Array.isArray(rRes.data.items)) ? rRes.data.items : [];
+      allProblemsForRate = (pAllRes && pAllRes.success && pAllRes.data && Array.isArray(pAllRes.data.items)) ? pAllRes.data.items : items;
+      ratesLoaded = true;
+      paintProblemRatesCard(allProblemsForRate);
+    }
+
+    function setRatesVisible(nextVisible) {
+      isRatesVisible = Boolean(nextVisible);
+      ctx.state.problemsRateVisible = isRatesVisible;
+      try {
+        localStorage.setItem(RATES_VISIBLE_STORAGE_KEY, isRatesVisible ? 'true' : 'false');
+      } catch (_e) {}
+      var rateCardEl = container.querySelector('#prb-rates-card');
+      if (rateCardEl) {
+        rateCardEl.classList.toggle('hidden', !isRatesVisible);
+      }
+      var toggleBtnEl = container.querySelector('#prb-toggle-rates-btn');
+      if (toggleBtnEl) {
+        toggleBtnEl.setAttribute('aria-expanded', isRatesVisible ? 'true' : 'false');
+        toggleBtnEl.classList.toggle('is-visible', isRatesVisible);
+        toggleBtnEl.innerHTML = getToggleBtnHtml(isRatesVisible);
+      }
+      if (isRatesVisible && !ratesLoaded) {
+        ensureRatesLoadedAndPaint().catch(function () {});
+      }
+    }
+
+    var toggleRatesBtn = container.querySelector('#prb-toggle-rates-btn');
+    if (toggleRatesBtn) {
+      toggleRatesBtn.addEventListener('click', function () {
+        setRatesVisible(!isRatesVisible);
+      });
+    }
+
+    function paintProblemRatesCard(prbSourceList) {
+      var rateHost = container.querySelector('#prb-rates-card');
+      if (!rateHost) return;
+      rateHost.classList.toggle('hidden', !isRatesVisible);
+      var metrics = (root.RGCrmCore && root.RGCrmCore.computeProblemsPer100Bookings)
+        ? root.RGCrmCore.computeProblemsPer100Bookings(resItems, prbSourceList || allProblemsForRate)
+        : { overall: { totalBookings: 0, problemsCount: 0, openProblemsCount: 0, resolvedProblemsCount: 0, ratePer100: 0, severity: 'normal' }, byCompany: [], byBranch: [] };
+      var ov = metrics.overall;
+      rateHost.innerHTML =
+        '<div class="section-header" style="margin-bottom:12px;">' +
+          '<div>' +
+            '<h3 class="section-title">' + (isEn ? 'Problems per 100 Bookings Indicator' : 'مؤشر نسبة المشكلات لكل 100 حجز (حسب الشركة والفرع)') + '</h3>' +
+            '<p class="section-subtitle">' + (isEn ? 'Overall rate: ' : 'المعدل العام: ') + '<strong class="tabular-nums">' + ov.ratePer100 + '</strong> ' + (isEn ? 'problems / 100 bookings' : 'مشكلة / 100 حجز') + ' (<span class="tabular-nums">' + ov.problemsCount + ' / ' + ov.totalBookings + '</span>)</p>' +
+          '</div>' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+            '<span class="rg-rate-badge is-' + esc(ov.severity) + ' tabular-nums" dir="ltr">' + ov.ratePer100 + ' / 100</span>' +
+            '<button type="button" class="btn btn-sm rg-rate-hide-inline-btn" id="prb-hide-rates-inline-btn" title="' + (isEn ? 'Hide indicator' : 'إخفاء مؤشر نسبة المشكلات') + '">' +
+              (isEn ? 'Hide' : 'إخفاء') +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="rg-rate-split-grid">' +
+          '<div class="rg-rate-panel">' +
+            '<h4 class="rg-rate-panel-title">' + (isEn ? 'By Company' : 'أعلى الشركات نسبةً للمشكلات') + '</h4>' +
+            (metrics.byCompany.length === 0
+              ? '<div class="empty-state" style="padding:12px;">' + (isEn ? 'Insufficient data.' : 'لا توجد بيانات كافية.') + '</div>'
+              : '<div class="rg-rate-list">' + metrics.byCompany.slice(0, 5).map(function (c) {
+                  return '<div class="rg-rate-row">' +
+                    '<div><strong>' + esc(c.companyName) + '</strong><div class="cell-sub tabular-nums">' +
+                      (isEn ? (c.problemsCount + ' problems / ' + c.totalBookings + ' bookings') : (c.problemsCount + ' مشكلة من ' + c.totalBookings + ' حجز')) +
+                    '</div></div>' +
+                    '<span class="rg-rate-badge is-' + esc(c.severity) + ' tabular-nums" dir="ltr">' + c.ratePer100 + ' / 100</span>' +
+                  '</div>';
+                }).join('') + '</div>') +
+          '</div>' +
+          '<div class="rg-rate-panel">' +
+            '<h4 class="rg-rate-panel-title">' + (isEn ? 'By Branch' : 'أعلى الفروع نسبةً للمشكلات') + '</h4>' +
+            (metrics.byBranch.length === 0
+              ? '<div class="empty-state" style="padding:12px;">' + (isEn ? 'Insufficient data.' : 'لا توجد بيانات كافية.') + '</div>'
+              : '<div class="rg-rate-list">' + metrics.byBranch.slice(0, 5).map(function (b) {
+                  return '<div class="rg-rate-row">' +
+                    '<div><strong>' + esc(b.branchName) + '</strong><div class="cell-sub">' + esc(b.companyName) + ' · <span class="tabular-nums">' + b.problemsCount + ' / ' + b.totalBookings + '</span></div></div>' +
+                    '<span class="rg-rate-badge is-' + esc(b.severity) + ' tabular-nums" dir="ltr">' + b.ratePer100 + ' / 100</span>' +
+                  '</div>';
+                }).join('') + '</div>') +
+          '</div>' +
+        '</div>';
+
+      var inlineHideBtn = rateHost.querySelector('#prb-hide-rates-inline-btn');
+      if (inlineHideBtn) {
+        inlineHideBtn.addEventListener('click', function () {
+          setRatesVisible(false);
+        });
+      }
+    }
+
     function filterAndApplyLocalProblem(updatedPrb) {
       if (!updatedPrb) return;
+      allProblemsForRate = allProblemsForRate.map(function (x) { return x.id === updatedPrb.id ? updatedPrb : x; });
       items = items.map(function (x) { return x.id === updatedPrb.id ? updatedPrb : x; });
       if (state.status) {
         items = items.filter(function (x) { return x.status === state.status; });
@@ -97,6 +249,7 @@
       if (state.priority) {
         items = items.filter(function (x) { return x.priority === state.priority; });
       }
+      if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
       paintProblemsRegion(items);
     }
 
@@ -114,10 +267,10 @@
             items.map(function (p) {
               var closed = isClosedStatus(p.status);
               return '<tr data-prb-row="' + esc(p.id) + '">' +
-                '<td class="mono"><strong>' + esc(p.problemNumber) + '</strong></td>' +
-                '<td class="mono"><button type="button" class="btn-link-inline prb-open-res" data-res-id="' + esc(p.reservationId) + '">' + esc(p.reservationNumber) + '</button></td>' +
+                '<td class="mono" style="white-space:nowrap;" dir="ltr"><strong>' + esc(p.problemNumber) + '</strong></td>' +
+                '<td class="mono" style="white-space:nowrap;"><button type="button" class="btn-link-inline prb-open-res" dir="ltr" data-res-id="' + esc(p.reservationId) + '">' + esc(p.reservationNumber) + '</button></td>' +
                 '<td>' + esc(p.customerName) + '</td>' +
-                '<td style="max-width:260px;">' + esc(p.description) + '</td>' +
+                '<td style="max-width:260px;">' + fmtMention(p.description, employees) + '</td>' +
                 '<td>' + prioBadge(p.priority) + '</td>' +
                 '<td>' + statusBadge(p.status) + '</td>' +
                 '<td>' + esc(p.createdByName) + '</td>' +
@@ -186,9 +339,14 @@
       if (seq !== activePrbSeq) return;
       if (resp && resp.success && resp.data) {
         paintProblemsRegion(resp.data.items || []);
+        if (!state.status && !state.priority && !state.employeeId && !state.search) {
+          allProblemsForRate = resp.data.items || [];
+          if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
+        }
       }
     }
 
+    if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
     paintProblemsRegion(items);
 
     var searchTimer = null;
@@ -223,7 +381,15 @@
     var user = root.RGAuth.getUser();
     var canEditTicket = Boolean(user && root.RGCrmCore.canUserPerform(user, 'edit_ticket_details'));
     var modalRoot = document.getElementById('modal-root');
-    var empList = Array.isArray(employees) ? employees : [];
+    var empList = Array.isArray(employees) && employees.length ? employees.slice() : [];
+    if (!empList.length && root.RGApp && root.RGApp.getEmployeesState) {
+      var empSt = root.RGApp.getEmployeesState();
+      if (empSt && Array.isArray(empSt.items) && empSt.items.length) empList = empSt.items.slice();
+    }
+    if (!empList.length && root.RGApi && root.RGApi.getCachedData) {
+      var empCached = root.RGApi.getCachedData('getEmployees', {}, true);
+      if (empCached && Array.isArray(empCached.items) && empCached.items.length) empList = empCached.items.slice();
+    }
     var isAlreadyClosed = isClosedStatus(problem.status);
 
     modalRoot.innerHTML =
@@ -249,7 +415,7 @@
                   return '<option value="' + esc(p) + '"' + (problem.priority === p ? ' selected' : '') + '>' + esc(p) + '</option>';
                 }).join('') +
               '</select></div>'
-            : '<p style="margin:0;padding:12px;background:var(--bg-surface-subtle);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);">' + esc(problem.description) + '</p>' +
+            : '<p style="margin:0;padding:12px;background:var(--bg-surface-subtle);border:1px solid var(--border-hairline);border-radius:var(--radius-sm);">' + fmtMention(problem.description, empList) + '</p>' +
               '<div class="form-grid-2">' +
                 '<div class="form-group"><label class="form-label" for="pu-status">الحالة</label><select class="select" id="pu-status">' +
                   root.RGCrmCore.PROBLEM_STATUSES.map(function (s) {
@@ -278,7 +444,7 @@
                 return '<div class="timeline-item">' +
                   '<div style="display:flex;justify-content:space-between;gap:8px;"><strong>' + esc(u.employeeName) + '</strong><span class="mono" style="font-size:11.5px;color:var(--text-muted);">' + String(u.createdAt).replace('T', ' ').substring(0, 16) + '</span></div>' +
                   '<div style="font-size:12.5px;">الحالة: ' + esc(u.previousStatus || '-') + ' ← <strong>' + esc(u.newStatus) + '</strong> | الأولوية: ' + esc(u.previousPriority || '-') + ' ← <strong>' + esc(u.newPriority) + '</strong></div>' +
-                  '<div>' + esc(u.note) + '</div>' +
+                  '<div>' + fmtMention(u.note, empList) + '</div>' +
                 '</div>';
               }).join('') || '<div class="empty-state" style="padding:12px;">لا توجد تحديثات إضافية.</div>') +
             '</div>' +
@@ -292,6 +458,12 @@
           '</div>' +
         '</form>' +
       '</div>';
+
+    if (root.RGCrmMentions && root.RGCrmMentions.attach) {
+      var getPool = function () { return empList; };
+      if (canEditTicket) root.RGCrmMentions.attach(document.getElementById('pu-desc'), getPool);
+      root.RGCrmMentions.attach(document.getElementById('pu-note'), getPool);
+    }
 
     var handledSubmit = false;
 

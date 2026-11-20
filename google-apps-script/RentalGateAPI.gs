@@ -416,6 +416,11 @@ function serializeReservationForClient_(sr, isFollowedFlag) {
     lastUpdatedByName: sr.lastUpdatedByName,
     lastUpdatedAt: sr.lastUpdatedAt,
     hasProblem: toBool(sr.hasProblem),
+    pinnedNote: sr.pinnedNote || '',
+    pinnedNoteById: sr.pinnedNoteById || '',
+    pinnedNoteByName: sr.pinnedNoteByName || '',
+    pinnedNoteUpdatedAt: sr.pinnedNoteUpdatedAt || '',
+    noAnswerCount: Math.max(0, Math.floor(toNumber(sr.noAnswerCount, 0))),
     createdAt: sr.createdAt || '',
     updatedAt: sr.updatedAt || '',
     statusHistory: normalizeStatusHistory_(sr.statusHistory),
@@ -936,10 +941,14 @@ function getSyncStatus(session) {
     return String(b.startedAt).localeCompare(String(a.startedAt));
   });
   var map = getSettingsMap_(false);
+  var interval = typeof normalizeAutoSyncParts_ === 'function'
+    ? normalizeAutoSyncParts_(map.auto_sync_interval_hours, map.auto_sync_interval_minutes)
+    : { hours: map.auto_sync_interval_hours !== undefined ? toNumber(map.auto_sync_interval_hours, 12) : 12, minutes: toNumber(map.auto_sync_interval_minutes, 0) };
   return {
     hasToken: Boolean(getRgToken()),
     autoSyncEnabled: map.auto_sync_enabled !== undefined ? toBool(map.auto_sync_enabled) : true,
-    autoSyncIntervalHours: map.auto_sync_interval_hours ? toNumber(map.auto_sync_interval_hours, 12) : 12,
+    autoSyncIntervalHours: interval.hours,
+    autoSyncIntervalMinutes: interval.minutes,
     lastSync: logs.length > 0 ? logs[0] : null,
     logs: logs.slice(0, 20)
   };

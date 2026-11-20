@@ -419,6 +419,15 @@ function handleNeonMirrorSync_(payload) {
         deleteRecordByKey(RG_SHEETS.USERS, 'id', data.id);
       }
       applied++;
+    } else if (action === 'deleteAllReservations') {
+      if (typeof clearSheetRecords === 'function') {
+        clearSheetRecords(RG_SHEETS.RESERVATIONS);
+        clearSheetRecords(RG_SHEETS.EXTENSIONS);
+        clearSheetRecords(RG_SHEETS.ASSIGNMENTS);
+        clearSheetRecords(RG_SHEETS.FOLLOWUPS);
+        clearSheetRecords(RG_SHEETS.FOLLOWUP_HISTORY);
+      }
+      applied++;
     } else if (action === 'upsertSetting' && data.key) {
       setBatch.push({
         key: data.key,
