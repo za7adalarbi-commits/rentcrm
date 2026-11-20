@@ -84,7 +84,7 @@ async function startServer() {
         } else if (/\.(png|jpg|jpeg|svg|webp|woff2?)$/i.test(filePath) || filePath.includes(`${path.sep}vendor${path.sep}`)) {
           res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
         } else if (/\.(js|css)$/i.test(filePath)) {
-          res.setHeader('Cache-Control', 'public, max-age=300, must-revalidate');
+          res.setHeader('Cache-Control', 'no-cache, must-revalidate');
         }
       }
     }));
