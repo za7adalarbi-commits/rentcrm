@@ -367,9 +367,7 @@ html.dark .kpi-hero-amber .kpi-hero-hint { color: #FBBF24; }
 .chart-card {
   position: relative;
   overflow: hidden;
-  background: var(--glass-l1);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
+  background: var(--glass-l3);
   border: 1px solid var(--border-hairline);
   border-radius: 20px;
   padding: 20px;

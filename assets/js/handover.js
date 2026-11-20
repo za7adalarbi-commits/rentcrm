@@ -47,12 +47,33 @@
     return 'status-neutral';
   }
 
-  function formatTimestamp(iso) {
+  function activeTimeFormat() {
+    return (root.RGApp && typeof root.RGApp.getTimeFormat === 'function') ? root.RGApp.getTimeFormat() : '24h';
+  }
+
+  function formatTimestamp(iso, lang) {
     if (!iso) return '-';
+    if (root.RGApp && typeof root.RGApp.formatDateTime === 'function') {
+      return root.RGApp.formatDateTime(iso, lang) || '-';
+    }
+    if (root.RGCrmCore && root.RGCrmCore.formatDateTimePreference) {
+      return root.RGCrmCore.formatDateTimePreference(iso, activeTimeFormat(), lang || 'ar') || '-';
+    }
     if (root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime) {
       return root.RGCrmCore.formatDisplayDateTime(iso) || '-';
     }
     return String(iso).replace('T', ' ').substring(0, 16);
+  }
+
+  function formatTimeOnly(val, lang) {
+    if (!val) return '';
+    if (root.RGApp && typeof root.RGApp.formatTime === 'function') {
+      return root.RGApp.formatTime(val, lang);
+    }
+    if (root.RGCrmCore && root.RGCrmCore.formatTimePreference) {
+      return root.RGCrmCore.formatTimePreference(val, activeTimeFormat(), lang || 'ar');
+    }
+    return String(val);
   }
 
   function formatDateOnly(val) {
@@ -235,7 +256,7 @@
               '</div>' +
               '<div class="handover-row-sub">' +
                 esc(r.carName || '-') + ' · ' + esc(r.lastUpdatedByName || '-') + ' · ' +
-                '<span class="mono tabular-nums" dir="ltr">' + esc(formatTimestamp(r.lastUpdatedAt || r.updatedAt)) + '</span>' +
+                '<span class="mono tabular-nums" dir="ltr">' + esc(formatTimestamp(r.lastUpdatedAt || r.updatedAt, appCtx.lang)) + '</span>' +
               '</div>' +
             '</div>' +
             '<div class="handover-row-end">' +
@@ -262,7 +283,7 @@
             '</div>' +
             '<div class="handover-row-sub">' +
               esc(r.carName || '-') + ' · ' +
-              '<span class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(entry.effectiveEndDate)) + (entry.effectiveEndTime ? ' ' + esc(entry.effectiveEndTime) : '') + '</span>' +
+              '<span class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(entry.effectiveEndDate)) + (entry.effectiveEndTime ? ' ' + esc(formatTimeOnly(entry.effectiveEndTime, appCtx.lang)) : '') + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="handover-row-end">' +
@@ -332,7 +353,7 @@
     function buildHandoverPdfConfig(liveSettings) {
       recomputeSummary();
       var payload = (core && core.buildShiftHandoverPdfPayload)
-        ? core.buildShiftHandoverPdfPayload(state.summary, appCtx.lang || 'ar')
+        ? core.buildShiftHandoverPdfPayload(state.summary, appCtx.lang || 'ar', { timeFormat: activeTimeFormat() })
         : { title: 'Shift Handover', filename: 'shift-handover.pdf', summaryItems: [], columns: [], rows: [], extraSections: [] };
       var s = Object.assign({}, state.pdfSettings, liveSettings || {});
       return Object.assign({}, payload, {

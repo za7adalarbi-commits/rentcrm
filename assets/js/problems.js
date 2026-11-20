@@ -19,6 +19,17 @@
     return esc(text);
   }
 
+  function fmtDateTime(val, ctx) {
+    if (!val) return '-';
+    if (ctx && typeof ctx.formatDateTime === 'function') return ctx.formatDateTime(val) || '-';
+    if (root.RGApp && typeof root.RGApp.formatDateTime === 'function') return root.RGApp.formatDateTime(val) || '-';
+    if (root.RGCrmCore && root.RGCrmCore.formatDateTimePreference) {
+      var tf = (root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h';
+      return root.RGCrmCore.formatDateTimePreference(val, tf, (ctx && ctx.lang) || 'ar') || '-';
+    }
+    return String(val).replace('T', ' ').substring(0, 16);
+  }
+
   function prioBadge(p) {
     if (p === 'مرتفع') return '<span class="status-tag status-danger">مرتفع</span>';
     if (p === 'متوسط') return '<span class="status-tag status-warning">متوسط</span>';
@@ -275,7 +286,7 @@
                 '<td>' + statusBadge(p.status) + '</td>' +
                 '<td>' + esc(p.createdByName) + '</td>' +
                 '<td>' + esc((p.assignedEmployeeNames || []).join('، ') || '-') + '</td>' +
-                '<td class="mono">' + String(p.updatedAt || '').replace('T', ' ').substring(0, 16) + '</td>' +
+                '<td class="mono tabular-nums" dir="ltr" style="white-space:nowrap;">' + esc(fmtDateTime(p.updatedAt, ctx)) + '</td>' +
                 '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   '<button type="button" class="btn btn-sm btn-primary btn-manage-prb" data-id="' + esc(p.id) + '">متابعة / تحديث</button>' +
                   (!closed ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb" data-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
@@ -442,7 +453,7 @@
             '<div class="timeline-list">' +
               ((problem.updates || []).map(function (u) {
                 return '<div class="timeline-item">' +
-                  '<div style="display:flex;justify-content:space-between;gap:8px;"><strong>' + esc(u.employeeName) + '</strong><span class="mono" style="font-size:11.5px;color:var(--text-muted);">' + String(u.createdAt).replace('T', ' ').substring(0, 16) + '</span></div>' +
+                  '<div style="display:flex;justify-content:space-between;gap:8px;"><strong>' + esc(u.employeeName) + '</strong><span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-muted);">' + esc(fmtDateTime(u.createdAt, ctx)) + '</span></div>' +
                   '<div style="font-size:12.5px;">الحالة: ' + esc(u.previousStatus || '-') + ' ← <strong>' + esc(u.newStatus) + '</strong> | الأولوية: ' + esc(u.previousPriority || '-') + ' ← <strong>' + esc(u.newPriority) + '</strong></div>' +
                   '<div>' + fmtMention(u.note, empList) + '</div>' +
                 '</div>';

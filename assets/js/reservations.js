@@ -87,8 +87,29 @@
     return String(val).substring(0, 10);
   }
 
-  function formatTimestamp(iso) {
+  function activeTimeFormat() {
+    return (root.RGApp && typeof root.RGApp.getTimeFormat === 'function') ? root.RGApp.getTimeFormat() : '24h';
+  }
+
+  function formatTimeOnly(val, lang) {
+    if (!val) return '';
+    if (root.RGApp && typeof root.RGApp.formatTime === 'function') {
+      return root.RGApp.formatTime(val, lang);
+    }
+    if (root.RGCrmCore && root.RGCrmCore.formatTimePreference) {
+      return root.RGCrmCore.formatTimePreference(val, activeTimeFormat(), lang || 'ar');
+    }
+    return String(val);
+  }
+
+  function formatTimestamp(iso, lang) {
     if (!iso) return '-';
+    if (root.RGApp && typeof root.RGApp.formatDateTime === 'function') {
+      return root.RGApp.formatDateTime(iso, lang) || '-';
+    }
+    if (root.RGCrmCore && root.RGCrmCore.formatDateTimePreference) {
+      return root.RGCrmCore.formatDateTimePreference(iso, activeTimeFormat(), lang || 'ar') || '-';
+    }
     if (root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime) {
       return root.RGCrmCore.formatDisplayDateTime(iso) || '-';
     }
@@ -352,14 +373,14 @@
                   if (!colVisible.endDate && r.endDate) periodParts.push('حتى ' + formatDateOnly(r.endDate));
                   if (!colVisible.daysCount) periodParts.push(totStartDays + ' يوم');
                   return '<td class="tabular-nums" style="white-space:nowrap;">' +
-                    '<div class="cell-primary mono" dir="ltr">' + esc(formatDateOnly(r.startDate)) + (r.startTime ? ' <span class="time-sub">' + esc(r.startTime) + '</span>' : '') + '</div>' +
+                    '<div class="cell-primary mono" dir="ltr">' + esc(formatDateOnly(r.startDate)) + (r.startTime ? ' <span class="time-sub">' + esc(formatTimeOnly(r.startTime, ctx.lang)) + '</span>' : '') + '</div>' +
                     (periodParts.length ? '<div class="cell-sub">' + esc(periodParts.join(' · ')) + '</div>' : '') +
                   '</td>';
                 }
                 if (c.key === 'endDate') {
                   var endTm = r.endTime || r.originalEndTime || '';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.endDate)) + '</div>' +
-                    (endTm ? '<div class="time-sub">' + esc(endTm) + '</div>' : '') + '</td>';
+                    (endTm ? '<div class="time-sub" dir="ltr">' + esc(formatTimeOnly(endTm, ctx.lang)) + '</div>' : '') + '</td>';
                 }
                 if (c.key === 'daysCount') {
                   var totDays = Number(r.totalDaysCount || r.daysCount || 1);
@@ -375,7 +396,7 @@
                 if (c.key === 'extendedUntilDate') {
                   if (!r.extendedUntilDate) return '<td class="mono tabular-nums">-</td>';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.extendedUntilDate)) + '</div>' +
-                    (r.extendedUntilTime ? '<div class="time-sub">' + esc(r.extendedUntilTime) + '</div>' : '') + '</td>';
+                    (r.extendedUntilTime ? '<div class="time-sub" dir="ltr">' + esc(formatTimeOnly(r.extendedUntilTime, ctx.lang)) + '</div>' : '') + '</td>';
                 }
                 if (c.key === 'extensionsAmount') {
                   var extAmtCol = Number(r.extensionsAmount || 0);
@@ -878,7 +899,7 @@
               '</td>' +
               '<td class="mono tabular-nums" style="white-space:nowrap;">' +
                 '<div>' + esc(formatDateOnly(entry.effectiveEndDate)) + '</div>' +
-                (entry.effectiveEndTime ? '<div class="time-sub">' + esc(entry.effectiveEndTime) + '</div>' : '') +
+                (entry.effectiveEndTime ? '<div class="time-sub" dir="ltr">' + esc(formatTimeOnly(entry.effectiveEndTime, ctx.lang)) + '</div>' : '') +
               '</td>' +
               '<td style="white-space:nowrap;">' +
                 '<span class="radar-countdown ' + toneCls + ' tabular-nums">' + esc(remLabel) + '</span>' +
@@ -1018,10 +1039,11 @@
           var assignedIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [];
           var isMine = currentEmpId && assignedIds.indexOf(currentEmpId) !== -1;
           var waPhone = (core && core.normalizeWhatsappPhone) ? core.normalizeWhatsappPhone(r.customerPhone) : '';
+          var schedTimeDisp = formatTimeOnly(entry.scheduledTime || '', ctx.lang);
           var waText = isPickup
             ? (isEn
-                ? ('Hello ' + (r.customerName || '') + ', reminder for your vehicle pickup (' + (r.carName || '') + ') today at ' + entry.scheduledTime + ' — Booking #' + (r.reservationNumber || ''))
-                : ('مرحباً ' + (r.customerName || 'عميلنا الكريم') + '، نذكّركم بموعد استلام مركبتكم (' + (r.carName || '') + ') اليوم الساعة ' + entry.scheduledTime + ' للحجز رقم ' + (r.reservationNumber || '') + '.'))
+                ? ('Hello ' + (r.customerName || '') + ', reminder for your vehicle pickup (' + (r.carName || '') + ') today at ' + schedTimeDisp + ' — Booking #' + (r.reservationNumber || ''))
+                : ('مرحباً ' + (r.customerName || 'عميلنا الكريم') + '، نذكّركم بموعد استلام مركبتكم (' + (r.carName || '') + ') اليوم الساعة ' + schedTimeDisp + ' للحجز رقم ' + (r.reservationNumber || '') + '.'))
             : (core && core.buildExtensionOfferMessage ? core.buildExtensionOfferMessage(r, ctx.lang, { agentName: currentUser && currentUser.name }) : '');
           var waHref = waPhone ? ('https://wa.me/' + waPhone + '?text=' + encodeURIComponent(waText)) : '';
           var telHref = (core && core.formatDirectCallTelHref) ? core.formatDirectCallTelHref(r.customerPhone, '90') : '';
@@ -1031,7 +1053,7 @@
           desktopRows.push(
             '<tr data-today-key="' + esc(entry.key) + '" class="today-move-row' + rowStateCls + '">' +
               '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                '<div class="today-time-slot">' + esc(entry.scheduledTime || '-') + '</div>' +
+                '<div class="today-time-slot" dir="ltr">' + esc(schedTimeDisp || '-') + '</div>' +
                 '<div class="cell-badges" style="margin-top:4px;">' + timingStateHtml + '</div>' +
               '</td>' +
               '<td style="white-space:nowrap;">' +
@@ -1070,7 +1092,7 @@
             '<article data-today-key="' + esc(entry.key) + '" class="today-mobile-card' + rowStateCls + '">' +
               '<div class="today-mobile-card-top">' +
                 '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
-                  '<span class="today-time-slot">' + esc(entry.scheduledTime || '-') + '</span>' +
+                  '<span class="today-time-slot" dir="ltr">' + esc(schedTimeDisp || '-') + '</span>' +
                   timingStateHtml +
                   '<span class="status-tag ' + moveTone + '">' + esc(moveLabel) + '</span>' +
                 '</div>' +
@@ -1434,13 +1456,13 @@
           '<div class="ext-compare-grid">' +
             '<div class="ext-compare-col is-original">' +
               '<span class="ext-compare-col-label">' + (isEn ? 'Original Contract (Before Extension)' : 'العقد الأصلي (قبل التمديد)') + '</span>' +
-              '<div class="ext-compare-row"><span>' + (isEn ? 'Original Return Date' : 'تاريخ الإرجاع الأصلي') + '</span><strong class="mono tabular-nums">' + esc(formatDateOnly(origEndDate)) + (origEndTime ? ' · ' + esc(origEndTime) : '') + '</strong></div>' +
+              '<div class="ext-compare-row"><span>' + (isEn ? 'Original Return Date' : 'تاريخ الإرجاع الأصلي') + '</span><strong class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(origEndDate)) + (origEndTime ? ' · ' + esc(formatTimeOnly(origEndTime, ctx.lang)) : '') + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Base Days' : 'الأيام الأساسية') + '</span><strong class="tabular-nums">' + baseDays + ' ' + dayUnit + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Base Amount' : 'قيمة العقد الأساسي') + '</span><strong class="mono tabular-nums">' + baseAmt + ' ' + curLabel + '</strong></div>' +
             '</div>' +
             '<div class="ext-compare-col is-extended">' +
               '<span class="ext-compare-col-label">' + (hasExtended ? (isEn ? 'After Extension & Modification' : 'بعد التمديد والتعديل') : (isEn ? 'Current Contract Status' : 'الوضع الحالي للعقد')) + '</span>' +
-              '<div class="ext-compare-row"><span>' + (isEn ? 'Extended Return Date' : 'تاريخ الإرجاع الممدد') + '</span><strong class="mono tabular-nums">' + (hasExtended && extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(extUntilTime) : '')) : (isEn ? 'Not extended' : 'لم يُمدد')) + '</strong></div>' +
+              '<div class="ext-compare-row"><span>' + (isEn ? 'Extended Return Date' : 'تاريخ الإرجاع الممدد') + '</span><strong class="mono tabular-nums" dir="ltr">' + (hasExtended && extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(formatTimeOnly(extUntilTime, ctx.lang)) : '')) : (isEn ? 'Not extended' : 'لم يُمدد')) + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Total Duration' : 'إجمالي المدة') + '</span><strong class="tabular-nums">' + totalDaysComp + ' ' + dayUnit + (extDays > 0 ? ' <span class="ext-delta-inline">(+' + extDays + ')</span>' : '') + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Final Total' : 'الإجمالي النهائي') + '</span><strong class="mono tabular-nums">' + totalAmt + ' ' + curLabel + (extAmount > 0 ? ' <span class="ext-delta-inline">(+' + extAmount + ' ' + curLabel + ')</span>' : '') + '</strong></div>' +
             '</div>' +
@@ -1457,7 +1479,7 @@
           '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extensions Count' : 'كم مرة ممدد') + '</span><span class="detail-v tabular-nums">' + extCount + ' ' + (isEn ? (extCount === 1 ? 'time' : 'times') : (extCount === 1 ? 'مرة' : 'مرات')) + '</span></div>' +
           '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Days' : 'إجمالي أيام التمديد') + '</span><span class="detail-v tabular-nums">' + extDays + ' ' + dayUnit + '</span></div>' +
           '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extensions Amount' : 'إجمالي سعر التمديد') + '</span><span class="detail-v mono tabular-nums">' + extAmount + ' ' + curLabel + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Until' : 'التمديد لحد') + '</span><span class="detail-v mono tabular-nums">' + (extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(extUntilTime) : '')) : (isEn ? 'None' : 'لا يوجد تمديد')) + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Until' : 'التمديد لحد') + '</span><span class="detail-v mono tabular-nums" dir="ltr">' + (extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(formatTimeOnly(extUntilTime, ctx.lang)) : '')) : (isEn ? 'None' : 'لا يوجد تمديد')) + '</span></div>' +
         '</div>' +
         (items.length === 0
           ? '<div style="margin-top:10px;font-size:13px;color:var(--text-muted);">' + (isEn ? 'No extensions recorded for this reservation yet.' : 'لا توجد تمديدات مسجلة لهذا الحجز حتى الآن.') + '</div>'
@@ -1483,7 +1505,7 @@
                     '<strong class="mono tabular-nums" style="color:var(--brand-primary);font-size:14px;">' + Number(ex.amount || 0) + ' ' + curLabel + '</strong>' +
                   '</div>' +
                   '<div class="meta-inline">' +
-                    '<span class="mono tabular-nums">' + esc(formatDateOnly(ex.startDate)) + (ex.startTime ? ' ' + esc(ex.startTime) : '') + ' ← ' + esc(formatDateOnly(ex.endDate)) + (ex.endTime ? ' ' + esc(ex.endTime) : '') + '</span>' +
+                    '<span class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(ex.startDate)) + (ex.startTime ? ' ' + esc(formatTimeOnly(ex.startTime, ctx.lang)) : '') + ' ← ' + esc(formatDateOnly(ex.endDate)) + (ex.endTime ? ' ' + esc(formatTimeOnly(ex.endTime, ctx.lang)) : '') + '</span>' +
                     '<span>·</span>' +
                     '<span class="tabular-nums"><strong>' + Number(ex.extendDays || 0) + '</strong> ' + dayUnit + '</span>' +
                     (vatNote ? '<span>·</span><span class="tabular-nums">' + esc(vatNote) + '</span>' : '') +
@@ -1608,13 +1630,13 @@
                 (r.deliverBranchName && r.deliverBranchName !== r.branchName ? ' (التسليم: ' + esc(r.deliverBranchName) + ')' : '') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">السيارة والفئة واللوحة</span><span class="detail-v">' + esc(r.carName) +
                 (r.carCategory ? '<span class="rg-ui-field-car-meta"> · ' + esc(r.carCategory) + '</span>' : '') + ' (' + esc(r.plateNumber || '-') + ')</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">بداية الحجز</span><span class="detail-v mono tabular-nums">' + esc(formatDateOnly(r.startDate)) +
-                (r.startTime ? ' · ' + esc(r.startTime) : '') + '</span>' +
-                (r.sourceCreatedAt ? '<span class="time-sub">أُنشئ بالمنصة: <span class="mono">' + esc(formatTimestamp(r.sourceCreatedAt)) + '</span></span>' : '') + '</div>' +
-              '<div class="detail-kv"><span class="detail-k">نهاية الحجز الأصلية</span><span class="detail-v mono tabular-nums">' + esc(formatDateOnly(origEndD)) +
-                (origEndT ? ' · ' + esc(origEndT) : '') + ' (' + Number(r.daysCount || 1) + ' يوم أساسي)</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">التمديد لحد (الإرجاع الفعلي)</span><span class="detail-v mono tabular-nums">' +
-                (extUntilD ? (esc(formatDateOnly(extUntilD)) + (extUntilT ? ' · ' + esc(extUntilT) : '')) : 'لا يوجد تمديد') + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">بداية الحجز</span><span class="detail-v mono tabular-nums" dir="ltr">' + esc(formatDateOnly(r.startDate)) +
+                (r.startTime ? ' · ' + esc(formatTimeOnly(r.startTime, ctx.lang)) : '') + '</span>' +
+                (r.sourceCreatedAt ? '<span class="time-sub">أُنشئ بالمنصة: <span class="mono" dir="ltr">' + esc(formatTimestamp(r.sourceCreatedAt, ctx.lang)) + '</span></span>' : '') + '</div>' +
+              '<div class="detail-kv"><span class="detail-k">نهاية الحجز الأصلية</span><span class="detail-v mono tabular-nums" dir="ltr">' + esc(formatDateOnly(origEndD)) +
+                (origEndT ? ' · ' + esc(formatTimeOnly(origEndT, ctx.lang)) : '') + ' (' + Number(r.daysCount || 1) + ' يوم أساسي)</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">التمديد لحد (الإرجاع الفعلي)</span><span class="detail-v mono tabular-nums" dir="ltr">' +
+                (extUntilD ? (esc(formatDateOnly(extUntilD)) + (extUntilT ? ' · ' + esc(formatTimeOnly(extUntilT, ctx.lang)) : '')) : 'لا يوجد تمديد') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">ملخص التمديد</span><span class="detail-v tabular-nums">' +
                 (extCount > 0 ? (extCount + ' مرات · ' + extDays + ' يوم إضافي · ' + Number(r.extensionsAmount || 0) + ' ر.س') : 'غير ممدد') + '</span></div>' +
               '<div class="detail-kv rg-ui-field-car-meta"><span class="detail-k">الاستلام / التسليم</span><span class="detail-v">' + esc(r.pickupTypeAr) + ' / ' + esc(r.returnTypeAr) + '</span></div>' +
@@ -1716,7 +1738,7 @@
                       '</div>' +
                       '<div>' + fmtMentionText(f.action) + '</div>' +
                       (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + fmtMentionText(f.notes) + '</div>' : '') +
-                      '<div class="meta-inline mono"><span>' + esc(formatDateOnly(f.followUpDate)) + '</span><span>·</span><span>' + esc(f.followUpTime) + '</span></div>' +
+                      '<div class="meta-inline mono"><span>' + esc(formatDateOnly(f.followUpDate)) + '</span><span>·</span><span dir="ltr">' + esc(formatTimeOnly(f.followUpTime, ctx.lang)) + '</span></div>' +
                     '</div>';
                   }).join('') + '</div>') +
             '</div>' +
@@ -2075,7 +2097,7 @@
       if (copySummaryBtn) {
         copySummaryBtn.addEventListener('click', function () {
           var summaryText = core.formatBookingSummaryText
-            ? core.formatBookingSummaryText(r, ctx.lang)
+            ? core.formatBookingSummaryText(r, ctx.lang, { timeFormat: activeTimeFormat() })
             : (r.reservationNumber + ' — ' + r.customerName + ' — ' + r.carName);
           copyTextToClipboard(summaryText).then(function () {
             ctx.toast(isEn ? 'Full booking summary copied.' : 'تم نسخ ملخص الحجز الكامل بنجاح.');
@@ -2378,7 +2400,7 @@
           '<div class="modal-header">' +
             '<div>' +
               '<h3 class="modal-title" id="fu-edit-title">تعديل التحديث والمتابعة — <span class="mono">' + esc(reservation.reservationNumber) + '</span></h3>' +
-              '<div class="meta-inline"><span>الموظف: ' + esc(followUp.employeeName) + '</span><span>·</span><span class="mono">' + esc(formatDateOnly(followUp.followUpDate)) + ' ' + esc(followUp.followUpTime) + '</span></div>' +
+              '<div class="meta-inline"><span>الموظف: ' + esc(followUp.employeeName) + '</span><span>·</span><span class="mono" dir="ltr">' + esc(formatDateOnly(followUp.followUpDate)) + ' ' + esc(formatTimeOnly(followUp.followUpTime, ctx.lang)) + '</span></div>' +
             '</div>' +
             '<button type="button" class="btn btn-sm" id="fu-edit-cancel">رجوع</button>' +
           '</div>' +
@@ -2894,7 +2916,7 @@
         extraSections.push({
           title: 'سجل المتابعات (' + details.followUps.length + ')',
           lines: details.followUps.map(function (f) {
-            return formatDateOnly(f.followUpDate) + ' ' + f.followUpTime + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (incNotes && f.notes ? ' — ملاحظة: ' + f.notes : '');
+            return formatDateOnly(f.followUpDate) + ' ' + formatTimeOnly(f.followUpTime, ctx.lang) + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (incNotes && f.notes ? ' — ملاحظة: ' + f.notes : '');
           })
         });
       } else if (incNotes) {

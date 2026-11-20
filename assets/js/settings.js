@@ -31,19 +31,109 @@
     });
   }
 
+  function formatPersonalSummaryLabels(tf, np, lang) {
+    var isEn = lang === 'en';
+    var timeTxt = tf === '12h'
+      ? (isEn ? '12-Hour (AM/PM)' : 'نظام 12 ساعة (ص / م)')
+      : (isEn ? '24-Hour Clock' : 'نظام 24 ساعة');
+    var posTxt = np === 'top'
+      ? (isEn ? 'Top Bar (Icons Only)' : 'في الأعلى (أيقونات فقط)')
+      : (np === 'bottom'
+          ? (isEn ? 'Bottom Dock (Icons Only)' : 'في الأسفل (أيقونات فقط)')
+          : (isEn ? 'Side Bar' : 'على الجانب'));
+    return { timeTxt: timeTxt, posTxt: posTxt };
+  }
+
+  function formatSettingDateTime(val, ctx) {
+    if (!val) return '-';
+    if (ctx && typeof ctx.formatDateTime === 'function') {
+      return ctx.formatDateTime(val) || '-';
+    }
+    if (root.RGCrmCore && root.RGCrmCore.formatDateTimePreference) {
+      var tf = (root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h';
+      return root.RGCrmCore.formatDateTimePreference(val, tf, (ctx && ctx.lang) || 'ar') || '-';
+    }
+    return String(val).replace('T', ' ').substring(0, 16);
+  }
+
+  function buildPersonalAccountCardHtml(user, ctx) {
+    var isEn = ctx && ctx.lang === 'en';
+    var tf = (ctx && ctx.getTimeFormat) ? ctx.getTimeFormat() : ((root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h');
+    var np = (ctx && ctx.getSidebarPosition) ? ctx.getSidebarPosition() : ((root.RGApp && root.RGApp.getSidebarPosition) ? root.RGApp.getSidebarPosition() : 'side');
+    var labels = formatPersonalSummaryLabels(tf, np, ctx && ctx.lang);
+    var userName = (user && user.name) ? user.name : '';
+    return '<div class="surface-card rg-personal-entry-card" id="personal-settings-card">' +
+      '<div class="section-header" style="margin-bottom:12px;">' +
+        '<div>' +
+          '<h2 class="section-title">' + (isEn ? 'Personal Account Settings' : 'الحساب الشخصي وتفضيلات العرض') + '</h2>' +
+          '<p class="section-subtitle">' + (isEn
+            ? ('Control your preferred 12h/24h time format and Top, Side, or Bottom icon navigation bar' + (userName ? (' — ' + escapeHtml(userName)) : '') + '.')
+            : ('تحكم في طريقة عرض الوقت (12 أو 24 ساعة) وموضع شريط الأقسام (على الجانب أو في الأعلى أو في الأسفل كأيقونات بدون كتابة)' + (userName ? (' — ' + escapeHtml(userName)) : '') + '.')) + '</p>' +
+        '</div>' +
+        '<div class="toolbar-row" style="margin-bottom:0;">' +
+          '<button type="button" class="btn btn-primary" id="btn-open-personal-settings">' +
+            '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>' +
+            '<span>' + (isEn ? 'Personal Account Settings' : 'إعدادات الحساب الشخصي') + '</span>' +
+          '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="rg-personal-summary-chips">' +
+        '<div class="rg-personal-chip">' +
+          '<span class="rg-personal-chip-k">' + (isEn ? 'Time Display' : 'نظام عرض الوقت') + '</span>' +
+          '<strong class="rg-personal-chip-v" id="personal-summary-time">' + escapeHtml(labels.timeTxt) + '</strong>' +
+        '</div>' +
+        '<div class="rg-personal-chip">' +
+          '<span class="rg-personal-chip-k">' + (isEn ? 'Navigation Bar' : 'موضع الشريط الجانبي') + '</span>' +
+          '<strong class="rg-personal-chip-v" id="personal-summary-pos">' + escapeHtml(labels.posTxt) + '</strong>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function bindPersonalAccountCard(container, ctx) {
+    var btn = document.getElementById('btn-open-personal-settings');
+    if (btn) {
+      btn.addEventListener('click', function () {
+        if (ctx && typeof ctx.openPersonalAccountSettingsModal === 'function') {
+          ctx.openPersonalAccountSettingsModal();
+        } else if (root.RGApp && typeof root.RGApp.openPersonalAccountSettingsModal === 'function') {
+          root.RGApp.openPersonalAccountSettingsModal();
+        }
+      });
+    }
+    var onPersonalChange = function (ev) {
+      if (!container || !container.isConnected) {
+        document.removeEventListener('rg:personalprefschange', onPersonalChange);
+        return;
+      }
+      var det = (ev && ev.detail) || {};
+      var tf = det.timeFormat || ((ctx && ctx.getTimeFormat) ? ctx.getTimeFormat() : '24h');
+      var np = det.sidebarPosition || ((ctx && ctx.getSidebarPosition) ? ctx.getSidebarPosition() : 'side');
+      var labels = formatPersonalSummaryLabels(tf, np, ctx && ctx.lang);
+      var timeEl = document.getElementById('personal-summary-time');
+      var posEl = document.getElementById('personal-summary-pos');
+      if (timeEl) timeEl.textContent = labels.timeTxt;
+      if (posEl) posEl.textContent = labels.posTxt;
+    };
+    document.addEventListener('rg:personalprefschange', onPersonalChange);
+  }
+
   async function render(container, ctx) {
     var t = ctx.t;
     var user = root.RGAuth.getUser();
     var canAccessApi = root.RGCrmCore.canAccessApi(user);
     var canSync = root.RGCrmCore.canUserPerform(user, 'sync_data');
     var canManageSettings = root.RGCrmCore.canUserPerform(user, 'manage_settings');
+    var personalCardHtml = buildPersonalAccountCardHtml(user, ctx);
 
     if (!canAccessApi && !canManageSettings) {
       container.innerHTML =
+        personalCardHtml +
         '<div class="surface-card">' +
-          '<h2 class="section-title">صلاحية مقيدة</h2>' +
-          '<p class="section-subtitle">إعدادات النظام وربط API والمزامنة مخصصة للمدير العام والمشرف فقط.</p>' +
+          '<h2 class="section-title">إعدادات النظام والربط</h2>' +
+          '<p class="section-subtitle">إعدادات النظام وربط API والمزامنة مخصصة للمدير العام والمشرف فقط، بينما تبقى إعدادات الحساب الشخصي متاحة لك أعلاه.</p>' +
         '</div>';
+      bindPersonalAccountCard(container, ctx);
       return;
     }
 
@@ -134,6 +224,7 @@
     var initialHiddenCount = uiOptionsList.filter(function (opt) { return Boolean(uiSimp[opt.key]); }).length;
 
     container.innerHTML =
+      personalCardHtml +
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div>' +
@@ -273,7 +364,7 @@
           '<div class="detail-summary-grid" style="margin-bottom:16px;">' +
             '<div class="detail-kv"><span class="detail-k">حالة الاتصال</span><span class="detail-v" id="sync-conn-status">' + (isBackendConnected || root.RGApi.isLiveMode() ? (hasRgToken ? 'RG_TOKEN محفوظ ومربوط تلقائيًا' : 'يرجى حفظ RG_TOKEN') : (settings.sandbox_has_rg_token ? 'تم التحقق من صيغة التوكن (وضع المعاينة)' : 'وضع المعاينة المحلية')) + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">جدولة التحديث التلقائي</span><span class="detail-v" id="sync-auto-badge">' + escapeHtml(autoSyncBadgeText) + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono">' + (lastSync ? String(lastSync.finishedAt).replace('T', ' ').substring(0, 19) : 'لم يتم السحب بعد') + '</span></div>' +
+            '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono" dir="ltr">' + (lastSync ? escapeHtml(formatSettingDateTime(lastSync.finishedAt, ctx)) : 'لم يتم السحب بعد') + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">الحجوزات المستوردة / المحدثة / التمديدات</span><span class="detail-v tabular-nums">' + (lastSync ? (lastSync.importedCount + ' مستورد · ' + lastSync.updatedCount + ' محدث · ' + lastSync.extensionsCount + ' تمديد') : '0 / 0 / 0') + '</span></div>' +
           '</div>' +
           '<div style="margin-bottom:16px;padding:12px 14px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
@@ -304,7 +395,7 @@
                     '<td class="tabular-nums">' + l.extensionsCount + '</td>' +
                     '<td class="tabular-nums">' + l.pagesFetched + '</td>' +
                     '<td>' + (l.errorMessage || '-') + '</td>' +
-                    '<td class="mono">' + String(l.finishedAt || '').replace('T', ' ').substring(0, 16) + '</td>' +
+                    '<td class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(l.finishedAt, ctx)) + '</td>' +
                   '</tr>';
                 }).join('') +
               '</tbody></table></div>') +
@@ -427,6 +518,8 @@
           '</div>' +
         '</div>'
       ) : '');
+
+    bindPersonalAccountCard(container, ctx);
 
     bindPasswordToggle('setup-database-url', 'toggle-setup-db-url');
     bindPasswordToggle('setup-rg-token', 'toggle-setup-rg-token');

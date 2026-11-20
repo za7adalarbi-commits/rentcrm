@@ -152,7 +152,7 @@
           var fuCnt = e.followUpsCount !== undefined ? e.followUpsCount : ((e.stats && e.stats.followUpsCount) || 0);
           var prbCnt = e.problemsCount !== undefined ? e.problemsCount : ((e.stats && e.stats.openProblemsCount) || 0);
           var lastActText = e.lastActivity
-            ? esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16)))
+            ? esc((ctx && ctx.formatDateTime ? ctx.formatDateTime(e.lastActivity) : (root.RGApp && root.RGApp.formatDateTime ? root.RGApp.formatDateTime(e.lastActivity) : (root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16)))))
             : '-';
 
           return '<tr data-emp-row="' + esc(e.id) + '">' +
@@ -867,7 +867,7 @@
                     '<div>' + esc(f.action) + '</div>' +
                     (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + esc(f.notes) + '</div>' : '') +
                     '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                      '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc(root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(f.followUpDate) : f.followUpDate) + '</span><span>·</span><span>' + esc(f.followUpTime) + '</span></div>' +
+                      '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc(root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(f.followUpDate) : f.followUpDate) + '</span><span>·</span><span dir="ltr">' + esc(ctx && ctx.formatTime ? ctx.formatTime(f.followUpTime) : (root.RGApp && root.RGApp.formatTime ? root.RGApp.formatTime(f.followUpTime) : f.followUpTime)) + '</span></div>' +
                       '<button type="button" class="btn btn-sm emp-open-res" data-res-id="' + esc(f.reservationId) + '">تفاصيل الحجز</button>' +
                     '</div>' +
                   '</div>';

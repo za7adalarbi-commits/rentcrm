@@ -88,10 +88,18 @@
         resolvedTheme = 'light';
       }
     }
+    var normTimeFmt = (root.RGCrmCore && root.RGCrmCore.normalizeTimeFormat)
+      ? root.RGCrmCore.normalizeTimeFormat(saved.timeFormat)
+      : (saved.timeFormat === '12h' ? '12h' : '24h');
+    var normNavPos = (root.RGCrmCore && root.RGCrmCore.normalizeSidebarPosition)
+      ? root.RGCrmCore.normalizeSidebarPosition(saved.sidebarPosition)
+      : ((saved.sidebarPosition === 'top' || saved.sidebarPosition === 'bottom') ? saved.sidebarPosition : 'side');
     return {
       lang: saved.lang === 'en' ? 'en' : 'ar',
       theme: resolvedTheme,
-      sidebarCollapsed: Boolean(saved.sidebarCollapsed)
+      sidebarCollapsed: Boolean(saved.sidebarCollapsed),
+      timeFormat: normTimeFmt,
+      sidebarPosition: normNavPos
     };
   }
 
@@ -137,7 +145,9 @@
       navOrder: Array.isArray(obj.navOrder) ? obj.navOrder.slice() : [],
       hiddenRoutes: Array.isArray(obj.hiddenRoutes) ? obj.hiddenRoutes.slice() : [],
       dashOrder: Array.isArray(obj.dashOrder) ? obj.dashOrder.slice() : [],
-      dashHidden: Array.isArray(obj.dashHidden) ? obj.dashHidden.slice() : []
+      dashHidden: Array.isArray(obj.dashHidden) ? obj.dashHidden.slice() : [],
+      timeFormat: obj.timeFormat === '12h' ? '12h' : '24h',
+      sidebarPosition: (obj.sidebarPosition === 'top' || obj.sidebarPosition === 'bottom') ? obj.sidebarPosition : 'side'
     };
   }
 
@@ -437,9 +447,58 @@
     });
   }
 
+  function getTimeFormat() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeTimeFormat) {
+      return root.RGCrmCore.normalizeTimeFormat(state.prefs.timeFormat);
+    }
+    return state.prefs.timeFormat === '12h' ? '12h' : '24h';
+  }
+
+  function getSidebarPosition() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeSidebarPosition) {
+      return root.RGCrmCore.normalizeSidebarPosition(state.prefs.sidebarPosition);
+    }
+    return (state.prefs.sidebarPosition === 'top' || state.prefs.sidebarPosition === 'bottom') ? state.prefs.sidebarPosition : 'side';
+  }
+
+  function formatTimePref(val, langOverride) {
+    if (val === null || val === undefined || val === '') return '';
+    var lang = langOverride || state.prefs.lang || 'ar';
+    var tf = getTimeFormat();
+    if (root.RGCrmCore && root.RGCrmCore.formatTimePreference) {
+      return root.RGCrmCore.formatTimePreference(val, tf, lang) || String(val);
+    }
+    return String(val);
+  }
+
+  function formatDateTimePref(val, langOverride) {
+    if (val === null || val === undefined || val === '') return '';
+    var lang = langOverride || state.prefs.lang || 'ar';
+    var tf = getTimeFormat();
+    if (root.RGCrmCore && root.RGCrmCore.formatDateTimePreference) {
+      return root.RGCrmCore.formatDateTimePreference(val, tf, lang) || String(val);
+    }
+    if (root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime) {
+      return root.RGCrmCore.formatDisplayDateTime(val) || String(val);
+    }
+    return String(val).replace('T', ' ').substring(0, 16);
+  }
+
   function hydrateLayoutPrefsFromServer(raw, user) {
     var u = user || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
     var norm = normalizeLayoutPrefsFallback(raw || loadLayoutPrefs(u));
+    if (raw && typeof raw === 'object') {
+      if (raw.timeFormat === '12h' || raw.timeFormat === '24h') {
+        state.prefs.timeFormat = raw.timeFormat;
+      }
+      if (raw.sidebarPosition === 'side' || raw.sidebarPosition === 'top' || raw.sidebarPosition === 'bottom') {
+        state.prefs.sidebarPosition = raw.sidebarPosition;
+      }
+      savePrefs();
+      applyThemeAndLang();
+    }
+    norm.timeFormat = getTimeFormat();
+    norm.sidebarPosition = getSidebarPosition();
     state.layoutPrefs = norm;
     try {
       localStorage.setItem(getLayoutStorageKey(u), JSON.stringify(norm));
@@ -451,7 +510,10 @@
     var o = opts || {};
     var u = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     var cur = getLayoutPrefs(u);
-    var next = normalizeLayoutPrefsFallback(Object.assign({}, cur, patch || {}));
+    var merged = Object.assign({}, cur, patch || {});
+    if (merged.timeFormat === undefined) merged.timeFormat = getTimeFormat();
+    if (merged.sidebarPosition === undefined) merged.sidebarPosition = getSidebarPosition();
+    var next = normalizeLayoutPrefsFallback(merged);
     state.layoutPrefs = next;
     try {
       localStorage.setItem(getLayoutStorageKey(u), JSON.stringify(next));
@@ -469,6 +531,55 @@
     return next;
   }
 
+  async function setPersonalPreferences(patch, opts) {
+    var p = patch && typeof patch === 'object' ? patch : {};
+    var o = opts || {};
+    var prevTime = getTimeFormat();
+    var prevPos = getSidebarPosition();
+
+    if (p.timeFormat !== undefined) {
+      state.prefs.timeFormat = (root.RGCrmCore && root.RGCrmCore.normalizeTimeFormat)
+        ? root.RGCrmCore.normalizeTimeFormat(p.timeFormat)
+        : (p.timeFormat === '12h' ? '12h' : '24h');
+    }
+    if (p.sidebarPosition !== undefined) {
+      state.prefs.sidebarPosition = (root.RGCrmCore && root.RGCrmCore.normalizeSidebarPosition)
+        ? root.RGCrmCore.normalizeSidebarPosition(p.sidebarPosition)
+        : ((p.sidebarPosition === 'top' || p.sidebarPosition === 'bottom') ? p.sidebarPosition : 'side');
+    }
+
+    var nextTime = getTimeFormat();
+    var nextPos = getSidebarPosition();
+
+    savePrefs();
+    applyThemeAndLang();
+
+    if (nextPos !== 'side') {
+      var sb = document.getElementById('app-sidebar');
+      var ov = document.getElementById('sidebar-overlay');
+      if (sb) sb.classList.remove('mobile-open');
+      if (ov) ov.classList.remove('active');
+    }
+    if (prevPos !== nextPos) {
+      closeProfileMenu();
+    }
+
+    try {
+      document.dispatchEvent(new CustomEvent('rg:personalprefschange', {
+        detail: { timeFormat: nextTime, sidebarPosition: nextPos }
+      }));
+    } catch (_evErr) {}
+
+    if (o.reRender !== false && prevTime !== nextTime && root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser()) {
+      await renderRoute();
+    }
+
+    if (o.persist !== false) {
+      await saveLayoutPrefs({ timeFormat: nextTime, sidebarPosition: nextPos }, { reRenderNav: false, persist: true });
+    }
+    return { timeFormat: nextTime, sidebarPosition: nextPos };
+  }
+
   function buildAppCtx() {
     return {
       t: t,
@@ -481,6 +592,14 @@
       applyUiSimplification: applyUiSimplification,
       getLayoutPrefs: getLayoutPrefs,
       saveLayoutPrefs: saveLayoutPrefs,
+      getTimeFormat: getTimeFormat,
+      getSidebarPosition: getSidebarPosition,
+      setPersonalPreferences: setPersonalPreferences,
+      formatTime: formatTimePref,
+      formatDateTime: formatDateTimePref,
+      openPersonalAccountSettingsModal: function (onUpdated) {
+        openPersonalAccountSettingsModal(onUpdated);
+      },
       openScreenOrganizerModal: function () {
         var u = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
         if (u) openScreenOrganizerModal(u);
@@ -667,6 +786,8 @@
     html.setAttribute('lang', state.prefs.lang === 'en' ? 'en' : 'ar');
     html.setAttribute('dir', state.prefs.lang === 'en' ? 'ltr' : 'rtl');
     html.setAttribute('data-theme', state.prefs.theme === 'dark' ? 'dark' : 'light');
+    html.setAttribute('data-nav-pos', getSidebarPosition());
+    html.setAttribute('data-time-format', getTimeFormat());
     if (state.prefs.theme === 'dark') html.classList.add('dark');
     else html.classList.remove('dark');
     applyUiSimplification(state.uiSimplification, true);
@@ -845,7 +966,6 @@
 
     var roleLabels = root.RGCrmCore.ROLE_LABELS[state.prefs.lang] || root.RGCrmCore.ROLE_LABELS.ar;
     var isEn = state.prefs.lang === 'en';
-    var canSettings = Boolean(root.RGCrmCore.canAccessApi(user) || root.RGCrmCore.canUserPerform(user, 'manage_settings'));
 
     var menu = document.createElement('div');
     menu.id = 'rg-profile-menu';
@@ -862,16 +982,18 @@
         '</div>' +
       '</div>' +
       '<div class="rg-profile-menu-items">' +
+        '<button type="button" class="rg-menu-item" role="menuitem" id="profile-personal-settings-btn">' +
+          renderIcon('M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z') +
+          '<span>' + (isEn ? 'Personal Account Settings' : 'إعدادات الحساب الشخصي') + '</span>' +
+        '</button>' +
         '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="my-followups">' +
           renderIcon('M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11') +
           '<span>' + t('nav_my_followups') + '</span>' +
         '</button>' +
-        (canSettings ? (
-          '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="settings">' +
-            renderIcon('M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z') +
-            '<span>' + t('nav_settings') + '</span>' +
-          '</button>'
-        ) : '') +
+        '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="settings">' +
+          renderIcon('M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z') +
+          '<span>' + t('nav_settings') + '</span>' +
+        '</button>' +
         '<button type="button" class="rg-menu-item" role="menuitem" id="profile-theme-btn">' +
           renderIcon(state.prefs.theme === 'dark'
             ? 'M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z'
@@ -896,17 +1018,33 @@
     var rect = trigger.getBoundingClientRect();
     var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
     var vh = window.innerHeight || document.documentElement.clientHeight || 800;
-    var menuW = Math.min(264, vw - 20);
+    var menuW = Math.min(268, vw - 20);
     var isRtl = document.documentElement.getAttribute('dir') !== 'ltr';
     var leftPos = isRtl ? (rect.right - menuW) : rect.left;
     if (leftPos + menuW > vw - 10) leftPos = vw - 10 - menuW;
     if (leftPos < 10) leftPos = 10;
-    var menuH = menu.offsetHeight || 240;
-    var topPos = Math.max(12, Math.min(vh - menuH - 12, rect.top - menuH - 10));
+    var menuH = menu.offsetHeight || 270;
+    var navPos = getSidebarPosition();
+    var openBelow = navPos === 'top' || (rect.top < menuH + 22 && (vh - rect.bottom) >= menuH + 22);
+    var topPos = openBelow
+      ? Math.min(vh - menuH - 12, rect.bottom + 8)
+      : Math.max(12, Math.min(vh - menuH - 12, rect.top - menuH - 10));
 
     menu.style.width = menuW + 'px';
     menu.style.left = Math.round(leftPos) + 'px';
     menu.style.top = Math.round(topPos) + 'px';
+
+    var profPersonalBtn = document.getElementById('profile-personal-settings-btn');
+    if (profPersonalBtn) {
+      profPersonalBtn.addEventListener('click', function () {
+        closeProfileMenu();
+        var sb = document.getElementById('app-sidebar');
+        var ov = document.getElementById('sidebar-overlay');
+        if (sb) sb.classList.remove('mobile-open');
+        if (ov) ov.classList.remove('active');
+        openPersonalAccountSettingsModal();
+      });
+    }
 
     menu.querySelectorAll('[data-profile-route]').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -1011,7 +1149,7 @@
               '</div>' +
               '<span style="font-size:12.5px;color:var(--text-secondary);">' + escNotif(n.message) + '</span>' +
               '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;">' +
-                '<span class="mono" style="font-size:11px;color:var(--text-muted);">' + escNotif(root.RGCrmCore && root.RGCrmCore.formatDisplayDateTime ? root.RGCrmCore.formatDisplayDateTime(n.createdAt) : String(n.createdAt).replace('T', ' ').substring(0, 16)) + '</span>' +
+                '<span class="mono" style="font-size:11px;color:var(--text-muted);">' + escNotif(formatDateTimePref(n.createdAt)) + '</span>' +
                 actionHint +
               '</div>' +
             '</button>';
@@ -1099,7 +1237,7 @@
                   '<td class="mono">' + (l.entityType ? l.entityType + ': ' + l.entityId : '-') + '</td>' +
                   '<td>' + (l.details || '-') + '</td>' +
                   '<td class="mono tabular-nums" style="white-space:nowrap;">' + (root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(l.logDate) : l.logDate) + '</td>' +
-                  '<td class="mono tabular-nums" style="white-space:nowrap;">' + l.logTime + '</td>' +
+                  '<td class="mono tabular-nums" style="white-space:nowrap;">' + (ctx.formatTime ? ctx.formatTime(l.logTime) : l.logTime) + '</td>' +
                 '</tr>';
               }).join('') +
             '</tbody></table></div>') +
@@ -1391,9 +1529,8 @@
         await renderActivityLog(slot, ctx);
         break;
       case 'settings': {
-        if (!curUser || (!root.RGCrmCore.canAccessApi(curUser) && !root.RGCrmCore.canUserPerform(curUser, 'manage_settings'))) {
-          state.route = 'dashboard';
-          await root.RGDashboard.render(slot, ctx, { silent: Boolean(rOpts.silent) });
+        if (!curUser) {
+          renderLoginScreen();
           break;
         }
         await root.RGSettings.render(slot, ctx);
@@ -1462,11 +1599,21 @@
     container.innerHTML = '';
     container.appendChild(slot);
 
-    var skeletonTimer = setTimeout(function () {
+    var isInstantlyReady = false;
+    var primReq = getRoutePrimaryRequest(state.route);
+    if (state.route === 'settings') {
+      isInstantlyReady = !curUser || !root.RGCrmCore.canAccessApi(curUser) || Boolean(primReq && root.RGApi && root.RGApi.hasCached && root.RGApi.hasCached(primReq.action, primReq.payload));
+    } else if (state.route === 'employees') {
+      isInstantlyReady = Boolean(state.employees && state.employees.loaded);
+    } else if (primReq && root.RGApi && root.RGApi.hasCached) {
+      isInstantlyReady = Boolean(root.RGApi.hasCached(primReq.action, primReq.payload));
+    }
+
+    var skeletonTimer = isInstantlyReady ? null : setTimeout(function () {
       if (seq === routeRenderSeq && slot.parentNode === container && slot.childElementCount === 0) {
         slot.innerHTML = buildLoadingSkeletonHtml(routeTitle);
       }
-    }, 30);
+    }, 85);
 
     var ctx = buildAppCtx();
 
@@ -1475,7 +1622,7 @@
     } catch (err) {
       slot.innerHTML = '<div class="form-error">' + ((err && err.message) || 'حدث خطأ أثناء عرض الصفحة.') + '</div>';
     } finally {
-      clearTimeout(skeletonTimer);
+      if (skeletonTimer) clearTimeout(skeletonTimer);
     }
   }
 
@@ -1487,8 +1634,8 @@
     if (item.id === 'employees' && !root.RGCrmCore.canUserPerform(user, 'view_employees') && user.role !== root.RGCrmCore.ROLES.GENERAL_MANAGER) {
       return false;
     }
-    if (item.id === 'settings' && !root.RGCrmCore.canAccessApi(user) && !root.RGCrmCore.canUserPerform(user, 'manage_settings')) {
-      return false;
+    if (item.id === 'settings') {
+      return true;
     }
     return true;
   }
@@ -1515,16 +1662,18 @@
   function buildSidebarNavInnerHtml(user) {
     var ordered = getOrderedNavItemsForUser(user, false);
     var isEn = state.prefs.lang === 'en';
+    var custLabel = isEn ? 'Organize Screens' : 'ترتيب وإخفاء الشاشات';
     return '<div class="nav-group-label">' + (isEn ? 'Screens' : 'الشاشات') + '</div>' +
       ordered.map(function (item) {
-        return '<button type="button" class="nav-item' + (item.id === state.route ? ' active' : '') + '" data-route="' + item.id + '" title="' + t(item.key) + '">' +
+        var lbl = t(item.key);
+        return '<button type="button" class="nav-item' + (item.id === state.route ? ' active' : '') + '" data-route="' + item.id + '" title="' + lbl + '" aria-label="' + lbl + '" data-tooltip="' + lbl + '">' +
           '<span class="nav-icon">' + renderIcon(item.icon) + '</span>' +
-          '<span class="nav-label">' + t(item.key) + '</span>' +
+          '<span class="nav-label">' + lbl + '</span>' +
         '</button>';
       }).join('') +
-      '<button type="button" class="nav-item nav-customize-btn" id="sidebar-customize-screens-btn" title="' + (isEn ? 'Customize Screens' : 'ترتيب وإخفاء الشاشات') + '">' +
+      '<button type="button" class="nav-item nav-customize-btn" id="sidebar-customize-screens-btn" title="' + custLabel + '" aria-label="' + custLabel + '" data-tooltip="' + custLabel + '">' +
         '<span class="nav-icon">' + renderIcon('M4 6h16M4 12h10M4 18h16M19 10v6M16 13h6') + '</span>' +
-        '<span class="nav-label">' + (isEn ? 'Organize Screens' : 'ترتيب وإخفاء الشاشات') + '</span>' +
+        '<span class="nav-label">' + custLabel + '</span>' +
       '</button>';
   }
 
@@ -1532,10 +1681,18 @@
     var overlay = document.getElementById('sidebar-overlay');
     var sidebar = document.getElementById('app-sidebar');
     document.querySelectorAll('.sidebar-nav .nav-item[data-route]').forEach(function (btn) {
+      btn.addEventListener('pointerenter', function () {
+        prefetchRouteData(btn.getAttribute('data-route'));
+      }, { passive: true });
+      btn.addEventListener('focus', function () {
+        prefetchRouteData(btn.getAttribute('data-route'));
+      }, { passive: true });
       btn.addEventListener('click', function () {
-        state.route = btn.getAttribute('data-route');
+        var targetRoute = btn.getAttribute('data-route');
         if (sidebar) sidebar.classList.remove('mobile-open');
         if (overlay) overlay.classList.remove('active');
+        if (state.route === targetRoute) return;
+        state.route = targetRoute;
         renderRoute();
       });
     });
@@ -1555,6 +1712,156 @@
     if (!navEl) return;
     navEl.innerHTML = buildSidebarNavInnerHtml(user);
     bindSidebarNavEvents(user);
+  }
+
+  function openPersonalAccountSettingsModal(onUpdated) {
+    var modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+    var isEn = state.prefs.lang === 'en';
+    var user = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var curTimeFmt = getTimeFormat();
+    var curNavPos = getSidebarPosition();
+
+    function formatLiveSample(fmt) {
+      var now = new Date();
+      var riyadh = new Date(now.getTime() + 3 * 3600000);
+      var hhmm = riyadh.toISOString().substring(11, 16);
+      if (root.RGCrmCore && root.RGCrmCore.formatTimePreference) {
+        return root.RGCrmCore.formatTimePreference(hhmm, fmt, state.prefs.lang);
+      }
+      return hhmm;
+    }
+
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" id="personal-settings-modal" role="dialog" aria-modal="true" aria-labelledby="personal-settings-title">' +
+        '<div class="modal-panel rg-personal-modal" style="max-width:600px;">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h3 class="modal-title" id="personal-settings-title">' + (isEn ? 'Personal Account Settings' : 'إعدادات الحساب الشخصي') + '</h3>' +
+              '<p class="section-subtitle">' + (isEn
+                ? ('Customize how time and navigation appear for your account' + (user && user.name ? (' (' + user.name + ')') : '') + '. Applies instantly.')
+                : ('خصص طريقة عرض الوقت وموضع شريط التنقل لحسابك' + (user && user.name ? (' (' + user.name + ')') : '') + ' مع تطبيق فوري.')) + '</p>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="personal-settings-close" data-modal-close aria-label="' + (isEn ? 'Close' : 'إغلاق') + '">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
+          '</div>' +
+
+          '<div class="rg-personal-section">' +
+            '<div class="rg-personal-sec-head">' +
+              '<div>' +
+                '<div class="rg-personal-sec-title">' + (isEn ? 'Time Display Format' : 'طريقة عرض الوقت') + '</div>' +
+                '<div class="rg-personal-sec-sub">' + (isEn ? 'Applied across bookings, follow-ups, radar, activity logs, and reports.' : 'يُطبق فوراً على الحجوزات والمتابعات والرادار وسجل النشاطات والتقارير.') + '</div>' +
+              '</div>' +
+              '<span class="status-tag status-info mono tabular-nums" id="personal-time-preview" dir="ltr">' + formatLiveSample(curTimeFmt) + '</span>' +
+            '</div>' +
+            '<div class="rg-choice-grid rg-choice-grid-2" role="radiogroup" aria-label="' + (isEn ? 'Time Display Format' : 'طريقة عرض الوقت') + '">' +
+              '<button type="button" class="rg-choice-card' + (curTimeFmt === '12h' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTimeFmt === '12h' ? 'true' : 'false') + '" data-time-choice="12h">' +
+                '<div class="rg-choice-card-top">' +
+                  '<span class="rg-choice-title">' + (isEn ? '12-Hour Format' : 'نظام 12 ساعة') + '</span>' +
+                  '<span class="rg-choice-badge mono tabular-nums">2:35 ' + (isEn ? 'PM' : 'م') + '</span>' +
+                '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Displays AM / PM (e.g. 9:15 AM · 11:40 PM)' : 'يعرض التوقيت بصيغة صباحاً / مساءً (ص / م)') + '</div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curTimeFmt === '24h' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTimeFmt === '24h' ? 'true' : 'false') + '" data-time-choice="24h">' +
+                '<div class="rg-choice-card-top">' +
+                  '<span class="rg-choice-title">' + (isEn ? '24-Hour Format' : 'نظام 24 ساعة') + '</span>' +
+                  '<span class="rg-choice-badge mono tabular-nums">14:35</span>' +
+                '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Standard 24h clock (00:00 – 23:59)' : 'يعرض التوقيت بنظام 24 ساعة القياسي (00:00 – 23:59)') + '</div>' +
+              '</button>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="rg-personal-section">' +
+            '<div class="rg-personal-sec-head">' +
+              '<div>' +
+                '<div class="rg-personal-sec-title">' + (isEn ? 'Navigation Bar Position' : 'موضع شريط التنقل (السيد بار)') + '</div>' +
+                '<div class="rg-personal-sec-sub">' + (isEn ? 'Top and Bottom modes display clean section icons without text labels.' : 'في وضعي الأعلى والأسفل يظهر الشريط كأيقونات فقط للانتقال السريع بين الأقسام بدون كتابة.') + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="rg-choice-grid rg-choice-grid-3" role="radiogroup" aria-label="' + (isEn ? 'Navigation Bar Position' : 'موضع شريط التنقل') + '">' +
+              '<button type="button" class="rg-choice-card' + (curNavPos === 'side' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curNavPos === 'side' ? 'true' : 'false') + '" data-pos-choice="side">' +
+                '<div class="rg-pos-wireframe is-side" aria-hidden="true"><span class="wf-bar"></span><span class="wf-body"></span></div>' +
+                '<div class="rg-choice-title">' + (isEn ? 'Side Bar' : 'على الجانب') + '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Full sidebar with labels' : 'قائمة جانبية بالأيقونات والأسماء') + '</div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curNavPos === 'top' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curNavPos === 'top' ? 'true' : 'false') + '" data-pos-choice="top">' +
+                '<div class="rg-pos-wireframe is-top" aria-hidden="true"><span class="wf-bar"><i></i><i></i><i></i><i></i></span><span class="wf-body"></span></div>' +
+                '<div class="rg-choice-title">' + (isEn ? 'Top (Icons)' : 'في الأعلى') + '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Icon-only top bar' : 'شريط علوي أيقونات بدون كتابة') + '</div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curNavPos === 'bottom' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curNavPos === 'bottom' ? 'true' : 'false') + '" data-pos-choice="bottom">' +
+                '<div class="rg-pos-wireframe is-bottom" aria-hidden="true"><span class="wf-body"></span><span class="wf-bar"><i></i><i></i><i></i><i></i></span></div>' +
+                '<div class="rg-choice-title">' + (isEn ? 'Bottom (Icons)' : 'في الأسفل') + '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Icon-only bottom dock' : 'شريط سفلي أيقونات بدون كتابة') + '</div>' +
+              '</button>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="modal-footer" style="justify-content:space-between;">' +
+            '<button type="button" class="btn btn-sm" id="personal-settings-reset">' + (isEn ? 'Reset Defaults' : 'استعادة الافتراضي') + '</button>' +
+            '<div style="display:flex;gap:8px;">' +
+              '<button type="button" class="btn btn-primary" id="personal-settings-done">' + (isEn ? 'Save & Done' : 'حفظ وإغلاق') + '</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    var previewEl = document.getElementById('personal-time-preview');
+    function syncModalSelections() {
+      var tf = getTimeFormat();
+      var np = getSidebarPosition();
+      if (previewEl) previewEl.textContent = formatLiveSample(tf);
+      modalRoot.querySelectorAll('[data-time-choice]').forEach(function (btn) {
+        var active = btn.getAttribute('data-time-choice') === tf;
+        btn.classList.toggle('is-selected', active);
+        btn.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
+      modalRoot.querySelectorAll('[data-pos-choice]').forEach(function (btn) {
+        var active = btn.getAttribute('data-pos-choice') === np;
+        btn.classList.toggle('is-selected', active);
+        btn.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
+    }
+
+    var pendingSavePromise = null;
+    function applyInstantPref(patch) {
+      pendingSavePromise = setPersonalPreferences(patch, { reRender: true, persist: true }).then(function () {
+        if (typeof onUpdated === 'function') onUpdated({ timeFormat: getTimeFormat(), sidebarPosition: getSidebarPosition() });
+      });
+      syncModalSelections();
+    }
+
+    modalRoot.querySelectorAll('[data-time-choice]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        applyInstantPref({ timeFormat: btn.getAttribute('data-time-choice') });
+      });
+    });
+
+    modalRoot.querySelectorAll('[data-pos-choice]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        applyInstantPref({ sidebarPosition: btn.getAttribute('data-pos-choice') });
+      });
+    });
+
+    var resetBtn = document.getElementById('personal-settings-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', function () {
+        applyInstantPref({ timeFormat: '24h', sidebarPosition: 'side' });
+        toast(isEn ? 'Personal preferences reset to defaults.' : 'تمت استعادة الإعدادات الشخصية للافتراضي.');
+      });
+    }
+
+    function closeAndAcknowledge() {
+      Promise.resolve(pendingSavePromise).finally(function () {
+        modalRoot.innerHTML = '';
+        toast(isEn ? 'Personal account preferences saved.' : 'تم حفظ إعدادات الحساب الشخصي.');
+      });
+    }
+
+    var closeBtn = document.getElementById('personal-settings-close');
+    var doneBtn = document.getElementById('personal-settings-done');
+    if (closeBtn) closeBtn.addEventListener('click', function () { modalRoot.innerHTML = ''; });
+    if (doneBtn) doneBtn.addEventListener('click', closeAndAcknowledge);
   }
 
   function openScreenOrganizerModal(user) {
@@ -2165,6 +2472,12 @@
     applyUiSimplification: applyUiSimplification,
     getLayoutPrefs: getLayoutPrefs,
     saveLayoutPrefs: saveLayoutPrefs,
+    getTimeFormat: getTimeFormat,
+    getSidebarPosition: getSidebarPosition,
+    setPersonalPreferences: setPersonalPreferences,
+    formatTime: formatTimePref,
+    formatDateTime: formatDateTimePref,
+    openPersonalAccountSettingsModal: openPersonalAccountSettingsModal,
     openScreenOrganizerModal: openScreenOrganizerModal,
     getEmployeesState: getEmployeesState,
     setEmployeesState: setEmployeesState,

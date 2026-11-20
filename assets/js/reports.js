@@ -181,7 +181,8 @@
         rows.forEach(function (r) {
           aoa.push(headers.map(function (h) {
             if (core && core.formatReportCellValue) {
-              return core.formatReportCellValue(h, r, 'ar', { keepNumber: true, emptyFallback: '' });
+              var xlTf = (root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h';
+              return core.formatReportCellValue(h, r, 'ar', { keepNumber: true, emptyFallback: '', timeFormat: xlTf });
             }
             var v = typeof h.value === 'function' ? h.value(r) : r[h.key];
             if (Array.isArray(v)) return v.join('، ');
@@ -431,9 +432,12 @@
     var logoImg = await loadLogoImage(plan.downsampleLogoPx || 96);
     throwIfAborted(signal);
 
-    var nowFormatted = (core && core.formatDisplayDateTime)
-      ? core.formatDisplayDateTime(new Date().toISOString())
-      : new Date().toISOString().substring(0, 16).replace('T', ' ');
+    var activePdfTf = options.timeFormat || ((root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h');
+    var nowFormatted = (core && core.formatDateTimePreference)
+      ? core.formatDateTimePreference(new Date().toISOString(), activePdfTf, lang)
+      : ((core && core.formatDisplayDateTime)
+          ? core.formatDisplayDateTime(new Date().toISOString())
+          : new Date().toISOString().substring(0, 16).replace('T', ' '));
     var metaText = (isRtl ? 'التاريخ: ' : 'Date: ') + nowFormatted + (exporterName ? (isRtl ? '  |  المصدر: ' : '  |  By: ') + exporterName : '');
 
     var pages = [];
@@ -704,7 +708,7 @@
           page.ctx.font = bodyFont;
           var cellLines = columns.map(function (col, cIdx) {
             var formatted = (core && core.formatReportCellValue)
-              ? core.formatReportCellValue(col, row, lang)
+              ? core.formatReportCellValue(col, row, lang, { timeFormat: activePdfTf })
               : (function () {
                   var v = typeof col.value === 'function' ? col.value(row) : row[col.key];
                   if (Array.isArray(v)) return v.join('، ') || '-';
@@ -1133,10 +1137,11 @@
         '</tr></thead><tbody>' +
           state.rows.slice(0, 50).map(function (row) {
             return '<tr>' + cols.map(function (c) {
+              var prevTf = (ctx && ctx.getTimeFormat) ? ctx.getTimeFormat() : ((root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h');
               var formatted = (core && core.formatReportCellValue)
-                ? core.formatReportCellValue(c, row, ctx.lang)
+                ? core.formatReportCellValue(c, row, ctx.lang, { timeFormat: prevTf })
                 : String(row[c.key] !== undefined && row[c.key] !== null ? row[c.key] : '-');
-              var isMono = c.formatType === 'date' || c.formatType === 'datetime' || c.formatType === 'ltr';
+              var isMono = c.formatType === 'date' || c.formatType === 'datetime' || c.formatType === 'time' || c.formatType === 'ltr';
               var cls = isMono ? 'mono tabular-nums' : 'tabular-nums';
               var st = isMono ? ' style="white-space:nowrap;"' : '';
               return '<td class="' + cls + '"' + st + '>' + formatted + '</td>';
@@ -1373,7 +1378,10 @@
           : ((resR && resR.success && resR.data && Array.isArray(resR.data.items)) ? resR.data.items : []);
         var prbItems = (prbR && prbR.success && prbR.data && Array.isArray(prbR.data.items)) ? prbR.data.items : [];
         if (hmHost && root.RGDashboard && root.RGDashboard.renderPeakHoursHeatmap) {
-          root.RGDashboard.renderPeakHoursHeatmap(hmHost, resItems, prbItems, { lang: ctx.lang });
+          root.RGDashboard.renderPeakHoursHeatmap(hmHost, resItems, prbItems, {
+            lang: ctx.lang,
+            timeFormat: ctx.getTimeFormat ? ctx.getTimeFormat() : undefined
+          });
         }
         renderProblemRatesSection(resItems, prbItems);
       } catch (_e) {}

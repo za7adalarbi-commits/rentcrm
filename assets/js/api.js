@@ -348,6 +348,45 @@
     }
   }
 
+  function syncSandboxReservationToIdb(ns, targetResId, targetResNum) {
+    if (getTransportUrl()) return;
+    try {
+      var db = loadSandboxDb();
+      if (!db || !Array.isArray(db.reservations)) return;
+      var targetId = String(targetResId || '').trim();
+      var targetNum = String(targetResNum || '').trim();
+      var resObj = db.reservations.find(function (r) {
+        return (targetId && r.id === targetId) || (targetNum && r.reservationNumber === targetNum);
+      });
+      if (!resObj) return;
+      var rid = resObj.id;
+      var rnum = resObj.reservationNumber;
+      var followUps = (db.followUps || []).filter(function (f) { return f && f.reservationId === rid; })
+        .sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
+      var enriched = Object.assign({}, resObj, { isFollowed: followUps.length > 0 });
+      var relExts = (db.extensions || []).filter(function (e) {
+        return e.reservationId === rid || (rnum && e.reservationNumber === rnum) || (resObj.sourceReservationId && String(e.sourceReservationId) === String(resObj.sourceReservationId));
+      }).sort(function (a, b) {
+        var sa = Number(a.sequenceNumber || 0);
+        var sb = Number(b.sequenceNumber || 0);
+        if (sa !== sb && sa > 0 && sb > 0) return sa - sb;
+        return String(a.startDate || '').localeCompare(String(b.startDate || ''));
+      });
+      var det = {
+        reservation: enriched,
+        extensions: relExts,
+        assignments: (db.assignments || []).filter(function (a) { return a.reservationId === rid && a.status === 'active'; }),
+        followUps: followUps,
+        followUpHistory: (db.followUpHistory || []).filter(function (h) { return h.reservationId === rid; })
+          .sort(function (a, b) { return String(b.changedAt).localeCompare(String(a.changedAt)); }),
+        problems: (db.problems || []).filter(function (p) { return p.reservationId === rid; }),
+        problemUpdates: (db.problemUpdates || []).filter(function (u) { return rnum && u.reservationNumber === rnum; }),
+        cachedAt: Date.now()
+      };
+      setLocalDetailState(ns, det);
+    } catch (e) {}
+  }
+
   function syncSandboxSnapshotToIdb(ns) {
     if (getTransportUrl()) return;
     try {
@@ -367,10 +406,55 @@
         lastSyncAt: (db.syncLog && db.syncLog[0] && db.syncLog[0].finishedAt) || new Date().toISOString()
       });
       if (!localDetailsByNs[ns]) localDetailsByNs[ns] = {};
+      var extsByRes = {};
+      var extsByNum = {};
+      (db.extensions || []).forEach(function (e) {
+        if (e.reservationId) {
+          if (!extsByRes[e.reservationId]) extsByRes[e.reservationId] = [];
+          extsByRes[e.reservationId].push(e);
+        }
+        if (e.reservationNumber) {
+          if (!extsByNum[e.reservationNumber]) extsByNum[e.reservationNumber] = [];
+          extsByNum[e.reservationNumber].push(e);
+        }
+      });
+      var assignByRes = {};
+      (db.assignments || []).forEach(function (a) {
+        if (a && a.status === 'active' && a.reservationId) {
+          if (!assignByRes[a.reservationId]) assignByRes[a.reservationId] = [];
+          assignByRes[a.reservationId].push(a);
+        }
+      });
+      var fuByRes = {};
+      (db.followUps || []).forEach(function (f) {
+        if (f && f.reservationId) {
+          if (!fuByRes[f.reservationId]) fuByRes[f.reservationId] = [];
+          fuByRes[f.reservationId].push(f);
+        }
+      });
+      var fuhByRes = {};
+      (db.followUpHistory || []).forEach(function (h) {
+        if (h && h.reservationId) {
+          if (!fuhByRes[h.reservationId]) fuhByRes[h.reservationId] = [];
+          fuhByRes[h.reservationId].push(h);
+        }
+      });
+      var prbByRes = {};
+      (db.problems || []).forEach(function (p) {
+        if (p && p.reservationId) {
+          if (!prbByRes[p.reservationId]) prbByRes[p.reservationId] = [];
+          prbByRes[p.reservationId].push(p);
+        }
+      });
+      var prbuByNum = {};
+      (db.problemUpdates || []).forEach(function (u) {
+        if (u && u.reservationNumber) {
+          if (!prbuByNum[u.reservationNumber]) prbuByNum[u.reservationNumber] = [];
+          prbuByNum[u.reservationNumber].push(u);
+        }
+      });
       enrichedList.forEach(function (r) {
-        var relExts = (db.extensions || []).filter(function (e) {
-          return e.reservationId === r.id || e.reservationNumber === r.reservationNumber || (r.sourceReservationId && String(e.sourceReservationId) === String(r.sourceReservationId));
-        }).sort(function (a, b) {
+        var relExts = (extsByRes[r.id] || extsByNum[r.reservationNumber] || []).slice().sort(function (a, b) {
           var sa = Number(a.sequenceNumber || 0);
           var sb = Number(b.sequenceNumber || 0);
           if (sa !== sb && sa > 0 && sb > 0) return sa - sb;
@@ -379,11 +463,11 @@
         var det = {
           reservation: r,
           extensions: relExts,
-          assignments: (db.assignments || []).filter(function (a) { return a.reservationId === r.id && a.status === 'active'; }),
-          followUps: (db.followUps || []).filter(function (f) { return f.reservationId === r.id; }).sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); }),
-          followUpHistory: (db.followUpHistory || []).filter(function (h) { return h.reservationId === r.id; }).sort(function (a, b) { return String(b.changedAt).localeCompare(String(a.changedAt)); }),
-          problems: (db.problems || []).filter(function (p) { return p.reservationId === r.id; }),
-          problemUpdates: (db.problemUpdates || []).filter(function (u) { return u.reservationNumber === r.reservationNumber; }),
+          assignments: assignByRes[r.id] || [],
+          followUps: (fuByRes[r.id] || []).slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); }),
+          followUpHistory: (fuhByRes[r.id] || []).slice().sort(function (a, b) { return String(b.changedAt).localeCompare(String(a.changedAt)); }),
+          problems: prbByRes[r.id] || [],
+          problemUpdates: prbuByNum[r.reservationNumber] || [],
           cachedAt: Date.now()
         };
         localDetailsByNs[ns][r.id] = det;
@@ -4831,7 +4915,17 @@
         } else if (action === 'deleteAllReservations' || action === 'importReservationsFromExcel') {
           clearCache(['*']);
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
-        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem' || action === 'deleteEmployee' || action === 'createEmployee' || action === 'updateEmployee' || action === 'disableEmployee')) {
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
+          var dObj = (parsed && parsed.data) || {};
+          var pObj = payload || {};
+          var tResId = dObj.reservationId || (dObj.reservation && dObj.reservation.id) || pObj.reservationId || '';
+          var tResNum = dObj.reservationNumber || (dObj.reservation && dObj.reservation.reservationNumber) || pObj.reservationNumber || '';
+          if (tResId || tResNum) {
+            syncSandboxReservationToIdb(ns, tResId, tResNum);
+          } else {
+            syncSandboxSnapshotToIdb(ns);
+          }
+        } else if (!transportUrl && action === 'deleteEmployee') {
           syncSandboxSnapshotToIdb(ns);
         }
 

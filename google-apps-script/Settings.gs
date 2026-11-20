@@ -192,11 +192,17 @@ function normalizeUserLayoutPrefs_(raw) {
     dashHidden.push(did);
   }
 
+  var timeFormat = normalizeStr(obj.timeFormat).toLowerCase() === '12h' ? '12h' : '24h';
+  var rawPos = normalizeStr(obj.sidebarPosition).toLowerCase();
+  var sidebarPosition = (rawPos === 'top' || rawPos === 'bottom') ? rawPos : 'side';
+
   return {
     navOrder: navOrder,
     hiddenRoutes: hiddenRoutes,
     dashOrder: dashOrder,
-    dashHidden: dashHidden
+    dashHidden: dashHidden,
+    timeFormat: timeFormat,
+    sidebarPosition: sidebarPosition
   };
 }
 

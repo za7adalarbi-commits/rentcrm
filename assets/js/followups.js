@@ -19,6 +19,17 @@
     return esc(text);
   }
 
+  function fmtTime(val, ctx) {
+    if (!val) return '';
+    if (ctx && typeof ctx.formatTime === 'function') return ctx.formatTime(val);
+    if (root.RGApp && typeof root.RGApp.formatTime === 'function') return root.RGApp.formatTime(val);
+    if (root.RGCrmCore && root.RGCrmCore.formatTimePreference) {
+      var tf = (root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h';
+      return root.RGCrmCore.formatTimePreference(val, tf, (ctx && ctx.lang) || 'ar');
+    }
+    return String(val);
+  }
+
   function statusClass(status) {
     if (['مؤكد', 'مقبول', 'تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم التسليم من قبل السائق', 'تم الإرجاع', 'مدفوع', 'مدفوع عن طريق المحفظة', 'مدفوع بالمحفظة', 'معتمد إداريًا'].indexOf(status) !== -1) return 'status-success';
     if (['نشط الآن', 'قيد الانتظار', 'في الطريق', 'جديد', 'تم التمديد', 'تم التمديد تلقائيًا', 'تم تغيير الموقع', 'تم الإنشاء', 'ناشط', 'نشط', 'بدأ التنفيذ', 'قيد التنفيذ', 'جاهز للاستلام'].indexOf(status) !== -1) return 'status-info';
@@ -190,7 +201,7 @@
           '<div>' + fmtMention(f.action, employees) + '</div>' +
           (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + fmtMention(f.notes, employees) + '</div>' : '') +
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
-            '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc((core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + '</span><span>·</span><span>' + esc(f.followUpTime || '') + '</span></div>' +
+            '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc((core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + '</span><span>·</span><span dir="ltr">' + esc(fmtTime(f.followUpTime, ctx)) + '</span></div>' +
             '<button type="button" class="btn btn-sm btn-primary myfu-open" data-id="' + esc(f.reservationId) + '">' + (isEn ? 'Open Booking' : 'فتح الحجز') + '</button>' +
           '</div>' +
         '</div>';
@@ -226,7 +237,7 @@
                   '<div>' + fmtMention(f.action, employees) + '</div>' +
                   (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + fmtMention(f.notes, employees) + '</div>' : '') +
                   '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                    '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc((core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + '</span><span>·</span><span>' + esc(f.followUpTime) + '</span></div>' +
+                    '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc((core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + '</span><span>·</span><span dir="ltr">' + esc(fmtTime(f.followUpTime, ctx)) + '</span></div>' +
                     '<button type="button" class="btn btn-sm myfu-open" data-id="' + esc(f.reservationId) + '">تفاصيل الحجز</button>' +
                   '</div>' +
                 '</div>';
@@ -452,7 +463,7 @@
                   '<td><span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span></td>' +
                   '<td><div class="cell-clamp-2" title="' + esc(f.action || '') + '">' + fmtMention(f.action, employees) + '</div></td>' +
                   '<td><div class="cell-clamp-2" title="' + esc(f.notes || '') + '">' + (f.notes ? fmtMention(f.notes, employees) : '-') + '</div></td>' +
-                  '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + ' ' + esc(f.followUpTime) + '</td>' +
+                  '<td class="mono tabular-nums" dir="ltr" style="white-space:nowrap;">' + esc((root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + (f.followUpTime ? ' ' + esc(fmtTime(f.followUpTime, ctx)) : '') + '</td>' +
                   '<td class="table-actions-cell"><button type="button" class="btn btn-sm btn-primary tfu-open-res" data-res-id="' + esc(f.reservationId) + '">التفاصيل</button></td>' +
                 '</tr>';
               }).join('') +

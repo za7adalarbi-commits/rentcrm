@@ -18,6 +18,33 @@
       .replace(/"/g, '&quot;');
   }
 
+  function resolveTimeFormat(explicitTf) {
+    if (explicitTf === '12h' || explicitTf === '24h') return explicitTf;
+    if (root.RGApp && typeof root.RGApp.getTimeFormat === 'function') {
+      return root.RGApp.getTimeFormat();
+    }
+    return (typeof document !== 'undefined' && document.documentElement && document.documentElement.getAttribute('data-time-format') === '12h')
+      ? '12h'
+      : '24h';
+  }
+
+  function fmtTime(val, lang, timeFormat) {
+    var tf = resolveTimeFormat(timeFormat);
+    var core = root.RGCrmCore;
+    if (core && typeof core.formatTimePreference === 'function') {
+      return core.formatTimePreference(val, tf, lang === 'en' ? 'en' : 'ar');
+    }
+    var s = String(val || '').trim();
+    return s.length >= 5 ? s.substring(0, 5) : s;
+  }
+
+  function fmtCompactHeatmapHour(h, isEn, timeFormat) {
+    var tf = resolveTimeFormat(timeFormat);
+    if (tf !== '12h') return (h < 10 ? '0' : '') + h;
+    var h12 = h % 12 === 0 ? 12 : (h % 12);
+    return String(h12) + (isEn ? (h < 12 ? 'a' : 'p') : (h < 12 ? 'ص' : 'م'));
+  }
+
   function prefersReducedMotion() {
     try {
       return Boolean(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -822,7 +849,7 @@
     }
   }
 
-  function renderLiveActivityFeed(wrap, items, lang) {
+  function renderLiveActivityFeed(wrap, items, lang, timeFormat) {
     if (!wrap) return;
     if (!Array.isArray(items) || items.length === 0) {
       wrap.innerHTML = '<div class="empty-state" style="padding:20px;">' + (lang === 'en' ? 'No recent activity recorded yet.' : 'لا توجد نشاطات مسجلة حتى الآن.') + '</div>';
@@ -835,8 +862,9 @@
           ? 'is-danger'
           : (actionLower.indexOf('sync') !== -1 || actionLower.indexOf('follow') !== -1 ? 'is-crimson' : 'is-info');
         var badgeChar = String(l.userName || 'S').trim().charAt(0) || 'S';
+        var fmtLogTime = l.logTime ? fmtTime(l.logTime, lang, timeFormat) : '';
         var timeLabel = (root.RGCrmCore && root.RGCrmCore.formatDisplayDate ? root.RGCrmCore.formatDisplayDate(l.logDate) : (l.logDate || '')) +
-          (l.logTime ? ' · ' + String(l.logTime).substring(0, 5) : '');
+          (fmtLogTime ? ' · ' + fmtLogTime : '');
 
         return '<div class="dash-feed-row">' +
           '<div style="display:flex;align-items:flex-start;gap:10px;min-width:0;">' +
@@ -949,31 +977,39 @@
       return;
     }
 
+    var tf = resolveTimeFormat(options.timeFormat);
     var busiestLbl = data.busiestDay
       ? ((isEn ? data.busiestDay.labelEn : data.busiestDay.labelAr) + ' (' + data.busiestDay.total + ')')
       : '-';
+    var peakSlotHourStr = (data.peakSlot && data.peakSlot.hourLabel)
+      ? fmtTime(data.peakSlot.hourLabel, options.lang, tf)
+      : '';
     var peakSlotLbl = (data.peakSlot && data.peakSlot.count > 0)
-      ? ((isEn ? data.peakSlot.labelEn : data.peakSlot.labelAr) + ' · ' + data.peakSlot.hourLabel + ' (' + data.peakSlot.count + ')')
+      ? ((isEn ? data.peakSlot.labelEn : data.peakSlot.labelAr) + ' · ' + peakSlotHourStr + ' (' + data.peakSlot.count + ')')
       : '-';
+    var peakHourDisplay = fmtTime(data.peakHourLabel, options.lang, tf);
 
     var hoursHeader = '';
     for (var h = 0; h < 24; h++) {
       var hh = (h < 10 ? '0' : '') + h;
-      hoursHeader += '<th class="mono tabular-nums" title="' + hh + ':00">' + hh + '</th>';
+      var hourFullLbl = fmtTime(hh + ':00', options.lang, tf);
+      var hourShortLbl = fmtCompactHeatmapHour(h, isEn, tf);
+      hoursHeader += '<th class="mono tabular-nums" title="' + esc(hourFullLbl) + '">' + esc(hourShortLbl) + '</th>';
     }
 
     var rowsHtml = (data.days || []).map(function (dayRow) {
       var dayLabel = isEn ? dayRow.labelEn : dayRow.labelAr;
       var cells = (dayRow.hours || []).map(function (cell) {
         var lvl = cell.intensity || 0;
-        var titleStr = dayLabel + ' ' + cell.hourLabel + ' — ' +
+        var cellHourStr = fmtTime(cell.hourLabel, options.lang, tf);
+        var titleStr = dayLabel + ' ' + cellHourStr + ' — ' +
           (isEn
             ? ('Total: ' + cell.count + ' (Bookings: ' + cell.reservations + ', Problems: ' + cell.problems + ')')
             : ('الإجمالي: ' + cell.count + ' (حجوزات: ' + cell.reservations + '، مشكلات: ' + cell.problems + ')'));
         return '<td>' +
           '<button type="button" class="rg-heatmap-cell lvl-' + lvl + ' tabular-nums"' +
             ' data-hm-day="' + esc(dayLabel) + '"' +
-            ' data-hm-hour="' + esc(cell.hourLabel) + '"' +
+            ' data-hm-hour="' + esc(cellHourStr) + '"' +
             ' data-hm-count="' + cell.count + '"' +
             ' data-hm-res="' + cell.reservations + '"' +
             ' data-hm-prb="' + cell.problems + '"' +
@@ -993,7 +1029,7 @@
       '<div class="rg-heatmap-top">' +
         '<div class="rg-heatmap-kpis">' +
           '<div class="rg-heatmap-kpi"><span>' + (isEn ? 'Busiest Day' : 'اليوم الأكثر ازدحاماً') + '</span><strong class="tabular-nums">' + esc(busiestLbl) + '</strong></div>' +
-          '<div class="rg-heatmap-kpi"><span>' + (isEn ? 'Peak Hour' : 'ساعة الذروة') + '</span><strong class="mono tabular-nums">' + esc(data.peakHourLabel) + ' (' + data.peakHourTotal + ')</strong></div>' +
+          '<div class="rg-heatmap-kpi"><span>' + (isEn ? 'Peak Hour' : 'ساعة الذروة') + '</span><strong class="mono tabular-nums">' + esc(peakHourDisplay) + ' (' + data.peakHourTotal + ')</strong></div>' +
           '<div class="rg-heatmap-kpi"><span>' + (isEn ? 'Hottest Shift Slot' : 'ذروة الضغط للوردية') + '</span><strong class="tabular-nums">' + esc(peakSlotLbl) + '</strong></div>' +
           '<div class="rg-heatmap-kpi"><span>' + (isEn ? 'Total Events' : 'إجمالي الأحداث') + '</span><strong class="tabular-nums">' + data.totalEvents + '</strong></div>' +
         '</div>' +
@@ -1021,8 +1057,8 @@
       '<div class="rg-heatmap-detail" data-hm-detail>' +
         (data.peakSlot && data.peakSlot.count > 0
           ? (isEn
-              ? ('Peak insight: ' + data.peakSlot.labelEn + ' at ' + data.peakSlot.hourLabel + ' — ' + data.peakSlot.reservations + ' bookings & ' + data.peakSlot.problems + ' problems. Hover or tap any cell to inspect.')
-              : ('مؤشر الذروة: ' + data.peakSlot.labelAr + ' الساعة ' + data.peakSlot.hourLabel + ' — ' + data.peakSlot.reservations + ' حجز و ' + data.peakSlot.problems + ' مشكلة. مرّر المؤشر أو اضغط على أي ساعة للتفاصيل.'))
+              ? ('Peak insight: ' + data.peakSlot.labelEn + ' at ' + peakSlotHourStr + ' — ' + data.peakSlot.reservations + ' bookings & ' + data.peakSlot.problems + ' problems. Hover or tap any cell to inspect.')
+              : ('مؤشر الذروة: ' + data.peakSlot.labelAr + ' الساعة ' + peakSlotHourStr + ' — ' + data.peakSlot.reservations + ' حجز و ' + data.peakSlot.problems + ' مشكلة. مرّر المؤشر أو اضغط على أي ساعة للتفاصيل.'))
           : (isEn ? 'No timed events recorded yet.' : 'لا توجد أحداث مسجلة بعد لعرض التفاصيل.')) +
       '</div>';
 
@@ -1163,7 +1199,7 @@
                 '<strong class="mono" dir="ltr" style="font-size:12px;color:var(--text-primary);white-space:nowrap;flex-shrink:0;">' + esc(r.reservationNumber || r.id) + '</strong>' +
                 '<span style="font-size:12.5px;font-weight:600;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.customerName || '-') + '</span>' +
               '</div>' +
-              '<div style="font-size:11.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.carName || '-') + (entry.effectiveEndTime ? ' · ' + esc(entry.effectiveEndTime) : '') + '</div>' +
+              '<div style="font-size:11.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.carName || '-') + (entry.effectiveEndTime ? ' · ' + esc(ctx.formatTime ? ctx.formatTime(entry.effectiveEndTime) : fmtTime(entry.effectiveEndTime, ctx.lang)) : '') + '</div>' +
             '</div>' +
             '<span class="radar-countdown ' + toneCls + ' tabular-nums" style="flex-shrink:0;">' + esc(remLabel) + '</span>' +
           '</button>';
@@ -1771,11 +1807,13 @@
           };
         }
 
+        var dashTimeFormat = ctx.getTimeFormat ? ctx.getTimeFormat() : undefined;
         if (needActivity) {
           renderLiveActivityFeed(
             container.querySelector('#dash-recent-activity'),
             actItems,
-            ctx.lang
+            ctx.lang,
+            dashTimeFormat
           );
         }
         if (visBySec.bottom_bento && visBySec.bottom_bento.shouldRenderData) {
@@ -1803,7 +1841,7 @@
             container.querySelector('#dash-peak-heatmap'),
             resItems,
             prbItems,
-            { lang: ctx.lang }
+            { lang: ctx.lang, timeFormat: dashTimeFormat }
           );
         }
       } catch (e) {}

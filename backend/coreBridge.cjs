@@ -222,6 +222,18 @@
     return s.replace('T', ' ').substring(0, 16);
   }
 
+  var TIME_FORMATS = ['24h', '12h'];
+  var SIDEBAR_POSITIONS = ['side', 'top', 'bottom'];
+
+  function normalizeTimeFormat(val) {
+    return String(val || '').trim().toLowerCase() === '12h' ? '12h' : '24h';
+  }
+
+  function normalizeSidebarPosition(val) {
+    var s = String(val || '').trim().toLowerCase();
+    return (s === 'top' || s === 'bottom') ? s : 'side';
+  }
+
   function extractTimeOnly(val) {
     if (val === null || val === undefined || val === '') return '';
     if (val instanceof Date && !isNaN(val.getTime())) {
@@ -230,10 +242,38 @@
     }
     var s = String(val).trim();
     if (!s || /^\d{4}-\d{2}-\d{2}$/.test(s)) return '';
-    var hmOnly = s.match(/^(\d{2}:\d{2})(?::\d{2})?$/);
-    if (hmOnly) return hmOnly[1];
+    var hmOnly = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+    if (hmOnly) {
+      var hh = Math.min(23, Math.max(0, parseInt(hmOnly[1], 10)));
+      var mm = Math.min(59, Math.max(0, parseInt(hmOnly[2], 10)));
+      return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+    }
     var dt = formatDisplayDateTime(s);
     return dt && dt.length >= 16 ? dt.substring(11, 16) : '';
+  }
+
+  function formatTimePreference(val, timeFormat, lang) {
+    var hm = extractTimeOnly(val);
+    if (!hm) return '';
+    if (normalizeTimeFormat(timeFormat) !== '12h') return hm;
+    var parts = hm.split(':');
+    var h = parseInt(parts[0], 10);
+    var mStr = parts[1] || '00';
+    if (isNaN(h)) return hm;
+    var isPm = h >= 12;
+    var h12 = h % 12;
+    if (h12 === 0) h12 = 12;
+    var suffix = (lang === 'en') ? (isPm ? 'PM' : 'AM') : (isPm ? 'م' : 'ص');
+    return h12 + ':' + mStr + ' ' + suffix;
+  }
+
+  function formatDateTimePreference(val, timeFormat, lang) {
+    var dt = formatDisplayDateTime(val);
+    if (!dt) return '';
+    if (normalizeTimeFormat(timeFormat) !== '12h') return dt;
+    var m = dt.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})$/);
+    if (!m) return dt;
+    return m[1] + ' ' + formatTimePreference(m[2], '12h', lang);
   }
 
   function translateOriginalStatus(code) {
@@ -1977,7 +2017,7 @@
       { key: 'action', label: 'الإجراء المتخذ', labelEn: 'Action', widthWeight: 1.65, formatType: 'text' },
       { key: 'notes', label: 'الملاحظات', labelEn: 'Notes', widthWeight: 1.5, formatType: 'text' },
       { key: 'followUpDate', label: 'التاريخ', labelEn: 'Date', widthWeight: 0.9, formatType: 'date' },
-      { key: 'followUpTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.75, formatType: 'ltr' }
+      { key: 'followUpTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.75, formatType: 'time' }
     ],
     problems: [
       { key: 'problemNumber', label: 'رقم المشكلة', labelEn: 'Ticket #', widthWeight: 0.95, formatType: 'ltr' },
@@ -2018,7 +2058,7 @@
       { key: 'entityId', label: 'المرجع', labelEn: 'Ref', widthWeight: 1.0, formatType: 'ltr' },
       { key: 'details', label: 'التفاصيل', labelEn: 'Details', widthWeight: 1.8, formatType: 'text' },
       { key: 'logDate', label: 'التاريخ', labelEn: 'Date', widthWeight: 0.95, formatType: 'date' },
-      { key: 'logTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.8, formatType: 'ltr' }
+      { key: 'logTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.8, formatType: 'time' }
     ]
   };
 
@@ -2050,8 +2090,11 @@
     if (ft === 'date') {
       return formatDisplayDate(val) || String(val);
     }
+    if (ft === 'time') {
+      return formatTimePreference(val, opts.timeFormat, lang) || String(val);
+    }
     if (ft === 'datetime') {
-      return formatDisplayDateTime(val) || String(val);
+      return formatDateTimePreference(val, opts.timeFormat, lang) || String(val);
     }
     if (ft === 'role') {
       var dict = ROLE_LABELS[lang === 'en' ? 'en' : 'ar'] || ROLE_LABELS.ar;
@@ -3900,9 +3943,10 @@
     };
   }
 
-  function buildShiftHandoverPdfPayload(summary, lang) {
+  function buildShiftHandoverPdfPayload(summary, lang, options) {
     var s = (summary && typeof summary === 'object') ? summary : computeShiftHandoverSummary({});
     var isEn = lang === 'en';
+    var timeFmt = normalizeTimeFormat(options && options.timeFormat);
     var win = s.shiftWindow || {};
     var counts = s.counts || {};
     var winLabel = isEn ? (win.labelEn || '') : (win.labelAr || '');
@@ -3979,8 +4023,9 @@
         lines: expList.map(function (it) {
           var r = it.reservation || {};
           var rem = isEn ? it.remainingLabelEn : it.remainingLabelAr;
+          var endTimeDisp = it.effectiveEndTime ? formatTimePreference(it.effectiveEndTime, timeFmt, lang) : '';
           return (r.reservationNumber || '-') + ' | ' + (r.customerName || '-') + ' (' + (r.customerPhone || '-') + ') | ' +
-            (r.carName || '-') + ' — ' + rem + ' (' + formatDisplayDate(it.effectiveEndDate) + (it.effectiveEndTime ? ' ' + it.effectiveEndTime : '') + ')';
+            (r.carName || '-') + ' — ' + rem + ' (' + formatDisplayDate(it.effectiveEndDate) + (endTimeDisp ? ' ' + endTimeDisp : '') + ')';
         })
       });
     }
@@ -4767,9 +4812,10 @@
     return href ? href.replace(/^tel:/, '') : '';
   }
 
-  function formatBookingSummaryText(reservation, lang) {
+  function formatBookingSummaryText(reservation, lang, options) {
     var r = (reservation && typeof reservation === 'object') ? reservation : {};
     var isEn = lang === 'en';
+    var timeFmt = normalizeTimeFormat(options && options.timeFormat);
     var resNum = normalizeStr(r.reservationNumber || r.id) || '-';
     var customer = normalizeStr(r.customerName) || '-';
     var phone = normalizeStr(r.customerPhone) || '-';
@@ -4777,8 +4823,11 @@
     var plate = normalizeStr(r.plateNumber) || '-';
     var company = normalizeStr(r.companyName) || '-';
     var branch = normalizeStr(r.branchName) || '-';
-    var startD = formatDisplayDate(r.startDate) || '-';
-    var endD = formatDisplayDate(r.extendedUntilDate || r.endDate) || '-';
+    var startT = r.startTime ? formatTimePreference(r.startTime, timeFmt, lang) : '';
+    var endTRaw = r.extendedUntilTime || r.endTime;
+    var endT = endTRaw ? formatTimePreference(endTRaw, timeFmt, lang) : '';
+    var startD = (formatDisplayDate(r.startDate) || '-') + (startT ? (' ' + startT) : '');
+    var endD = (formatDisplayDate(r.extendedUntilDate || r.endDate) || '-') + (endT ? (' ' + endT) : '');
     var totalAmt = Number(r.totalAmount || 0);
     var status = normalizeStr(r.internalStatus || r.originalStatusAr) || '-';
 
@@ -5168,7 +5217,9 @@
       navOrder: navOrder,
       hiddenRoutes: hiddenRoutes,
       dashOrder: dashOrder,
-      dashHidden: dashHidden
+      dashHidden: dashHidden,
+      timeFormat: normalizeTimeFormat(obj.timeFormat),
+      sidebarPosition: normalizeSidebarPosition(obj.sidebarPosition)
     };
   }
 
@@ -5597,6 +5648,12 @@
     formatDisplayDate: formatDisplayDate,
     formatDisplayDateTime: formatDisplayDateTime,
     extractTimeOnly: extractTimeOnly,
+    TIME_FORMATS: TIME_FORMATS,
+    SIDEBAR_POSITIONS: SIDEBAR_POSITIONS,
+    normalizeTimeFormat: normalizeTimeFormat,
+    normalizeSidebarPosition: normalizeSidebarPosition,
+    formatTimePreference: formatTimePreference,
+    formatDateTimePreference: formatDateTimePreference,
     normalizeLoginUsername: normalizeLoginUsername,
     getReportColumns: getReportColumns,
     formatReportCellValue: formatReportCellValue,
