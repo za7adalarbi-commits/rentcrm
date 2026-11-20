@@ -213,6 +213,8 @@
 
   var hydratedNamespaces = {};
   var hydrationPromises = {};
+  var revalidatedInPage = {};
+  var localReservationsFreshInPage = {};
   var localReservationsByNs = {};
   var localCustomersByNs = {};
   var customersDirtyByNs = {};
@@ -226,7 +228,7 @@
     return mode + '::' + (tok ? simpleHash(tok) : 'anon');
   }
 
-  function setLocalReservationsState(ns, list, replaceAll, metaPatch) {
+  function writeLocalReservationsState(ns, list, replaceAll, metaPatch) {
     var core = root.RGCrmCore;
     var existingBucket = localReservationsByNs[ns] || { list: [], byId: {}, byNumber: {} };
     var nextList = replaceAll
@@ -266,18 +268,26 @@
     });
     localMetaByNs[ns] = nextMeta;
 
+    var idbPromises = [];
     if (root.RGIdbCache) {
       if (replaceAll) {
-        root.RGIdbCache.replaceReservationsSnapshot(ns, nextList, customers, nextMeta).catch(function () {});
+        idbPromises.push(root.RGIdbCache.replaceReservationsSnapshot(ns, nextList, customers, nextMeta).catch(function () {}));
       } else if (Array.isArray(list) && list.length > 0) {
-        root.RGIdbCache.upsertReservations(ns, list).catch(function () {});
+        idbPromises.push(root.RGIdbCache.upsertReservations(ns, list).catch(function () {}));
         if (shouldRebuildCustomers) {
-          root.RGIdbCache.upsertCustomers(ns, customers).catch(function () {});
+          idbPromises.push(root.RGIdbCache.upsertCustomers(ns, customers).catch(function () {}));
         }
-        root.RGIdbCache.upsertMeta(ns, nextMeta).catch(function () {});
+        idbPromises.push(root.RGIdbCache.upsertMeta(ns, nextMeta).catch(function () {}));
       }
     }
-    return nextList;
+    return {
+      list: nextList,
+      idbPromise: idbPromises.length ? Promise.all(idbPromises).catch(function () {}) : Promise.resolve()
+    };
+  }
+
+  function setLocalReservationsState(ns, list, replaceAll, metaPatch) {
+    return writeLocalReservationsState(ns, list, replaceAll, metaPatch).list;
   }
 
   function setLocalExtensionsState(ns, extList) {
@@ -409,6 +419,7 @@
         allowAgentViewAll: db.settings.allow_agent_view_all !== false,
         lastSyncAt: (db.syncLog && db.syncLog[0] && db.syncLog[0].finishedAt) || new Date().toISOString()
       });
+      localReservationsFreshInPage[ns] = true;
       if (!localDetailsByNs[ns]) localDetailsByNs[ns] = {};
       var extsByRes = {};
       var extsByNum = {};
@@ -503,7 +514,8 @@
               byId[r.id] = r;
               if (r.reservationNumber) byNum[r.reservationNumber] = r;
             });
-            localReservationsByNs[ns] = { list: snap.reservations, byId: byId, byNumber: byNum, updatedAt: now };
+            var snapUpdatedAt = Number((snap.meta && snap.meta.updatedAt) || 0);
+            localReservationsByNs[ns] = { list: snap.reservations, byId: byId, byNumber: byNum, updatedAt: snapUpdatedAt };
           }
           if (Array.isArray(snap.customers) && snap.customers.length > 0) {
             localCustomersByNs[ns] = snap.customers;
@@ -623,17 +635,19 @@
     var ns = getCacheNamespace();
     if (!scopes || (Array.isArray(scopes) && scopes.indexOf('*') !== -1)) {
       apiResponseCache = {};
+      revalidatedInPage = {};
+      localReservationsFreshInPage = {};
       try { if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(SESSION_CACHE_KEY); } catch (e) {}
       if (root.RGIdbCache && Array.isArray(scopes) && scopes.indexOf('*') !== -1) {
-        root.RGIdbCache.clearNamespace(ns).catch(function () {});
         delete localReservationsByNs[ns];
         delete localCustomersByNs[ns];
         delete localDetailsByNs[ns];
         delete localExtensionsByResNs[ns];
         delete localMetaByNs[ns];
         delete hydratedNamespaces[ns];
+        return root.RGIdbCache.clearNamespace(ns).catch(function () {});
       }
-      return;
+      return Promise.resolve();
     }
     var list = Array.isArray(scopes) ? scopes : [scopes];
     var removedKeys = [];
@@ -641,14 +655,20 @@
       var entry = apiResponseCache[k];
       if (entry && list.indexOf(entry.scope) !== -1) {
         delete apiResponseCache[k];
+        delete revalidatedInPage[k];
         removedKeys.push(k);
       }
     });
+    if (list.indexOf('reservations') !== -1) {
+      localReservationsFreshInPage[ns] = false;
+    }
+    var idbPromises = [];
     if (root.RGIdbCache) {
-      if (removedKeys.length) root.RGIdbCache.deleteKvByKeys(removedKeys).catch(function () {});
-      root.RGIdbCache.deleteKvByScopes(ns, list).catch(function () {});
+      if (removedKeys.length) idbPromises.push(root.RGIdbCache.deleteKvByKeys(removedKeys).catch(function () {}));
+      idbPromises.push(root.RGIdbCache.deleteKvByScopes(ns, list).catch(function () {}));
     }
     schedulePersistApiCache(true);
+    return idbPromises.length ? Promise.all(idbPromises).catch(function () {}) : Promise.resolve();
   }
 
   function primeCache(action, payload, data) {
@@ -659,6 +679,7 @@
     var now = Date.now();
     var ns = getCacheNamespace();
     var key = core.buildApiCacheKey(getTransportUrl(), getToken(), action, payload || {});
+    revalidatedInPage[key] = true;
     apiResponseCache[key] = {
       key: key,
       ns: ns,
@@ -683,7 +704,7 @@
     if (!policy.cacheable) return false;
     var key = core.buildApiCacheKey(getTransportUrl(), getToken(), action, payload || {});
     var entry = apiResponseCache[key];
-    return Boolean(entry && Date.now() < entry.expiresAt);
+    return Boolean(entry && (!getTransportUrl() || revalidatedInPage[key]) && Date.now() < entry.expiresAt);
   }
 
   function getCachedData(action, payload, allowStale) {
@@ -891,6 +912,7 @@
             allowAgentViewAll: resp.data.allowAgentViewAll !== false,
             lastSyncAt: resp.data.syncedAt || new Date().toISOString()
           });
+          localReservationsFreshInPage[ns] = true;
           if (Array.isArray(resp.data.followUps) && resp.data.followUps.length > 0 && !hasCached('getTeamFollowUps', {})) {
             primeCache('getTeamFollowUps', {}, { items: resp.data.followUps });
           }
@@ -942,6 +964,7 @@
     if (!resBucket || !Array.isArray(resBucket.list) || resBucket.list.length === 0) return null;
     var meta = localMetaByNs[ns] || {};
     if (!meta.allReservationsHydrated) return null;
+    if (getTransportUrl() && !localReservationsFreshInPage[ns]) return null;
 
     var ageMs = Date.now() - Number(resBucket.updatedAt || meta.updatedAt || 0);
     if (ageMs > SWR_STALE_MAX_MS * 2) return null;
@@ -4693,16 +4716,19 @@
     if (policy.cacheable && !skipCache && cacheKey && apiResponseCache[cacheKey]) {
       var cachedEntry = apiResponseCache[cacheKey];
       var nowTs = Date.now();
-      if (nowTs < cachedEntry.expiresAt) {
+      var isPageValidated = !transportUrl || Boolean(revalidatedInPage[cacheKey]);
+      if (isPageValidated && nowTs < cachedEntry.expiresAt) {
         return cachedEntry.response;
       }
-      if (nowTs < (cachedEntry.staleUntil || 0)) {
+      if (isPageValidated && nowTs < (cachedEntry.staleUntil || 0)) {
         if (!inFlightRequests[cacheKey]) {
           startNetworkOrSandbox().catch(function () {});
         }
         return cachedEntry.response;
       }
-      delete apiResponseCache[cacheKey];
+      if (nowTs >= (cachedEntry.staleUntil || 0)) {
+        delete apiResponseCache[cacheKey];
+      }
     }
 
     if (policy.cacheable && !skipCache && cacheKey && inFlightRequests[cacheKey]) {
@@ -4719,6 +4745,7 @@
 
     async function executeCall() {
       var parsed;
+      var networkFailed = false;
       if (!transportUrl) {
         parsed = sandboxExecute(action, token, payload);
       } else if (backendUrl) {
@@ -4772,7 +4799,8 @@
         } catch (bErr) {
           if (bTimeoutId) clearTimeout(bTimeoutId);
           var isBAbort = bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1);
-          return {
+          networkFailed = true;
+          parsed = {
             success: false,
             message: isBAbort
               ? 'انتهت مهلة الاتصال بخادم قاعدة البيانات السحابية. يرجى المحاولة مرة أخرى.'
@@ -4920,7 +4948,8 @@
                 errorMessage: err && err.message ? err.message : String(err)
               });
             }
-            return {
+            networkFailed = true;
+            parsed = {
               success: false,
               message: isAbort
                 ? 'انتهت مهلة الاتصال بخادم Google Apps Script. يرجى المحاولة مرة أخرى.'
@@ -4932,30 +4961,46 @@
         }
       }
 
+      if (networkFailed && !skipCache && policy.cacheable && cacheKey && apiResponseCache[cacheKey]) {
+        var offlineEntry = apiResponseCache[cacheKey];
+        if (offlineEntry && offlineEntry.response && Date.now() < (offlineEntry.staleUntil || 0)) {
+          return offlineEntry.response;
+        }
+      }
+
       if (parsed && parsed.success) {
+        var pendingIdbOps = [];
         // Persist reservation & customer entities into IndexedDB automatically
         if (action === 'getReservationDetails' && parsed.data && parsed.data.reservation) {
           setLocalDetailState(ns, parsed.data);
         } else if (action === 'getReservations' && parsed.data && Array.isArray(parsed.data.items) && parsed.data.items.length > 0) {
-          setLocalReservationsState(ns, parsed.data.items, false);
+          pendingIdbOps.push(writeLocalReservationsState(ns, parsed.data.items, false).idbPromise);
         } else if ((action === 'pullReservations' || action === 'syncRentalGate') && parsed.data) {
+          localReservationsFreshInPage[ns] = false;
+          if (localMetaByNs[ns]) localMetaByNs[ns].allReservationsHydrated = false;
           if (Array.isArray(parsed.data.changedReservations) && parsed.data.changedReservations.length > 0) {
-            setLocalReservationsState(ns, parsed.data.changedReservations, false, {
+            pendingIdbOps.push(writeLocalReservationsState(ns, parsed.data.changedReservations, false, {
+              allReservationsHydrated: false,
               lastSyncAt: parsed.data.finishedAt || new Date().toISOString()
-            });
+            }).idbPromise);
             parsed.data.changedReservations.forEach(function (cr) {
               if (localDetailsByNs[ns] && localDetailsByNs[ns][cr.id]) {
                 localDetailsByNs[ns][cr.id] = Object.assign({}, localDetailsByNs[ns][cr.id], {
                   reservation: cr,
                   cachedAt: Date.now()
                 });
-                if (root.RGIdbCache) root.RGIdbCache.upsertReservationDetail(ns, localDetailsByNs[ns][cr.id]).catch(function () {});
+                if (root.RGIdbCache) pendingIdbOps.push(root.RGIdbCache.upsertReservationDetail(ns, localDetailsByNs[ns][cr.id]).catch(function () {}));
               }
             });
+          } else if (root.RGIdbCache) {
+            pendingIdbOps.push(root.RGIdbCache.upsertMeta(ns, Object.assign({}, localMetaByNs[ns] || {}, {
+              allReservationsHydrated: false,
+              lastSyncAt: parsed.data.finishedAt || new Date().toISOString()
+            })).catch(function () {}));
           }
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
         } else if (action === 'quickUpdateReservationStatus' && parsed.data && parsed.data.reservation) {
-          setLocalReservationsState(ns, [parsed.data.reservation], false);
+          pendingIdbOps.push(writeLocalReservationsState(ns, [parsed.data.reservation], false).idbPromise);
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.reservation.id]) {
             var curDet = localDetailsByNs[ns][parsed.data.reservation.id];
             setLocalDetailState(ns, Object.assign({}, curDet, {
@@ -4964,12 +5009,12 @@
             }));
           }
         } else if (action === 'updateReservationDetails' && parsed.data && parsed.data.id) {
-          setLocalReservationsState(ns, [parsed.data], false);
+          pendingIdbOps.push(writeLocalReservationsState(ns, [parsed.data], false).idbPromise);
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
         } else if (action === 'deleteAllReservations' || action === 'importReservationsFromExcel') {
-          clearCache(['*']);
+          pendingIdbOps.push(clearCache(['*']));
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
         } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
           var dObj = (parsed && parsed.data) || {};
@@ -4986,6 +5031,8 @@
         }
 
         if (shouldWriteCache && cacheKey) {
+          var wasRevalidated = Boolean(revalidatedInPage[cacheKey]);
+          revalidatedInPage[cacheKey] = true;
           var writeTs = Date.now();
           apiResponseCache[cacheKey] = {
             key: cacheKey,
@@ -4996,7 +5043,7 @@
             staleUntil: writeTs + Math.max(policy.ttlMs, IDB_KV_MAX_AGE_MS),
             response: parsed
           };
-          schedulePersistApiCache(false);
+          schedulePersistApiCache(!wasRevalidated || action === 'getReservations' || action === 'getDashboard' || action === 'getEmployees');
         } else if (core && core.getCacheInvalidationScopes) {
           var invScopes = core.getCacheInvalidationScopes(action);
           var skipOptimisticClear = payload && payload._keepOptimisticCache;
@@ -5005,7 +5052,7 @@
             var secondaryOnly = invScopes.filter(function (s) {
               return s === 'dashboard' || s === 'reports' || s === 'activity' || s === 'employees';
             });
-            if (secondaryOnly.length > 0) clearCache(secondaryOnly);
+            if (secondaryOnly.length > 0) pendingIdbOps.push(clearCache(secondaryOnly));
             if (action === 'createProblem' && parsed.data && parsed.data.id) {
               patchCachedScopes(['problems'], function (data, actName) {
                 if (actName === 'getProblems' && Array.isArray(data.items)) {
@@ -5033,12 +5080,15 @@
               });
             }
           } else if (invScopes.length > 0) {
-            clearCache(invScopes);
+            pendingIdbOps.push(clearCache(invScopes));
           }
+        }
+        if (pendingIdbOps.length > 0) {
+          await Promise.all(pendingIdbOps).catch(function () {});
         }
       } else if (payload && payload._keepOptimisticCache && core && core.getCacheInvalidationScopes) {
         // Optimistic mutation failed on server -> clear affected primary caches so next read fetches truth
-        clearCache(core.getCacheInvalidationScopes(action));
+        await clearCache(core.getCacheInvalidationScopes(action));
       }
       return parsed;
     }

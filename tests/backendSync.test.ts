@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 import { hashPassword, hashToken, normalizeLoginUsername, verifySharedSecret } from '../backend/auth';
 import { maskDatabaseUrl, persistCoreFilesOnDisk } from '../backend/coreBinding';
 import type { DbClient, DbExecutor, QueryResult } from '../backend/db';
@@ -2575,4 +2576,295 @@ test('/api/health and /api/crm resolve server-side GAS_WEBAPP_URL fallback clean
     FIXED_SERVER_CONFIG.gasWebAppUrl = prevFixedGas;
     FIXED_SERVER_CONFIG.databaseUrl = prevFixedDb;
   }
+});
+
+test('RGApi always revalidates live server after F5 refresh, flushes IDB/session cache on pullReservations, and keeps intra-session speed & offline fallback', async () => {
+  const coreSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/core.js'), 'utf8');
+  const idbSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/idb.js'), 'utf8');
+  const apiSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/api.js'), 'utf8');
+
+  const createMemoryStorage = (initial: Record<string, string> = {}) => {
+    const map = new Map<string, string>(Object.entries(initial));
+    return {
+      getItem: (k: string) => (map.has(k) ? map.get(k)! : null),
+      setItem: (k: string, v: string) => { map.set(k, String(v)); },
+      removeItem: (k: string) => { map.delete(k); },
+      dump: () => Object.fromEntries(map.entries())
+    };
+  };
+
+  function bootFrontendSandbox(opts: {
+    sessionInit?: Record<string, string>;
+    localInit?: Record<string, string>;
+    idbSnapshot?: { kvEntries?: any[]; reservations?: any[]; meta?: any };
+    fetchImpl: (url: string, init?: any) => Promise<any>;
+  }) {
+    const localStorage = createMemoryStorage({
+      rg_crm_session_token: 'tok_live_test_1',
+      ...(opts.localInit || {})
+    });
+    const sessionStorage = createMemoryStorage(opts.sessionInit || {});
+
+    const ctx: any = {
+      console,
+      Date,
+      Math,
+      JSON,
+      Promise,
+      Object,
+      Array,
+      String,
+      Number,
+      Boolean,
+      Set,
+      Map,
+      RegExp,
+      URL,
+      setTimeout,
+      clearTimeout,
+      CustomEvent: class CustomEvent {
+        type: string;
+        detail: any;
+        constructor(type: string, init?: any) {
+          this.type = type;
+          this.detail = init?.detail;
+        }
+      },
+      document: {
+        dispatchEvent() {}
+      },
+      localStorage,
+      sessionStorage,
+      fetch: opts.fetchImpl
+    };
+    ctx.window = ctx;
+    ctx.RG_APP_CONFIG = { mode: 'neon', backendApiUrl: '/api/crm', gasWebAppUrl: '' };
+    ctx.location = {
+      protocol: 'https:',
+      hostname: 'rentcrm.example.com',
+      origin: 'https://rentcrm.example.com',
+      search: '',
+      href: 'https://rentcrm.example.com/#reservations',
+      pathname: '/',
+      hash: '#reservations'
+    };
+    ctx.history = { replaceState() {} };
+
+    vm.runInNewContext(coreSrc, ctx);
+    vm.runInNewContext(idbSrc, ctx);
+
+    // Override RGIdbCache after idb.js with deterministic in-memory fake IDB tracking puts/deletes
+    const idbStore = {
+      kvEntries: [...(opts.idbSnapshot?.kvEntries || [])],
+      reservations: [...(opts.idbSnapshot?.reservations || [])],
+      meta: opts.idbSnapshot?.meta ? { ...opts.idbSnapshot.meta } : null
+    };
+    ctx.RGIdbCache = {
+      isSupported: () => true,
+      loadNamespaceSnapshot: async () => ({
+        kvEntries: idbStore.kvEntries.map((x) => ({ ...x })),
+        reservations: idbStore.reservations.map((x) => ({ ...x })),
+        customers: [],
+        details: [],
+        meta: idbStore.meta ? { ...idbStore.meta } : null
+      }),
+      putKvEntries: async (entries: any[]) => {
+        for (const e of entries) {
+          const idx = idbStore.kvEntries.findIndex((x) => x.key === e.key);
+          if (idx === -1) idbStore.kvEntries.push({ ...e });
+          else idbStore.kvEntries[idx] = { ...e };
+        }
+        return true;
+      },
+      deleteKvByKeys: async (keys: string[]) => {
+        idbStore.kvEntries = idbStore.kvEntries.filter((x) => !keys.includes(x.key));
+        return true;
+      },
+      deleteKvByScopes: async (_ns: string, scopes: string[]) => {
+        idbStore.kvEntries = idbStore.kvEntries.filter((x) => !scopes.includes(x.scope));
+        return true;
+      },
+      upsertReservations: async (_ns: string, rows: any[]) => {
+        for (const r of rows) {
+          const idx = idbStore.reservations.findIndex((x) => x.id === r.id);
+          if (idx === -1) idbStore.reservations.push({ ...r });
+          else idbStore.reservations[idx] = { ...r };
+        }
+        return true;
+      },
+      replaceReservationsSnapshot: async (_ns: string, rows: any[], _cust: any[], meta: any) => {
+        idbStore.reservations = rows.map((r) => ({ ...r }));
+        idbStore.meta = { ...meta };
+        return true;
+      },
+      upsertCustomers: async () => true,
+      upsertReservationDetail: async () => true,
+      upsertMeta: async (_ns: string, patch: any) => {
+        idbStore.meta = { ...(idbStore.meta || {}), ...patch };
+        return true;
+      },
+      clearNamespace: async () => {
+        idbStore.kvEntries = [];
+        idbStore.reservations = [];
+        idbStore.meta = null;
+        return true;
+      }
+    };
+
+    vm.runInNewContext(apiSrc, ctx);
+    return { ctx, sessionStorage, idbStore };
+  }
+
+  const now = Date.now();
+  const buildCoreCtx: any = { window: {} };
+  buildCoreCtx.window = buildCoreCtx;
+  vm.runInNewContext(coreSrc, buildCoreCtx);
+  const resCacheKey = buildCoreCtx.RGCrmCore.buildApiCacheKey('/api/crm', 'tok_live_test_1', 'getReservations', { page: 1 });
+  const dashCacheKey = buildCoreCtx.RGCrmCore.buildApiCacheKey('/api/crm', 'tok_live_test_1', 'getDashboard', {});
+
+  let serverResItems = [{ id: 'RES_NEW', reservationNumber: 'RG-NEW-999', customerName: 'عميل محدث بعد السحب' }];
+  let serverDashTotal = 999;
+  const crmActionsCalled: string[] = [];
+
+  // 1) Simulate F5 reload while sessionStorage + IndexedDB STILL contain stale pre-pull data with future expiresAt!
+  const staleResEntry = {
+    key: resCacheKey,
+    ns: '/api/crm::tok_live_test_1',
+    scope: 'reservations',
+    storedAt: now - 5000,
+    expiresAt: now + 55000,
+    staleUntil: now + 86400000,
+    response: {
+      success: true,
+      message: '',
+      data: { items: [{ id: 'RES_OLD', reservationNumber: 'RG-OLD-111', customerName: 'بيانات قديمة' }], total: 1 },
+      error: null
+    }
+  };
+  const staleDashEntry = {
+    key: dashCacheKey,
+    ns: '/api/crm::tok_live_test_1',
+    scope: 'dashboard',
+    storedAt: now - 5000,
+    expiresAt: now + 55000,
+    staleUntil: now + 86400000,
+    response: {
+      success: true,
+      message: '',
+      data: { kpis: { totalReservations: 111 } },
+      error: null
+    }
+  };
+
+  const f5Session = bootFrontendSandbox({
+    sessionInit: {
+      rg_crm_swr_v1: JSON.stringify({
+        [resCacheKey]: staleResEntry,
+        [dashCacheKey]: staleDashEntry
+      })
+    },
+    idbSnapshot: {
+      kvEntries: [staleResEntry, staleDashEntry],
+      reservations: [{ id: 'RES_OLD', reservationNumber: 'RG-OLD-111', customerName: 'بيانات قديمة' }],
+      meta: { allReservationsHydrated: true, updatedAt: now - 5000 }
+    },
+    fetchImpl: async (url: string, init?: any) => {
+      if (String(url).includes('/api/health')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ ok: true, mode: 'neon', databaseConfigured: true, connected: true, backendApiUrl: '/api/crm' })
+        };
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      crmActionsCalled.push(body.action);
+      if (body.action === 'getReservations') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ success: true, message: '', data: { items: serverResItems, total: serverResItems.length }, error: null })
+        };
+      }
+      if (body.action === 'getDashboard') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ success: true, message: '', data: { kpis: { totalReservations: serverDashTotal } }, error: null })
+        };
+      }
+      if (body.action === 'pullReservations') {
+        serverResItems = [{ id: 'RES_PULLED_2', reservationNumber: 'RG-PULLED-2', customerName: 'عميل مسحوب للتو' }];
+        serverDashTotal = 1002;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({
+            success: true,
+            message: 'ok',
+            data: { pulled: 1, changedReservations: serverResItems, finishedAt: new Date().toISOString() },
+            error: null
+          })
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify({ success: true, message: '', data: {}, error: null })
+      };
+    }
+  });
+
+  await f5Session.ctx.RGApi.ready();
+
+  // First read after F5 MUST NOT serve stale session/IDB cache when online!
+  const firstResAfterF5 = await f5Session.ctx.RGApi.callApi('getReservations', { page: 1 });
+  assert.equal(firstResAfterF5.data.items[0].id, 'RES_NEW');
+  assert.equal(crmActionsCalled.filter((a) => a === 'getReservations').length, 1);
+
+  const firstDashAfterF5 = await f5Session.ctx.RGApi.callApi('getDashboard', {});
+  assert.equal(firstDashAfterF5.data.kpis.totalReservations, 999);
+  assert.equal(crmActionsCalled.filter((a) => a === 'getDashboard').length, 1);
+
+  // Intra-session navigation MUST still hit cache at 0ms (no extra fetch calls)
+  const secondResSamePage = await f5Session.ctx.RGApi.callApi('getReservations', { page: 1 });
+  assert.equal(secondResSamePage.data.items[0].id, 'RES_NEW');
+  assert.equal(crmActionsCalled.filter((a) => a === 'getReservations').length, 1);
+
+  // Pull reservations must await clearing reservations/dashboard KV cache and IDB meta hydration flag
+  const pullResult = await f5Session.ctx.RGApi.callApi('pullReservations', { datePreset: '7d' });
+  assert.equal(pullResult.success, true);
+  assert.equal(f5Session.idbStore.kvEntries.some((x) => x.scope === 'reservations' || x.scope === 'dashboard'), false);
+  assert.equal(f5Session.idbStore.meta?.allReservationsHydrated, false);
+
+  // Next getReservations (even without forceRefresh) must hit live server and get RG-PULLED-2
+  const afterPullRes = await f5Session.ctx.RGApi.callApi('getReservations', { page: 1 });
+  assert.equal(afterPullRes.data.items[0].id, 'RES_PULLED_2');
+  assert.equal(crmActionsCalled.filter((a) => a === 'getReservations').length, 2);
+
+  // 2) Offline fallback on cold F5 reload if live server is unreachable
+  const offlineSession = bootFrontendSandbox({
+    sessionInit: {
+      rg_crm_swr_v1: JSON.stringify({ [resCacheKey]: staleResEntry })
+    },
+    fetchImpl: async (url: string) => {
+      if (String(url).includes('/api/health')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ ok: true, mode: 'neon', databaseConfigured: true, connected: true, backendApiUrl: '/api/crm' })
+        };
+      }
+      throw new Error('offline_network_error');
+    }
+  });
+  await offlineSession.ctx.RGApi.ready();
+  const offlineRes = await offlineSession.ctx.RGApi.callApi('getReservations', { page: 1 });
+  assert.equal(offlineRes.success, true);
+  assert.equal(offlineRes.data.items[0].id, 'RES_OLD');
 });

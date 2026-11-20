@@ -417,8 +417,10 @@ test('formatDisplayDate and formatDisplayDateTime normalize Google Sheets UTC mi
   assert.equal(core.formatDisplayDateTime('2026-11-17T15:24:00'), '2026-11-17 15:24');
 
   const bsPolicy = core.getApiCachePolicy('getAppBootstrap');
-  assert.equal(bsPolicy.cacheable, true);
-  assert.equal(bsPolicy.ttlMs >= 30000, true);
+  assert.equal(bsPolicy.cacheable, false);
+  const resPolicy = core.getApiCachePolicy('getReservations');
+  assert.equal(resPolicy.cacheable, true);
+  assert.equal(resPolicy.ttlMs >= 30000, true);
 });
 
 test('normalizeLoginUsername trims, converts Arabic-Indic digits, and lowercases', () => {

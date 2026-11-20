@@ -621,9 +621,12 @@
       });
     }
 
-    async function refreshTableRegion() {
+    async function refreshTableRegion(opts) {
       var seq = ++activeFetchSeq;
-      var resp = await root.RGApi.callApi('getReservations', state);
+      var queryPayload = (opts && opts.forceRefresh)
+        ? Object.assign({}, state, { forceRefresh: true })
+        : state;
+      var resp = await root.RGApi.callApi('getReservations', queryPayload);
       if (seq !== activeFetchSeq) return;
       if (resp && resp.success && resp.data) {
         paintTableRegion(resp.data);
@@ -783,7 +786,7 @@
                 : ('تم سحب الحجوزات بنجاح' + rangeNote + ': ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + diagHint);
               ctx.toast(msg);
               ctx.refreshNotifications();
-              refreshTableRegion();
+              refreshTableRegion({ forceRefresh: true });
               refreshRadarData();
             } else {
               ctx.toast((resp && resp.message) || 'تعذر سحب الحجوزات.', true);

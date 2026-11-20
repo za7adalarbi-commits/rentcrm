@@ -381,7 +381,7 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
       const pHash = hashPassword(s.password, s.salt);
       await tx.query(
         `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11,$12::timestamptz,$12::timestamptz)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11::text,$12::timestamptz,$12::timestamptz)
          ON CONFLICT (username) DO NOTHING`,
         [s.id, s.name, s.username, pHash, s.salt, s.phone, s.email, s.jobTitle, s.role, JSON.stringify(s.permissions), nowIso, nowIso]
       );
@@ -854,18 +854,20 @@ export async function getReservations(
     lastUpdatedByName: 'r.last_updated_by_name'
   };
 
-  let orderSql = 'r.updated_at DESC';
+  let orderSql = 'r.updated_at DESC, r.start_date DESC, r.id DESC';
   const rawSortBy = str(payload.sortBy);
   const rawSortDir = str(payload.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   if (rawSortBy === 'startDate_desc') {
-    orderSql = 'r.start_date DESC, r.updated_at DESC';
+    orderSql = 'r.start_date DESC, r.updated_at DESC, r.id DESC';
   } else if (rawSortBy === 'startDate_asc') {
-    orderSql = 'r.start_date ASC, r.updated_at DESC';
+    orderSql = 'r.start_date ASC, r.updated_at DESC, r.id DESC';
   } else if (rawSortBy === 'totalAmount_desc') {
-    orderSql = 'r.total_amount DESC, r.updated_at DESC';
+    orderSql = 'r.total_amount DESC, r.updated_at DESC, r.id DESC';
   } else if (rawSortBy && RESERVATION_SORT_COLUMNS[rawSortBy]) {
     const col = RESERVATION_SORT_COLUMNS[rawSortBy];
-    orderSql = col === 'r.updated_at' ? `${col} ${rawSortDir}` : `${col} ${rawSortDir}, r.updated_at DESC`;
+    orderSql = col === 'r.updated_at'
+      ? `${col} ${rawSortDir}, r.start_date DESC, r.id DESC`
+      : `${col} ${rawSortDir}, r.updated_at DESC, r.id DESC`;
   }
 
   const page = Math.max(1, num(payload.page, 1));
@@ -2466,7 +2468,7 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
 
     await tx.query(
       `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11,$12::timestamptz,$12::timestamptz)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11::text,$12::timestamptz,$12::timestamptz)`,
       [id, name, username, pHash, salt, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso, nowIso]
     );
     await tx.query(

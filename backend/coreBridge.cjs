@@ -1901,7 +1901,7 @@
   }
 
   var API_CACHE_POLICIES = {
-    getAppBootstrap: { cacheable: true, ttlMs: 30000, scope: 'dashboard' },
+    getAppBootstrap: { cacheable: false, ttlMs: 0, scope: 'dashboard' },
     getMe: { cacheable: true, ttlMs: 300000, scope: 'employees' },
     getEmployees: { cacheable: true, ttlMs: 300000, scope: 'employees' },
     getEmployeeDetails: { cacheable: true, ttlMs: 60000, scope: 'employees' },
