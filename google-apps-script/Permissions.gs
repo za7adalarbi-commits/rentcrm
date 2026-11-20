@@ -78,21 +78,21 @@ var RG_DEFAULT_ROLE_PRESETS = [
     id: 'agent_standard',
     label: 'موظف خدمة عملاء (الافتراضي)',
     jobTitle: 'موظف خدمة العملاء',
-    role: RG_ROLES.AGENT,
+    role: 'agent',
     permissions: RG_ROLE_PERMISSIONS.agent.slice()
   },
   {
     id: 'agent_senior',
     label: 'موظف متابعة أول (صلاحيات موسعة)',
     jobTitle: 'موظف متابعة أول',
-    role: RG_ROLES.AGENT,
+    role: 'agent',
     permissions: RG_ROLE_PERMISSIONS.agent.concat(['view_all_reservations', 'view_employees', 'edit_any_followup'])
   },
   {
     id: 'qa_reports',
     label: 'مسؤول جودة وتقارير (قراءة وتصدير)',
     jobTitle: 'أخصائي جودة وتقارير',
-    role: RG_ROLES.AGENT,
+    role: 'agent',
     permissions: [
       'view_dashboard', 'dash_perms_configured',
       'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
@@ -105,14 +105,14 @@ var RG_DEFAULT_ROLE_PRESETS = [
     id: 'supervisor_ops',
     label: 'مشرف عمليات ومتابعة (مع صلاحية API)',
     jobTitle: 'مشرف خدمة العملاء',
-    role: RG_ROLES.SUPERVISOR,
+    role: 'supervisor',
     permissions: RG_ROLE_PERMISSIONS.supervisor.slice()
   },
   {
     id: 'general_manager',
     label: 'المدير العام (كامل الصلاحيات)',
     jobTitle: 'المدير العام',
-    role: RG_ROLES.GENERAL_MANAGER,
+    role: 'general_manager',
     permissions: RG_ROLE_PERMISSIONS.general_manager.slice()
   }
 ];

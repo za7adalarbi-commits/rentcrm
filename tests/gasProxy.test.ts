@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import vm from 'node:vm';
 import core from '../backend/coreBridge.cjs';
 import {
   normalizeAndValidateGasTarget,
@@ -149,4 +152,35 @@ test('fetchGasServerSide falls back to GET ?action=ping when POST throws network
   );
   assert.equal(htmlRes.success, false);
   assert.equal(htmlRes.error, 'HTML_RESPONSE');
+});
+
+test('all google-apps-script .gs files initialize cleanly in any file order and handle doGet/doPost ping', () => {
+  const gasDir = path.resolve(process.cwd(), 'google-apps-script');
+  const files = fs.readdirSync(gasDir).filter((f) => f.endsWith('.gs')).sort();
+  assert.ok(files.length >= 18);
+
+  for (const firstFile of files) {
+    const ctx: Record<string, any> = vm.createContext({
+      console,
+      ContentService: {
+        MimeType: { JSON: 'application/json' },
+        createTextOutput: (txt: string) => ({
+          _txt: txt,
+          setMimeType() {
+            return this;
+          }
+        })
+      }
+    });
+    const order = [firstFile, ...files.filter((f) => f !== firstFile)];
+    for (const f of order) {
+      vm.runInContext(fs.readFileSync(path.join(gasDir, f), 'utf8'), ctx, { filename: f });
+    }
+    const getOut = JSON.parse(ctx.doGet({ parameter: { action: 'ping' } })._txt);
+    const postOut = JSON.parse(
+      ctx.doPost({ parameter: {}, postData: { contents: JSON.stringify({ action: 'ping', payload: {} }) } })._txt
+    );
+    assert.equal(getOut.success, true);
+    assert.equal(postOut.success, true);
+  }
 });
