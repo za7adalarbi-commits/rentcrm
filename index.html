@@ -28,10 +28,14 @@
           }
           theme = theme === 'dark' ? 'dark' : 'light';
           var lang = prefs && prefs.lang === 'en' ? 'en' : 'ar';
+          var navPos = prefs && (prefs.sidebarPosition === 'top' || prefs.sidebarPosition === 'bottom') ? prefs.sidebarPosition : 'side';
+          var timeFmt = prefs && prefs.timeFormat === '12h' ? '12h' : '24h';
           var html = document.documentElement;
           html.setAttribute('data-theme', theme);
           html.setAttribute('lang', lang);
           html.setAttribute('dir', lang === 'en' ? 'ltr' : 'rtl');
+          html.setAttribute('data-nav-pos', navPos);
+          html.setAttribute('data-time-format', timeFmt);
           if (theme === 'dark') html.classList.add('dark');
           else html.classList.remove('dark');
         } catch (e) {}
