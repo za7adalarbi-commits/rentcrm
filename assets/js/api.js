@@ -5061,6 +5061,25 @@
       clean = check.normalized;
     }
 
+    // 1) Fast, CORS-free server-side probe & diagnosis on Node/Vercel/Cloud Run origins
+    try {
+      var serverPing = await callBackendSetupEndpoint('pingGasUrl', { gasUrl: clean });
+      if (serverPing && !serverPing.staticHostOnly) {
+        if (serverPing.success) {
+          return {
+            success: true,
+            message: serverPing.message || 'RENTAL GATE CRM API متصل ويعمل بنجاح.',
+            data: Object.assign({}, serverPing.data || {}, { normalizedUrl: clean }),
+            error: null
+          };
+        }
+        if (serverPing.message) {
+          return serverPing;
+        }
+      }
+    } catch (proxyErr) {}
+
+    // 2) Pure static hosting fallback (e.g. GitHub Pages): Direct POST then GET ?action=ping
     var directError = null;
     var pingTimer = null;
     try {
@@ -5101,7 +5120,6 @@
       directError = err;
     }
 
-    // Fallback 1: Direct GET ?action=ping (handles environments where cross-origin POST redirect fails)
     var getTimer = null;
     try {
       var sep = clean.indexOf('?') === -1 ? '?' : '&';
@@ -5130,25 +5148,6 @@
     } catch (getErr) {
       if (getTimer) clearTimeout(getTimer);
     }
-
-    // Fallback 2: Server-side /api/crm diagnostics & CORS-free proxy
-    try {
-      var serverPing = await callBackendSetupEndpoint('pingGasUrl', { gasUrl: clean });
-      if (serverPing && !serverPing.staticHostOnly) {
-        if (serverPing.success) {
-          gasServerProxyUrls[clean] = true;
-          return {
-            success: true,
-            message: (serverPing.message || 'تم الاتصال بنجاح.') + ' (تم التحقق عبر وسيط الخادم بنجاح)',
-            data: Object.assign({}, serverPing.data || {}, { normalizedUrl: clean }),
-            error: null
-          };
-        }
-        if (serverPing.error && serverPing.error !== 'NETWORK_ERROR') {
-          return serverPing;
-        }
-      }
-    } catch (proxyErr) {}
 
     if (directError && directError.success === false && directError.message) {
       return directError;

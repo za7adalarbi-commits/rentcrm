@@ -202,11 +202,12 @@ export async function fetchGasServerSide(
       };
     } catch (err: any) {
       const isAbort = err && (err.name === 'AbortError' || String(err.message || '').includes('abort'));
+      const causeDetail = err?.cause ? ` (${String(err.cause.code || err.cause.message || err.cause)})` : '';
       return {
         success: false,
         message: isAbort
           ? 'انتهت مهلة الاتصال بـ Google Apps Script. حاول مرة أخرى.'
-          : `تعذر الوصول إلى Google Apps Script من الخادم: ${String(err?.message || err)}`,
+          : `تعذر الوصول إلى Google Apps Script من الخادم: ${String(err?.message || err)}${causeDetail}`,
         data: null,
         error: isAbort ? 'TIMEOUT' : 'NETWORK_ERROR'
       };
