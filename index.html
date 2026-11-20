@@ -17,6 +17,26 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem('rg_crm_user_prefs');
+          var prefs = raw ? JSON.parse(raw) : null;
+          var theme = prefs && (prefs.theme === 'dark' || prefs.theme === 'light') ? prefs.theme : '';
+          if (!theme && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+            theme = 'dark';
+          }
+          theme = theme === 'dark' ? 'dark' : 'light';
+          var lang = prefs && prefs.lang === 'en' ? 'en' : 'ar';
+          var html = document.documentElement;
+          html.setAttribute('data-theme', theme);
+          html.setAttribute('lang', lang);
+          html.setAttribute('dir', lang === 'en' ? 'ltr' : 'rtl');
+          if (theme === 'dark') html.classList.add('dark');
+          else html.classList.remove('dark');
+        } catch (e) {}
+      })();
+    </script>
     <link rel="stylesheet" href="./src/index.css" />
     <link rel="stylesheet" href="./assets/css/style.css" />
     <link rel="stylesheet" href="./assets/css/dashboard.css" />
@@ -34,13 +54,19 @@
     <script defer src="./assets/js/idb.js"></script>
     <script defer src="./assets/js/api.js"></script>
     <script defer src="./assets/js/auth.js"></script>
+    <script defer src="./assets/js/mentions.js"></script>
     <script defer src="./assets/js/dashboard.js"></script>
+    <script defer src="./assets/js/pdfControls.js"></script>
     <script defer src="./assets/js/reports.js"></script>
     <script defer src="./assets/js/reservations.js"></script>
     <script defer src="./assets/js/followups.js"></script>
     <script defer src="./assets/js/problems.js"></script>
     <script defer src="./assets/js/employees.js"></script>
     <script defer src="./assets/js/settings.js"></script>
+    <script defer src="./assets/js/datepicker.js"></script>
+    <script defer src="./assets/js/pdfPreview.js"></script>
+    <script defer src="./assets/js/handover.js"></script>
+    <script defer src="./assets/js/dropdowns.js"></script>
     <script defer src="./assets/js/app.js"></script>
   </body>
 </html>
