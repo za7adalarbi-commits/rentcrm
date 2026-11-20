@@ -151,6 +151,16 @@ export async function fetchGasServerSide(
           };
         }
         if (trimmed.startsWith('<') || /^<!doctype/i.test(trimmed)) {
+          const missingFnMatch = trimmed.match(/Script function not found:\s*([A-Za-z0-9_]+)/i);
+          if (missingFnMatch) {
+            const missingFn = missingFnMatch[1];
+            return {
+              success: false,
+              message: `خطأ من Google Apps Script: الدالة (${missingFn}) غير موجودة في الإصدار المنشور على رابط /exec. الحل: (1) تأكد من إضافة/نسخ ملف google-apps-script/Code.gs كاملاً في المحرر وحفظه (Ctrl+S)، (2) اختر Deploy -> Manage deployments -> Edit -> Version: New version -> Deploy لتحديث رابط /exec، (3) تأكد أن الرابط يعود لنفس مشروع Apps Script.`,
+              data: { missingFunction: missingFn },
+              error: 'GAS_MISSING_HANDLER'
+            };
+          }
           if (/accounts\.google\.com|ServiceLogin/i.test(trimmed)) {
             return {
               success: false,
@@ -217,10 +227,21 @@ export async function fetchGasServerSide(
   };
 
   let result = await runHopChain('POST', check.normalized);
-  if (actionName === 'ping' && !result.success && result.error !== 'GAS_AUTH_REQUIRED' && result.error !== 'GAS_NOT_FOUND') {
+  if (
+    actionName === 'ping' &&
+    !result.success &&
+    result.error !== 'GAS_AUTH_REQUIRED' &&
+    result.error !== 'GAS_NOT_FOUND' &&
+    result.error !== 'GAS_MISSING_HANDLER'
+  ) {
     const sep = check.normalized.includes('?') ? '&' : '?';
     const getResult = await runHopChain('GET', `${check.normalized}${sep}action=ping`);
-    if (getResult.success || getResult.error === 'GAS_AUTH_REQUIRED' || getResult.error === 'GAS_NOT_FOUND') {
+    if (
+      getResult.success ||
+      getResult.error === 'GAS_AUTH_REQUIRED' ||
+      getResult.error === 'GAS_NOT_FOUND' ||
+      getResult.error === 'GAS_MISSING_HANDLER'
+    ) {
       result = getResult;
     }
   }

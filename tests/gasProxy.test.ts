@@ -152,6 +152,28 @@ test('fetchGasServerSide falls back to GET ?action=ping when POST throws network
   );
   assert.equal(htmlRes.success, false);
   assert.equal(htmlRes.error, 'HTML_RESPONSE');
+
+  const missingDoGetFetch = (async (_url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') {
+      throw new TypeError('post blocked');
+    }
+    return new Response(
+      '<!DOCTYPE html><html><head><title>Error</title></head><body><div>Script function not found: doGet</div></body></html>',
+      { status: 200 }
+    );
+  }) as unknown as typeof fetch;
+  const missingRes = await fetchGasServerSide(
+    'https://script.google.com/macros/s/AKfycbMissingDoGet/exec',
+    'ping',
+    '',
+    {},
+    missingDoGetFetch
+  );
+  assert.equal(missingRes.success, false);
+  assert.equal(missingRes.error, 'GAS_MISSING_HANDLER');
+  assert.equal(missingRes.data?.missingFunction, 'doGet');
+  assert.ok(missingRes.message.includes('Code.gs'));
+  assert.ok(missingRes.message.includes('New version'));
 });
 
 test('all google-apps-script .gs files initialize cleanly in any file order and handle doGet/doPost ping', () => {

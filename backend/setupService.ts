@@ -235,11 +235,15 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
       });
       const text = await resp.text();
       let parsed: any = null;
-      try {
-        const trimmed = String(text || '').trim();
-        if (trimmed && !trimmed.startsWith('<')) parsed = JSON.parse(trimmed);
-      } catch {
-        parsed = null;
+      const trimmed = String(text || '').trim();
+      if (crmCore && typeof crmCore.parseGasResponseText === 'function') {
+        parsed = crmCore.parseGasResponseText(trimmed, resp.status);
+      } else if (trimmed && !trimmed.startsWith('<')) {
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          parsed = null;
+        }
       }
       if (resp.ok && parsed && parsed.success) {
         autoBoundGas = true;

@@ -1786,6 +1786,24 @@
       };
     }
     if (trimmed.charAt(0) === '<' || /^<!doctype/i.test(trimmed)) {
+      var missingFnMatch = trimmed.match(/Script function not found:\s*([A-Za-z0-9_]+)/i);
+      if (missingFnMatch) {
+        var missingFn = missingFnMatch[1];
+        return {
+          success: false,
+          message: 'خطأ من Google Apps Script: الدالة (' + missingFn + ') غير موجودة في الإصدار المنشور على رابط /exec. الحل: (1) تأكد من وجود ملف google-apps-script/Code.gs كاملاً داخل مشروع Apps Script وحفظه (Ctrl+S)، (2) من المحرر اختر Deploy <- Manage deployments <- تعديل (Edit) <- Version: New version <- Deploy لأن رابط /exec لا يقرأ التعديلات بدون نشر إصدار جديد.',
+          data: { missingFunction: missingFn },
+          error: 'GAS_MISSING_HANDLER'
+        };
+      }
+      if (/accounts\.google\.com|ServiceLogin/i.test(trimmed)) {
+        return {
+          success: false,
+          message: 'الرابط محمي بحساب Google لأن خيار Who has access لم يُضبط على Anyone. من محرر Apps Script: Deploy -> Manage deployments -> Edit -> Who has access: Anyone ثم Deploy.',
+          data: null,
+          error: 'GAS_AUTH_REQUIRED'
+        };
+      }
       return {
         success: false,
         message: 'أعاد الخادم صفحة HTML بدلاً من JSON. تأكد من إعداد النشر في Google Apps Script على (Execute as: Me) و(Who has access: Anyone) واستخدام رابط /exec الصحيح.',

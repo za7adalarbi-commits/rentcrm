@@ -329,8 +329,8 @@
             '</ul>' +
           '</div>' +
           '<ol style="margin:8px 0 0;padding-inline-start:20px;font-size:12.5px;line-height:1.8;color:var(--text-secondary);">' +
-            '<li>أنشئ مشروع Apps Script (أو من داخل Google Sheet عبر <strong>Extensions → Apps Script</strong>) وارفع ملفات مجلد <span class="mono">google-apps-script/</span> + <span class="mono">appsscript.json</span>.</li>' +
-            '<li>انشر المشروع كـ <strong>Web App</strong> (Execute as: <strong>Me</strong> · Who has access: <strong>Anyone</strong>) وانسخ رابط <span class="mono">/exec</span>.</li>' +
+            '<li>أنشئ مشروع Apps Script (أو من داخل Google Sheet عبر <strong>Extensions → Apps Script</strong>) وارفع <strong>كامل</strong> ملفات مجلد <span class="mono">google-apps-script/</span> (وعلى رأسها <span class="mono">Code.gs</span> الذي يحتوي على <span class="mono">doGet</span> و<span class="mono">doPost</span>) + <span class="mono">appsscript.json</span> ثم احفظ (<span class="mono">Ctrl+S</span>).</li>' +
+            '<li>انشر المشروع كـ <strong>Web App</strong> (Execute as: <strong>Me</strong> · Who has access: <strong>Anyone</strong>) وانسخ رابط <span class="mono">/exec</span>. عند تعديل أي ملف لاحقاً اختر <strong>Deploy → Manage deployments → Edit → Version: New version → Deploy</strong> لتجنب خطأ <span class="mono" dir="ltr">Script function not found: doGet</span>.</li>' +
             '<li>أدخل رابط Neon ورابط <span class="mono">/exec</span> وتوكن <span class="mono">RG_TOKEN</span> أعلاه ثم اضغط <strong>حفظ وربط وتثبيت في الكود الأساسي</strong>.</li>' +
             '<li>بعد الربط، اضغط <strong>اختبار الاتصال</strong> ثم <strong>سحب الحجوزات الآن</strong>.</li>' +
           '</ol>' +

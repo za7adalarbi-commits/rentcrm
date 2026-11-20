@@ -289,6 +289,16 @@ test('validateGasUrl, extractGasUrlFromSearch, buildGasFetchOptions, and parseGa
   assert.equal(htmlResp.success, false);
   assert.equal(htmlResp.error, 'HTML_RESPONSE');
 
+  const missingDoGetResp = core.parseGasResponseText(
+    '<!DOCTYPE html><html><head><title>Error</title></head><body>Script function not found: doGet</body></html>',
+    200
+  );
+  assert.equal(missingDoGetResp.success, false);
+  assert.equal(missingDoGetResp.error, 'GAS_MISSING_HANDLER');
+  assert.equal(missingDoGetResp.data.missingFunction, 'doGet');
+  assert.ok(missingDoGetResp.message.includes('Code.gs'));
+  assert.ok(missingDoGetResp.message.includes('New version'));
+
   const okResp = core.parseGasResponseText('{"success":true,"message":"ok","data":{"token":"SES_1"}}', 200);
   assert.equal(okResp.success, true);
   assert.equal(okResp.data.token, 'SES_1');

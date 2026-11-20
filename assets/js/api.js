@@ -5145,6 +5145,14 @@
       if (getParsed && getParsed.success) {
         return getParsed;
       }
+      if (
+        getParsed &&
+        getParsed.success === false &&
+        getParsed.message &&
+        (!directError || !directError.error || getParsed.error === 'GAS_MISSING_HANDLER' || getParsed.error === 'GAS_AUTH_REQUIRED')
+      ) {
+        directError = getParsed;
+      }
     } catch (getErr) {
       if (getTimer) clearTimeout(getTimer);
     }
