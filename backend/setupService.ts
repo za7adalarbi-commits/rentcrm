@@ -25,6 +25,12 @@ import {
   resolveServerConfig,
   upsertServerSetting
 } from './serverConfig.js';
+import {
+  buildVercelEnvChecklist,
+  syncEnvVarsToVercel,
+  type VercelEnvChecklistItem,
+  type VercelEnvSyncResult
+} from './vercelEnv.js';
 
 export interface SetupCapabilitiesResponse {
   writableCoreFiles: boolean;
@@ -37,6 +43,12 @@ export interface SetupCapabilitiesResponse {
   rgApiBaseUrl: string;
   hasRgToken: boolean;
   hasSyncSecret: boolean;
+  hasEnvGasUrl: boolean;
+  hasEnvDatabaseUrl: boolean;
+  hasVercelToken: boolean;
+  hasVercelProjectId: boolean;
+  hasVercelDeployHook: boolean;
+  vercelProjectUrl: string;
   updatedAt: string;
   updatedBy: string;
 }
@@ -68,6 +80,10 @@ export async function getSetupCapabilities(
 
   const hasRgToken = Boolean(resolved?.rgToken || process.env.RG_TOKEN || FIXED_SERVER_CONFIG.rgToken);
   const hasSyncSecret = Boolean(resolved?.syncApiSecret || process.env.SYNC_API_SECRET || FIXED_SERVER_CONFIG.syncApiSecret);
+  const vercelHost = String(process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL || '')
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '')
+    .trim();
 
   return {
     writableCoreFiles,
@@ -80,6 +96,12 @@ export async function getSetupCapabilities(
     rgApiBaseUrl,
     hasRgToken,
     hasSyncSecret,
+    hasEnvGasUrl: Boolean(String(process.env.GAS_WEBAPP_URL || '').trim()),
+    hasEnvDatabaseUrl: Boolean(String(process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.NEON_DATABASE_URL || '').trim()),
+    hasVercelToken: Boolean(String(process.env.VERCEL_TOKEN || '').trim()),
+    hasVercelProjectId: Boolean(String(process.env.VERCEL_PROJECT_ID || '').trim()),
+    hasVercelDeployHook: Boolean(String(process.env.VERCEL_DEPLOY_HOOK_URL || '').trim()),
+    vercelProjectUrl: vercelHost ? `https://${vercelHost}` : '',
     updatedAt: FIXED_SERVER_CONFIG.updatedAt || '',
     updatedBy: FIXED_SERVER_CONFIG.updatedBy || ''
   };
@@ -92,6 +114,7 @@ export interface UnifiedSetupOptions {
   rootDir?: string;
   skipLiveDbTest?: boolean;
   wasDatabaseConfiguredBeforeRequest?: boolean;
+  fetchFn?: typeof fetch;
   ensureSeededFn?: (exec: DbExecutor) => Promise<void>;
   logActivityFn?: (exec: DbExecutor, actor: any, action: string, target: string, targetId: string, details: string) => Promise<void>;
 }
@@ -104,6 +127,9 @@ function str(v: unknown, fallback = ''): string {
 export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
   const payload = opts.payload && typeof opts.payload === 'object' ? opts.payload : {};
   const rootDir = opts.rootDir || process.cwd();
+  const fetchFn = opts.fetchFn || fetch;
+  const hadEnvGasUrlBefore = str(process.env.GAS_WEBAPP_URL);
+  const hadEnvModeBefore = normalizeMode(process.env.CONNECTION_MODE);
 
   if (opts.session) {
     requirePermission(opts.session, 'manage_settings');
@@ -218,7 +244,7 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000) : null;
     try {
-      const resp = await fetch(gasUrl, {
+      const resp = await fetchFn(gasUrl, {
         method: 'POST',
         redirect: 'follow',
         signal: ctrl?.signal,
@@ -281,6 +307,36 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
     };
   }
 
+  let vercelSync: VercelEnvSyncResult = {
+    attempted: false,
+    configured: Boolean(str(payload.vercelToken || process.env.VERCEL_TOKEN) && str(payload.vercelProjectId || process.env.VERCEL_PROJECT_ID)),
+    synced: false,
+    syncedKeys: [],
+    redeployTriggered: false,
+    projectId: str(payload.vercelProjectId || process.env.VERCEL_PROJECT_ID),
+    error: null
+  };
+
+  if (payload.syncToVercel !== false) {
+    vercelSync = await syncEnvVarsToVercel(
+      {
+        mode,
+        gasWebAppUrl: mode === 'sandbox' ? '' : gasUrl,
+        databaseUrl: nextDbUrl,
+        rgToken: nextRgToken,
+        rgApiBaseUrl: nextBaseUrl,
+        syncApiSecret: nextSyncSecret,
+        vercelToken: str(payload.vercelToken),
+        vercelProjectId: str(payload.vercelProjectId),
+        vercelTeamId: str(payload.vercelTeamId),
+        vercelDeployHookUrl: str(payload.vercelDeployHookUrl),
+        triggerDeploy: payload.vercelTriggerDeploy !== false,
+        includeDatabaseUrl: mode === 'neon'
+      },
+      fetchFn
+    );
+  }
+
   if (activeExecutor && opts.logActivityFn) {
     await opts.logActivityFn(
       activeExecutor,
@@ -288,30 +344,56 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
       'تحديث الوضع والربط الشامل',
       'Settings',
       'unified_setup',
-      `الوضع: ${mode} | قاعدة البيانات: ${databaseConnected ? 'متصلة' : 'غير مستخدمة'} | الكود الأساسي: ${persistResult.updatedFiles.length ? persistResult.updatedFiles.join(', ') : 'قاعدة البيانات فقط'}`
+      `الوضع: ${mode} | قاعدة البيانات: ${databaseConnected ? 'متصلة' : 'غير مستخدمة'} | الكود الأساسي: ${persistResult.updatedFiles.length ? persistResult.updatedFiles.join(', ') : 'قاعدة البيانات فقط'}${vercelSync.synced ? ` | Vercel: ${vercelSync.syncedKeys.join(', ')}` : ''}`
     ).catch(() => undefined);
   }
 
   const isServerlessEnv = process.env.VERCEL === '1' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
   const hadDbBeforeCall = opts.wasDatabaseConfiguredBeforeRequest ?? isDatabaseConfigured();
-  const needsVercelEnvVar = Boolean(mode === 'neon' && isServerlessEnv && !hadDbBeforeCall);
+  const vercelSyncedGas = vercelSync.synced && vercelSync.syncedKeys.includes('GAS_WEBAPP_URL');
+  const vercelSyncedDb = vercelSync.synced && vercelSync.syncedKeys.includes('DATABASE_URL');
+  const needsNeonEnv = Boolean(mode === 'neon' && isServerlessEnv && !hadDbBeforeCall && !vercelSyncedDb);
+  const needsGasEnv = Boolean(
+    mode === 'gas' &&
+    isServerlessEnv &&
+    !vercelSyncedGas &&
+    (hadEnvGasUrlBefore !== gasUrl || hadEnvModeBefore !== 'gas')
+  );
+  const needsVercelEnvVar = Boolean(needsNeonEnv || needsGasEnv);
+
+  const vercelEnvChecklist: VercelEnvChecklistItem[] = isServerlessEnv || vercelSync.configured || mode === 'gas'
+    ? buildVercelEnvChecklist({
+        mode,
+        gasWebAppUrl: mode === 'sandbox' ? '' : gasUrl,
+        databaseUrl: mode === 'neon' ? nextDbUrl : '',
+        rgToken: nextRgToken,
+        syncApiSecret: nextSyncSecret
+      })
+    : [];
 
   const summaryParts: string[] = [];
   if (mode === 'neon') {
     summaryParts.push('تم الربط بقاعدة البيانات السحابية Neon PostgreSQL');
   } else if (mode === 'gas') {
-    summaryParts.push('تم التبديل إلى وضع Google Apps Script & Google Sheets المباشر');
+    summaryParts.push('تم التبديل إلى وضع Google Apps Script & Google Sheets عبر Vercel');
   } else {
     summaryParts.push('تم التبديل إلى وضع المعاينة المحلية (Sandbox)');
   }
-  if (persistResult.updatedFiles.length > 0) {
+  if (vercelSync.synced) {
+    summaryParts.push(`وتم تحديث متغيرات بيئة Vercel تلقائيًا (${vercelSync.syncedKeys.join('، ')})${vercelSync.redeployTriggered ? ' وتشغيل إعادة النشر' : ''}`);
+  } else if (persistResult.updatedFiles.length > 0) {
     summaryParts.push(`وتثبيت الإعدادات في الكود الأساسي (${persistResult.updatedFiles.join('، ')})`);
   } else if (persistResult.readOnlyFilesystem) {
-    summaryParts.push(
-      needsVercelEnvVar
-        ? '(تم الاتصال مؤقتًا على Vercel — لتثبيت الرابط دائمًا أضف DATABASE_URL في Vercel Environment Variables ثم أعد النشر)'
-        : '(الاستضافة السحابية للقراءة فقط — تم الحفظ عالميًا في Neon لجميع المستخدمين)'
-    );
+    if (needsNeonEnv) {
+      summaryParts.push('(تم الاتصال مؤقتًا على Vercel — لتثبيت الرابط دائمًا أضف DATABASE_URL في Vercel Environment Variables ثم أعد النشر)');
+    } else if (needsGasEnv) {
+      summaryParts.push('(لتثبيت رابط Apps Script لجميع المستخدمين على Vercel أضف GAS_WEBAPP_URL وCONNECTION_MODE=gas في Vercel Environment Variables)');
+    } else if (activeExecutor) {
+      summaryParts.push('(الاستضافة السحابية للقراءة فقط — تم الحفظ عالميًا في Neon لجميع المستخدمين)');
+    }
+  }
+  if (vercelSync.attempted && vercelSync.error) {
+    summaryParts.push(`(ملاحظة Vercel: ${vercelSync.error})`);
   }
   if (autoBoundGas) {
     summaryParts.push('وربط Google Apps Script تلقائيًا');
@@ -336,6 +418,8 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
     updatedFiles: persistResult.updatedFiles,
     readOnlyFilesystem: persistResult.readOnlyFilesystem,
     needsVercelEnvVar,
+    vercelSync,
+    vercelEnvChecklist,
     generatedConfigJs: persistResult.generatedConfigJs,
     message: summaryParts.join(' ')
   };

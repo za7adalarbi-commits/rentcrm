@@ -1092,9 +1092,9 @@ export async function claimReservation(executor: DbExecutor, session: AuthSessio
            last_updated_by_id = $5,
            last_updated_by_name = $6,
            last_updated_at = $7,
-           updated_at = $7::timestamptz
+           updated_at = $8::timestamptz
        WHERE id = $1`,
-      [resId, JSON.stringify(ids), JSON.stringify(names), lastUpdateText, session.user.id, session.user.name, nowIso]
+      [resId, JSON.stringify(ids), JSON.stringify(names), lastUpdateText, session.user.id, session.user.name, nowIso, nowIso]
     );
 
     if (added) {
@@ -1231,10 +1231,10 @@ export async function quickUpdateReservationStatus(
            last_updated_by_id = $4,
            last_updated_by_name = $5,
            last_updated_at = $6,
-           updated_at = $6::timestamptz,
-           status_history = $7::jsonb
+           updated_at = $7::timestamptz,
+           status_history = $8::jsonb
        WHERE id = $1`,
-      [resId, newStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory)]
+      [resId, newStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
     );
 
     await logActivity(tx, session.user, 'تحديث حالة سريع', 'Reservation', resObj.reservationNumber, `${prevStatus} → ${newStatus}${note ? ` (${note})` : ''}`);
@@ -1363,7 +1363,7 @@ export async function updateReservationDetails(
            extensions_count = $25, base_amount = $26, extensions_amount = $27, total_amount = $28,
            has_extensions = $29, priority = $30, internal_status = $31,
            last_update_text = $32, last_updated_by_id = $33, last_updated_by_name = $34,
-           last_updated_at = $35, updated_at = $35::timestamptz, status_history = $36::jsonb
+           last_updated_at = $35, updated_at = $36::timestamptz, status_history = $37::jsonb
        WHERE id = $1`,
       [
         resId,
@@ -1401,6 +1401,7 @@ export async function updateReservationDetails(
         nextObj.lastUpdatedById,
         nextObj.lastUpdatedByName,
         nextObj.lastUpdatedAt,
+        nextObj.updatedAt,
         JSON.stringify(nextObj.statusHistory)
       ]
     );
@@ -1525,9 +1526,9 @@ export async function recordNoAnswerFollowUp(
            last_updated_by_id = $4,
            last_updated_by_name = $5,
            last_updated_at = $6,
-           updated_at = $6::timestamptz
+           updated_at = $7::timestamptz
        WHERE id = $1`,
-      [resId, nextCount, lastText, session.user.id, session.user.name, nowIso]
+      [resId, nextCount, lastText, session.user.id, session.user.name, nowIso, nowIso]
     );
 
     await logActivity(tx, session.user, 'تسجيل محاولة اتصال - لم يرد', 'FollowUp', resObj.reservationNumber, `${action}${notes ? ` — ${notes}` : ''}`);
@@ -1677,10 +1678,10 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
     await tx.query(
       `UPDATE reservations
        SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
-           last_updated_by_name = $5, last_updated_at = $6, updated_at = $6::timestamptz,
-           status_history = $7::jsonb
+           last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
+           status_history = $8::jsonb
        WHERE id = $1`,
-      [resId, status, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory)]
+      [resId, status, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
     );
 
     await logActivity(tx, session.user, 'إضافة متابعة', 'FollowUp', resObj.reservationNumber, `الحالة: ${status} — ${action}`);
@@ -1780,10 +1781,10 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
       await tx.query(
         `UPDATE reservations
          SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
-             last_updated_by_name = $5, last_updated_at = $6, updated_at = $6::timestamptz,
-             status_history = $7::jsonb
+             last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
+             status_history = $8::jsonb
          WHERE id = $1`,
-        [rObj.id, newStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory)]
+        [rObj.id, newStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
       );
     }
 
@@ -1866,9 +1867,9 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
       `UPDATE reservations
        SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb,
            last_update_text = $4, last_updated_by_id = $5, last_updated_by_name = $6,
-           last_updated_at = $7, updated_at = $7::timestamptz
+           last_updated_at = $7, updated_at = $8::timestamptz
        WHERE id = $1`,
-      [resId, JSON.stringify(mergedIds), JSON.stringify(mergedNames), lastText, session.user.id, session.user.name, nowIso]
+      [resId, JSON.stringify(mergedIds), JSON.stringify(mergedNames), lastText, session.user.id, session.user.name, nowIso, nowIso]
     );
 
     await logActivity(tx, session.user, 'إسناد موظفين', 'Reservation', resObj.reservationNumber, lastText);
@@ -2465,13 +2466,13 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
 
     await tx.query(
       `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11,$11::timestamptz,$11::timestamptz)`,
-      [id, name, username, pHash, salt, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso]
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11,$12::timestamptz,$12::timestamptz)`,
+      [id, name, username, pHash, salt, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso, nowIso]
     );
     await tx.query(
       `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'active',$9,$9::timestamptz,$9::timestamptz)`,
-      [id, name, username, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso]
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'active',$9,$10::timestamptz,$10::timestamptz)`,
+      [id, name, username, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso, nowIso]
     );
 
     await logActivity(tx, session.user, 'إضافة موظف', 'Employee', username, `إضافة ${name} بدور ${role}`);

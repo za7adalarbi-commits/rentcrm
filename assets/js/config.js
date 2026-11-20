@@ -6,8 +6,8 @@
 (function (root) {
   'use strict';
   root.RG_APP_CONFIG = Object.assign({
-    mode: '',
+    mode: 'neon',
     gasWebAppUrl: '',
-    backendApiUrl: ''
+    backendApiUrl: '/api/crm'
   }, root.RG_APP_CONFIG || {});
 })(typeof window !== 'undefined' ? window : globalThis);

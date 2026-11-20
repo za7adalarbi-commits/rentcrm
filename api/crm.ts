@@ -16,6 +16,24 @@ import { ensureSeededDatabase, logActivity } from '../backend/queries.js';
 import { dispatchCrmRequest } from '../backend/router.js';
 import { applyUnifiedConnectionSetup, getSetupCapabilities } from '../backend/setupService.js';
 import { fetchGasServerSide } from '../backend/gasProxy.js';
+import { FIXED_SERVER_CONFIG } from '../backend/fixedConfig.js';
+import { resolveServerConfig } from '../backend/serverConfig.js';
+
+async function resolveServerFallbackGasUrl(explicitUrl: unknown): Promise<string> {
+  const direct = String(explicitUrl || '').trim();
+  if (direct) return direct;
+  const envUrl = String(process.env.GAS_WEBAPP_URL || FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
+  if (envUrl) return envUrl;
+  if (isDatabaseConfigured()) {
+    try {
+      const cfg = await resolveServerConfig(createPgExecutor());
+      if (cfg.gasWebAppUrl) return cfg.gasWebAppUrl;
+    } catch {
+      // Non-fatal fallback
+    }
+  }
+  return '';
+}
 
 function parseBody(rawBody: any): Record<string, any> {
   if (!rawBody) return {};
@@ -107,7 +125,8 @@ export default async function handler(req: any, res: any) {
     }
 
     if (action === 'pingGasUrl') {
-      const pingRes = await fetchGasServerSide(String(payload.gasUrl || ''), 'ping', '', {});
+      const targetGasUrl = await resolveServerFallbackGasUrl(payload.gasUrl);
+      const pingRes = await fetchGasServerSide(targetGasUrl, 'ping', '', {});
       res.status(200).json(pingRes);
       return;
     }
@@ -118,8 +137,9 @@ export default async function handler(req: any, res: any) {
         res.status(200).json({ success: false, message: 'إجراء Google Apps Script مطلوب.', data: null, error: 'MISSING_ACTION' });
         return;
       }
+      const targetGasUrl = await resolveServerFallbackGasUrl(payload.gasUrl);
       const proxyRes = await fetchGasServerSide(
-        String(payload.gasUrl || ''),
+        targetGasUrl,
         targetAction,
         String(payload.token || token || ''),
         (payload.payload && typeof payload.payload === 'object') ? payload.payload : {}

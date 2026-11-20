@@ -15,7 +15,7 @@ export interface FixedServerConfig {
 }
 
 export const FIXED_SERVER_CONFIG: FixedServerConfig = {
-  mode: '',
+  mode: 'neon',
   databaseUrl: '',
   gasWebAppUrl: '',
   rgToken: '',

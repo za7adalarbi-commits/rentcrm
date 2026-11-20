@@ -36,6 +36,8 @@
   var detectedBackendUrl = '';
   var detectedGasUrl = '';
   var detectedMode = '';
+  var detectedBackendProxyAvailable = false;
+  var detectedEnvGasConfigured = false;
   var backendProbeDone = false;
   var backendProbePromise = null;
 
@@ -162,6 +164,8 @@
             }
           }
           if (json && json.ok) {
+            detectedBackendProxyAvailable = Boolean(json.serverlessProxyAvailable !== false);
+            detectedEnvGasConfigured = Boolean(json.envGasConfigured);
             if (json.mode) {
               detectedMode = String(json.mode || '').trim().toLowerCase();
             }
@@ -4650,7 +4654,8 @@
     await probeBackendHealth();
     var backendUrl = getBackendApiUrl();
     var gasUrl = backendUrl ? '' : getGasUrl();
-    var transportUrl = backendUrl || gasUrl;
+    var useServerGasFallback = Boolean(!backendUrl && !gasUrl && getConfiguredMode() === 'gas' && detectedBackendProxyAvailable && detectedEnvGasConfigured);
+    var transportUrl = backendUrl || gasUrl || (useServerGasFallback ? 'vercel://gas-proxy' : '');
     var token = getToken();
     var core = root.RGCrmCore;
     var ns = getCacheNamespace();
@@ -4777,7 +4782,7 @@
           };
         }
       } else {
-        if (core && core.validateGasUrl) {
+        if (gasUrl && core && core.validateGasUrl) {
           var check = core.validateGasUrl(gasUrl);
           if (!check.valid) {
             return {
@@ -4791,7 +4796,7 @@
 
         var isGasSyncDiag = action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus';
         var timeoutId = null;
-        var cleanGasUrl = (core && core.validateGasUrl) ? core.validateGasUrl(gasUrl).normalized : gasUrl;
+        var cleanGasUrl = (gasUrl && core && core.validateGasUrl) ? core.validateGasUrl(gasUrl).normalized : (gasUrl || '');
         var compactPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
 
         var tryGasProxyFallback = async function () {
@@ -4803,18 +4808,26 @@
             payload: compactPayload
           });
           if (!proxyRes || proxyRes.staticHostOnly) return null;
-          if (proxyRes.success || (proxyRes.error && proxyRes.error !== 'NETWORK_ERROR' && proxyRes.error !== 'BACKEND_NOT_FOUND')) {
+          if (cleanGasUrl && (proxyRes.success || (proxyRes.error && proxyRes.error !== 'NETWORK_ERROR' && proxyRes.error !== 'BACKEND_NOT_FOUND'))) {
             gasServerProxyUrls[cleanGasUrl] = true;
           }
           return proxyRes;
         };
 
         try {
-          if (gasServerProxyUrls[cleanGasUrl]) {
+          if (detectedBackendProxyAvailable || !cleanGasUrl || gasServerProxyUrls[cleanGasUrl]) {
             var directProxyRes = await tryGasProxyFallback();
             if (directProxyRes) {
               parsed = directProxyRes;
             }
+          }
+          if (!parsed && !cleanGasUrl) {
+            return {
+              success: false,
+              message: 'رابط Google Apps Script غير مضبوط على وسيط Vercel بعد.',
+              data: null,
+              error: 'MISSING_GAS_URL'
+            };
           }
           if (!parsed) {
             var opts = (core && core.buildGasFetchOptions)
@@ -5222,12 +5235,13 @@
       var nextMode = String(res.data.mode || '').trim().toLowerCase();
       var nextGas = String(res.data.gasWebAppUrl || '').trim();
       var nextBackend = nextMode === 'neon' ? '/api/crm' : '';
+      var persistGasInBrowser = Boolean(nextMode === 'gas' && nextGas && res.data.readOnlyFilesystem && !res.data.coreFilesUpdated);
       root.RG_APP_CONFIG = Object.assign(root.RG_APP_CONFIG || {}, {
         mode: nextMode,
         gasWebAppUrl: nextGas,
         backendApiUrl: nextBackend
       });
-      safeStorageSet(STORAGE_GAS_URL, nextMode === 'sandbox' ? SANDBOX_SENTINEL : '');
+      safeStorageSet(STORAGE_GAS_URL, nextMode === 'sandbox' ? SANDBOX_SENTINEL : (persistGasInBrowser ? nextGas : ''));
       safeStorageSet(STORAGE_BACKEND_URL, '');
       if (nextMode !== 'sandbox' && typeof window !== 'undefined' && window.history && typeof window.history.replaceState === 'function' && window.location && window.location.search) {
         try {
@@ -5244,6 +5258,12 @@
       _cachedConnInfo = null;
       clearCache();
       await refreshGlobalConnection().catch(function () {});
+      if (persistGasInBrowser) {
+        detectedMode = 'gas';
+        detectedGasUrl = nextGas;
+        detectedBackendUrl = '';
+        _cachedConnInfo = null;
+      }
     }
     return res;
   }
@@ -5254,6 +5274,7 @@
     getBackendApiUrl: getBackendApiUrl,
     getActiveMode: getConfiguredMode,
     isBackendConnected: function () { return Boolean(getBackendApiUrl()); },
+    isVercelProxyAvailable: function () { return Boolean(detectedBackendProxyAvailable); },
     refreshGlobalConnection: refreshGlobalConnection,
     getSetupCapabilities: getSetupCapabilities,
     applyUnifiedSetup: applyUnifiedSetup,

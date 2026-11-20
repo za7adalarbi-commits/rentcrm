@@ -21,6 +21,7 @@ import {
   ingestIncrementalSyncBatch,
   pullFromRentalGateDirect
 } from '../backend/syncService';
+import { buildVercelEnvChecklist, syncEnvVarsToVercel } from '../backend/vercelEnv';
 
 function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[]> } {
   const state: Record<string, any[]> = {
@@ -607,8 +608,8 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
         r.last_updated_by_id = params[3];
         r.last_updated_by_name = params[4];
         r.last_updated_at = params[5];
-        r.updated_at = new Date(params[5]);
-        r.status_history = JSON.parse(params[6]);
+        r.updated_at = new Date(params[6]);
+        r.status_history = JSON.parse(params[7]);
       }
       return { rows: [], rowCount: 1 };
     }
@@ -650,8 +651,8 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
         r.last_updated_by_id = params[32];
         r.last_updated_by_name = params[33];
         r.last_updated_at = params[34];
-        r.updated_at = new Date(params[34]);
-        r.status_history = JSON.parse(params[35]);
+        r.updated_at = new Date(params[35]);
+        r.status_history = JSON.parse(params[36]);
       }
       return { rows: [], rowCount: r ? 1 : 0 };
     }
@@ -2323,8 +2324,255 @@ test('backend updateSettings supports minutes interval and deleteAllReservations
   assert.ok(db.state.sheets_mirror_outbox.some((m) => m.action === 'deleteAllReservations'));
 });
 
+test('no SQL query in backend/ or api/ mixes inconsistent type casts for the same parameter placeholder', () => {
+  const dirs = ['backend', 'api'].map((d) => path.resolve(process.cwd(), d));
+  const conflicts: string[] = [];
 
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.ts'))) {
+      const fullPath = path.join(dir, file);
+      const src = fs.readFileSync(fullPath, 'utf8');
+      const sqlBlocks = [...src.matchAll(/`([^`]*(?:\$\d+|\$\{[^}]+\})[^`]*)`/g)];
+      for (const m of sqlBlocks) {
+        const sql = m[1];
+        if (!/(SELECT|INSERT|UPDATE|DELETE|WITH|VALUES)\b/i.test(sql)) continue;
+        const formsByParam: Record<string, Set<string>> = {};
+        for (const pm of sql.matchAll(/((?:\$\d+|\$\{[^}]+\})(?:\s*::\s*[a-z0-9_]+(?:\[\])?)?)/gi)) {
+          const clean = pm[1].replace(/\s+/g, '').toLowerCase();
+          const baseMatch = clean.match(/^(\$\d+|\$\{[^}]+\})/);
+          if (!baseMatch) continue;
+          const base = baseMatch[1];
+          const cast = clean.includes('::') ? clean.slice(base.length + 2) : '<untyped>';
+          if (!formsByParam[base]) formsByParam[base] = new Set();
+          formsByParam[base].add(cast);
+        }
+        for (const [param, casts] of Object.entries(formsByParam)) {
+          if (casts.size > 1) {
+            const lineNum = src.slice(0, m.index || 0).split('\n').length;
+            conflicts.push(`${path.basename(dir)}/${file}:${lineNum} ${param} -> [${[...casts].join(', ')}]`);
+          }
+        }
+      }
+    }
+  }
 
+  assert.deepEqual(conflicts, []);
+});
 
+test('serverConfig prefers DB-saved gas_webapp_url over stale env GAS_WEBAPP_URL and clears in sandbox mode', async () => {
+  const prevEnvGas = process.env.GAS_WEBAPP_URL;
+  const prevFixedGas = FIXED_SERVER_CONFIG.gasWebAppUrl;
+  const prevDb = process.env.DATABASE_URL;
+  process.env.GAS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbOldEnvUrl12345/exec';
+  process.env.DATABASE_URL = 'postgresql://user:pass@ep-demo.aws.neon.tech/neondb?sslmode=require';
+  FIXED_SERVER_CONFIG.gasWebAppUrl = '';
 
+  try {
+    const db = createInMemoryMockExecutor();
+    db.state.settings.push(
+      { key: 'connection_mode', value: 'gas' },
+      { key: 'gas_webapp_url', value: 'https://script.google.com/macros/s/AKfycbNewDbUrl67890/exec' }
+    );
 
+    const cfg = await resolveServerConfig(db);
+    assert.equal(cfg.mode, 'gas');
+    assert.equal(cfg.gasWebAppUrl, 'https://script.google.com/macros/s/AKfycbNewDbUrl67890/exec');
+
+    const healthAuto = await readPublicHealthAutoBind(db);
+    assert.equal(healthAuto.mode, 'gas');
+    assert.equal(healthAuto.gasWebAppUrl, 'https://script.google.com/macros/s/AKfycbNewDbUrl67890/exec');
+
+    // Sandbox clears gasWebAppUrl
+    const modeRow = db.state.settings.find((s) => s.key === 'connection_mode');
+    if (modeRow) modeRow.value = 'sandbox';
+    const sandboxCfg = await resolveServerConfig(db);
+    assert.equal(sandboxCfg.mode, 'sandbox');
+    assert.equal(sandboxCfg.gasWebAppUrl, '');
+  } finally {
+    if (prevEnvGas !== undefined) process.env.GAS_WEBAPP_URL = prevEnvGas;
+    else delete process.env.GAS_WEBAPP_URL;
+    if (prevDb !== undefined) process.env.DATABASE_URL = prevDb;
+    else delete process.env.DATABASE_URL;
+    FIXED_SERVER_CONFIG.gasWebAppUrl = prevFixedGas;
+  }
+});
+
+test('vercelEnv upserts GAS_WEBAPP_URL & CONNECTION_MODE through Vercel REST API and setupService integrates seamlessly', async () => {
+  const prevVercel = process.env.VERCEL;
+  const prevGasEnv = process.env.GAS_WEBAPP_URL;
+  const prevModeEnv = process.env.CONNECTION_MODE;
+  const prevFixedMode = FIXED_SERVER_CONFIG.mode;
+  const prevFixedGas = FIXED_SERVER_CONFIG.gasWebAppUrl;
+  const prevFixedDb = FIXED_SERVER_CONFIG.databaseUrl;
+
+  process.env.VERCEL = '1';
+  delete process.env.GAS_WEBAPP_URL;
+  delete process.env.CONNECTION_MODE;
+
+  const gasTarget = 'https://script.google.com/macros/s/AKfycbVercelGasTest12345/exec';
+  const requests: Array<{ url: string; method: string; headers: any; body: any }> = [];
+
+  const mockFetch = (async (url: any, init: any) => {
+    const u = String(url);
+    const parsedBody = init?.body ? JSON.parse(String(init.body)) : null;
+    requests.push({ url: u, method: String(init?.method || 'GET'), headers: init?.headers || {}, body: parsedBody });
+    if (u.startsWith('https://api.vercel.com/v10/projects/')) {
+      return new Response(JSON.stringify({ created: { key: parsedBody?.key } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    if (u.startsWith('https://api.vercel.com/v1/integrations/deploy/')) {
+      return new Response(JSON.stringify({ job: { id: 'dep_123' } }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    if (u === gasTarget) {
+      return new Response(JSON.stringify({ success: true, message: 'bound', data: { ok: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    return new Response('{}', { status: 404 });
+  }) as any;
+
+  try {
+    // 1. Direct vercelEnv helper syncs GAS_WEBAPP_URL + CONNECTION_MODE + triggers deploy hook
+    const directSync = await syncEnvVarsToVercel(
+      {
+        mode: 'gas',
+        gasWebAppUrl: gasTarget,
+        rgToken: 'rg_secret_token_abc',
+        vercelToken: 'vrc_tok_demo',
+        vercelProjectId: 'prj_demo_123',
+        vercelTeamId: 'team_demo_99',
+        vercelDeployHookUrl: 'https://api.vercel.com/v1/integrations/deploy/prj_demo_123/hookxyz'
+      },
+      mockFetch
+    );
+    assert.equal(directSync.attempted, true);
+    assert.equal(directSync.synced, true);
+    assert.equal(directSync.redeployTriggered, true);
+    assert.deepEqual(directSync.syncedKeys, ['CONNECTION_MODE', 'GAS_WEBAPP_URL', 'RG_TOKEN']);
+    const gasPost = requests.find((r) => r.body?.key === 'GAS_WEBAPP_URL');
+    assert.ok(gasPost);
+    assert.equal(gasPost.url, 'https://api.vercel.com/v10/projects/prj_demo_123/env?upsert=true&teamId=team_demo_99');
+    assert.equal(gasPost.body.value, gasTarget);
+    assert.equal(gasPost.body.type, 'plain');
+    const tokPost = requests.find((r) => r.body?.key === 'RG_TOKEN');
+    assert.equal(tokPost?.body?.type, 'encrypted');
+
+    // 2. setupService in GAS mode on Vercel without VERCEL_TOKEN reports needsVercelEnvVar + checklist
+    const checklistSetup = await applyUnifiedConnectionSetup({
+      skipLiveDbTest: true,
+      fetchFn: mockFetch,
+      payload: {
+        mode: 'gas',
+        gasWebAppUrl: gasTarget,
+        persistCoreFiles: false
+      }
+    });
+    assert.equal(checklistSetup.saved, true);
+    assert.equal(checklistSetup.mode, 'gas');
+    assert.equal(checklistSetup.needsVercelEnvVar, true);
+    assert.equal(checklistSetup.vercelEnvChecklist.some((x) => x.key === 'GAS_WEBAPP_URL' && x.value === gasTarget), true);
+    assert.equal(checklistSetup.vercelEnvChecklist.some((x) => x.key === 'CONNECTION_MODE' && x.value === 'gas'), true);
+
+    // 3. setupService in GAS mode with VERCEL_TOKEN + VERCEL_PROJECT_ID clears needsVercelEnvVar automatically
+    delete process.env.GAS_WEBAPP_URL;
+    const syncedSetup = await applyUnifiedConnectionSetup({
+      skipLiveDbTest: true,
+      fetchFn: mockFetch,
+      payload: {
+        mode: 'gas',
+        gasWebAppUrl: gasTarget,
+        vercelToken: 'vrc_tok_demo',
+        vercelProjectId: 'prj_demo_123',
+        persistCoreFiles: false
+      }
+    });
+    assert.equal(syncedSetup.saved, true);
+    assert.equal(syncedSetup.vercelSync.synced, true);
+    assert.equal(syncedSetup.needsVercelEnvVar, false);
+
+    // Checklist never includes raw sensitive secrets
+    const cl = buildVercelEnvChecklist({
+      mode: 'gas',
+      gasWebAppUrl: gasTarget,
+      rgToken: 'super_secret_token_never_leak'
+    });
+    const rgItem = cl.find((x) => x.key === 'RG_TOKEN');
+    assert.equal(rgItem?.sensitive, true);
+    assert.equal(rgItem?.value, '');
+  } finally {
+    if (prevVercel !== undefined) process.env.VERCEL = prevVercel;
+    else delete process.env.VERCEL;
+    if (prevGasEnv !== undefined) process.env.GAS_WEBAPP_URL = prevGasEnv;
+    else delete process.env.GAS_WEBAPP_URL;
+    if (prevModeEnv !== undefined) process.env.CONNECTION_MODE = prevModeEnv;
+    else delete process.env.CONNECTION_MODE;
+    FIXED_SERVER_CONFIG.mode = prevFixedMode;
+    FIXED_SERVER_CONFIG.gasWebAppUrl = prevFixedGas;
+    FIXED_SERVER_CONFIG.databaseUrl = prevFixedDb;
+  }
+});
+
+test('/api/health and /api/crm resolve server-side GAS_WEBAPP_URL fallback cleanly when payload.gasUrl is omitted', async () => {
+  const prevGas = process.env.GAS_WEBAPP_URL;
+  const prevMode = process.env.CONNECTION_MODE;
+  const prevDb = process.env.DATABASE_URL;
+  const prevFixedGas = FIXED_SERVER_CONFIG.gasWebAppUrl;
+  const prevFixedDb = FIXED_SERVER_CONFIG.databaseUrl;
+
+  const makeMockRes = () => {
+    const out: { statusCode: number; body: any } = { statusCode: 200, body: undefined };
+    const res: any = {
+      headersSent: false,
+      status(code: number) { out.statusCode = code; return res; },
+      json(payload: any) { out.body = payload; res.headersSent = true; return res; },
+      end() { res.headersSent = true; return res; }
+    };
+    return { res, out };
+  };
+
+  try {
+    delete process.env.DATABASE_URL;
+    FIXED_SERVER_CONFIG.databaseUrl = '';
+    process.env.CONNECTION_MODE = 'gas';
+    process.env.GAS_WEBAPP_URL = 'https://invalid-unconfigured-domain.example.com/exec';
+
+    const { default: healthHandler } = await import('../api/health.js');
+    const healthMock = makeMockRes();
+    await healthHandler({ method: 'GET', headers: {} }, healthMock.res);
+    assert.equal(healthMock.out.statusCode, 200);
+    assert.equal(healthMock.out.body.ok, true);
+    assert.equal(healthMock.out.body.serverlessProxyAvailable, true);
+    assert.equal(healthMock.out.body.envGasConfigured, true);
+    assert.equal(healthMock.out.body.gasWebAppUrl, 'https://invalid-unconfigured-domain.example.com/exec');
+
+    const { default: crmHandler } = await import('../api/crm.js');
+    // Omitting payload.gasUrl triggers server fallback lookup -> validates server GAS URL instead of complaining empty URL
+    const pingFallbackMock = makeMockRes();
+    await crmHandler({
+      method: 'POST',
+      headers: {},
+      body: { action: 'pingGasUrl', payload: {} }
+    }, pingFallbackMock.res);
+    assert.equal(pingFallbackMock.out.statusCode, 200);
+    assert.equal(pingFallbackMock.out.body.success, false);
+    // Validates against host check rather than returning empty-URL error -> proves server GAS_WEBAPP_URL was resolved!
+    assert.equal(pingFallbackMock.out.body.error, 'INVALID_GAS_URL');
+    assert.ok(String(pingFallbackMock.out.body.message).includes('script.google.com'));
+  } finally {
+    if (prevGas !== undefined) process.env.GAS_WEBAPP_URL = prevGas;
+    else delete process.env.GAS_WEBAPP_URL;
+    if (prevMode !== undefined) process.env.CONNECTION_MODE = prevMode;
+    else delete process.env.CONNECTION_MODE;
+    if (prevDb !== undefined) process.env.DATABASE_URL = prevDb;
+    else delete process.env.DATABASE_URL;
+    FIXED_SERVER_CONFIG.gasWebAppUrl = prevFixedGas;
+    FIXED_SERVER_CONFIG.databaseUrl = prevFixedDb;
+  }
+});

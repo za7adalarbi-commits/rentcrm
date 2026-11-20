@@ -189,6 +189,10 @@
     var hasSyncSecret = Boolean(settings.hasSyncSecret || caps.hasSyncSecret);
     var writableCoreFiles = settings.writableCoreFiles !== undefined ? Boolean(settings.writableCoreFiles) : (caps.writableCoreFiles !== false);
     var currentRgBaseUrl = String(settings.rg_api_base_url || caps.rgApiBaseUrl || 'https://api.rentalgate.net/api').trim();
+    var isVercelServerless = Boolean(caps.isServerless);
+    var isVercelProxyAlive = Boolean(isVercelServerless || (root.RGApi && root.RGApi.isVercelProxyAvailable && root.RGApi.isVercelProxyAvailable()));
+    var hasEnvGasUrl = Boolean(caps.hasEnvGasUrl);
+    var hasVercelCredsConfigured = Boolean(caps.hasVercelToken && caps.hasVercelProjectId);
 
     var sourceLabels = {
       global_config: 'ربط تلقائي ثابت في الكود الأساسي (config.js / قاعدة البيانات)',
@@ -198,8 +202,8 @@
       sandbox: 'وضع المعاينة المحلية (Sandbox)'
     };
     var connModeSubtitle = isBackendConnected
-      ? ('الوضع الحالي: <strong>متصل بقاعدة البيانات السحابية (Neon PostgreSQL)</strong> · الكود الأساسي: <strong>' + (writableCoreFiles ? 'قابل للتعديل والتثبيت التلقائي' : 'استضافة سحابية (Neon العالمية)') + '</strong>')
-      : ('الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل بـ Google Apps Script & Google Sheets' : 'وضع المعاينة المحلية (Sandbox)') + '</strong> · المصدر: <strong>' + (sourceLabels[connInfo.source] || connInfo.source || 'تلقائي') + '</strong>');
+      ? ('الوضع الحالي: <strong>متصل بقاعدة البيانات السحابية (Neon PostgreSQL)</strong> · وسيط Vercel: <strong>' + (isVercelProxyAlive ? 'مفعّل (/api/crm)' : 'استضافة محلية/ثابتة') + '</strong>')
+      : ('الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل بـ Google Apps Script عبر وسيط Vercel (/api/crm)' : 'وضع المعاينة المحلية (Sandbox)') + '</strong> · المصدر: <strong>' + (sourceLabels[connInfo.source] || connInfo.source || 'تلقائي') + '</strong>');
 
     var isGeneralManager = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
@@ -228,16 +232,16 @@
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div>' +
-            '<h2 class="section-title">مركز الوضع والربط الشامل (تثبيت تلقائي في الكود الأساسي)</h2>' +
+            '<h2 class="section-title">مركز الوضع والربط الشامل (Vercel + Google Apps Script + Neon)</h2>' +
             '<p class="section-subtitle">' + connModeSubtitle + '</p>' +
           '</div>' +
         '</div>' +
 
-        '<div class="detail-summary-grid" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));">' +
-          '<div class="detail-kv"><span class="detail-k">وضع التشغيل الحالي</span><span class="detail-v">' + (activeMode === 'neon' ? 'Neon PostgreSQL + Apps Script' : (activeMode === 'gas' ? 'Google Apps Script مباشر' : 'وضع المعاينة المحلية')) + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">قاعدة البيانات (Neon)</span><span class="detail-v" style="font-size:12.5px;overflow-wrap:anywhere;">' + (hasDatabaseUrl ? ('متصلة <span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-secondary);">(' + escapeHtml((maskedDbUrl || '').replace(/^postgres(ql)?:\/\/\*\*\*@/i, '')) + ')</span>') : 'غير مربوطة بعد') + '</span></div>' +
+        '<div class="detail-summary-grid" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">' +
+          '<div class="detail-kv"><span class="detail-k">وضع التشغيل الحالي</span><span class="detail-v">' + (activeMode === 'neon' ? 'Neon PostgreSQL + Apps Script' : (activeMode === 'gas' ? 'Apps Script عبر وسيط Vercel' : 'وضع المعاينة المحلية')) + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">وسيط Vercel (/api/crm)</span><span class="detail-v">' + (isVercelProxyAlive ? (hasEnvGasUrl ? 'مفعّل + GAS_WEBAPP_URL مضبوط' : 'مفعّل وجاهز لتمرير /exec') : 'استضافة بدون خادم Vercel') + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">قاعدة البيانات (Neon)</span><span class="detail-v" style="font-size:12.5px;overflow-wrap:anywhere;">' + (hasDatabaseUrl ? ('متصلة <span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-secondary);">(' + escapeHtml((maskedDbUrl || '').replace(/^postgres(ql)?:\/\/\*\*\*@/i, '')) + ')</span>') : 'غير مربوطة (وضع Apps Script فقط)') + '</span></div>' +
           '<div class="detail-kv"><span class="detail-k">توكن Rental Gate</span><span class="detail-v">' + (hasRgToken ? 'محفوظ ومشفر' : 'غير محفوظ بعد') + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">تثبيت الكود الأساسي</span><span class="detail-v">' + (writableCoreFiles ? 'مفعل (config.js + fixedConfig.ts)' : 'حفظ عالمي في Neon') + '</span></div>' +
         '</div>' +
 
         '<div class="form-grid-2">' +
@@ -302,12 +306,37 @@
               '<span>تعديل وتثبيت الإعدادات في الكود الأساسي لتصبح ثابتة دائمًا:</span>' +
               '<span class="mono" dir="ltr" style="font-size:12px;color:var(--text-secondary);">assets/js/config.js · backend/fixedConfig.ts · .env</span>' +
             '</label>' +
-          '</div>'
+          '</div>' +
+          '<details id="setup-vercel-details" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);"' + (isVercelServerless ? ' open' : '') + '>' +
+            '<summary style="cursor:pointer;font-weight:700;font-size:13px;">تثبيت رابط Google Apps Script ومتغيرات البيئة عبر Vercel (' + (hasVercelCredsConfigured ? 'بيانات Vercel مضبوطة على الخادم' : 'تحديث متغيرات Vercel تلقائيًا أو يدويًا') + ')</summary>' +
+            '<div style="font-size:12px;color:var(--text-secondary);margin:8px 0;line-height:1.65;">عند التفعيل على Vercel تمر جميع طلبات <span class="mono" dir="ltr">/exec</span> عبر وسيط <span class="mono" dir="ltr">/api/crm</span> لتفادي حظر CORS وتكتم الرابط. يمكنك إدخال معرف المشروع والتوكن لحفظ <span class="mono" dir="ltr">GAS_WEBAPP_URL</span> و<span class="mono" dir="ltr">CONNECTION_MODE</span> مباشرة في Vercel أو نسخها من التقرير بعد الحفظ.</div>' +
+            '<div class="form-grid-2">' +
+              '<div class="form-group">' +
+                '<label class="form-label" for="setup-vercel-project-id">معرف مشروع Vercel (VERCEL_PROJECT_ID)</label>' +
+                '<input type="text" class="input mono" id="setup-vercel-project-id" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (caps.hasVercelProjectId ? 'محفوظ على الخادم — اتركه فارغًا للإبقاء عليه' : 'prj_xxxxxxxxxxxxxxxxx') + '">' +
+              '</div>' +
+              '<div class="form-group">' +
+                '<label class="form-label" for="setup-vercel-token">توكن Vercel API (VERCEL_TOKEN)</label>' +
+                '<div class="password-field-wrap">' +
+                  '<input type="password" class="input mono" id="setup-vercel-token" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (caps.hasVercelToken ? 'محفوظ على الخادم — اتركه فارغًا للإبقاء عليه' : 'اختياري لتحديث متغيرات Vercel تلقائيًا') + '">' +
+                  '<button type="button" class="password-toggle-btn" id="toggle-setup-vercel-token" aria-label="إظهار توكن Vercel">إظهار</button>' +
+                '</div>' +
+              '</div>' +
+              '<div class="form-group">' +
+                '<label class="form-label" for="setup-vercel-team-id">معرف الفريق في Vercel (VERCEL_TEAM_ID — اختياري)</label>' +
+                '<input type="text" class="input mono" id="setup-vercel-team-id" dir="ltr" autocomplete="off" spellcheck="false" placeholder="team_... (اتركه فارغًا للحساب الشخصي)">' +
+              '</div>' +
+              '<div class="form-group">' +
+                '<label class="form-label" for="setup-vercel-deploy-hook">رابط إعادة النشر التلقائي (VERCEL_DEPLOY_HOOK_URL — اختياري)</label>' +
+                '<input type="url" class="input mono" id="setup-vercel-deploy-hook" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (caps.hasVercelDeployHook ? 'محفوظ على الخادم' : 'https://api.vercel.com/v1/integrations/deploy/...') + '">' +
+              '</div>' +
+            '</div>' +
+          '</details>'
         ) : '') +
 
         '<div class="toolbar-row" style="margin-top:12px;margin-bottom:0;flex-wrap:wrap;">' +
-          '<button type="button" class="btn btn-primary" id="btn-save-gas-url">حفظ وربط وتثبيت في الكود الأساسي</button>' +
-          '<button type="button" class="btn" id="btn-ping-gas-url">فحص رابط Apps Script</button>' +
+          '<button type="button" class="btn btn-primary" id="btn-save-gas-url">حفظ وربط وتثبيت الإعدادات</button>' +
+          '<button type="button" class="btn" id="btn-ping-gas-url">فحص رابط Apps Script عبر الخادم</button>' +
           '<button type="button" class="btn btn-charcoal" id="btn-copy-autoconnect-link">نسخ رابط الربط التلقائي للفريق</button>' +
           (!isBackendConnected && connInfo.defaultUrl && (connInfo.source === 'local_storage' || connInfo.source === 'local_sandbox') ? '<button type="button" class="btn" id="btn-restore-global-gas">استعادة الربط التلقائي العام</button>' : '') +
           '<button type="button" class="btn btn-danger" id="btn-clear-gas-url">العودة لوضع المعاينة</button>' +
@@ -525,6 +554,7 @@
     bindPasswordToggle('setup-rg-token', 'toggle-setup-rg-token');
     bindPasswordToggle('setup-sync-secret', 'toggle-setup-sync-secret');
     bindPasswordToggle('setup-admin-password', 'toggle-setup-admin-password');
+    bindPasswordToggle('setup-vercel-token', 'toggle-setup-vercel-token');
     bindPasswordToggle('set-rg-token', 'toggle-rg-token');
 
     var saveGasBtn = document.getElementById('btn-save-gas-url');
@@ -541,6 +571,14 @@
       var rgBaseVal = rgBaseEl ? rgBaseEl.value.trim() : '';
       var syncSecretEl = document.getElementById('setup-sync-secret');
       var syncSecretVal = syncSecretEl ? syncSecretEl.value.trim() : '';
+      var vercelProjEl = document.getElementById('setup-vercel-project-id');
+      var vercelProjVal = vercelProjEl ? vercelProjEl.value.trim() : '';
+      var vercelTokEl = document.getElementById('setup-vercel-token');
+      var vercelTokVal = vercelTokEl ? vercelTokEl.value.trim() : '';
+      var vercelTeamEl = document.getElementById('setup-vercel-team-id');
+      var vercelTeamVal = vercelTeamEl ? vercelTeamEl.value.trim() : '';
+      var vercelHookEl = document.getElementById('setup-vercel-deploy-hook');
+      var vercelHookVal = vercelHookEl ? vercelHookEl.value.trim() : '';
       var adminVerifyWrap = document.getElementById('setup-admin-verify-wrap');
       var adminUserEl = document.getElementById('setup-admin-username');
       var adminPwdEl = document.getElementById('setup-admin-password');
@@ -576,7 +614,7 @@
 
       runWithLock(saveGasBtn, 'applyUnifiedSetup', async function () {
         var prevText = saveGasBtn.textContent;
-        saveGasBtn.textContent = 'جاري الاختبار والربط وتثبيت الكود...';
+        saveGasBtn.textContent = 'جاري الاختبار والربط...';
         try {
           if (root.RGApi.applyUnifiedSetup) {
             var res = await root.RGApi.applyUnifiedSetup({
@@ -587,6 +625,10 @@
               rgToken: rgTokVal,
               rgApiBaseUrl: rgBaseVal,
               syncApiSecret: syncSecretVal,
+              vercelProjectId: vercelProjVal,
+              vercelToken: vercelTokVal,
+              vercelTeamId: vercelTeamVal,
+              vercelDeployHookUrl: vercelHookVal,
               persistCoreFiles: persistCore,
               adminUsername: adminUsernameVal,
               adminPassword: adminPasswordVal,
@@ -600,6 +642,7 @@
                 if (dbUrlEl) dbUrlEl.value = '';
                 if (rgTokEl) rgTokEl.value = '';
                 if (syncSecretEl) syncSecretEl.value = '';
+                if (vercelTokEl) vercelTokEl.value = '';
                 if (adminPwdEl) adminPwdEl.value = '';
 
                 out.className = 'form-success';
@@ -607,29 +650,81 @@
 
                 if (reportBox) {
                   var filesList = Array.isArray(res.data.updatedFiles) ? res.data.updatedFiles : [];
+                  var vSync = res.data.vercelSync || null;
+                  var vChecklist = Array.isArray(res.data.vercelEnvChecklist) ? res.data.vercelEnvChecklist : [];
+                  var partsHtml = [];
+
+                  if (vSync && vSync.synced) {
+                    partsHtml.push(
+                      '<div style="margin-bottom:8px;"><strong>تم تحديث متغيرات بيئة Vercel تلقائيًا:</strong> ' +
+                      '<span class="mono" dir="ltr">' + escapeHtml((vSync.syncedKeys || []).join(' · ')) + '</span>' +
+                      (vSync.redeployTriggered ? ' — وتم تشغيل إعادة النشر (Redeploy) فورًا.' : ' — أعد نشر Vercel لبدء اعتماد القيم على الخادم.') +
+                      '</div>'
+                    );
+                  } else if (vSync && vSync.attempted && vSync.error) {
+                    partsHtml.push(
+                      '<div class="form-error" style="margin-bottom:8px;">' + escapeHtml(vSync.error) + '</div>'
+                    );
+                  }
+
                   if (filesList.length > 0) {
+                    partsHtml.push(
+                      '<div><strong>تم تعديل ملفات الكود الأساسي بنجاح:</strong> ' +
+                      '<span class="mono" dir="ltr">' + escapeHtml(filesList.join(' · ')) + '</span></div>'
+                    );
+                  }
+
+                  if (res.data.needsVercelEnvVar) {
+                    var targetDesc = selectedMode === 'gas'
+                      ? 'لتثبيت رابط <span class="mono" dir="ltr">Google Apps Script</span> لجميع المستخدمين عبر Vercel، أضف المتغيرات التالية في لوحة Vercel ← <strong>Settings → Environment Variables</strong> ثم اضغط <strong>Redeploy</strong>:'
+                      : 'تم الاختبار والربط بـ Neon على الجلسة الحالية، ولكن لتثبيته دائمًا على Vercel أضف <span class="mono" dir="ltr">DATABASE_URL</span> في <strong>Settings → Environment Variables</strong> ثم اضغط <strong>Redeploy</strong>:';
+                    partsHtml.push('<div style="margin-top:6px;"><strong>خطوة تثبيت متغيرات Vercel:</strong><div style="margin-top:4px;color:var(--text-secondary);line-height:1.7;">' + targetDesc + '</div></div>');
+                    if (vChecklist.length > 0) {
+                      partsHtml.push(
+                        '<div style="display:grid;gap:6px;margin-top:8px;">' +
+                          vChecklist.map(function (item, idx) {
+                            var displayVal = item.sensitive ? item.maskedValue : item.value;
+                            return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border-hairline);border-radius:6px;background:var(--bg-surface);">' +
+                              '<div style="min-width:0;flex:1;"><strong class="mono" dir="ltr">' + escapeHtml(item.key) + '</strong> = <span class="mono" dir="ltr" style="font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere;">' + escapeHtml(displayVal) + '</span></div>' +
+                              (!item.sensitive && item.value ? '<button type="button" class="btn btn-sm vercel-copy-env-btn" data-env-idx="' + idx + '">نسخ القيمة</button>' : '') +
+                            '</div>';
+                          }).join('') +
+                        '</div>'
+                      );
+                    }
+                    partsHtml.push('<div style="margin-top:8px;"><button type="button" class="btn btn-primary btn-sm" id="btn-proceed-neon-login">' + (selectedMode === 'gas' ? 'المتابعة الآن عبر وسيط Vercel + Apps Script' : 'الانتقال الآن لشاشة تسجيل الدخول في Neon') + '</button></div>');
+                  } else if (!filesList.length && res.data.readOnlyFilesystem && res.data.generatedConfigJs && !(vSync && vSync.synced)) {
+                    partsHtml.push(
+                      '<strong>تم الحفظ السحابي بنجاح.</strong>' +
+                      '<div style="margin-top:4px;color:var(--text-muted);">ملاحظة: استضافة Vercel للقراءة فقط لا تعدل الملفات أثناء التشغيل، ويُقرأ الإعداد تلقائيًا من Neon أو متغيرات Vercel.</div>'
+                    );
+                  }
+
+                  if (partsHtml.length > 0) {
                     reportBox.classList.remove('hidden');
-                    reportBox.innerHTML =
-                      '<strong>تم تعديل ملفات الكود الأساسي بنجاح:</strong> ' +
-                      '<span class="mono" dir="ltr">' + escapeHtml(filesList.join(' · ')) + '</span>';
-                  } else if (res.data.needsVercelEnvVar) {
-                    reportBox.classList.remove('hidden');
-                    reportBox.innerHTML =
-                      '<strong>تم الاختبار والربط بـ Neon على الجلسة الحالية، ولكن يلزم خطوة واحدة لتثبيته دائمًا على Vercel:</strong>' +
-                      '<div style="margin-top:6px;color:var(--text-secondary);line-height:1.7;">أضف المتغير <span class="mono" dir="ltr">DATABASE_URL</span> في لوحة Vercel ← <strong>Settings → Environment Variables</strong> ثم اضغط <strong>Redeploy</strong> حتى لا ينقطع الاتصال بعد إعادة تشغيل السيرفر.</div>' +
-                      '<div style="margin-top:8px;"><button type="button" class="btn btn-primary btn-sm" id="btn-proceed-neon-login">الانتقال الآن لشاشة تسجيل الدخول في Neon</button></div>';
-                  } else if (res.data.readOnlyFilesystem && res.data.generatedConfigJs) {
-                    reportBox.classList.remove('hidden');
-                    reportBox.innerHTML =
-                      '<strong>تم الحفظ عالميًا في Neon PostgreSQL لجميع المستخدمين.</strong>' +
-                      '<div style="margin-top:4px;color:var(--text-muted);">ملاحظة: استضافة Vercel للقراءة فقط لا تعدل الملفات أثناء التشغيل، لكن الموقع يقرأ الإعدادات من Neon تلقائيًا لكل زائر.</div>';
+                    reportBox.innerHTML = partsHtml.join('');
+                    reportBox.querySelectorAll('.vercel-copy-env-btn').forEach(function (copyBtn) {
+                      copyBtn.addEventListener('click', async function () {
+                        var itemIdx = Number(copyBtn.getAttribute('data-env-idx'));
+                        var targetItem = vChecklist[itemIdx];
+                        if (!targetItem || !targetItem.value) return;
+                        try {
+                          if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(targetItem.value);
+                          }
+                          ctx.toast('تم نسخ ' + targetItem.key);
+                        } catch (copyErr) {
+                          ctx.toast('تعذر النسخ التلقائي — انسخ القيمة يدويًا.', true);
+                        }
+                      });
+                    });
                   } else {
                     reportBox.classList.add('hidden');
                   }
                 }
 
                 var switchedAuthRealm = (selectedMode === 'neon' && !isBackendConnected) || (selectedMode === 'gas' && isBackendConnected) || (selectedMode === 'sandbox' && (isBackendConnected || root.RGApi.isLiveMode()));
-                ctx.toast(res.data.coreFilesUpdated ? 'تم الحفظ وتعديل الكود الأساسي ليكون ثابتًا!' : 'تم الحفظ والربط التلقائي بنجاح!');
+                ctx.toast(res.data.coreFilesUpdated ? 'تم الحفظ وتعديل الكود الأساسي ليكون ثابتًا!' : (res.data.vercelSync && res.data.vercelSync.synced ? 'تم الحفظ ومزامنة متغيرات Vercel تلقائيًا!' : 'تم الحفظ والربط التلقائي بنجاح!'));
 
                 if (res.data.needsVercelEnvVar && switchedAuthRealm) {
                   var proceedBtn = document.getElementById('btn-proceed-neon-login');

@@ -141,7 +141,7 @@ export async function resolveServerConfig(executor: DbClient): Promise<ResolvedS
     decryptServerSecret(map.sync_api_secret_enc || '') || String(map.sync_api_secret || '').trim();
   const dbBaseUrl = String(map.rg_api_base_url || '').trim().replace(/\/+$/, '');
 
-  const gasWebAppUrl = envGasUrl || dbGasUrl || fixedGasUrl;
+  const gasWebAppUrl = dbMode === 'sandbox' ? '' : (dbGasUrl || envGasUrl || fixedGasUrl);
   const mode = dbMode || fixedMode || envMode || (getDatabaseUrl() ? 'neon' : (gasWebAppUrl ? 'gas' : 'sandbox'));
 
   return {
@@ -182,7 +182,7 @@ export async function readPublicHealthAutoBind(
     }
   }
 
-  const resolvedGasUrl = envGasUrl || dbGasUrl || fixedGasUrl;
+  const resolvedGasUrl = dbMode === 'sandbox' ? '' : (dbGasUrl || envGasUrl || fixedGasUrl);
   const resolvedMode = dbMode || fixedMode || (getDatabaseUrl() ? 'neon' : (resolvedGasUrl ? 'gas' : ''));
   return {
     mode: resolvedMode,

@@ -28,7 +28,9 @@ export default async function handler(_req: any, res: any) {
       ...health,
       mode,
       backendApiUrl,
-      gasWebAppUrl: autoBind.gasWebAppUrl
+      gasWebAppUrl: autoBind.gasWebAppUrl,
+      serverlessProxyAvailable: true,
+      envGasConfigured: Boolean(String(process.env.GAS_WEBAPP_URL || '').trim())
     });
   } catch (err: any) {
     console.error('Unhandled /api/health error:', err);
@@ -42,7 +44,9 @@ export default async function handler(_req: any, res: any) {
         error: String(err?.message || 'HEALTH_CHECK_FAILED'),
         mode: '',
         backendApiUrl: '',
-        gasWebAppUrl: ''
+        gasWebAppUrl: '',
+        serverlessProxyAvailable: false,
+        envGasConfigured: false
       });
     }
   }
