@@ -130,8 +130,8 @@
       container.innerHTML =
         personalCardHtml +
         '<div class="surface-card">' +
-          '<h2 class="section-title">إعدادات النظام والربط</h2>' +
-          '<p class="section-subtitle">إعدادات النظام وربط API والمزامنة مخصصة للمدير العام والمشرف فقط، بينما تبقى إعدادات الحساب الشخصي متاحة لك أعلاه.</p>' +
+          '<h2 class="section-title">إعدادات النظام وفحص الاتصال</h2>' +
+          '<p class="section-subtitle">إعدادات النظام واختبارات الاتصال والمزامنة مخصصة للمدير العام والمشرف فقط، بينما تبقى إعدادات الحساب الشخصي متاحة لك أعلاه.</p>' +
         '</div>';
       bindPersonalAccountCard(container, ctx);
       return;
@@ -186,24 +186,14 @@
     var hasDatabaseUrl = Boolean(settings.hasDatabaseUrl || caps.hasDatabaseUrl);
     var maskedDbUrl = String(settings.maskedDatabaseUrl || caps.maskedDatabaseUrl || '').trim();
     var hasRgToken = Boolean(settings.hasDirectToken || settings.hasRgToken || caps.hasRgToken);
-    var hasSyncSecret = Boolean(settings.hasSyncSecret || caps.hasSyncSecret);
-    var writableCoreFiles = settings.writableCoreFiles !== undefined ? Boolean(settings.writableCoreFiles) : (caps.writableCoreFiles !== false);
-    var currentRgBaseUrl = String(settings.rg_api_base_url || caps.rgApiBaseUrl || 'https://api.rentalgate.net/api').trim();
+    var hasGasUrl = Boolean(currentGasUrl || caps.hasEnvGasUrl);
     var isVercelServerless = Boolean(caps.isServerless);
     var isVercelProxyAlive = Boolean(isVercelServerless || (root.RGApi && root.RGApi.isVercelProxyAvailable && root.RGApi.isVercelProxyAvailable()));
     var hasEnvGasUrl = Boolean(caps.hasEnvGasUrl);
-    var hasVercelCredsConfigured = Boolean(caps.hasVercelToken && caps.hasVercelProjectId);
 
-    var sourceLabels = {
-      global_config: 'ربط تلقائي ثابت في الكود الأساسي (config.js / قاعدة البيانات)',
-      query_param: 'ربط تلقائي عبر الرابط المشارك',
-      local_storage: 'محفوظ في هذا المتصفح',
-      local_sandbox: 'وضع المعاينة المحلية (تجاوز مؤقت)',
-      sandbox: 'وضع المعاينة المحلية (Sandbox)'
-    };
     var connModeSubtitle = isBackendConnected
-      ? ('الوضع الحالي: <strong>متصل بقاعدة البيانات السحابية (Neon PostgreSQL)</strong> · وسيط Vercel: <strong>' + (isVercelProxyAlive ? 'مفعّل (/api/crm)' : 'استضافة محلية/ثابتة') + '</strong>')
-      : ('الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل بـ Google Apps Script عبر وسيط Vercel (/api/crm)' : 'وضع المعاينة المحلية (Sandbox)') + '</strong> · المصدر: <strong>' + (sourceLabels[connInfo.source] || connInfo.source || 'تلقائي') + '</strong>');
+      ? ('الوضع الحالي: <strong>متصل بقاعدة البيانات السحابية (Neon PostgreSQL)</strong> · وسيط الخادم: <strong>' + (isVercelProxyAlive ? 'مفعّل (/api/crm)' : 'استضافة محلية') + '</strong>')
+      : ('الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل بـ Google Apps Script (/exec)' : 'وضع المعاينة المحلية (Sandbox)') + '</strong>');
 
     var isGeneralManager = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
@@ -229,141 +219,35 @@
 
     container.innerHTML =
       personalCardHtml +
-      '<div class="surface-card">' +
+      '<div class="surface-card" id="connection-diagnostics-card">' +
         '<div class="section-header">' +
           '<div>' +
-            '<h2 class="section-title">مركز الوضع والربط الشامل (Vercel + Google Apps Script + Neon)</h2>' +
+            '<h2 class="section-title">مركز اختبار وفحص الاتصالات (Connection Diagnostics)</h2>' +
             '<p class="section-subtitle">' + connModeSubtitle + '</p>' +
           '</div>' +
         '</div>' +
 
         '<div class="detail-summary-grid" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">' +
-          '<div class="detail-kv"><span class="detail-k">وضع التشغيل الحالي</span><span class="detail-v">' + (activeMode === 'neon' ? 'Neon PostgreSQL + Apps Script' : (activeMode === 'gas' ? 'Apps Script عبر وسيط Vercel' : 'وضع المعاينة المحلية')) + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">وسيط Vercel (/api/crm)</span><span class="detail-v">' + (isVercelProxyAlive ? (hasEnvGasUrl ? 'مفعّل + GAS_WEBAPP_URL مضبوط' : 'مفعّل وجاهز لتمرير /exec') : 'استضافة بدون خادم Vercel') + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">قاعدة البيانات (Neon)</span><span class="detail-v" style="font-size:12.5px;overflow-wrap:anywhere;">' + (hasDatabaseUrl ? ('متصلة <span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-secondary);">(' + escapeHtml((maskedDbUrl || '').replace(/^postgres(ql)?:\/\/\*\*\*@/i, '')) + ')</span>') : 'غير مربوطة (وضع Apps Script فقط)') + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">توكن Rental Gate</span><span class="detail-v">' + (hasRgToken ? 'محفوظ ومشفر' : 'غير محفوظ بعد') + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">وضع التشغيل</span><span class="detail-v">' + (activeMode === 'neon' ? 'Neon PostgreSQL + Apps Script' : (activeMode === 'gas' ? 'Google Apps Script (/exec)' : 'وضع المعاينة المحلية')) + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">الخادم والوسيط (/api/crm)</span><span class="detail-v">' + (isVercelProxyAlive ? (hasEnvGasUrl ? 'مفعّل + GAS مضبوط' : 'مفعّل وجاهز') : 'استضافة بدون وسيط خادم') + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">قاعدة البيانات (Neon)</span><span class="detail-v" style="font-size:12.5px;overflow-wrap:anywhere;">' + (hasDatabaseUrl ? ('مضبوطة <span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-secondary);">(' + escapeHtml((maskedDbUrl || '').replace(/^postgres(ql)?:\/\/\*\*\*@/i, '')) + ')</span>') : 'غير مضبوطة في الخادم') + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">Google Apps Script</span><span class="detail-v">' + (hasGasUrl ? 'مضبوط في بيئة الخادم' : 'غير مضبوط') + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">توكن Rental Gate</span><span class="detail-v">' + (hasRgToken ? 'مضبوط ومحفوظ بالخادم' : 'غير مضبوط') + '</span></div>' +
         '</div>' +
 
-        '<div class="form-grid-2">' +
-          '<div class="form-group">' +
-            '<label class="form-label" for="setup-mode">وضع تشغيل النظام للجميع</label>' +
-            '<select class="select" id="setup-mode">' +
-              '<option value="neon"' + (activeMode === 'neon' ? ' selected' : '') + '>سحابي: Neon PostgreSQL + Apps Script</option>' +
-              '<option value="gas"' + (activeMode === 'gas' ? ' selected' : '') + '>مباشر: Google Apps Script &amp; Sheets</option>' +
-              '<option value="sandbox"' + (activeMode === 'sandbox' ? ' selected' : '') + '>محلي: وضع المعاينة (Sandbox)</option>' +
-            '</select>' +
-          '</div>' +
-          '<div class="form-group">' +
-            '<label class="form-label" for="set-gas-url">رابط Google Apps Script Web App (/exec)</label>' +
-            '<input class="input mono" id="set-gas-url" dir="ltr" placeholder="https://script.google.com/macros/s/.../exec" value="' + escapeHtml(currentGasUrl) + '">' +
-          '</div>' +
+        '<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);font-size:12.5px;color:var(--text-secondary);line-height:1.65;">' +
+          'يتم ضبط متغيرات الربط (<span class="mono" dir="ltr">DATABASE_URL · GAS_WEBAPP_URL · RG_TOKEN · SYNC_API_SECRET</span>) من إعدادات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط، وتُستخدم الأزرار التالية لاختبار سلامة كل اتصال مباشرة.' +
         '</div>' +
 
-        (canManageSettings ? (
-          '<div id="setup-neon-fields" class="form-grid-2" style="margin-top:12px;">' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="setup-database-url">رابط قاعدة بيانات Neon PostgreSQL (DATABASE_URL)</label>' +
-              '<div class="password-field-wrap">' +
-                '<input type="password" class="input mono" id="setup-database-url" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (hasDatabaseUrl ? 'مضبوط حاليًا — اتركه فارغًا للإبقاء عليه أو الصق رابطًا جديدًا' : 'postgresql://user:pass@ep-xxx.aws.neon.tech/neondb?sslmode=require') + '">' +
-                '<button type="button" class="password-toggle-btn" id="toggle-setup-db-url" aria-label="إظهار رابط قاعدة البيانات">إظهار</button>' +
-              '</div>' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="setup-rg-token">توكن Rental Gate API (RG_TOKEN)</label>' +
-              '<div class="password-field-wrap">' +
-                '<input type="password" class="input mono" id="setup-rg-token" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (hasRgToken ? 'محفوظ ومشفر — اتركه فارغًا للإبقاء عليه أو الصق توكن جديد' : 'الصق Bearer Token هنا ليُحفظ مشفرًا ويُثبت تلقائيًا') + '">' +
-                '<button type="button" class="password-toggle-btn" id="toggle-setup-rg-token" aria-label="إظهار التوكن">إظهار</button>' +
-              '</div>' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="setup-rg-api-base">رابط واجهة Rental Gate API الأساسي</label>' +
-              '<input class="input mono" id="setup-rg-api-base" dir="ltr" value="' + escapeHtml(currentRgBaseUrl) + '">' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="setup-sync-secret">مفتاح المزامنة الآمنة (SYNC_API_SECRET)</label>' +
-              '<div class="password-field-wrap">' +
-                '<input type="password" class="input mono" id="setup-sync-secret" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (hasSyncSecret ? 'مولد ومحفوظ تلقائيًا — اتركه فارغًا للإبقاء عليه' : 'اتركه فارغًا ليتم توليده وتثبيته تلقائيًا') + '">' +
-                '<button type="button" class="password-toggle-btn" id="toggle-setup-sync-secret" aria-label="إظهار مفتاح المزامنة">إظهار</button>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div id="setup-admin-verify-wrap" class="form-grid-2' + (!isBackendConnected ? '' : ' hidden') + '" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="setup-admin-username">حساب المدير العام للتأكيد (عند التحويل من المعاينة أو Apps Script)</label>' +
-              '<input type="text" class="input mono" id="setup-admin-username" dir="ltr" autocomplete="username" value="' + escapeHtml((user && user.username) || 'admin') + '">' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="setup-admin-password">كلمة مرور المدير العام في Neon (التحقق)</label>' +
-              '<div class="password-field-wrap">' +
-                '<input type="password" class="input mono" id="setup-admin-password" dir="ltr" autocomplete="current-password" placeholder="أدخل كلمة مرور المدير (الافتراضية Admin@123)">' +
-                '<button type="button" class="password-toggle-btn" id="toggle-setup-admin-password" aria-label="إظهار كلمة مرور المدير">إظهار</button>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-            '<label class="checkbox-item" style="font-weight:700;flex-wrap:wrap;">' +
-              '<input type="checkbox" id="setup-persist-core"' + (writableCoreFiles ? ' checked' : '') + '>' +
-              '<span>تعديل وتثبيت الإعدادات في الكود الأساسي لتصبح ثابتة دائمًا:</span>' +
-              '<span class="mono" dir="ltr" style="font-size:12px;color:var(--text-secondary);">assets/js/config.js · backend/fixedConfig.ts · .env</span>' +
-            '</label>' +
-          '</div>' +
-          '<details id="setup-vercel-details" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);"' + (isVercelServerless ? ' open' : '') + '>' +
-            '<summary style="cursor:pointer;font-weight:700;font-size:13px;">تثبيت رابط Google Apps Script ومتغيرات البيئة عبر Vercel (' + (hasVercelCredsConfigured ? 'بيانات Vercel مضبوطة على الخادم' : 'تحديث متغيرات Vercel تلقائيًا أو يدويًا') + ')</summary>' +
-            '<div style="font-size:12px;color:var(--text-secondary);margin:8px 0;line-height:1.65;">عند التفعيل على Vercel تمر جميع طلبات <span class="mono" dir="ltr">/exec</span> عبر وسيط <span class="mono" dir="ltr">/api/crm</span> لتفادي حظر CORS وتكتم الرابط. يمكنك إدخال معرف المشروع والتوكن لحفظ <span class="mono" dir="ltr">GAS_WEBAPP_URL</span> و<span class="mono" dir="ltr">CONNECTION_MODE</span> مباشرة في Vercel أو نسخها من التقرير بعد الحفظ.</div>' +
-            '<div class="form-grid-2">' +
-              '<div class="form-group">' +
-                '<label class="form-label" for="setup-vercel-project-id">معرف مشروع Vercel (VERCEL_PROJECT_ID)</label>' +
-                '<input type="text" class="input mono" id="setup-vercel-project-id" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (caps.hasVercelProjectId ? 'محفوظ على الخادم — اتركه فارغًا للإبقاء عليه' : 'prj_xxxxxxxxxxxxxxxxx') + '">' +
-              '</div>' +
-              '<div class="form-group">' +
-                '<label class="form-label" for="setup-vercel-token">توكن Vercel API (VERCEL_TOKEN)</label>' +
-                '<div class="password-field-wrap">' +
-                  '<input type="password" class="input mono" id="setup-vercel-token" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (caps.hasVercelToken ? 'محفوظ على الخادم — اتركه فارغًا للإبقاء عليه' : 'اختياري لتحديث متغيرات Vercel تلقائيًا') + '">' +
-                  '<button type="button" class="password-toggle-btn" id="toggle-setup-vercel-token" aria-label="إظهار توكن Vercel">إظهار</button>' +
-                '</div>' +
-              '</div>' +
-              '<div class="form-group">' +
-                '<label class="form-label" for="setup-vercel-team-id">معرف الفريق في Vercel (VERCEL_TEAM_ID — اختياري)</label>' +
-                '<input type="text" class="input mono" id="setup-vercel-team-id" dir="ltr" autocomplete="off" spellcheck="false" placeholder="team_... (اتركه فارغًا للحساب الشخصي)">' +
-              '</div>' +
-              '<div class="form-group">' +
-                '<label class="form-label" for="setup-vercel-deploy-hook">رابط إعادة النشر التلقائي (VERCEL_DEPLOY_HOOK_URL — اختياري)</label>' +
-                '<input type="url" class="input mono" id="setup-vercel-deploy-hook" dir="ltr" autocomplete="off" spellcheck="false" placeholder="' + (caps.hasVercelDeployHook ? 'محفوظ على الخادم' : 'https://api.vercel.com/v1/integrations/deploy/...') + '">' +
-              '</div>' +
-            '</div>' +
-          '</details>'
-        ) : '') +
-
-        '<div class="toolbar-row" style="margin-top:12px;margin-bottom:0;flex-wrap:wrap;">' +
-          '<button type="button" class="btn btn-primary" id="btn-save-gas-url">حفظ وربط وتثبيت الإعدادات</button>' +
-          '<button type="button" class="btn" id="btn-ping-gas-url">فحص رابط Apps Script عبر الخادم</button>' +
-          '<button type="button" class="btn btn-charcoal" id="btn-copy-autoconnect-link">نسخ رابط الربط التلقائي للفريق</button>' +
-          (!isBackendConnected && connInfo.defaultUrl && (connInfo.source === 'local_storage' || connInfo.source === 'local_sandbox') ? '<button type="button" class="btn" id="btn-restore-global-gas">استعادة الربط التلقائي العام</button>' : '') +
-          '<button type="button" class="btn btn-danger" id="btn-clear-gas-url">العودة لوضع المعاينة</button>' +
+        '<div class="toolbar-row" style="margin-top:0;margin-bottom:0;flex-wrap:wrap;">' +
+          '<button type="button" class="btn btn-primary" id="btn-test-all-connections">اختبار جميع الاتصالات</button>' +
+          '<button type="button" class="btn" id="btn-test-server-health">اختبار الخادم (/api/health)</button>' +
+          '<button type="button" class="btn" id="btn-test-neon-db">اختبار قاعدة البيانات (Neon)</button>' +
+          '<button type="button" class="btn" id="btn-ping-gas-url">اختبار Google Apps Script</button>' +
+          '<button type="button" class="btn" id="btn-test-rg-top">اختبار Rental Gate API</button>' +
         '</div>' +
 
-        '<div id="gas-ping-result" class="hidden" style="margin-top:10px;"></div>' +
-        '<div id="setup-core-files-report" class="hidden" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);font-size:12.5px;"></div>' +
-        '<div id="autoconnect-share-wrap" class="hidden" style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-          '<div style="font-size:12px;font-weight:700;margin-bottom:6px;">رابط الدخول المربوط تلقائيًا (أي موظف يفتحه يرتبط بالخادم فورًا دون إدخال أي رابط):</div>' +
-          '<input type="text" class="input mono" id="autoconnect-share-url" dir="ltr" readonly style="font-size:12px;">' +
-        '</div>' +
-        '<details style="margin-top:12px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-          '<summary style="cursor:pointer;font-weight:700;font-size:13px;">الربط التلقائي للجميع + خطوات تجهيز Rental Gate API وGoogle Apps Script</summary>' +
-          '<div style="margin:10px 0 8px;padding:8px 10px;border-radius:6px;background:var(--bg-surface);border:1px solid var(--border-hairline);font-size:12.5px;line-height:1.75;">' +
-            '<strong>كيف يتم تثبيت كل شيء تلقائيًا من هذه الصفحة؟</strong>' +
-            '<ul style="margin:6px 0 0;padding-inline-start:18px;">' +
-              '<li>بمجرد الضغط على <strong>حفظ وربط وتثبيت في الكود الأساسي</strong>، يختبر النظام الاتصال بـ Neon ويهيئ الجداول تلقائيًا، ويحفظ الإعدادات مشفرة في قاعدة البيانات، ويدفع مفاتيح المزامنة إلى Google Apps Script.</li>' +
-              '<li>على البيئة المحلية/الخادم القابل للكتابة يتم تعديل <span class="mono" dir="ltr">assets/js/config.js</span> و<span class="mono" dir="ltr">backend/fixedConfig.ts</span> و<span class="mono" dir="ltr">.env</span> مباشرةً لتصبح ثابتة في الكود الأساسي حتى بعد إعادة البناء أو الرفع.</li>' +
-            '</ul>' +
-          '</div>' +
-          '<ol style="margin:8px 0 0;padding-inline-start:20px;font-size:12.5px;line-height:1.8;color:var(--text-secondary);">' +
-            '<li>أنشئ مشروع Apps Script (أو من داخل Google Sheet عبر <strong>Extensions → Apps Script</strong>) وارفع <strong>كامل</strong> ملفات مجلد <span class="mono">google-apps-script/</span> (وعلى رأسها <span class="mono">Code.gs</span> الذي يحتوي على <span class="mono">doGet</span> و<span class="mono">doPost</span>) + <span class="mono">appsscript.json</span> ثم احفظ (<span class="mono">Ctrl+S</span>).</li>' +
-            '<li>انشر المشروع كـ <strong>Web App</strong> (Execute as: <strong>Me</strong> · Who has access: <strong>Anyone</strong>) وانسخ رابط <span class="mono">/exec</span>. عند تعديل أي ملف لاحقاً اختر <strong>Deploy → Manage deployments → Edit → Version: New version → Deploy</strong> لتجنب خطأ <span class="mono" dir="ltr">Script function not found: doGet</span>.</li>' +
-            '<li>أدخل رابط Neon ورابط <span class="mono">/exec</span> وتوكن <span class="mono">RG_TOKEN</span> أعلاه ثم اضغط <strong>حفظ وربط وتثبيت في الكود الأساسي</strong>.</li>' +
-            '<li>بعد الربط، اضغط <strong>اختبار الاتصال</strong> ثم <strong>سحب الحجوزات الآن</strong>.</li>' +
-          '</ol>' +
-        '</details>' +
+        '<div id="conn-test-results" class="hidden" style="margin-top:12px;display:grid;gap:8px;"></div>' +
       '</div>' +
 
       (canSync ? (
@@ -372,7 +256,7 @@
             '<div><h2 class="section-title">مزامنة بيانات Rental Gate API</h2>' +
             '<p class="section-subtitle">يتم السحب عبر الخادم السحابي وGoogle Apps Script · الكاش المحلي (IndexedDB): <strong class="tabular-nums">' + cacheStats.reservationsCount + '</strong> حجز · <strong class="tabular-nums">' + cacheStats.customersCount + '</strong> عميل</p></div>' +
             '<div class="toolbar-row" style="margin-bottom:0;">' +
-              '<button type="button" class="btn" id="btn-test-rg">اختبار الاتصال</button>' +
+              '<button type="button" class="btn" id="btn-test-rg">اختبار الاتصال بـ Rental Gate</button>' +
               '<button type="button" class="btn btn-primary" id="btn-sync-now">سحب الحجوزات الآن</button>' +
             '</div>' +
           '</div>' +
@@ -391,21 +275,10 @@
             '</div>'
           ) : '') +
           '<div class="detail-summary-grid" style="margin-bottom:16px;">' +
-            '<div class="detail-kv"><span class="detail-k">حالة الاتصال</span><span class="detail-v" id="sync-conn-status">' + (isBackendConnected || root.RGApi.isLiveMode() ? (hasRgToken ? 'RG_TOKEN محفوظ ومربوط تلقائيًا' : 'يرجى حفظ RG_TOKEN') : (settings.sandbox_has_rg_token ? 'تم التحقق من صيغة التوكن (وضع المعاينة)' : 'وضع المعاينة المحلية')) + '</span></div>' +
+            '<div class="detail-kv"><span class="detail-k">حالة توكن Rental Gate</span><span class="detail-v" id="sync-conn-status">' + (isBackendConnected || root.RGApi.isLiveMode() ? (hasRgToken ? 'مضبوط ومربوط في الخادم' : 'غير مضبوط في متغيرات البيئة') : 'وضع المعاينة المحلية') + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">جدولة التحديث التلقائي</span><span class="detail-v" id="sync-auto-badge">' + escapeHtml(autoSyncBadgeText) + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono" dir="ltr">' + (lastSync ? escapeHtml(formatSettingDateTime(lastSync.finishedAt, ctx)) : 'لم يتم السحب بعد') + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">الحجوزات المستوردة / المحدثة / التمديدات</span><span class="detail-v tabular-nums">' + (lastSync ? (lastSync.importedCount + ' مستورد · ' + lastSync.updatedCount + ' محدث · ' + lastSync.extensionsCount + ' تمديد') : '0 / 0 / 0') + '</span></div>' +
-          '</div>' +
-          '<div style="margin-bottom:16px;padding:12px 14px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-            '<label class="form-label" for="set-rg-token">تحديث سريع لتوكن Rental Gate (RG_TOKEN / RENTAL_TOKEN)</label>' +
-            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;">' +
-              '<div class="password-field-wrap" style="flex:1;min-width:240px;">' +
-                '<input type="password" class="input mono" id="set-rg-token" dir="ltr" autocomplete="off" spellcheck="false" placeholder="الصق Bearer Token هنا ليُحفظ مشفرًا ويُدفع لـ Apps Script تلقائيًا">' +
-                '<button type="button" class="password-toggle-btn" id="toggle-rg-token" aria-label="إظهار التوكن">إظهار</button>' +
-              '</div>' +
-              '<button type="button" class="btn btn-primary" id="btn-save-rg-token">حفظ التوكن وتحديث الربط</button>' +
-            '</div>' +
-            '<div style="font-size:11.5px;color:var(--text-muted);margin-top:6px;">يُشفر التوكن بـ AES-256-GCM داخل Neon ويُدفع تلقائيًا إلى Script Properties ولا يظهر في المتصفح أو الملفات العامة.</div>' +
           '</div>' +
           '<div id="sync-action-msg" class="hidden" style="margin-bottom:14px;"></div>' +
           '<h3 style="margin:0 0 10px;font-size:14.5px;">سجل عمليات السحب (SyncLog)</h3>' +
@@ -550,311 +423,148 @@
 
     bindPersonalAccountCard(container, ctx);
 
-    bindPasswordToggle('setup-database-url', 'toggle-setup-db-url');
-    bindPasswordToggle('setup-rg-token', 'toggle-setup-rg-token');
-    bindPasswordToggle('setup-sync-secret', 'toggle-setup-sync-secret');
-    bindPasswordToggle('setup-admin-password', 'toggle-setup-admin-password');
-    bindPasswordToggle('setup-vercel-token', 'toggle-setup-vercel-token');
-    bindPasswordToggle('set-rg-token', 'toggle-rg-token');
+    var connResultsEl = document.getElementById('conn-test-results');
+    var diagCardsByKey = {};
 
-    var saveGasBtn = document.getElementById('btn-save-gas-url');
-    if (saveGasBtn) {
-    saveGasBtn.addEventListener('click', function () {
-      var modeEl = document.getElementById('setup-mode');
-      var selectedMode = modeEl ? modeEl.value : (isBackendConnected ? 'neon' : 'gas');
-      var gasVal = document.getElementById('set-gas-url').value.trim();
-      var dbUrlEl = document.getElementById('setup-database-url');
-      var dbUrlVal = dbUrlEl ? dbUrlEl.value.trim() : '';
-      var rgTokEl = document.getElementById('setup-rg-token');
-      var rgTokVal = rgTokEl ? rgTokEl.value.trim() : '';
-      var rgBaseEl = document.getElementById('setup-rg-api-base');
-      var rgBaseVal = rgBaseEl ? rgBaseEl.value.trim() : '';
-      var syncSecretEl = document.getElementById('setup-sync-secret');
-      var syncSecretVal = syncSecretEl ? syncSecretEl.value.trim() : '';
-      var vercelProjEl = document.getElementById('setup-vercel-project-id');
-      var vercelProjVal = vercelProjEl ? vercelProjEl.value.trim() : '';
-      var vercelTokEl = document.getElementById('setup-vercel-token');
-      var vercelTokVal = vercelTokEl ? vercelTokEl.value.trim() : '';
-      var vercelTeamEl = document.getElementById('setup-vercel-team-id');
-      var vercelTeamVal = vercelTeamEl ? vercelTeamEl.value.trim() : '';
-      var vercelHookEl = document.getElementById('setup-vercel-deploy-hook');
-      var vercelHookVal = vercelHookEl ? vercelHookEl.value.trim() : '';
-      var adminVerifyWrap = document.getElementById('setup-admin-verify-wrap');
-      var adminUserEl = document.getElementById('setup-admin-username');
-      var adminPwdEl = document.getElementById('setup-admin-password');
-      var adminUsernameVal = adminUserEl ? adminUserEl.value.trim() : ((user && user.username) || 'admin');
-      var adminPasswordVal = adminPwdEl ? adminPwdEl.value : '';
-      var persistCoreEl = document.getElementById('setup-persist-core');
-      var persistCore = persistCoreEl ? Boolean(persistCoreEl.checked) : true;
-
-      var out = document.getElementById('gas-ping-result');
-      var reportBox = document.getElementById('setup-core-files-report');
-
-      if (gasVal && root.RGCrmCore && root.RGCrmCore.validateGasUrl) {
-        var check = root.RGCrmCore.validateGasUrl(gasVal);
-        if (!check.valid) {
-          out.className = 'form-error';
-          out.textContent = check.message;
-          return;
-        }
-        gasVal = check.normalized;
-      }
-
-      if (selectedMode === 'gas' && !gasVal) {
-        out.className = 'form-error';
-        out.textContent = 'يرجى إدخال رابط Google Apps Script (/exec) لتفعيل وضع Google Apps Script.';
+    function renderDiagCards() {
+      if (!connResultsEl) return;
+      var keys = Object.keys(diagCardsByKey);
+      if (!keys.length) {
+        connResultsEl.classList.add('hidden');
+        connResultsEl.innerHTML = '';
         return;
       }
-
-      if (selectedMode === 'neon' && !dbUrlVal && !hasDatabaseUrl) {
-        out.className = 'form-error';
-        out.textContent = 'يرجى إدخال رابط قاعدة بيانات Neon PostgreSQL (DATABASE_URL) أولاً.';
-        return;
-      }
-
-      runWithLock(saveGasBtn, 'applyUnifiedSetup', async function () {
-        var prevText = saveGasBtn.textContent;
-        saveGasBtn.textContent = 'جاري الاختبار والربط...';
-        try {
-          if (root.RGApi.applyUnifiedSetup) {
-            var res = await root.RGApi.applyUnifiedSetup({
-              mode: selectedMode,
-              databaseUrl: dbUrlVal,
-              gasWebAppUrl: gasVal,
-              keepExistingGasUrl: selectedMode !== 'sandbox' && Boolean(gasVal),
-              rgToken: rgTokVal,
-              rgApiBaseUrl: rgBaseVal,
-              syncApiSecret: syncSecretVal,
-              vercelProjectId: vercelProjVal,
-              vercelToken: vercelTokVal,
-              vercelTeamId: vercelTeamVal,
-              vercelDeployHookUrl: vercelHookVal,
-              persistCoreFiles: persistCore,
-              adminUsername: adminUsernameVal,
-              adminPassword: adminPasswordVal,
-              actorRole: user ? user.role : '',
-              actorName: user ? user.name : '',
-              siteOrigin: window.location.origin
-            });
-
-            if (res && !res.staticHostOnly) {
-              if (res.success && res.data) {
-                if (dbUrlEl) dbUrlEl.value = '';
-                if (rgTokEl) rgTokEl.value = '';
-                if (syncSecretEl) syncSecretEl.value = '';
-                if (vercelTokEl) vercelTokEl.value = '';
-                if (adminPwdEl) adminPwdEl.value = '';
-
-                out.className = 'form-success';
-                out.textContent = res.data.message || 'تم الحفظ والربط وتثبيت الإعدادات بنجاح.';
-
-                if (reportBox) {
-                  var filesList = Array.isArray(res.data.updatedFiles) ? res.data.updatedFiles : [];
-                  var vSync = res.data.vercelSync || null;
-                  var vChecklist = Array.isArray(res.data.vercelEnvChecklist) ? res.data.vercelEnvChecklist : [];
-                  var partsHtml = [];
-
-                  if (vSync && vSync.synced) {
-                    partsHtml.push(
-                      '<div style="margin-bottom:8px;"><strong>تم تحديث متغيرات بيئة Vercel تلقائيًا:</strong> ' +
-                      '<span class="mono" dir="ltr">' + escapeHtml((vSync.syncedKeys || []).join(' · ')) + '</span>' +
-                      (vSync.redeployTriggered ? ' — وتم تشغيل إعادة النشر (Redeploy) فورًا.' : ' — أعد نشر Vercel لبدء اعتماد القيم على الخادم.') +
-                      '</div>'
-                    );
-                  } else if (vSync && vSync.attempted && vSync.error) {
-                    partsHtml.push(
-                      '<div class="form-error" style="margin-bottom:8px;">' + escapeHtml(vSync.error) + '</div>'
-                    );
-                  }
-
-                  if (filesList.length > 0) {
-                    partsHtml.push(
-                      '<div><strong>تم تعديل ملفات الكود الأساسي بنجاح:</strong> ' +
-                      '<span class="mono" dir="ltr">' + escapeHtml(filesList.join(' · ')) + '</span></div>'
-                    );
-                  }
-
-                  if (res.data.needsVercelEnvVar) {
-                    var targetDesc = selectedMode === 'gas'
-                      ? 'لتثبيت رابط <span class="mono" dir="ltr">Google Apps Script</span> لجميع المستخدمين عبر Vercel، أضف المتغيرات التالية في لوحة Vercel ← <strong>Settings → Environment Variables</strong> ثم اضغط <strong>Redeploy</strong>:'
-                      : 'تم الاختبار والربط بـ Neon على الجلسة الحالية، ولكن لتثبيته دائمًا على Vercel أضف <span class="mono" dir="ltr">DATABASE_URL</span> في <strong>Settings → Environment Variables</strong> ثم اضغط <strong>Redeploy</strong>:';
-                    partsHtml.push('<div style="margin-top:6px;"><strong>خطوة تثبيت متغيرات Vercel:</strong><div style="margin-top:4px;color:var(--text-secondary);line-height:1.7;">' + targetDesc + '</div></div>');
-                    if (vChecklist.length > 0) {
-                      partsHtml.push(
-                        '<div style="display:grid;gap:6px;margin-top:8px;">' +
-                          vChecklist.map(function (item, idx) {
-                            var displayVal = item.sensitive ? item.maskedValue : item.value;
-                            return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border-hairline);border-radius:6px;background:var(--bg-surface);">' +
-                              '<div style="min-width:0;flex:1;"><strong class="mono" dir="ltr">' + escapeHtml(item.key) + '</strong> = <span class="mono" dir="ltr" style="font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere;">' + escapeHtml(displayVal) + '</span></div>' +
-                              (!item.sensitive && item.value ? '<button type="button" class="btn btn-sm vercel-copy-env-btn" data-env-idx="' + idx + '">نسخ القيمة</button>' : '') +
-                            '</div>';
-                          }).join('') +
-                        '</div>'
-                      );
-                    }
-                    partsHtml.push('<div style="margin-top:8px;"><button type="button" class="btn btn-primary btn-sm" id="btn-proceed-neon-login">' + (selectedMode === 'gas' ? 'المتابعة الآن عبر وسيط Vercel + Apps Script' : 'الانتقال الآن لشاشة تسجيل الدخول في Neon') + '</button></div>');
-                  } else if (!filesList.length && res.data.readOnlyFilesystem && res.data.generatedConfigJs && !(vSync && vSync.synced)) {
-                    partsHtml.push(
-                      '<strong>تم الحفظ السحابي بنجاح.</strong>' +
-                      '<div style="margin-top:4px;color:var(--text-muted);">ملاحظة: استضافة Vercel للقراءة فقط لا تعدل الملفات أثناء التشغيل، ويُقرأ الإعداد تلقائيًا من Neon أو متغيرات Vercel.</div>'
-                    );
-                  }
-
-                  if (partsHtml.length > 0) {
-                    reportBox.classList.remove('hidden');
-                    reportBox.innerHTML = partsHtml.join('');
-                    reportBox.querySelectorAll('.vercel-copy-env-btn').forEach(function (copyBtn) {
-                      copyBtn.addEventListener('click', async function () {
-                        var itemIdx = Number(copyBtn.getAttribute('data-env-idx'));
-                        var targetItem = vChecklist[itemIdx];
-                        if (!targetItem || !targetItem.value) return;
-                        try {
-                          if (navigator.clipboard && navigator.clipboard.writeText) {
-                            await navigator.clipboard.writeText(targetItem.value);
-                          }
-                          ctx.toast('تم نسخ ' + targetItem.key);
-                        } catch (copyErr) {
-                          ctx.toast('تعذر النسخ التلقائي — انسخ القيمة يدويًا.', true);
-                        }
-                      });
-                    });
-                  } else {
-                    reportBox.classList.add('hidden');
-                  }
-                }
-
-                var switchedAuthRealm = (selectedMode === 'neon' && !isBackendConnected) || (selectedMode === 'gas' && isBackendConnected) || (selectedMode === 'sandbox' && (isBackendConnected || root.RGApi.isLiveMode()));
-                ctx.toast(res.data.coreFilesUpdated ? 'تم الحفظ وتعديل الكود الأساسي ليكون ثابتًا!' : (res.data.vercelSync && res.data.vercelSync.synced ? 'تم الحفظ ومزامنة متغيرات Vercel تلقائيًا!' : 'تم الحفظ والربط التلقائي بنجاح!'));
-
-                if (res.data.needsVercelEnvVar && switchedAuthRealm) {
-                  var proceedBtn = document.getElementById('btn-proceed-neon-login');
-                  if (proceedBtn) {
-                    proceedBtn.addEventListener('click', async function () {
-                      root.RGApi.setToken('');
-                      await root.RGAuth.logout().catch(function () {});
-                      ctx.onAuthChanged();
-                    });
-                  }
-                  return;
-                }
-
-                if (switchedAuthRealm) {
-                  root.RGApi.setToken('');
-                  await root.RGAuth.logout().catch(function () {});
-                  ctx.onAuthChanged();
-                  return;
-                }
-                render(container, ctx);
-                return;
-              }
-
-              var errCode = String((res && (res.error || res.message)) || '');
-              if (errCode.indexOf('ADMIN_VERIFY_REQUIRED') !== -1 || errCode.indexOf('كلمة مرور المدير') !== -1) {
-                if (adminVerifyWrap) adminVerifyWrap.classList.remove('hidden');
-                if (adminPwdEl) adminPwdEl.focus();
-              }
-              out.className = 'form-error';
-              out.textContent = (res && res.message) || 'تعذر حفظ إعدادات الربط.';
-              return;
-            }
-          }
-
-          // Pure static hosting fallback (no Node/Vercel backend available on origin)
-          root.RGApi.setGasUrl(selectedMode === 'sandbox' ? '' : gasVal);
-          root.RGApi.setToken('');
-          ctx.toast(selectedMode !== 'sandbox' && gasVal
-            ? 'تم حفظ رابط Google Apps Script. يرجى تسجيل الدخول على الخادم الفعلي.'
-            : 'تم التبديل إلى وضع المعاينة المحلية.');
-          root.RGAuth.logout().then(function () { ctx.onAuthChanged(); });
-        } finally {
-          if (saveGasBtn.isConnected !== false) saveGasBtn.textContent = prevText;
-        }
-      });
-    });
-    }
-
-    var clearGasBtn = document.getElementById('btn-clear-gas-url');
-    if (clearGasBtn) {
-      clearGasBtn.addEventListener('click', function () {
-        root.RGApi.setGasUrl('');
-        root.RGApi.setToken('');
-        ctx.toast('تم التبديل إلى وضع المعاينة المحلية.');
-        ctx.onAuthChanged();
-      });
-    }
-
-    var restoreGlobalBtn = document.getElementById('btn-restore-global-gas');
-    if (restoreGlobalBtn) {
-      restoreGlobalBtn.addEventListener('click', function () {
-        root.RGApi.setGasUrl('__DEFAULT__');
-        root.RGApi.setToken('');
-        ctx.toast('تمت استعادة الربط التلقائي العام.');
-        ctx.onAuthChanged();
-      });
-    }
-
-    var copyAutoconnectBtn = document.getElementById('btn-copy-autoconnect-link');
-    if (copyAutoconnectBtn) {
-      copyAutoconnectBtn.addEventListener('click', async function () {
-        var raw = document.getElementById('set-gas-url').value.trim();
-        var out = document.getElementById('gas-ping-result');
-        var shareUrl = (root.RGCrmCore && root.RGCrmCore.buildAutoConnectShareUrl)
-          ? root.RGCrmCore.buildAutoConnectShareUrl(window.location.origin, window.location.pathname, raw)
+      connResultsEl.classList.remove('hidden');
+      connResultsEl.innerHTML = keys.map(function (k) {
+        var item = diagCardsByKey[k];
+        var tagCls = item.status === 'ok'
+          ? 'status-success'
+          : (item.status === 'pending' ? 'status-info' : 'status-danger');
+        var tagLabel = item.status === 'ok'
+          ? 'ناجح'
+          : (item.status === 'pending' ? 'جاري الاختبار...' : 'فشل');
+        var latencyBadge = typeof item.latencyMs === 'number' && item.latencyMs > 0
+          ? ('<span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-muted);">' + item.latencyMs + 'ms</span>')
           : '';
-        if (!shareUrl) {
-          out.className = 'form-error';
-          out.textContent = 'أدخل رابط Google Apps Script (/exec) صالحاً أولاً لتوليد رابط الربط التلقائي.';
-          return;
-        }
-        var wrap = document.getElementById('autoconnect-share-wrap');
-        var shareInput = document.getElementById('autoconnect-share-url');
-        if (wrap && shareInput) {
-          shareInput.value = shareUrl;
-          wrap.classList.remove('hidden');
-        }
-        try {
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            await navigator.clipboard.writeText(shareUrl);
-          } else if (shareInput) {
-            shareInput.select();
-            document.execCommand('copy');
+        return '<div style="padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+          '<div style="min-width:0;flex:1;">' +
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">' +
+              '<strong style="font-size:13px;">' + escapeHtml(item.label) + '</strong>' +
+              '<span class="status-tag ' + tagCls + '">' + tagLabel + '</span>' +
+              latencyBadge +
+            '</div>' +
+            '<div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6;">' + escapeHtml(item.message || '') + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    function setDiagResult(key, label, status, message, latencyMs) {
+      diagCardsByKey[key] = {
+        label: label,
+        status: status,
+        message: message,
+        latencyMs: latencyMs
+      };
+      renderDiagCards();
+    }
+
+    async function runServerHealthTest() {
+      setDiagResult('server', 'الخادم (/api/health)', 'pending', 'جاري فحص نقطة الخادم...', 0);
+      var res = root.RGApi.testServerHealth
+        ? await root.RGApi.testServerHealth()
+        : { success: false, message: 'دالة فحص الخادم غير متاحة.', data: null };
+      setDiagResult('server', 'الخادم (/api/health)', res.success ? 'ok' : 'fail', res.message || '', res.data && res.data.latencyMs);
+      return res;
+    }
+
+    async function runNeonDbTest() {
+      setDiagResult('neon', 'قاعدة البيانات (Neon PostgreSQL)', 'pending', 'جاري اختبار الاتصال بقاعدة البيانات...', 0);
+      var res = root.RGApi.testDatabaseHealth
+        ? await root.RGApi.testDatabaseHealth()
+        : { success: false, message: 'دالة اختبار قاعدة البيانات غير متاحة.', data: null };
+      setDiagResult('neon', 'قاعدة البيانات (Neon PostgreSQL)', res.success ? 'ok' : 'fail', res.message || '', res.data && res.data.latencyMs);
+      return res;
+    }
+
+    async function runGasPingTest() {
+      setDiagResult('gas', 'Google Apps Script (/exec)', 'pending', 'جاري فحص رابط Google Apps Script من الخادم...', 0);
+      var startedAt = Date.now();
+      var res = await root.RGApi.pingGasUrl('');
+      var elapsed = Date.now() - startedAt;
+      setDiagResult('gas', 'Google Apps Script (/exec)', res && res.success ? 'ok' : 'fail', (res && res.message) || (res && res.success ? 'الاتصال ناجح!' : 'فشل الاتصال.'), elapsed);
+      return res;
+    }
+
+    async function runRgApiTest() {
+      setDiagResult('rg', 'Rental Gate API (RG_TOKEN)', 'pending', 'جاري اختبار الاتصال بواجهة Rental Gate...', 0);
+      var startedAt = Date.now();
+      var res = await root.RGApi.callApi('testConnection', {});
+      var elapsed = Date.now() - startedAt;
+      var ok = Boolean(res && res.success && res.data && res.data.connected);
+      var msgText = (res && res.data && res.data.message) || (res && res.message) || (ok ? 'الاتصال ناجح!' : 'فشل الاتصال.');
+      setDiagResult('rg', 'Rental Gate API (RG_TOKEN)', ok ? 'ok' : 'fail', msgText, elapsed);
+      return res;
+    }
+
+    var testAllBtn = document.getElementById('btn-test-all-connections');
+    if (testAllBtn) {
+      testAllBtn.addEventListener('click', function () {
+        runWithLock(testAllBtn, 'testAllConnections', async function () {
+          var prevText = testAllBtn.textContent;
+          testAllBtn.textContent = 'جاري الفحص الشامل...';
+          try {
+            await Promise.all([
+              runServerHealthTest(),
+              runNeonDbTest(),
+              runGasPingTest(),
+              runRgApiTest()
+            ]);
+          } finally {
+            if (testAllBtn.isConnected !== false) testAllBtn.textContent = prevText;
           }
-          ctx.toast('تم نسخ رابط الربط التلقائي! أي موظف يفتحه يتصل بالخادم مباشرة.');
-        } catch (e) {
-          ctx.toast('تم توليد رابط الربط التلقائي — انسخه من الحقل أسفله.');
-        }
+        });
+      });
+    }
+
+    var testHealthBtn = document.getElementById('btn-test-server-health');
+    if (testHealthBtn) {
+      testHealthBtn.addEventListener('click', function () {
+        runWithLock(testHealthBtn, 'testServerHealth', async function () {
+          var prevText = testHealthBtn.textContent;
+          testHealthBtn.textContent = 'جاري الاختبار...';
+          try {
+            await runServerHealthTest();
+          } finally {
+            if (testHealthBtn.isConnected !== false) testHealthBtn.textContent = prevText;
+          }
+        });
+      });
+    }
+
+    var testNeonBtn = document.getElementById('btn-test-neon-db');
+    if (testNeonBtn) {
+      testNeonBtn.addEventListener('click', function () {
+        runWithLock(testNeonBtn, 'testDatabaseHealth', async function () {
+          var prevText = testNeonBtn.textContent;
+          testNeonBtn.textContent = 'جاري الاختبار...';
+          try {
+            await runNeonDbTest();
+          } finally {
+            if (testNeonBtn.isConnected !== false) testNeonBtn.textContent = prevText;
+          }
+        });
       });
     }
 
     var pingGasBtn = document.getElementById('btn-ping-gas-url');
     if (pingGasBtn) {
       pingGasBtn.addEventListener('click', function () {
-        var inp = document.getElementById('set-gas-url');
-        var val = inp ? inp.value.trim() : '';
-        var out = document.getElementById('gas-ping-result');
-        if (!val) {
-          out.className = 'form-error';
-          out.textContent = 'يرجى إدخال رابط Web App (/exec) أولاً.';
-          return;
-        }
-        if (root.RGCrmCore && root.RGCrmCore.validateGasUrl) {
-          var vCheck = root.RGCrmCore.validateGasUrl(val);
-          if (vCheck.valid && vCheck.normalized && inp && vCheck.normalized !== val) {
-            val = vCheck.normalized;
-            inp.value = val;
-          }
-        }
         runWithLock(pingGasBtn, 'pingGasUrl', async function () {
           var prevText = pingGasBtn.textContent;
-          pingGasBtn.textContent = 'جاري الفحص...';
-          out.className = 'glass-subcard';
-          out.style.padding = '10px 12px';
-          out.textContent = 'جاري فحص الاتصال برابط Google Apps Script...';
+          pingGasBtn.textContent = 'جاري الاختبار...';
           try {
-            var res = await root.RGApi.pingGasUrl(val);
-            out.style.padding = '';
-            out.className = res.success ? 'form-success' : 'form-error';
-            out.textContent = res.message || (res.success ? 'الاتصال ناجح!' : 'فشل الاتصال.');
+            await runGasPingTest();
           } finally {
             if (pingGasBtn.isConnected !== false) pingGasBtn.textContent = prevText;
           }
@@ -862,44 +572,16 @@
       });
     }
 
-    var saveRgTokenBtn = document.getElementById('btn-save-rg-token');
-    if (saveRgTokenBtn) {
-      saveRgTokenBtn.addEventListener('click', function () {
-        var inp = document.getElementById('set-rg-token');
-        var msg = document.getElementById('sync-action-msg');
-        var raw = inp ? inp.value.trim() : '';
-        if (!raw) {
-          msg.className = 'form-error';
-          msg.textContent = 'يرجى لصق التوكن أولاً ثم الضغط على حفظ.';
-          return;
-        }
-        runWithLock(saveRgTokenBtn, 'saveApiToken', async function () {
-          var prevText = saveRgTokenBtn.textContent;
-          saveRgTokenBtn.textContent = 'جاري الحفظ...';
+    var testRgTopBtn = document.getElementById('btn-test-rg-top');
+    if (testRgTopBtn) {
+      testRgTopBtn.addEventListener('click', function () {
+        runWithLock(testRgTopBtn, 'testConnectionTop', async function () {
+          var prevText = testRgTopBtn.textContent;
+          testRgTopBtn.textContent = 'جاري الاختبار...';
           try {
-            var res = await root.RGApi.callApi('saveApiToken', {
-              token: raw,
-              testAfterSave: isBackendConnected || root.RGApi.isLiveMode(),
-              siteOrigin: window.location.origin
-            });
-            if (res.success) {
-              if (inp) inp.value = '';
-              var connOk = res.data && res.data.connection ? res.data.connection.connected : null;
-              var connStatus = document.getElementById('sync-conn-status');
-              if (connStatus) {
-                connStatus.textContent = connOk === true
-                  ? 'متصل بنجاح (RG_TOKEN محفوظ ومربوط)'
-                  : 'تم حفظ RG_TOKEN وتحديث الربط';
-              }
-              msg.className = connOk === false ? 'form-error' : 'form-success';
-              msg.textContent = (res.data && res.data.connection && res.data.connection.message) || res.message || 'تم حفظ التوكن بنجاح.';
-              ctx.toast('تم حفظ التوكن بنجاح.');
-            } else {
-              msg.className = 'form-error';
-              msg.textContent = res.message || 'تعذر حفظ التوكن.';
-            }
+            await runRgApiTest();
           } finally {
-            if (saveRgTokenBtn.isConnected !== false) saveRgTokenBtn.textContent = prevText;
+            if (testRgTopBtn.isConnected !== false) testRgTopBtn.textContent = prevText;
           }
         });
       });
@@ -910,9 +592,15 @@
       testRgBtn.addEventListener('click', function () {
         var msg = document.getElementById('sync-action-msg');
         runWithLock(testRgBtn, 'testConnection', async function () {
-          var res = await root.RGApi.callApi('testConnection', {});
-          msg.className = (res.success && res.data && res.data.connected) ? 'form-success' : 'form-error';
-          msg.textContent = (res.data && res.data.message) || res.message;
+          var prevText = testRgBtn.textContent;
+          testRgBtn.textContent = 'جاري الاختبار...';
+          try {
+            var res = await root.RGApi.callApi('testConnection', {});
+            msg.className = (res.success && res.data && res.data.connected) ? 'form-success' : 'form-error';
+            msg.textContent = (res.data && res.data.message) || res.message;
+          } finally {
+            if (testRgBtn.isConnected !== false) testRgBtn.textContent = prevText;
+          }
         });
       });
     }

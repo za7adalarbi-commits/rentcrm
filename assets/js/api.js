@@ -67,54 +67,26 @@
   function getBackendApiUrl() {
     var mode = getConfiguredMode();
     if (mode === 'sandbox' || mode === 'gas') return '';
-    var search = typeof window !== 'undefined' ? window.location.search : '';
-
-    var match = search.match(/(?:\?|&)backendUrl=([^&]+)/);
-    if (match && match[1]) {
-      try {
-        var decoded = decodeURIComponent(match[1]).trim();
-        if (decoded === 'clear' || decoded === 'none') {
-          safeStorageSet(STORAGE_BACKEND_URL, '');
-        } else if (decoded) {
-          safeStorageSet(STORAGE_BACKEND_URL, decoded);
-          return decoded;
-        }
-      } catch (e) {}
-    }
-
-    var storedBackend = safeStorageGet(STORAGE_BACKEND_URL);
-    if (storedBackend) return storedBackend;
     if (detectedBackendUrl) return detectedBackendUrl;
     return getDefaultConfiguredBackendUrl();
   }
 
   function getConnectionInfo() {
-    var search = typeof window !== 'undefined' ? window.location.search : '';
-    var stored = safeStorageGet(STORAGE_GAS_URL);
     var defUrl = getDefaultConfiguredGasUrl();
-    if (_cachedConnInfo && _cachedConnInfo.search === search && _cachedConnInfo.stored === stored && _cachedConnInfo.defUrl === defUrl) {
+    var mode = getConfiguredMode();
+    var activeUrl = mode === 'sandbox' ? '' : defUrl;
+    var source = activeUrl ? 'global_config' : 'sandbox';
+    if (_cachedConnInfo && _cachedConnInfo.defUrl === activeUrl && _cachedConnInfo.source === source) {
       return _cachedConnInfo.info;
     }
-    var info;
-    if (root.RGCrmCore && root.RGCrmCore.resolveGasConnection) {
-      info = root.RGCrmCore.resolveGasConnection(search, stored, defUrl);
-      if (info.clearStored) {
-        safeStorageSet(STORAGE_GAS_URL, '');
-        stored = '';
-      } else if (info.persist && info.url) {
-        safeStorageSet(STORAGE_GAS_URL, info.url);
-        stored = info.url;
-      }
-    } else {
-      info = {
-        url: (stored && stored !== SANDBOX_SENTINEL) ? stored : defUrl,
-        source: stored ? 'local_storage' : (defUrl ? 'global_config' : 'sandbox'),
-        defaultUrl: defUrl,
-        persist: false,
-        clearStored: false
-      };
-    }
-    _cachedConnInfo = { search: search, stored: stored, defUrl: defUrl, info: info };
+    var info = {
+      url: activeUrl,
+      source: source,
+      defaultUrl: activeUrl,
+      persist: false,
+      clearStored: false
+    };
+    _cachedConnInfo = { defUrl: activeUrl, source: source, info: info };
     return info;
   }
 
@@ -1472,19 +1444,10 @@
     }
   }
 
-  function setGasUrl(url) {
+  function setGasUrl() {
     _cachedConnInfo = null;
-    var raw = String(url || '').trim();
-    var defUrl = getDefaultConfiguredGasUrl();
-    if (raw === '__DEFAULT__') {
-      safeStorageSet(STORAGE_GAS_URL, '');
-    } else if (!raw) {
-      safeStorageSet(STORAGE_GAS_URL, defUrl ? SANDBOX_SENTINEL : '');
-    } else if (defUrl && raw === defUrl) {
-      safeStorageSet(STORAGE_GAS_URL, '');
-    } else {
-      safeStorageSet(STORAGE_GAS_URL, raw);
-    }
+    safeStorageSet(STORAGE_GAS_URL, '');
+    safeStorageSet(STORAGE_BACKEND_URL, '');
     clearCache();
   }
 
@@ -5113,13 +5076,32 @@
   async function pingGasUrl(url) {
     var clean = String(url || '').trim();
     var core = root.RGCrmCore;
+
+    if (!clean) {
+      try {
+        var autoServerPing = await callBackendSetupEndpoint('pingGasUrl', {});
+        if (autoServerPing && !autoServerPing.staticHostOnly) {
+          return autoServerPing;
+        }
+      } catch (_autoErr) {}
+      clean = getGasUrl();
+      if (!clean) {
+        return {
+          success: false,
+          message: 'رابط Google Apps Script (/exec) غير مضبوط في إعدادات بيئة الخادم.',
+          data: null,
+          error: 'MISSING_GAS_URL'
+        };
+      }
+    }
+
     if (core && core.validateGasUrl) {
       var check = core.validateGasUrl(clean);
       if (!check.valid) {
         return { success: false, message: check.message, data: null, error: 'INVALID_GAS_URL' };
       }
       if (check.isSandbox) {
-        return { success: false, message: 'يرجى إدخال رابط Web App (/exec) أولاً.', data: null, error: 'EMPTY_URL' };
+        return { success: false, message: 'رابط Google Apps Script (/exec) غير مضبوط.', data: null, error: 'EMPTY_URL' };
       }
       clean = check.normalized;
     }
@@ -5276,46 +5258,78 @@
     return callBackendSetupEndpoint('getSetupCapabilities', {});
   }
 
-  async function applyUnifiedSetup(payload) {
-    var nextPayload = Object.assign({
-      siteOrigin: typeof window !== 'undefined' && window.location ? window.location.origin : ''
-    }, payload || {});
-    var res = await callBackendSetupEndpoint('applyUnifiedConnectionSetup', nextPayload);
-    if (res && res.success && res.data) {
-      var nextMode = String(res.data.mode || '').trim().toLowerCase();
-      var nextGas = String(res.data.gasWebAppUrl || '').trim();
-      var nextBackend = nextMode === 'neon' ? '/api/crm' : '';
-      var persistGasInBrowser = Boolean(nextMode === 'gas' && nextGas && res.data.readOnlyFilesystem && !res.data.coreFilesUpdated);
-      root.RG_APP_CONFIG = Object.assign(root.RG_APP_CONFIG || {}, {
-        mode: nextMode,
-        gasWebAppUrl: nextGas,
-        backendApiUrl: nextBackend
-      });
-      safeStorageSet(STORAGE_GAS_URL, nextMode === 'sandbox' ? SANDBOX_SENTINEL : (persistGasInBrowser ? nextGas : ''));
-      safeStorageSet(STORAGE_BACKEND_URL, '');
-      if (nextMode !== 'sandbox' && typeof window !== 'undefined' && window.history && typeof window.history.replaceState === 'function' && window.location && window.location.search) {
-        try {
-          var cleanUrl = new URL(window.location.href);
-          if (cleanUrl.searchParams.has('sandbox')) {
-            cleanUrl.searchParams.delete('sandbox');
-            window.history.replaceState(null, '', cleanUrl.pathname + (cleanUrl.search || '') + (cleanUrl.hash || ''));
-          }
-        } catch (e) {}
-      }
-      detectedMode = nextMode;
-      detectedGasUrl = nextGas;
-      detectedBackendUrl = nextBackend;
-      _cachedConnInfo = null;
-      clearCache();
-      await refreshGlobalConnection().catch(function () {});
-      if (persistGasInBrowser) {
-        detectedMode = 'gas';
-        detectedGasUrl = nextGas;
-        detectedBackendUrl = '';
-        _cachedConnInfo = null;
-      }
+  async function testServerHealth() {
+    var startedAt = Date.now();
+    if (typeof window === 'undefined' || typeof fetch !== 'function') {
+      return { success: false, message: 'غير مدعوم في هذه البيئة.', data: null };
     }
-    return res;
+    var proto = window.location ? window.location.protocol : '';
+    var host = window.location ? window.location.hostname : '';
+    if ((proto !== 'http:' && proto !== 'https:') || /github\.io$/i.test(host)) {
+      return {
+        success: false,
+        message: 'استضافة ثابتة بدون خادم خلفي (Static Host).',
+        data: { staticHostOnly: true, latencyMs: Date.now() - startedAt }
+      };
+    }
+    try {
+      var resp = await fetch('/api/health', { method: 'GET', cache: 'no-store' });
+      var latencyMs = Math.max(1, Date.now() - startedAt);
+      var text = await resp.text();
+      var json = text ? JSON.parse(text) : null;
+      if (resp.ok && json && json.ok) {
+        return {
+          success: true,
+          message: 'الخادم يعمل بنجاح (' + latencyMs + 'ms) — الوضع: ' + (json.mode || 'neon') + (json.serverlessProxyAvailable ? ' · وسيط Vercel مفعّل' : ''),
+          data: Object.assign({ latencyMs: latencyMs, statusCode: resp.status }, json)
+        };
+      }
+      return {
+        success: false,
+        message: 'استجابة غير متوقعة من نقطة فحص الخادم (HTTP ' + resp.status + ').',
+        data: { latencyMs: latencyMs, statusCode: resp.status }
+      };
+    } catch (err) {
+      return {
+        success: false,
+        message: 'تعذر الوصول إلى نقطة فحص الخادم (/api/health): ' + (err && err.message ? err.message : err),
+        data: { latencyMs: Date.now() - startedAt }
+      };
+    }
+  }
+
+  async function testDatabaseHealth() {
+    var startedAt = Date.now();
+    var res = await callBackendSetupEndpoint('testDatabaseHealth', {});
+    var latencyMs = Math.max(1, Date.now() - startedAt);
+    if (res && res.staticHostOnly) {
+      return {
+        success: false,
+        message: 'لا يوجد خادم متصل باختبار قاعدة البيانات على هذه الاستضافة.',
+        data: { connected: false, configured: false, latencyMs: latencyMs }
+      };
+    }
+    if (res && res.success && res.data) {
+      return {
+        success: Boolean(res.data.connected),
+        message: res.data.message || (res.data.connected ? 'اتصال Neon PostgreSQL ناجح.' : 'قاعدة البيانات غير متصلة.'),
+        data: Object.assign({ latencyMs: res.data.latencyMs || latencyMs }, res.data)
+      };
+    }
+    return {
+      success: false,
+      message: (res && res.message) || 'تعذر اختبار قاعدة بيانات Neon PostgreSQL.',
+      data: { connected: false, latencyMs: latencyMs }
+    };
+  }
+
+  async function applyUnifiedSetup() {
+    return {
+      success: false,
+      message: 'تم إلغاء الربط عبر الموقع — يتم ضبط متغيرات الاتصال من إعدادات بيئة الخادم فقط.',
+      data: null,
+      error: 'WEB_SETUP_DISABLED'
+    };
   }
 
   root.RGApi = {
@@ -5328,6 +5342,8 @@
     refreshGlobalConnection: refreshGlobalConnection,
     getSetupCapabilities: getSetupCapabilities,
     applyUnifiedSetup: applyUnifiedSetup,
+    testServerHealth: testServerHealth,
+    testDatabaseHealth: testDatabaseHealth,
     getConnectionInfo: getConnectionInfo,
     setGasUrl: setGasUrl,
     getToken: getToken,

@@ -194,6 +194,9 @@ export async function dispatchCrmRequest(
       case 'testConnection':
         result = await queries.testRentalGateConnection(executor, session);
         break;
+      case 'testDatabaseHealth':
+        result = await queries.testDatabaseHealth(executor, session);
+        break;
       case 'saveApiToken':
         result = await queries.saveApiToken(executor, session, payload);
         break;

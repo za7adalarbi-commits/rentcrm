@@ -10,6 +10,14 @@
 
   var vendorScriptPromises = {};
 
+  function escapeHtml(val) {
+    return String(val == null ? '' : val)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function assetUrl(rel) {
     if (root.RGCrmCore && root.RGCrmCore.resolveAssetUrl) {
       return root.RGCrmCore.resolveAssetUrl(rel, root.__RG_BASE_URL__);
@@ -1305,8 +1313,9 @@
             '<div class="auth-mode-box">' +
               '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
                 '<div><strong>حالة الخادم:</strong> ' + (isBackendLive ? 'متصل تلقائيًا بقاعدة البيانات السحابية' : (isLive ? 'متصل تلقائيًا بـ Google Apps Script' : 'معاينة محلية (Sandbox)')) + '</div>' +
-                (!isLive && connInfo.defaultUrl ? '<button type="button" class="btn btn-sm btn-primary" id="login-restore-default-gas">تفعيل الربط التلقائي للخادم</button>' : '') +
+                '<button type="button" class="btn btn-sm" id="login-test-connection-btn">اختبار اتصال الخادم</button>' +
               '</div>' +
+              '<div id="login-conn-test-result" class="hidden" role="status" style="margin-top:8px;"></div>' +
               (!isLive ? (
                 '<div class="auth-demo-quick">' +
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">دخول كمدير (admin)</button>' +
@@ -1314,7 +1323,7 @@
                   '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">دخول كموظف (agent1)</button>' +
                 '</div>' +
                 '<div style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.6;">' +
-                  'يتم ربط الخادم تلقائيًا من داخل <strong>الإعدادات</strong> (بعد دخول المدير) أو عبر <span class="mono" dir="ltr">assets/js/config.js</span> دون الحاجة لإدخاله عند تسجيل الدخول.' +
+                  'يتم ضبط الاتصال بقاعدة البيانات و<span class="mono" dir="ltr">Apps Script</span> من متغيرات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط.' +
                 '</div>'
               ) : (
                 '<div class="glass-subcard" style="margin-top:8px;padding:10px 12px;font-size:12px;line-height:1.6;color:var(--text-secondary);">' +
@@ -1400,13 +1409,52 @@
       });
     });
 
-    var restoreDefaultBtn = document.getElementById('login-restore-default-gas');
-    if (restoreDefaultBtn) {
-      restoreDefaultBtn.addEventListener('click', function () {
-        root.RGApi.setGasUrl('__DEFAULT__');
-        root.RGApi.setToken('');
-        toast('تمت استعادة الربط التلقائي بالخادم.');
-        renderLoginScreen();
+    var testConnBtn = document.getElementById('login-test-connection-btn');
+    var testConnOut = document.getElementById('login-conn-test-result');
+    if (testConnBtn && testConnOut) {
+      testConnBtn.addEventListener('click', async function () {
+        testConnBtn.disabled = true;
+        var origText = testConnBtn.textContent;
+        testConnBtn.textContent = 'جاري الاختبار...';
+        testConnOut.classList.remove('hidden');
+        testConnOut.innerHTML = '<div class="glass-subcard" style="padding:8px 10px;font-size:12px;color:var(--text-secondary);">جاري فحص اتصال الخادم...</div>';
+        try {
+          var healthRes = root.RGApi.testServerHealth
+            ? await root.RGApi.testServerHealth()
+            : { success: false, message: 'دالة اختبار الخادم غير متاحة.' };
+          var parts = [];
+          var okHealth = Boolean(healthRes && healthRes.success);
+          var hd = (healthRes && healthRes.data) || {};
+          parts.push(
+            '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
+              '<span><strong>الخادم (/api/health):</strong> ' + escapeHtml((healthRes && healthRes.message) || (okHealth ? 'متصل' : 'غير متصل')) + '</span>' +
+              (hd.latencyMs ? '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + hd.latencyMs + 'ms</span>' : '') +
+            '</div>'
+          );
+          var shouldPingGas = Boolean((okHealth && (hd.envGasConfigured || hd.mode === 'gas')) || connInfo.url);
+          if (shouldPingGas && root.RGApi.pingGasUrl) {
+            var gasRes = await root.RGApi.pingGasUrl('');
+            var gd = (gasRes && gasRes.data) || {};
+            parts.push(
+              '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;padding-top:4px;border-top:1px solid var(--border-hairline);">' +
+                '<span><strong>Apps Script:</strong> ' + escapeHtml((gasRes && gasRes.message) || (gasRes && gasRes.success ? 'متصل' : 'فشل الاتصال')) + '</span>' +
+                (gd.latencyMs ? '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + gd.latencyMs + 'ms</span>' : '') +
+              '</div>'
+            );
+          }
+          testConnOut.innerHTML =
+            '<div class="' + (okHealth ? 'form-success' : 'form-error') + '" style="padding:8px 10px;border-radius:var(--radius-sm);font-size:12px;line-height:1.55;">' +
+              parts.join('') +
+            '</div>';
+        } catch (err) {
+          testConnOut.innerHTML =
+            '<div class="form-error" style="padding:8px 10px;border-radius:var(--radius-sm);font-size:12px;">' +
+              escapeHtml((err && err.message) || 'تعذر فحص اتصال الخادم.') +
+            '</div>';
+        } finally {
+          testConnBtn.disabled = false;
+          testConnBtn.textContent = origText;
+        }
       });
     }
 

@@ -166,10 +166,20 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
 
   schemaInitPromise = (async () => {
     try {
-      const check = await executor.query<{ reg: string | null }>(
-        "SELECT to_regclass('public.employees') AS reg"
+      const check = await executor.query<{ reg: string | null; all_ok?: boolean }>(
+        `SELECT
+          to_regclass('public.employees') AS reg,
+          (
+            to_regclass('public.employees') IS NOT NULL AND
+            to_regclass('public.activity_log') IS NOT NULL AND
+            to_regclass('public.sync_log') IS NOT NULL AND
+            to_regclass('public.reservations') IS NOT NULL AND
+            to_regclass('public.settings') IS NOT NULL AND
+            to_regclass('public.sessions') IS NOT NULL
+          ) AS all_ok`
       );
-      const exists = Boolean(check.rows[0] && check.rows[0].reg);
+      const row = check.rows[0];
+      const exists = Boolean(row && row.reg && row.all_ok !== false);
       if (!exists) {
         const schemaSql = loadSchemaSql();
         await executor.query(schemaSql);

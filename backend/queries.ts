@@ -3510,7 +3510,7 @@ export async function pullOrSyncReservations(
     }
   }
 
-  throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate أو رابط Google Apps Script في صفحة الإعدادات.');
+  throw new Error('NO_RG_TOKEN: يرجى ضبط متغير RG_TOKEN أو GAS_WEBAPP_URL في إعدادات بيئة الخادم (.env / Vercel).');
 }
 
 export async function saveGlobalConnectionSettings(
@@ -3639,6 +3639,36 @@ export async function saveApiToken(executor: DbExecutor, session: AuthSession, p
   return { saved: true, hasRgToken: true, hasDirectToken: true, connection };
 }
 
+export async function testDatabaseHealth(executor: DbExecutor, session: AuthSession) {
+  requireApiAccess(session);
+  const startedAt = Date.now();
+  const serverCfg = await resolveServerConfig(executor);
+  const dbCheck = await executor.query<{ ok: number }>(`SELECT 1 AS ok`);
+  const countsRes = await executor.query<{ res_cnt: string; emp_cnt: string; sync_cnt: string }>(
+    `SELECT
+       (SELECT COUNT(*)::text FROM reservations) AS res_cnt,
+       (SELECT COUNT(*)::text FROM employees) AS emp_cnt,
+       (SELECT COUNT(*)::text FROM sync_log) AS sync_cnt`
+  );
+  const latencyMs = Math.max(1, Date.now() - startedAt);
+  const row = countsRes.rows[0] || { res_cnt: '0', emp_cnt: '0', sync_cnt: '0' };
+  const ok = Boolean(dbCheck.rows[0] && Number(dbCheck.rows[0].ok) === 1);
+  return {
+    connected: ok,
+    configured: true,
+    latencyMs,
+    mode: serverCfg.mode || 'neon',
+    hasGasUrl: Boolean(serverCfg.gasWebAppUrl),
+    hasRgToken: Boolean(serverCfg.rgToken),
+    reservationsCount: Number(row.res_cnt || 0),
+    employeesCount: Number(row.emp_cnt || 0),
+    syncLogsCount: Number(row.sync_cnt || 0),
+    message: ok
+      ? `اتصال Neon PostgreSQL ناجح (${latencyMs}ms) — الحجوزات: ${row.res_cnt || 0} · الموظفون: ${row.emp_cnt || 0}.`
+      : 'تعذر التحقق من استجابة قاعدة بيانات Neon PostgreSQL.'
+  };
+}
+
 export async function testRentalGateConnection(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
   const serverCfg = await resolveServerConfig(executor);
@@ -3650,8 +3680,8 @@ export async function testRentalGateConnection(executor: DbExecutor, session: Au
       statusCode: 0,
       hasToken: Boolean(gasUrl),
       message: gasUrl
-        ? 'الربط يعمل عبر Google Apps Script المربوط بقاعدة Neon PostgreSQL.'
-        : 'يرجى إدخال توكن Rental Gate في الإعدادات ليتم حفظه والربط تلقائيًا.'
+        ? 'الربط يعمل عبر Google Apps Script المضبوط على الخادم.'
+        : 'متغير RG_TOKEN غير مضبوط في إعدادات بيئة الخادم (.env / Vercel).'
     };
   }
   const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');

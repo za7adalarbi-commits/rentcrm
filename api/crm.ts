@@ -156,6 +156,21 @@ export default async function handler(req: any, res: any) {
         return;
       }
 
+      if (action === 'testDatabaseHealth') {
+        res.status(200).json({
+          success: true,
+          message: 'متغير DATABASE_URL غير مضبوط في بيئة الخادم.',
+          data: {
+            connected: false,
+            configured: false,
+            latencyMs: 0,
+            message: 'متغير DATABASE_URL غير مضبوط في بيئة الخادم (.env / Vercel Environment Variables).'
+          },
+          error: null
+        });
+        return;
+      }
+
       if (action === 'applyUnifiedConnectionSetup') {
         try {
           const isServerless = process.env.VERCEL === '1' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);

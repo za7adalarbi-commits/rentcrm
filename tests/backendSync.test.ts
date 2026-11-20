@@ -974,6 +974,21 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: found ? [found] : ([] as any[]), rowCount: found ? 1 : 0 };
     }
 
+    if (sql.startsWith('SELECT 1 AS ok')) {
+      return { rows: [{ ok: 1 }] as any[], rowCount: 1 };
+    }
+
+    if (sql.includes('AS res_cnt') && sql.includes('AS emp_cnt') && sql.includes('AS sync_cnt')) {
+      return {
+        rows: [{
+          res_cnt: String(state.reservations.length),
+          emp_cnt: String(state.employees.length),
+          sync_cnt: String(state.sync_log.length)
+        }] as any[],
+        rowCount: 1
+      };
+    }
+
     if (sql.startsWith('SELECT COUNT(*)::int AS cnt FROM reservations')) {
       return { rows: [{ cnt: state.reservations.length }] as any[], rowCount: 1 };
     }
@@ -2867,4 +2882,188 @@ test('RGApi always revalidates live server after F5 refresh, flushes IDB/session
   const offlineRes = await offlineSession.ctx.RGApi.callApi('getReservations', { page: 1 });
   assert.equal(offlineRes.success, true);
   assert.equal(offlineRes.data.items[0].id, 'RES_OLD');
+});
+
+test('testDatabaseHealth diagnostics, disabled client-side web binding, and UI test buttons replace website binding forms', async () => {
+  const db = createInMemoryMockExecutor();
+  const adminLogin = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'Admin', password: 'Admin@123' }
+  });
+  assert.equal(adminLogin.success, true);
+  const adminToken = adminLogin.data.token;
+
+  const agentLogin = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'agent1', password: 'Agent@123' }
+  });
+  assert.equal(agentLogin.success, true);
+  const agentToken = agentLogin.data.token;
+
+  // Unauthenticated or agent without access_api must be denied
+  const unauthHealth = await dispatchCrmRequest(db, { action: 'testDatabaseHealth' });
+  assert.equal(unauthHealth.success, false);
+  const agentHealth = await dispatchCrmRequest(db, { action: 'testDatabaseHealth', token: agentToken });
+  assert.equal(agentHealth.success, false);
+
+  // Admin gets structured Neon PostgreSQL health metrics
+  const dbHealth = await dispatchCrmRequest(db, {
+    action: 'testDatabaseHealth',
+    token: adminToken
+  });
+  assert.equal(dbHealth.success, true);
+  assert.equal(dbHealth.data.connected, true);
+  assert.equal(dbHealth.data.configured, true);
+  assert.ok(Number(dbHealth.data.latencyMs) >= 1);
+  assert.equal(typeof dbHealth.data.reservationsCount, 'number');
+  assert.ok(Number(dbHealth.data.employeesCount) >= 3);
+
+  // Verify frontend RGApi diagnostics & disabled web setup in VM sandbox
+  const coreSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/core.js'), 'utf8');
+  const idbSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/idb.js'), 'utf8');
+  const apiSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/api.js'), 'utf8');
+
+  const createMemStorage = (init: Record<string, string> = {}) => {
+    const map = new Map<string, string>(Object.entries(init));
+    return {
+      getItem: (k: string) => (map.has(k) ? map.get(k)! : null),
+      setItem: (k: string, v: string) => { map.set(k, String(v)); },
+      removeItem: (k: string) => { map.delete(k); }
+    };
+  };
+
+  const calledUrls: Array<{ url: string; action: string }> = [];
+  const ctx: any = {
+    console, Date, Math, JSON, Promise, Object, Array, String, Number, Boolean, Set, Map, RegExp, URL,
+    setTimeout, clearTimeout,
+    CustomEvent: class CustomEvent { type: string; detail: any; constructor(t: string, i?: any) { this.type = t; this.detail = i?.detail; } },
+    document: { dispatchEvent() {} },
+    localStorage: createMemStorage({
+      rg_crm_session_token: adminToken,
+      rg_crm_gas_url: 'https://stale-override.example.com/exec',
+      rg_crm_backend_api_url: 'https://stale-backend.example.com/api/crm'
+    }),
+    sessionStorage: createMemStorage({}),
+    RG_APP_CONFIG: { mode: 'neon', backendApiUrl: '/api/crm', gasWebAppUrl: '' },
+    location: {
+      protocol: 'https:',
+      hostname: 'rentcrm.example.com',
+      origin: 'https://rentcrm.example.com',
+      search: '?gasUrl=https%3A%2F%2Fmalicious.example.com%2Fexec',
+      href: 'https://rentcrm.example.com/?gasUrl=foo',
+      pathname: '/',
+      hash: '#settings'
+    },
+    history: { replaceState() {} },
+    fetch: async (url: string, init?: any) => {
+      const u = String(url);
+      if (u.includes('/api/health')) {
+        calledUrls.push({ url: u, action: 'health' });
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({
+            ok: true,
+            mode: 'neon',
+            databaseConfigured: true,
+            connected: true,
+            envGasConfigured: true,
+            backendApiUrl: '/api/crm',
+            message: 'الخادم متصل'
+          })
+        };
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      calledUrls.push({ url: u, action: body.action || '' });
+      if (body.action === 'testDatabaseHealth') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({ success: true, message: 'ok', data: dbHealth.data, error: null })
+        };
+      }
+      if (body.action === 'pingGasUrl') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          text: async () => JSON.stringify({
+            success: true,
+            message: 'Google Apps Script يعمل بنجاح.',
+            data: { latencyMs: 42 },
+            error: null
+          })
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify({ success: true, message: '', data: {}, error: null })
+      };
+    }
+  };
+  ctx.window = ctx;
+  vm.runInNewContext(coreSrc, ctx);
+  vm.runInNewContext(idbSrc, ctx);
+  vm.runInNewContext(apiSrc, ctx);
+
+  await ctx.RGApi.ready();
+
+  // Browser URL/localStorage overrides MUST NOT override backend /api/crm
+  assert.equal(ctx.RGApi.getBackendApiUrl(), '/api/crm');
+
+  // Website unified setup must be disabled
+  const disabledSetup = await ctx.RGApi.applyUnifiedSetup({ mode: 'gas', gasWebAppUrl: 'https://script.google.com/macros/s/abc/exec' });
+  assert.equal(disabledSetup.success, false);
+  assert.equal(disabledSetup.error, 'WEB_SETUP_DISABLED');
+
+  // New test button API helpers hit server diagnostics cleanly
+  const srvHealth = await ctx.RGApi.testServerHealth();
+  assert.equal(srvHealth.success, true);
+  assert.equal(srvHealth.data.mode, 'neon');
+
+  const neonTest = await ctx.RGApi.testDatabaseHealth();
+  assert.equal(neonTest.success, true);
+  assert.equal(neonTest.data.connected, true);
+
+  const gasTest = await ctx.RGApi.pingGasUrl('');
+  assert.equal(gasTest.success, true);
+  assert.ok(calledUrls.some((c) => c.action === 'pingGasUrl'));
+
+  // Verify settings.js and app.js have test buttons and zero website connection/binding forms
+  const settingsSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/settings.js'), 'utf8');
+  const appSrc = fs.readFileSync(path.resolve(process.cwd(), 'assets/js/app.js'), 'utf8');
+  const srcAppSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/assets/js/app.js'), 'utf8');
+  assert.equal(appSrc, srcAppSrc);
+
+  for (const id of [
+    'btn-test-all-connections',
+    'btn-test-server-health',
+    'btn-test-neon-db',
+    'btn-ping-gas-url',
+    'btn-test-rg-top',
+    'btn-test-rg'
+  ]) {
+    assert.ok(settingsSrc.includes(id), `settings.js missing test button ${id}`);
+  }
+  assert.ok(appSrc.includes('login-test-connection-btn'), 'app.js missing login-test-connection-btn');
+
+  for (const removedId of [
+    'btn-save-gas-url',
+    'btn-save-rg-token',
+    'btn-restore-global-gas',
+    'btn-clear-gas-url',
+    'setup-database-url',
+    'setup-rg-token',
+    'setup-sync-secret',
+    'setup-vercel-token',
+    'set-gas-url',
+    'set-rg-token'
+  ]) {
+    assert.equal(settingsSrc.includes(removedId), false, `settings.js still contains binding control ${removedId}`);
+  }
+  assert.equal(appSrc.includes('login-restore-default-gas'), false, 'app.js still contains login-restore-default-gas');
 });
