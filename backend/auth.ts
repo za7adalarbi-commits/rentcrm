@@ -259,12 +259,72 @@ export async function handleLogin(
   return { token: rawToken, expiresAt, user };
 }
 
+const AUTH_SESSION_CACHE_TTL_MS = 8000;
+const AUTH_LAST_SEEN_TOUCH_MS = 300000;
+const authSessionCaches = new WeakMap<
+  object,
+  Map<string, { cachedUntil: number; lastSeenTouchAt: number; session: AuthSession }>
+>();
+
+function getAuthSessionCache(executor: object) {
+  let map = authSessionCaches.get(executor);
+  if (!map) {
+    map = new Map();
+    authSessionCaches.set(executor, map);
+  }
+  return map;
+}
+
+export function invalidateAuthSessionCache(
+  executor: object,
+  opts?: { tokenHash?: string; employeeId?: string; all?: boolean }
+): void {
+  if (!executor || typeof executor !== 'object') return;
+  const map = authSessionCaches.get(executor);
+  if (!map || map.size === 0) return;
+  if (!opts || opts.all) {
+    map.clear();
+    return;
+  }
+  if (opts.tokenHash && map.has(opts.tokenHash)) {
+    map.delete(opts.tokenHash);
+  }
+  if (opts.employeeId) {
+    for (const [k, entry] of map.entries()) {
+      if (entry.session.employeeId === opts.employeeId) {
+        map.delete(k);
+      }
+    }
+  }
+}
+
 export async function requireAuth(executor: DbExecutor, rawToken: string): Promise<AuthSession> {
   const token = String(rawToken || '').trim();
   if (!token) {
     throw new Error('UNAUTHORIZED: يلزم تسجيل الدخول أولاً.');
   }
   const tHash = hashToken(token);
+  const sesCache = getAuthSessionCache(executor);
+  const nowMs = Date.now();
+  const cached = sesCache.get(tHash);
+  if (cached && nowMs < cached.cachedUntil) {
+    const expMs = new Date(cached.session.expiresAt).getTime();
+    const delExp = cached.session.user?.activeDelegation?.expiresAt
+      ? Date.parse(String(cached.session.user.activeDelegation.expiresAt))
+      : 0;
+    if ((isNaN(expMs) || nowMs <= expMs) && (!delExp || isNaN(delExp) || nowMs <= delExp)) {
+      if (nowMs - cached.lastSeenTouchAt > AUTH_LAST_SEEN_TOUCH_MS) {
+        cached.lastSeenTouchAt = nowMs;
+        void executor.query(
+          `UPDATE sessions SET last_seen_at = $2::timestamptz WHERE token_hash = $1`,
+          [tHash, new Date(nowMs).toISOString()]
+        ).catch(() => undefined);
+      }
+      return cached.session;
+    }
+    sesCache.delete(tHash);
+  }
+
   const sesRes = await executor.query(
     `SELECT s.token_hash, s.employee_id, s.username, s.role, s.expires_at, s.is_revoked, s.last_seen_at,
             e.id AS emp_id, e.name, e.username AS emp_username, e.phone, e.email,
@@ -279,22 +339,25 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
 
   const row = sesRes.rows[0];
   if (!row || row.is_revoked === true) {
+    sesCache.delete(tHash);
     throw new Error('UNAUTHORIZED: الجلسة غير صالحة أو تم إنهاؤها.');
   }
 
   const expTime = new Date(row.expires_at).getTime();
   if (!isNaN(expTime) && Date.now() > expTime) {
+    sesCache.delete(tHash);
     await executor.query(`UPDATE sessions SET is_revoked = TRUE WHERE token_hash = $1`, [tHash]);
     throw new Error('UNAUTHORIZED: انتهت صلاحية الجلسة. يرجى تسجيل الدخول مجددًا.');
   }
 
   if (String(row.emp_status || 'active') !== 'active') {
+    sesCache.delete(tHash);
     throw new Error('UNAUTHORIZED: الحساب غير نشط أو غير موجود.');
   }
 
   // Opportunistic touch at most once every 5 minutes without blocking read/write latency
   const lastSeenMs = row.last_seen_at ? new Date(row.last_seen_at).getTime() : 0;
-  if (!lastSeenMs || isNaN(lastSeenMs) || (Date.now() - lastSeenMs) > 300000) {
+  if (!lastSeenMs || isNaN(lastSeenMs) || (Date.now() - lastSeenMs) > AUTH_LAST_SEEN_TOUCH_MS) {
     const nowIso = new Date().toISOString();
     void executor.query(
       `UPDATE sessions SET last_seen_at = $2::timestamptz WHERE token_hash = $1`,
@@ -318,7 +381,7 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
   });
   const user = await applyDelegationForUser(executor, baseUser);
 
-  return {
+  const authSession: AuthSession = {
     tokenHash: tHash,
     employeeId: user.id,
     username: user.username,
@@ -326,9 +389,19 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
     expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
     user
   };
+  if (sesCache.size > 400) {
+    sesCache.clear();
+  }
+  sesCache.set(tHash, {
+    cachedUntil: Date.now() + AUTH_SESSION_CACHE_TTL_MS,
+    lastSeenTouchAt: lastSeenMs && !isNaN(lastSeenMs) ? lastSeenMs : Date.now(),
+    session: authSession
+  });
+  return authSession;
 }
 
 export async function handleLogout(executor: DbExecutor, session: AuthSession): Promise<{ loggedOut: boolean }> {
+  invalidateAuthSessionCache(executor, { tokenHash: session.tokenHash });
   await executor.query(`UPDATE sessions SET is_revoked = TRUE WHERE token_hash = $1`, [session.tokenHash]);
   const nowIso = new Date().toISOString();
   await executor.query(
@@ -340,5 +413,6 @@ export async function handleLogout(executor: DbExecutor, session: AuthSession): 
 }
 
 export async function revokeEmployeeSessions(client: DbClient, employeeId: string): Promise<void> {
+  invalidateAuthSessionCache(client as object, { employeeId });
   await client.query(`UPDATE sessions SET is_revoked = TRUE WHERE employee_id = $1`, [employeeId]);
 }

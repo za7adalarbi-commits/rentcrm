@@ -1995,7 +1995,7 @@
 
   function stableSerializePayload(payload) {
     if (!payload || typeof payload !== 'object') return '{}';
-    var ignored = { visibleCols: true, forceRefresh: true, silentRefresh: true, abortKey: true, clientRequestId: true };
+    var ignored = { visibleCols: true, forceRefresh: true, silentRefresh: true, abortKey: true, clientRequestId: true, nowMs: true };
     var keys = Object.keys(payload).filter(function (k) {
       return !ignored[k] && payload[k] !== undefined;
     }).sort();

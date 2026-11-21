@@ -1417,6 +1417,35 @@
       });
     }
 
+    function extractRadarItemsFromData(data) {
+      if (!data || typeof data !== 'object') return null;
+      if (Array.isArray(data.items)) return data.items;
+      var byId = {};
+      var list = [];
+      var collect = function (arr) {
+        if (!Array.isArray(arr)) return;
+        arr.forEach(function (entry) {
+          var r = (entry && entry.reservation && entry.reservation.id) ? entry.reservation : entry;
+          if (r && r.id && !byId[r.id]) {
+            byId[r.id] = true;
+            list.push(r);
+          }
+        });
+      };
+      if (data.todaySummary) {
+        collect(data.todaySummary.allItems);
+        collect(data.todaySummary.items);
+      }
+      if (data.radarSummary) {
+        collect(data.radarSummary.allItems);
+        collect(data.radarSummary.items);
+      }
+      if (list.length > 0 || (data.counts && Number(data.counts.todayTotal || 0) === 0 && Number(data.counts.radarTotal || 0) === 0)) {
+        return list;
+      }
+      return null;
+    }
+
     async function refreshRadarData(showToast, extraOpts) {
       var seq = ++radarFetchSeq;
       var opts = extraOpts || {};
@@ -1438,19 +1467,19 @@
         });
         if (seq !== radarFetchSeq || !container.isConnected) return;
         if (resp && resp.aborted) return;
-        if (resp && resp.success && resp.data && Array.isArray(resp.data.items)) {
+        var extracted = (resp && resp.success && resp.data) ? extractRadarItemsFromData(resp.data) : null;
+        if (extracted !== null) {
           radarLoadError = '';
-          radarRawReservations = resp.data.items;
+          radarRawReservations = extracted;
+        } else if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+          radarLoadError = '';
+          radarRawReservations = currentItems.slice();
         } else if (radarRawReservations === null) {
-          if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
-            radarRawReservations = currentItems.slice();
-          } else {
-            radarLoadError = (resp && resp.message) || 'تعذر تحميل بيانات اليوم والرادار.';
-            var tb = document.getElementById('res-today-tab-count');
-            var rb = document.getElementById('res-radar-tab-count');
-            if (tb) tb.textContent = '!';
-            if (rb) rb.textContent = '!';
-          }
+          radarLoadError = (resp && resp.message) || 'تعذر تحميل بيانات اليوم والرادار.';
+          var tb = document.getElementById('res-today-tab-count');
+          var rb = document.getElementById('res-radar-tab-count');
+          if (tb) tb.textContent = '!';
+          if (rb) rb.textContent = '!';
         }
         paintRadarView();
         paintTodayView();
@@ -1463,6 +1492,7 @@
         if (seq !== radarFetchSeq || !container.isConnected) return;
         if (radarRawReservations === null) {
           if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+            radarLoadError = '';
             radarRawReservations = currentItems.slice();
           } else {
             radarLoadError = 'تعذر الاتصال بالخادم أثناء تحميل بيانات اليوم والرادار.';

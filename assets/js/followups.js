@@ -317,20 +317,31 @@
           return;
         }
         runWithLock(btn, 'togglePinnedCritical:' + rid, function () {
+          var prevPinnedIds = pinnedIds.slice();
+          if (isPinnedNow) {
+            pinnedIds = pinnedIds.filter(function (id) { return id !== rid; });
+          } else {
+            pinnedIds = [rid].concat(pinnedIds).slice(0, maxPins);
+          }
           if (root.RGApi.applyOptimisticMutation) {
             root.RGApi.applyOptimisticMutation('togglePinnedCriticalReservation', { reservationId: rid, pin: !isPinnedNow }, currentUser);
           }
+          btn.setAttribute('data-pinned', !isPinnedNow ? '1' : '0');
+          btn.classList.toggle('is-pinned', !isPinnedNow);
+          ctx.toast(!isPinnedNow ? 'تم تثبيت الحجز في قائمة الحالات الحرجة.' : 'تم إلغاء تثبيت الحجز الحرج.');
+          renderMyFollowUps(container, ctx);
           return root.RGApi.callApi('togglePinnedCriticalReservation', {
             reservationId: rid,
-            pin: !isPinnedNow
+            pin: !isPinnedNow,
+            _keepOptimisticCache: true
           }).then(function (resp) {
-            if (resp && resp.success) {
-              ctx.toast(!isPinnedNow ? 'تم تثبيت الحجز في قائمة الحالات الحرجة.' : 'تم إلغاء تثبيت الحجز الحرج.');
-            } else {
+            if (!resp || !resp.success) {
+              pinnedIds = prevPinnedIds;
               ctx.toast((resp && resp.message) || 'تعذر تحديث قائمة التثبيت.', true);
+              renderMyFollowUps(container, ctx);
             }
-            renderMyFollowUps(container, ctx);
           }).catch(function () {
+            pinnedIds = prevPinnedIds;
             ctx.toast('تعذر الاتصال بالخادم أثناء تحديث التثبيت.', true);
             renderMyFollowUps(container, ctx);
           });
@@ -343,22 +354,49 @@
         var rid = btn.getAttribute('data-id');
         if (!rid) return;
         runWithLock(btn, 'recordNoAnswer:' + rid, function () {
+          var targetRec = assignedById[rid] || null;
+          var prevNa = targetRec ? Math.max(0, Number(targetRec.noAnswerCount || 0)) : 0;
+          var prevLastTxt = targetRec ? (targetRec.lastUpdateText || '') : '';
+          var nextCount = prevNa + 1;
+          var nextActionTxt = (core && core.buildNoAnswerActionText)
+            ? core.buildNoAnswerActionText(nextCount, 'ar')
+            : ('محاولة اتصال — لم يرد (المحاولة #' + nextCount + ')');
+          if (targetRec) {
+            targetRec.noAnswerCount = nextCount;
+            targetRec.lastUpdateText = nextActionTxt;
+          }
           if (root.RGApi.applyOptimisticMutation) {
             root.RGApi.applyOptimisticMutation('recordNoAnswerFollowUp', { reservationId: rid }, currentUser);
           }
+          var rowEl = btn.closest('tr');
+          if (rowEl) {
+            var lastEl = rowEl.querySelector('.myfu-last-update-cell .cell-clamp-2');
+            if (lastEl) lastEl.textContent = nextActionTxt;
+            var badgeEl = rowEl.querySelector('.rg-attempt-badge');
+            if (badgeEl) {
+              badgeEl.textContent = (isEn ? 'Attempts: ' : 'محاولات: ') + nextCount;
+            }
+          }
+          ctx.toast('تم تسجيل محاولة اتصال — لم يرد (المحاولة #' + nextCount + ')');
           return root.RGApi.callApi('recordNoAnswerFollowUp', {
             reservationId: rid,
             _keepOptimisticCache: true
           }).then(function (resp) {
             if (resp && resp.success) {
-              var nextCount = (resp.data && resp.data.noAnswerCount) || ((Number((assignedById[rid] && assignedById[rid].noAnswerCount) || 0)) + 1);
-              ctx.toast('تم تسجيل محاولة اتصال — لم يرد (المحاولة #' + nextCount + ')');
               ctx.refreshNotifications();
             } else {
+              if (targetRec) {
+                targetRec.noAnswerCount = prevNa;
+                targetRec.lastUpdateText = prevLastTxt;
+              }
               ctx.toast((resp && resp.message) || 'تعذر تسجيل محاولة الاتصال.', true);
+              renderMyFollowUps(container, ctx);
             }
-            renderMyFollowUps(container, ctx);
           }).catch(function () {
+            if (targetRec) {
+              targetRec.noAnswerCount = prevNa;
+              targetRec.lastUpdateText = prevLastTxt;
+            }
             ctx.toast('تعذر الاتصال بالخادم أثناء تسجيل المحاولة.', true);
             renderMyFollowUps(container, ctx);
           });

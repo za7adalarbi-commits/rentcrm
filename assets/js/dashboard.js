@@ -1835,12 +1835,37 @@
             }
           }
           if (radarRes && !radarRes.aborted) {
-            if (radarRes.success && radarRes.data && Array.isArray(radarRes.data.items)) {
-              radarItems = radarRes.data.items;
-            } else if (!radarRes.success && !hasCachedRadar) {
+            var rData = radarRes.data;
+            var rItems = null;
+            if (radarRes.success && rData) {
+              if (Array.isArray(rData.items)) {
+                rItems = rData.items;
+              } else {
+                var byIdR = {};
+                var collectedR = [];
+                var pushR = function (arr) {
+                  if (!Array.isArray(arr)) return;
+                  arr.forEach(function (entry) {
+                    var rv = (entry && entry.reservation && entry.reservation.id) ? entry.reservation : entry;
+                    if (rv && rv.id && !byIdR[rv.id]) {
+                      byIdR[rv.id] = true;
+                      collectedR.push(rv);
+                    }
+                  });
+                };
+                if (rData.radarSummary) { pushR(rData.radarSummary.allItems); pushR(rData.radarSummary.items); }
+                if (rData.todaySummary) { pushR(rData.todaySummary.allItems); pushR(rData.todaySummary.items); }
+                if (collectedR.length > 0 || (rData.counts && Number(rData.counts.radarTotal || 0) === 0)) {
+                  rItems = collectedR;
+                }
+              }
+            }
+            if (rItems !== null) {
+              radarItems = rItems;
+            } else if (!hasCachedRadar) {
               if (resItems.length > 0) {
                 radarItems = resItems;
-              } else {
+              } else if (!radarRes.success) {
                 radarErr = radarRes.message || 'تعذر تحميل بيانات رادار 24 ساعة.';
               }
             }

@@ -1,5 +1,9 @@
-import {createRoot} from 'react-dom/client';
-import App from './App';
+import { createRoot } from 'react-dom/client';
+import './pwaRegister';
 import './index.css';
+import App from './App';
 
-createRoot(document.getElementById('root')!).render(<App />);
+const rootEl = document.getElementById('root');
+if (rootEl) {
+  createRoot(rootEl).render(<App />);
+}

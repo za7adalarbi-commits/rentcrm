@@ -1080,6 +1080,128 @@
     };
   }
 
+  function queryLocalTodayAndRadarFast(payload, userContext) {
+    var ns = getCacheNamespace();
+    var core = root.RGCrmCore;
+    if (!core || !core.computeTodayMovementsSummary || !core.computeExpiryRadarSummary) return null;
+
+    var resBucket = localReservationsByNs[ns];
+    if (!resBucket || !Array.isArray(resBucket.list) || resBucket.list.length === 0) return null;
+    var meta = localMetaByNs[ns] || {};
+    if (!meta.allReservationsHydrated) return null;
+    if (getTransportUrl() && !localReservationsFreshInPage[ns]) return null;
+
+    var ageMs = Date.now() - Number(resBucket.updatedAt || meta.updatedAt || 0);
+    if (ageMs > SWR_STALE_MAX_MS * 2) return null;
+
+    var p = payload || {};
+    var u = userContext || {};
+    var restrictAgent = u.role === 'agent' && u.allowAgentViewAll === false &&
+      !(u.user && core.canUserPerform && core.canUserPerform(u.user, 'view_all_reservations'));
+    var candidates = resBucket.list.filter(function (r) {
+      if (!r) return false;
+      if (restrictAgent) {
+        return Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds.indexOf(u.employeeId) !== -1;
+      }
+      return true;
+    });
+    var todayStr = /^\d{4}-\d{2}-\d{2}$/.test(String(p.todayDate || ''))
+      ? String(p.todayDate)
+      : (core.getRiyadhDateString ? core.getRiyadhDateString() : todayIso(0));
+    var nowMs = (typeof p.nowMs === 'number' && isFinite(p.nowMs)) ? p.nowMs : Date.now();
+    var todaySummary = core.computeTodayMovementsSummary(candidates, nowMs, {
+      todayDate: todayStr,
+      subFilter: 'all'
+    });
+    var radarSummary = core.computeExpiryRadarSummary(candidates, nowMs, {
+      subFilter: 'all',
+      windowHours: 24,
+      gracePastHours: 12
+    });
+    var counts = {
+      todayTotal: Number(todaySummary.totalCount || 0),
+      pickupCount: Number(todaySummary.pickupCount || 0),
+      returnCount: Number(todaySummary.returnCount || 0),
+      pendingPickupCount: Number(todaySummary.pendingPickupCount || 0),
+      pendingReturnCount: Number(todaySummary.pendingReturnCount || 0),
+      overdueTodayCount: Number(todaySummary.overdueCount || 0),
+      radarTotal: Number(radarSummary.totalCount || 0),
+      upcoming24hCount: Number(radarSummary.upcoming24hCount || 0),
+      critical6hCount: Number(radarSummary.critical6hCount || 0),
+      soon24hCount: Number(radarSummary.soon24hCount || 0),
+      expiredUnclosedCount: Number(radarSummary.expiredUnclosedCount || 0),
+      extendedInRadarCount: Number(radarSummary.extendedInRadarCount || 0)
+    };
+    return {
+      isStale: ageMs > 45000,
+      response: {
+        success: true,
+        message: '',
+        data: {
+          todayDate: todayStr,
+          serverTime: new Date().toISOString(),
+          counts: counts,
+          todaySummary: todaySummary,
+          radarSummary: radarSummary,
+          items: candidates
+        },
+        error: null
+      }
+    };
+  }
+
+  function emitOptimisticMutationEvent(action, detail) {
+    try {
+      if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function') {
+        var core = root.RGCrmCore;
+        var scopes = (core && core.getCacheInvalidationScopes) ? core.getCacheInvalidationScopes(action) : [];
+        document.dispatchEvent(new CustomEvent('rg:optimisticmutation', {
+          detail: Object.assign({
+            action: action,
+            scopes: scopes,
+            at: Date.now()
+          }, detail || {})
+        }));
+      }
+    } catch (_e) {}
+  }
+
+  function patchTodayRadarCaches(resUpdaterFn) {
+    var core = root.RGCrmCore;
+    if (typeof resUpdaterFn !== 'function') return;
+    patchCachedScopes(['todayRadar'], function (data, actName) {
+      if (actName !== 'getTodayAndRadar' || !data || !Array.isArray(data.items)) return undefined;
+      var nextItems = data.items.map(resUpdaterFn);
+      if (core && core.computeTodayMovementsSummary && core.computeExpiryRadarSummary) {
+        var nowMs = Date.now();
+        var todayStr = data.todayDate || (core.getRiyadhDateString ? core.getRiyadhDateString() : todayIso(0));
+        var tSum = core.computeTodayMovementsSummary(nextItems, nowMs, { todayDate: todayStr, subFilter: 'all' });
+        var rSum = core.computeExpiryRadarSummary(nextItems, nowMs, { subFilter: 'all', windowHours: 24, gracePastHours: 12 });
+        var counts = {
+          todayTotal: Number(tSum.totalCount || 0),
+          pickupCount: Number(tSum.pickupCount || 0),
+          returnCount: Number(tSum.returnCount || 0),
+          pendingPickupCount: Number(tSum.pendingPickupCount || 0),
+          pendingReturnCount: Number(tSum.pendingReturnCount || 0),
+          overdueTodayCount: Number(tSum.overdueCount || 0),
+          radarTotal: Number(rSum.totalCount || 0),
+          upcoming24hCount: Number(rSum.upcoming24hCount || 0),
+          critical6hCount: Number(rSum.critical6hCount || 0),
+          soon24hCount: Number(rSum.soon24hCount || 0),
+          expiredUnclosedCount: Number(rSum.expiredUnclosedCount || 0),
+          extendedInRadarCount: Number(rSum.extendedInRadarCount || 0)
+        };
+        return Object.assign({}, data, {
+          items: nextItems,
+          todaySummary: tSum,
+          radarSummary: rSum,
+          counts: counts
+        });
+      }
+      return Object.assign({}, data, { items: nextItems });
+    });
+  }
+
   function applyOptimisticMutation(action, payload, actor) {
     var p = payload || {};
     var core = root.RGCrmCore;
@@ -1139,6 +1261,8 @@
         }
         return undefined;
       });
+      patchTodayRadarCaches(applyAssignFn);
+      emitOptimisticMutationEvent(action, { reservationId: resIdClaim });
       return;
     }
 
@@ -1231,6 +1355,8 @@
         }
         return undefined;
       });
+      patchTodayRadarCaches(patchResStatus);
+      emitOptimisticMutationEvent(action, { reservationId: resIdFu });
       return;
     }
 
@@ -1268,6 +1394,8 @@
         }
         return undefined;
       });
+      patchTodayRadarCaches(patchPinned);
+      emitOptimisticMutationEvent(action, { reservationId: resIdPin });
       return;
     }
 
@@ -1351,6 +1479,8 @@
         }
         return undefined;
       });
+      patchTodayRadarCaches(patchNa);
+      emitOptimisticMutationEvent(action, { reservationId: resIdNa });
       return;
     }
 
@@ -1427,7 +1557,11 @@
           }
           return undefined;
         });
+        patchTodayRadarCaches(function (r) {
+          return r && r.id === affectedResId ? Object.assign({}, r, { hasProblem: Boolean(stillOpenOnRes) }) : r;
+        });
       }
+      emitOptimisticMutationEvent(action, { problemId: prbId, reservationId: affectedResId });
       return;
     }
 
@@ -1497,6 +1631,117 @@
         }
         return undefined;
       });
+      patchTodayRadarCaches(function (r) {
+        if (!r || r.id !== resIdPrb) return r;
+        return Object.assign({}, r, {
+          hasProblem: true,
+          priority: optPrb.priority === 'مرتفع' ? 'مرتفع' : r.priority
+        });
+      });
+      emitOptimisticMutationEvent(action, { reservationId: resIdPrb });
+      return;
+    }
+
+    if (action === 'updateReservationDetails') {
+      var resIdDet = String(p.reservationId || '').trim();
+      if (!resIdDet) return;
+      var patchDet = function (rec) {
+        if (!rec || rec.id !== resIdDet) return rec;
+        var out = Object.assign({}, rec, {
+          lastUpdatedById: actUser.id || rec.lastUpdatedById,
+          lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
+          lastUpdatedAt: nowIso,
+          updatedAt: nowIso
+        });
+        if (p.internalStatus !== undefined && p.internalStatus !== '') out.internalStatus = String(p.internalStatus);
+        if (p.priority !== undefined && p.priority !== '') out.priority = String(p.priority);
+        if (p.notes !== undefined) out.notes = String(p.notes);
+        if (p.customerPhone !== undefined && p.customerPhone !== '') out.customerPhone = String(p.customerPhone);
+        return out;
+      };
+      var nsDet = getCacheNamespace();
+      if (localReservationsByNs[nsDet] && localReservationsByNs[nsDet].byId[resIdDet]) {
+        setLocalReservationsState(nsDet, [patchDet(localReservationsByNs[nsDet].byId[resIdDet])], false);
+      }
+      if (localDetailsByNs[nsDet] && localDetailsByNs[nsDet][resIdDet] && localDetailsByNs[nsDet][resIdDet].reservation) {
+        setLocalDetailState(nsDet, Object.assign({}, localDetailsByNs[nsDet][resIdDet], {
+          reservation: patchDet(localDetailsByNs[nsDet][resIdDet].reservation)
+        }));
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchDet) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdDet) {
+          return Object.assign({}, data, { reservation: patchDet(data.reservation) });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, { assignedReservations: data.assignedReservations.map(patchDet) });
+        }
+        return undefined;
+      });
+      patchTodayRadarCaches(patchDet);
+      emitOptimisticMutationEvent(action, { reservationId: resIdDet });
+      return;
+    }
+
+    if (action === 'assignEmployees' || action === 'removeAssignment') {
+      var resIdAs = String(p.reservationId || '').trim();
+      if (!resIdAs) return;
+      var patchAs = function (rec) {
+        if (!rec || rec.id !== resIdAs) return rec;
+        if (action === 'assignEmployees' && Array.isArray(p.employeeIds)) {
+          var nextIds = p.employeeIds.map(String).filter(Boolean);
+          var nextNames = nextIds.map(function (eid) {
+            var foundEmp = allEmployees.find(function (e) { return e.id === eid; });
+            return (foundEmp && foundEmp.name) || eid;
+          });
+          return Object.assign({}, rec, {
+            assignedEmployeeIds: nextIds,
+            assignedEmployeeNames: nextNames,
+            updatedAt: nowIso
+          });
+        }
+        if (action === 'removeAssignment' && p.employeeId) {
+          var remId = String(p.employeeId);
+          var curIds = Array.isArray(rec.assignedEmployeeIds) ? rec.assignedEmployeeIds : [];
+          var curNames = Array.isArray(rec.assignedEmployeeNames) ? rec.assignedEmployeeNames : [];
+          var keptIds = [];
+          var keptNames = [];
+          curIds.forEach(function (eid, idx) {
+            if (eid !== remId) {
+              keptIds.push(eid);
+              keptNames.push(curNames[idx] || eid);
+            }
+          });
+          return Object.assign({}, rec, {
+            assignedEmployeeIds: keptIds,
+            assignedEmployeeNames: keptNames,
+            updatedAt: nowIso
+          });
+        }
+        return rec;
+      };
+      var nsAs = getCacheNamespace();
+      if (localReservationsByNs[nsAs] && localReservationsByNs[nsAs].byId[resIdAs]) {
+        setLocalReservationsState(nsAs, [patchAs(localReservationsByNs[nsAs].byId[resIdAs])], false);
+      }
+      if (localDetailsByNs[nsAs] && localDetailsByNs[nsAs][resIdAs] && localDetailsByNs[nsAs][resIdAs].reservation) {
+        setLocalDetailState(nsAs, Object.assign({}, localDetailsByNs[nsAs][resIdAs], {
+          reservation: patchAs(localDetailsByNs[nsAs][resIdAs].reservation)
+        }));
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchAs) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdAs) {
+          return Object.assign({}, data, { reservation: patchAs(data.reservation) });
+        }
+        return undefined;
+      });
+      patchTodayRadarCaches(patchAs);
+      emitOptimisticMutationEvent(action, { reservationId: resIdAs });
       return;
     }
 
@@ -1512,6 +1757,7 @@
         var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
         return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
       });
+      emitOptimisticMutationEvent(action, {});
       return;
     }
 
@@ -1529,6 +1775,7 @@
         }
         return undefined;
       });
+      emitOptimisticMutationEvent(action, { employeeId: empTargetId });
       return;
     }
 
@@ -1543,6 +1790,7 @@
         }
         return undefined;
       });
+      emitOptimisticMutationEvent(action, { employeeId: delEmpId });
     }
   }
 
@@ -3052,7 +3300,8 @@
             serverTime: new Date().toISOString(),
             counts: trCounts,
             todaySummary: trTodaySummary,
-            radarSummary: trRadarSummary
+            radarSummary: trRadarSummary,
+            items: trCandidates
           },
           error: null
         };
@@ -5224,6 +5473,14 @@
         var changedPrb = (db.problems || []).filter(function (p) {
           return Date.parse(p.updatedAt || p.createdAt || '') > sinceMs;
         });
+        var changedEmps = (db.employees || []).filter(function (e) {
+          return Date.parse(e.updatedAt || e.createdAt || '') > sinceMs;
+        }).map(function (e) {
+          var copy = Object.assign({}, e);
+          delete copy.passwordHash;
+          delete copy.salt;
+          return copy;
+        });
         var myNotifDelta = sandboxExecute('getNotifications', token, {});
         var activeAnnsDelta = (db.announcements || []).filter(function (a) { return isSandboxAnnouncementActive(a); });
         var activeLocksDelta = pruneSandboxLocks(db);
@@ -5237,7 +5494,7 @@
             changedReservations: changedRes,
             changedFollowUps: changedFu,
             changedProblems: changedPrb,
-            changedEmployees: [],
+            changedEmployees: changedEmps,
             todayRadarCounts: (deltaTodayRadar && deltaTodayRadar.success && deltaTodayRadar.data) ? deltaTodayRadar.data.counts : null,
             notifications: myNotifDelta.success ? myNotifDelta.data : { items: [], unreadCount: 0 },
             announcements: activeAnnsDelta,
@@ -5474,6 +5731,40 @@
       });
     }
 
+    var delResIds = Array.isArray(delta.deletedReservationIds) ? delta.deletedReservationIds : [];
+    if (delResIds.length > 0) {
+      var delResMap = {};
+      delResIds.forEach(function (id) { if (id) delResMap[String(id)] = true; });
+      touchedScopes.reservations = true;
+      touchedScopes.todayRadar = true;
+      touchedScopes.followUps = true;
+      touchedScopes.problems = true;
+      touchedScopes.dashboard = true;
+      touchedScopes.reports = true;
+      if (localReservationsByNs[ns] && Array.isArray(localReservationsByNs[ns].list)) {
+        var remainingRes = localReservationsByNs[ns].list.filter(function (r) { return r && !delResMap[String(r.id)]; });
+        setLocalReservationsState(ns, remainingRes, true);
+      }
+      delResIds.forEach(function (did) {
+        if (localDetailsByNs[ns]) delete localDetailsByNs[ns][did];
+      });
+      patchCachedScopes(['reservations', 'todayRadar', 'followUps', 'problems'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.filter(function (r) { return r && !delResMap[String(r.id)]; }) });
+        }
+        if (actName === 'getTodayAndRadar' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.filter(function (r) { return r && !delResMap[String(r.id)]; }) });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, { assignedReservations: data.assignedReservations.filter(function (r) { return r && !delResMap[String(r.id)]; }) });
+        }
+        if (actName === 'getProblems' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.filter(function (p) { return p && !delResMap[String(p.reservationId)]; }) });
+        }
+        return undefined;
+      });
+    }
+
     var invalidateList = [];
     if (touchedScopes.dashboard) invalidateList.push('dashboard');
     if (touchedScopes.todayRadar) invalidateList.push('todayRadar');
@@ -5490,6 +5781,36 @@
     }
 
     return { changedScopes: Object.keys(touchedScopes) };
+  }
+
+  var syncProgressSeq = 0;
+  var FOREGROUND_SYNC_ACTIONS = {
+    syncRentalGate: true,
+    pullReservations: true,
+    syncLocalCache: true,
+    applyUnifiedConnectionSetup: true,
+    importReservationsFromExcel: true,
+    deleteAllReservations: true,
+    bulkReassignEmployeeReservations: true,
+    syncOfflineQueue: true
+  };
+
+  function isTrackedSyncProcess(action, payload) {
+    var clean = String(action || '').trim();
+    if (!clean) return false;
+    if (payload && (payload.silentRefresh || payload.backgroundSync)) return false;
+    if (FOREGROUND_SYNC_ACTIONS[clean]) return true;
+    return Boolean(payload && payload.showGlobalLoading === true);
+  }
+
+  function emitSyncProgress(phase, detail) {
+    try {
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+        window.dispatchEvent(new CustomEvent('rg:syncprogress', {
+          detail: Object.assign({ phase: phase }, detail || {})
+        }));
+      }
+    } catch (_eSync) {}
   }
 
   async function callApi(action, payload) {
@@ -5542,17 +5863,25 @@
       return promise;
     };
 
-    // Instant local IndexedDB query path for reservations filtering/sorting/pagination
-    if (action === 'getReservations' && !skipCache) {
+    // Instant local IndexedDB query path for reservations & today/radar filtering/sorting/pagination
+    if ((action === 'getReservations' || action === 'getTodayAndRadar') && !skipCache) {
       var activeUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
-      var fastLocalRes = queryLocalReservationsFast(payload, activeUser ? {
+      var fastUserCtx = activeUser ? {
         employeeId: activeUser.id,
         role: activeUser.role,
         user: activeUser,
         allowAgentViewAll: !(localMetaByNs[ns] && localMetaByNs[ns].allowAgentViewAll === false)
-      } : null);
-      if (fastLocalRes) {
-        return fastLocalRes.response;
+      } : null;
+      if (action === 'getReservations') {
+        var fastLocalRes = queryLocalReservationsFast(payload, fastUserCtx);
+        if (fastLocalRes) {
+          return fastLocalRes.response;
+        }
+      } else if (action === 'getTodayAndRadar') {
+        var fastTodayRadar = queryLocalTodayAndRadarFast(payload, fastUserCtx);
+        if (fastTodayRadar) {
+          return fastTodayRadar.response;
+        }
       }
     }
 
@@ -5653,7 +5982,34 @@
       return new Promise(function (resolve) { setTimeout(resolve, base + jitter); });
     }
 
+    var isForegroundSync = isTrackedSyncProcess(action, payload);
+    var syncReqId = isForegroundSync ? ('SYNC_' + (++syncProgressSeq) + '_' + Date.now()) : '';
+
     async function executeCall() {
+      if (!isForegroundSync) {
+        return runExecuteCall();
+      }
+      var syncOk = false;
+      emitSyncProgress('start', {
+        requestId: syncReqId,
+        action: action,
+        timestamp: Date.now()
+      });
+      try {
+        var outRes = await runExecuteCall();
+        syncOk = Boolean(outRes && outRes.success);
+        return outRes;
+      } finally {
+        emitSyncProgress('end', {
+          requestId: syncReqId,
+          action: action,
+          timestamp: Date.now(),
+          success: syncOk
+        });
+      }
+    }
+
+    async function runExecuteCall() {
       if (isCallerAborted()) {
         return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
       }
@@ -6074,6 +6430,21 @@
         if (pendingIdbOps.length > 0) {
           await Promise.all(pendingIdbOps).catch(function () {});
         }
+        if (!policy.cacheable && action !== 'ping' && action !== 'getAppBootstrap' && action !== 'getDeltaSync' && action !== 'getReservationLocks') {
+          try {
+            if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function') {
+              var mutScopes = (core && core.getCacheInvalidationScopes) ? core.getCacheInvalidationScopes(action) : [];
+              document.dispatchEvent(new CustomEvent('rg:mutationcomplete', {
+                detail: {
+                  action: action,
+                  scopes: mutScopes,
+                  reservationId: (payload && payload.reservationId) || (parsed.data && (parsed.data.reservationId || (parsed.data.reservation && parsed.data.reservation.id))) || '',
+                  at: Date.now()
+                }
+              }));
+            }
+          } catch (_mEvErr) {}
+        }
       } else if (payload && payload._keepOptimisticCache && core && core.getCacheInvalidationScopes) {
         await clearCache(core.getCacheInvalidationScopes(action));
       }
@@ -6478,24 +6849,44 @@
         return { synced: 0, remaining: 0 };
       }
       var queue = await root.RGIdbCache.getOfflineQueue(ns);
+      var queueSyncId = queue.length > 0 ? ('SYNC_' + (++syncProgressSeq) + '_' + Date.now()) : '';
+      if (queueSyncId) {
+        emitSyncProgress('start', {
+          requestId: queueSyncId,
+          action: 'syncOfflineQueue',
+          total: queue.length,
+          timestamp: Date.now()
+        });
+      }
       var synced = 0;
       var failed = 0;
-      for (var i = 0; i < queue.length; i++) {
-        var item = queue[i];
-        if (!item || !item.action) continue;
-        try {
-          var replayPayload = Object.assign({}, item.payload || {}, { _replayingOfflineQueue: true });
-          var resp = await callApi(item.action, replayPayload);
-          if (resp && resp.success && !resp.queuedOffline) {
-            await root.RGIdbCache.removeOfflineQueueItem(item.id);
-            synced += 1;
-          } else {
+      try {
+        for (var i = 0; i < queue.length; i++) {
+          var item = queue[i];
+          if (!item || !item.action) continue;
+          try {
+            var replayPayload = Object.assign({}, item.payload || {}, { _replayingOfflineQueue: true });
+            var resp = await callApi(item.action, replayPayload);
+            if (resp && resp.success && !resp.queuedOffline) {
+              await root.RGIdbCache.removeOfflineQueueItem(item.id);
+              synced += 1;
+            } else {
+              failed += 1;
+              break;
+            }
+          } catch (_err) {
             failed += 1;
             break;
           }
-        } catch (_err) {
-          failed += 1;
-          break;
+        }
+      } finally {
+        if (queueSyncId) {
+          emitSyncProgress('end', {
+            requestId: queueSyncId,
+            action: 'syncOfflineQueue',
+            timestamp: Date.now(),
+            success: failed === 0
+          });
         }
       }
       var remaining = await root.RGIdbCache.getOfflineQueueCount(ns);

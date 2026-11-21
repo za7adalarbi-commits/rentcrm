@@ -1,4 +1,4 @@
-import { handleLogin, handleLogout, hashToken, requireAuth, type AuthSession } from './auth.js';
+import { handleLogin, handleLogout, hashToken, invalidateAuthSessionCache, requireAuth, type AuthSession } from './auth.js';
 import { getMutationSyncSpec, invalidateAndBumpVersion } from './cache.js';
 import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
@@ -287,6 +287,18 @@ export async function dispatchCrmRequest(
           data: null,
           error: `UNKNOWN_ACTION: ${action}`
         };
+    }
+
+    if (
+      action === 'saveRolePreset' ||
+      action === 'deleteRolePreset' ||
+      action === 'resetRolePresets' ||
+      action === 'savePermissionDefinition' ||
+      action === 'deletePermissionDefinition' ||
+      action === 'applyUnifiedConnectionSetup' ||
+      action === 'updateSettings'
+    ) {
+      invalidateAuthSessionCache(executor, { all: true });
     }
 
     const syncSpec = getMutationSyncSpec(action);

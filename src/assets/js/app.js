@@ -248,6 +248,43 @@
   var lastHiddenAt = 0;
   var lastFingerprints = { notifications: '', routes: {}, announcements: '', locks: '' };
   var employeeSubscribers = [];
+  var tabInstanceId = 'TAB_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
+  var syncBroadcastChannel = null;
+  var BC_PING_KEY = 'rg_crm_bc_ping';
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      syncBroadcastChannel = new BroadcastChannel('rg_crm_sync_v1');
+    }
+  } catch (_bcErr) {
+    syncBroadcastChannel = null;
+  }
+
+  function broadcastTabSync(detail) {
+    try {
+      var msg = {
+        type: 'rg_crm_sync',
+        originTabId: tabInstanceId,
+        action: (detail && detail.action) || '',
+        reservationId: (detail && detail.reservationId) || '',
+        scopes: (detail && Array.isArray(detail.scopes)) ? detail.scopes : [],
+        at: Date.now()
+      };
+      if (syncBroadcastChannel) {
+        syncBroadcastChannel.postMessage(msg);
+      }
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(BC_PING_KEY, JSON.stringify(msg));
+      }
+    } catch (_e) {}
+  }
+
+  function handleSiblingTabMessage(msg) {
+    if (!msg || msg.originTabId === tabInstanceId) return;
+    if (Array.isArray(msg.scopes) && msg.scopes.length > 0 && root.RGApi && root.RGApi.clearCache) {
+      root.RGApi.clearCache(msg.scopes);
+    }
+    scheduleDebouncedDeltaSync();
+  }
 
   function getEmployeesState() {
     var emp = state.employees || {};
@@ -3327,7 +3364,9 @@
       if (Array.isArray(evData.scopes) && evData.scopes.length && root.RGApi && root.RGApi.clearCache) {
         root.RGApi.clearCache(evData.scopes);
       }
-      return;
+      if (evData.originTabId && evData.originTabId === tabInstanceId) {
+        return;
+      }
     }
 
     scheduleDebouncedDeltaSync();
@@ -3421,8 +3460,21 @@
       window.addEventListener('rg:offlinequeuechange', function () {
         updateOfflineBanner().catch(function () {});
       });
+      if (syncBroadcastChannel) {
+        syncBroadcastChannel.onmessage = function (ev) {
+          handleSiblingTabMessage(ev && ev.data);
+        };
+      }
+      document.addEventListener('rg:mutationcomplete', function (ev) {
+        broadcastTabSync((ev && ev.detail) || {});
+      });
       window.addEventListener('storage', function (ev) {
-        if (ev && ev.key && String(ev.key).indexOf('rg_crm_sandbox') !== -1) {
+        if (!ev || !ev.key) return;
+        if (ev.key === BC_PING_KEY && ev.newValue) {
+          try { handleSiblingTabMessage(JSON.parse(ev.newValue)); } catch (_eBc) {}
+          return;
+        }
+        if (String(ev.key).indexOf('rg_crm_sandbox') !== -1) {
           scheduleDebouncedDeltaSync();
         }
       });

@@ -3,6 +3,7 @@ import {
   crmCore,
   generateId,
   hashPassword,
+  invalidateAuthSessionCache,
   mapEmployeeRow,
   normalizeLoginUsername,
   parseJsonArray,
@@ -515,7 +516,7 @@ export async function getTodayAndRadar(
 
   const candidates = await getCachedOrLoad(
     executor,
-    { scope: 'todayRadar', key: `cand:${roleScope}:${todayStr}`, ttlMs: 15000 },
+    { scope: 'todayRadar', key: `cand:${roleScope}:${todayStr}`, ttlMs: 15000, bypassCache: toBool(payload.forceRefresh) },
     async () => {
       const params: any[] = [todayStr, minDate, maxDate];
       let agentSql = '';
@@ -589,7 +590,8 @@ export async function getTodayAndRadar(
     serverTime: new Date().toISOString(),
     counts,
     todaySummary,
-    radarSummary
+    radarSummary,
+    items: candidates
   };
 }
 
@@ -2856,6 +2858,7 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
     return emp;
   });
 
+  invalidateAuthSessionCache(executor, { employeeId: empId });
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
@@ -2957,6 +2960,7 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
     };
   });
 
+  invalidateAuthSessionCache(executor, { employeeId: empId });
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
@@ -3416,6 +3420,7 @@ export async function deleteAllReservations(
     };
   });
 
+  facetsCacheByExec.delete(executor);
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
@@ -3616,6 +3621,7 @@ export async function importReservationsFromExcel(
     };
   });
 
+  facetsCacheByExec.delete(executor);
   return out;
 }
 
@@ -4178,6 +4184,7 @@ export async function saveAnnouncement(executor: DbExecutor, session: AuthSessio
     await logActivity(tx, session.user, 'نشر تعميم وردية', 'Announcement', annId, `${title ? `${title}: ` : ''}${message.slice(0, 120)}`);
   });
 
+  invalidateScopes(executor, ['announcements', 'dashboard']);
   const data = await getAnnouncements(executor, session);
   const saved = data.items.find((it) => it.id === annId) || null;
   return { announcement: saved, items: data.items, activeItems: data.activeItems };
@@ -4192,6 +4199,7 @@ export async function deleteAnnouncement(executor: DbExecutor, session: AuthSess
 
   await executor.query(`DELETE FROM shift_announcements WHERE id = $1`, [annId]);
   await logActivity(executor, session.user, 'حذف تعميم وردية', 'Announcement', annId, 'تم حذف تعميم الوردية');
+  invalidateScopes(executor, ['announcements', 'dashboard']);
   const data = await getAnnouncements(executor, session);
   return { deleted: true, items: data.items, activeItems: data.activeItems };
 }
@@ -4288,6 +4296,7 @@ export async function saveDelegation(executor: DbExecutor, session: AuthSession,
     return formatDelegationRow(rowRes.rows[0]);
   });
 
+  invalidateAuthSessionCache(executor, { employeeId: empId });
   return { delegation: out };
 }
 
@@ -4299,10 +4308,12 @@ export async function revokeDelegation(executor: DbExecutor, session: AuthSessio
   if (!delId) throw new Error('VALIDATION_ERROR: معرف التفويض مطلوب.');
 
   const nowIso = new Date().toISOString();
+  let revokedEmpId = '';
   await executor.withTransaction(async (tx) => {
     const curRes = await tx.query(`SELECT * FROM employee_delegations WHERE id = $1 LIMIT 1`, [delId]);
     if (!curRes.rows[0]) throw new Error('NOT_FOUND: سجل التفويض غير موجود.');
     const cur = curRes.rows[0];
+    revokedEmpId = str(cur.delegate_employee_id);
     await tx.query(
       `UPDATE employee_delegations
        SET status = 'revoked', revoked_at = $2, revoked_by_id = $3, revoked_by_name = $4, updated_at = NOW()
@@ -4320,6 +4331,11 @@ export async function revokeDelegation(executor: DbExecutor, session: AuthSessio
     );
   });
 
+  if (revokedEmpId) {
+    invalidateAuthSessionCache(executor, { employeeId: revokedEmpId });
+  } else {
+    invalidateAuthSessionCache(executor, { all: true });
+  }
   return { revoked: true };
 }
 
@@ -4337,7 +4353,6 @@ function formatLockRow(row: any): Record<string, any> {
 }
 
 export async function getReservationLocks(executor: DbExecutor, _session: AuthSession) {
-  await executor.query(`DELETE FROM reservation_locks WHERE expires_at <= NOW()`).catch(() => undefined);
   const res = await executor.query(`SELECT * FROM reservation_locks WHERE expires_at > NOW()`);
   return {
     items: res.rows.map(formatLockRow)
