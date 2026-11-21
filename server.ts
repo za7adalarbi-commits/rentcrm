@@ -6,6 +6,8 @@ import zlib from 'node:zlib';
 import crmHandler from './api/crm.js';
 import healthHandler from './api/health.js';
 import syncHandler from './api/sync.js';
+import { requireAuth } from './backend/auth.js';
+import { createPgExecutor, isDatabaseConfigured } from './backend/db.js';
 import { subscribeCrmEvents } from './backend/realtime.js';
 
 function gzipResponseMiddleware(req: Request, res: Response, next: NextFunction) {
@@ -66,7 +68,38 @@ async function startServer() {
   app.all('/api/crm', runApiRoute(crmHandler));
   app.all('/api/sync', runApiRoute(syncHandler));
 
-  app.get('/api/events', (req: Request, res: Response) => {
+  app.get('/api/events', async (req: Request, res: Response) => {
+    const authHeader = String(req.headers?.authorization || '').trim();
+    const bearerToken = /^Bearer\s+/i.test(authHeader) ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const queryToken = String(req.query?.token || '').trim();
+    const rawToken = bearerToken || queryToken;
+
+    if (!rawToken) {
+      res.status(401).json({
+        success: false,
+        message: 'UNAUTHORIZED: يلزم تسجيل الدخول لفتح قناة التحديث اللحظي.',
+        data: null,
+        error: 'UNAUTHORIZED'
+      });
+      return;
+    }
+
+    let userId = 'sandbox';
+    if (isDatabaseConfigured()) {
+      try {
+        const session = await requireAuth(createPgExecutor(), rawToken);
+        userId = session.user.id;
+      } catch (err: any) {
+        res.status(401).json({
+          success: false,
+          message: String(err?.message || 'UNAUTHORIZED: الجلسة غير صالحة.'),
+          data: null,
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+    }
+
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -74,11 +107,12 @@ async function startServer() {
     if (typeof (res as any).flushHeaders === 'function') {
       (res as any).flushHeaders();
     }
-    res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, at: new Date().toISOString() })}\n\n`);
+    res.write(`retry: 3000\nevent: ready\ndata: ${JSON.stringify({ ok: true, userId, at: new Date().toISOString() })}\n\n`);
 
     const unsubscribe = subscribeCrmEvents((ev) => {
       if (res.writableEnded) return;
-      res.write(`event: crm\ndata: ${JSON.stringify(ev)}\n\n`);
+      const frameId = ev.version ? `id: ${ev.version}\n` : '';
+      res.write(`${frameId}event: crm\ndata: ${JSON.stringify(ev)}\n\n`);
     });
 
     const keepAlive = setInterval(() => {
