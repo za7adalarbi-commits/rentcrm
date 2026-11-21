@@ -29,15 +29,10 @@ function getEmployees(session) {
   }
 
   var empCacheKey = 'RG_EMP_SUMMARY_V' + getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + getCacheVersion_('PRB') + '_' + getCacheVersion_('EMP');
-  try {
-    var cachedRaw = CacheService.getScriptCache().get(empCacheKey);
-    if (cachedRaw) {
-      var cached = JSON.parse(cachedRaw);
-      if (cached && Array.isArray(cached.items)) {
-        return cached;
-      }
-    }
-  } catch (e) {}
+  var cachedEmp = getCompressedJsonCache_(empCacheKey);
+  if (cachedEmp && Array.isArray(cachedEmp.items)) {
+    return cachedEmp;
+  }
 
   var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
   var reservations = readAllRecords(RG_SHEETS.RESERVATIONS, false);
@@ -62,6 +57,8 @@ function getEmployees(session) {
 
   var prbCounts = {};
   for (var p = 0; p < problems.length; p++) {
+    var probSt = normalizeStr(problems[p].status);
+    if (probSt === 'مغلقة' || probSt === 'تم الحل') continue;
     var rawPids = problems[p].assignedEmployeeIds;
     if (!rawPids || rawPids === '[]') continue;
     var pids = safeJsonParse(rawPids, []);
@@ -85,9 +82,7 @@ function getEmployees(session) {
     rolePresets: readRolePresetsSetting(),
     customPermissions: readCustomPermissionsSetting()
   };
-  try {
-    CacheService.getScriptCache().put(empCacheKey, JSON.stringify(response), 300);
-  } catch (e) {}
+  putCompressedJsonCache_(empCacheKey, response, 300);
   return response;
 }
 
@@ -350,6 +345,11 @@ function deleteEmployee(session, payload) {
 
     revokeEmployeeSessions(employeeId);
     clearEmployeeSessionCache_(employeeId);
+    try {
+      updateRecordsWhere_(RG_SHEETS.DELEGATIONS, function (d) {
+        return d.delegateEmployeeId === employeeId && d.status === 'active';
+      }, { status: 'revoked', revokedAt: nowIso(), revokedById: session.user.id, revokedByName: session.user.name, updatedAt: nowIso() });
+    } catch (_delErr) {}
     deleteRecordByKey(RG_SHEETS.EMPLOYEES, 'id', employeeId);
     deleteRecordByKey(RG_SHEETS.USERS, 'id', employeeId);
     logActivity(session.user, 'حذف موظف', 'Employee', employeeId, existing.name + ' (' + existing.username + ')');

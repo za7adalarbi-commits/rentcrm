@@ -73,6 +73,42 @@ function handleApiRequest(e, method) {
       case 'getReservations':
         result = getReservations(session, payload);
         break;
+      case 'getTodayAndRadar':
+        result = getTodayAndRadar(session, payload);
+        break;
+      case 'getDeltaSync':
+        result = getDeltaSync(session, payload);
+        break;
+      case 'getAnnouncements':
+        result = getAnnouncements(session);
+        break;
+      case 'saveAnnouncement':
+        result = saveAnnouncement(session, payload);
+        break;
+      case 'deleteAnnouncement':
+        result = deleteAnnouncement(session, payload);
+        break;
+      case 'getDelegations':
+        result = getDelegations(session);
+        break;
+      case 'saveDelegation':
+        result = saveDelegation(session, payload);
+        break;
+      case 'revokeDelegation':
+        result = revokeDelegation(session, payload);
+        break;
+      case 'getReservationLocks':
+        result = getReservationLocks(session);
+        break;
+      case 'acquireReservationLock':
+        result = acquireReservationLock(session, payload);
+        break;
+      case 'releaseReservationLock':
+        result = releaseReservationLock(session, payload);
+        break;
+      case 'bulkReassignEmployeeReservations':
+        result = bulkReassignEmployeeReservations(session, payload);
+        break;
       case 'syncLocalCache':
         result = syncLocalCache(session, payload);
         break;

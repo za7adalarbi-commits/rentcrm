@@ -89,6 +89,18 @@ var RG_SHEETS_SCHEMA = {
     'id', 'triggeredById', 'triggeredByName', 'status', 'importedCount',
     'updatedCount', 'extensionsCount', 'pagesFetched', 'errorMessage',
     'durationMs', 'startedAt', 'finishedAt'
+  ],
+  Announcements: [
+    'id', 'title', 'message', 'tone', 'isPinned', 'isActive', 'startsAt', 'expiresAt',
+    'createdById', 'createdByName', 'createdByRole', 'createdAt', 'updatedAt'
+  ],
+  Delegations: [
+    'id', 'delegateEmployeeId', 'delegateEmployeeName', 'delegatedRole',
+    'grantedById', 'grantedByName', 'reason', 'startsAt', 'expiresAt',
+    'status', 'revokedAt', 'revokedById', 'revokedByName', 'createdAt', 'updatedAt'
+  ],
+  ReservationLocks: [
+    'reservationId', 'lockedById', 'lockedByName', 'lockedByRole', 'lockedAt', 'expiresAt'
   ]
 };
 
@@ -100,6 +112,7 @@ var _rgRecordsCache = {};
 var _rgSettingsMapCache = null;
 var _rgVersionMemCache = {};
 var _rgDirtyCacheSheets = {};
+var _rgScriptLockDepth = 0;
 var RG_CACHE_CHUNK_SIZE = 95000;
 var RG_CACHE_MAX_CHUNKS = 20;
 var RG_CACHE_TTL_SECONDS = 600;
@@ -184,14 +197,24 @@ function getSpreadsheet() {
 }
 
 function withScriptLock(fn) {
+  if (_rgScriptLockDepth > 0) {
+    _rgScriptLockDepth += 1;
+    try {
+      return fn();
+    } finally {
+      _rgScriptLockDepth -= 1;
+    }
+  }
   var lock = LockService.getScriptLock();
   var acquired = lock.tryLock(20000);
   if (!acquired) {
     throw new Error('النظام مشغول حالياً بمعالجة عملية متزامنة أخرى، يرجى المحاولة بعد ثوانٍ.');
   }
+  _rgScriptLockDepth += 1;
   try {
     return fn();
   } finally {
+    _rgScriptLockDepth -= 1;
     lock.releaseLock();
   }
 }
@@ -244,11 +267,22 @@ function invalidateCache(sheetName, keepMemCache) {
     _rgSettingsMapCache = null;
     bumpCacheVersion_('EMP');
   }
-  if (sheetName === RG_SHEETS.RESERVATIONS) bumpCacheVersion_('RES');
-  else if (sheetName === RG_SHEETS.FOLLOWUPS) bumpCacheVersion_('FU');
-  else if (sheetName === RG_SHEETS.PROBLEMS || sheetName === RG_SHEETS.PROBLEM_UPDATES) bumpCacheVersion_('PRB');
-  else if (sheetName === RG_SHEETS.NOTIFICATIONS) bumpCacheVersion_('NTF');
-  else if (sheetName === RG_SHEETS.EMPLOYEES) bumpCacheVersion_('EMP');
+  if (sheetName === RG_SHEETS.RESERVATIONS) {
+    bumpCacheVersion_('RES');
+    if (typeof _rgDashMemCache === 'object') _rgDashMemCache = {};
+  } else if (sheetName === RG_SHEETS.FOLLOWUPS) {
+    bumpCacheVersion_('FU');
+    if (typeof _rgDashMemCache === 'object') _rgDashMemCache = {};
+  } else if (sheetName === RG_SHEETS.PROBLEMS || sheetName === RG_SHEETS.PROBLEM_UPDATES) {
+    bumpCacheVersion_('PRB');
+    if (typeof _rgDashMemCache === 'object') _rgDashMemCache = {};
+  } else if (sheetName === RG_SHEETS.NOTIFICATIONS) {
+    bumpCacheVersion_('NTF');
+  } else if (sheetName === RG_SHEETS.EMPLOYEES || sheetName === RG_SHEETS.DELEGATIONS) {
+    bumpCacheVersion_('EMP');
+  } else if (sheetName === RG_SHEETS.ANNOUNCEMENTS) {
+    bumpCacheVersion_('ANN');
+  }
 
   try {
     var base = getCacheKey(sheetName);
@@ -276,6 +310,7 @@ function invalidateAllCaches() {
   _rgDirtyCacheSheets = {};
   _rgVersionMemCache = {};
   _rgSettingsMapCache = null;
+  if (typeof _rgDashMemCache === 'object') _rgDashMemCache = {};
   var names = Object.keys(RG_SHEETS_SCHEMA);
   for (var i = 0; i < names.length; i++) {
     invalidateCache(names[i]);
@@ -348,6 +383,30 @@ function getChunkedCache_(sheetName) {
       parts.push(chunk);
     }
     return decodeCachePayload_(parts.join(''));
+  } catch (e) {
+    return null;
+  }
+}
+
+function putCompressedJsonCache_(key, value, ttlSeconds) {
+  if (!key) return false;
+  try {
+    var serialized = JSON.stringify(value);
+    var encoded = encodeCachePayload_(serialized);
+    if (encoded.length <= RG_CACHE_CHUNK_SIZE) {
+      CacheService.getScriptCache().put(key, encoded, ttlSeconds || 180);
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+function getCompressedJsonCache_(key) {
+  if (!key) return null;
+  try {
+    var raw = CacheService.getScriptCache().get(key);
+    if (!raw) return null;
+    return decodeCachePayload_(raw);
   } catch (e) {
     return null;
   }
@@ -924,7 +983,7 @@ function updateRecordsWhere_(sheetName, predicateFn, patchOrUpdaterFn) {
   if (minDirty !== -1) {
     var sliceCount = maxDirty - minDirty + 1;
     sheet.getRange(minDirty + 2, 1, sliceCount, headers.length).setValues(values.slice(minDirty, maxDirty + 1));
-    invalidateCache(sheetName);
+    invalidateCache(sheetName, false);
   }
   return updatedRecords;
 }

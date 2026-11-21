@@ -69,6 +69,71 @@ function clearEmployeeSessionCache_(employeeId) {
   } catch (e) {}
 }
 
+function isDelegationActiveGas_(item, nowMs) {
+  if (!item || typeof item !== 'object') return false;
+  if (normalizeStr(item.status).toLowerCase() !== 'active') return false;
+  if (normalizeStr(item.revokedAt)) return false;
+  var now = typeof nowMs === 'number' && isFinite(nowMs) ? nowMs : Date.now();
+  var sMs = item.startsAt ? Date.parse(item.startsAt) : 0;
+  var eMs = item.expiresAt ? Date.parse(item.expiresAt) : 0;
+  if (sMs && !isNaN(sMs) && now < sMs) return false;
+  if (eMs && !isNaN(eMs) && now > eMs) return false;
+  return Boolean(eMs && !isNaN(eMs));
+}
+
+function resolveActiveDelegationForEmployee_(employeeId) {
+  var targetId = normalizeStr(employeeId);
+  if (!targetId) return null;
+  try {
+    var list = readAllRecords(RG_SHEETS.DELEGATIONS, false);
+    var nowMs = Date.now();
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      if (normalizeStr(d.delegateEmployeeId) !== targetId) continue;
+      if (!isDelegationActiveGas_(d, nowMs)) continue;
+      return {
+        id: d.id,
+        delegatedRole: d.delegatedRole || RG_ROLES.SUPERVISOR,
+        grantedById: d.grantedById,
+        grantedByName: d.grantedByName,
+        reason: d.reason,
+        startsAt: d.startsAt,
+        expiresAt: d.expiresAt
+      };
+    }
+  } catch (e) {}
+  return null;
+}
+
+function applyDelegationToCleanUser_(cleanUser) {
+  if (!cleanUser || typeof cleanUser !== 'object') return cleanUser;
+  var baseRole = normalizeStr(cleanUser.role) || RG_ROLES.AGENT;
+  var basePerms = resolveEffectivePermissions(cleanUser);
+  if (baseRole === RG_ROLES.AGENT) {
+    var activeDel = resolveActiveDelegationForEmployee_(cleanUser.id);
+    if (activeDel) {
+      var supPerms = RG_ROLE_PERMISSIONS.supervisor || [];
+      var merged = [];
+      var seen = {};
+      for (var i = 0; i < basePerms.length; i++) {
+        if (!seen[basePerms[i]]) { seen[basePerms[i]] = true; merged.push(basePerms[i]); }
+      }
+      for (var j = 0; j < supPerms.length; j++) {
+        if (!seen[supPerms[j]]) { seen[supPerms[j]] = true; merged.push(supPerms[j]); }
+      }
+      cleanUser.baseRole = baseRole;
+      cleanUser.role = RG_ROLES.SUPERVISOR;
+      cleanUser.permissions = merged;
+      cleanUser.activeDelegation = activeDel;
+      return cleanUser;
+    }
+  }
+  cleanUser.baseRole = baseRole;
+  cleanUser.permissions = basePerms;
+  cleanUser.activeDelegation = null;
+  return cleanUser;
+}
+
 function handleLogin(payload) {
   var p = payload || {};
   var username = normalizeLoginUsername_(p.username);
@@ -78,7 +143,7 @@ function handleLogin(payload) {
     throw new Error('يرجى إدخال اسم المستخدم وكلمة المرور.');
   }
 
-  return withScriptLock(function () {
+  var authResult = withScriptLock(function () {
     var employees = readAllRecords(RG_SHEETS.EMPLOYEES, false);
     if (employees.length === 0) {
       initDatabaseCore_();
@@ -135,7 +200,7 @@ function handleLogin(payload) {
     var nowIsoStr = now.toISOString();
     touchEmployeeActivityThrottled_(user.id, nowIsoStr);
 
-    var cleanUser = sanitizeEmployeeForClient(user);
+    var cleanUser = applyDelegationToCleanUser_(sanitizeEmployeeForClient(user));
     cleanUser.lastActivity = nowIsoStr;
 
     var sessionObj = {
@@ -149,18 +214,25 @@ function handleLogin(payload) {
 
     logActivity(user, 'تسجيل الدخول', 'Employee', user.id, 'تسجيل دخول ناجح للمستخدم ' + user.username);
 
-    var response = {
+    return {
       token: rawToken,
       expiresAt: expiresIso,
-      user: cleanUser
+      user: cleanUser,
+      sessionObj: sessionObj
     };
-    if (p.includeBootstrap !== false) {
-      response.bootstrap = getAppBootstrap(sessionObj, {
-        range: normalizeStr(p.range) || '30d'
-      });
-    }
-    return response;
   });
+
+  var response = {
+    token: authResult.token,
+    expiresAt: authResult.expiresAt,
+    user: authResult.user
+  };
+  if (p.includeBootstrap !== false) {
+    response.bootstrap = getAppBootstrap(authResult.sessionObj, {
+      range: normalizeStr(p.range) || '30d'
+    });
+  }
+  return response;
 }
 
 function handleLogout(session) {
@@ -186,7 +258,11 @@ function requireAuth(token) {
     var cachedRaw = CacheService.getScriptCache().get(RG_SESSION_CACHE_PREFIX + tokenHash);
     if (cachedRaw) {
       var cached = JSON.parse(cachedRaw);
-      if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now()) {
+      var delExp = cached && cached.user && cached.user.activeDelegation && cached.user.activeDelegation.expiresAt
+        ? Date.parse(cached.user.activeDelegation.expiresAt)
+        : 0;
+      var delegationStillValid = !delExp || (!isNaN(delExp) && delExp > Date.now());
+      if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now() && delegationStillValid) {
         return {
           tokenHash: tokenHash,
           employeeId: cached.employeeId,
@@ -213,11 +289,11 @@ function requireAuth(token) {
     throw new Error('UNAUTHORIZED: الحساب غير نشط أو غير موجود.');
   }
 
-  var cleanUser = sanitizeEmployeeForClient(user);
+  var cleanUser = applyDelegationToCleanUser_(sanitizeEmployeeForClient(user));
   var result = {
     tokenHash: tokenHash,
-    employeeId: user.id,
-    role: user.role,
+    employeeId: cleanUser.id,
+    role: cleanUser.role,
     permissions: cleanUser.permissions,
     user: cleanUser
   };

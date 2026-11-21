@@ -26,26 +26,26 @@ var _rgDashMemCache = {};
 
 function getDashboard(session, params) {
   var p = params || {};
+  var settingsMap = getSettingsMap_(false);
+  var allowAgentAll = settingsMap.allow_agent_view_all !== undefined ? toBool(settingsMap.allow_agent_view_all) : true;
+  var restrictToAgent = session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations');
+
   var rangeKey = normalizeStr(p.range) || '30d';
   var todayStr = formatDateOnly(new Date());
   var isStandardRange = (rangeKey === 'today' || rangeKey === '7d' || rangeKey === '30d' || rangeKey === 'month');
   var verKey = getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + getCacheVersion_('PRB');
-  var cacheKey = isStandardRange ? ('RG_DASH_V' + verKey + '_' + rangeKey) : '';
+  var roleScopeKey = restrictToAgent ? session.employeeId : 'ALL';
+  var cacheKey = isStandardRange ? ('RG_DASH_V' + verKey + '_' + roleScopeKey + '_' + rangeKey) : '';
 
-  if (cacheKey) {
+  if (cacheKey && !toBool(p.forceRefresh)) {
     if (_rgDashMemCache[cacheKey] && _rgDashMemCache[cacheKey].dateStr === todayStr) {
       return _rgDashMemCache[cacheKey].data;
     }
-    try {
-      var cachedRaw = CacheService.getScriptCache().get(cacheKey);
-      if (cachedRaw) {
-        var cachedObj = JSON.parse(cachedRaw);
-        if (cachedObj && cachedObj.dateStr === todayStr && cachedObj.data) {
-          _rgDashMemCache[cacheKey] = cachedObj;
-          return cachedObj.data;
-        }
-      }
-    } catch (e) {}
+    var cachedObj = getCompressedJsonCache_(cacheKey);
+    if (cachedObj && cachedObj.dateStr === todayStr && cachedObj.data) {
+      _rgDashMemCache[cacheKey] = cachedObj;
+      return cachedObj.data;
+    }
   }
 
   var range = resolveDateRange(rangeKey, p.dateFrom, p.dateTo);
@@ -72,19 +72,22 @@ function getDashboard(session, params) {
 
   for (var i = 0; i < reservations.length; i++) {
     var res = reservations[i];
+    if (restrictToAgent) {
+      var rawMy = String(res.assignedEmployeeIds || '');
+      if (rawMy.indexOf(session.employeeId) === -1) continue;
+      if (safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
+    }
     var d = formatDateOnly(res.startDate || res.createdAt);
     if (range.start && d < range.start) continue;
     if (range.end && d > range.end) continue;
 
     filteredTotal++;
     var st = res.internalStatus || 'تم الإنشاء';
-    if (Object.prototype.hasOwnProperty.call(statusCounts, st)) {
-      statusCounts[st]++;
-    }
+    statusCounts[st] = (statusCounts[st] || 0) + 1;
     if (formatDateOnly(res.createdAt) === todayStr || formatDateOnly(res.startDate) === todayStr) {
       todayReservations++;
     }
-    if (st === 'تم الإنشاء') newReservations++;
+    if (st === 'تم الإنشاء' || st === 'جديد' || st === 'قيد الانتظار' || st === 'معلق') newReservations++;
     var comp = res.companyName || 'غير محدد';
     companyCounts[comp] = (companyCounts[comp] || 0) + 1;
 
@@ -137,18 +140,26 @@ function getDashboard(session, params) {
     });
   }
 
+  var todayRadarCounts = null;
+  if (typeof getTodayAndRadar === 'function') {
+    try {
+      var trSummary = getTodayAndRadar(session, { summaryOnly: true, todayDate: todayStr });
+      if (trSummary && trSummary.counts) todayRadarCounts = trSummary.counts;
+    } catch (_trErr) {}
+  }
+
   var result = {
     kpis: {
       totalReservations: filteredTotal,
       todayReservations: todayReservations,
       newReservations: newReservations,
-      booked: statusCounts['تم الحجز'],
-      delivered: statusCounts['تم التسليم'],
-      received: statusCounts['تم الاستلام'],
-      created: statusCounts['تم الإنشاء'],
-      cancelled: statusCounts['تم الإلغاء'],
-      extended: statusCounts['تم التمديد'],
-      notBooked: statusCounts['لم يتم الحجز'],
+      booked: statusCounts['تم الحجز'] || 0,
+      delivered: statusCounts['تم التسليم'] || 0,
+      received: statusCounts['تم الاستلام'] || 0,
+      created: statusCounts['تم الإنشاء'] || 0,
+      cancelled: statusCounts['تم الإلغاء'] || 0,
+      extended: statusCounts['تم التمديد'] || 0,
+      notBooked: statusCounts['لم يتم الحجز'] || 0,
       openProblems: openProblems,
       highProblems: highProblems,
       todayFollowUps: todayFollowUps
@@ -161,15 +172,14 @@ function getDashboard(session, params) {
       problemsOpenVsClosed: { open: openProblems, closed: closedProblems },
       reservationsByCompany: companyCounts,
       employeeComparison: empActivityComparison
-    }
+    },
+    todayRadarCounts: todayRadarCounts
   };
 
   if (cacheKey) {
     var payloadToCache = { dateStr: todayStr, data: result };
     _rgDashMemCache[cacheKey] = payloadToCache;
-    try {
-      CacheService.getScriptCache().put(cacheKey, JSON.stringify(payloadToCache), 300);
-    } catch (e) {}
+    putCompressedJsonCache_(cacheKey, payloadToCache, 180);
   }
 
   return result;
@@ -178,13 +188,34 @@ function getDashboard(session, params) {
 function getAppBootstrap(session, params) {
   var map = getSettingsMap_(false);
   var canDash = hasPermission(session, 'view_dashboard');
+  var dashData = canDash ? getDashboard(session, params || { range: '30d' }) : null;
+  var uiSimplification = normalizeUiSimplificationSettings_(map.ui_simplification);
+  var handoverSettings = typeof normalizeHandoverSettings_ === 'function'
+    ? normalizeHandoverSettings_(map.handover_settings)
+    : {};
+  var announcementsData = typeof getAnnouncements === 'function'
+    ? getAnnouncements(session)
+    : { items: [], activeItems: [] };
+  var locksData = typeof getReservationLocks === 'function'
+    ? getReservationLocks(session)
+    : { items: [] };
+  var settingsOut = null;
+  if (canAccessApi(session.user || session)) {
+    settingsOut = getSettings(session);
+  }
   return {
     user: session.user,
-    dashboard: canDash ? getDashboard(session, params || { range: '30d' }) : null,
+    me: { user: session.user },
+    dashboard: dashData,
+    todayRadarCounts: dashData && dashData.todayRadarCounts ? dashData.todayRadarCounts : null,
     notifications: getNotifications(session),
     employees: getEmployees(session),
     problems: getProblems(session, {}),
-    uiSimplification: normalizeUiSimplificationSettings_(map.ui_simplification),
+    settings: settingsOut,
+    uiSimplification: uiSimplification,
+    handoverSettings: handoverSettings,
+    announcements: announcementsData.activeItems || [],
+    activeLocks: locksData.items || [],
     layoutPrefs: normalizeUserLayoutPrefs_(map['layout_prefs_u_' + session.employeeId]),
     pinnedCriticalIds: getUserPinnedCriticalIds_(session.employeeId)
   };

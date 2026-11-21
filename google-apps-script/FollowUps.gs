@@ -494,6 +494,11 @@ function getMyFollowUps(session, params) {
     return String(b.createdAt).localeCompare(String(a.createdAt));
   });
 
+  var followedResIds = {};
+  for (var fi = 0; fi < allFollowUps.length; fi++) {
+    if (allFollowUps[fi].reservationId) followedResIds[allFollowUps[fi].reservationId] = true;
+  }
+
   var reservations = readAllRecords(RG_SHEETS.RESERVATIONS, false).filter(function (r) {
     var ids = safeJsonParse(r.assignedEmployeeIds, []);
     return ids.indexOf(session.employeeId) !== -1;
@@ -504,7 +509,7 @@ function getMyFollowUps(session, params) {
     mentionFollowUps: mentionFollowUps,
     pinnedCriticalIds: getUserPinnedCriticalIds_(session.employeeId),
     assignedReservations: reservations.map(function (r) {
-      return serializeReservationForClient_(r, false);
+      return serializeReservationForClient_(r, Boolean(followedResIds[r.id]));
     })
   };
 }

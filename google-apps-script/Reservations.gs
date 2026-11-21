@@ -17,14 +17,20 @@ function getReservations(session, params) {
   var dateFrom = normalizeStr(p.dateFrom);
   var dateTo = normalizeStr(p.dateTo);
   var unfollowedOnly = toBool(p.unfollowedOnly);
-  var hasProblemsOnly = toBool(p.hasProblemsOnly);
+  var hasProblemsOnly = toBool(p.hasProblemsOnly) || toBool(p.hasProblem);
+  var hasExtensions = toBool(p.hasExtensions);
+  var timeField = normalizeStr(p.timeField || 'both').toLowerCase();
+  var timeFrom = normalizeStr(p.timeFrom);
+  var timeTo = normalizeStr(p.timeTo);
+  var overdueUnpaidOnly = toBool(p.overdueUnpaidOnly);
   var sortBy = normalizeStr(p.sortBy) || 'lastUpdatedAt';
   var sortDir = normalizeStr(p.sortDir) === 'asc' ? 1 : -1;
   var page = Math.max(1, toNumber(p.page, 1));
   var pageSize = Math.min(200, Math.max(1, toNumber(p.pageSize, 25)));
 
   var isDefaultQuery = !search && !company && !branch && !status && !employeeId && !priority &&
-    !dateFrom && !dateTo && !unfollowedOnly && !hasProblemsOnly &&
+    !dateFrom && !dateTo && !unfollowedOnly && !hasProblemsOnly && !hasExtensions &&
+    !timeFrom && !timeTo && !overdueUnpaidOnly &&
     page === 1 && sortBy === 'lastUpdatedAt' && sortDir === -1;
 
   var resVer = getCacheVersion_('RES');
@@ -33,52 +39,56 @@ function getReservations(session, params) {
     ? ('RG_RES_DEF_V' + resVer + '_' + fuVer + '_' + (restrictToAgent ? session.employeeId : 'ALL') + '_' + pageSize)
     : '';
 
-  if (defaultCacheKey) {
-    try {
-      var defCachedRaw = CacheService.getScriptCache().get(defaultCacheKey);
-      if (defCachedRaw) {
-        var defCached = JSON.parse(defCachedRaw);
-        if (defCached && Array.isArray(defCached.items)) {
-          return defCached;
-        }
-      }
-    } catch (e0) {}
+  if (defaultCacheKey && !toBool(p.forceRefresh)) {
+    var defCached = getCompressedJsonCache_(defaultCacheKey);
+    if (defCached && Array.isArray(defCached.items)) {
+      return defCached;
+    }
   }
 
   var all = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   var facetsKey = 'RG_FACETS_V' + resVer;
-  var cachedFacets = null;
-  try {
-    var fRaw = CacheService.getScriptCache().get(facetsKey);
-    if (fRaw) {
-      var parsedF = JSON.parse(fRaw);
-      if (parsedF && Array.isArray(parsedF.companies) && Array.isArray(parsedF.branches)) {
-        cachedFacets = parsedF;
-      }
-    }
-  } catch (e) {}
+  var cachedFacets = getCompressedJsonCache_(facetsKey);
+  if (!(cachedFacets && Array.isArray(cachedFacets.companies) && Array.isArray(cachedFacets.branches))) {
+    cachedFacets = null;
+  }
 
   var companiesMap = cachedFacets ? null : {};
   var branchesMap = cachedFacets ? null : {};
   var matched = [];
 
   var followedKey = 'RG_FOLLOWED_RES_V' + fuVer;
-  var followedResIds = null;
-  try {
-    var flRaw = CacheService.getScriptCache().get(followedKey);
-    if (flRaw) followedResIds = JSON.parse(flRaw);
-  } catch (e1) {}
+  var followedResIds = getCompressedJsonCache_(followedKey);
   if (!followedResIds || typeof followedResIds !== 'object') {
     followedResIds = {};
     var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
     for (var f = 0; f < followUps.length; f++) {
       if (followUps[f].reservationId) followedResIds[followUps[f].reservationId] = true;
     }
-    try {
-      var flStr = JSON.stringify(followedResIds);
-      if (flStr.length < 95000) CacheService.getScriptCache().put(followedKey, flStr, 300);
-    } catch (e2) {}
+    putCompressedJsonCache_(followedKey, followedResIds, 300);
   }
+
+  var extByResId = null;
+  if (overdueUnpaidOnly) {
+    extByResId = {};
+    var allExt = readAllRecords(RG_SHEETS.EXTENSIONS, false);
+    for (var exi = 0; exi < allExt.length; exi++) {
+      var ex = allExt[exi];
+      if (!ex || ex.isAcceptedAndPaid === 'false') continue;
+      if (ex.reservationId) {
+        if (!extByResId[ex.reservationId]) extByResId[ex.reservationId] = [];
+        extByResId[ex.reservationId].push(ex);
+      }
+      if (ex.reservationNumber) {
+        var nk = 'num:' + ex.reservationNumber;
+        if (!extByResId[nk]) extByResId[nk] = [];
+        extByResId[nk].push(ex);
+      }
+    }
+  }
+  var nowMs = Date.now();
+  var tfMin = timeFrom ? gsParseMinutesOfDay_(timeFrom) : null;
+  var ttMin = timeTo ? gsParseMinutesOfDay_(timeTo) : null;
 
   for (var i = 0; i < all.length; i++) {
     var r = all[i];
@@ -101,6 +111,28 @@ function getReservations(session, params) {
     if (dateTo && r.startDate > dateTo) continue;
     if (unfollowedOnly && followedResIds[r.id]) continue;
     if (hasProblemsOnly && !toBool(r.hasProblem)) continue;
+    if (hasExtensions && !(toBool(r.hasExtensions) || toNumber(r.extensionsCount, 0) > 0)) continue;
+
+    if (tfMin !== null || ttMin !== null) {
+      var sMin = gsParseMinutesOfDay_(r.startTime || extractTimeHM_(r.startDate));
+      var eMin = gsParseMinutesOfDay_(r.extendedUntilTime || r.endTime || extractTimeHM_(r.endDate));
+      var inTime = false;
+      if (timeField === 'start') {
+        inTime = sMin !== null && (tfMin === null || sMin >= tfMin) && (ttMin === null || sMin <= ttMin);
+      } else if (timeField === 'end') {
+        inTime = eMin !== null && (tfMin === null || eMin >= tfMin) && (ttMin === null || eMin <= ttMin);
+      } else {
+        var sOk = sMin !== null && (tfMin === null || sMin >= tfMin) && (ttMin === null || sMin <= ttMin);
+        var eOk = eMin !== null && (tfMin === null || eMin >= tfMin) && (ttMin === null || eMin <= ttMin);
+        inTime = sOk || eOk;
+      }
+      if (!inTime) continue;
+    }
+
+    if (overdueUnpaidOnly) {
+      var exForRes = (extByResId[r.id] || []).concat(extByResId['num:' + r.reservationNumber] || []);
+      if (!gsIsReservationOverdueUnpaid_(r, exForRes, nowMs)) continue;
+    }
 
     if (employeeId) {
       var rawEmp = String(r.assignedEmployeeIds || '');
@@ -109,7 +141,15 @@ function getReservations(session, params) {
     }
 
     if (search) {
-      var hay = (r.reservationNumber + ' ' + r.customerName + ' ' + r.customerPhone + ' ' + r.carName + ' ' + r.companyName).toLowerCase();
+      var hay = (
+        normalizeStr(r.reservationNumber) + ' ' +
+        normalizeStr(r.customerName) + ' ' +
+        normalizeStr(r.customerPhone) + ' ' +
+        normalizeStr(r.carName) + ' ' +
+        normalizeStr(r.plateNumber) + ' ' +
+        normalizeStr(r.branchName) + ' ' +
+        normalizeStr(r.companyName)
+      ).toLowerCase();
       if (hay.indexOf(search) === -1) continue;
     }
 
@@ -121,9 +161,7 @@ function getReservations(session, params) {
       companies: Object.keys(companiesMap).sort(),
       branches: Object.keys(branchesMap).sort()
     };
-    try {
-      CacheService.getScriptCache().put(facetsKey, JSON.stringify(cachedFacets), 600);
-    } catch (e) {}
+    putCompressedJsonCache_(facetsKey, cachedFacets, 600);
   }
 
   var numericSort = (sortBy === 'daysCount' || sortBy === 'extendedDaysCount' || sortBy === 'totalDaysCount' || sortBy === 'extensionsCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
@@ -156,12 +194,7 @@ function getReservations(session, params) {
   };
 
   if (defaultCacheKey) {
-    try {
-      var resStr = JSON.stringify(resPayload);
-      if (resStr.length < 95000) {
-        CacheService.getScriptCache().put(defaultCacheKey, resStr, 180);
-      }
-    } catch (e3) {}
+    putCompressedJsonCache_(defaultCacheKey, resPayload, 180);
   }
 
   return resPayload;
@@ -1115,6 +1148,912 @@ function importReservationsFromExcel(session, payload) {
       skippedRows: skippedRows,
       totalProcessed: validRows.length,
       errors: errors
+    };
+  });
+}
+
+// =========================================================================
+// TODAY MOVEMENTS & 24H RADAR, DELTA SYNC, ANNOUNCEMENTS, DELEGATIONS & LOCKS
+// =========================================================================
+
+var RG_CLOSED_RES_STATUSES_ = [
+  'تم الإلغاء', 'ملغي', 'cancelled', 'canceled', 'لم يتم الحجز', 'مرفوض', 'rejected',
+  'تم الإرجاع', 'تم الاستلام', 'منتهي', 'مكتمل', 'completed', 'returned', 'closed', 'لم يحضر', 'no_show'
+];
+
+var RG_EXCLUDED_TODAY_STATUSES_ = [
+  'تم الإلغاء', 'ملغي', 'cancelled', 'canceled', 'مرفوض', 'rejected',
+  'لم يتم الحجز', 'لم يحضر', 'no_show'
+];
+
+var RG_PICKUP_DONE_STATUSES_ = [
+  'تم التسليم', 'نشط الآن', 'نشط', 'active', 'delivered', 'picked_up',
+  'تم الاستلام', 'تم الإرجاع', 'منتهي', 'مكتمل', 'completed', 'returned', 'closed'
+];
+
+function gsPad2_(n) {
+  return n < 10 ? '0' + n : String(n);
+}
+
+function gsParseMinutesOfDay_(timeStr) {
+  var clean = convertEasternDigitsGs_(normalizeStr(timeStr));
+  var m = /^(\d{1,2}):(\d{2})/.exec(clean);
+  if (!m) return null;
+  var hh = parseInt(m[1], 10);
+  var mm = parseInt(m[2], 10);
+  if (isNaN(hh) || isNaN(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
+function gsNormalizeHHmm_(timeStr, fallback) {
+  var mins = gsParseMinutesOfDay_(timeStr);
+  if (mins === null) return fallback || '';
+  return gsPad2_(Math.floor(mins / 60)) + ':' + gsPad2_(mins % 60);
+}
+
+function gsParseEndTimestampMs_(dateStr, timeStr) {
+  var rawDate = convertEasternDigitsGs_(normalizeStr(dateStr));
+  if (!rawDate) return null;
+  var rawTime = convertEasternDigitsGs_(normalizeStr(timeStr));
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(rawDate) && !rawTime) {
+    var parsedIso = Date.parse(rawDate);
+    if (!isNaN(parsedIso)) return parsedIso;
+  }
+  var dateOnlyMatch = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/.exec(rawDate);
+  if (!dateOnlyMatch) {
+    var fb = Date.parse(rawDate);
+    return isNaN(fb) ? null : fb;
+  }
+  var year = parseInt(dateOnlyMatch[1], 10);
+  var month = parseInt(dateOnlyMatch[2], 10);
+  var day = parseInt(dateOnlyMatch[3], 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  var hh = 23;
+  var mm = 59;
+  var tm = /^(\d{1,2}):(\d{2})/.exec(rawTime);
+  if (tm) {
+    hh = Math.min(23, Math.max(0, parseInt(tm[1], 10)));
+    mm = Math.min(59, Math.max(0, parseInt(tm[2], 10)));
+  } else {
+    var emb = /T(\d{2}):(\d{2})/.exec(rawDate);
+    if (emb) {
+      hh = Math.min(23, Math.max(0, parseInt(emb[1], 10)));
+      mm = Math.min(59, Math.max(0, parseInt(emb[2], 10)));
+    }
+  }
+  var dt = new Date(year, month - 1, day, hh, mm, 0, 0);
+  var ms = dt.getTime();
+  return isNaN(ms) ? null : ms;
+}
+
+function gsResolveEffectiveEnd_(r) {
+  var obj = (r && typeof r === 'object') ? r : {};
+  var extDate = normalizeStr(obj.extendedUntilDate);
+  var extTime = normalizeStr(obj.extendedUntilTime);
+  var endDate = normalizeStr(obj.endDate || obj.originalEndDate);
+  var endTime = normalizeStr(obj.endTime || obj.originalEndTime);
+  var useExt = Boolean(extDate);
+  var effDate = useExt ? extDate : endDate;
+  var effTime = useExt ? (extTime || endTime || '23:59') : (endTime || '23:59');
+  var cleanTime = gsNormalizeHHmm_(effTime, '');
+  return {
+    date: effDate.substring(0, 10),
+    time: cleanTime,
+    isExtended: useExt || toNumber(obj.extensionsCount, 0) > 0 || toBool(obj.hasExtensions),
+    timestampMs: gsParseEndTimestampMs_(effDate, cleanTime || effTime)
+  };
+}
+
+function gsResolveStartInfo_(r) {
+  var obj = (r && typeof r === 'object') ? r : {};
+  var dateStr = formatDateOnly(obj.startDate || obj.pickupDate || '');
+  var rawTime = normalizeStr(obj.startTime) || extractTimeHM_(obj.startDate) || '09:00';
+  var cleanTime = gsNormalizeHHmm_(rawTime, '09:00');
+  return {
+    date: dateStr,
+    time: cleanTime,
+    minutesOfDay: gsParseMinutesOfDay_(cleanTime),
+    timestampMs: dateStr ? gsParseEndTimestampMs_(dateStr, cleanTime) : null
+  };
+}
+
+function gsMatchStatusList_(r, list) {
+  var obj = (r && typeof r === 'object') ? r : {};
+  var a = normalizeStr(obj.internalStatus).toLowerCase();
+  var b = normalizeStr(obj.originalStatusAr).toLowerCase();
+  var c = normalizeStr(obj.originalStatusCode).toLowerCase();
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i].toLowerCase();
+    if (a === s || b === s || c === s) return true;
+  }
+  return false;
+}
+
+function gsIsClosedStatus_(r) {
+  return gsMatchStatusList_(r, RG_CLOSED_RES_STATUSES_);
+}
+
+function gsIsExcludedTodayStatus_(r) {
+  return gsMatchStatusList_(r, RG_EXCLUDED_TODAY_STATUSES_);
+}
+
+function gsIsPickupCompleted_(r) {
+  return gsMatchStatusList_(r, RG_PICKUP_DONE_STATUSES_);
+}
+
+function gsIsReservationOverdueUnpaid_(r, extensions, nowMs) {
+  if (!r || gsIsClosedStatus_(r) || gsIsExcludedTodayStatus_(r)) return false;
+  var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+  var extList = Array.isArray(extensions) ? extensions : [];
+  for (var i = 0; i < extList.length; i++) {
+    var ex = extList[i];
+    if (!ex || !isExtensionAcceptedAndPaid(ex)) continue;
+    var exEndD = formatDateOnly(ex.endDate || ex.newEndDate || ex.actualEndDate);
+    var exEndT = gsNormalizeHHmm_(ex.endTime || r.endTime, '23:59');
+    var exMs = exEndD ? gsParseEndTimestampMs_(exEndD, exEndT) : null;
+    if (exMs !== null && exMs >= now) return false;
+  }
+  var eff = gsResolveEffectiveEnd_(r);
+  if (eff.timestampMs === null || !isFinite(eff.timestampMs)) return false;
+  return eff.timestampMs < now;
+}
+
+function gsFormatRemainingLabels_(diffMs) {
+  var isPast = diffMs < 0;
+  var absMin = Math.round(Math.abs(diffMs) / 60000);
+  var hrs = Math.floor(absMin / 60);
+  var mins = absMin % 60;
+  if (absMin < 1) {
+    return {
+      ar: isPast ? 'انتهى للتو' : 'أقل من دقيقة',
+      en: isPast ? 'Just expired' : '< 1m left'
+    };
+  }
+  var pAr = [];
+  var pEn = [];
+  if (hrs > 0) { pAr.push(hrs + ' س'); pEn.push(hrs + 'h'); }
+  if (mins > 0) { pAr.push(mins + ' د'); pEn.push(mins + 'm'); }
+  var bAr = pAr.join(' ');
+  var bEn = pEn.join(' ');
+  return {
+    ar: isPast ? ('منتهي منذ ' + bAr) : ('باقي ' + bAr),
+    en: isPast ? ('Overdue ' + bEn) : (bEn + ' left')
+  };
+}
+
+function gsComputeExpiryRadarSummary_(reservations, nowMs) {
+  var list = Array.isArray(reservations) ? reservations : [];
+  var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+  var maxFutureMs = 24 * 3600000;
+  var maxPastMs = 12 * 3600000;
+
+  var allMatches = [];
+  var critical6hCount = 0;
+  var soon24hCount = 0;
+  var expiredUnclosedCount = 0;
+  var extendedInRadarCount = 0;
+
+  for (var i = 0; i < list.length; i++) {
+    var res = list[i];
+    if (!res || typeof res !== 'object' || gsIsClosedStatus_(res)) continue;
+    var eff = gsResolveEffectiveEnd_(res);
+    if (eff.timestampMs === null || !isFinite(eff.timestampMs)) continue;
+    var diffMs = eff.timestampMs - now;
+    if (diffMs > maxFutureMs || diffMs < -maxPastMs) continue;
+
+    var bucket = 'soon_24h';
+    var rank = 2;
+    if (diffMs < 0) {
+      bucket = 'expired_unclosed';
+      rank = 0;
+      expiredUnclosedCount += 1;
+    } else if (diffMs <= 6 * 3600000) {
+      bucket = 'critical_6h';
+      rank = 1;
+      critical6hCount += 1;
+    } else {
+      soon24hCount += 1;
+    }
+    if (eff.isExtended) extendedInRadarCount += 1;
+
+    var labels = gsFormatRemainingLabels_(diffMs);
+    allMatches.push({
+      reservation: res,
+      effectiveEndDate: eff.date,
+      effectiveEndTime: eff.time,
+      effectiveEndTimestampMs: eff.timestampMs,
+      isExtended: eff.isExtended,
+      diffMs: diffMs,
+      diffMinutes: Math.round(diffMs / 60000),
+      bucket: bucket,
+      urgencyRank: rank,
+      remainingLabelAr: labels.ar,
+      remainingLabelEn: labels.en
+    });
+  }
+
+  allMatches.sort(function (a, b) {
+    if (a.urgencyRank !== b.urgencyRank) return a.urgencyRank - b.urgencyRank;
+    return a.effectiveEndTimestampMs - b.effectiveEndTimestampMs;
+  });
+
+  return {
+    items: allMatches,
+    allItems: allMatches,
+    totalCount: allMatches.length,
+    upcoming24hCount: critical6hCount + soon24hCount,
+    critical6hCount: critical6hCount,
+    soon24hCount: soon24hCount,
+    expiredUnclosedCount: expiredUnclosedCount,
+    extendedInRadarCount: extendedInRadarCount
+  };
+}
+
+function gsComputeTodayMovementsSummary_(reservations, nowMs, todayDate) {
+  var list = Array.isArray(reservations) ? reservations : [];
+  var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+  var todayStr = normalizeStr(todayDate) || formatDateOnly(new Date(now));
+
+  var allItems = [];
+  var pickupCount = 0;
+  var returnCount = 0;
+  var pendingPickupCount = 0;
+  var pendingReturnCount = 0;
+  var overdueCount = 0;
+  var completedCount = 0;
+
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i];
+    if (!r || typeof r !== 'object' || gsIsExcludedTodayStatus_(r)) continue;
+
+    var startInfo = gsResolveStartInfo_(r);
+    if (startInfo.date && startInfo.date === todayStr) {
+      var pickupDone = gsIsPickupCompleted_(r);
+      var pickupOverdue = !pickupDone && startInfo.timestampMs !== null && startInfo.timestampMs < now;
+      pickupCount += 1;
+      if (pickupDone) completedCount += 1;
+      else pendingPickupCount += 1;
+      if (pickupOverdue) overdueCount += 1;
+      allItems.push({
+        key: String(r.id || r.reservationNumber || i) + ':pickup',
+        movementType: 'pickup',
+        reservation: r,
+        scheduledDate: todayStr,
+        scheduledTime: startInfo.time,
+        scheduledMinutes: startInfo.minutesOfDay !== null ? startInfo.minutesOfDay : 540,
+        scheduledTimestampMs: startInfo.timestampMs,
+        isCompleted: pickupDone,
+        isOverdue: pickupOverdue,
+        isExtended: false
+      });
+    }
+
+    var effEnd = gsResolveEffectiveEnd_(r);
+    if (effEnd.date && effEnd.date === todayStr) {
+      var retTime = gsNormalizeHHmm_(effEnd.time, '23:59');
+      var retMins = gsParseMinutesOfDay_(retTime);
+      var retDone = gsIsClosedStatus_(r);
+      var retOverdue = !retDone && effEnd.timestampMs !== null && effEnd.timestampMs < now;
+      returnCount += 1;
+      if (retDone) completedCount += 1;
+      else pendingReturnCount += 1;
+      if (retOverdue) overdueCount += 1;
+      allItems.push({
+        key: String(r.id || r.reservationNumber || i) + ':return',
+        movementType: 'return',
+        reservation: r,
+        scheduledDate: todayStr,
+        scheduledTime: retTime,
+        scheduledMinutes: retMins !== null ? retMins : 1439,
+        scheduledTimestampMs: effEnd.timestampMs,
+        isCompleted: retDone,
+        isOverdue: retOverdue,
+        isExtended: effEnd.isExtended
+      });
+    }
+  }
+
+  allItems.sort(function (a, b) {
+    if (a.scheduledMinutes !== b.scheduledMinutes) return a.scheduledMinutes - b.scheduledMinutes;
+    if (a.movementType !== b.movementType) return a.movementType === 'pickup' ? -1 : 1;
+    var ra = normalizeStr(a.reservation && a.reservation.reservationNumber);
+    var rb = normalizeStr(b.reservation && b.reservation.reservationNumber);
+    return ra < rb ? -1 : (ra > rb ? 1 : 0);
+  });
+
+  return {
+    todayDate: todayStr,
+    items: allItems,
+    allItems: allItems,
+    totalCount: allItems.length,
+    filteredCount: allItems.length,
+    pickupCount: pickupCount,
+    returnCount: returnCount,
+    pendingPickupCount: pendingPickupCount,
+    pendingReturnCount: pendingReturnCount,
+    overdueCount: overdueCount,
+    completedCount: completedCount
+  };
+}
+
+function getTodayAndRadar(session, params) {
+  var p = params || {};
+  var settingsMap = getSettingsMap_(false);
+  var allowAgentAll = settingsMap.allow_agent_view_all !== undefined ? toBool(settingsMap.allow_agent_view_all) : true;
+  var restrictToAgent = session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations');
+  var roleScope = restrictToAgent ? session.employeeId : 'ALL';
+
+  var rawToday = normalizeStr(p.todayDate);
+  var todayStr = /^\d{4}-\d{2}-\d{2}$/.test(rawToday) ? rawToday : formatDateOnly(new Date());
+  var minDate = shiftIsoDateDays_(todayStr, -2);
+  var maxDate = shiftIsoDateDays_(todayStr, 2);
+
+  var rawNow = Number(p.nowMs);
+  var serverNow = Date.now();
+  var nowMs = (!isNaN(rawNow) && isFinite(rawNow) && Math.abs(rawNow - serverNow) <= 86400000) ? rawNow : serverNow;
+
+  var cacheKey = 'RG_TODAY_RADAR_V' + getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + roleScope + '_' + todayStr;
+  var candidates = !toBool(p.forceRefresh) ? getCompressedJsonCache_(cacheKey) : null;
+
+  if (!Array.isArray(candidates)) {
+    var all = readAllRecords(RG_SHEETS.RESERVATIONS, false);
+    var followUps = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
+    var followedSet = {};
+    for (var f = 0; f < followUps.length; f++) {
+      if (followUps[f].reservationId) followedSet[followUps[f].reservationId] = true;
+    }
+    candidates = [];
+    for (var i = 0; i < all.length; i++) {
+      var r = all[i];
+      if (restrictToAgent) {
+        var rawMy = String(r.assignedEmployeeIds || '');
+        if (rawMy.indexOf(session.employeeId) === -1) continue;
+        if (safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
+      }
+      var sDate = formatDateOnly(r.startDate);
+      var eDate = formatDateOnly(r.endDate);
+      var xDate = formatDateOnly(r.extendedUntilDate);
+      var match = (sDate === todayStr) ||
+        (eDate && eDate >= minDate && eDate <= maxDate) ||
+        (xDate && xDate >= minDate && xDate <= maxDate);
+      if (!match) continue;
+      candidates.push(serializeReservationForClient_(r, Boolean(followedSet[r.id])));
+    }
+    putCompressedJsonCache_(cacheKey, candidates, 60);
+  }
+
+  var todaySummary = gsComputeTodayMovementsSummary_(candidates, nowMs, todayStr);
+  var radarSummary = gsComputeExpiryRadarSummary_(candidates, nowMs);
+
+  var counts = {
+    todayTotal: toNumber(todaySummary.totalCount, 0),
+    pickupCount: toNumber(todaySummary.pickupCount, 0),
+    returnCount: toNumber(todaySummary.returnCount, 0),
+    pendingPickupCount: toNumber(todaySummary.pendingPickupCount, 0),
+    pendingReturnCount: toNumber(todaySummary.pendingReturnCount, 0),
+    overdueTodayCount: toNumber(todaySummary.overdueCount, 0),
+    radarTotal: toNumber(radarSummary.totalCount, 0),
+    upcoming24hCount: toNumber(radarSummary.upcoming24hCount, 0),
+    critical6hCount: toNumber(radarSummary.critical6hCount, 0),
+    soon24hCount: toNumber(radarSummary.soon24hCount, 0),
+    expiredUnclosedCount: toNumber(radarSummary.expiredUnclosedCount, 0),
+    extendedInRadarCount: toNumber(radarSummary.extendedInRadarCount, 0)
+  };
+
+  if (toBool(p.summaryOnly)) {
+    return {
+      todayDate: todayStr,
+      serverTime: nowIso(),
+      counts: counts
+    };
+  }
+
+  return {
+    todayDate: todayStr,
+    serverTime: nowIso(),
+    counts: counts,
+    todaySummary: todaySummary,
+    radarSummary: radarSummary,
+    items: candidates
+  };
+}
+
+function isAnnouncementActiveGs_(item, nowMs) {
+  if (!item || !toBool(item.isActive)) return false;
+  var now = typeof nowMs === 'number' && isFinite(nowMs) ? nowMs : Date.now();
+  if (item.startsAt) {
+    var s = Date.parse(item.startsAt);
+    if (!isNaN(s) && now < s) return false;
+  }
+  if (item.expiresAt) {
+    var e = Date.parse(item.expiresAt);
+    if (!isNaN(e) && now > e) return false;
+  }
+  return true;
+}
+
+function formatAnnouncementForClient_(row) {
+  return {
+    id: normalizeStr(row.id),
+    title: normalizeStr(row.title),
+    message: normalizeStr(row.message),
+    tone: normalizeStr(row.tone) || 'warning',
+    isPinned: toBool(row.isPinned),
+    isActive: row.isActive === '' || row.isActive === undefined ? true : toBool(row.isActive),
+    startsAt: normalizeStr(row.startsAt),
+    expiresAt: normalizeStr(row.expiresAt),
+    createdById: normalizeStr(row.createdById),
+    createdByName: normalizeStr(row.createdByName),
+    createdByRole: normalizeStr(row.createdByRole),
+    createdAt: normalizeStr(row.createdAt),
+    updatedAt: normalizeStr(row.updatedAt)
+  };
+}
+
+function getAnnouncements(session) {
+  var rows = readAllRecords(RG_SHEETS.ANNOUNCEMENTS, false);
+  var items = rows.map(formatAnnouncementForClient_);
+  items.sort(function (a, b) {
+    if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+    return String(b.updatedAt || b.createdAt).localeCompare(String(a.updatedAt || a.createdAt));
+  });
+  var nowMs = Date.now();
+  var activeItems = items.filter(function (it) {
+    return isAnnouncementActiveGs_(it, nowMs);
+  });
+  return { items: items, activeItems: activeItems };
+}
+
+function saveAnnouncement(session, payload) {
+  if (session.role !== RG_ROLES.GENERAL_MANAGER && session.role !== RG_ROLES.SUPERVISOR) {
+    throw new Error('FORBIDDEN: إدارة تعميمات وإعلانات الوردية متاحة للمشرف والمدير العام فقط.');
+  }
+  var p = payload || {};
+  var title = normalizeStr(p.title);
+  var message = normalizeStr(p.message);
+  if (!message) throw new Error('VALIDATION_ERROR: نص التعميم أو التنبيه مطلوب.');
+
+  var toneRaw = normalizeStr(p.tone || 'warning').toLowerCase();
+  var tone = (toneRaw === 'info' || toneRaw === 'danger' || toneRaw === 'warning') ? toneRaw : 'warning';
+  var isPinned = p.isPinned !== undefined ? toBool(p.isPinned) : true;
+  var isActive = p.isActive !== undefined ? toBool(p.isActive) : true;
+  var startsAt = normalizeStr(p.startsAt);
+  var expiresAt = normalizeStr(p.expiresAt);
+  var annId = normalizeStr(p.id) || generateId('ANN');
+
+  return withScriptLock(function () {
+    var existing = findRecordById(RG_SHEETS.ANNOUNCEMENTS, 'id', annId);
+    var now = nowIso();
+    var rec = {
+      id: annId,
+      title: title,
+      message: message,
+      tone: tone,
+      isPinned: isPinned ? 'true' : 'false',
+      isActive: isActive ? 'true' : 'false',
+      startsAt: startsAt,
+      expiresAt: expiresAt,
+      createdById: existing ? existing.createdById : session.employeeId,
+      createdByName: existing ? existing.createdByName : session.user.name,
+      createdByRole: existing ? existing.createdByRole : session.role,
+      createdAt: existing ? (existing.createdAt || now) : now,
+      updatedAt: now
+    };
+    upsertRecordByKey(RG_SHEETS.ANNOUNCEMENTS, 'id', annId, rec);
+    logActivity(session.user, 'نشر تعميم وردية', 'Announcement', annId, (title ? (title + ': ') : '') + message.slice(0, 120));
+    var data = getAnnouncements(session);
+    var saved = formatAnnouncementForClient_(rec);
+    return { announcement: saved, items: data.items, activeItems: data.activeItems };
+  });
+}
+
+function deleteAnnouncement(session, payload) {
+  if (session.role !== RG_ROLES.GENERAL_MANAGER && session.role !== RG_ROLES.SUPERVISOR) {
+    throw new Error('FORBIDDEN: حذف تعميمات الوردية متاح للمشرف والمدير العام فقط.');
+  }
+  var p = payload || {};
+  var annId = normalizeStr(p.id || p.announcementId);
+  if (!annId) throw new Error('VALIDATION_ERROR: معرف التعميم مطلوب.');
+
+  return withScriptLock(function () {
+    deleteRecordByKey(RG_SHEETS.ANNOUNCEMENTS, 'id', annId);
+    logActivity(session.user, 'حذف تعميم وردية', 'Announcement', annId, 'تم حذف تعميم الوردية');
+    var data = getAnnouncements(session);
+    return { deleted: true, items: data.items, activeItems: data.activeItems };
+  });
+}
+
+function formatDelegationForClient_(row, nowMs) {
+  var obj = {
+    id: normalizeStr(row.id),
+    delegateEmployeeId: normalizeStr(row.delegateEmployeeId),
+    delegateEmployeeName: normalizeStr(row.delegateEmployeeName),
+    delegatedRole: normalizeStr(row.delegatedRole) || RG_ROLES.SUPERVISOR,
+    grantedById: normalizeStr(row.grantedById),
+    grantedByName: normalizeStr(row.grantedByName),
+    reason: normalizeStr(row.reason),
+    startsAt: normalizeStr(row.startsAt),
+    expiresAt: normalizeStr(row.expiresAt),
+    status: normalizeStr(row.status) || 'active',
+    revokedAt: normalizeStr(row.revokedAt),
+    revokedById: normalizeStr(row.revokedById),
+    revokedByName: normalizeStr(row.revokedByName),
+    createdAt: normalizeStr(row.createdAt),
+    updatedAt: normalizeStr(row.updatedAt)
+  };
+  obj.isActiveNow = typeof isDelegationActiveGas_ === 'function' ? isDelegationActiveGas_(obj, nowMs) : false;
+  return obj;
+}
+
+function getDelegations(session) {
+  var canManage = session.role === RG_ROLES.GENERAL_MANAGER ||
+    hasPermission(session, 'manage_employees') ||
+    hasPermission(session, 'view_employees');
+  var rows = readAllRecords(RG_SHEETS.DELEGATIONS, false);
+  var filtered = canManage ? rows : rows.filter(function (r) {
+    return normalizeStr(r.delegateEmployeeId) === session.employeeId;
+  });
+  filtered.sort(function (a, b) {
+    return String(b.createdAt).localeCompare(String(a.createdAt));
+  });
+  var nowMs = Date.now();
+  return {
+    items: filtered.slice(0, canManage ? 100 : 20).map(function (r) {
+      return formatDelegationForClient_(r, nowMs);
+    })
+  };
+}
+
+function saveDelegation(session, payload) {
+  if (session.role !== RG_ROLES.GENERAL_MANAGER && !hasPermission(session, 'manage_employees')) {
+    throw new Error('FORBIDDEN: منح تفويض الصلاحيات المؤقت متاح للمدير العام أو مسؤول إدارة الموظفين فقط.');
+  }
+  var p = payload || {};
+  var empId = normalizeStr(p.delegateEmployeeId);
+  var startsAt = normalizeStr(p.startsAt) || nowIso();
+  var expiresAt = normalizeStr(p.expiresAt);
+  var reason = normalizeStr(p.reason) || 'تفويض صلاحية مشرف بديل مؤقت';
+  if (!empId || !expiresAt) {
+    throw new Error('VALIDATION_ERROR: يرجى تحديد الموظف البديل وتاريخ/وقت انتهاء التفويض.');
+  }
+  var sMs = Date.parse(startsAt);
+  var eMs = Date.parse(expiresAt);
+  if (isNaN(eMs) || (!isNaN(sMs) && eMs <= sMs)) {
+    throw new Error('VALIDATION_ERROR: يجب أن يكون موعد انتهاء التفويض بعد موعد البداية.');
+  }
+
+  return withScriptLock(function () {
+    var targetEmp = findRecordById(RG_SHEETS.EMPLOYEES, 'id', empId);
+    if (!targetEmp) throw new Error('NOT_FOUND: الموظف المحدد غير موجود.');
+    if (normalizeStr(targetEmp.status || 'active') !== 'active') {
+      throw new Error('VALIDATION_ERROR: لا يمكن تفويض حساب موقوف.');
+    }
+
+    var now = nowIso();
+    var delRec = {
+      id: generateId('DEL'),
+      delegateEmployeeId: targetEmp.id,
+      delegateEmployeeName: targetEmp.name,
+      delegatedRole: RG_ROLES.SUPERVISOR,
+      grantedById: session.employeeId,
+      grantedByName: session.user.name,
+      reason: reason,
+      startsAt: startsAt,
+      expiresAt: expiresAt,
+      status: 'active',
+      revokedAt: '',
+      revokedById: '',
+      revokedByName: '',
+      createdAt: now,
+      updatedAt: now
+    };
+    appendRecord(RG_SHEETS.DELEGATIONS, delRec);
+    clearEmployeeSessionCache_(targetEmp.id);
+
+    createNotification(
+      targetEmp.id,
+      '',
+      'delegation',
+      'تم منحك صلاحية مشرف مؤقتة',
+      'منحك ' + session.user.name + ' صلاحية المشرف مؤقتًا حتى ' + formatDateTimeDisplay_(expiresAt) + ' (' + reason + ').',
+      'Employee',
+      targetEmp.id
+    );
+    logActivity(session.user, 'تفويض صلاحيات مؤقت', 'Employee', targetEmp.name,
+      'تفويض ' + targetEmp.name + ' بصلاحية مشرف مؤقت حتى ' + formatDateTimeDisplay_(expiresAt));
+
+    return { delegation: formatDelegationForClient_(delRec, Date.now()) };
+  });
+}
+
+function revokeDelegation(session, payload) {
+  if (session.role !== RG_ROLES.GENERAL_MANAGER && !hasPermission(session, 'manage_employees')) {
+    throw new Error('FORBIDDEN: إلغاء التفويض المؤقت متاح للمدير العام أو مسؤول إدارة الموظفين فقط.');
+  }
+  var p = payload || {};
+  var delId = normalizeStr(p.id || p.delegationId);
+  if (!delId) throw new Error('VALIDATION_ERROR: معرف التفويض مطلوب.');
+
+  return withScriptLock(function () {
+    var cur = findRecordById(RG_SHEETS.DELEGATIONS, 'id', delId);
+    if (!cur) throw new Error('NOT_FOUND: سجل التفويض غير موجود.');
+    var now = nowIso();
+    updateRecordByKey(RG_SHEETS.DELEGATIONS, 'id', delId, {
+      status: 'revoked',
+      revokedAt: now,
+      revokedById: session.employeeId,
+      revokedByName: session.user.name,
+      updatedAt: now
+    });
+    if (cur.delegateEmployeeId) {
+      clearEmployeeSessionCache_(cur.delegateEmployeeId);
+    }
+    logActivity(session.user, 'إلغاء تفويض مؤقت', 'Employee', cur.delegateEmployeeName, 'تم إلغاء التفويض المؤقت عن ' + cur.delegateEmployeeName);
+    return { revoked: true };
+  });
+}
+
+function formatLockForClient_(row) {
+  return {
+    reservationId: normalizeStr(row.reservationId),
+    lockedById: normalizeStr(row.lockedById),
+    lockedByName: normalizeStr(row.lockedByName),
+    lockedByRole: normalizeStr(row.lockedByRole),
+    lockedAt: normalizeStr(row.lockedAt),
+    expiresAt: normalizeStr(row.expiresAt)
+  };
+}
+
+function getReservationLocks(session) {
+  var rows = readAllRecords(RG_SHEETS.RESERVATION_LOCKS, false);
+  var nowMs = Date.now();
+  var items = [];
+  for (var i = 0; i < rows.length; i++) {
+    var expMs = rows[i].expiresAt ? Date.parse(rows[i].expiresAt) : 0;
+    if (expMs && !isNaN(expMs) && expMs > nowMs) {
+      items.push(formatLockForClient_(rows[i]));
+    }
+  }
+  return { items: items };
+}
+
+function acquireReservationLock(session, payload) {
+  var p = payload || {};
+  var resId = normalizeStr(p.reservationId);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب للقفل التعاوني.');
+
+  return withScriptLock(function () {
+    var nowMs = Date.now();
+    var existing = findRecordById(RG_SHEETS.RESERVATION_LOCKS, 'reservationId', resId);
+    if (existing) {
+      var expMs = existing.expiresAt ? Date.parse(existing.expiresAt) : 0;
+      if (expMs && !isNaN(expMs) && expMs > nowMs && normalizeStr(existing.lockedById) !== session.employeeId) {
+        return {
+          acquired: false,
+          lock: formatLockForClient_(existing)
+        };
+      }
+    }
+    var lockRec = {
+      reservationId: resId,
+      lockedById: session.employeeId,
+      lockedByName: session.user.name,
+      lockedByRole: session.role,
+      lockedAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + 120000).toISOString()
+    };
+    upsertRecordByKey(RG_SHEETS.RESERVATION_LOCKS, 'reservationId', resId, lockRec);
+    return {
+      acquired: true,
+      lock: formatLockForClient_(lockRec)
+    };
+  });
+}
+
+function releaseReservationLock(session, payload) {
+  var p = payload || {};
+  var resId = normalizeStr(p.reservationId);
+  return withScriptLock(function () {
+    if (resId) {
+      var existing = findRecordById(RG_SHEETS.RESERVATION_LOCKS, 'reservationId', resId);
+      if (existing && normalizeStr(existing.lockedById) === session.employeeId) {
+        deleteRecordByKey(RG_SHEETS.RESERVATION_LOCKS, 'reservationId', resId);
+      }
+    } else {
+      updateRecordsWhere_(RG_SHEETS.RESERVATION_LOCKS, function (lk) {
+        return normalizeStr(lk.lockedById) === session.employeeId;
+      }, { expiresAt: new Date(Date.now() - 1000).toISOString() });
+    }
+    return { released: true };
+  });
+}
+
+function getDeltaSync(session, params) {
+  var p = params || {};
+  var rawSince = normalizeStr(p.updatedAfter);
+  var sinceMs = rawSince && !isNaN(Date.parse(rawSince)) ? (Date.parse(rawSince) - 2000) : (Date.now() - 120000);
+  var sinceIso = new Date(sinceMs).toISOString();
+
+  var settingsMap = getSettingsMap_(false);
+  var allowAgentAll = settingsMap.allow_agent_view_all !== undefined ? toBool(settingsMap.allow_agent_view_all) : true;
+  var restrictToAgent = session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations');
+
+  var allRes = readAllRecords(RG_SHEETS.RESERVATIONS, false);
+  var allFu = readAllRecords(RG_SHEETS.FOLLOWUPS, false);
+  var allPrb = readAllRecords(RG_SHEETS.PROBLEMS, false);
+  var allEmp = readAllRecords(RG_SHEETS.EMPLOYEES, false);
+
+  var followedSet = {};
+  var changedFollowUps = [];
+  for (var fi = 0; fi < allFu.length; fi++) {
+    var fu = allFu[fi];
+    if (fu.reservationId) followedSet[fu.reservationId] = true;
+    var fuTs = normalizeStr(fu.createdAt);
+    if (fuTs && fuTs > sinceIso) changedFollowUps.push(fu);
+  }
+  changedFollowUps.sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
+
+  var changedReservations = [];
+  for (var ri = 0; ri < allRes.length; ri++) {
+    var r = allRes[ri];
+    if (restrictToAgent) {
+      var rawMy = String(r.assignedEmployeeIds || '');
+      if (rawMy.indexOf(session.employeeId) === -1 || safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
+    }
+    var rTs = normalizeStr(r.updatedAt || r.lastUpdatedAt || r.createdAt);
+    if (rTs && rTs > sinceIso) {
+      changedReservations.push(serializeReservationForClient_(r, Boolean(followedSet[r.id])));
+    }
+  }
+  changedReservations.sort(function (a, b) { return String(b.updatedAt).localeCompare(String(a.updatedAt)); });
+
+  var changedProblems = [];
+  for (var pi = 0; pi < allPrb.length; pi++) {
+    var pr = allPrb[pi];
+    var pTs = normalizeStr(pr.updatedAt || pr.createdAt);
+    if (pTs && pTs > sinceIso) changedProblems.push(formatProblemForClient(pr));
+  }
+  changedProblems.sort(function (a, b) { return String(b.updatedAt).localeCompare(String(a.updatedAt)); });
+
+  var changedEmployees = [];
+  for (var ei = 0; ei < allEmp.length; ei++) {
+    var e = allEmp[ei];
+    var eTs = normalizeStr(e.updatedAt || e.lastActivity || e.createdAt);
+    if (eTs && eTs > sinceIso) changedEmployees.push(sanitizeEmployeeForClient(e));
+  }
+
+  var trSummary = getTodayAndRadar(session, { summaryOnly: true, todayDate: normalizeStr(p.todayDate) });
+  var notifications = getNotifications(session);
+  var announcementsData = getAnnouncements(session);
+  var locksData = getReservationLocks(session);
+
+  return {
+    serverTime: nowIso(),
+    syncVersion: getCacheVersion_('RES') + '_' + getCacheVersion_('FU') + '_' + getCacheVersion_('PRB'),
+    changedReservations: changedReservations.slice(0, 200),
+    changedFollowUps: changedFollowUps.slice(0, 200),
+    changedProblems: changedProblems.slice(0, 100),
+    changedEmployees: changedEmployees.slice(0, 50),
+    todayRadarCounts: trSummary && trSummary.counts ? trSummary.counts : null,
+    notifications: notifications,
+    announcements: announcementsData.activeItems || [],
+    locks: locksData.items || [],
+    user: session.user
+  };
+}
+
+function bulkReassignEmployeeReservations(session, payload) {
+  requirePermission(session, 'assign_employees');
+  var p = payload || {};
+  var fromEmployeeId = normalizeStr(p.fromEmployeeId);
+  var toEmployeeId = normalizeStr(p.toEmployeeId);
+  var onlyActive = p.onlyActive !== false;
+
+  if (!fromEmployeeId || !toEmployeeId) {
+    throw new Error('VALIDATION_ERROR: يرجى تحديد الموظف المحوّل منه والموظف المستلم للوردية.');
+  }
+  if (fromEmployeeId === toEmployeeId) {
+    throw new Error('VALIDATION_ERROR: لا يمكن التحويل إلى نفس الموظف.');
+  }
+
+  return withScriptLock(function () {
+    var fromEmp = findRecordById(RG_SHEETS.EMPLOYEES, 'id', fromEmployeeId);
+    var toEmp = findRecordById(RG_SHEETS.EMPLOYEES, 'id', toEmployeeId);
+    if (!fromEmp || !toEmp) throw new Error('NOT_FOUND: أحد الموظفين المحددين غير موجود.');
+    if (normalizeStr(toEmp.status || 'active') !== 'active') {
+      throw new Error('VALIDATION_ERROR: الموظف المستلم للوردية غير نشط.');
+    }
+
+    var allRes = readAllRecords(RG_SHEETS.RESERVATIONS, true);
+    var now = nowIso();
+    var transferredCount = 0;
+    var transferredNumbers = [];
+    var rowsToUpsert = [];
+    var newAssignBatch = [];
+
+    for (var i = 0; i < allRes.length; i++) {
+      var res = allRes[i];
+      var curIds = safeJsonParse(res.assignedEmployeeIds, []);
+      if (!Array.isArray(curIds) || curIds.indexOf(fromEmployeeId) === -1) continue;
+      if (onlyActive && gsIsClosedStatus_(res)) continue;
+
+      var curNames = safeJsonParse(res.assignedEmployeeNames, []);
+      if (!Array.isArray(curNames)) curNames = [];
+      var nextIds = [];
+      var nextNames = [];
+      var seen = {};
+      for (var j = 0; j < curIds.length; j++) {
+        var eid = normalizeStr(curIds[j]);
+        if (!eid || eid === fromEmployeeId || seen[eid]) continue;
+        seen[eid] = true;
+        nextIds.push(eid);
+        nextNames.push(normalizeStr(curNames[j]) || eid);
+      }
+      if (!seen[toEmployeeId]) {
+        seen[toEmployeeId] = true;
+        nextIds.push(toEmployeeId);
+        nextNames.push(toEmp.name);
+      }
+
+      var copyRec = {};
+      for (var rk in res) {
+        if (Object.prototype.hasOwnProperty.call(res, rk)) copyRec[rk] = res[rk];
+      }
+      copyRec.assignedEmployeeIds = JSON.stringify(nextIds);
+      copyRec.assignedEmployeeNames = JSON.stringify(nextNames);
+      copyRec.lastUpdateText = 'تحويل وردية جماعي: من ' + fromEmp.name + ' إلى ' + toEmp.name;
+      copyRec.lastUpdatedById = session.employeeId;
+      copyRec.lastUpdatedByName = session.user.name;
+      copyRec.lastUpdatedAt = now;
+      copyRec.updatedAt = now;
+      rowsToUpsert.push(copyRec);
+
+      newAssignBatch.push({
+        id: generateId('ASN'),
+        reservationId: res.id,
+        reservationNumber: res.reservationNumber,
+        employeeId: toEmp.id,
+        employeeName: toEmp.name,
+        assignedById: session.employeeId,
+        assignedByName: session.user.name,
+        roleType: 'shift_handover',
+        status: 'active',
+        assignedAt: now,
+        updatedAt: now
+      });
+
+      transferredCount += 1;
+      transferredNumbers.push(res.reservationNumber);
+    }
+
+    if (rowsToUpsert.length > 0) {
+      batchUpsertRecords(RG_SHEETS.RESERVATIONS, 'id', rowsToUpsert);
+      updateRecordsWhere_(RG_SHEETS.ASSIGNMENTS, function (a) {
+        return a.employeeId === fromEmployeeId && a.status === 'active' && transferredNumbers.indexOf(a.reservationNumber) !== -1;
+      }, { status: 'transferred', updatedAt: now });
+      batchAppendRecords(RG_SHEETS.ASSIGNMENTS, newAssignBatch);
+      createNotification(
+        toEmp.id,
+        '',
+        'assignment',
+        'استلام وردية: ' + transferredCount + ' حجز نشط',
+        'تم تحويل ' + transferredCount + ' حجزًا نشطًا من ' + fromEmp.name + ' إليك بواسطة ' + session.user.name + '.',
+        'Reservation',
+        transferredNumbers[0] || ''
+      );
+    }
+
+    logActivity(session.user, 'تحويل جماعي للوردية', 'Reservation', fromEmp.name + ' -> ' + toEmp.name,
+      'تحويل ' + transferredCount + ' حجز نشط من ' + fromEmp.name + ' إلى ' + toEmp.name);
+
+    return {
+      fromEmployeeId: fromEmployeeId,
+      fromEmployeeName: fromEmp.name,
+      toEmployeeId: toEmployeeId,
+      toEmployeeName: toEmp.name,
+      transferredCount: transferredCount,
+      reservationNumbers: transferredNumbers
     };
   });
 }

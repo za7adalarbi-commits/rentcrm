@@ -13,22 +13,17 @@ function computeReservationFacets_(reservations) {
     companies: Object.keys(companiesMap).sort(),
     branches: Object.keys(branchesMap).sort()
   };
-  try {
-    CacheService.getScriptCache().put('RG_FACETS_V1', JSON.stringify(facets), 600);
-  } catch (e) {}
+  var key = 'RG_FACETS_V' + getCacheVersion_('RES');
+  putCompressedJsonCache_(key, facets, 600);
   return facets;
 }
 
 function getCachedReservationFacets_() {
-  try {
-    var raw = CacheService.getScriptCache().get('RG_FACETS_V1');
-    if (raw) {
-      var parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.companies) && Array.isArray(parsed.branches)) {
-        return parsed;
-      }
-    }
-  } catch (e) {}
+  var key = 'RG_FACETS_V' + getCacheVersion_('RES');
+  var parsed = getCompressedJsonCache_(key);
+  if (parsed && Array.isArray(parsed.companies) && Array.isArray(parsed.branches)) {
+    return parsed;
+  }
   var reservations = readAllRecords(RG_SHEETS.RESERVATIONS, false);
   return computeReservationFacets_(reservations);
 }
@@ -93,7 +88,13 @@ function getReports(session, params) {
   }
 
   if (reportType === 'activity_log') {
-    var logRes = getActivityLogs(session, { userId: employeeId, date: dateFrom });
+    var logRes = getActivityLogs(session, {
+      userId: employeeId,
+      dateFrom: dateFrom,
+      dateTo: dateTo,
+      actionType: normalizeStr(p.actionType),
+      search: normalizeStr(p.search)
+    });
     return { reportType: reportType, rows: logRes.items, facets: getCachedReservationFacets_() };
   }
 

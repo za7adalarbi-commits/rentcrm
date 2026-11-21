@@ -55,6 +55,44 @@ function normalizeUiSimplificationSettings_(raw) {
   };
 }
 
+function normalizeHandoverSettings_(raw) {
+  var obj = typeof raw === 'string' ? safeJsonParse(raw, {}) : (raw || {});
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) obj = {};
+  var validPresets = ['8h', '12h', 'today', 'yesterday', 'custom'];
+  var preset = normalizeStr(obj.defaultPreset || '8h').toLowerCase();
+  if (validPresets.indexOf(preset) === -1) preset = '8h';
+  var defaults = {
+    includeTodayMovements: true,
+    includePending: true,
+    includeClosed: true,
+    includeOpenProblems: true,
+    includeExpiring24h: true,
+    autoIncludeNotes: true
+  };
+  function pickBool(k) {
+    if (obj[k] === undefined || obj[k] === null) return Boolean(defaults[k]);
+    return obj[k] === true || obj[k] === 'true' || obj[k] === 1;
+  }
+  function cleanTime(val) {
+    var m = /^(\d{1,2}):(\d{2})/.exec(normalizeStr(val));
+    if (!m) return '';
+    var hh = Math.min(23, Math.max(0, parseInt(m[1], 10)));
+    var mm = Math.min(59, Math.max(0, parseInt(m[2], 10)));
+    return (hh < 10 ? '0' + hh : String(hh)) + ':' + (mm < 10 ? '0' + mm : String(mm));
+  }
+  return {
+    defaultPreset: preset,
+    defaultTimeFrom: cleanTime(obj.defaultTimeFrom),
+    defaultTimeTo: cleanTime(obj.defaultTimeTo),
+    includeTodayMovements: pickBool('includeTodayMovements'),
+    includePending: pickBool('includePending'),
+    includeClosed: pickBool('includeClosed'),
+    includeOpenProblems: pickBool('includeOpenProblems'),
+    includeExpiring24h: pickBool('includeExpiring24h'),
+    autoIncludeNotes: pickBool('autoIncludeNotes')
+  };
+}
+
 function getSettings(session) {
   requireApiAccess(session);
   var map = getSettingsMap_(false);
@@ -72,6 +110,7 @@ function getSettings(session) {
     auto_sync_interval_hours: interval.hours,
     auto_sync_interval_minutes: interval.minutes,
     ui_simplification: normalizeUiSimplificationSettings_(map.ui_simplification),
+    handover_settings: normalizeHandoverSettings_(map.handover_settings),
     hasRgToken: Boolean(getRgToken())
   };
 }
@@ -92,9 +131,12 @@ function updateSettings(session, payload) {
       'allow_agent_view_all',
       'default_language',
       'auto_sync_enabled',
-      'ui_simplification'
+      'ui_simplification',
+      'handover_settings'
     ];
 
+    var rowsToUpsert = [];
+    var nowStr = nowIso();
     for (var i = 0; i < allowedKeys.length; i++) {
       var k = allowedKeys[i];
       if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
@@ -103,16 +145,18 @@ function updateSettings(session, payload) {
         val = JSON.stringify(val);
       } else if (k === 'ui_simplification') {
         val = JSON.stringify(normalizeUiSimplificationSettings_(val));
+      } else if (k === 'handover_settings') {
+        val = JSON.stringify(normalizeHandoverSettings_(val));
       } else if (k === 'auto_sync_enabled') {
         val = toBool(val) ? 'true' : 'false';
       } else {
         val = String(val);
       }
-      upsertRecordByKey(RG_SHEETS.SETTINGS, 'key', k, {
+      rowsToUpsert.push({
         key: k,
         value: val,
         updatedBy: session.user.name,
-        updatedAt: nowIso()
+        updatedAt: nowStr
       });
     }
 
@@ -121,18 +165,22 @@ function updateSettings(session, payload) {
         Object.prototype.hasOwnProperty.call(p, 'auto_sync_interval_hours') ? p.auto_sync_interval_hours : existingMap.auto_sync_interval_hours,
         Object.prototype.hasOwnProperty.call(p, 'auto_sync_interval_minutes') ? p.auto_sync_interval_minutes : existingMap.auto_sync_interval_minutes
       );
-      upsertRecordByKey(RG_SHEETS.SETTINGS, 'key', 'auto_sync_interval_hours', {
+      rowsToUpsert.push({
         key: 'auto_sync_interval_hours',
         value: String(nextInterval.hours),
         updatedBy: session.user.name,
-        updatedAt: nowIso()
+        updatedAt: nowStr
       });
-      upsertRecordByKey(RG_SHEETS.SETTINGS, 'key', 'auto_sync_interval_minutes', {
+      rowsToUpsert.push({
         key: 'auto_sync_interval_minutes',
         value: String(nextInterval.minutes),
         updatedBy: session.user.name,
-        updatedAt: nowIso()
+        updatedAt: nowStr
       });
+    }
+
+    if (rowsToUpsert.length > 0) {
+      batchUpsertRecords(RG_SHEETS.SETTINGS, 'key', rowsToUpsert);
     }
 
     var current = getSettings(session);

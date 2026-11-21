@@ -482,12 +482,37 @@ function runRentalGateSyncInternal(actor, options) {
 
   var startedAt = nowIso();
   var startMs = Date.now();
+  var parallelFetch;
+  try {
+    // 1. Fetch extensions & reservations in parallel batches OUTSIDE the script lock
+    parallelFetch = fetchBothEndpointsParallel_(RG_RESERVATIONS_API, RG_EXTENDS_API, token);
+  } catch (fetchErr) {
+    try {
+      withScriptLock(function () {
+        appendRecord(RG_SHEETS.SYNC_LOG, {
+          id: generateId('SYNC'),
+          triggeredById: actorId,
+          triggeredByName: actorName,
+          status: 'error',
+          importedCount: 0,
+          updatedCount: 0,
+          extensionsCount: 0,
+          pagesFetched: 0,
+          errorMessage: fetchErr.message,
+          durationMs: Date.now() - startMs,
+          startedAt: startedAt,
+          finishedAt: nowIso()
+        });
+      });
+    } catch (_logErr) {}
+    throw fetchErr;
+  }
 
-  return withScriptLock(function () {
+  var syncOut = withScriptLock(function () {
     var importedCount = 0;
     var updatedCount = 0;
     var extensionsCount = 0;
-    var pagesFetched = 0;
+    var pagesFetched = parallelFetch.pagesFetched || 0;
 
     try {
       var excludedSetting = findRecordById(RG_SHEETS.SETTINGS, 'key', 'excluded_statuses');
@@ -496,10 +521,6 @@ function runRentalGateSyncInternal(actor, options) {
       for (var e = 0; e < excludedStatuses.length; e++) {
         excludedSet[normalizeStr(excludedStatuses[e]).toLowerCase()] = true;
       }
-
-      // 1. Fetch extensions & reservations in parallel batches via UrlFetchApp.fetchAll()
-      var parallelFetch = fetchBothEndpointsParallel_(RG_RESERVATIONS_API, RG_EXTENDS_API, token);
-      pagesFetched += parallelFetch.pagesFetched;
 
       var existingExtensions = readAllRecords(RG_SHEETS.EXTENSIONS, true);
       var existingExtByNum = {};
@@ -836,6 +857,11 @@ function runRentalGateSyncInternal(actor, options) {
           lastUpdatedByName: nextLastUpdatedByName,
           lastUpdatedAt: nextLastUpdatedAt,
           hasProblem: existing ? existing.hasProblem : 'false',
+          pinnedNote: existing ? normalizeStr(existing.pinnedNote) : '',
+          pinnedNoteById: existing ? normalizeStr(existing.pinnedNoteById) : '',
+          pinnedNoteByName: existing ? normalizeStr(existing.pinnedNoteByName) : '',
+          pinnedNoteUpdatedAt: existing ? normalizeStr(existing.pinnedNoteUpdatedAt) : '',
+          noAnswerCount: existing ? Math.max(0, Math.floor(toNumber(existing.noAnswerCount, 0))) : 0,
           createdAt: existing ? existing.createdAt : nowStr,
           updatedAt: nowStr,
           statusHistory: JSON.stringify(nextStatusHistory),
@@ -877,14 +903,6 @@ function runRentalGateSyncInternal(actor, options) {
         finishedAt: nowIso()
       };
       appendRecord(RG_SHEETS.SYNC_LOG, syncRecord);
-      var neonSyncMeta = (typeof pushIncrementalSyncToNeonSafe_ === 'function')
-        ? pushIncrementalSyncToNeonSafe_(resRecordsToUpsert, extRecordsToUpsert, {
-            triggeredById: actorId,
-            triggeredByName: actorName,
-            pagesFetched: pagesFetched,
-            appliedRange: appliedRange
-          })
-        : { skipped: true };
       if (actorId !== 'SYSTEM' || (importedCount + updatedCount + extensionsCount) > 0) {
         var rangeDesc = appliedRange.hasCustomRange
           ? (' | النطاق: ' + (appliedRange.dateFrom || '-') + ' → ' + (appliedRange.dateTo || '-'))
@@ -894,24 +912,13 @@ function runRentalGateSyncInternal(actor, options) {
       }
 
       return {
-        id: syncRecord.id,
-        triggeredById: syncRecord.triggeredById,
-        triggeredByName: syncRecord.triggeredByName,
-        status: syncRecord.status,
-        importedCount: syncRecord.importedCount,
-        updatedCount: syncRecord.updatedCount,
-        extensionsCount: syncRecord.extensionsCount,
-        pagesFetched: syncRecord.pagesFetched,
-        fetchedCount: rawFetchedCount,
+        syncRecord: syncRecord,
+        rawFetchedCount: rawFetchedCount,
         excludedFilteredCount: excludedFilteredCount,
         rangeFilteredCount: rangeFilteredCount,
-        errorMessage: syncRecord.errorMessage,
-        durationMs: syncRecord.durationMs,
-        startedAt: syncRecord.startedAt,
-        finishedAt: syncRecord.finishedAt,
-        appliedRange: appliedRange,
         changedReservations: changedReservations,
-        neonSync: neonSyncMeta
+        resRecordsToUpsert: resRecordsToUpsert,
+        extRecordsToUpsert: extRecordsToUpsert
       };
     } catch (err) {
       var errRecord = {
@@ -932,6 +939,36 @@ function runRentalGateSyncInternal(actor, options) {
       throw err;
     }
   });
+
+  var neonSyncMeta = (typeof pushIncrementalSyncToNeonSafe_ === 'function')
+    ? pushIncrementalSyncToNeonSafe_(syncOut.resRecordsToUpsert, syncOut.extRecordsToUpsert, {
+        triggeredById: actorId,
+        triggeredByName: actorName,
+        pagesFetched: syncOut.syncRecord.pagesFetched,
+        appliedRange: appliedRange
+      })
+    : { skipped: true };
+
+  return {
+    id: syncOut.syncRecord.id,
+    triggeredById: syncOut.syncRecord.triggeredById,
+    triggeredByName: syncOut.syncRecord.triggeredByName,
+    status: syncOut.syncRecord.status,
+    importedCount: syncOut.syncRecord.importedCount,
+    updatedCount: syncOut.syncRecord.updatedCount,
+    extensionsCount: syncOut.syncRecord.extensionsCount,
+    pagesFetched: syncOut.syncRecord.pagesFetched,
+    fetchedCount: syncOut.rawFetchedCount,
+    excludedFilteredCount: syncOut.excludedFilteredCount,
+    rangeFilteredCount: syncOut.rangeFilteredCount,
+    errorMessage: syncOut.syncRecord.errorMessage,
+    durationMs: syncOut.syncRecord.durationMs,
+    startedAt: syncOut.syncRecord.startedAt,
+    finishedAt: syncOut.syncRecord.finishedAt,
+    appliedRange: appliedRange,
+    changedReservations: syncOut.changedReservations,
+    neonSync: neonSyncMeta
+  };
 }
 
 function getSyncStatus(session) {

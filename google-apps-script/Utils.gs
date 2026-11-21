@@ -20,7 +20,10 @@ var RG_SHEETS = {
   ROLES: 'Roles',
   PERMISSIONS: 'Permissions',
   SESSIONS: 'Sessions',
-  SYNC_LOG: 'SyncLog'
+  SYNC_LOG: 'SyncLog',
+  ANNOUNCEMENTS: 'Announcements',
+  DELEGATIONS: 'Delegations',
+  RESERVATION_LOCKS: 'ReservationLocks'
 };
 
 var RG_ROLES = {
