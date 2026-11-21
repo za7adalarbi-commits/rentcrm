@@ -6,6 +6,7 @@ import zlib from 'node:zlib';
 import crmHandler from './api/crm.js';
 import healthHandler from './api/health.js';
 import syncHandler from './api/sync.js';
+import { subscribeCrmEvents } from './backend/realtime.js';
 
 function gzipResponseMiddleware(req: Request, res: Response, next: NextFunction) {
   const acceptEnc = String(req.headers['accept-encoding'] || '');
@@ -46,6 +47,7 @@ async function startServer() {
 
   const runApiRoute = (handlerFn: (req: Request, res: Response) => Promise<void>) => {
     return (req: Request, res: Response) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       Promise.resolve(handlerFn(req, res)).catch((err: any) => {
         console.error('Express API route error:', err);
         if (!res.headersSent) {
@@ -63,6 +65,43 @@ async function startServer() {
   app.all('/api/health', runApiRoute(healthHandler));
   app.all('/api/crm', runApiRoute(crmHandler));
   app.all('/api/sync', runApiRoute(syncHandler));
+
+  app.get('/api/events', (req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
+    res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, at: new Date().toISOString() })}\n\n`);
+
+    const unsubscribe = subscribeCrmEvents((ev) => {
+      if (res.writableEnded) return;
+      res.write(`event: crm\ndata: ${JSON.stringify(ev)}\n\n`);
+    });
+
+    const keepAlive = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(`: ping ${Date.now()}\n\n`);
+      }
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      unsubscribe();
+    });
+  });
+
+  app.use('/api', (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.status(404).json({
+      success: false,
+      message: `نقطة النهاية ${req.originalUrl || req.path} غير موجودة.`,
+      data: null,
+      error: 'API_ROUTE_NOT_FOUND'
+    });
+  });
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
