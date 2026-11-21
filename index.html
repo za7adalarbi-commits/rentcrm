@@ -20,6 +20,26 @@
     <script>
       (function () {
         try {
+          var BUILD_VER = '20261120d';
+          if (localStorage.getItem('rg_crm_client_build') !== BUILD_VER) {
+            try { sessionStorage.removeItem('rg_crm_swr_v1'); } catch (_s) {}
+            ['rg_crm_gas_url', 'rg_crm_backend_url', 'rg_crm_backend_api_url'].forEach(function (k) {
+              try { localStorage.removeItem(k); } catch (_l) {}
+            });
+            try {
+              if (typeof indexedDB !== 'undefined' && typeof indexedDB.deleteDatabase === 'function') {
+                indexedDB.deleteDatabase('rg_crm_idb_v1');
+              }
+            } catch (_i) {}
+            try {
+              if (window.caches && typeof window.caches.keys === 'function') {
+                window.caches.keys().then(function (names) {
+                  names.forEach(function (n) { window.caches.delete(n).catch(function () {}); });
+                }).catch(function () {});
+              }
+            } catch (_c) {}
+            try { localStorage.setItem('rg_crm_client_build', BUILD_VER); } catch (_b) {}
+          }
           var raw = localStorage.getItem('rg_crm_user_prefs');
           var prefs = raw ? JSON.parse(raw) : null;
           var theme = prefs && (prefs.theme === 'dark' || prefs.theme === 'light') ? prefs.theme : '';
@@ -42,9 +62,9 @@
       })();
     </script>
     <link rel="stylesheet" href="./src/index.css" />
-    <link rel="stylesheet" href="./assets/css/style.css?v=20261120c" />
-    <link rel="stylesheet" href="./assets/css/dashboard.css?v=20261120c" />
-    <link rel="stylesheet" href="./assets/css/responsive.css?v=20261120c" />
+    <link rel="stylesheet" href="./assets/css/style.css?v=20261120d" />
+    <link rel="stylesheet" href="./assets/css/dashboard.css?v=20261120d" />
+    <link rel="stylesheet" href="./assets/css/responsive.css?v=20261120d" />
   </head>
   <body>
     <div id="app-root"></div>
@@ -53,24 +73,24 @@
 
     <script defer src="./assets/vendor/chart.umd.min.js"></script>
 
-    <script defer src="./assets/js/config.js?v=20261120c"></script>
-    <script defer src="./assets/js/core.js?v=20261120c"></script>
-    <script defer src="./assets/js/idb.js?v=20261120c"></script>
-    <script defer src="./assets/js/api.js?v=20261120c"></script>
-    <script defer src="./assets/js/auth.js?v=20261120c"></script>
-    <script defer src="./assets/js/mentions.js?v=20261120c"></script>
-    <script defer src="./assets/js/dashboard.js?v=20261120c"></script>
-    <script defer src="./assets/js/pdfControls.js?v=20261120c"></script>
-    <script defer src="./assets/js/reports.js?v=20261120c"></script>
-    <script defer src="./assets/js/reservations.js?v=20261120c"></script>
-    <script defer src="./assets/js/followups.js?v=20261120c"></script>
-    <script defer src="./assets/js/problems.js?v=20261120c"></script>
-    <script defer src="./assets/js/employees.js?v=20261120c"></script>
-    <script defer src="./assets/js/settings.js?v=20261120c"></script>
-    <script defer src="./assets/js/datepicker.js?v=20261120c"></script>
-    <script defer src="./assets/js/pdfPreview.js?v=20261120c"></script>
-    <script defer src="./assets/js/handover.js?v=20261120c"></script>
-    <script defer src="./assets/js/dropdowns.js?v=20261120c"></script>
-    <script defer src="./assets/js/app.js?v=20261120c"></script>
+    <script defer src="./assets/js/config.js?v=20261120d"></script>
+    <script defer src="./assets/js/core.js?v=20261120d"></script>
+    <script defer src="./assets/js/idb.js?v=20261120d"></script>
+    <script defer src="./assets/js/api.js?v=20261120d"></script>
+    <script defer src="./assets/js/auth.js?v=20261120d"></script>
+    <script defer src="./assets/js/mentions.js?v=20261120d"></script>
+    <script defer src="./assets/js/dashboard.js?v=20261120d"></script>
+    <script defer src="./assets/js/pdfControls.js?v=20261120d"></script>
+    <script defer src="./assets/js/reports.js?v=20261120d"></script>
+    <script defer src="./assets/js/reservations.js?v=20261120d"></script>
+    <script defer src="./assets/js/followups.js?v=20261120d"></script>
+    <script defer src="./assets/js/problems.js?v=20261120d"></script>
+    <script defer src="./assets/js/employees.js?v=20261120d"></script>
+    <script defer src="./assets/js/settings.js?v=20261120d"></script>
+    <script defer src="./assets/js/datepicker.js?v=20261120d"></script>
+    <script defer src="./assets/js/pdfPreview.js?v=20261120d"></script>
+    <script defer src="./assets/js/handover.js?v=20261120d"></script>
+    <script defer src="./assets/js/dropdowns.js?v=20261120d"></script>
+    <script defer src="./assets/js/app.js?v=20261120d"></script>
   </body>
 </html>

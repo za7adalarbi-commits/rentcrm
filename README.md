@@ -35,8 +35,7 @@ RENT-CRM/
 │   ├── vendor/
 │   │   ├── chart.umd.min.js
 │   │   ├── xlsx.full.min.js
-│   │   ├── jspdf.umd.min.js
-│   │   └── jspdf.plugin.autotable.min.js
+│   │   └── jspdf.umd.min.js
 │   └── images/
 │       └── logo.png
 ├── google-apps-script/

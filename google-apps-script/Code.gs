@@ -62,7 +62,7 @@ function handleApiRequest(e, method) {
         result = handleLogout(session);
         break;
       case 'getMe':
-        result = { user: session.user };
+        result = { user: session.user, layoutPrefs: getUserLayoutPrefs(session) };
         break;
       case 'getAppBootstrap':
         result = getAppBootstrap(session, payload);

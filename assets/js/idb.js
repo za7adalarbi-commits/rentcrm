@@ -1,13 +1,15 @@
 /**
- * RENTAL GATE CRM — IndexedDB Local Cache Engine (Reservations, Customers, Details & SWR KV)
+ * RENTAL GATE CRM — Hardened IndexedDB Local Cache Engine & Boot Sync Enforcer
  * Persists reservations, derived customer profiles, reservation details, and API SWR cache locally
- * with strict namespace isolation and graceful in-memory fallback.
+ * with strict namespace isolation, enforced server sync checks on every page load,
+ * full browser cache purging utilities, and graceful in-memory fallback.
  */
 (function (root) {
   'use strict';
 
-  var DB_NAME = 'rg_crm_idb_v1';
-  var DB_VERSION = 1;
+  var DB_NAME = 'rg_crm_idb_v2';
+  var DB_VERSION = 2;
+  var LEGACY_DB_NAMES = ['rg_crm_idb_v1'];
   var STORES = {
     KV: 'kv_cache',
     RESERVATIONS: 'reservations',
@@ -15,8 +17,21 @@
     DETAILS: 'reservation_details',
     META: 'meta'
   };
+  var DEFAULT_SYNC_INVALIDATE_SCOPES = [
+    'dashboard',
+    'reservations',
+    'reports',
+    'followups',
+    'problems',
+    'employees',
+    'notifications',
+    'activity'
+  ];
 
   var _dbPromise = null;
+  var _legacyPurged = false;
+  var _bootSyncStateByNs = {};
+  var _bootSyncPromiseByNs = {};
   var _memFallback = {
     kv_cache: {},
     reservations: {},
@@ -33,40 +48,58 @@
     }
   }
 
+  function purgeLegacyDatabasesOnce() {
+    if (_legacyPurged || !isSupported() || typeof indexedDB.deleteDatabase !== 'function') return;
+    _legacyPurged = true;
+    LEGACY_DB_NAMES.forEach(function (legacyName) {
+      try {
+        var delReq = indexedDB.deleteDatabase(legacyName);
+        if (delReq) {
+          delReq.onerror = function () {};
+          delReq.onblocked = function () {};
+        }
+      } catch (_e) {}
+    });
+  }
+
+  function createSchemaStores(db) {
+    if (!db.objectStoreNames.contains(STORES.KV)) {
+      var kvStore = db.createObjectStore(STORES.KV, { keyPath: 'key' });
+      kvStore.createIndex('ns', 'ns', { unique: false });
+      kvStore.createIndex('scope', 'scope', { unique: false });
+    }
+    if (!db.objectStoreNames.contains(STORES.RESERVATIONS)) {
+      var resStore = db.createObjectStore(STORES.RESERVATIONS, { keyPath: 'nsId' });
+      resStore.createIndex('ns', 'ns', { unique: false });
+      resStore.createIndex('id', 'id', { unique: false });
+      resStore.createIndex('reservationNumber', 'reservationNumber', { unique: false });
+      resStore.createIndex('customerPhone', 'customerPhone', { unique: false });
+    }
+    if (!db.objectStoreNames.contains(STORES.CUSTOMERS)) {
+      var custStore = db.createObjectStore(STORES.CUSTOMERS, { keyPath: 'nsId' });
+      custStore.createIndex('ns', 'ns', { unique: false });
+      custStore.createIndex('id', 'id', { unique: false });
+      custStore.createIndex('customerPhone', 'customerPhone', { unique: false });
+    }
+    if (!db.objectStoreNames.contains(STORES.DETAILS)) {
+      var detStore = db.createObjectStore(STORES.DETAILS, { keyPath: 'nsId' });
+      detStore.createIndex('ns', 'ns', { unique: false });
+      detStore.createIndex('id', 'id', { unique: false });
+    }
+    if (!db.objectStoreNames.contains(STORES.META)) {
+      db.createObjectStore(STORES.META, { keyPath: 'ns' });
+    }
+  }
+
   function open() {
     if (!isSupported()) return Promise.resolve(null);
+    purgeLegacyDatabasesOnce();
     if (_dbPromise) return _dbPromise;
     _dbPromise = new Promise(function (resolve) {
       try {
         var req = indexedDB.open(DB_NAME, DB_VERSION);
         req.onupgradeneeded = function (ev) {
-          var db = ev.target.result;
-          if (!db.objectStoreNames.contains(STORES.KV)) {
-            var kvStore = db.createObjectStore(STORES.KV, { keyPath: 'key' });
-            kvStore.createIndex('ns', 'ns', { unique: false });
-            kvStore.createIndex('scope', 'scope', { unique: false });
-          }
-          if (!db.objectStoreNames.contains(STORES.RESERVATIONS)) {
-            var resStore = db.createObjectStore(STORES.RESERVATIONS, { keyPath: 'nsId' });
-            resStore.createIndex('ns', 'ns', { unique: false });
-            resStore.createIndex('id', 'id', { unique: false });
-            resStore.createIndex('reservationNumber', 'reservationNumber', { unique: false });
-            resStore.createIndex('customerPhone', 'customerPhone', { unique: false });
-          }
-          if (!db.objectStoreNames.contains(STORES.CUSTOMERS)) {
-            var custStore = db.createObjectStore(STORES.CUSTOMERS, { keyPath: 'nsId' });
-            custStore.createIndex('ns', 'ns', { unique: false });
-            custStore.createIndex('id', 'id', { unique: false });
-            custStore.createIndex('customerPhone', 'customerPhone', { unique: false });
-          }
-          if (!db.objectStoreNames.contains(STORES.DETAILS)) {
-            var detStore = db.createObjectStore(STORES.DETAILS, { keyPath: 'nsId' });
-            detStore.createIndex('ns', 'ns', { unique: false });
-            detStore.createIndex('id', 'id', { unique: false });
-          }
-          if (!db.objectStoreNames.contains(STORES.META)) {
-            db.createObjectStore(STORES.META, { keyPath: 'ns' });
-          }
+          createSchemaStores(ev.target.result);
         };
         req.onsuccess = function (ev) {
           var db = ev.target.result;
@@ -74,11 +107,21 @@
             try { db.close(); } catch (e) {}
             _dbPromise = null;
           };
+          db.onclose = function () {
+            _dbPromise = null;
+          };
           resolve(db);
         };
-        req.onerror = function () { resolve(null); };
-        req.onblocked = function () { resolve(null); };
+        req.onerror = function () {
+          _dbPromise = null;
+          resolve(null);
+        };
+        req.onblocked = function () {
+          _dbPromise = null;
+          resolve(null);
+        };
       } catch (e) {
+        _dbPromise = null;
         resolve(null);
       }
     });
@@ -98,6 +141,24 @@
         req.onerror = function () { resolve([]); };
       } catch (e) {
         resolve([]);
+      }
+    });
+  }
+
+  async function loadMeta(ns) {
+    var cleanNs = String(ns || 'default');
+    var db = await open();
+    if (!db) {
+      return _memFallback.meta[cleanNs] ? Object.assign({}, _memFallback.meta[cleanNs]) : null;
+    }
+    return new Promise(function (resolve) {
+      try {
+        var tx = db.transaction([STORES.META], 'readonly');
+        var req = tx.objectStore(STORES.META).get(cleanNs);
+        req.onsuccess = function () { resolve(req.result || _memFallback.meta[cleanNs] || null); };
+        req.onerror = function () { resolve(_memFallback.meta[cleanNs] || null); };
+      } catch (e) {
+        resolve(_memFallback.meta[cleanNs] || null);
       }
     });
   }
@@ -132,6 +193,7 @@
           }
         });
         Promise.all([kvP, resP, custP, detP, metaP]).then(function (arr) {
+          if (arr[4]) _memFallback.meta[cleanNs] = arr[4];
           resolve({
             kvEntries: arr[0],
             reservations: arr[1],
@@ -162,6 +224,7 @@
         tx.onabort = function () { resolve(false); };
         writerFn(tx);
       } catch (e) {
+        _dbPromise = null;
         resolve(false);
       }
     });
@@ -319,7 +382,8 @@
 
   async function upsertMeta(ns, patch) {
     var cleanNs = String(ns || 'default');
-    var rec = Object.assign({ ns: cleanNs }, _memFallback.meta[cleanNs] || {}, patch || {}, {
+    var existing = await loadMeta(cleanNs);
+    var rec = Object.assign({ ns: cleanNs }, existing || {}, _memFallback.meta[cleanNs] || {}, patch || {}, {
       ns: cleanNs,
       updatedAt: Date.now()
     });
@@ -332,6 +396,8 @@
 
   async function clearNamespace(ns) {
     var cleanNs = String(ns || 'default');
+    delete _bootSyncStateByNs[cleanNs];
+    delete _bootSyncPromiseByNs[cleanNs];
     [STORES.KV, STORES.RESERVATIONS, STORES.CUSTOMERS, STORES.DETAILS, STORES.META].forEach(function (sName) {
       Object.keys(_memFallback[sName]).forEach(function (k) {
         if (_memFallback[sName][k] && _memFallback[sName][k].ns === cleanNs) {
@@ -356,11 +422,292 @@
     });
   }
 
+  function normalizeSyncSignature(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var epoch = String(raw.syncEpoch || raw.epoch || '').trim();
+    var lastSyncAt = String(raw.lastSyncAt || raw.finishedAt || '').trim();
+    var lastResUpdatedAt = String(raw.lastResUpdatedAt || raw.maxUpdatedAt || '').trim();
+    var reservationsCount = raw.reservationsCount !== undefined && raw.reservationsCount !== null
+      ? Number(raw.reservationsCount)
+      : (raw.totalReservations !== undefined && raw.totalReservations !== null ? Number(raw.totalReservations) : null);
+    if (!epoch && (reservationsCount !== null || lastSyncAt || lastResUpdatedAt)) {
+      epoch = String(reservationsCount !== null ? reservationsCount : '') + '|' + lastSyncAt + '|' + lastResUpdatedAt;
+    }
+    return {
+      syncEpoch: epoch,
+      lastSyncAt: lastSyncAt,
+      lastResUpdatedAt: lastResUpdatedAt,
+      reservationsCount: (reservationsCount !== null && isFinite(reservationsCount)) ? reservationsCount : null
+    };
+  }
+
+  async function recordServerSyncState(ns, syncState) {
+    var cleanNs = String(ns || 'default');
+    var sig = normalizeSyncSignature(syncState);
+    if (!sig) return null;
+    var patch = {
+      lastServerEpoch: sig.syncEpoch,
+      lastServerSyncAt: sig.lastSyncAt,
+      lastServerResUpdatedAt: sig.lastResUpdatedAt,
+      serverReservationsCount: sig.reservationsCount,
+      lastSyncCheckedAt: Date.now()
+    };
+    await upsertMeta(cleanNs, patch);
+    _bootSyncStateByNs[cleanNs] = Object.assign({}, _bootSyncStateByNs[cleanNs] || {}, {
+      verified: true,
+      status: 'synchronized',
+      syncEpoch: sig.syncEpoch,
+      lastSyncAt: sig.lastSyncAt,
+      reservationsCount: sig.reservationsCount,
+      checkedAt: Date.now()
+    });
+    return _bootSyncStateByNs[cleanNs];
+  }
+
+  /**
+   * Enforces a server sync check once per page load (or on demand when opts.force is true).
+   * Compares server syncEpoch / lastSyncAt / reservationsCount against IndexedDB META and
+   * automatically invalidates stale dashboard & list caches when remote state changed or on cold boot mismatch.
+   */
+  async function enforceBootSyncCheck(ns, syncProbeFn, opts) {
+    var cleanNs = String(ns || 'default');
+    var o = opts || {};
+    var force = Boolean(o.force);
+
+    if (!force && _bootSyncStateByNs[cleanNs] && _bootSyncStateByNs[cleanNs].verified) {
+      return _bootSyncStateByNs[cleanNs];
+    }
+    if (!force && _bootSyncPromiseByNs[cleanNs]) {
+      return _bootSyncPromiseByNs[cleanNs];
+    }
+
+    var runPromise = (async function () {
+      var localMeta = await loadMeta(cleanNs);
+      var prevEpoch = localMeta ? String(localMeta.lastServerEpoch || '') : '';
+      var prevSyncAt = localMeta ? String(localMeta.lastServerSyncAt || localMeta.lastSyncAt || '') : '';
+      var prevResCnt = (localMeta && localMeta.serverReservationsCount !== undefined && localMeta.serverReservationsCount !== null)
+        ? Number(localMeta.serverReservationsCount)
+        : null;
+
+      var probeRaw = null;
+      var offlineFallback = false;
+      try {
+        probeRaw = typeof syncProbeFn === 'function' ? await syncProbeFn() : syncProbeFn;
+      } catch (_err) {
+        offlineFallback = true;
+      }
+
+      if (!probeRaw || probeRaw.offline === true) {
+        offlineFallback = true;
+      }
+
+      if (offlineFallback) {
+        var offlineState = {
+          verified: false,
+          offlineFallback: true,
+          invalidated: false,
+          status: 'offline_fallback',
+          syncEpoch: prevEpoch,
+          lastSyncAt: prevSyncAt,
+          reservationsCount: prevResCnt,
+          checkedAt: Date.now()
+        };
+        _bootSyncStateByNs[cleanNs] = offlineState;
+        return offlineState;
+      }
+
+      var remoteSig = normalizeSyncSignature(probeRaw);
+      var hasRemoteEpoch = Boolean(remoteSig && (remoteSig.syncEpoch || remoteSig.lastSyncAt || remoteSig.reservationsCount !== null));
+      var epochChanged = hasRemoteEpoch && Boolean(
+        (remoteSig.syncEpoch && remoteSig.syncEpoch !== prevEpoch) ||
+        (remoteSig.lastSyncAt && remoteSig.lastSyncAt !== prevSyncAt) ||
+        (remoteSig.reservationsCount !== null && prevResCnt !== null && remoteSig.reservationsCount !== prevResCnt) ||
+        (!prevEpoch && remoteSig.syncEpoch)
+      );
+
+      var scopes = Array.isArray(o.scopesToInvalidate) && o.scopesToInvalidate.length
+        ? o.scopesToInvalidate
+        : DEFAULT_SYNC_INVALIDATE_SCOPES;
+      var invalidated = false;
+
+      if (epochChanged || o.alwaysInvalidateDashboardOnBoot === true) {
+        var targetScopes = epochChanged ? scopes : ['dashboard'];
+        await deleteKvByScopes(cleanNs, targetScopes);
+        invalidated = true;
+      }
+
+      var nextMetaPatch = {
+        lastSyncCheckedAt: Date.now()
+      };
+      if (epochChanged) {
+        nextMetaPatch.allReservationsHydrated = false;
+      }
+      if (remoteSig) {
+        if (remoteSig.syncEpoch) nextMetaPatch.lastServerEpoch = remoteSig.syncEpoch;
+        if (remoteSig.lastSyncAt) nextMetaPatch.lastServerSyncAt = remoteSig.lastSyncAt;
+        if (remoteSig.lastResUpdatedAt) nextMetaPatch.lastServerResUpdatedAt = remoteSig.lastResUpdatedAt;
+        if (remoteSig.reservationsCount !== null) nextMetaPatch.serverReservationsCount = remoteSig.reservationsCount;
+      }
+      await upsertMeta(cleanNs, nextMetaPatch);
+
+      var result = {
+        verified: true,
+        offlineFallback: false,
+        invalidated: invalidated,
+        epochChanged: epochChanged,
+        status: epochChanged ? 'stale_purged' : 'synchronized',
+        syncEpoch: (remoteSig && remoteSig.syncEpoch) || prevEpoch,
+        lastSyncAt: (remoteSig && remoteSig.lastSyncAt) || prevSyncAt,
+        reservationsCount: (remoteSig && remoteSig.reservationsCount !== null) ? remoteSig.reservationsCount : prevResCnt,
+        checkedAt: Date.now()
+      };
+      _bootSyncStateByNs[cleanNs] = result;
+      return result;
+    })().finally(function () {
+      delete _bootSyncPromiseByNs[cleanNs];
+    });
+
+    _bootSyncPromiseByNs[cleanNs] = runPromise;
+    return runPromise;
+  }
+
+  function getSyncState(ns) {
+    var cleanNs = String(ns || 'default');
+    return _bootSyncStateByNs[cleanNs]
+      ? Object.assign({}, _bootSyncStateByNs[cleanNs])
+      : { verified: false, offlineFallback: false, invalidated: false, status: 'pending', syncEpoch: '', lastSyncAt: '', reservationsCount: null, checkedAt: 0 };
+  }
+
+  function resetBootSyncState(ns) {
+    if (ns) {
+      var cleanNs = String(ns);
+      delete _bootSyncStateByNs[cleanNs];
+      delete _bootSyncPromiseByNs[cleanNs];
+      return;
+    }
+    _bootSyncStateByNs = {};
+    _bootSyncPromiseByNs = {};
+  }
+
+  /**
+   * Purges all IndexedDB stores, legacy databases, CacheStorage buckets,
+   * Service Worker registrations, and stale session/local cache keys.
+   */
+  async function wipeAllCaches(options) {
+    var opts = options || {};
+    resetBootSyncState();
+    _memFallback = {
+      kv_cache: {},
+      reservations: {},
+      customers: {},
+      reservation_details: {},
+      meta: {}
+    };
+
+    var cleared = {
+      indexedDb: false,
+      cacheStorage: 0,
+      serviceWorkers: 0,
+      sessionStorage: false,
+      localStorageKeys: []
+    };
+
+    var db = await open();
+    if (db) {
+      await runWriteBatch([STORES.KV, STORES.RESERVATIONS, STORES.CUSTOMERS, STORES.DETAILS, STORES.META], function (tx) {
+        if (!tx) return;
+        [STORES.KV, STORES.RESERVATIONS, STORES.CUSTOMERS, STORES.DETAILS, STORES.META].forEach(function (sName) {
+          try { tx.objectStore(sName).clear(); } catch (_e) {}
+        });
+      });
+      cleared.indexedDb = true;
+    }
+
+    if (opts.deleteDatabase && isSupported() && typeof indexedDB.deleteDatabase === 'function') {
+      try {
+        if (db) {
+          try { db.close(); } catch (_e2) {}
+          _dbPromise = null;
+        }
+        indexedDB.deleteDatabase(DB_NAME);
+      } catch (_e3) {}
+    }
+
+    if (isSupported() && typeof indexedDB.deleteDatabase === 'function') {
+      LEGACY_DB_NAMES.forEach(function (legacyName) {
+        try { indexedDB.deleteDatabase(legacyName); } catch (_e4) {}
+      });
+    }
+
+    try {
+      if (typeof root !== 'undefined' && root.caches && typeof root.caches.keys === 'function') {
+        var cacheNames = await root.caches.keys();
+        await Promise.all(cacheNames.map(function (cName) {
+          return root.caches.delete(cName).then(function (ok) {
+            if (ok) cleared.cacheStorage += 1;
+          }).catch(function () {});
+        }));
+      }
+    } catch (_cErr) {}
+
+    try {
+      if (typeof navigator !== 'undefined' && navigator.serviceWorker && typeof navigator.serviceWorker.getRegistrations === 'function') {
+        var regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(function (reg) {
+          return reg.unregister().then(function (ok) {
+            if (ok) cleared.serviceWorkers += 1;
+          }).catch(function () {});
+        }));
+      }
+    } catch (_swErr) {}
+
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        var sessKeys = [];
+        for (var i = 0; i < sessionStorage.length; i++) {
+          var sk = sessionStorage.key(i);
+          if (sk && sk.indexOf('rg_crm_') === 0) sessKeys.push(sk);
+        }
+        sessKeys.forEach(function (k) { sessionStorage.removeItem(k); });
+        cleared.sessionStorage = true;
+      }
+    } catch (_ssErr) {}
+
+    try {
+      if (typeof localStorage !== 'undefined') {
+        var preserveAuth = opts.preserveAuth !== false && opts.includeAuth !== true;
+        var staleLocalKeys = [
+          'rg_crm_gas_url',
+          'rg_crm_backend_url',
+          'rg_crm_backend_api_url',
+          'rg_crm_swr_v1',
+          'rg_crm_ui_simp_v1'
+        ];
+        if (!preserveAuth) {
+          staleLocalKeys.push('rg_crm_session_token');
+        }
+        if (opts.includeSandboxDb) {
+          staleLocalKeys.push('rg_crm_sandbox_db_v1');
+        }
+        staleLocalKeys.forEach(function (lk) {
+          if (localStorage.getItem(lk) !== null) {
+            localStorage.removeItem(lk);
+            cleared.localStorageKeys.push(lk);
+          }
+        });
+      }
+    } catch (_lsErr) {}
+
+    return cleared;
+  }
+
   root.RGIdbCache = {
     DB_NAME: DB_NAME,
+    DB_VERSION: DB_VERSION,
     STORES: STORES,
     isSupported: isSupported,
     open: open,
+    loadMeta: loadMeta,
     loadNamespaceSnapshot: loadNamespaceSnapshot,
     putKvEntries: putKvEntries,
     deleteKvByKeys: deleteKvByKeys,
@@ -370,6 +717,11 @@
     upsertCustomers: upsertCustomers,
     upsertReservationDetail: upsertReservationDetail,
     upsertMeta: upsertMeta,
-    clearNamespace: clearNamespace
+    clearNamespace: clearNamespace,
+    recordServerSyncState: recordServerSyncState,
+    enforceBootSyncCheck: enforceBootSyncCheck,
+    getSyncState: getSyncState,
+    resetBootSyncState: resetBootSyncState,
+    wipeAllCaches: wipeAllCaches
   };
 })(window);

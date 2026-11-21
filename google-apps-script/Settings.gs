@@ -195,6 +195,11 @@ function normalizeUserLayoutPrefs_(raw) {
   var timeFormat = normalizeStr(obj.timeFormat).toLowerCase() === '12h' ? '12h' : '24h';
   var rawPos = normalizeStr(obj.sidebarPosition).toLowerCase();
   var sidebarPosition = (rawPos === 'top' || rawPos === 'bottom') ? rawPos : 'side';
+  var rawTheme = normalizeStr(obj.theme).toLowerCase();
+  var theme = (rawTheme === 'dark' || rawTheme === 'light') ? rawTheme : '';
+  var rawLang = normalizeStr(obj.lang).toLowerCase();
+  var lang = (rawLang === 'ar' || rawLang === 'en') ? rawLang : '';
+  var sidebarCollapsed = obj.sidebarCollapsed === true || normalizeStr(obj.sidebarCollapsed).toLowerCase() === 'true';
 
   return {
     navOrder: navOrder,
@@ -202,8 +207,19 @@ function normalizeUserLayoutPrefs_(raw) {
     dashOrder: dashOrder,
     dashHidden: dashHidden,
     timeFormat: timeFormat,
-    sidebarPosition: sidebarPosition
+    sidebarPosition: sidebarPosition,
+    theme: theme,
+    lang: lang,
+    sidebarCollapsed: Boolean(sidebarCollapsed)
   };
+}
+
+function getUserLayoutPrefs(session) {
+  if (!session || !session.employeeId) {
+    return normalizeUserLayoutPrefs_({});
+  }
+  var map = getSettingsMap_(false);
+  return normalizeUserLayoutPrefs_(map['layout_prefs_u_' + session.employeeId]);
 }
 
 function saveUserLayoutPrefs(session, payload) {

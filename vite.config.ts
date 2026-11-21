@@ -97,16 +97,6 @@ export default defineConfig(({command}) => {
           if (fs.existsSync(distDir) && fs.existsSync(rootAssets)) {
             fs.cpSync(rootAssets, distRootAssets, {recursive: true, force: true});
           }
-          // Prune unused static assets copied into dist/ to optimize production bundle footprint
-          const unusedPaths = [
-            path.resolve(distDir, 'assets/aistudio'),
-            path.resolve(distDir, 'assets/vendor/jspdf.plugin.autotable.min.js'),
-          ];
-          for (const target of unusedPaths) {
-            if (fs.existsSync(target)) {
-              fs.rmSync(target, {recursive: true, force: true});
-            }
-          }
           if (fs.existsSync(distDir)) {
             fs.writeFileSync(path.resolve(distDir, '.nojekyll'), '', 'utf8');
             fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');

@@ -6,6 +6,7 @@
 
   var currentUser = null;
   var pendingBootstrap = null;
+  var restoredLayoutPrefs = null;
 
   function getUser() {
     return currentUser;
@@ -18,7 +19,12 @@
   function primeBootstrapCaches(bs, range) {
     if (!bs || !root.RGApi || !root.RGApi.primeCache) return;
     var r = range || '30d';
-    if (bs.user) root.RGApi.primeCache('getMe', {}, { user: bs.user });
+    if (bs.user) {
+      root.RGApi.primeCache('getMe', {}, {
+        user: bs.user,
+        layoutPrefs: bs.layoutPrefs || null
+      });
+    }
     if (bs.dashboard) root.RGApi.primeCache('getDashboard', { range: r }, bs.dashboard);
     if (bs.employees) root.RGApi.primeCache('getEmployees', {}, bs.employees);
     if (bs.notifications) root.RGApi.primeCache('getNotifications', {}, bs.notifications);
@@ -34,6 +40,12 @@
     return out;
   }
 
+  function consumeRestoredLayoutPrefs() {
+    var out = restoredLayoutPrefs;
+    restoredLayoutPrefs = null;
+    return out;
+  }
+
   async function restoreSession() {
     var token = root.RGApi.getToken();
     if (!token) return null;
@@ -41,11 +53,13 @@
       var res = await root.RGApi.callApi('getMe', {});
       if (res && res.success && res.data && res.data.user) {
         currentUser = res.data.user;
+        restoredLayoutPrefs = res.data.layoutPrefs || null;
         return currentUser;
       }
     } catch (e) {}
     root.RGApi.setToken('');
     currentUser = null;
+    restoredLayoutPrefs = null;
     return null;
   }
 
@@ -73,6 +87,7 @@
       if (res && res.success && res.data && res.data.token && res.data.user) {
         root.RGApi.setToken(res.data.token);
         currentUser = res.data.user;
+        restoredLayoutPrefs = (res.data.bootstrap && res.data.bootstrap.layoutPrefs) || null;
         if (res.data.bootstrap) {
           pendingBootstrap = { range: range, data: res.data.bootstrap };
           primeBootstrapCaches(res.data.bootstrap, range);
@@ -93,6 +108,7 @@
 
   async function logout() {
     pendingBootstrap = null;
+    restoredLayoutPrefs = null;
     try {
       if (root.RGApi.getToken()) {
         await root.RGApi.callApi('logout', {});
@@ -109,6 +125,7 @@
     login: login,
     logout: logout,
     consumeBootstrap: consumeBootstrap,
+    consumeRestoredLayoutPrefs: consumeRestoredLayoutPrefs,
     primeBootstrapCaches: primeBootstrapCaches
   };
 })(window);

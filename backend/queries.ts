@@ -2883,6 +2883,14 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   return getSettings(executor, session);
 }
 
+export async function getUserLayoutPrefs(
+  executor: DbExecutor,
+  session: AuthSession
+) {
+  const settings = await getSettingsMap(executor);
+  return crmCore.normalizeUserLayoutPrefs(parseJsonValue(settings[`layout_prefs_u_${session.user.id}`], {}));
+}
+
 export async function saveUserLayoutPrefs(
   executor: DbExecutor,
   session: AuthSession,

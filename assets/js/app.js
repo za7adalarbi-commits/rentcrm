@@ -81,6 +81,30 @@
     return 'dashboard';
   }
 
+  function getDefaultSystemTheme() {
+    try {
+      return (root.matchMedia && root.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    } catch (_e2) {
+      return 'light';
+    }
+  }
+
+  function getUserPrefsStorageKey(user) {
+    var uid = user && user.id ? String(user.id).trim() : '';
+    return uid ? ('rg_crm_user_prefs_u_' + uid) : PREFS_KEY;
+  }
+
+  function loadPerUserPrefs(user) {
+    var uid = user && user.id ? String(user.id).trim() : '';
+    if (!uid) return {};
+    try {
+      var raw = localStorage.getItem('rg_crm_user_prefs_u_' + uid);
+      return raw ? (JSON.parse(raw) || {}) : {};
+    } catch (_e) {
+      return {};
+    }
+  }
+
   function loadInitialPrefs() {
     var saved = {};
     try {
@@ -88,14 +112,7 @@
     } catch (_e) {
       saved = {};
     }
-    var resolvedTheme = (saved.theme === 'dark' || saved.theme === 'light') ? saved.theme : '';
-    if (!resolvedTheme) {
-      try {
-        resolvedTheme = (root.matchMedia && root.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
-      } catch (_e2) {
-        resolvedTheme = 'light';
-      }
-    }
+    var resolvedTheme = (saved.theme === 'dark' || saved.theme === 'light') ? saved.theme : getDefaultSystemTheme();
     var normTimeFmt = (root.RGCrmCore && root.RGCrmCore.normalizeTimeFormat)
       ? root.RGCrmCore.normalizeTimeFormat(saved.timeFormat)
       : (saved.timeFormat === '12h' ? '12h' : '24h');
@@ -149,20 +166,28 @@
       return root.RGCrmCore.normalizeUserLayoutPrefs(raw);
     }
     var obj = (raw && typeof raw === 'object') ? raw : {};
+    var rt = String(obj.theme || '').trim().toLowerCase();
+    var rl = String(obj.lang || '').trim().toLowerCase();
     return {
       navOrder: Array.isArray(obj.navOrder) ? obj.navOrder.slice() : [],
       hiddenRoutes: Array.isArray(obj.hiddenRoutes) ? obj.hiddenRoutes.slice() : [],
       dashOrder: Array.isArray(obj.dashOrder) ? obj.dashOrder.slice() : [],
       dashHidden: Array.isArray(obj.dashHidden) ? obj.dashHidden.slice() : [],
       timeFormat: obj.timeFormat === '12h' ? '12h' : '24h',
-      sidebarPosition: (obj.sidebarPosition === 'top' || obj.sidebarPosition === 'bottom') ? obj.sidebarPosition : 'side'
+      sidebarPosition: (obj.sidebarPosition === 'top' || obj.sidebarPosition === 'bottom') ? obj.sidebarPosition : 'side',
+      theme: (rt === 'dark' || rt === 'light') ? rt : '',
+      lang: (rl === 'ar' || rl === 'en') ? rl : '',
+      sidebarCollapsed: Boolean(obj.sidebarCollapsed === true || obj.sidebarCollapsed === 'true')
     };
   }
 
   function loadLayoutPrefs(user) {
     try {
       var key = getLayoutStorageKey(user);
-      var raw = localStorage.getItem(key) || (user ? localStorage.getItem(LAYOUT_PREFS_STORAGE_KEY) : '');
+      var raw = localStorage.getItem(key);
+      if (!raw && (!user || !user.id)) {
+        raw = localStorage.getItem(LAYOUT_PREFS_STORAGE_KEY);
+      }
       return normalizeLayoutPrefsFallback(raw ? JSON.parse(raw) : {});
     } catch (_e) {
       return normalizeLayoutPrefsFallback({});
@@ -494,19 +519,51 @@
 
   function hydrateLayoutPrefsFromServer(raw, user) {
     var u = user || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
-    var norm = normalizeLayoutPrefsFallback(raw || loadLayoutPrefs(u));
-    if (raw && typeof raw === 'object') {
-      if (raw.timeFormat === '12h' || raw.timeFormat === '24h') {
-        state.prefs.timeFormat = raw.timeFormat;
-      }
-      if (raw.sidebarPosition === 'side' || raw.sidebarPosition === 'top' || raw.sidebarPosition === 'bottom') {
-        state.prefs.sidebarPosition = raw.sidebarPosition;
-      }
-      savePrefs();
+    var localUserLayout = loadLayoutPrefs(u);
+    var localUserPrefs = loadPerUserPrefs(u);
+    var norm = normalizeLayoutPrefsFallback(raw || localUserLayout);
+
+    if (u && u.id) {
+      var nextTime = (raw && (raw.timeFormat === '12h' || raw.timeFormat === '24h'))
+        ? raw.timeFormat
+        : ((localUserPrefs.timeFormat === '12h' || localUserPrefs.timeFormat === '24h') ? localUserPrefs.timeFormat : norm.timeFormat);
+      var nextPos = (raw && (raw.sidebarPosition === 'side' || raw.sidebarPosition === 'top' || raw.sidebarPosition === 'bottom'))
+        ? raw.sidebarPosition
+        : ((localUserPrefs.sidebarPosition === 'side' || localUserPrefs.sidebarPosition === 'top' || localUserPrefs.sidebarPosition === 'bottom') ? localUserPrefs.sidebarPosition : norm.sidebarPosition);
+      var nextTheme = (raw && (raw.theme === 'dark' || raw.theme === 'light'))
+        ? raw.theme
+        : ((localUserPrefs.theme === 'dark' || localUserPrefs.theme === 'light') ? localUserPrefs.theme : getDefaultSystemTheme());
+      var nextLang = (raw && (raw.lang === 'ar' || raw.lang === 'en'))
+        ? raw.lang
+        : ((localUserPrefs.lang === 'ar' || localUserPrefs.lang === 'en') ? localUserPrefs.lang : 'ar');
+      var nextCollapsed = (raw && typeof raw === 'object' && raw.sidebarCollapsed !== undefined)
+        ? Boolean(raw.sidebarCollapsed)
+        : Boolean(localUserPrefs.sidebarCollapsed || localUserLayout.sidebarCollapsed);
+
+      state.prefs.timeFormat = nextTime;
+      state.prefs.sidebarPosition = nextPos;
+      state.prefs.theme = nextTheme;
+      state.prefs.lang = nextLang;
+      state.prefs.sidebarCollapsed = nextCollapsed;
+      savePrefs(u);
       applyThemeAndLang();
+      syncThemeButtonsUI();
+    } else if (raw && typeof raw === 'object') {
+      if (raw.timeFormat === '12h' || raw.timeFormat === '24h') state.prefs.timeFormat = raw.timeFormat;
+      if (raw.sidebarPosition === 'side' || raw.sidebarPosition === 'top' || raw.sidebarPosition === 'bottom') state.prefs.sidebarPosition = raw.sidebarPosition;
+      if (raw.theme === 'dark' || raw.theme === 'light') state.prefs.theme = raw.theme;
+      if (raw.lang === 'ar' || raw.lang === 'en') state.prefs.lang = raw.lang;
+      if (raw.sidebarCollapsed !== undefined) state.prefs.sidebarCollapsed = Boolean(raw.sidebarCollapsed);
+      savePrefs(null);
+      applyThemeAndLang();
+      syncThemeButtonsUI();
     }
+
     norm.timeFormat = getTimeFormat();
     norm.sidebarPosition = getSidebarPosition();
+    norm.theme = state.prefs.theme === 'dark' ? 'dark' : 'light';
+    norm.lang = state.prefs.lang === 'en' ? 'en' : 'ar';
+    norm.sidebarCollapsed = Boolean(state.prefs.sidebarCollapsed);
     state.layoutPrefs = norm;
     try {
       localStorage.setItem(getLayoutStorageKey(u), JSON.stringify(norm));
@@ -521,11 +578,16 @@
     var merged = Object.assign({}, cur, patch || {});
     if (merged.timeFormat === undefined) merged.timeFormat = getTimeFormat();
     if (merged.sidebarPosition === undefined) merged.sidebarPosition = getSidebarPosition();
+    if (merged.theme === undefined) merged.theme = state.prefs.theme === 'dark' ? 'dark' : 'light';
+    if (merged.lang === undefined) merged.lang = state.prefs.lang === 'en' ? 'en' : 'ar';
+    if (merged.sidebarCollapsed === undefined) merged.sidebarCollapsed = Boolean(state.prefs.sidebarCollapsed);
     var next = normalizeLayoutPrefsFallback(merged);
     state.layoutPrefs = next;
     try {
       localStorage.setItem(getLayoutStorageKey(u), JSON.stringify(next));
-      localStorage.setItem(LAYOUT_PREFS_STORAGE_KEY, JSON.stringify(next));
+      if (!u || !u.id) {
+        localStorage.setItem(LAYOUT_PREFS_STORAGE_KEY, JSON.stringify(next));
+      }
     } catch (_e) {}
 
     if (o.reRenderNav !== false && u) {
@@ -544,6 +606,8 @@
     var o = opts || {};
     var prevTime = getTimeFormat();
     var prevPos = getSidebarPosition();
+    var prevLang = state.prefs.lang;
+    var prevTheme = state.prefs.theme;
 
     if (p.timeFormat !== undefined) {
       state.prefs.timeFormat = (root.RGCrmCore && root.RGCrmCore.normalizeTimeFormat)
@@ -555,12 +619,37 @@
         ? root.RGCrmCore.normalizeSidebarPosition(p.sidebarPosition)
         : ((p.sidebarPosition === 'top' || p.sidebarPosition === 'bottom') ? p.sidebarPosition : 'side');
     }
+    if (p.theme === 'dark' || p.theme === 'light') {
+      state.prefs.theme = p.theme;
+    }
+    if (p.lang === 'ar' || p.lang === 'en') {
+      state.prefs.lang = p.lang;
+    }
+    if (p.sidebarCollapsed !== undefined) {
+      state.prefs.sidebarCollapsed = Boolean(p.sidebarCollapsed);
+    }
 
     var nextTime = getTimeFormat();
     var nextPos = getSidebarPosition();
+    var nextTheme = state.prefs.theme === 'dark' ? 'dark' : 'light';
+    var nextLang = state.prefs.lang === 'en' ? 'en' : 'ar';
 
     savePrefs();
     applyThemeAndLang();
+    syncThemeButtonsUI();
+
+    if (prevTheme !== nextTheme) {
+      var ctxTheme = buildAppCtx();
+      if (root.RGDashboard && typeof root.RGDashboard.refreshTheme === 'function') {
+        try { root.RGDashboard.refreshTheme(ctxTheme); } catch (_e) {}
+      }
+      if (root.RGReports && typeof root.RGReports.refreshTheme === 'function') {
+        try { root.RGReports.refreshTheme(ctxTheme); } catch (_e2) {}
+      }
+      try {
+        document.dispatchEvent(new CustomEvent('rg:themechange', { detail: { theme: nextTheme } }));
+      } catch (_e3) {}
+    }
 
     if (nextPos !== 'side') {
       var sb = document.getElementById('app-sidebar');
@@ -574,18 +663,30 @@
 
     try {
       document.dispatchEvent(new CustomEvent('rg:personalprefschange', {
-        detail: { timeFormat: nextTime, sidebarPosition: nextPos }
+        detail: { timeFormat: nextTime, sidebarPosition: nextPos, theme: nextTheme, lang: nextLang }
       }));
     } catch (_evErr) {}
 
-    if (o.reRender !== false && prevTime !== nextTime && root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser()) {
-      await renderRoute();
+    var curUser = root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser();
+    if (o.reRender !== false && curUser) {
+      if (prevLang !== nextLang) {
+        renderAppShell(curUser);
+        await renderRoute();
+      } else if (prevTime !== nextTime) {
+        await renderRoute();
+      }
     }
 
     if (o.persist !== false) {
-      await saveLayoutPrefs({ timeFormat: nextTime, sidebarPosition: nextPos }, { reRenderNav: false, persist: true });
+      await saveLayoutPrefs({
+        timeFormat: nextTime,
+        sidebarPosition: nextPos,
+        theme: nextTheme,
+        lang: nextLang,
+        sidebarCollapsed: Boolean(state.prefs.sidebarCollapsed)
+      }, { reRenderNav: false, persist: true });
     }
-    return { timeFormat: nextTime, sidebarPosition: nextPos };
+    return { timeFormat: nextTime, sidebarPosition: nextPos, theme: nextTheme, lang: nextLang };
   }
 
   function buildAppCtx() {
@@ -785,8 +886,15 @@
     return dict[key] || key;
   }
 
-  function savePrefs() {
-    localStorage.setItem(PREFS_KEY, JSON.stringify(state.prefs));
+  function savePrefs(userOverride) {
+    try {
+      var serialized = JSON.stringify(state.prefs);
+      localStorage.setItem(PREFS_KEY, serialized);
+      var u = userOverride || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
+      if (u && u.id) {
+        localStorage.setItem(getUserPrefsStorageKey(u), serialized);
+      }
+    } catch (_e) {}
   }
 
   function applyThemeAndLang() {
@@ -885,6 +993,11 @@
     try {
       document.dispatchEvent(new CustomEvent('rg:themechange', { detail: { theme: state.prefs.theme } }));
     } catch (_e3) {}
+
+    var curU = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    if (curU && curU.id) {
+      saveLayoutPrefs({ theme: state.prefs.theme }, { reRenderNav: false, persist: true }).catch(function () {});
+    }
   }
 
   function toggleThemeWithReveal(triggerEl) {
@@ -1769,6 +1882,8 @@
     var user = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
     var curTimeFmt = getTimeFormat();
     var curNavPos = getSidebarPosition();
+    var curTheme = state.prefs.theme === 'dark' ? 'dark' : 'light';
+    var curLang = state.prefs.lang === 'en' ? 'en' : 'ar';
 
     function formatLiveSample(fmt) {
       var now = new Date();
@@ -1782,15 +1897,40 @@
 
     modalRoot.innerHTML =
       '<div class="modal-backdrop" id="personal-settings-modal" role="dialog" aria-modal="true" aria-labelledby="personal-settings-title">' +
-        '<div class="modal-panel rg-personal-modal" style="max-width:600px;">' +
+        '<div class="modal-panel rg-personal-modal" style="max-width:620px;">' +
           '<div class="modal-header">' +
             '<div>' +
               '<h3 class="modal-title" id="personal-settings-title">' + (isEn ? 'Personal Account Settings' : 'إعدادات الحساب الشخصي') + '</h3>' +
               '<p class="section-subtitle">' + (isEn
-                ? ('Customize how time and navigation appear for your account' + (user && user.name ? (' (' + user.name + ')') : '') + '. Applies instantly.')
-                : ('خصص طريقة عرض الوقت وموضع شريط التنقل لحسابك' + (user && user.name ? (' (' + user.name + ')') : '') + ' مع تطبيق فوري.')) + '</p>' +
+                ? ('Customize theme, language, time display, and navigation for your account' + (user && user.name ? (' (' + user.name + ')') : '') + '. Saved automatically.')
+                : ('خصص المظهر واللغة وطريقة عرض الوقت وموضع شريط التنقل لحسابك' + (user && user.name ? (' (' + user.name + ')') : '') + ' مع الحفظ التلقائي لحسابك.')) + '</p>' +
             '</div>' +
             '<button type="button" class="btn btn-sm" id="personal-settings-close" data-modal-close aria-label="' + (isEn ? 'Close' : 'إغلاق') + '">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
+          '</div>' +
+
+          '<div class="rg-personal-section">' +
+            '<div class="rg-personal-sec-head">' +
+              '<div>' +
+                '<div class="rg-personal-sec-title">' + (isEn ? 'Appearance & Language' : 'المظهر واللغة') + '</div>' +
+                '<div class="rg-personal-sec-sub">' + (isEn ? 'Saved per employee account across devices.' : 'تُحفظ تلقائيًا داخل حساب الموظف وتبقى محفوظة عند التحديث أو تسجيل الدخول.') + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="rg-choice-grid rg-choice-grid-2" role="radiogroup" aria-label="' + (isEn ? 'Theme' : 'المظهر') + '" style="margin-bottom:10px;">' +
+              '<button type="button" class="rg-choice-card' + (curTheme === 'light' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTheme === 'light' ? 'true' : 'false') + '" data-theme-choice="light">' +
+                '<div class="rg-choice-card-top"><span class="rg-choice-title">' + (isEn ? 'Light Mode' : 'الوضع النهاري') + '</span></div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curTheme === 'dark' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTheme === 'dark' ? 'true' : 'false') + '" data-theme-choice="dark">' +
+                '<div class="rg-choice-card-top"><span class="rg-choice-title">' + (isEn ? 'Dark Mode' : 'الوضع الليلي') + '</span></div>' +
+              '</button>' +
+            '</div>' +
+            '<div class="rg-choice-grid rg-choice-grid-2" role="radiogroup" aria-label="' + (isEn ? 'Language' : 'اللغة') + '">' +
+              '<button type="button" class="rg-choice-card' + (curLang === 'ar' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curLang === 'ar' ? 'true' : 'false') + '" data-lang-choice="ar">' +
+                '<div class="rg-choice-card-top"><span class="rg-choice-title">العربية (RTL)</span></div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curLang === 'en' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curLang === 'en' ? 'true' : 'false') + '" data-lang-choice="en">' +
+                '<div class="rg-choice-card-top"><span class="rg-choice-title">English (LTR)</span></div>' +
+              '</button>' +
+            '</div>' +
           '</div>' +
 
           '<div class="rg-personal-section">' +
@@ -1858,7 +1998,19 @@
     function syncModalSelections() {
       var tf = getTimeFormat();
       var np = getSidebarPosition();
+      var th = state.prefs.theme === 'dark' ? 'dark' : 'light';
+      var lg = state.prefs.lang === 'en' ? 'en' : 'ar';
       if (previewEl) previewEl.textContent = formatLiveSample(tf);
+      modalRoot.querySelectorAll('[data-theme-choice]').forEach(function (btn) {
+        var active = btn.getAttribute('data-theme-choice') === th;
+        btn.classList.toggle('is-selected', active);
+        btn.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
+      modalRoot.querySelectorAll('[data-lang-choice]').forEach(function (btn) {
+        var active = btn.getAttribute('data-lang-choice') === lg;
+        btn.classList.toggle('is-selected', active);
+        btn.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
       modalRoot.querySelectorAll('[data-time-choice]').forEach(function (btn) {
         var active = btn.getAttribute('data-time-choice') === tf;
         btn.classList.toggle('is-selected', active);
@@ -1874,10 +2026,29 @@
     var pendingSavePromise = null;
     function applyInstantPref(patch) {
       pendingSavePromise = setPersonalPreferences(patch, { reRender: true, persist: true }).then(function () {
-        if (typeof onUpdated === 'function') onUpdated({ timeFormat: getTimeFormat(), sidebarPosition: getSidebarPosition() });
+        if (typeof onUpdated === 'function') {
+          onUpdated({
+            timeFormat: getTimeFormat(),
+            sidebarPosition: getSidebarPosition(),
+            theme: state.prefs.theme,
+            lang: state.prefs.lang
+          });
+        }
       });
       syncModalSelections();
     }
+
+    modalRoot.querySelectorAll('[data-theme-choice]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        applyInstantPref({ theme: btn.getAttribute('data-theme-choice') });
+      });
+    });
+
+    modalRoot.querySelectorAll('[data-lang-choice]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        applyInstantPref({ lang: btn.getAttribute('data-lang-choice') });
+      });
+    });
 
     modalRoot.querySelectorAll('[data-time-choice]').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -1894,7 +2065,7 @@
     var resetBtn = document.getElementById('personal-settings-reset');
     if (resetBtn) {
       resetBtn.addEventListener('click', function () {
-        applyInstantPref({ timeFormat: '24h', sidebarPosition: 'side' });
+        applyInstantPref({ timeFormat: '24h', sidebarPosition: 'side', theme: 'light', lang: 'ar', sidebarCollapsed: false });
         toast(isEn ? 'Personal preferences reset to defaults.' : 'تمت استعادة الإعدادات الشخصية للافتراضي.');
       });
     }
@@ -2185,6 +2356,7 @@
       savePrefs();
       var sb = document.getElementById('app-sidebar');
       sb.classList.toggle('collapsed', state.prefs.sidebarCollapsed);
+      saveLayoutPrefs({ sidebarCollapsed: Boolean(state.prefs.sidebarCollapsed) }, { reRenderNav: false, persist: true }).catch(function () {});
     });
 
     var overlay = document.getElementById('sidebar-overlay');
@@ -2236,6 +2408,7 @@
       state.prefs.lang = state.prefs.lang === 'ar' ? 'en' : 'ar';
       savePrefs();
       applyThemeAndLang();
+      saveLayoutPrefs({ lang: state.prefs.lang }, { reRenderNav: false, persist: true }).catch(function () {});
       renderAppShell(user);
       renderRoute();
     });
@@ -2245,6 +2418,7 @@
       closeNotificationsPopover();
       stopAutoRefreshLoop();
       state.route = 'dashboard';
+      state.layoutPrefs = normalizeLayoutPrefsFallback({});
       delete state.reservations;
       delete state.reports;
       delete state.problems;
@@ -2503,7 +2677,10 @@
       return;
     }
 
-    hydrateLayoutPrefsFromServer(null, user);
+    hydrateLayoutPrefsFromServer(
+      (root.RGAuth && root.RGAuth.consumeRestoredLayoutPrefs) ? root.RGAuth.consumeRestoredLayoutPrefs() : null,
+      user
+    );
     renderAppShell(user);
     await Promise.all([
       renderRoute(),

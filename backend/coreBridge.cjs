@@ -1954,7 +1954,7 @@
     saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
     applyUnifiedConnectionSetup: ['*'],
     updateSettings: ['settings', 'sync', 'reservations', 'dashboard', 'activity'],
-    saveUserLayoutPrefs: ['dashboard'],
+    saveUserLayoutPrefs: ['dashboard', 'employees'],
     deleteAllReservations: ['*']
   };
 
@@ -5237,13 +5237,22 @@
       return true;
     });
 
+    var rawTheme = normalizeStr(obj.theme).toLowerCase();
+    var theme = (rawTheme === 'dark' || rawTheme === 'light') ? rawTheme : '';
+    var rawLang = normalizeStr(obj.lang).toLowerCase();
+    var lang = (rawLang === 'ar' || rawLang === 'en') ? rawLang : '';
+    var sidebarCollapsed = obj.sidebarCollapsed === true || obj.sidebarCollapsed === 'true';
+
     return {
       navOrder: navOrder,
       hiddenRoutes: hiddenRoutes,
       dashOrder: dashOrder,
       dashHidden: dashHidden,
       timeFormat: normalizeTimeFormat(obj.timeFormat),
-      sidebarPosition: normalizeSidebarPosition(obj.sidebarPosition)
+      sidebarPosition: normalizeSidebarPosition(obj.sidebarPosition),
+      theme: theme,
+      lang: lang,
+      sidebarCollapsed: Boolean(sidebarCollapsed)
     };
   }
 

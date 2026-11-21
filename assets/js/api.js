@@ -38,6 +38,7 @@
   var detectedMode = '';
   var detectedBackendProxyAvailable = false;
   var detectedEnvGasConfigured = false;
+  var detectedServerSyncMeta = null;
   var backendProbeDone = false;
   var backendProbePromise = null;
 
@@ -138,6 +139,7 @@
           if (json && json.ok) {
             detectedBackendProxyAvailable = Boolean(json.serverlessProxyAvailable !== false);
             detectedEnvGasConfigured = Boolean(json.envGasConfigured);
+            detectedServerSyncMeta = (json.syncMeta && typeof json.syncMeta === 'object') ? json.syncMeta : null;
             if (json.mode) {
               detectedMode = String(json.mode || '').trim().toLowerCase();
             }
@@ -168,6 +170,7 @@
   async function refreshGlobalConnection() {
     backendProbeDone = false;
     backendProbePromise = null;
+    detectedServerSyncMeta = null;
     _cachedConnInfo = null;
     return probeBackendHealth();
   }
@@ -463,6 +466,60 @@
     } catch (e) {}
   }
 
+  function invalidateInMemoryByScopes(scopes) {
+    var list = Array.isArray(scopes) ? scopes : [scopes];
+    var ns = getCacheNamespace();
+    Object.keys(apiResponseCache).forEach(function (k) {
+      var entry = apiResponseCache[k];
+      if (entry && list.indexOf(entry.scope) !== -1) {
+        delete apiResponseCache[k];
+        delete revalidatedInPage[k];
+      }
+    });
+    if (list.indexOf('reservations') !== -1) {
+      localReservationsFreshInPage[ns] = false;
+      if (localMetaByNs[ns]) localMetaByNs[ns].allReservationsHydrated = false;
+    }
+    try {
+      if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(SESSION_CACHE_KEY);
+    } catch (_e) {}
+  }
+
+  async function runBootSyncCheck(targetNs, force) {
+    var ns = targetNs || getCacheNamespace();
+    if (!root.RGIdbCache || typeof root.RGIdbCache.enforceBootSyncCheck !== 'function') {
+      return { verified: true, invalidated: false, offlineFallback: false };
+    }
+    var syncRes = await root.RGIdbCache.enforceBootSyncCheck(
+      ns,
+      async function () {
+        if (force) {
+          await refreshGlobalConnection();
+        } else {
+          await probeBackendHealth();
+        }
+        if (detectedServerSyncMeta) {
+          return detectedServerSyncMeta;
+        }
+        if (!getTransportUrl()) {
+          return { syncEpoch: 'sandbox:' + (localMetaByNs[ns] && localMetaByNs[ns].reservationsCount || 0) };
+        }
+        return { offline: false, syncEpoch: '' };
+      },
+      {
+        force: Boolean(force),
+        alwaysInvalidateDashboardOnBoot: Boolean(getTransportUrl() && !detectedServerSyncMeta)
+      }
+    );
+    if (syncRes && syncRes.invalidated) {
+      var invScopes = syncRes.epochChanged
+        ? ['dashboard', 'reservations', 'reports', 'followups', 'problems', 'employees', 'notifications', 'activity']
+        : ['dashboard'];
+      invalidateInMemoryByScopes(invScopes);
+    }
+    return syncRes;
+  }
+
   async function ensureHydrated(targetNs) {
     var ns = targetNs || getCacheNamespace();
     if (hydratedNamespaces[ns]) return true;
@@ -471,6 +528,7 @@
     hydrationPromises[ns] = (async function () {
       try {
         if (root.RGIdbCache) {
+          await runBootSyncCheck(ns, false);
           var snap = await root.RGIdbCache.loadNamespaceSnapshot(ns);
           var now = Date.now();
           (snap.kvEntries || []).forEach(function (entry) {
@@ -514,7 +572,10 @@
 
   async function ready() {
     await probeBackendHealth();
-    return ensureHydrated(getCacheNamespace());
+    var ns = getCacheNamespace();
+    await ensureHydrated(ns);
+    await runBootSyncCheck(ns, false);
+    return true;
   }
 
   function hydrateApiCache() {
@@ -2730,8 +2791,13 @@
         saveSandboxDb(db);
         return { success: true, message: 'تم تسجيل الخروج.', data: { loggedOut: true }, error: null };
       }
-      case 'getMe':
-        return { success: true, message: '', data: { user: session.user }, error: null };
+      case 'getMe': {
+        var meLayout = db.settings['layout_prefs_u_' + session.employeeId];
+        var meNormLayout = (core && core.normalizeUserLayoutPrefs)
+          ? core.normalizeUserLayoutPrefs(meLayout)
+          : { navOrder: [], hiddenRoutes: [], dashOrder: [], dashHidden: [] };
+        return { success: true, message: '', data: { user: session.user, layoutPrefs: meNormLayout }, error: null };
+      }
 
       case 'getAppBootstrap': {
         var bsDash = sandboxExecute('getDashboard', token, payload && payload.range ? payload : { range: '30d' });
@@ -4933,8 +4999,23 @@
 
       if (parsed && parsed.success) {
         var pendingIdbOps = [];
-        // Persist reservation & customer entities into IndexedDB automatically
-        if (action === 'getReservationDetails' && parsed.data && parsed.data.reservation) {
+        if (action === 'getDashboard' && parsed.data && parsed.data.kpis && root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
+          var dashSyncAt = (parsed.data.lastSync && parsed.data.lastSync.finishedAt) || (detectedServerSyncMeta && detectedServerSyncMeta.lastSyncAt) || '';
+          pendingIdbOps.push(root.RGIdbCache.recordServerSyncState(ns, {
+            syncEpoch: (detectedServerSyncMeta && detectedServerSyncMeta.syncEpoch) || '',
+            reservationsCount: (detectedServerSyncMeta && detectedServerSyncMeta.reservationsCount !== undefined) ? detectedServerSyncMeta.reservationsCount : undefined,
+            lastResUpdatedAt: (detectedServerSyncMeta && detectedServerSyncMeta.lastResUpdatedAt) || '',
+            lastSyncAt: dashSyncAt
+          }).catch(function () {}));
+        } else if (action === 'getAppBootstrap' && parsed.data && parsed.data.dashboard && parsed.data.dashboard.kpis && root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
+          var bootSyncAt = (parsed.data.dashboard.lastSync && parsed.data.dashboard.lastSync.finishedAt) || (detectedServerSyncMeta && detectedServerSyncMeta.lastSyncAt) || '';
+          pendingIdbOps.push(root.RGIdbCache.recordServerSyncState(ns, {
+            syncEpoch: (detectedServerSyncMeta && detectedServerSyncMeta.syncEpoch) || '',
+            reservationsCount: (detectedServerSyncMeta && detectedServerSyncMeta.reservationsCount !== undefined) ? detectedServerSyncMeta.reservationsCount : undefined,
+            lastResUpdatedAt: (detectedServerSyncMeta && detectedServerSyncMeta.lastResUpdatedAt) || '',
+            lastSyncAt: bootSyncAt
+          }).catch(function () {}));
+        } else if (action === 'getReservationDetails' && parsed.data && parsed.data.reservation) {
           setLocalDetailState(ns, parsed.data);
         } else if (action === 'getReservations' && parsed.data && Array.isArray(parsed.data.items) && parsed.data.items.length > 0) {
           pendingIdbOps.push(writeLocalReservationsState(ns, parsed.data.items, false).idbPromise);
@@ -4961,6 +5042,12 @@
               lastSyncAt: parsed.data.finishedAt || new Date().toISOString()
             })).catch(function () {}));
           }
+          if (root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
+            pendingIdbOps.push(root.RGIdbCache.recordServerSyncState(ns, {
+              lastSyncAt: parsed.data.finishedAt || new Date().toISOString(),
+              lastResUpdatedAt: new Date().toISOString()
+            }).catch(function () {}));
+          }
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
         } else if (action === 'quickUpdateReservationStatus' && parsed.data && parsed.data.reservation) {
           pendingIdbOps.push(writeLocalReservationsState(ns, [parsed.data.reservation], false).idbPromise);
@@ -4978,6 +5065,9 @@
           }
         } else if (action === 'deleteAllReservations' || action === 'importReservationsFromExcel') {
           pendingIdbOps.push(clearCache(['*']));
+          if (root.RGIdbCache && typeof root.RGIdbCache.resetBootSyncState === 'function') {
+            root.RGIdbCache.resetBootSyncState(ns);
+          }
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
         } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
           var dObj = (parsed && parsed.data) || {};
@@ -5332,6 +5422,52 @@
     };
   }
 
+  async function wipeAllBrowserCaches(options) {
+    var opts = options || {};
+    apiResponseCache = {};
+    inFlightRequests = {};
+    inFlightWarm = {};
+    revalidatedInPage = {};
+    localReservationsFreshInPage = {};
+    localReservationsByNs = {};
+    localCustomersByNs = {};
+    customersDirtyByNs = {};
+    localDetailsByNs = {};
+    localExtensionsByResNs = {};
+    localMetaByNs = {};
+    hydratedNamespaces = {};
+    hydrationPromises = {};
+    detectedServerSyncMeta = null;
+    _cachedConnInfo = null;
+
+    var report = {
+      indexedDb: false,
+      cacheStorage: 0,
+      serviceWorkers: 0,
+      sessionStorage: true,
+      localStorageKeys: []
+    };
+
+    try {
+      if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(SESSION_CACHE_KEY);
+    } catch (_e) {}
+
+    if (root.RGIdbCache && typeof root.RGIdbCache.wipeAllCaches === 'function') {
+      report = await root.RGIdbCache.wipeAllCaches(Object.assign({ preserveAuth: true }, opts));
+    }
+
+    await refreshGlobalConnection().catch(function () {});
+    await ensureHydrated(getCacheNamespace()).catch(function () {});
+    return report;
+  }
+
+  function getSyncCheckStatus() {
+    if (root.RGIdbCache && typeof root.RGIdbCache.getSyncState === 'function') {
+      return root.RGIdbCache.getSyncState(getCacheNamespace());
+    }
+    return { verified: true, status: 'synchronized' };
+  }
+
   root.RGApi = {
     ready: ready,
     getGasUrl: getGasUrl,
@@ -5351,6 +5487,9 @@
     isLiveMode: isLiveMode,
     warmUpGas: warmUpGas,
     clearCache: clearCache,
+    wipeAllBrowserCaches: wipeAllBrowserCaches,
+    enforceBootSyncCheck: function (force) { return runBootSyncCheck(getCacheNamespace(), force !== false); },
+    getSyncCheckStatus: getSyncCheckStatus,
     primeCache: primeCache,
     hasCached: hasCached,
     getCachedData: getCachedData,

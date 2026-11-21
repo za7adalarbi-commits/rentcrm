@@ -3045,25 +3045,197 @@ test('testDatabaseHealth diagnostics, disabled client-side web binding, and UI t
     'btn-test-neon-db',
     'btn-ping-gas-url',
     'btn-test-rg-top',
-    'btn-test-rg'
+    'btn-test-rg',
+    'btn-clear-browser-cache',
+    'btn-save-rg-token',
+    'set-rg-token',
+    'rg-token-settings-form'
   ]) {
-    assert.ok(settingsSrc.includes(id), `settings.js missing test button ${id}`);
+    assert.ok(settingsSrc.includes(id), `settings.js missing required control ${id}`);
   }
   assert.ok(appSrc.includes('login-test-connection-btn'), 'app.js missing login-test-connection-btn');
 
   for (const removedId of [
     'btn-save-gas-url',
-    'btn-save-rg-token',
     'btn-restore-global-gas',
     'btn-clear-gas-url',
     'setup-database-url',
     'setup-rg-token',
     'setup-sync-secret',
     'setup-vercel-token',
-    'set-gas-url',
-    'set-rg-token'
+    'set-gas-url'
   ]) {
     assert.equal(settingsSrc.includes(removedId), false, `settings.js still contains binding control ${removedId}`);
   }
   assert.equal(appSrc.includes('login-restore-default-gas'), false, 'app.js still contains login-restore-default-gas');
 });
+
+test('RGIdbCache: enforces boot sync check on page load, invalidates stale server epoch, falls back offline, and wipes all caches cleanly', async () => {
+  const idbPath = path.resolve(process.cwd(), 'assets/js/idb.js');
+  const idbCode = fs.readFileSync(idbPath, 'utf8');
+
+  const clearedCaches: string[] = [];
+  const unregisteredSw: number[] = [];
+  const removedSession: string[] = [];
+  const removedLocal: string[] = [];
+  const sessionMap = new Map<string, string>([
+    ['rg_crm_swr_v1', '{"k":1}'],
+    ['other_key', 'keep']
+  ]);
+  const localMap = new Map<string, string>([
+    ['rg_crm_gas_url', 'https://old.example/exec'],
+    ['rg_crm_swr_v1', 'stale'],
+    ['rg_crm_session_token', 'tok_keep'],
+    ['rg_crm_user_prefs_u_emp1', '{"theme":"dark"}']
+  ]);
+
+  const sandboxCtx: any = {
+    window: {} as any,
+    caches: {
+      keys: async () => ['rg-cache-v1', 'static-v2'],
+      delete: async (k: string) => {
+        clearedCaches.push(k);
+        return true;
+      }
+    },
+    navigator: {
+      serviceWorker: {
+        getRegistrations: async () => [
+          { unregister: async () => { unregisteredSw.push(1); return true; } }
+        ]
+      }
+    },
+    sessionStorage: {
+      get length() { return sessionMap.size; },
+      key: (idx: number) => Array.from(sessionMap.keys())[idx] ?? null,
+      removeItem: (k: string) => { removedSession.push(k); sessionMap.delete(k); }
+    },
+    localStorage: {
+      getItem: (k: string) => (localMap.has(k) ? localMap.get(k)! : null),
+      removeItem: (k: string) => { removedLocal.push(k); localMap.delete(k); }
+    }
+  };
+  sandboxCtx.window.caches = sandboxCtx.caches;
+  vm.createContext(sandboxCtx);
+  vm.runInContext(idbCode, sandboxCtx);
+
+  const idb = sandboxCtx.window.RGIdbCache;
+  assert.ok(idb, 'RGIdbCache exported');
+  assert.equal(idb.DB_NAME, 'rg_crm_idb_v2');
+  assert.equal(idb.DB_VERSION, 2);
+
+  // Store initial KV entries in dashboard & non-dashboard scopes
+  await idb.putKvEntries([
+    { key: 'k_dash', ns: 'ns1', scope: 'dashboard', staleUntil: Date.now() + 60000, response: { success: true, data: { total: 5 } } },
+    { key: 'k_res', ns: 'ns1', scope: 'reservations', staleUntil: Date.now() + 60000, response: { success: true, data: { total: 5 } } }
+  ]);
+
+  // First boot sync check with epoch v1 -> purges stale KV & saves META
+  const res1 = await idb.enforceBootSyncCheck('ns1', async () => ({
+    reservationsCount: 5,
+    lastSyncAt: '2026-11-20T01:00:00Z',
+    syncEpoch: 'ep-1'
+  }));
+  assert.equal(res1.verified, true);
+  assert.equal(res1.epochChanged, true);
+  assert.equal(res1.invalidated, true);
+  assert.equal(res1.status, 'stale_purged');
+  const snapAfter1 = await idb.loadNamespaceSnapshot('ns1');
+  assert.equal(snapAfter1.kvEntries.length, 0);
+  assert.equal(snapAfter1.meta.lastServerEpoch, 'ep-1');
+
+  // Re-populate KV and verify same epoch stays synchronized without purging
+  await idb.putKvEntries([
+    { key: 'k_dash2', ns: 'ns1', scope: 'dashboard', staleUntil: Date.now() + 60000, response: { success: true, data: { total: 5 } } }
+  ]);
+  const res2 = await idb.enforceBootSyncCheck('ns1', async () => ({
+    reservationsCount: 5,
+    lastSyncAt: '2026-11-20T01:00:00Z',
+    syncEpoch: 'ep-1'
+  }), { force: true });
+  assert.equal(res2.verified, true);
+  assert.equal(res2.epochChanged, false);
+  assert.equal(res2.invalidated, false);
+  assert.equal(res2.status, 'synchronized');
+  const snapAfter2 = await idb.loadNamespaceSnapshot('ns1');
+  assert.equal(snapAfter2.kvEntries.length, 1);
+
+  // Offline probe falls back gracefully without wiping cached data
+  const resOffline = await idb.enforceBootSyncCheck('ns1', async () => {
+    throw new Error('network down');
+  }, { force: true });
+  assert.equal(resOffline.offlineFallback, true);
+  assert.equal(resOffline.status, 'offline_fallback');
+
+  // Full cache wipe preserves auth token + per-user prefs while clearing CacheStorage, SW, session & stale overrides
+  const wiped = await idb.wipeAllCaches({ preserveAuth: true });
+  assert.deepEqual(clearedCaches, ['rg-cache-v1', 'static-v2']);
+  assert.equal(wiped.cacheStorage, 2);
+  assert.equal(wiped.serviceWorkers, 1);
+  assert.equal(unregisteredSw.length, 1);
+  assert.ok(removedSession.includes('rg_crm_swr_v1'));
+  assert.equal(sessionMap.get('other_key'), 'keep');
+  assert.ok(removedLocal.includes('rg_crm_gas_url'));
+  assert.ok(removedLocal.includes('rg_crm_swr_v1'));
+  assert.equal(localMap.get('rg_crm_session_token'), 'tok_keep');
+  assert.equal(localMap.get('rg_crm_user_prefs_u_emp1'), '{"theme":"dark"}');
+});
+
+test('Per-employee UI customization persistence: theme, lang, sidebarCollapsed, timeFormat, sidebarPosition, navOrder, dashHidden isolated per employee ID', async () => {
+  const db = createInMemoryMockExecutor();
+  const adminLogin = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' }
+  });
+  assert.equal(adminLogin.success, true);
+  const adminToken = adminLogin.data.token;
+
+  const agentLogin = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'agent1', password: process.env.RG_SEED_AGENT_PASSWORD || 'Agent@123' }
+  });
+  assert.equal(agentLogin.success, true);
+  const agentToken = agentLogin.data.token;
+
+  const saveAdmin = await dispatchCrmRequest(db, {
+    action: 'saveUserLayoutPrefs',
+    token: adminToken,
+    payload: {
+      theme: 'dark',
+      lang: 'en',
+      sidebarCollapsed: true,
+      timeFormat: '12h',
+      sidebarPosition: 'top',
+      hiddenRoutes: ['activity'],
+      dashHidden: ['radar']
+    }
+  });
+  assert.equal(saveAdmin.success, true);
+  assert.equal(saveAdmin.data.layoutPrefs.theme, 'dark');
+  assert.equal(saveAdmin.data.layoutPrefs.lang, 'en');
+  assert.equal(saveAdmin.data.layoutPrefs.sidebarCollapsed, true);
+  assert.equal(saveAdmin.data.layoutPrefs.timeFormat, '12h');
+  assert.equal(saveAdmin.data.layoutPrefs.sidebarPosition, 'top');
+
+  // Check admin getMe & getAppBootstrap restore admin customizations
+  const adminMe = await dispatchCrmRequest(db, { action: 'getMe', token: adminToken });
+  assert.equal(adminMe.success, true);
+  assert.equal(adminMe.data.layoutPrefs.theme, 'dark');
+  assert.equal(adminMe.data.layoutPrefs.lang, 'en');
+  assert.equal(adminMe.data.layoutPrefs.sidebarCollapsed, true);
+
+  const adminBoot = await dispatchCrmRequest(db, { action: 'getAppBootstrap', token: adminToken, payload: { range: '30d' } });
+  assert.equal(adminBoot.success, true);
+  assert.equal(adminBoot.data.layoutPrefs.theme, 'dark');
+  assert.equal(adminBoot.data.layoutPrefs.sidebarCollapsed, true);
+
+  // Check agent1 remains completely isolated (keeps default preferences)
+  const agentMe = await dispatchCrmRequest(db, { action: 'getMe', token: agentToken });
+  assert.equal(agentMe.success, true);
+  assert.equal(agentMe.data.layoutPrefs.theme, '');
+  assert.equal(agentMe.data.layoutPrefs.lang, '');
+  assert.equal(agentMe.data.layoutPrefs.sidebarCollapsed, false);
+  assert.equal(agentMe.data.layoutPrefs.timeFormat, '24h');
+  assert.equal(agentMe.data.layoutPrefs.sidebarPosition, 'side');
+});
+

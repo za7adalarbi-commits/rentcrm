@@ -236,19 +236,47 @@
         '</div>' +
 
         '<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);font-size:12.5px;color:var(--text-secondary);line-height:1.65;">' +
-          'يتم ضبط متغيرات الربط (<span class="mono" dir="ltr">DATABASE_URL · GAS_WEBAPP_URL · RG_TOKEN · SYNC_API_SECRET</span>) من إعدادات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط، وتُستخدم الأزرار التالية لاختبار سلامة كل اتصال مباشرة.' +
+          'تمت إزالة جميع نماذج ربط قاعدة البيانات و<span class="mono" dir="ltr">Google Apps Script</span> و<span class="mono" dir="ltr">Vercel</span> من واجهة الموقع؛ تُضبط هذه المتغيرات من بيئة الخادم فقط، وتُستخدم الأزرار التالية لفحص الاتصال ومسح كاش المتصفح، مع إتاحة تحديث توكن <span class="mono" dir="ltr">RG_TOKEN</span> فقط.' +
         '</div>' +
 
         '<div class="toolbar-row" style="margin-top:0;margin-bottom:0;flex-wrap:wrap;">' +
-          '<button type="button" class="btn btn-primary" id="btn-test-all-connections">اختبار جميع الاتصالات</button>' +
-          '<button type="button" class="btn" id="btn-test-server-health">اختبار الخادم (/api/health)</button>' +
-          '<button type="button" class="btn" id="btn-test-neon-db">اختبار قاعدة البيانات (Neon)</button>' +
-          '<button type="button" class="btn" id="btn-ping-gas-url">اختبار Google Apps Script</button>' +
-          '<button type="button" class="btn" id="btn-test-rg-top">اختبار Rental Gate API</button>' +
+          '<button type="button" class="btn btn-primary" id="btn-test-all-connections">فحص جميع الاتصالات</button>' +
+          '<button type="button" class="btn" id="btn-test-server-health">فحص الخادم (/api/health)</button>' +
+          '<button type="button" class="btn" id="btn-test-neon-db">فحص قاعدة البيانات (Neon)</button>' +
+          '<button type="button" class="btn" id="btn-ping-gas-url">فحص Google Apps Script</button>' +
+          '<button type="button" class="btn" id="btn-test-rg-top">فحص Rental Gate API</button>' +
+          '<button type="button" class="btn btn-danger" id="btn-clear-browser-cache">مسح كاش المتصفح بالكامل</button>' +
         '</div>' +
 
         '<div id="conn-test-results" class="hidden" style="margin-top:12px;display:grid;gap:8px;"></div>' +
       '</div>' +
+
+      (canManageSettings ? (
+        '<form class="surface-card" id="rg-token-settings-form">' +
+          '<div class="section-header" style="margin-bottom:12px;">' +
+            '<div>' +
+              '<h2 class="section-title">تحديث توكن Rental Gate API (<span class="mono" dir="ltr">RG_TOKEN</span>)</h2>' +
+              '<p class="section-subtitle">الربط الوحيد المتاح عبر الإعدادات: أدخل التوكن ليُحفظ مشفرًا في الخادم مع اختباره تلقائيًا.</p>' +
+            '</div>' +
+            '<span class="status-tag ' + (hasRgToken ? 'status-success' : 'status-warning') + '">' + (hasRgToken ? 'مضبوط بالخادم' : 'غير مضبوط') + '</span>' +
+          '</div>' +
+          '<div class="form-grid-2" style="align-items:end;">' +
+            '<div class="form-group">' +
+              '<label class="form-label" for="set-rg-token">توكن Rental Gate API (<span class="mono" dir="ltr">RG_TOKEN</span>)</label>' +
+              '<div class="password-field-wrap">' +
+                '<input type="password" class="input mono" id="set-rg-token" dir="ltr" lang="en" autocomplete="off" spellcheck="false" placeholder="ألصق التوكن هنا بدون مسافات...">' +
+                '<button type="button" class="password-toggle-btn" id="btn-toggle-rg-token" aria-label="إظهار التوكن">إظهار</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="form-group">' +
+              '<div class="toolbar-row" style="margin-bottom:0;">' +
+                '<button type="submit" class="btn btn-primary" id="btn-save-rg-token">حفظ واختبار التوكن</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div id="rg-token-action-msg" class="hidden" style="margin-top:10px;"></div>' +
+        '</form>'
+      ) : '') +
 
       (canSync ? (
         '<div class="surface-card">' +
@@ -577,11 +605,92 @@
       testRgTopBtn.addEventListener('click', function () {
         runWithLock(testRgTopBtn, 'testConnectionTop', async function () {
           var prevText = testRgTopBtn.textContent;
-          testRgTopBtn.textContent = 'جاري الاختبار...';
+          testRgTopBtn.textContent = 'جاري الفحص...';
           try {
             await runRgApiTest();
           } finally {
             if (testRgTopBtn.isConnected !== false) testRgTopBtn.textContent = prevText;
+          }
+        });
+      });
+    }
+
+    var clearBrowserCacheBtn = document.getElementById('btn-clear-browser-cache');
+    if (clearBrowserCacheBtn) {
+      clearBrowserCacheBtn.addEventListener('click', function () {
+        runWithLock(clearBrowserCacheBtn, 'wipeAllBrowserCaches', async function () {
+          var prevText = clearBrowserCacheBtn.textContent;
+          clearBrowserCacheBtn.textContent = 'جاري مسح الكاش...';
+          setDiagResult('cache', 'كاش المتصفح (IndexedDB + CacheStorage)', 'pending', 'جاري تفريغ الكاش والملفات المخزنة وإعادة المزامنة...', 0);
+          try {
+            var cleared = (root.RGApi && root.RGApi.wipeAllBrowserCaches)
+              ? await root.RGApi.wipeAllBrowserCaches({ preserveAuth: true })
+              : null;
+            var summaryMsg = cleared
+              ? ('تم مسح كاش المتصفح بالكامل (IndexedDB: ' + (cleared.indexedDb ? 'مفرغ' : 'نظيف') + ' · CacheStorage: ' + Number(cleared.cacheStorage || 0) + ' · Session: ' + (cleared.sessionStorage ? 'مفرغ' : 'نظيف') + ').')
+              : 'تم مسح كاش الذاكرة المحلية بنجاح.';
+            setDiagResult('cache', 'كاش المتصفح (IndexedDB + CacheStorage)', 'ok', summaryMsg, 1);
+            ctx.toast('تم مسح كاش المتصفح بالكامل وإعادة المزامنة مع الخادم.');
+            await render(container, ctx);
+          } catch (err) {
+            setDiagResult('cache', 'كاش المتصفح (IndexedDB + CacheStorage)', 'fail', (err && err.message) || 'تعذر مسح كاش المتصفح.', 0);
+            ctx.toast((err && err.message) || 'تعذر مسح كاش المتصفح.', true);
+          } finally {
+            if (clearBrowserCacheBtn.isConnected !== false) clearBrowserCacheBtn.textContent = prevText;
+          }
+        });
+      });
+    }
+
+    bindPasswordToggle('set-rg-token', 'btn-toggle-rg-token');
+    var rgTokenForm = document.getElementById('rg-token-settings-form');
+    if (rgTokenForm) {
+      rgTokenForm.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var tokInput = document.getElementById('set-rg-token');
+        var tokMsgEl = document.getElementById('rg-token-action-msg');
+        var saveTokBtn = document.getElementById('btn-save-rg-token');
+        var rawTok = String((tokInput && tokInput.value) || '').trim().replace(/^Bearer\s+/i, '');
+        if (!rawTok || rawTok.length < 15 || /\s/.test(rawTok)) {
+          if (tokMsgEl) {
+            tokMsgEl.className = 'form-error';
+            tokMsgEl.textContent = 'صيغة التوكن غير صالحة. يرجى لصق التوكن كاملاً بدون مسافات (15 حرفاً على الأقل).';
+          }
+          if (tokInput) tokInput.focus();
+          return;
+        }
+        runWithLock(saveTokBtn, 'saveApiToken', async function () {
+          var prevText = saveTokBtn ? saveTokBtn.textContent : '';
+          if (saveTokBtn) saveTokBtn.textContent = 'جاري الحفظ والاختبار...';
+          try {
+            var res = await root.RGApi.callApi('saveApiToken', {
+              token: rawTok,
+              rgToken: rawTok,
+              siteOrigin: window.location.origin,
+              testAfterSave: true
+            });
+            if (res && res.success) {
+              if (tokInput) tokInput.value = '';
+              var connRes = res.data && res.data.connection;
+              var connOk = Boolean(connRes && connRes.connected);
+              var msgText = (connRes && connRes.message)
+                ? ('تم حفظ التوكن بنجاح — ' + connRes.message)
+                : (res.message || 'تم حفظ توكن Rental Gate بنجاح.');
+              if (tokMsgEl) {
+                tokMsgEl.className = (!connRes || connOk) ? 'form-success' : 'form-error';
+                tokMsgEl.textContent = msgText;
+              }
+              ctx.toast(msgText);
+              await render(container, ctx);
+            } else {
+              if (tokMsgEl) {
+                tokMsgEl.className = 'form-error';
+                tokMsgEl.textContent = (res && res.message) || 'تعذر حفظ التوكن.';
+              }
+              ctx.toast((res && res.message) || 'تعذر حفظ التوكن.', true);
+            }
+          } finally {
+            if (saveTokBtn && saveTokBtn.isConnected !== false) saveTokBtn.textContent = prevText;
           }
         });
       });

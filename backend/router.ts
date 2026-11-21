@@ -72,7 +72,10 @@ export async function dispatchCrmRequest(
         result = await handleLogout(executor, session);
         break;
       case 'getMe':
-        result = { user: session.user };
+        result = {
+          user: session.user,
+          layoutPrefs: await queries.getUserLayoutPrefs(executor, session)
+        };
         break;
       case 'getAppBootstrap':
         result = await queries.getAppBootstrap(executor, session, payload);
