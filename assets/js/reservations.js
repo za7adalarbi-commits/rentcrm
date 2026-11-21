@@ -187,11 +187,13 @@
     var hasPreloadedEmps = Boolean(empState && empState.loaded && Array.isArray(empState.items) && empState.items.length > 0);
     var [empRes, resData] = await Promise.all([
       hasPreloadedEmps ? Promise.resolve({ success: true, data: { items: empState.items } }) : root.RGApi.callApi('getEmployees', {}),
-      root.RGApi.callApi('getReservations', state)
+      root.RGApi.callApi('getReservations', Object.assign({}, state, { abortKey: 'res:list' }))
     ]);
+    if (resData && resData.aborted) return;
 
-    var employees = (empRes.success && empRes.data.items) || [];
-    var payload = (resData.success && resData.data) || { items: [], total: 0, page: 1, totalPages: 1, facets: { companies: [], branches: [] } };
+    var employees = (empRes.success && empRes.data && empRes.data.items) || [];
+    var initialLoadError = (!resData || !resData.success) ? ((resData && resData.message) || 'تعذر تحميل قائمة الحجوزات.') : '';
+    var payload = (resData && resData.success && resData.data) || { items: [], total: 0, page: 1, totalPages: 1, facets: { companies: [], branches: [] } };
     var currentItems = payload.items || [];
     var currentTotalPages = payload.totalPages || 1;
     var facets = payload.facets || { companies: [], branches: [] };
@@ -223,11 +225,11 @@
           '</button>' +
           '<button type="button" class="res-view-tab' + (state.viewMode === 'today' ? ' is-active' : '') + '" data-res-view="today" role="tab" aria-selected="' + (state.viewMode === 'today') + '">' +
             '<span>' + (isEn ? 'Today\'s Pickups & Returns' : 'التسليم والاستلام اليوم') + '</span>' +
-            '<span class="res-tab-count tabular-nums" data-testid="today-tab-count" id="res-today-tab-count">0</span>' +
+            '<span class="res-tab-count tabular-nums" data-testid="today-tab-count" id="res-today-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
           '</button>' +
           '<button type="button" class="res-view-tab' + (state.viewMode === 'radar' ? ' is-active' : '') + '" data-res-view="radar" role="tab" aria-selected="' + (state.viewMode === 'radar') + '">' +
             '<span>' + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات (24 ساعة)') + '</span>' +
-            '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count">0</span>' +
+            '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
           '</button>' +
         '</div>' +
         '<div id="res-all-view"' + (state.viewMode !== 'all' ? ' class="hidden"' : '') + '>' +
@@ -511,6 +513,9 @@
           var rid = sel.getAttribute('data-id');
           var nextStatus = sel.value;
           runWithLock(sel, 'quickUpdateReservationStatus:' + rid, function () {
+            var prevItems = currentItems.slice();
+            var targetItem = prevItems.find(function (x) { return x && x.id === rid; });
+            var expectedUpdatedAt = (targetItem && (targetItem.updatedAt || targetItem.lastUpdatedAt)) || '';
             var nowIso = new Date().toISOString();
             var actionText = 'تحديث سريع للحالة إلى: ' + nextStatus;
             currentItems = currentItems.map(function (item) {
@@ -535,17 +540,27 @@
             return root.RGApi.callApi('quickUpdateReservationStatus', {
               reservationId: rid,
               status: nextStatus,
+              expectedUpdatedAt: expectedUpdatedAt,
               _keepOptimisticCache: true
             }).then(function (resp) {
               if (resp && resp.success) {
                 ctx.refreshNotifications();
+                refreshRadarData(false, { forceRefresh: true });
               } else {
-                ctx.toast((resp && resp.message) || 'تعذر تحديث حالة الحجز.', true);
-                refreshTableRegion();
+                currentItems = prevItems;
+                paintCurrentItems();
+                if (resp && resp.error === 'CONFLICT_STALE_DATA') {
+                  ctx.toast(resp.message || 'تم تعديل هذا الحجز من مستخدم آخر، جاري تحديث البيانات...', true);
+                  refreshTableRegion({ forceRefresh: true, silentRefresh: true });
+                  refreshRadarData(false, { forceRefresh: true });
+                } else {
+                  ctx.toast((resp && resp.message) || 'تعذر تحديث حالة الحجز.', true);
+                }
               }
             }).catch(function () {
+              currentItems = prevItems;
+              paintCurrentItems();
               ctx.toast('تعذر الاتصال بالخادم أثناء تحديث الحالة.', true);
-              refreshTableRegion();
             });
           });
         });
@@ -555,6 +570,7 @@
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-id');
           runWithLock(btn, 'claimReservation:' + rid, function () {
+            var prevItems = currentItems.slice();
             currentItems = currentItems.map(function (item) {
               if (item.id !== rid) return item;
               var claimed = root.RGCrmCore.claimReservationRecord(item, currentUser);
@@ -575,12 +591,14 @@
               if (resp && resp.success) {
                 ctx.refreshNotifications();
               } else {
+                currentItems = prevItems;
+                paintCurrentItems();
                 ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true);
-                refreshTableRegion();
               }
             }).catch(function () {
+              currentItems = prevItems;
+              paintCurrentItems();
               ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
-              refreshTableRegion();
             });
           });
         });
@@ -590,6 +608,7 @@
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-id');
           runWithLock(btn, 'unclaimReservation:' + rid, function () {
+            var prevItems = currentItems.slice();
             currentItems = currentItems.map(function (item) {
               if (item.id !== rid) return item;
               var unclaimed = root.RGCrmCore.unclaimReservationRecord(item, currentEmpId);
@@ -610,12 +629,14 @@
               if (resp && resp.success) {
                 ctx.refreshNotifications();
               } else {
+                currentItems = prevItems;
+                paintCurrentItems();
                 ctx.toast((resp && resp.message) || 'تعذر إلغاء استلام الحجز.', true);
-                refreshTableRegion();
               }
             }).catch(function () {
+              currentItems = prevItems;
+              paintCurrentItems();
               ctx.toast('تعذر الاتصال بالخادم أثناء إلغاء الاستلام.', true);
-              refreshTableRegion();
             });
           });
         });
@@ -629,6 +650,25 @@
           });
         });
       });
+    }
+
+    function paintTableError(msg) {
+      var region = container.querySelector('#res-table-region');
+      if (!region) return;
+      region.innerHTML =
+        '<div class="rg-error-banner" role="alert">' +
+          '<div class="rg-error-banner-body">' +
+            '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load reservations' : 'تعذر تحميل الحجوزات') + '</div>' +
+            '<div class="rg-error-banner-msg">' + esc(msg || (isEn ? 'Please retry.' : 'يرجى إعادة المحاولة.')) + '</div>' +
+          '</div>' +
+          '<button type="button" class="btn btn-sm btn-primary" id="res-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+        '</div>';
+      var rBtn = document.getElementById('res-retry-btn');
+      if (rBtn) {
+        rBtn.addEventListener('click', function () {
+          refreshTableRegion({ forceRefresh: true });
+        });
+      }
     }
 
     function paintTableRegion(data) {
@@ -653,17 +693,30 @@
 
     async function refreshTableRegion(opts) {
       var seq = ++activeFetchSeq;
-      var queryPayload = (opts && opts.forceRefresh)
-        ? Object.assign({}, state, { forceRefresh: true })
-        : state;
+      var region = container.querySelector('#res-table-region');
+      if (region && !(opts && opts.silentRefresh) && currentItems.length === 0) {
+        region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+      }
+      var queryPayload = Object.assign({}, state, {
+        forceRefresh: Boolean(opts && opts.forceRefresh),
+        silentRefresh: Boolean(opts && opts.silentRefresh),
+        abortKey: 'res:list'
+      });
       var resp = await root.RGApi.callApi('getReservations', queryPayload);
-      if (seq !== activeFetchSeq) return;
+      if (seq !== activeFetchSeq || !container.isConnected) return;
+      if (resp && resp.aborted) return;
       if (resp && resp.success && resp.data) {
         paintTableRegion(resp.data);
+      } else if (!(opts && opts.silentRefresh) || currentItems.length === 0) {
+        paintTableError((resp && resp.message) || 'تعذر تحميل الحجوزات.');
       }
     }
 
-    paintTableRegion(payload);
+    if (initialLoadError) {
+      paintTableError(initialLoadError);
+    } else {
+      paintTableRegion(payload);
+    }
 
     function applyFilterChange() {
       state.search = document.getElementById('res-search').value;
@@ -880,6 +933,7 @@
     }
 
     var radarRawReservations = null;
+    var radarLoadError = '';
     var radarFetchSeq = 0;
 
     function paintRadarView() {
@@ -895,10 +949,25 @@
           })
         : { items: [], totalCount: 0, upcoming24hCount: 0, critical6hCount: 0, expiredUnclosedCount: 0, extendedInRadarCount: 0 };
 
-      if (badgeEl) badgeEl.textContent = String(summary.totalCount || 0);
+      if (badgeEl && radarRawReservations !== null) {
+        badgeEl.textContent = String(summary.totalCount || 0);
+      }
       if (state.viewMode !== 'radar') return;
 
       if (radarRawReservations === null) {
+        if (radarLoadError) {
+          radarWrap.innerHTML =
+            '<div class="rg-error-banner" role="alert">' +
+              '<div class="rg-error-banner-body">' +
+                '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load 24h Radar' : 'تعذر تحميل رادار 24 ساعة') + '</div>' +
+                '<div class="rg-error-banner-msg">' + esc(radarLoadError) + '</div>' +
+              '</div>' +
+              '<button type="button" class="btn btn-sm btn-primary" id="radar-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+            '</div>';
+          var rRetry = document.getElementById('radar-retry-btn');
+          if (rRetry) rRetry.addEventListener('click', function () { refreshRadarData(true, { forceRefresh: true }); });
+          return;
+        }
         radarWrap.innerHTML = '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
         return;
       }
@@ -1060,10 +1129,25 @@
           })
         : { todayDate: '', items: [], totalCount: 0, pickupCount: 0, returnCount: 0, pendingPickupCount: 0, pendingReturnCount: 0, overdueCount: 0, completedCount: 0 };
 
-      if (badgeEl) badgeEl.textContent = String(summary.totalCount || 0);
+      if (badgeEl && radarRawReservations !== null) {
+        badgeEl.textContent = String(summary.totalCount || 0);
+      }
       if (state.viewMode !== 'today') return;
 
       if (radarRawReservations === null) {
+        if (radarLoadError) {
+          todayWrap.innerHTML =
+            '<div class="rg-error-banner" role="alert">' +
+              '<div class="rg-error-banner-body">' +
+                '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load Today\'s Pickups & Returns' : 'تعذر تحميل جدول التسليم والاستلام لليوم') + '</div>' +
+                '<div class="rg-error-banner-msg">' + esc(radarLoadError) + '</div>' +
+              '</div>' +
+              '<button type="button" class="btn btn-sm btn-primary" id="today-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+            '</div>';
+          var tRetry = document.getElementById('today-retry-btn');
+          if (tRetry) tRetry.addEventListener('click', function () { refreshRadarData(true, { forceRefresh: true }); });
+          return;
+        }
         todayWrap.innerHTML = '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
         return;
       }
@@ -1302,6 +1386,8 @@
           var target = (radarRawReservations || []).find(function (x) { return x && x.id === rid; });
           if (!target || !currentUser) return;
           runWithLock(btn, 'claimReservation:' + rid, function () {
+            var prevAssignedIds = Array.isArray(target.assignedEmployeeIds) ? target.assignedEmployeeIds.slice() : [];
+            var prevAssignedNames = Array.isArray(target.assignedEmployeeNames) ? target.assignedEmployeeNames.slice() : [];
             var claimed = root.RGCrmCore.claimReservationRecord(target, currentUser);
             target.assignedEmployeeIds = claimed.assignedEmployeeIds;
             target.assignedEmployeeNames = claimed.assignedEmployeeNames;
@@ -1313,42 +1399,75 @@
             return root.RGApi.callApi('claimReservation', { reservationId: rid, _keepOptimisticCache: true }).then(function (resp) {
               if (resp && resp.success) {
                 ctx.refreshNotifications();
-                refreshTableRegion();
+                refreshTableRegion({ silentRefresh: true });
               } else {
+                target.assignedEmployeeIds = prevAssignedIds;
+                target.assignedEmployeeNames = prevAssignedNames;
+                paintTodayView();
                 ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true);
-                refreshRadarData(false);
               }
+            }).catch(function () {
+              target.assignedEmployeeIds = prevAssignedIds;
+              target.assignedEmployeeNames = prevAssignedNames;
+              paintTodayView();
+              ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
             });
           });
         });
       });
     }
 
-    async function refreshRadarData(showToast) {
+    async function refreshRadarData(showToast, extraOpts) {
       var seq = ++radarFetchSeq;
+      var opts = extraOpts || {};
+      var core = root.RGCrmCore;
+      var todayDateStr = (core && core.getRiyadhDateString) ? core.getRiyadhDateString() : '';
+      radarLoadError = '';
       if (state.viewMode === 'radar' && radarRawReservations === null) {
         paintRadarView();
       } else if (state.viewMode === 'today' && radarRawReservations === null) {
         paintTodayView();
       }
       try {
-        var resp = await root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true });
+        var resp = await root.RGApi.callApi('getTodayAndRadar', {
+          todayDate: todayDateStr,
+          nowMs: Date.now(),
+          silentRefresh: true,
+          forceRefresh: Boolean(showToast || opts.forceRefresh),
+          abortKey: 'res:todayRadar'
+        });
         if (seq !== radarFetchSeq || !container.isConnected) return;
+        if (resp && resp.aborted) return;
         if (resp && resp.success && resp.data && Array.isArray(resp.data.items)) {
+          radarLoadError = '';
           radarRawReservations = resp.data.items;
         } else if (radarRawReservations === null) {
-          radarRawReservations = currentItems.slice();
+          if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+            radarRawReservations = currentItems.slice();
+          } else {
+            radarLoadError = (resp && resp.message) || 'تعذر تحميل بيانات اليوم والرادار.';
+            var tb = document.getElementById('res-today-tab-count');
+            var rb = document.getElementById('res-radar-tab-count');
+            if (tb) tb.textContent = '!';
+            if (rb) rb.textContent = '!';
+          }
         }
         paintRadarView();
         paintTodayView();
-        if (showToast) {
+        if (showToast && resp && resp.success) {
           ctx.toast(state.viewMode === 'today'
             ? (isEn ? 'Today\'s pickups & returns updated.' : 'تم تحديث جدول التسليم والاستلام لليوم.')
             : (isEn ? '24h Expiry Radar updated.' : 'تم تحديث رادار الانتهاء بنجاح.'));
         }
       } catch (_e) {
         if (seq !== radarFetchSeq || !container.isConnected) return;
-        if (radarRawReservations === null) radarRawReservations = currentItems.slice();
+        if (radarRawReservations === null) {
+          if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+            radarRawReservations = currentItems.slice();
+          } else {
+            radarLoadError = 'تعذر الاتصال بالخادم أثناء تحميل بيانات اليوم والرادار.';
+          }
+        }
         paintRadarView();
         paintTodayView();
       }
@@ -1387,15 +1506,37 @@
       state.priority || state.dateFrom || state.dateTo || state.timeFrom || state.timeTo ||
       state.unfollowedOnly || state.hasProblemsOnly || state.overdueUnpaidOnly
     );
-    if (!hasActiveResFilters && Number(payload.total || 0) <= currentItems.length) {
+    if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
       radarRawReservations = currentItems.slice();
       paintRadarView();
       paintTodayView();
-    } else if (state.viewMode === 'radar' || state.viewMode === 'today') {
-      refreshRadarData(false);
     } else {
-      paintRadarView();
-      paintTodayView();
+      refreshRadarData(false);
+    }
+
+    if (!container._rgResDeltaBound) {
+      container._rgResDeltaBound = true;
+      var onResDeltaSync = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onResDeltaSync);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        var relevant = Boolean(
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          Boolean(d.todayRadarCounts)
+        );
+        if (!relevant) return;
+        var activeEl = document.activeElement;
+        var editingControl = Boolean(activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName));
+        if (editingControl) return;
+        refreshTableRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+        refreshRadarData(false, { forceRefresh: true }).catch(function () {});
+      };
+      document.addEventListener('rg:deltasync', onResDeltaSync);
     }
   }
 
@@ -2061,6 +2202,7 @@
         quickBtn.addEventListener('click', function () {
           var nextStatus = document.getElementById('drawer-quick-status').value;
           var quickNote = String(document.getElementById('drawer-quick-note').value || '').trim();
+          var expectedUpdatedAt = r.updatedAt || r.lastUpdatedAt || '';
           runWithLock(quickBtn, 'quickUpdateReservationStatus:' + r.id, function () {
             var now = new Date();
             var nowIso = now.toISOString();
@@ -2114,6 +2256,7 @@
               reservationId: r.id,
               status: nextStatus,
               note: quickNote,
+              expectedUpdatedAt: expectedUpdatedAt,
               _keepOptimisticCache: true
             }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
@@ -2610,6 +2753,7 @@
       var extDaysVal = Math.max(0, Number(document.getElementById('re-ext-days').value || 0));
       var res = await root.RGApi.callApi('updateReservationDetails', {
         reservationId: reservation.id,
+        expectedUpdatedAt: reservation.updatedAt || reservation.lastUpdatedAt || '',
         customerName: document.getElementById('re-customer').value,
         customerPhone: document.getElementById('re-phone').value,
         customerEmail: document.getElementById('re-email').value,
@@ -2641,7 +2785,9 @@
       });
       if (!res.success) {
         var e = document.getElementById('res-edit-err');
-        e.textContent = res.message;
+        e.textContent = (res.error === 'CONFLICT_STALE_DATA')
+          ? ((res.message || 'تم تعديل الحجز من مستخدم آخر.') + ' يرجى إغلاق النافذة وإعادة فتح الحجز لتحديث البيانات.')
+          : res.message;
         e.classList.remove('hidden');
         return;
       }

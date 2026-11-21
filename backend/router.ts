@@ -1,4 +1,5 @@
 import { handleLogin, handleLogout, hashToken, requireAuth, type AuthSession } from './auth.js';
+import { getMutationSyncSpec, invalidateAndBumpVersion } from './cache.js';
 import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent } from './realtime.js';
@@ -83,6 +84,9 @@ export async function dispatchCrmRequest(
         break;
       case 'getDashboard':
         result = await queries.getDashboard(executor, session, payload);
+        break;
+      case 'getTodayAndRadar':
+        result = await queries.getTodayAndRadar(executor, session, payload);
         break;
       case 'getReservations':
         result = await queries.getReservations(executor, session, payload);
@@ -285,20 +289,24 @@ export async function dispatchCrmRequest(
         };
     }
 
-    const MUTATING_SSE_ACTIONS = new Set([
-      'claimReservation', 'unclaimReservation', 'quickUpdateReservationStatus',
-      'updateReservationDetails', 'saveReservationPinnedNote', 'recordNoAnswerFollowUp',
-      'addFollowUp', 'updateFollowUp', 'assignEmployees', 'removeAssignment',
-      'bulkReassignEmployeeReservations', 'createProblem', 'updateProblem',
-      'saveAnnouncement', 'deleteAnnouncement', 'saveDelegation', 'revokeDelegation',
-      'acquireReservationLock', 'releaseReservationLock', 'pullReservations',
-      'syncRentalGate', 'importReservationsFromExcel', 'updateSettings'
-    ]);
-    if (MUTATING_SSE_ACTIONS.has(action)) {
-      const evType = (action === 'saveAnnouncement' || action === 'deleteAnnouncement')
-        ? 'announcement'
-        : ((action === 'acquireReservationLock' || action === 'releaseReservationLock') ? 'lock' : 'delta');
-      broadcastCrmEvent({ type: evType, action, at: new Date().toISOString(), actorId: session.user.id });
+    const syncSpec = getMutationSyncSpec(action);
+    if (syncSpec) {
+      let version = 0;
+      if (syncSpec.scopes.length > 0) {
+        version = await invalidateAndBumpVersion(executor, syncSpec.scopes, syncSpec.persistVersion).catch(() => 0);
+      }
+      const entityIds: string[] = [];
+      const candidateResId = String(payload?.reservationId || result?.reservation?.id || result?.id || '').trim();
+      if (candidateResId) entityIds.push(candidateResId);
+      broadcastCrmEvent({
+        type: syncSpec.eventType,
+        action,
+        scopes: syncSpec.scopes,
+        entityIds: entityIds.length ? entityIds : undefined,
+        actorId: session.user.id,
+        version: version || undefined,
+        at: new Date().toISOString()
+      });
     }
 
     return {
@@ -310,7 +318,7 @@ export async function dispatchCrmRequest(
   } catch (err: any) {
     const msg = String(err?.message || 'حدث خطأ غير متوقع.');
     const errorCode = msg.includes(':') ? msg.split(':')[0].trim() : 'SERVER_ERROR';
-    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR)/.test(errorCode);
+    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA)/.test(errorCode);
     if (!isExpectedClientErr) {
       await logBackendError(executor, 'router', action, err, { payload });
     }

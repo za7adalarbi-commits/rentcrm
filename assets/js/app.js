@@ -1239,7 +1239,7 @@
           }
           closeCallWrapUpBar();
           if (root.RGApi && root.RGApi.invalidateScopes) {
-            root.RGApi.invalidateScopes(['reservations', 'followups', 'dashboard', 'activity']);
+            root.RGApi.invalidateScopes(['reservations', 'followUps', 'dashboard', 'activity']);
           }
           document.dispatchEvent(new CustomEvent('rg:deltasync', {
             detail: { localMutation: true, reservationId: callInfo.reservationId }
@@ -1933,12 +1933,30 @@
   }
 
   async function renderActivityLog(container, ctx) {
-    var res = await root.RGApi.callApi('getActivityLogs', {});
-    if (!res.success) {
-      container.innerHTML = '<div class="form-error">' + escapeHtml(res.message) + '</div>';
+    var res = await root.RGApi.callApi('getActivityLogs', { abortKey: 'act:logs' });
+    if (res && res.aborted) return;
+    if (!res || !res.success) {
+      var errMsg = (res && res.message) || 'تعذر تحميل سجل النشاطات.';
+      container.innerHTML =
+        '<div class="surface-card">' +
+          '<div class="section-header"><div><h2 class="section-title">' + ctx.t('nav_activity') + '</h2></div></div>' +
+          '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">تعذر تحميل البيانات</div>' +
+              '<div class="rg-error-banner-msg">' + escapeHtml(errMsg) + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="act-retry-btn">إعادة المحاولة</button>' +
+          '</div>' +
+        '</div>';
+      var actRetryBtn = document.getElementById('act-retry-btn');
+      if (actRetryBtn) {
+        actRetryBtn.addEventListener('click', function () {
+          renderActivityLog(container, ctx);
+        });
+      }
       return;
     }
-    var items = res.data.items || [];
+    var items = (res.data && res.data.items) || [];
     container.innerHTML =
       '<div class="surface-card">' +
         '<div class="section-header"><div><h2 class="section-title">' + ctx.t('nav_activity') + '</h2><p class="section-subtitle">سجل غير قابل للتعديل أو الحذف لجميع عمليات النظام مع مقارنة القيم قبل وبعد التعديل.</p></div></div>' +
@@ -2379,20 +2397,29 @@
       isInstantlyReady = Boolean(root.RGApi.hasCached(primReq.action, primReq.payload));
     }
 
-    var skeletonTimer = isInstantlyReady ? null : setTimeout(function () {
-      if (seq === routeRenderSeq && slot.parentNode === container && slot.childElementCount === 0) {
-        slot.innerHTML = buildLoadingSkeletonHtml(routeTitle);
-      }
-    }, 85);
+    if (!isInstantlyReady) {
+      slot.innerHTML = buildLoadingSkeletonHtml(routeTitle);
+    }
 
     var ctx = buildAppCtx();
 
     try {
       await renderActiveRouteView(slot, ctx, { silent: false });
     } catch (err) {
-      slot.innerHTML = '<div class="form-error">' + ((err && err.message) || 'حدث خطأ أثناء عرض الصفحة.') + '</div>';
-    } finally {
-      if (skeletonTimer) clearTimeout(skeletonTimer);
+      slot.innerHTML =
+        '<div class="surface-card">' +
+          '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">تعذر عرض الصفحة</div>' +
+              '<div class="rg-error-banner-msg">' + escapeHtml((err && err.message) || 'حدث خطأ أثناء عرض الصفحة.') + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="route-retry-btn">إعادة المحاولة</button>' +
+          '</div>' +
+        '</div>';
+      var routeRetry = document.getElementById('route-retry-btn');
+      if (routeRetry) {
+        routeRetry.addEventListener('click', function () { renderRoute(); });
+      }
     }
   }
 
@@ -3152,6 +3179,23 @@
     }
   }
 
+  var seenSseEventIds = {};
+  var seenSseEventOrder = [];
+
+  function recordSseEventOnce(evData) {
+    if (!evData || typeof evData !== 'object') return true;
+    var key = String(evData.version || evData.at || '') + ':' + String(evData.type || '') + ':' + String(evData.action || '');
+    if (key === '::') return true;
+    if (seenSseEventIds[key]) return false;
+    seenSseEventIds[key] = true;
+    seenSseEventOrder.push(key);
+    if (seenSseEventOrder.length > 100) {
+      var oldest = seenSseEventOrder.shift();
+      delete seenSseEventIds[oldest];
+    }
+    return true;
+  }
+
   async function runDeltaSync() {
     var curUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     if (!curUser) return;
@@ -3168,6 +3212,10 @@
       if (!res || !res.success || !res.data) return;
       var d = res.data;
       if (d.serverTime) state.lastDeltaSyncAt = d.serverTime;
+
+      if (root.RGApi && typeof root.RGApi.applyDeltaSyncToCache === 'function') {
+        root.RGApi.applyDeltaSyncToCache(d);
+      }
 
       if (d.notifications) {
         var nextNotifFp = computeFingerprintSafe(d.notifications);
@@ -3194,17 +3242,50 @@
         }
       }
 
+      var hasEmployeeChanges = Boolean(
+        (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+        (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0)
+      );
+      if (hasEmployeeChanges && state.employees && state.employees.loaded) {
+        var prevEmpItems = Array.isArray(state.employees.items) ? state.employees.items.slice() : [];
+        var mergedEmps = (root.RGCrmCore && root.RGCrmCore.mergeDeltaRecords)
+          ? root.RGCrmCore.mergeDeltaRecords(prevEmpItems, d.changedEmployees || [], 'id')
+          : prevEmpItems;
+        if (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) {
+          var delEmpMap = {};
+          d.deletedEmployeeIds.forEach(function (did) { if (did) delEmpMap[String(did)] = true; });
+          mergedEmps = mergedEmps.filter(function (emp) { return emp && !delEmpMap[String(emp.id)]; });
+        }
+        setEmployeesState({
+          items: mergedEmps,
+          lastUpdatedAt: new Date().toISOString()
+        });
+      }
+
       var hasChanges = Boolean(
         (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+        (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
         (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
-        (Array.isArray(d.changedProblems) && d.changedProblems.length > 0)
+        (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+        hasEmployeeChanges ||
+        Boolean(d.todayRadarCounts)
       );
+
+      if (hasChanges && root.RGApi && root.RGApi.invalidateScopes) {
+        var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps'];
+        if (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) {
+          scopesToInvalidate.push('reservations', 'followUps', 'problems');
+        }
+        if (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) {
+          scopesToInvalidate.push('employees');
+        }
+        root.RGApi.invalidateScopes(scopesToInvalidate);
+      }
 
       document.dispatchEvent(new CustomEvent('rg:deltasync', { detail: d }));
 
-      if (hasChanges && root.RGApi && root.RGApi.invalidateScopes) {
-        root.RGApi.invalidateScopes(['reservations', 'followups', 'problems', 'dashboard', 'activity', 'reports']);
-        if (canRunSilentAutoRefreshNow()) {
+      if (hasChanges && canRunSilentAutoRefreshNow()) {
+        if (state.route === 'activity' || state.route === 'reports') {
           refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
         }
       }
@@ -3220,7 +3301,7 @@
     deltaDebounceTimer = setTimeout(function () {
       deltaDebounceTimer = null;
       runDeltaSync().catch(function () {});
-    }, 400);
+    }, 180);
   }
 
   function stopSseConnection() {
@@ -3234,6 +3315,24 @@
     }
   }
 
+  function handleIncomingSseEvent(ev) {
+    var evData = null;
+    if (ev && ev.data) {
+      try { evData = JSON.parse(ev.data); } catch (_e) { evData = null; }
+    }
+    if (evData && !recordSseEventOnce(evData)) return;
+
+    var curUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    if (evData && curUser && evData.actorId && String(evData.actorId) === String(curUser.id)) {
+      if (Array.isArray(evData.scopes) && evData.scopes.length && root.RGApi && root.RGApi.clearCache) {
+        root.RGApi.clearCache(evData.scopes);
+      }
+      return;
+    }
+
+    scheduleDebouncedDeltaSync();
+  }
+
   function startSseConnection() {
     stopSseConnection();
     if (typeof EventSource === 'undefined') return;
@@ -3244,13 +3343,14 @@
     try {
       var src = new EventSource('/api/events?token=' + encodeURIComponent(token));
       sseSource = src;
-      src.addEventListener('delta', scheduleDebouncedDeltaSync);
-      src.addEventListener('announcement', scheduleDebouncedDeltaSync);
-      src.addEventListener('lock', scheduleDebouncedDeltaSync);
+      src.addEventListener('crm', handleIncomingSseEvent);
+      src.addEventListener('delta', handleIncomingSseEvent);
+      src.addEventListener('announcement', handleIncomingSseEvent);
+      src.addEventListener('lock', handleIncomingSseEvent);
       src.onerror = function () {
         stopSseConnection();
         if (root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser() && !isAppOfflineNow()) {
-          sseReconnectTimer = setTimeout(startSseConnection, 15000);
+          sseReconnectTimer = setTimeout(startSseConnection, 10000);
         }
       };
     } catch (_e) {}
@@ -3294,7 +3394,7 @@
         if (document.visibilityState === 'visible') {
           scheduleRefreshInterval();
           runDeltaSync().catch(function () {});
-          if (lastHiddenAt && (Date.now() - lastHiddenAt >= 30000)) {
+          if (lastHiddenAt && (Date.now() - lastHiddenAt >= 5000)) {
             lastHiddenAt = 0;
             refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
           }
@@ -3320,6 +3420,11 @@
       });
       window.addEventListener('rg:offlinequeuechange', function () {
         updateOfflineBanner().catch(function () {});
+      });
+      window.addEventListener('storage', function (ev) {
+        if (ev && ev.key && String(ev.key).indexOf('rg_crm_sandbox') !== -1) {
+          scheduleDebouncedDeltaSync();
+        }
       });
     }
   }
@@ -3418,6 +3523,13 @@
       if (consumed.data.notifications) applyNotificationsState(consumed.data.notifications);
       await renderRoute();
       startAutoRefreshLoop();
+      if (root.RGApi && root.RGApi.hasCached && !root.RGApi.hasCached('getTodayAndRadar', {})) {
+        root.RGApi.callApi('getTodayAndRadar', {
+          todayDate: (root.RGCrmCore && root.RGCrmCore.getRiyadhDateString) ? root.RGCrmCore.getRiyadhDateString() : '',
+          nowMs: Date.now(),
+          silentRefresh: true
+        }).catch(function () {});
+      }
       return;
     }
 
@@ -3439,6 +3551,13 @@
         if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
         await renderRoute();
         startAutoRefreshLoop();
+        if (root.RGApi && root.RGApi.hasCached && !root.RGApi.hasCached('getTodayAndRadar', {})) {
+          root.RGApi.callApi('getTodayAndRadar', {
+            todayDate: (root.RGCrmCore && root.RGCrmCore.getRiyadhDateString) ? root.RGCrmCore.getRiyadhDateString() : '',
+            nowMs: Date.now(),
+            silentRefresh: true
+          }).catch(function () {});
+        }
         return;
       }
       if (bootRes && String(bootRes.error || '').indexOf('UNAUTHORIZED') === 0) {
@@ -3476,6 +3595,13 @@
     ]);
     state.lastDeltaSyncAt = new Date().toISOString();
     startAutoRefreshLoop();
+    if (root.RGApi && root.RGApi.hasCached && !root.RGApi.hasCached('getTodayAndRadar', {})) {
+      root.RGApi.callApi('getTodayAndRadar', {
+        todayDate: (root.RGCrmCore && root.RGCrmCore.getRiyadhDateString) ? root.RGCrmCore.getRiyadhDateString() : '',
+        nowMs: Date.now(),
+        silentRefresh: true
+      }).catch(function () {});
+    }
   }
 
   root.RGApp = {

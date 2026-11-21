@@ -1,6 +1,8 @@
 import { crmCore, generateId, parseJsonArray } from './auth.js';
+import { invalidateAndBumpVersion } from './cache.js';
 import type { DbClient, DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
+import { broadcastCrmEvent } from './realtime.js';
 import { resolveServerConfig } from './serverConfig.js';
 
 export interface SyncActor {
@@ -928,6 +930,22 @@ export async function ingestIncrementalSyncBatch(
     });
 
     const finishedAt = new Date().toISOString();
+    if (importedCount > 0 || updatedCount > 0 || extensionsCount > 0) {
+      const version = await invalidateAndBumpVersion(
+        executor,
+        ['reservations', 'todayRadar', 'dashboard', 'reports', 'activity', 'sync'],
+        true
+      ).catch(() => 0);
+      broadcastCrmEvent({
+        type: 'delta',
+        action: 'ingestSyncBatch',
+        scopes: ['reservations', 'todayRadar', 'dashboard', 'reports', 'sync'],
+        entityIds: changedReservations.map((r: any) => str(r?.id)).filter(Boolean).slice(0, 50),
+        actorId: actor.id,
+        version: version || undefined,
+        at: finishedAt
+      });
+    }
     return {
       syncId,
       status: 'success',

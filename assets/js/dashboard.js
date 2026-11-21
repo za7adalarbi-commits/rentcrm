@@ -791,7 +791,7 @@
     var stripWrap = kpisEl.querySelector('#dash-kpis-strip');
 
     if (heroWrap) {
-      if (heroWrap.children.length === heroDefs.length) {
+      if (heroWrap.children.length === heroDefs.length && heroWrap.querySelector('[data-kpi-key]')) {
         heroDefs.forEach(function (item) {
           var btn = heroWrap.querySelector('[data-kpi-key="' + item.key + '"]');
           if (!btn) return;
@@ -805,12 +805,13 @@
         });
       } else {
         heroWrap.innerHTML = heroDefs.map(function (item) {
+          var v = Math.max(0, Math.round(Number(k[item.key] || 0)));
           return '<button type="button" class="kpi-hero-card kpi-hero-' + item.tone + '" data-kpi-key="' + item.key + '" data-kpi-route="' + item.route + '" data-kpi-status="' + item.status + '">' +
             '<div class="kpi-hero-top">' +
               '<span class="kpi-hero-medallion">' + renderHeroIcon(item.icon) + '</span>' +
               '<div class="kpi-hero-meta">' +
                 '<span class="kpi-hero-label">' + esc(item.label) + '</span>' +
-                '<span class="kpi-hero-value tabular-nums" data-val="0">' + Number(k[item.key] || 0) + '</span>' +
+                '<span class="kpi-hero-value tabular-nums" data-val="' + v + '">' + v + '</span>' +
               '</div>' +
             '</div>' +
             '<div class="kpi-hero-bottom">' +
@@ -819,15 +820,11 @@
             '</div>' +
           '</button>';
         }).join('');
-        heroDefs.forEach(function (item) {
-          var valEl = heroWrap.querySelector('[data-kpi-key="' + item.key + '"] .kpi-hero-value');
-          if (valEl) animateKpiNumber(valEl, Number(k[item.key] || 0));
-        });
       }
     }
 
     if (stripWrap) {
-      if (stripWrap.children.length === stripDefs.length) {
+      if (stripWrap.children.length === stripDefs.length && stripWrap.querySelector('[data-kpi-key]')) {
         stripDefs.forEach(function (item) {
           var btn = stripWrap.querySelector('[data-kpi-key="' + item.key + '"]');
           if (!btn) return;
@@ -1219,11 +1216,14 @@
     }
 
     function buildSectionBodyHtml(secId) {
+      var kpiSkelHero = '<div class="rg-kpi-skeleton-card"></div><div class="rg-kpi-skeleton-card"></div><div class="rg-kpi-skeleton-card"></div><div class="rg-kpi-skeleton-card"></div>';
+      var kpiSkelStrip = '<div class="rg-kpi-skeleton-card" style="min-height:76px;"></div><div class="rg-kpi-skeleton-card" style="min-height:76px;"></div><div class="rg-kpi-skeleton-card" style="min-height:76px;"></div><div class="rg-kpi-skeleton-card" style="min-height:76px;"></div>';
+      var feedSkel = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       switch (secId) {
         case 'hero_kpis':
-          return '<div class="kpi-hero-grid" id="dash-kpis-hero"></div>';
+          return '<div class="kpi-hero-grid" id="dash-kpis-hero">' + kpiSkelHero + '</div>';
         case 'strip_kpis':
-          return '<div class="kpi-strip-grid" id="dash-kpis-strip"></div>';
+          return '<div class="kpi-strip-grid" id="dash-kpis-strip">' + kpiSkelStrip + '</div>';
         case 'daily_chart':
           return '<section class="chart-card" id="dash-daily-chart-card">' +
             '<div class="chart-card-head">' +
@@ -1238,7 +1238,7 @@
               '<h3 class="chart-card-title">' + chartHeaderIcon('M13 2L3 14h9l-1 8 10-12h-9l1-8z') + t('recent_activity') + '</h3>' +
               '<button type="button" class="btn btn-sm dash-jump-btn" data-jump="activity">' + t('view_all') + '</button>' +
             '</div>' +
-            '<div id="dash-recent-activity"></div>' +
+            '<div id="dash-recent-activity">' + feedSkel + '</div>' +
           '</section>';
         case 'charts_grid':
           return '<div class="charts-grid" id="dash-charts-grid">' +
@@ -1286,13 +1286,13 @@
         case 'expiry_radar':
           return '<section class="chart-card" id="dash-expiry-radar-section">' +
             '<div class="chart-card-head">' +
-              '<h3 class="chart-card-title">' + chartHeaderIcon('M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10zM12 6v6l4 2') + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات خلال 24 ساعة') + ' <span class="chart-sub-hint tabular-nums" id="dash-radar-count">0</span></h3>' +
+              '<h3 class="chart-card-title">' + chartHeaderIcon('M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10zM12 6v6l4 2') + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات خلال 24 ساعة') + ' <span class="chart-sub-hint tabular-nums" id="dash-radar-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span></h3>' +
               '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                 '<button type="button" class="btn btn-sm" id="dash-open-today-btn">' + (isEn ? 'Today\'s Pickups & Returns' : 'التسليم والاستلام اليوم') + '</button>' +
                 '<button type="button" class="btn btn-sm btn-primary" id="dash-open-radar-btn">' + (isEn ? 'Open 24h Radar' : 'فتح رادار 24 ساعة') + '</button>' +
               '</div>' +
             '</div>' +
-            '<div id="dash-expiry-radar-feed"></div>' +
+            '<div id="dash-expiry-radar-feed">' + feedSkel + '</div>' +
           '</section>';
         case 'peak_heatmap':
           return '<section class="chart-card" id="dash-peak-heatmap-section">' +
@@ -1300,7 +1300,7 @@
               '<h3 class="chart-card-title">' + chartHeaderIcon('M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z') + (isEn ? 'Peak Hours Heatmap (Shift Planning)' : 'مصفوفة ساعات الذروة (تخطيط الورديات)') + '</h3>' +
               '<span class="chart-sub-hint">' + (isEn ? '7 Days × 24 Hours' : '7 أيام × 24 ساعة') + '</span>' +
             '</div>' +
-            '<div id="dash-peak-heatmap"></div>' +
+            '<div id="dash-peak-heatmap">' + feedSkel + '</div>' +
           '</section>';
         case 'bottom_bento':
           return '<div class="dash-bento-bottom" id="dash-bottom-bento">' +
@@ -1309,14 +1309,14 @@
                 '<h3 class="chart-card-title">' + chartHeaderIcon('M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z') + t('recent_reservations') + '</h3>' +
                 '<button type="button" class="btn btn-sm dash-jump-btn" data-jump="reservations">' + t('view_all') + '</button>' +
               '</div>' +
-              '<div id="dash-recent-reservations"></div>' +
+              '<div id="dash-recent-reservations">' + feedSkel + '</div>' +
             '</section>' +
             '<section class="chart-card">' +
               '<div class="chart-card-head">' +
                 '<h3 class="chart-card-title">' + chartHeaderIcon('M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z') + t('active_problems') + '</h3>' +
                 '<button type="button" class="btn btn-sm dash-jump-btn" data-jump="problems">' + t('view_all') + '</button>' +
               '</div>' +
-              '<div id="dash-open-problems"></div>' +
+              '<div id="dash-open-problems">' + feedSkel + '</div>' +
             '</section>' +
             '<section class="dash-command-banner">' +
               '<div style="position:relative;z-index:1;">' +
@@ -1749,92 +1749,148 @@
       if (cw) cw.style.display = state.range === 'custom' ? '' : 'none';
     }
 
+    function renderFeedErrorBanner(host, msg, onRetry) {
+      if (!host) return;
+      host.innerHTML =
+        '<div class="rg-error-banner" role="alert">' +
+          '<div class="rg-error-banner-body">' +
+            '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load data' : 'تعذر تحميل البيانات') + '</div>' +
+            '<div class="rg-error-banner-msg">' + esc(msg || (isEn ? 'Please retry.' : 'يرجى إعادة المحاولة.')) + '</div>' +
+          '</div>' +
+          '<button type="button" class="btn btn-sm btn-primary rg-feed-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+        '</div>';
+      var rBtn = host.querySelector('.rg-feed-retry-btn');
+      if (rBtn && typeof onRetry === 'function') {
+        rBtn.addEventListener('click', onRetry);
+      }
+    }
+
     async function loadSecondaryFeeds(seq, preloadedActivity, forceLocalOnly) {
       try {
         var needActivity = Boolean(visBySec.recent_activity && visBySec.recent_activity.shouldRenderData);
         var needRes = Boolean(
           (visBySec.bottom_bento && visBySec.bottom_bento.shouldRenderData) ||
-          (visBySec.expiry_radar && visBySec.expiry_radar.shouldRenderData) ||
           (visBySec.peak_heatmap && visBySec.peak_heatmap.shouldRenderData)
         );
+        var needRadar = Boolean(visBySec.expiry_radar && visBySec.expiry_radar.shouldRenderData);
         var needPrb = Boolean(
           (visBySec.bottom_bento && visBySec.bottom_bento.shouldRenderData) ||
           (visBySec.peak_heatmap && visBySec.peak_heatmap.shouldRenderData)
         );
-        if (!needActivity && !needRes && !needPrb) return;
+        if (!needActivity && !needRes && !needPrb && !needRadar) return;
 
         var cachedSec = state._lastSecondaryData || null;
         var hasCachedAct = Boolean(cachedSec && Array.isArray(cachedSec.actItems));
         var hasCachedRes = Boolean(cachedSec && Array.isArray(cachedSec.resItems));
         var hasCachedPrb = Boolean(cachedSec && Array.isArray(cachedSec.prbItems));
+        var hasCachedRadar = Boolean(cachedSec && Array.isArray(cachedSec.radarItems));
 
         var actFromDash = Array.isArray(preloadedActivity) ? preloadedActivity : null;
         var fetchAct = needActivity && !actFromDash && !(forceLocalOnly && hasCachedAct);
         var fetchRes = needRes && !(forceLocalOnly && hasCachedRes);
         var fetchPrb = needPrb && !(forceLocalOnly && hasCachedPrb);
+        var fetchRadar = needRadar && !(forceLocalOnly && hasCachedRadar);
 
         var actItems = actFromDash || (hasCachedAct ? cachedSec.actItems : []);
         var resItems = hasCachedRes ? cachedSec.resItems : [];
         var prbItems = hasCachedPrb ? cachedSec.prbItems : [];
+        var radarItems = hasCachedRadar ? cachedSec.radarItems : [];
 
-        if (fetchAct || fetchRes || fetchPrb) {
-          var [actRes, resRes, prbRes] = await Promise.all([
-            fetchAct ? root.RGApi.callApi('getActivityLogs', { silentRefresh: true }) : Promise.resolve(null),
-            fetchRes ? root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true }) : Promise.resolve(null),
-            fetchPrb ? root.RGApi.callApi('getProblems', { silentRefresh: true }) : Promise.resolve(null)
+        var actErr = '';
+        var resErr = '';
+        var prbErr = '';
+        var radarErr = '';
+
+        if (fetchAct || fetchRes || fetchPrb || fetchRadar) {
+          var todayDateStr = (root.RGCrmCore && root.RGCrmCore.getRiyadhDateString)
+            ? root.RGCrmCore.getRiyadhDateString()
+            : '';
+          var [actRes, resRes, prbRes, radarRes] = await Promise.all([
+            fetchAct ? root.RGApi.callApi('getActivityLogs', { silentRefresh: true, abortKey: 'dash:act' }) : Promise.resolve(null),
+            fetchRes ? root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true, abortKey: 'dash:res' }) : Promise.resolve(null),
+            fetchPrb ? root.RGApi.callApi('getProblems', { silentRefresh: true, abortKey: 'dash:prb' }) : Promise.resolve(null),
+            fetchRadar ? root.RGApi.callApi('getTodayAndRadar', { todayDate: todayDateStr, nowMs: Date.now(), silentRefresh: true, abortKey: 'dash:radar' }) : Promise.resolve(null)
           ]);
           if (seq !== dashLoadSeq || !container.isConnected) return;
 
-          if (actRes && actRes.success && actRes.data && Array.isArray(actRes.data.items)) {
-            actItems = actRes.data.items;
+          if (actRes && !actRes.aborted) {
+            if (actRes.success && actRes.data && Array.isArray(actRes.data.items)) {
+              actItems = actRes.data.items;
+            } else if (!actRes.success && !hasCachedAct) {
+              actErr = actRes.message || 'تعذر تحميل سجل النشاطات.';
+            }
           }
-          if (resRes && resRes.success && resRes.data && Array.isArray(resRes.data.items)) {
-            resItems = resRes.data.items;
+          if (resRes && !resRes.aborted) {
+            if (resRes.success && resRes.data && Array.isArray(resRes.data.items)) {
+              resItems = resRes.data.items;
+            } else if (!resRes.success && !hasCachedRes) {
+              resErr = resRes.message || 'تعذر تحميل الحجوزات.';
+            }
           }
-          if (prbRes && prbRes.success && prbRes.data && Array.isArray(prbRes.data.items)) {
-            prbItems = prbRes.data.items;
+          if (prbRes && !prbRes.aborted) {
+            if (prbRes.success && prbRes.data && Array.isArray(prbRes.data.items)) {
+              prbItems = prbRes.data.items;
+            } else if (!prbRes.success && !hasCachedPrb) {
+              prbErr = prbRes.message || 'تعذر تحميل المشكلات.';
+            }
+          }
+          if (radarRes && !radarRes.aborted) {
+            if (radarRes.success && radarRes.data && Array.isArray(radarRes.data.items)) {
+              radarItems = radarRes.data.items;
+            } else if (!radarRes.success && !hasCachedRadar) {
+              if (resItems.length > 0) {
+                radarItems = resItems;
+              } else {
+                radarErr = radarRes.message || 'تعذر تحميل بيانات رادار 24 ساعة.';
+              }
+            }
           }
           state._lastSecondaryData = {
             actItems: actItems,
             resItems: resItems,
-            prbItems: prbItems
+            prbItems: prbItems,
+            radarItems: radarItems
           };
         } else if (actFromDash && (!cachedSec || !cachedSec.actItems)) {
           state._lastSecondaryData = {
             actItems: actItems,
             resItems: resItems,
-            prbItems: prbItems
+            prbItems: prbItems,
+            radarItems: radarItems
           };
         }
 
         var dashTimeFormat = ctx.getTimeFormat ? ctx.getTimeFormat() : undefined;
+        var retrySecondary = function () {
+          loadSecondaryFeeds(dashLoadSeq, null, false);
+        };
         if (needActivity) {
-          renderLiveActivityFeed(
-            container.querySelector('#dash-recent-activity'),
-            actItems,
-            ctx.lang,
-            dashTimeFormat
-          );
+          var actHost = container.querySelector('#dash-recent-activity');
+          if (actErr) renderFeedErrorBanner(actHost, actErr, retrySecondary);
+          else renderLiveActivityFeed(actHost, actItems, ctx.lang, dashTimeFormat);
         }
         if (visBySec.bottom_bento && visBySec.bottom_bento.shouldRenderData) {
-          renderRecentReservationsFeed(
-            container.querySelector('#dash-recent-reservations'),
-            resItems.slice(0, 4),
-            ctx
-          );
-          renderActiveProblemsFeed(
-            container.querySelector('#dash-open-problems'),
-            prbItems,
-            ctx
-          );
+          var recentResHost = container.querySelector('#dash-recent-reservations');
+          if (resErr) renderFeedErrorBanner(recentResHost, resErr, retrySecondary);
+          else renderRecentReservationsFeed(recentResHost, resItems.slice(0, 4), ctx);
+
+          var openPrbHost = container.querySelector('#dash-open-problems');
+          if (prbErr) renderFeedErrorBanner(openPrbHost, prbErr, retrySecondary);
+          else renderActiveProblemsFeed(openPrbHost, prbItems, ctx);
         }
-        if (visBySec.expiry_radar && visBySec.expiry_radar.shouldRenderData) {
-          renderExpiryRadarFeed(
-            container.querySelector('#dash-expiry-radar-feed'),
-            container.querySelector('#dash-radar-count'),
-            resItems,
-            ctx
-          );
+        if (needRadar) {
+          var radarFeedHost = container.querySelector('#dash-expiry-radar-feed');
+          var radarBadgeHost = container.querySelector('#dash-radar-count');
+          if (radarErr) {
+            renderFeedErrorBanner(radarFeedHost, radarErr, retrySecondary);
+          } else {
+            renderExpiryRadarFeed(
+              radarFeedHost,
+              radarBadgeHost,
+              radarItems.length ? radarItems : resItems,
+              ctx
+            );
+          }
         }
         if (visBySec.peak_heatmap && visBySec.peak_heatmap.shouldRenderData) {
           renderPeakHoursHeatmap(
@@ -1860,13 +1916,29 @@
           range: state.range,
           dateFrom: state.dateFrom,
           dateTo: state.dateTo,
-          silentRefresh: Boolean(pOpts.silentRefresh)
+          silentRefresh: Boolean(pOpts.silentRefresh),
+          forceRefresh: Boolean(pOpts.forceRefresh),
+          abortKey: 'dash:main'
         });
         if (seq !== dashLoadSeq || !container.isConnected) return;
+        if (res && res.aborted) return;
 
         if (!res || !res.success) {
           if (!pOpts.silentRefresh && sectionsHost) {
-            sectionsHost.innerHTML = '<div class="form-error" style="grid-column:span 12;">' + ((res && res.message) || 'تعذر تحميل لوحة التحكم.') + '</div>';
+            sectionsHost.innerHTML =
+              '<div class="rg-error-banner" role="alert" style="grid-column:span 12;">' +
+                '<div class="rg-error-banner-body">' +
+                  '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load dashboard' : 'تعذر تحميل لوحة التحكم') + '</div>' +
+                  '<div class="rg-error-banner-msg">' + esc((res && res.message) || 'تعذر تحميل لوحة التحكم.') + '</div>' +
+                '</div>' +
+                '<button type="button" class="btn btn-sm btn-primary" id="dash-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+              '</div>';
+            var dashRetryBtn = document.getElementById('dash-retry-btn');
+            if (dashRetryBtn) {
+              dashRetryBtn.addEventListener('click', function () {
+                render(container, ctx, { forceRebuild: true });
+              });
+            }
           }
           return;
         }
@@ -1878,6 +1950,11 @@
       var chartsData = dashData.charts || {};
       paintKpis(sectionsHost, kpisData, chartsData, t, ctx.lang);
 
+      var radarCountEl = container.querySelector('#dash-radar-count');
+      if (radarCountEl && dashData.todayRadarCounts && typeof dashData.todayRadarCounts.radarCount === 'number') {
+        radarCountEl.textContent = String(dashData.todayRadarCounts.radarCount);
+      }
+
       var statPill = container.querySelector('#dash-banner-stat-pill');
       if (statPill) {
         statPill.textContent = ctx.lang === 'en'
@@ -1888,6 +1965,28 @@
       ctx.state.lastDashboardCharts = chartsData;
       renderCharts(chartsData, t, ctx, Boolean(pOpts.isUpdate || isShellMounted || pOpts.localOnly));
       loadSecondaryFeeds(seq, dashData.recentActivity, Boolean(pOpts.localOnly));
+    }
+
+    if (!container._rgDashDeltaBound) {
+      container._rgDashDeltaBound = true;
+      var onDashDeltaSync = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onDashDeltaSync);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        var relevant = Boolean(
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          Boolean(d.todayRadarCounts)
+        );
+        if (relevant) {
+          loadAndPaint({ isUpdate: true, silentRefresh: true, forceRefresh: true }).catch(function () {});
+        }
+      };
+      document.addEventListener('rg:deltasync', onDashDeltaSync);
     }
 
     await loadAndPaint({

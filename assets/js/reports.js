@@ -1093,6 +1093,10 @@
 
     async function loadPreview(logExport) {
       var seq = ++previewSeq;
+      var wrap = document.getElementById('report-preview-wrap');
+      if (wrap && !logExport) {
+        wrap.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+      }
       var params = {
         reportType: state.reportType,
         dateFrom: document.getElementById('rep-from').value,
@@ -1100,14 +1104,25 @@
         employeeId: document.getElementById('rep-emp').value,
         company: document.getElementById('rep-company').value,
         branch: document.getElementById('rep-branch').value,
-        logExport: Boolean(logExport)
+        logExport: Boolean(logExport),
+        abortKey: 'rep:preview'
       };
       var r = await root.RGApi.callApi('getReports', params);
-      if (seq !== previewSeq) return;
-      var wrap = document.getElementById('report-preview-wrap');
+      if (seq !== previewSeq || !container.isConnected) return;
+      if (r && r.aborted) return;
+      wrap = document.getElementById('report-preview-wrap');
       if (!wrap) return;
-      if (!r.success) {
-        wrap.innerHTML = '<div class="form-error">' + r.message + '</div>';
+      if (!r || !r.success) {
+        wrap.innerHTML =
+          '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">' + (ctx.lang === 'en' ? 'Failed to load report' : 'تعذر تحميل التقرير') + '</div>' +
+              '<div class="rg-error-banner-msg">' + String((r && r.message) || 'تعذر تحميل بيانات التقرير.').replace(/</g, '&lt;') + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="rep-retry-btn">' + (ctx.lang === 'en' ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+          '</div>';
+        var repRetry = document.getElementById('rep-retry-btn');
+        if (repRetry) repRetry.addEventListener('click', function () { loadPreview(false); });
         return;
       }
       if (r.data && r.data.facets) {

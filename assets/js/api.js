@@ -204,15 +204,19 @@
   var SWR_STALE_MAX_MS = 300000;
   var IDB_KV_MAX_AGE_MS = 86400000; // 24 hours persistent IndexedDB KV window
   var sandboxDbCache = null;
+  var sandboxDbRawCache = null;
   var apiResponseCache = {};
   var inFlightRequests = {};
   var inFlightMutations = {};
   var inFlightWarm = {};
+  var activeAbortControllers = {};
+  var abortRequestSeq = 0;
   var persistTimer = null;
   var persistIdleId = null;
 
   var hydratedNamespaces = {};
   var hydrationPromises = {};
+  var readyPromisesByNs = {};
   var revalidatedInPage = {};
   var localReservationsFreshInPage = {};
   var localReservationsByNs = {};
@@ -538,8 +542,8 @@
     );
     if (syncRes && syncRes.invalidated) {
       var invScopes = syncRes.epochChanged
-        ? ['dashboard', 'reservations', 'reports', 'followups', 'problems', 'employees', 'notifications', 'activity']
-        : ['dashboard'];
+        ? ['dashboard', 'todayRadar', 'reservations', 'reports', 'followUps', 'problems', 'employees', 'notifications', 'activity', 'announcements', 'settings']
+        : ['dashboard', 'todayRadar'];
       invalidateInMemoryByScopes(invScopes);
     }
     return syncRes;
@@ -598,9 +602,12 @@
   async function ready() {
     await probeBackendHealth();
     var ns = getCacheNamespace();
-    await ensureHydrated(ns);
-    await runBootSyncCheck(ns, false);
-    return true;
+    if (hydratedNamespaces[ns]) return true;
+    if (readyPromisesByNs[ns]) return readyPromisesByNs[ns];
+    readyPromisesByNs[ns] = ensureHydrated(ns).finally(function () {
+      delete readyPromisesByNs[ns];
+    });
+    return readyPromisesByNs[ns];
   }
 
   function hydrateApiCache() {
@@ -687,7 +694,7 @@
   // Kick off backend health detection and IndexedDB hydration immediately at boot without blocking
   probeBackendHealth().then(function () {
     return ensureHydrated(getCacheNamespace());
-  });
+  }).catch(function () {});
 
   function clearCache(scopes) {
     var ns = getCacheNamespace();
@@ -707,7 +714,16 @@
       }
       return Promise.resolve();
     }
-    var list = Array.isArray(scopes) ? scopes : [scopes];
+    var SCOPE_ALIASES = {
+      followups: 'followUps',
+      teamfollowups: 'followUps',
+      todayradar: 'todayRadar'
+    };
+    var rawList = Array.isArray(scopes) ? scopes : [scopes];
+    var list = rawList.map(function (s) {
+      var low = String(s || '').trim().toLowerCase();
+      return SCOPE_ALIASES[low] || String(s || '').trim();
+    }).filter(Boolean);
     var removedKeys = [];
     Object.keys(apiResponseCache).forEach(function (k) {
       var entry = apiResponseCache[k];
@@ -2520,10 +2536,10 @@
   }
 
   function loadSandboxDb() {
-    if (sandboxDbCache) {
+    var raw = safeStorageGet(STORAGE_DB);
+    if (sandboxDbCache && raw && raw === sandboxDbRawCache) {
       return sandboxDbCache;
     }
-    var raw = safeStorageGet(STORAGE_DB);
     if (!raw) {
       var seeded = seedSandboxDb();
       saveSandboxDb(seeded);
@@ -2687,7 +2703,10 @@
       }
 
       if (dirty) saveSandboxDb(parsed);
-      else sandboxDbCache = parsed;
+      else {
+        sandboxDbCache = parsed;
+        sandboxDbRawCache = raw;
+      }
       return sandboxDbCache;
     } catch (e) {
       var fresh = seedSandboxDb();
@@ -2697,8 +2716,10 @@
   }
 
   function saveSandboxDb(db) {
+    var json = JSON.stringify(db);
     sandboxDbCache = db;
-    safeStorageSet(STORAGE_DB, JSON.stringify(db));
+    sandboxDbRawCache = json;
+    safeStorageSet(STORAGE_DB, json);
   }
 
   function sanitizeEmp(e) {
@@ -2952,7 +2973,9 @@
 
       case 'getDashboard': {
         var rangeKey = payload.range || '30d';
-        var todayStr = todayIso(0);
+        var todayStr = /^\d{4}-\d{2}-\d{2}$/.test(String(payload.todayDate || ''))
+          ? String(payload.todayDate)
+          : todayIso(0);
         var start = '';
         var end = todayStr;
         if (rangeKey === 'today') start = todayStr;
@@ -2964,7 +2987,75 @@
           end = payload.dateTo || todayStr;
         }
         var metrics = core.computeDashboardMetrics(db.reservations, db.followUps, db.problems, db.employees, { start: start, end: end }, todayStr);
+        var dashTodayRadar = sandboxExecute('getTodayAndRadar', token, { summaryOnly: true, todayDate: todayStr, nowMs: payload.nowMs });
+        if (dashTodayRadar && dashTodayRadar.success && dashTodayRadar.data && dashTodayRadar.data.counts) {
+          metrics.todayRadarCounts = dashTodayRadar.data.counts;
+        }
         return { success: true, message: '', data: metrics, error: null };
+      }
+
+      case 'getTodayAndRadar': {
+        var trTodayStr = /^\d{4}-\d{2}-\d{2}$/.test(String(payload.todayDate || ''))
+          ? String(payload.todayDate)
+          : todayIso(0);
+        var trNowMs = (typeof payload.nowMs === 'number' && isFinite(payload.nowMs)) ? payload.nowMs : Date.now();
+        var restrictTrAgent = session.role === 'agent' && db.settings.allow_agent_view_all === false && !core.canUserPerform(session.user, 'view_all_reservations');
+        var trFollowedSet = {};
+        (db.followUps || []).forEach(function (f) {
+          if (f && f.reservationId) trFollowedSet[f.reservationId] = true;
+        });
+        var trCandidates = (db.reservations || []).filter(function (r) {
+          if (!r) return false;
+          if (restrictTrAgent) {
+            return Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds.indexOf(session.employeeId) !== -1;
+          }
+          return true;
+        }).map(function (r) {
+          return Object.assign({}, r, { isFollowed: Boolean(trFollowedSet[r.id]) });
+        });
+        var trTodaySummary = core.computeTodayMovementsSummary(trCandidates, trNowMs, {
+          todayDate: trTodayStr,
+          subFilter: 'all'
+        });
+        var trRadarSummary = core.computeExpiryRadarSummary(trCandidates, trNowMs, {
+          subFilter: 'all',
+          windowHours: 24,
+          gracePastHours: 12
+        });
+        var trCounts = {
+          todayTotal: Number(trTodaySummary.totalCount || 0),
+          pickupCount: Number(trTodaySummary.pickupCount || 0),
+          returnCount: Number(trTodaySummary.returnCount || 0),
+          pendingPickupCount: Number(trTodaySummary.pendingPickupCount || 0),
+          pendingReturnCount: Number(trTodaySummary.pendingReturnCount || 0),
+          overdueTodayCount: Number(trTodaySummary.overdueCount || 0),
+          radarTotal: Number(trRadarSummary.totalCount || 0),
+          upcoming24hCount: Number(trRadarSummary.upcoming24hCount || 0),
+          critical6hCount: Number(trRadarSummary.critical6hCount || 0),
+          soon24hCount: Number(trRadarSummary.soon24hCount || 0),
+          expiredUnclosedCount: Number(trRadarSummary.expiredUnclosedCount || 0),
+          extendedInRadarCount: Number(trRadarSummary.extendedInRadarCount || 0)
+        };
+        if (payload.summaryOnly) {
+          return {
+            success: true,
+            message: '',
+            data: { todayDate: trTodayStr, serverTime: new Date().toISOString(), counts: trCounts },
+            error: null
+          };
+        }
+        return {
+          success: true,
+          message: '',
+          data: {
+            todayDate: trTodayStr,
+            serverTime: new Date().toISOString(),
+            counts: trCounts,
+            todaySummary: trTodaySummary,
+            radarSummary: trRadarSummary
+          },
+          error: null
+        };
       }
 
       case 'syncLocalCache': {
@@ -5136,14 +5227,18 @@
         var myNotifDelta = sandboxExecute('getNotifications', token, {});
         var activeAnnsDelta = (db.announcements || []).filter(function (a) { return isSandboxAnnouncementActive(a); });
         var activeLocksDelta = pruneSandboxLocks(db);
+        var deltaTodayRadar = sandboxExecute('getTodayAndRadar', token, { summaryOnly: true, todayDate: todayIso(0) });
         return {
           success: true,
           message: '',
           data: {
             serverTime: new Date().toISOString(),
+            syncVersion: Number(db.settings._sync_version || 1),
             changedReservations: changedRes,
             changedFollowUps: changedFu,
             changedProblems: changedPrb,
+            changedEmployees: [],
+            todayRadarCounts: (deltaTodayRadar && deltaTodayRadar.success && deltaTodayRadar.data) ? deltaTodayRadar.data.counts : null,
             notifications: myNotifDelta.success ? myNotifDelta.data : { items: [], unreadCount: 0 },
             announcements: activeAnnsDelta,
             locks: activeLocksDelta,
@@ -5266,6 +5361,137 @@
     }
   }
 
+  function generateClientRequestId(action) {
+    return 'REQ_' + String(action || 'op').slice(0, 6).toUpperCase() + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+  }
+
+  function applyDeltaSyncToCache(delta) {
+    if (!delta || typeof delta !== 'object') return { changedScopes: [] };
+    var ns = getCacheNamespace();
+    var core = root.RGCrmCore;
+    var touchedScopes = {};
+
+    var chRes = Array.isArray(delta.changedReservations) ? delta.changedReservations : [];
+    if (chRes.length > 0) {
+      touchedScopes.reservations = true;
+      touchedScopes.todayRadar = true;
+      touchedScopes.dashboard = true;
+      touchedScopes.reports = true;
+      writeLocalReservationsState(ns, chRes, false);
+      chRes.forEach(function (cr) {
+        if (cr && cr.id && localDetailsByNs[ns] && localDetailsByNs[ns][cr.id]) {
+          localDetailsByNs[ns][cr.id] = Object.assign({}, localDetailsByNs[ns][cr.id], {
+            reservation: cr,
+            cachedAt: Date.now()
+          });
+          if (root.RGIdbCache) {
+            root.RGIdbCache.upsertReservationDetail(ns, localDetailsByNs[ns][cr.id]).catch(function () {});
+          }
+        }
+      });
+      if (core && core.mergeDeltaRecords) {
+        patchCachedScopes(['reservations'], function (data, actName) {
+          if (actName === 'getReservations' && Array.isArray(data.items)) {
+            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chRes, 'id') });
+          }
+          if (actName === 'getReservationDetails' && data.reservation) {
+            var m = chRes.find(function (x) { return x && x.id === data.reservation.id; });
+            if (m) return Object.assign({}, data, { reservation: Object.assign({}, data.reservation, m) });
+          }
+          return undefined;
+        });
+      }
+    }
+
+    var chFu = Array.isArray(delta.changedFollowUps) ? delta.changedFollowUps : [];
+    if (chFu.length > 0) {
+      touchedScopes.followUps = true;
+      touchedScopes.dashboard = true;
+      touchedScopes.todayRadar = true;
+      if (localReservationsByNs[ns] && localReservationsByNs[ns].byId) {
+        var fuResPatch = [];
+        chFu.forEach(function (f) {
+          if (f && f.reservationId && localReservationsByNs[ns].byId[f.reservationId]) {
+            fuResPatch.push(Object.assign({}, localReservationsByNs[ns].byId[f.reservationId], { isFollowed: true }));
+          }
+        });
+        if (fuResPatch.length) writeLocalReservationsState(ns, fuResPatch, false);
+      }
+      if (core && core.mergeDeltaRecords) {
+        patchCachedScopes(['followUps'], function (data, actName) {
+          if ((actName === 'getTeamFollowUps' || actName === 'getMyFollowUps') && Array.isArray(data.items)) {
+            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chFu, 'id') });
+          }
+          if (actName === 'getMyFollowUps' && Array.isArray(data.followUps)) {
+            return Object.assign({}, data, { followUps: core.mergeDeltaRecords(data.followUps, chFu, 'id') });
+          }
+          return undefined;
+        });
+      }
+    }
+
+    var chPrb = Array.isArray(delta.changedProblems) ? delta.changedProblems : [];
+    if (chPrb.length > 0) {
+      touchedScopes.problems = true;
+      touchedScopes.dashboard = true;
+      touchedScopes.reports = true;
+      if (core && core.mergeDeltaRecords) {
+        patchCachedScopes(['problems'], function (data, actName) {
+          if (actName === 'getProblems' && Array.isArray(data.items)) {
+            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chPrb, 'id') });
+          }
+          if (actName === 'getProblemDetails' && data.problem) {
+            var mp = chPrb.find(function (x) { return x && x.id === data.problem.id; });
+            if (mp) return Object.assign({}, data, { problem: Object.assign({}, data.problem, mp) });
+          }
+          return undefined;
+        });
+      }
+    }
+
+    var chEmp = Array.isArray(delta.changedEmployees) ? delta.changedEmployees : [];
+    if (chEmp.length > 0) {
+      touchedScopes.employees = true;
+      if (core && core.mergeDeltaRecords) {
+        patchCachedScopes(['employees'], function (data, actName) {
+          if (actName === 'getEmployees' && Array.isArray(data.items)) {
+            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chEmp, 'id') });
+          }
+          return undefined;
+        });
+      }
+    }
+
+    if (delta.notifications && Array.isArray(delta.notifications.items)) {
+      touchedScopes.notifications = true;
+      primeCache('getNotifications', {}, delta.notifications);
+    }
+
+    if (Array.isArray(delta.announcements)) {
+      touchedScopes.announcements = true;
+      patchCachedScopes(['announcements'], function (data) {
+        return Object.assign({}, data, { activeItems: delta.announcements });
+      });
+    }
+
+    var invalidateList = [];
+    if (touchedScopes.dashboard) invalidateList.push('dashboard');
+    if (touchedScopes.todayRadar) invalidateList.push('todayRadar');
+    if (touchedScopes.reports) invalidateList.push('reports');
+    if (invalidateList.length > 0) {
+      clearCache(invalidateList);
+    }
+
+    if (delta.syncVersion && root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
+      root.RGIdbCache.recordServerSyncState(ns, {
+        syncEpoch: 'v' + String(delta.syncVersion),
+        lastSyncAt: delta.serverTime || new Date().toISOString()
+      }).catch(function () {});
+    }
+
+    return { changedScopes: Object.keys(touchedScopes) };
+  }
+
   async function callApi(action, payload) {
     await probeBackendHealth();
     var backendUrl = getBackendApiUrl();
@@ -5276,19 +5502,43 @@
     var core = root.RGCrmCore;
     var ns = getCacheNamespace();
 
+    var reqPayload = payload && typeof payload === 'object' ? Object.assign({}, payload) : {};
+    if ((action === 'addFollowUp' || action === 'createProblem') && !reqPayload.clientRequestId) {
+      reqPayload.clientRequestId = generateClientRequestId(action);
+    }
+    payload = reqPayload;
+
     var policy = (core && core.getApiCachePolicy) ? core.getApiCachePolicy(action) : { cacheable: false, ttlMs: 0, scope: '' };
     var isSilentRefresh = Boolean(payload && payload.silentRefresh);
-    var skipCache = Boolean((payload && (payload.forceRefresh || payload.logExport)) || isSilentRefresh);
+    var isForceRefresh = Boolean(payload && payload.forceRefresh);
+    var abortKey = payload && payload.abortKey ? String(payload.abortKey).trim() : '';
+    var skipCache = Boolean((payload && (isForceRefresh || payload.logExport)) || isSilentRefresh);
     var shouldWriteCache = Boolean(policy.cacheable && !(payload && payload.logExport));
     var cacheKey = (policy.cacheable && core && core.buildApiCacheKey)
       ? core.buildApiCacheKey(transportUrl, token, action, payload)
       : '';
 
+    var callerController = null;
+    var myAbortSeq = 0;
+    if (abortKey && typeof AbortController !== 'undefined') {
+      if (activeAbortControllers[abortKey]) {
+        try { activeAbortControllers[abortKey].controller.abort(); } catch (_eAbort) {}
+      }
+      callerController = new AbortController();
+      myAbortSeq = ++abortRequestSeq;
+      activeAbortControllers[abortKey] = { controller: callerController, seq: myAbortSeq };
+    }
+
     var startNetworkOrSandbox = function () {
       var promise = executeCall().finally(function () {
-        delete inFlightRequests[cacheKey];
+        if (cacheKey) delete inFlightRequests[cacheKey];
+        if (abortKey && activeAbortControllers[abortKey] && activeAbortControllers[abortKey].seq === myAbortSeq) {
+          delete activeAbortControllers[abortKey];
+        }
       });
-      inFlightRequests[cacheKey] = promise;
+      if (cacheKey && !abortKey) {
+        inFlightRequests[cacheKey] = promise;
+      }
       return promise;
     };
 
@@ -5324,7 +5574,8 @@
       }
     }
 
-    if (policy.cacheable && !skipCache && cacheKey && inFlightRequests[cacheKey]) {
+    // Single-flight deduplication for cacheable reads (even during silentRefresh unless forced or using abortKey)
+    if (policy.cacheable && !isForceRefresh && !abortKey && cacheKey && inFlightRequests[cacheKey]) {
       return inFlightRequests[cacheKey];
     }
 
@@ -5383,225 +5634,292 @@
       };
     }
 
+    function isCallerAborted() {
+      return Boolean(callerController && callerController.signal && callerController.signal.aborted);
+    }
+
+    function isRetryableReadFailure(resObj, hadNetworkFailure) {
+      if (!policy.cacheable || isCallerAborted()) return false;
+      if (hadNetworkFailure) return true;
+      if (!resObj || resObj.success) return false;
+      var errCode = String(resObj.error || '').toUpperCase();
+      return errCode === 'GATEWAY_ERROR' || errCode === 'TIMEOUT' || errCode === 'EMPTY_RESPONSE' ||
+        errCode === 'HTTP_429' || errCode === 'HTTP_502' || errCode === 'HTTP_503' || errCode === 'HTTP_504';
+    }
+
+    function waitRetryJitter(attemptIdx) {
+      var base = attemptIdx === 0 ? 180 : 480;
+      var jitter = Math.floor(Math.random() * 140);
+      return new Promise(function (resolve) { setTimeout(resolve, base + jitter); });
+    }
+
     async function executeCall() {
+      if (isCallerAborted()) {
+        return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
+      }
       if (OFFLINE_QUEUEABLE[action] && isOfflineNow() && !(payload && payload._replayingOfflineQueue)) {
         return enqueueAndApplyOffline('offline');
       }
-      var parsed;
+      var parsed = null;
       var networkFailed = false;
-      if (!transportUrl) {
-        parsed = sandboxExecute(action, token, payload);
-      } else if (backendUrl) {
-        var bTimeoutId = null;
-        try {
-          var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
-          var bOpts = {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            cache: 'no-store',
-            body: JSON.stringify({ action: action, token: token || '', payload: bPayload })
-          };
-          if (typeof AbortController !== 'undefined') {
-            var bController = new AbortController();
-            var bTimeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
-            bOpts.signal = bController.signal;
-            bTimeoutId = setTimeout(function () {
-              try { bController.abort(); } catch (e) {}
-            }, bTimeoutMs);
-          }
-          var bResponse = await fetch(backendUrl, bOpts);
-          var bContentType = bResponse.headers && bResponse.headers.get ? (bResponse.headers.get('content-type') || '') : '';
-          var bText = await bResponse.text();
-          if (bTimeoutId) clearTimeout(bTimeoutId);
-          parsed = (core && core.parseBackendResponseText)
-            ? core.parseBackendResponseText(bText, bResponse.status, bContentType)
-            : (bText ? JSON.parse(bText) : { success: false, message: 'استجابة فارغة من خادم قاعدة البيانات السحابية.', data: null, error: 'EMPTY_RESPONSE' });
-          if ((action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus') && typeof console !== 'undefined' && typeof console.info === 'function') {
-            var bRawJson = null;
-            try { bRawJson = bText ? JSON.parse(bText) : null; } catch (bJsonErr) { bRawJson = { _parseError: String(bJsonErr && bJsonErr.message ? bJsonErr.message : bJsonErr) }; }
-            var bRawData = bRawJson && typeof bRawJson === 'object' ? bRawJson.data : null;
-            console.info('[RGApi:SyncBackendDiag]', {
-              action: action,
-              endpoint: backendUrl,
-              status: bResponse.status,
-              statusText: bResponse.statusText,
-              ok: bResponse.ok,
-              contentType: bContentType,
-              rawTextLength: bText ? bText.length : 0,
-              rawTopLevelKeys: bRawJson && typeof bRawJson === 'object' ? Object.keys(bRawJson) : typeof bRawJson,
-              rawDataKeys: bRawData && typeof bRawData === 'object' ? Object.keys(bRawData) : typeof bRawData,
-              rawDataStructure: bRawData || bRawJson,
-              parsedSuccess: Boolean(parsed && parsed.success),
-              parsedError: parsed && parsed.error ? parsed.error : null
-            });
-          }
-          if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
-            setToken('');
-            document.dispatchEvent(new CustomEvent('rg:unauthorized'));
-          }
-        } catch (bErr) {
-          if (bTimeoutId) clearTimeout(bTimeoutId);
-          var isBAbort = bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1);
-          networkFailed = true;
-          parsed = {
-            success: false,
-            message: isBAbort
-              ? 'انتهت مهلة الاتصال بخادم قاعدة البيانات السحابية. يرجى المحاولة مرة أخرى.'
-              : ('تعذر الاتصال بخادم قاعدة البيانات السحابية: ' + (bErr.message || bErr)),
-            data: null,
-            error: isBAbort ? 'TIMEOUT' : (bErr.message || 'NETWORK_ERROR')
-          };
+      var maxAttempts = (policy.cacheable && transportUrl) ? 3 : 1;
+
+      for (var attempt = 0; attempt < maxAttempts; attempt++) {
+        if (isCallerAborted()) {
+          return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
         }
-      } else {
-        if (gasUrl && core && core.validateGasUrl) {
-          var check = core.validateGasUrl(gasUrl);
-          if (!check.valid) {
-            return {
-              success: false,
-              message: check.message,
-              data: null,
-              error: 'INVALID_GAS_URL'
+        parsed = null;
+        networkFailed = false;
+
+        if (!transportUrl) {
+          parsed = sandboxExecute(action, token, payload);
+        } else if (backendUrl) {
+          var bTimeoutId = null;
+          var bTimedOut = false;
+          var onCallerAbortB = null;
+          try {
+            var bPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
+            var bOpts = {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              cache: 'no-store',
+              body: JSON.stringify({ action: action, token: token || '', payload: bPayload })
             };
-          }
-        }
-
-        var isGasSyncDiag = action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus';
-        var timeoutId = null;
-        var cleanGasUrl = (gasUrl && core && core.validateGasUrl) ? core.validateGasUrl(gasUrl).normalized : (gasUrl || '');
-        var compactPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
-
-        var tryGasProxyFallback = async function () {
-          if (typeof callBackendSetupEndpoint !== 'function') return null;
-          var proxyRes = await callBackendSetupEndpoint('gasProxy', {
-            gasUrl: cleanGasUrl,
-            action: action,
-            token: token || '',
-            payload: compactPayload
-          });
-          if (!proxyRes || proxyRes.staticHostOnly) return null;
-          if (cleanGasUrl && (proxyRes.success || (proxyRes.error && proxyRes.error !== 'NETWORK_ERROR' && proxyRes.error !== 'BACKEND_NOT_FOUND'))) {
-            gasServerProxyUrls[cleanGasUrl] = true;
-          }
-          return proxyRes;
-        };
-
-        try {
-          if (detectedBackendProxyAvailable || !cleanGasUrl || gasServerProxyUrls[cleanGasUrl]) {
-            var directProxyRes = await tryGasProxyFallback();
-            if (directProxyRes) {
-              parsed = directProxyRes;
-            }
-          }
-          if (!parsed && !cleanGasUrl) {
-            return {
-              success: false,
-              message: 'رابط Google Apps Script غير مضبوط على وسيط Vercel بعد.',
-              data: null,
-              error: 'MISSING_GAS_URL'
-            };
-          }
-          if (!parsed) {
-            var opts = (core && core.buildGasFetchOptions)
-              ? core.buildGasFetchOptions(action, token, payload)
-              : {
-                  method: 'POST',
-                  redirect: 'follow',
-                  credentials: 'omit',
-                  cache: 'no-store',
-                  headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                  body: JSON.stringify({ action: action, token: token, payload: compactPayload })
-                };
-            // Avoid keepalive on cross-origin 302 redirects (script.google.com -> script.googleusercontent.com)
-            if (opts && opts.keepalive) {
-              opts = Object.assign({}, opts);
-              delete opts.keepalive;
-            }
-
             if (typeof AbortController !== 'undefined') {
-              var controller = new AbortController();
-              var timeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
-              opts.signal = controller.signal;
-              timeoutId = setTimeout(function () {
-                try { controller.abort(); } catch (e) {}
-              }, timeoutMs);
-            }
-
-            var response = await fetch(cleanGasUrl, opts);
-            var text = await response.text();
-            if (timeoutId) clearTimeout(timeoutId);
-            parsed = (core && core.parseGasResponseText)
-              ? core.parseGasResponseText(text, response.status)
-              : JSON.parse(text);
-
-            if (isGasSyncDiag && typeof console !== 'undefined' && typeof console.info === 'function') {
-              var gasContentType = response.headers && response.headers.get ? (response.headers.get('content-type') || '') : '';
-              var rawJsonStruct = null;
-              try {
-                rawJsonStruct = text ? JSON.parse(text) : null;
-              } catch (jsonDiagErr) {
-                rawJsonStruct = {
-                  _parseError: jsonDiagErr && jsonDiagErr.message ? jsonDiagErr.message : String(jsonDiagErr)
-                };
+              var bController = new AbortController();
+              var bTimeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
+              bOpts.signal = bController.signal;
+              if (callerController) {
+                onCallerAbortB = function () { try { bController.abort(); } catch (_e) {} };
+                if (callerController.signal.aborted) onCallerAbortB();
+                else callerController.signal.addEventListener('abort', onCallerAbortB, { once: true });
               }
-              var rawDataObj = rawJsonStruct && typeof rawJsonStruct === 'object' ? rawJsonStruct.data : null;
-              console.info('[RGApi:GasSyncDiag]', {
+              bTimeoutId = setTimeout(function () {
+                bTimedOut = true;
+                try { bController.abort(); } catch (e) {}
+              }, bTimeoutMs);
+            }
+            var bResponse = await fetch(backendUrl, bOpts);
+            var bContentType = bResponse.headers && bResponse.headers.get ? (bResponse.headers.get('content-type') || '') : '';
+            var bText = await bResponse.text();
+            if (bTimeoutId) clearTimeout(bTimeoutId);
+            if (callerController && onCallerAbortB) callerController.signal.removeEventListener('abort', onCallerAbortB);
+            parsed = (core && core.parseBackendResponseText)
+              ? core.parseBackendResponseText(bText, bResponse.status, bContentType)
+              : (bText ? JSON.parse(bText) : { success: false, message: 'استجابة فارغة من خادم قاعدة البيانات السحابية.', data: null, error: 'EMPTY_RESPONSE' });
+            if ((action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus') && typeof console !== 'undefined' && typeof console.info === 'function') {
+              var bRawJson = null;
+              try { bRawJson = bText ? JSON.parse(bText) : null; } catch (bJsonErr) { bRawJson = { _parseError: String(bJsonErr && bJsonErr.message ? bJsonErr.message : bJsonErr) }; }
+              var bRawData = bRawJson && typeof bRawJson === 'object' ? bRawJson.data : null;
+              console.info('[RGApi:SyncBackendDiag]', {
                 action: action,
-                gasUrl: cleanGasUrl,
-                status: response.status,
-                statusText: response.statusText,
-                ok: response.ok,
-                redirected: Boolean(response.redirected),
-                finalUrl: response.url || '',
-                contentType: gasContentType,
-                rawTextLength: text ? text.length : 0,
-                rawTextPreview: text ? text.slice(0, 1200) : '',
-                rawTopLevelKeys: rawJsonStruct && typeof rawJsonStruct === 'object' ? Object.keys(rawJsonStruct) : typeof rawJsonStruct,
-                rawDataKeys: rawDataObj && typeof rawDataObj === 'object' ? Object.keys(rawDataObj) : typeof rawDataObj,
-                rawDataStructure: rawDataObj !== undefined && rawDataObj !== null ? rawDataObj : rawJsonStruct,
+                endpoint: backendUrl,
+                status: bResponse.status,
+                statusText: bResponse.statusText,
+                ok: bResponse.ok,
+                contentType: bContentType,
+                rawTextLength: bText ? bText.length : 0,
+                rawTopLevelKeys: bRawJson && typeof bRawJson === 'object' ? Object.keys(bRawJson) : typeof bRawJson,
+                rawDataKeys: bRawData && typeof bRawData === 'object' ? Object.keys(bRawData) : typeof bRawData,
+                rawDataStructure: bRawData || bRawJson,
                 parsedSuccess: Boolean(parsed && parsed.success),
-                parsedError: parsed && parsed.error ? parsed.error : null,
-                parsedMessage: parsed && parsed.message ? parsed.message : ''
+                parsedError: parsed && parsed.error ? parsed.error : null
               });
             }
-          }
-
-          if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
-            setToken('');
-            document.dispatchEvent(new CustomEvent('rg:unauthorized'));
-          }
-        } catch (err) {
-          if (timeoutId) clearTimeout(timeoutId);
-          var isAbort = err && (err.name === 'AbortError' || String(err.message || '').indexOf('abort') !== -1);
-          if (!isAbort) {
-            var proxiedErrFallback = await tryGasProxyFallback();
-            if (proxiedErrFallback) {
-              parsed = proxiedErrFallback;
-              if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
-                setToken('');
-                document.dispatchEvent(new CustomEvent('rg:unauthorized'));
-              }
+            if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
+              setToken('');
+              document.dispatchEvent(new CustomEvent('rg:unauthorized'));
             }
-          }
-          if (!parsed) {
-            if (isGasSyncDiag && typeof console !== 'undefined' && typeof console.error === 'function') {
-              console.error('[RGApi:GasSyncDiag] Fetch error:', {
-                action: action,
-                gasUrl: cleanGasUrl,
-                errorName: err && err.name ? err.name : '',
-                errorMessage: err && err.message ? err.message : String(err)
-              });
+          } catch (bErr) {
+            if (bTimeoutId) clearTimeout(bTimeoutId);
+            if (callerController && onCallerAbortB) callerController.signal.removeEventListener('abort', onCallerAbortB);
+            if (isCallerAborted()) {
+              return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
             }
+            var isBAbort = bTimedOut || (bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1));
             networkFailed = true;
             parsed = {
               success: false,
-              message: isAbort
-                ? 'انتهت مهلة الاتصال بخادم Google Apps Script. يرجى المحاولة مرة أخرى.'
-                : ('تعذر الاتصال بخادم Google Apps Script. تأكد من صحة رابط /exec واتصالك بالإنترنت وصلاحيات النشر (Anyone): ' + (err.message || err)),
+              message: isBAbort
+                ? 'انتهت مهلة الاتصال بخادم قاعدة البيانات السحابية. يرجى المحاولة مرة أخرى.'
+                : ('تعذر الاتصال بخادم قاعدة البيانات السحابية: ' + (bErr.message || bErr)),
               data: null,
-              error: isAbort ? 'TIMEOUT' : (err.message || 'NETWORK_ERROR')
+              error: isBAbort ? 'TIMEOUT' : (bErr.message || 'NETWORK_ERROR')
             };
           }
+        } else {
+          if (gasUrl && core && core.validateGasUrl) {
+            var check = core.validateGasUrl(gasUrl);
+            if (!check.valid) {
+              return {
+                success: false,
+                message: check.message,
+                data: null,
+                error: 'INVALID_GAS_URL'
+              };
+            }
+          }
+
+          var isGasSyncDiag = action === 'pullReservations' || action === 'syncRentalGate' || action === 'testConnection' || action === 'getSyncStatus';
+          var timeoutId = null;
+          var gasTimedOut = false;
+          var onCallerAbortG = null;
+          var cleanGasUrl = (gasUrl && core && core.validateGasUrl) ? core.validateGasUrl(gasUrl).normalized : (gasUrl || '');
+          var compactPayload = (core && core.compactGasPayload) ? core.compactGasPayload(payload) : (payload || {});
+
+          var tryGasProxyFallback = async function () {
+            if (typeof callBackendSetupEndpoint !== 'function') return null;
+            var proxyRes = await callBackendSetupEndpoint('gasProxy', {
+              gasUrl: cleanGasUrl,
+              action: action,
+              token: token || '',
+              payload: compactPayload
+            });
+            if (!proxyRes || proxyRes.staticHostOnly) return null;
+            if (cleanGasUrl && (proxyRes.success || (proxyRes.error && proxyRes.error !== 'NETWORK_ERROR' && proxyRes.error !== 'BACKEND_NOT_FOUND'))) {
+              gasServerProxyUrls[cleanGasUrl] = true;
+            }
+            return proxyRes;
+          };
+
+          try {
+            if (detectedBackendProxyAvailable || !cleanGasUrl || gasServerProxyUrls[cleanGasUrl]) {
+              var directProxyRes = await tryGasProxyFallback();
+              if (directProxyRes) {
+                parsed = directProxyRes;
+              }
+            }
+            if (!parsed && !cleanGasUrl) {
+              return {
+                success: false,
+                message: 'رابط Google Apps Script غير مضبوط على وسيط Vercel بعد.',
+                data: null,
+                error: 'MISSING_GAS_URL'
+              };
+            }
+            if (!parsed) {
+              var opts = (core && core.buildGasFetchOptions)
+                ? core.buildGasFetchOptions(action, token, payload)
+                : {
+                    method: 'POST',
+                    redirect: 'follow',
+                    credentials: 'omit',
+                    cache: 'no-store',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ action: action, token: token, payload: compactPayload })
+                  };
+              if (opts && opts.keepalive) {
+                opts = Object.assign({}, opts);
+                delete opts.keepalive;
+              }
+
+              if (typeof AbortController !== 'undefined') {
+                var controller = new AbortController();
+                var timeoutMs = (core && core.getGasActionTimeoutMs) ? core.getGasActionTimeoutMs(action) : 35000;
+                opts.signal = controller.signal;
+                if (callerController) {
+                  onCallerAbortG = function () { try { controller.abort(); } catch (_e) {} };
+                  if (callerController.signal.aborted) onCallerAbortG();
+                  else callerController.signal.addEventListener('abort', onCallerAbortG, { once: true });
+                }
+                timeoutId = setTimeout(function () {
+                  gasTimedOut = true;
+                  try { controller.abort(); } catch (e) {}
+                }, timeoutMs);
+              }
+
+              var response = await fetch(cleanGasUrl, opts);
+              var text = await response.text();
+              if (timeoutId) clearTimeout(timeoutId);
+              if (callerController && onCallerAbortG) callerController.signal.removeEventListener('abort', onCallerAbortG);
+              parsed = (core && core.parseGasResponseText)
+                ? core.parseGasResponseText(text, response.status)
+                : JSON.parse(text);
+
+              if (isGasSyncDiag && typeof console !== 'undefined' && typeof console.info === 'function') {
+                var gasContentType = response.headers && response.headers.get ? (response.headers.get('content-type') || '') : '';
+                var rawJsonStruct = null;
+                try {
+                  rawJsonStruct = text ? JSON.parse(text) : null;
+                } catch (jsonDiagErr) {
+                  rawJsonStruct = {
+                    _parseError: jsonDiagErr && jsonDiagErr.message ? jsonDiagErr.message : String(jsonDiagErr)
+                  };
+                }
+                var rawDataObj = rawJsonStruct && typeof rawJsonStruct === 'object' ? rawJsonStruct.data : null;
+                console.info('[RGApi:GasSyncDiag]', {
+                  action: action,
+                  gasUrl: cleanGasUrl,
+                  status: response.status,
+                  statusText: response.statusText,
+                  ok: response.ok,
+                  redirected: Boolean(response.redirected),
+                  finalUrl: response.url || '',
+                  contentType: gasContentType,
+                  rawTextLength: text ? text.length : 0,
+                  rawTextPreview: text ? text.slice(0, 1200) : '',
+                  rawTopLevelKeys: rawJsonStruct && typeof rawJsonStruct === 'object' ? Object.keys(rawJsonStruct) : typeof rawJsonStruct,
+                  rawDataKeys: rawDataObj && typeof rawDataObj === 'object' ? Object.keys(rawDataObj) : typeof rawDataObj,
+                  rawDataStructure: rawDataObj !== undefined && rawDataObj !== null ? rawDataObj : rawJsonStruct,
+                  parsedSuccess: Boolean(parsed && parsed.success),
+                  parsedError: parsed && parsed.error ? parsed.error : null,
+                  parsedMessage: parsed && parsed.message ? parsed.message : ''
+                });
+              }
+            }
+
+            if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
+              setToken('');
+              document.dispatchEvent(new CustomEvent('rg:unauthorized'));
+            }
+          } catch (err) {
+            if (timeoutId) clearTimeout(timeoutId);
+            if (callerController && onCallerAbortG) callerController.signal.removeEventListener('abort', onCallerAbortG);
+            if (isCallerAborted()) {
+              return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
+            }
+            var isAbort = gasTimedOut || (err && (err.name === 'AbortError' || String(err.message || '').indexOf('abort') !== -1));
+            if (!isAbort) {
+              var proxiedErrFallback = await tryGasProxyFallback();
+              if (proxiedErrFallback) {
+                parsed = proxiedErrFallback;
+                if (!parsed.success && String(parsed.error || '').indexOf('UNAUTHORIZED') === 0) {
+                  setToken('');
+                  document.dispatchEvent(new CustomEvent('rg:unauthorized'));
+                }
+              }
+            }
+            if (!parsed) {
+              if (isGasSyncDiag && typeof console !== 'undefined' && typeof console.error === 'function') {
+                console.error('[RGApi:GasSyncDiag] Fetch error:', {
+                  action: action,
+                  gasUrl: cleanGasUrl,
+                  errorName: err && err.name ? err.name : '',
+                  errorMessage: err && err.message ? err.message : String(err)
+                });
+              }
+              networkFailed = true;
+              parsed = {
+                success: false,
+                message: isAbort
+                  ? 'انتهت مهلة الاتصال بخادم Google Apps Script. يرجى المحاولة مرة أخرى.'
+                  : ('تعذر الاتصال بخادم Google Apps Script. تأكد من صحة رابط /exec واتصالك بالإنترنت وصلاحيات النشر (Anyone): ' + (err.message || err)),
+                data: null,
+                error: isAbort ? 'TIMEOUT' : (err.message || 'NETWORK_ERROR')
+              };
+            }
+          }
         }
+
+        if (attempt + 1 < maxAttempts && isRetryableReadFailure(parsed, networkFailed)) {
+          await waitRetryJitter(attempt);
+          continue;
+        }
+        break;
+      }
+
+      if (isCallerAborted()) {
+        return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
       }
 
       if (networkFailed && OFFLINE_QUEUEABLE[action] && !(payload && payload._replayingOfflineQueue)) {
@@ -5714,14 +6032,13 @@
             staleUntil: writeTs + Math.max(policy.ttlMs, IDB_KV_MAX_AGE_MS),
             response: parsed
           };
-          schedulePersistApiCache(!wasRevalidated || action === 'getReservations' || action === 'getDashboard' || action === 'getEmployees');
+          schedulePersistApiCache(!wasRevalidated || action === 'getReservations' || action === 'getDashboard' || action === 'getEmployees' || action === 'getTodayAndRadar');
         } else if (core && core.getCacheInvalidationScopes) {
           var invScopes = core.getCacheInvalidationScopes(action);
           var skipOptimisticClear = payload && payload._keepOptimisticCache;
           if (skipOptimisticClear) {
-            // Reconcile primary cached scopes softly while clearing secondary summary/report caches
             var secondaryOnly = invScopes.filter(function (s) {
-              return s === 'dashboard' || s === 'reports' || s === 'activity' || s === 'employees';
+              return s === 'dashboard' || s === 'todayRadar' || s === 'reports' || s === 'activity' || s === 'employees';
             });
             if (secondaryOnly.length > 0) pendingIdbOps.push(clearCache(secondaryOnly));
             if (action === 'createProblem' && parsed.data && parsed.data.id) {
@@ -5758,13 +6075,12 @@
           await Promise.all(pendingIdbOps).catch(function () {});
         }
       } else if (payload && payload._keepOptimisticCache && core && core.getCacheInvalidationScopes) {
-        // Optimistic mutation failed on server -> clear affected primary caches so next read fetches truth
         await clearCache(core.getCacheInvalidationScopes(action));
       }
       return parsed;
     }
 
-    if (policy.cacheable && !skipCache && cacheKey) {
+    if (policy.cacheable && cacheKey) {
       return startNetworkOrSandbox();
     }
 
@@ -6221,6 +6537,7 @@
     isLiveMode: isLiveMode,
     warmUpGas: warmUpGas,
     clearCache: clearCache,
+    invalidateScopes: clearCache,
     wipeAllBrowserCaches: wipeAllBrowserCaches,
     enforceBootSyncCheck: function (force) { return runBootSyncCheck(getCacheNamespace(), force !== false); },
     getSyncCheckStatus: getSyncCheckStatus,
@@ -6238,6 +6555,7 @@
     isOfflineQueueableAction: isOfflineQueueableAction,
     getOfflineQueueStatus: getOfflineQueueStatus,
     syncOfflineQueue: syncOfflineQueue,
+    applyDeltaSyncToCache: applyDeltaSyncToCache,
     callApi: callApi,
     pingGasUrl: pingGasUrl
   };

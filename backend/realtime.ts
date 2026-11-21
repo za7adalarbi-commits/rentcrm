@@ -1,14 +1,17 @@
 import { EventEmitter } from 'node:events';
 
 export interface CrmRealtimeEvent {
-  type: 'delta' | 'announcement' | 'lock';
+  type: 'delta' | 'announcement' | 'lock' | 'settings';
   action: string;
   at: string;
   actorId?: string;
+  scopes?: string[];
+  entityIds?: string[];
+  version?: number;
 }
 
 const emitter = new EventEmitter();
-emitter.setMaxListeners(200);
+emitter.setMaxListeners(500);
 
 export function broadcastCrmEvent(event: CrmRealtimeEvent): void {
   try {

@@ -47,11 +47,24 @@
     var empState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
     var hasPreloadedEmps = Boolean(empState && empState.loaded && Array.isArray(empState.items) && empState.items.length > 0);
     var [res, empRes] = await Promise.all([
-      root.RGApi.callApi('getMyFollowUps', {}),
+      root.RGApi.callApi('getMyFollowUps', { abortKey: 'fu:my' }),
       hasPreloadedEmps ? Promise.resolve({ success: true, data: { items: empState.items } }) : root.RGApi.callApi('getEmployees', {})
     ]);
-    if (!res.success) {
-      container.innerHTML = '<div class="form-error">' + esc(res.message) + '</div>';
+    if (res && res.aborted) return;
+    if (!res || !res.success) {
+      container.innerHTML =
+        '<div class="surface-card">' +
+          '<div class="section-header"><div><h2 class="section-title">' + t('nav_my_followups') + '</h2></div></div>' +
+          '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load My Follow-Ups' : 'تعذر تحميل متابعاتي') + '</div>' +
+              '<div class="rg-error-banner-msg">' + esc((res && res.message) || 'تعذر تحميل البيانات.') + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="myfu-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+          '</div>' +
+        '</div>';
+      var myfuRetry = document.getElementById('myfu-retry-btn');
+      if (myfuRetry) myfuRetry.addEventListener('click', function () { renderMyFollowUps(container, ctx); });
       return;
     }
 
@@ -357,6 +370,10 @@
       sel.addEventListener('change', function () {
         var rid = sel.getAttribute('data-id');
         var nextStatus = sel.value;
+        var targetRes = assignedById[rid] || null;
+        var prevStatus = (targetRes && targetRes.internalStatus) || '';
+        var prevLastText = (targetRes && targetRes.lastUpdateText) || '-';
+        var expectedUpdatedAt = (targetRes && (targetRes.updatedAt || targetRes.lastUpdatedAt)) || '';
         runWithLock(sel, 'quickUpdateReservationStatus:' + rid, function () {
           if (root.RGApi.applyOptimisticMutation) {
             root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
@@ -373,17 +390,21 @@
           return root.RGApi.callApi('quickUpdateReservationStatus', {
             reservationId: rid,
             status: nextStatus,
+            expectedUpdatedAt: expectedUpdatedAt,
             _keepOptimisticCache: true
           }).then(function (resp) {
             if (resp && resp.success) {
               ctx.refreshNotifications();
             } else {
+              if (prevStatus) sel.value = prevStatus;
+              if (lastEl) lastEl.textContent = prevLastText;
               ctx.toast((resp && resp.message) || 'تعذر تحديث الحالة.', true);
               renderMyFollowUps(container, ctx);
             }
           }).catch(function () {
+            if (prevStatus) sel.value = prevStatus;
+            if (lastEl) lastEl.textContent = prevLastText;
             ctx.toast('تعذر الاتصال بالخادم أثناء تحديث الحالة.', true);
-            renderMyFollowUps(container, ctx);
           });
         });
       });
@@ -427,10 +448,31 @@
         });
       });
     });
+    if (!container._rgMyFuDeltaBound) {
+      container._rgMyFuDeltaBound = true;
+      var onMyFuDelta = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onMyFuDelta);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        var relevant = Boolean(
+          (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0)
+        );
+        if (!relevant) return;
+        var activeEl = document.activeElement;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        renderMyFollowUps(container, ctx);
+      };
+      document.addEventListener('rg:deltasync', onMyFuDelta);
+    }
   }
 
   async function renderTeamFollowUps(container, ctx) {
     var t = ctx.t;
+    var isEn = ctx.lang === 'en';
     var state = ctx.state.teamFollowUps || { employeeId: '', status: '', date: '' };
     ctx.state.teamFollowUps = state;
 
@@ -438,11 +480,13 @@
     var hasPreloadedEmps2 = Boolean(empState2 && empState2.loaded && Array.isArray(empState2.items) && empState2.items.length > 0);
     var [empRes, fuRes, empDetailRes] = await Promise.all([
       hasPreloadedEmps2 ? Promise.resolve({ success: true, data: { items: empState2.items } }) : root.RGApi.callApi('getEmployees', {}),
-      root.RGApi.callApi('getTeamFollowUps', state),
-      state.employeeId ? root.RGApi.callApi('getEmployeeDetails', { employeeId: state.employeeId }) : Promise.resolve(null)
+      root.RGApi.callApi('getTeamFollowUps', Object.assign({}, state, { abortKey: 'fu:team' })),
+      state.employeeId ? root.RGApi.callApi('getEmployeeDetails', { employeeId: state.employeeId, abortKey: 'fu:empDet' }) : Promise.resolve(null)
     ]);
-    var employees = (empRes.success && empRes.data.items) || [];
-    var items = (fuRes.success && fuRes.data.items) || [];
+    if (fuRes && fuRes.aborted) return;
+    var employees = (empRes.success && empRes.data && empRes.data.items) || [];
+    var fuLoadErr = (!fuRes || !fuRes.success) ? ((fuRes && fuRes.message) || 'تعذر تحميل متابعات الفريق.') : '';
+    var items = (fuRes && fuRes.success && fuRes.data && fuRes.data.items) || [];
     var empDetails = (empDetailRes && empDetailRes.success) ? empDetailRes.data : null;
 
     var currentUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
@@ -488,7 +532,9 @@
                 '</div>') +
           '</div>'
         ) : '') +
-        (items.length === 0
+        (fuLoadErr
+          ? '<div class="rg-error-banner" role="alert"><div class="rg-error-banner-body"><div class="rg-error-banner-title">' + (isEn ? 'Failed to load follow-ups' : 'تعذر تحميل المتابعات') + '</div><div class="rg-error-banner-msg">' + esc(fuLoadErr) + '</div></div><button type="button" class="btn btn-sm btn-primary" id="tfu-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button></div>'
+          : (items.length === 0
           ? '<div class="empty-state">لا توجد متابعات مطابقة.</div>'
           : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
               '<th>رقم الحجز</th><th>العميل</th><th>الموظف</th><th>الحالة</th><th>الإجراء</th><th>الملاحظات</th><th>التاريخ والوقت</th><th>تفاصيل الحجز</th>' +
@@ -505,8 +551,15 @@
                   '<td class="table-actions-cell"><button type="button" class="btn btn-sm btn-primary tfu-open-res" data-res-id="' + esc(f.reservationId) + '">التفاصيل</button></td>' +
                 '</tr>';
               }).join('') +
-            '</tbody></table></div>') +
+            '</tbody></table></div>')) +
       '</div>';
+
+    var tfuRetryBtn = document.getElementById('tfu-retry-btn');
+    if (tfuRetryBtn) {
+      tfuRetryBtn.addEventListener('click', function () {
+        renderTeamFollowUps(container, ctx);
+      });
+    }
 
     ['tfu-emp', 'tfu-status', 'tfu-date'].forEach(function (id) {
       document.getElementById(id).addEventListener('change', function () {
@@ -560,6 +613,27 @@
         }
       });
     });
+
+    if (!container._rgTeamFuDeltaBound) {
+      container._rgTeamFuDeltaBound = true;
+      var onTeamFuDelta = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onTeamFuDelta);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        var relevant = Boolean(
+          (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0)
+        );
+        if (!relevant) return;
+        var activeEl = document.activeElement;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        renderTeamFollowUps(container, ctx);
+      };
+      document.addEventListener('rg:deltasync', onTeamFuDelta);
+    }
   }
 
   root.RGFollowUps = {

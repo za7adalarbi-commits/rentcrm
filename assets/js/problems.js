@@ -95,15 +95,17 @@
     var hasPrbFilter = Boolean(state.status || state.priority || state.employeeId || state.search);
 
     var [prbRes, empRes, resListRes, allPrbRes] = await Promise.all([
-      root.RGApi.callApi('getProblems', state),
+      root.RGApi.callApi('getProblems', Object.assign({}, state, { abortKey: 'prb:list' })),
       hasPreloadedEmps ? Promise.resolve({ success: true, data: { items: empState.items } }) : root.RGApi.callApi('getEmployees', {}),
       isRatesVisible ? root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true }) : Promise.resolve(null),
       (isRatesVisible && hasPrbFilter)
         ? root.RGApi.callApi('getProblems', { silentRefresh: true })
         : Promise.resolve(null)
     ]);
-    var items = (prbRes.success && prbRes.data.items) || [];
-    var employees = (empRes.success && empRes.data.items) || [];
+    if (prbRes && prbRes.aborted) return;
+    var prbLoadError = (!prbRes || !prbRes.success) ? ((prbRes && prbRes.message) || 'تعذر تحميل المشكلات.') : '';
+    var items = (prbRes && prbRes.success && prbRes.data && prbRes.data.items) || [];
+    var employees = (empRes.success && empRes.data && empRes.data.items) || [];
     var resItems = (resListRes && resListRes.success && resListRes.data && Array.isArray(resListRes.data.items)) ? resListRes.data.items : [];
     var allProblemsForRate = (allPrbRes && allPrbRes.success && allPrbRes.data && Array.isArray(allPrbRes.data.items)) ? allPrbRes.data.items : items;
     var ratesLoaded = Boolean(isRatesVisible);
@@ -264,6 +266,21 @@
       paintProblemsRegion(items);
     }
 
+    function paintProblemsError(msg) {
+      var region = container.querySelector('#prb-table-region');
+      if (!region) return;
+      region.innerHTML =
+        '<div class="rg-error-banner" role="alert">' +
+          '<div class="rg-error-banner-body">' +
+            '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load problems' : 'تعذر تحميل قائمة المشكلات') + '</div>' +
+            '<div class="rg-error-banner-msg">' + esc(msg || 'تعذر تحميل المشكلات.') + '</div>' +
+          '</div>' +
+          '<button type="button" class="btn btn-sm btn-primary" id="prb-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+        '</div>';
+      var pRetry = document.getElementById('prb-retry-btn');
+      if (pRetry) pRetry.addEventListener('click', function () { refreshProblemsRegion({ forceRefresh: true }); });
+    }
+
     function paintProblemsRegion(list) {
       items = list || [];
       var countEl = container.querySelector('#prb-total-count');
@@ -321,8 +338,11 @@
           var p = items.find(function (x) { return x.id === pid; });
           if (!p) return;
           runWithLock(btn, 'updateProblem:' + pid, function () {
+            var prevItems = items.slice();
+            var prevAllProblems = allProblemsForRate.slice();
             var closePayload = {
               problemId: pid,
+              expectedUpdatedAt: p.updatedAt || '',
               status: 'مغلقة',
               priority: p.priority || 'متوسط',
               note: 'تم إغلاق المشكلة'
@@ -337,28 +357,47 @@
             filterAndApplyLocalProblem(optUpdated);
             ctx.toast('تم إغلاق المشكلة ' + p.problemNumber + ' بنجاح.');
             return syncProblemUpdateInBackground(closePayload, ctx, function () {
-              refreshProblemsRegion();
+              items = prevItems;
+              allProblemsForRate = prevAllProblems;
+              paintProblemsRegion(items);
+              if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
+              refreshProblemsRegion({ forceRefresh: true, silentRefresh: true });
             });
           });
         });
       });
     }
 
-    async function refreshProblemsRegion() {
+    async function refreshProblemsRegion(opts) {
       var seq = ++activePrbSeq;
-      var resp = await root.RGApi.callApi('getProblems', state);
-      if (seq !== activePrbSeq) return;
+      var region = container.querySelector('#prb-table-region');
+      if (region && !(opts && opts.silentRefresh) && items.length === 0) {
+        region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+      }
+      var resp = await root.RGApi.callApi('getProblems', Object.assign({}, state, {
+        forceRefresh: Boolean(opts && opts.forceRefresh),
+        silentRefresh: Boolean(opts && opts.silentRefresh),
+        abortKey: 'prb:list'
+      }));
+      if (seq !== activePrbSeq || !container.isConnected) return;
+      if (resp && resp.aborted) return;
       if (resp && resp.success && resp.data) {
         paintProblemsRegion(resp.data.items || []);
         if (!state.status && !state.priority && !state.employeeId && !state.search) {
           allProblemsForRate = resp.data.items || [];
           if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
         }
+      } else if (!(opts && opts.silentRefresh) || items.length === 0) {
+        paintProblemsError((resp && resp.message) || 'تعذر تحميل المشكلات.');
       }
     }
 
     if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
-    paintProblemsRegion(items);
+    if (prbLoadError) {
+      paintProblemsError(prbLoadError);
+    } else {
+      paintProblemsRegion(items);
+    }
 
     var searchTimer = null;
     document.getElementById('prb-search').addEventListener('input', function (ev) {
@@ -366,7 +405,7 @@
       searchTimer = setTimeout(function () {
         state.search = ev.target.value;
         refreshProblemsRegion();
-      }, 180);
+      }, 220);
     });
 
     ['prb-status', 'prb-prio', 'prb-emp'].forEach(function (id) {
@@ -386,6 +425,27 @@
       document.getElementById('prb-emp').value = '';
       refreshProblemsRegion();
     });
+
+    if (!container._rgPrbDeltaBound) {
+      container._rgPrbDeltaBound = true;
+      var onPrbDelta = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onPrbDelta);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        var relevant = Boolean(
+          (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0)
+        );
+        if (!relevant) return;
+        var activeEl = document.activeElement;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        refreshProblemsRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+      };
+      document.addEventListener('rg:deltasync', onPrbDelta);
+    }
   }
 
   function openProblemUpdateModal(problem, employees, ctx, onSaved, onCancel) {
@@ -509,6 +569,7 @@
 
       var payload = {
         problemId: problem.id,
+        expectedUpdatedAt: problem.updatedAt || '',
         status: nextStatus,
         priority: nextPrio,
         assignedEmployeeIds: selectedEmpIds,

@@ -11,6 +11,12 @@ import {
   revokeEmployeeSessions,
   type AuthSession
 } from './auth.js';
+import {
+  getCachedOrLoad,
+  getLocalCacheVersion,
+  invalidateScopes,
+  runWithIdempotency
+} from './cache.js';
 import { getDatabaseUrl, type DbClient, type DbExecutor } from './db.js';
 import { isCoreFilesystemWritable, maskDatabaseUrl } from './coreBinding.js';
 import {
@@ -266,23 +272,55 @@ const INTERNAL_SECRET_SETTING_KEYS = new Set([
   'rg_token'
 ]);
 
-export async function getSettingsMap(client: DbClient): Promise<Record<string, any>> {
-  const res = await client.query<{ key: string; value: string }>(`SELECT key, value FROM settings`);
-  const map: Record<string, any> = {};
-  for (const row of res.rows) {
-    if (INTERNAL_SECRET_SETTING_KEYS.has(String(row.key))) continue;
-    const raw = row.value;
-    if (raw === 'true') map[row.key] = true;
-    else if (raw === 'false') map[row.key] = false;
-    else if (typeof raw === 'string' && (raw.startsWith('[') || raw.startsWith('{'))) {
-      map[row.key] = parseJsonValue(raw, raw);
-    } else if (raw !== '' && !isNaN(Number(raw)) && !/^0\d+/.test(raw)) {
-      map[row.key] = Number(raw);
-    } else {
-      map[row.key] = raw;
-    }
+function isDbExecutorObj(client: DbClient): client is DbExecutor {
+  return Boolean(client && typeof (client as DbExecutor).withTransaction === 'function');
+}
+
+function assertOptimisticLock(existingUpdatedAt: string, expectedUpdatedAt: unknown): void {
+  const exp = str(expectedUpdatedAt);
+  if (!exp) return;
+  const expMs = Date.parse(exp);
+  const curMs = Date.parse(str(existingUpdatedAt));
+  if (!isNaN(expMs) && !isNaN(curMs) && curMs - expMs > 1000) {
+    throw new Error('CONFLICT_STALE_DATA: تم تعديل هذا السجل بواسطة مستخدم آخر. تم تحديث البيانات، يرجى المراجعة وإعادة المحاولة.');
   }
-  return map;
+}
+
+function shiftIsoDateDays(isoDate: string, deltaDays: number): string {
+  const parts = String(isoDate || '').split('-').map(Number);
+  if (parts.length !== 3 || parts.some((n) => isNaN(n))) return isoDate;
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] + deltaDays));
+  return d.toISOString().slice(0, 10);
+}
+
+export async function getSettingsMap(client: DbClient): Promise<Record<string, any>> {
+  const loadSettings = async (): Promise<Record<string, any>> => {
+    const res = await client.query<{ key: string; value: string }>(`SELECT key, value FROM settings`);
+    const map: Record<string, any> = {};
+    for (const row of res.rows) {
+      if (INTERNAL_SECRET_SETTING_KEYS.has(String(row.key))) continue;
+      const raw = row.value;
+      if (raw === 'true') map[row.key] = true;
+      else if (raw === 'false') map[row.key] = false;
+      else if (typeof raw === 'string' && (raw.startsWith('[') || raw.startsWith('{'))) {
+        map[row.key] = parseJsonValue(raw, raw);
+      } else if (raw !== '' && !isNaN(Number(raw)) && !/^0\d+/.test(raw)) {
+        map[row.key] = Number(raw);
+      } else {
+        map[row.key] = raw;
+      }
+    }
+    return map;
+  };
+
+  if (isDbExecutorObj(client)) {
+    return getCachedOrLoad(
+      client,
+      { scope: 'settings', key: 'settings_map', ttlMs: 30000 },
+      loadSettings
+    );
+  }
+  return loadSettings();
 }
 
 async function getRolePresetsFromDb(client: DbClient): Promise<any[]> {
@@ -445,12 +483,114 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
     }
   });
     seededExecutors.add(executor);
+    invalidateScopes(executor, ['settings']);
   })().finally(() => {
     seedPromiseByExec.delete(executor);
   });
 
   seedPromiseByExec.set(executor, p);
   return p;
+}
+
+// ---------- TODAY MOVEMENTS & 24H RADAR (FULL-DB PREFILTERED) ----------
+
+export async function getTodayAndRadar(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+): Promise<Record<string, any>> {
+  const settings = await getSettingsMap(executor);
+  const allowAgentViewAll = settings.allow_agent_view_all !== false;
+  const restrictAgent = session.user.role === 'agent' && !allowAgentViewAll;
+  const roleScope = restrictAgent ? `agent:${session.user.id}` : 'all';
+
+  const rawToday = str(payload.todayDate);
+  const todayStr = /^\d{4}-\d{2}-\d{2}$/.test(rawToday) ? rawToday : new Date().toISOString().slice(0, 10);
+  const minDate = shiftIsoDateDays(todayStr, -2);
+  const maxDate = shiftIsoDateDays(todayStr, 2);
+
+  const rawNow = Number(payload.nowMs);
+  const serverNow = Date.now();
+  const nowMs = (!isNaN(rawNow) && Math.abs(rawNow - serverNow) <= 86400000) ? rawNow : serverNow;
+
+  const candidates = await getCachedOrLoad(
+    executor,
+    { scope: 'todayRadar', key: `cand:${roleScope}:${todayStr}`, ttlMs: 15000 },
+    async () => {
+      const params: any[] = [todayStr, minDate, maxDate];
+      let agentSql = '';
+      if (restrictAgent) {
+        params.push(JSON.stringify([session.user.id]));
+        agentSql = `r.assigned_employee_ids @> $${params.length}::jsonb AND `;
+      }
+      const rowsRes = await executor.query(
+        `SELECT r.*
+         FROM reservations r
+         WHERE ${agentSql}(
+           r.start_date = $1
+           OR (r.end_date >= $2 AND r.end_date <= $3)
+           OR (r.extended_until_date >= $2 AND r.extended_until_date <= $3)
+         )
+         ORDER BY r.start_date ASC, r.end_date ASC
+         LIMIT 2500`,
+        params
+      );
+      const mapped = rowsRes.rows.map((r) => mapReservationRowToClient(r, false));
+      const ids = mapped.map((m) => str(m.id)).filter(Boolean);
+      if (ids.length > 0) {
+        const fuSetRes = await executor.query<{ reservation_id: string }>(
+          `SELECT DISTINCT reservation_id FROM follow_ups WHERE reservation_id = ANY($1::text[])`,
+          [ids]
+        ).catch(() => ({ rows: [] as Array<{ reservation_id: string }> }));
+        const followedSet = new Set(fuSetRes.rows.map((x) => str(x.reservation_id)));
+        for (const item of mapped) {
+          if (followedSet.has(str(item.id))) item.isFollowed = true;
+        }
+      }
+      return mapped;
+    }
+  );
+
+  const todaySummary = crmCore.computeTodayMovementsSummary(candidates, nowMs, {
+    todayDate: todayStr,
+    subFilter: 'all'
+  });
+  const radarSummary = crmCore.computeExpiryRadarSummary(candidates, nowMs, {
+    subFilter: 'all',
+    windowHours: 24,
+    gracePastHours: 12
+  });
+
+  const counts = {
+    todayTotal: num(todaySummary.totalCount),
+    pickupCount: num(todaySummary.pickupCount),
+    returnCount: num(todaySummary.returnCount),
+    pendingPickupCount: num(todaySummary.pendingPickupCount),
+    pendingReturnCount: num(todaySummary.pendingReturnCount),
+    overdueTodayCount: num(todaySummary.overdueCount),
+    radarTotal: num(radarSummary.totalCount),
+    upcoming24hCount: num(radarSummary.upcoming24hCount),
+    critical6hCount: num(radarSummary.critical6hCount),
+    soon24hCount: num(radarSummary.soon24hCount),
+    expiredUnclosedCount: num(radarSummary.expiredUnclosedCount),
+    extendedInRadarCount: num(radarSummary.extendedInRadarCount)
+  };
+
+  if (toBool(payload.summaryOnly)) {
+    return {
+      todayDate: todayStr,
+      serverTime: new Date().toISOString(),
+      counts
+    };
+  }
+
+  return {
+    todayDate: todayStr,
+    serverTime: new Date().toISOString(),
+    counts,
+    todaySummary,
+    radarSummary
+  };
 }
 
 // ---------- DASHBOARD & BOOTSTRAP ----------
@@ -462,7 +602,9 @@ export async function getDashboard(
 ): Promise<Record<string, any>> {
   const settings = await getSettingsMap(executor);
   const allowAgentViewAll = settings.allow_agent_view_all !== false;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = /^\d{4}-\d{2}-\d{2}$/.test(str(payload.todayDate))
+    ? str(payload.todayDate)
+    : new Date().toISOString().slice(0, 10);
 
   const range = str(payload.range);
   let dateFrom = str(payload.dateFrom);
@@ -483,93 +625,101 @@ export async function getDashboard(
     }
   }
 
-  const resParams: any[] = [];
-  const resClauses: string[] = [];
-  if (session.user.role === 'agent' && !allowAgentViewAll) {
-    resParams.push(JSON.stringify([session.user.id]));
-    resClauses.push(`assigned_employee_ids @> $${resParams.length}::jsonb`);
-  }
-  if (dateFrom) {
-    resParams.push(dateFrom);
-    resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) >= $${resParams.length}`);
-  }
-  if (dateTo) {
-    resParams.push(dateTo);
-    resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) <= $${resParams.length}`);
-  }
-  const resWhere = resClauses.length ? `WHERE ${resClauses.join(' AND ')}` : '';
-  const totalParams = [...resParams, today];
-  const todayParamIdx = totalParams.length;
-
-  const fuParams: any[] = [];
-  const fuClauses: string[] = [];
-  if (dateFrom) {
-    fuParams.push(dateFrom);
-    fuClauses.push(`follow_up_date >= $${fuParams.length}`);
-  }
-  if (dateTo) {
-    fuParams.push(dateTo);
-    fuClauses.push(`follow_up_date <= $${fuParams.length}`);
-  }
-  const fuWhere = fuClauses.length ? `WHERE ${fuClauses.join(' AND ')}` : '';
-
+  const restrictAgent = session.user.role === 'agent' && !allowAgentViewAll;
   const canSync = crmCore.canAccessApi(session.user);
+  const cacheKey = `${restrictAgent ? session.user.id : 'all'}|${canSync ? 'sync' : 'nosync'}|${range}|${dateFrom}|${dateTo}|${today}`;
 
-  const [
-    resTotalsQuery,
-    resStatusQuery,
-    resCompanyQuery,
-    resAssignedQuery,
-    fuAggQuery,
-    fuTodayQuery,
-    prbAggQuery,
-    empQuery,
-    recentActivityRes,
-    syncRes
-  ] = await Promise.all([
-    executor.query<{ total_cnt: number; today_cnt: number }>(
-      `SELECT COUNT(*)::int AS total_cnt,
-              COUNT(*) FILTER (WHERE start_date = $${todayParamIdx} OR to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $${todayParamIdx})::int AS today_cnt
-       FROM reservations ${resWhere}`,
-      totalParams
-    ),
-    executor.query<{ internal_status: string; cnt: number }>(
-      `SELECT COALESCE(NULLIF(internal_status, ''), 'تم الإنشاء') AS internal_status, COUNT(*)::int AS cnt
-       FROM reservations ${resWhere}
-       GROUP BY 1`,
-      resParams
-    ),
-    executor.query<{ company_name: string; cnt: number }>(
-      `SELECT COALESCE(NULLIF(company_name, ''), 'غير محدد') AS company_name, COUNT(*)::int AS cnt
-       FROM reservations ${resWhere}
-       GROUP BY 1`,
-      resParams
-    ),
-    executor.query<{ emp_id: string; cnt: number }>(
-      `SELECT emp_id, COUNT(*)::int AS cnt
-       FROM reservations r,
-            LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
-       ${resWhere}
-       GROUP BY emp_id`,
-      resParams
-    ),
-    executor.query<{ follow_up_date: string; employee_name: string; cnt: number }>(
-      `SELECT follow_up_date, employee_name, COUNT(*)::int AS cnt
-       FROM follow_ups ${fuWhere}
-       GROUP BY follow_up_date, employee_name`,
-      fuParams
-    ),
-    executor.query<{ today_cnt: number }>(
-      `SELECT COUNT(*)::int AS today_cnt FROM follow_ups WHERE follow_up_date = $1`,
-      [today]
-    ),
-    executor.query<{ status: string; priority: string; cnt: number }>(
-      `SELECT status, priority, COUNT(*)::int AS cnt FROM problems GROUP BY status, priority`
-    ),
-    executor.query(`SELECT id, name, status FROM employees WHERE status = 'active'`),
-    executor.query(`SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 8`),
-    canSync ? executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 1`) : Promise.resolve({ rows: [] as any[], rowCount: 0 })
-  ]);
+  return getCachedOrLoad(
+    executor,
+    { scope: 'dashboard', key: cacheKey, ttlMs: 20000, bypassCache: toBool(payload.forceRefresh) },
+    async () => {
+      const resParams: any[] = [];
+      const resClauses: string[] = [];
+      if (restrictAgent) {
+        resParams.push(JSON.stringify([session.user.id]));
+        resClauses.push(`assigned_employee_ids @> $${resParams.length}::jsonb`);
+      }
+      if (dateFrom) {
+        resParams.push(dateFrom);
+        resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) >= $${resParams.length}`);
+      }
+      if (dateTo) {
+        resParams.push(dateTo);
+        resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) <= $${resParams.length}`);
+      }
+      const resWhere = resClauses.length ? `WHERE ${resClauses.join(' AND ')}` : '';
+      const totalParams = [...resParams, today];
+      const todayParamIdx = totalParams.length;
+
+      const fuParams: any[] = [];
+      const fuClauses: string[] = [];
+      if (dateFrom) {
+        fuParams.push(dateFrom);
+        fuClauses.push(`follow_up_date >= $${fuParams.length}`);
+      }
+      if (dateTo) {
+        fuParams.push(dateTo);
+        fuClauses.push(`follow_up_date <= $${fuParams.length}`);
+      }
+      const fuWhere = fuClauses.length ? `WHERE ${fuClauses.join(' AND ')}` : '';
+
+      const [
+        resTotalsQuery,
+        resStatusQuery,
+        resCompanyQuery,
+        resAssignedQuery,
+        fuAggQuery,
+        fuTodayQuery,
+        prbAggQuery,
+        empQuery,
+        recentActivityRes,
+        syncRes,
+        todayRadarSummary
+      ] = await Promise.all([
+        executor.query<{ total_cnt: number; today_cnt: number }>(
+          `SELECT COUNT(*)::int AS total_cnt,
+                  COUNT(*) FILTER (WHERE start_date = $${todayParamIdx}::text OR (created_at >= ($${todayParamIdx}::text || 'T00:00:00Z')::timestamptz AND created_at < (($${todayParamIdx}::text || 'T00:00:00Z')::timestamptz + INTERVAL '1 day')))::int AS today_cnt
+           FROM reservations ${resWhere}`,
+          totalParams
+        ),
+        executor.query<{ internal_status: string; cnt: number }>(
+          `SELECT COALESCE(NULLIF(internal_status, ''), 'تم الإنشاء') AS internal_status, COUNT(*)::int AS cnt
+           FROM reservations ${resWhere}
+           GROUP BY 1`,
+          resParams
+        ),
+        executor.query<{ company_name: string; cnt: number }>(
+          `SELECT COALESCE(NULLIF(company_name, ''), 'غير محدد') AS company_name, COUNT(*)::int AS cnt
+           FROM reservations ${resWhere}
+           GROUP BY 1`,
+          resParams
+        ),
+        executor.query<{ emp_id: string; cnt: number }>(
+          `SELECT emp_id, COUNT(*)::int AS cnt
+           FROM reservations r,
+                LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
+           ${resWhere}
+           GROUP BY emp_id`,
+          resParams
+        ),
+        executor.query<{ follow_up_date: string; employee_name: string; cnt: number }>(
+          `SELECT follow_up_date, employee_name, COUNT(*)::int AS cnt
+           FROM follow_ups ${fuWhere}
+           GROUP BY follow_up_date, employee_name`,
+          fuParams
+        ),
+        executor.query<{ today_cnt: number }>(
+          `SELECT COUNT(*)::int AS today_cnt FROM follow_ups WHERE follow_up_date = $1`,
+          [today]
+        ),
+        executor.query<{ status: string; priority: string; cnt: number }>(
+          `SELECT status, priority, COUNT(*)::int AS cnt FROM problems GROUP BY status, priority`
+        ),
+        executor.query(`SELECT id, name, status FROM employees WHERE status = 'active'`),
+        executor.query(`SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 8`),
+        canSync ? executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 1`) : Promise.resolve({ rows: [] as any[], rowCount: 0 }),
+        getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: today }).catch(() => ({ counts: null }))
+      ]);
 
   const statusCounts: Record<string, number> = {};
   for (const s of crmCore.FOLLOWUP_STATUSES) {
@@ -683,11 +833,14 @@ export async function getDashboard(
     };
   }
 
-  return {
-    ...metrics,
-    recentActivity,
-    lastSync
-  };
+      return {
+        ...metrics,
+        recentActivity,
+        lastSync,
+        todayRadarCounts: (todayRadarSummary as any)?.counts || null
+      };
+    }
+  );
 }
 
 export async function getNotifications(executor: DbExecutor, session: AuthSession) {
@@ -770,6 +923,7 @@ export async function getAppBootstrap(
     user: session.user,
     me: { user: session.user },
     dashboard,
+    todayRadarCounts: dashboard?.todayRadarCounts || null,
     notifications,
     employees: employeesData,
     settings: settingsOut,
@@ -778,7 +932,8 @@ export async function getAppBootstrap(
     announcements: announcementsData.activeItems || [],
     activeLocks: locksData.items || [],
     layoutPrefs,
-    pinnedCriticalIds
+    pinnedCriticalIds,
+    syncVersion: getLocalCacheVersion(executor)
   };
 }
 
@@ -1280,6 +1435,7 @@ export async function quickUpdateReservationStatus(
     if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
 
     const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+    assertOptimisticLock(resObj.updatedAt, payload.expectedUpdatedAt);
     const prevStatus = str(resObj.internalStatus);
     const nowIso = new Date().toISOString();
     const actionLabel = `تحديث سريع للحالة إلى: ${newStatus}`;
@@ -1381,6 +1537,7 @@ export async function updateReservationDetails(
     const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
     if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
     const existing = mapReservationRowToClient(resQuery.rows[0], false);
+    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
     const nextStatus = payload.internalStatus !== undefined ? str(payload.internalStatus) : existing.internalStatus;
     if (payload.internalStatus !== undefined && !crmCore.isValidWorkflowStatus(nextStatus)) {
@@ -1546,6 +1703,7 @@ export async function saveReservationPinnedNote(
     const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
     if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
     const existing = mapReservationRowToClient(resQuery.rows[0], false);
+    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
     const nowIso = new Date().toISOString();
     const byId = note ? session.user.id : '';
@@ -1739,6 +1897,7 @@ export async function togglePinnedCriticalReservation(
     return { pinnedCriticalIds: nextIds, isPinned: shouldPin };
   });
 
+  invalidateScopes(executor, ['settings']);
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
@@ -1754,80 +1913,82 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
   if (!resId || !status || !action) throw new Error('VALIDATION_ERROR: الحجز والحالة والإجراء حقول مطلوبة.');
   if (!crmCore.isValidWorkflowStatus(status)) throw new Error('VALIDATION_ERROR: حالة المتابعة غير معتمدة.');
 
-  const out = await executor.withTransaction(async (tx) => {
-    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
-    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
-    const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+  return runWithIdempotency(executor, session.user.id, 'addFollowUp', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
+      if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+      const resObj = mapReservationRowToClient(resQuery.rows[0], false);
 
-    const nowIso = new Date().toISOString();
-    const fuObj = {
-      id: generateId('FU'),
-      reservationId: resObj.id,
-      reservationNumber: resObj.reservationNumber,
-      customerName: resObj.customerName,
-      employeeId: session.user.id,
-      employeeName: session.user.name,
-      status,
-      action,
-      notes,
-      followUpDate: nowIso.slice(0, 10),
-      followUpTime: nowIso.slice(11, 19),
-      createdAt: nowIso
-    };
+      const nowIso = new Date().toISOString();
+      const fuObj = {
+        id: generateId('FU'),
+        reservationId: resObj.id,
+        reservationNumber: resObj.reservationNumber,
+        customerName: resObj.customerName,
+        employeeId: session.user.id,
+        employeeName: session.user.name,
+        status,
+        action,
+        notes,
+        followUpDate: nowIso.slice(0, 10),
+        followUpTime: nowIso.slice(11, 19),
+        createdAt: nowIso
+      };
 
-    await tx.query(
-      `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
-      [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
-    );
+      await tx.query(
+        `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
+        [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
+      );
 
-    const lastText = action + (notes ? ` — ${notes}` : '');
-    const nextHistory = crmCore.appendStatusStageEntry(resObj.statusHistory || [], {
-      source: 'followup',
-      previousStatus: resObj.internalStatus,
-      newStatus: status,
-      changedAt: nowIso,
-      changedById: session.user.id,
-      changedByName: session.user.name,
-      note: lastText
+      const lastText = action + (notes ? ` — ${notes}` : '');
+      const nextHistory = crmCore.appendStatusStageEntry(resObj.statusHistory || [], {
+        source: 'followup',
+        previousStatus: resObj.internalStatus,
+        newStatus: status,
+        changedAt: nowIso,
+        changedById: session.user.id,
+        changedByName: session.user.name,
+        note: lastText
+      });
+
+      await tx.query(
+        `UPDATE reservations
+         SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
+             last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
+             status_history = $8::jsonb
+         WHERE id = $1`,
+        [resId, status, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
+      );
+
+      await logActivity(tx, session.user, 'إضافة متابعة', 'FollowUp', resObj.reservationNumber, `الحالة: ${status} — ${action}`);
+      await dispatchMentionNotifications(tx, {
+        texts: [action, notes],
+        sender: session.user,
+        entityType: 'Reservation',
+        entityId: resObj.id,
+        label: resObj.reservationNumber
+      });
+
+      const updatedRes: Record<string, any> = {
+        ...resObj,
+        internalStatus: status,
+        lastUpdateText: lastText,
+        lastUpdatedById: session.user.id,
+        lastUpdatedByName: session.user.name,
+        lastUpdatedAt: nowIso,
+        updatedAt: nowIso,
+        statusHistory: nextHistory,
+        isFollowed: true
+      };
+      await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
+      await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+      return { followUp: fuObj, reservation: updatedRes };
     });
 
-    await tx.query(
-      `UPDATE reservations
-       SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
-           last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
-           status_history = $8::jsonb
-       WHERE id = $1`,
-      [resId, status, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
-    );
-
-    await logActivity(tx, session.user, 'إضافة متابعة', 'FollowUp', resObj.reservationNumber, `الحالة: ${status} — ${action}`);
-    await dispatchMentionNotifications(tx, {
-      texts: [action, notes],
-      sender: session.user,
-      entityType: 'Reservation',
-      entityId: resObj.id,
-      label: resObj.reservationNumber
-    });
-
-    const updatedRes: Record<string, any> = {
-      ...resObj,
-      internalStatus: status,
-      lastUpdateText: lastText,
-      lastUpdatedById: session.user.id,
-      lastUpdatedByName: session.user.name,
-      lastUpdatedAt: nowIso,
-      updatedAt: nowIso,
-      statusHistory: nextHistory,
-      isFollowed: true
-    };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-    return { followUp: fuObj, reservation: updatedRes };
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
   });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
 }
 
 export async function updateFollowUp(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -2126,97 +2287,99 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
   const priority = crmCore.PROBLEM_PRIORITIES.includes(str(payload.priority)) ? str(payload.priority) : 'متوسط';
   if (!description) throw new Error('VALIDATION_ERROR: وصف المشكلة مطلوب.');
 
-  const out = await executor.withTransaction(async (tx) => {
-    let resObj: any = null;
-    if (resId || resNumberInput) {
-      const rRes = await tx.query(
-        `SELECT * FROM reservations WHERE id = $1 OR reservation_number = $2 LIMIT 1 FOR UPDATE`,
-        [resId, resNumberInput]
-      );
-      if (rRes.rows[0]) resObj = mapReservationRowToClient(rRes.rows[0], false);
-    }
+  return runWithIdempotency(executor, session.user.id, 'createProblem', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      let resObj: any = null;
+      if (resId || resNumberInput) {
+        const rRes = await tx.query(
+          `SELECT * FROM reservations WHERE id = $1 OR reservation_number = $2 LIMIT 1 FOR UPDATE`,
+          [resId, resNumberInput]
+        );
+        if (rRes.rows[0]) resObj = mapReservationRowToClient(rRes.rows[0], false);
+      }
 
-    const assignedIdsInput: string[] = Array.isArray(payload.assignedEmployeeIds)
-      ? payload.assignedEmployeeIds.map((x: any) => str(x)).filter(Boolean)
-      : [];
-    const empIds = assignedIdsInput.length ? assignedIdsInput : [session.user.id];
-    const empRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[])`, [empIds]);
-    const eMap = new Map(empRes.rows.map((e) => [str(e.id), str(e.name)]));
-    const empNames = empIds.map((id) => eMap.get(id) || session.user.name);
+      const assignedIdsInput: string[] = Array.isArray(payload.assignedEmployeeIds)
+        ? payload.assignedEmployeeIds.map((x: any) => str(x)).filter(Boolean)
+        : [];
+      const empIds = assignedIdsInput.length ? assignedIdsInput : [session.user.id];
+      const empRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[])`, [empIds]);
+      const eMap = new Map(empRes.rows.map((e) => [str(e.id), str(e.name)]));
+      const empNames = empIds.map((id) => eMap.get(id) || session.user.name);
 
-    const nowIso = new Date().toISOString();
-    const prb = {
-      id: generateId('PRB'),
-      problemNumber: `PRB-${String(Date.now()).slice(-6)}`,
-      reservationId: resObj ? resObj.id : resId,
-      reservationNumber: resObj ? resObj.reservationNumber : resNumberInput,
-      customerName: resObj ? resObj.customerName : str(payload.customerName),
-      createdById: session.user.id,
-      createdByName: session.user.name,
-      assignedEmployeeIds: empIds,
-      assignedEmployeeNames: empNames,
-      description,
-      priority,
-      status: 'جديدة',
-      createdAt: nowIso,
-      updatedAt: nowIso
-    };
+      const nowIso = new Date().toISOString();
+      const prb = {
+        id: generateId('PRB'),
+        problemNumber: `PRB-${String(Date.now()).slice(-6)}`,
+        reservationId: resObj ? resObj.id : resId,
+        reservationNumber: resObj ? resObj.reservationNumber : resNumberInput,
+        customerName: resObj ? resObj.customerName : str(payload.customerName),
+        createdById: session.user.id,
+        createdByName: session.user.name,
+        assignedEmployeeIds: empIds,
+        assignedEmployeeNames: empNames,
+        description,
+        priority,
+        status: 'جديدة',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
 
-    const insertSql = `
-      INSERT INTO %TABLE% (id, problem_number, reservation_id, reservation_number, customer_name, created_by_id, created_by_name, assigned_employee_ids, assigned_employee_names, description, priority, status, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13::timestamptz,$13::timestamptz)
-    `;
-    const params = [
-      prb.id, prb.problemNumber, prb.reservationId || null, prb.reservationNumber, prb.customerName,
-      prb.createdById, prb.createdByName, JSON.stringify(prb.assignedEmployeeIds), JSON.stringify(prb.assignedEmployeeNames),
-      prb.description, prb.priority, prb.status, nowIso
-    ];
-    await tx.query(insertSql.replace('%TABLE%', 'problems'), params);
-    await tx.query(insertSql.replace('%TABLE%', 'issues'), params);
+      const insertSql = `
+        INSERT INTO %TABLE% (id, problem_number, reservation_id, reservation_number, customer_name, created_by_id, created_by_name, assigned_employee_ids, assigned_employee_names, description, priority, status, created_at, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13::timestamptz,$13::timestamptz)
+      `;
+      const params = [
+        prb.id, prb.problemNumber, prb.reservationId || null, prb.reservationNumber, prb.customerName,
+        prb.createdById, prb.createdByName, JSON.stringify(prb.assignedEmployeeIds), JSON.stringify(prb.assignedEmployeeNames),
+        prb.description, prb.priority, prb.status, nowIso
+      ];
+      await tx.query(insertSql.replace('%TABLE%', 'problems'), params);
+      await tx.query(insertSql.replace('%TABLE%', 'issues'), params);
 
-    await tx.query(
-      `INSERT INTO problem_updates (id, problem_id, reservation_number, employee_id, employee_name, previous_status, new_status, previous_priority, new_priority, note, created_at)
-       VALUES ($1,$2,$3,$4,$5,'','جديدة','',$6,'فتح تذكرة مشكلة جديدة',$7::timestamptz)`,
-      [generateId('PRBU'), prb.id, prb.reservationNumber, session.user.id, session.user.name, prb.priority, nowIso]
-    );
-
-    if (resObj) {
       await tx.query(
-        `UPDATE reservations
-         SET has_problem = TRUE,
-             priority = CASE WHEN $2 = 'مرتفع' THEN 'مرتفع' ELSE priority END,
-             updated_at = $3::timestamptz
-         WHERE id = $1`,
-        [resObj.id, prb.priority, nowIso]
+        `INSERT INTO problem_updates (id, problem_id, reservation_number, employee_id, employee_name, previous_status, new_status, previous_priority, new_priority, note, created_at)
+         VALUES ($1,$2,$3,$4,$5,'','جديدة','',$6,'فتح تذكرة مشكلة جديدة',$7::timestamptz)`,
+        [generateId('PRBU'), prb.id, prb.reservationNumber, session.user.id, session.user.name, prb.priority, nowIso]
       );
-    }
 
-    if (prb.priority === 'مرتفع') {
-      await createNotification(tx, {
-        recipientRole: 'supervisor',
-        type: 'high_priority_problem',
-        title: `مشكلة عالية الأولوية (${prb.problemNumber})`,
-        message: `${prb.customerName || prb.reservationNumber}: ${prb.description.slice(0, 80)}`,
+      if (resObj) {
+        await tx.query(
+          `UPDATE reservations
+           SET has_problem = TRUE,
+               priority = CASE WHEN $2 = 'مرتفع' THEN 'مرتفع' ELSE priority END,
+               updated_at = $3::timestamptz
+           WHERE id = $1`,
+          [resObj.id, prb.priority, nowIso]
+        );
+      }
+
+      if (prb.priority === 'مرتفع') {
+        await createNotification(tx, {
+          recipientRole: 'supervisor',
+          type: 'high_priority_problem',
+          title: `مشكلة عالية الأولوية (${prb.problemNumber})`,
+          message: `${prb.customerName || prb.reservationNumber}: ${prb.description.slice(0, 80)}`,
+          entityType: 'Problem',
+          entityId: prb.id
+        });
+      }
+
+      await dispatchMentionNotifications(tx, {
+        texts: [description],
+        sender: session.user,
         entityType: 'Problem',
-        entityId: prb.id
+        entityId: prb.id,
+        label: prb.problemNumber
       });
-    }
 
-    await dispatchMentionNotifications(tx, {
-      texts: [description],
-      sender: session.user,
-      entityType: 'Problem',
-      entityId: prb.id,
-      label: prb.problemNumber
+      await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
+      await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
+      return { ...prb, updates: [] };
     });
 
-    await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
-    await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
-    return { ...prb, updates: [] };
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
   });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
 }
 
 export async function updateProblem(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -2228,6 +2391,7 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
     const pRes = await tx.query(`SELECT * FROM problems WHERE id = $1 FOR UPDATE`, [problemId]);
     if (!pRes.rows[0]) throw new Error('NOT_FOUND: المشكلة غير موجودة.');
     const existing = formatProblemRow(pRes.rows[0]);
+    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
     const nextStatus = payload.status !== undefined ? str(payload.status) : existing.status;
     const nextPrio = payload.priority !== undefined ? str(payload.priority) : existing.priority;
@@ -2402,78 +2566,85 @@ export async function getProblemDetails(executor: DbExecutor, _session: AuthSess
 // ---------- EMPLOYEES, ROLES & PERMISSIONS ----------
 
 export async function getEmployees(executor: DbExecutor, session: AuthSession) {
-  if (!crmCore.canUserPerform(session.user, 'view_employees')) {
-    const dirRes = await executor.query(
-      `SELECT id, name, username, role, job_title, status
-       FROM employees
-       WHERE status = 'active'
-       ORDER BY name ASC`
-    );
-    const dirItems = dirRes.rows.map((r: any) => ({
-      id: str(r.id),
-      name: str(r.name),
-      username: str(r.username),
-      role: str(r.role || 'agent'),
-      jobTitle: str(r.job_title),
-      status: str(r.status || 'active')
-    }));
-    return {
-      items: dirItems,
-      total: dirItems.length,
-      directoryOnly: true
-    };
-  }
-  const [empRes, resCountsRes, fuCountsRes, prbCountsRes, presets, customPerms] = await Promise.all([
-    executor.query(`SELECT * FROM employees ORDER BY created_at ASC`),
-    executor.query<{ emp_id: string; cnt: number }>(
-      `SELECT emp_id, COUNT(*)::int AS cnt
-       FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
-       GROUP BY emp_id`
-    ),
-    executor.query<{ employee_id: string; cnt: number }>(
-      `SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups GROUP BY employee_id`
-    ),
-    executor.query<{ emp_id: string; cnt: number }>(
-      `SELECT emp_id, COUNT(*)::int AS cnt
-       FROM problems p, LATERAL jsonb_array_elements_text(p.assigned_employee_ids) AS emp_id
-       WHERE p.status NOT IN ('مغلقة', 'تم الحل')
-       GROUP BY emp_id`
-    ),
-    getRolePresetsFromDb(executor),
-    getPermissionDefsFromDb(executor)
-  ]);
-
-  const resCountMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
-  const fuCountMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
-  const prbCountMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
-
-  const items = empRes.rows.map((row) => {
-    const emp = mapEmployeeRow(row);
-    const assignedCount = resCountMap.get(emp.id) || 0;
-    const followUpsCount = fuCountMap.get(emp.id) || 0;
-    const openProblemsCount = prbCountMap.get(emp.id) || 0;
-    return {
-      ...emp,
-      reservationsCount: assignedCount,
-      followUpsCount,
-      problemsCount: openProblemsCount,
-      stats: {
-        assignedCount,
-        followUpsCount,
-        openProblemsCount
+  const canView = crmCore.canUserPerform(session.user, 'view_employees');
+  return getCachedOrLoad(
+    executor,
+    { scope: 'employees', key: canView ? 'full' : 'dir', ttlMs: 30000 },
+    async () => {
+      if (!canView) {
+        const dirRes = await executor.query(
+          `SELECT id, name, username, role, job_title, status
+           FROM employees
+           WHERE status = 'active'
+           ORDER BY name ASC`
+        );
+        const dirItems = dirRes.rows.map((r: any) => ({
+          id: str(r.id),
+          name: str(r.name),
+          username: str(r.username),
+          role: str(r.role || 'agent'),
+          jobTitle: str(r.job_title),
+          status: str(r.status || 'active')
+        }));
+        return {
+          items: dirItems,
+          total: dirItems.length,
+          directoryOnly: true
+        };
       }
-    };
-  });
+      const [empRes, resCountsRes, fuCountsRes, prbCountsRes, presets, customPerms] = await Promise.all([
+        executor.query(`SELECT * FROM employees ORDER BY created_at ASC`),
+        executor.query<{ emp_id: string; cnt: number }>(
+          `SELECT emp_id, COUNT(*)::int AS cnt
+           FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
+           GROUP BY emp_id`
+        ),
+        executor.query<{ employee_id: string; cnt: number }>(
+          `SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups GROUP BY employee_id`
+        ),
+        executor.query<{ emp_id: string; cnt: number }>(
+          `SELECT emp_id, COUNT(*)::int AS cnt
+           FROM problems p, LATERAL jsonb_array_elements_text(p.assigned_employee_ids) AS emp_id
+           WHERE p.status NOT IN ('مغلقة', 'تم الحل')
+           GROUP BY emp_id`
+        ),
+        getRolePresetsFromDb(executor),
+        getPermissionDefsFromDb(executor)
+      ]);
 
-  const rolePresets = crmCore.normalizeRolePresets(presets);
-  const permissionsCatalog = crmCore.mergePermissionsCatalog(customPerms);
+      const resCountMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
+      const fuCountMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
+      const prbCountMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
 
-  return {
-    items,
-    rolePresets,
-    permissionsCatalog,
-    customPermissions: customPerms
-  };
+      const items = empRes.rows.map((row) => {
+        const emp = mapEmployeeRow(row);
+        const assignedCount = resCountMap.get(emp.id) || 0;
+        const followUpsCount = fuCountMap.get(emp.id) || 0;
+        const openProblemsCount = prbCountMap.get(emp.id) || 0;
+        return {
+          ...emp,
+          reservationsCount: assignedCount,
+          followUpsCount,
+          problemsCount: openProblemsCount,
+          stats: {
+            assignedCount,
+            followUpsCount,
+            openProblemsCount
+          }
+        };
+      });
+
+      const rolePresets = crmCore.normalizeRolePresets(presets);
+      const permissionsCatalog = crmCore.mergePermissionsCatalog(customPerms);
+
+      return {
+        items,
+        rolePresets,
+        permissionsCatalog,
+        customPermissions: customPerms
+      };
+    }
+  );
 }
 
 export async function getEmployeeDetails(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -2969,7 +3140,7 @@ export async function applyUnifiedConnectionSetupAction(
   payload: Record<string, any> = {}
 ) {
   requirePermission(session, 'manage_settings');
-  return runUnifiedConnectionSetup({
+  const out = await runUnifiedConnectionSetup({
     executor,
     session,
     payload,
@@ -2979,6 +3150,8 @@ export async function applyUnifiedConnectionSetupAction(
       await logActivity(exec, actor, act, target, targetId, details);
     }
   });
+  invalidateScopes(executor, ['settings']);
+  return out;
 }
 
 export async function updateSettings(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -3054,6 +3227,7 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     await logActivity(tx, session.user, 'تحديث الإعدادات', 'Settings', 'system', 'تحديث إعدادات النظام في قاعدة البيانات', settingDiffs);
   });
 
+  invalidateScopes(executor, ['settings']);
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return getSettings(executor, session);
 }
@@ -3080,6 +3254,7 @@ export async function saveUserLayoutPrefs(
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
     [key, value, session.user.name]
   );
+  invalidateScopes(executor, ['settings']);
   return { layoutPrefs: normalized };
 }
 
@@ -3498,115 +3673,132 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
     requirePermission(session, 'export_reports');
   }
   const rType = str(payload.reportType || 'all_reservations');
-  const params: any[] = [];
-  const clauses: string[] = [];
+  const cacheKey = JSON.stringify({
+    rType,
+    status: str(payload.status),
+    priority: str(payload.priority),
+    company: str(payload.company),
+    branch: str(payload.branch),
+    employeeId: str(payload.employeeId),
+    dateFrom: str(payload.dateFrom),
+    dateTo: str(payload.dateTo)
+  });
 
-  if (payload.status) { params.push(str(payload.status)); clauses.push(`r.internal_status = $${params.length}`); }
-  if (payload.priority) { params.push(str(payload.priority)); clauses.push(`r.priority = $${params.length}`); }
-  if (payload.company) { params.push(str(payload.company)); clauses.push(`r.company_name = $${params.length}`); }
-  if (payload.branch) { params.push(str(payload.branch)); clauses.push(`r.branch_name = $${params.length}`); }
-  if (payload.employeeId) { params.push(JSON.stringify([str(payload.employeeId)])); clauses.push(`r.assigned_employee_ids @> $${params.length}::jsonb`); }
-  if (payload.dateFrom) { params.push(str(payload.dateFrom)); clauses.push(`r.start_date >= $${params.length}`); }
-  if (payload.dateTo) { params.push(str(payload.dateTo)); clauses.push(`r.start_date <= $${params.length}`); }
-  if (rType === 'unfollowed') clauses.push(`NOT EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id)`);
+  return getCachedOrLoad(
+    executor,
+    { scope: 'reports', key: cacheKey, ttlMs: 30000, bypassCache: toBool(payload.forceRefresh) },
+    async () => {
+      const params: any[] = [];
+      const clauses: string[] = [];
 
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const facets = await getCachedReservationFacets(executor);
+      if (payload.status) { params.push(str(payload.status)); clauses.push(`r.internal_status = $${params.length}`); }
+      if (payload.priority) { params.push(str(payload.priority)); clauses.push(`r.priority = $${params.length}`); }
+      if (payload.company) { params.push(str(payload.company)); clauses.push(`r.company_name = $${params.length}`); }
+      if (payload.branch) { params.push(str(payload.branch)); clauses.push(`r.branch_name = $${params.length}`); }
+      if (payload.employeeId) { params.push(JSON.stringify([str(payload.employeeId)])); clauses.push(`r.assigned_employee_ids @> $${params.length}::jsonb`); }
+      if (payload.dateFrom) { params.push(str(payload.dateFrom)); clauses.push(`r.start_date >= $${params.length}`); }
+      if (payload.dateTo) { params.push(str(payload.dateTo)); clauses.push(`r.start_date <= $${params.length}`); }
+      if (rType === 'unfollowed') clauses.push(`NOT EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id)`);
 
-  if (rType === 'employee_performance') {
-    const [empRes, resCountsRes, fuCountsRes, prbCountsRes] = await Promise.all([
-      executor.query(`SELECT id, name, job_title, role, last_activity FROM employees ORDER BY created_at ASC`),
-      executor.query<{ emp_id: string; cnt: number }>(
-        `SELECT emp_id, COUNT(*)::int AS cnt
-         FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
-         GROUP BY emp_id`
-      ),
-      executor.query<{ employee_id: string; cnt: number }>(
-        `SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups GROUP BY employee_id`
-      ),
-      executor.query<{ emp_id: string; cnt: number }>(
-        `SELECT emp_id, COUNT(*)::int AS cnt
-         FROM problems p, LATERAL jsonb_array_elements_text(p.assigned_employee_ids) AS emp_id
-         GROUP BY emp_id`
-      )
-    ]);
-    const resMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
-    const fuMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
-    const prbMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
-    const rows = empRes.rows.map((e) => ({
-      employeeId: str(e.id),
-      employeeName: str(e.name),
-      jobTitle: str(e.job_title),
-      role: str(e.role),
-      assignedReservations: resMap.get(str(e.id)) || 0,
-      followUpsCount: fuMap.get(str(e.id)) || 0,
-      problemsCount: prbMap.get(str(e.id)) || 0,
-      lastActivity: str(e.last_activity)
-    }));
-    return { reportType: rType, rows, facets };
-  }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      const facets = await getCachedReservationFacets(executor);
 
-  if (rType === 'followups_log') {
-    const fParams: any[] = [];
-    const fClauses: string[] = [];
-    if (payload.employeeId) { fParams.push(str(payload.employeeId)); fClauses.push(`employee_id = $${fParams.length}`); }
-    if (payload.status) { fParams.push(str(payload.status)); fClauses.push(`status = $${fParams.length}`); }
-    if (payload.dateFrom) { fParams.push(str(payload.dateFrom)); fClauses.push(`follow_up_date >= $${fParams.length}`); }
-    if (payload.dateTo) { fParams.push(str(payload.dateTo)); fClauses.push(`follow_up_date <= $${fParams.length}`); }
-    const fWhere = fClauses.length ? `WHERE ${fClauses.join(' AND ')}` : '';
-    const fuRes = await executor.query(`SELECT * FROM follow_ups ${fWhere} ORDER BY created_at DESC LIMIT 1000`, fParams);
-    return { reportType: rType, rows: fuRes.rows.map(formatFollowUpRow), facets };
-  }
+      if (rType === 'employee_performance') {
+        const [empRes, resCountsRes, fuCountsRes, prbCountsRes] = await Promise.all([
+          executor.query(`SELECT id, name, job_title, role, last_activity FROM employees ORDER BY created_at ASC`),
+          executor.query<{ emp_id: string; cnt: number }>(
+            `SELECT emp_id, COUNT(*)::int AS cnt
+             FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
+             GROUP BY emp_id`
+          ),
+          executor.query<{ employee_id: string; cnt: number }>(
+            `SELECT employee_id, COUNT(*)::int AS cnt FROM follow_ups GROUP BY employee_id`
+          ),
+          executor.query<{ emp_id: string; cnt: number }>(
+            `SELECT emp_id, COUNT(*)::int AS cnt
+             FROM problems p, LATERAL jsonb_array_elements_text(p.assigned_employee_ids) AS emp_id
+             GROUP BY emp_id`
+          )
+        ]);
+        const resMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
+        const fuMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
+        const prbMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
+        const rows = empRes.rows.map((e) => ({
+          employeeId: str(e.id),
+          employeeName: str(e.name),
+          jobTitle: str(e.job_title),
+          role: str(e.role),
+          assignedReservations: resMap.get(str(e.id)) || 0,
+          followUpsCount: fuMap.get(str(e.id)) || 0,
+          problemsCount: prbMap.get(str(e.id)) || 0,
+          lastActivity: str(e.last_activity)
+        }));
+        return { reportType: rType, rows, facets };
+      }
 
-  if (rType === 'problems') {
-    const pParams: any[] = [];
-    const pClauses: string[] = [];
-    if (payload.priority) { pParams.push(str(payload.priority)); pClauses.push(`priority = $${pParams.length}`); }
-    if (payload.status) { pParams.push(str(payload.status)); pClauses.push(`status = $${pParams.length}`); }
-    if (payload.employeeId) { pParams.push(JSON.stringify([str(payload.employeeId)])); pClauses.push(`assigned_employee_ids @> $${pParams.length}::jsonb`); }
-    if (payload.dateFrom) { pParams.push(str(payload.dateFrom)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= $${pParams.length}`); }
-    if (payload.dateTo) { pParams.push(str(payload.dateTo)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= $${pParams.length}`); }
-    const pWhere = pClauses.length ? `WHERE ${pClauses.join(' AND ')}` : '';
-    const prbRes = await executor.query(`SELECT * FROM problems ${pWhere} ORDER BY updated_at DESC LIMIT 1000`, pParams);
-    return { reportType: rType, rows: prbRes.rows.map((p) => formatProblemRow(p)), facets };
-  }
+      if (rType === 'followups_log') {
+        const fParams: any[] = [];
+        const fClauses: string[] = [];
+        if (payload.employeeId) { fParams.push(str(payload.employeeId)); fClauses.push(`employee_id = $${fParams.length}`); }
+        if (payload.status) { fParams.push(str(payload.status)); fClauses.push(`status = $${fParams.length}`); }
+        if (payload.dateFrom) { fParams.push(str(payload.dateFrom)); fClauses.push(`follow_up_date >= $${fParams.length}`); }
+        if (payload.dateTo) { fParams.push(str(payload.dateTo)); fClauses.push(`follow_up_date <= $${fParams.length}`); }
+        const fWhere = fClauses.length ? `WHERE ${fClauses.join(' AND ')}` : '';
+        const fuRes = await executor.query(`SELECT * FROM follow_ups ${fWhere} ORDER BY created_at DESC LIMIT 1000`, fParams);
+        return { reportType: rType, rows: fuRes.rows.map(formatFollowUpRow), facets };
+      }
 
-  if (rType === 'extensions') {
-    const eParams: any[] = [];
-    const eClauses: string[] = [];
-    if (payload.dateFrom) { eParams.push(str(payload.dateFrom)); eClauses.push(`start_date >= $${eParams.length}`); }
-    if (payload.dateTo) { eParams.push(str(payload.dateTo)); eClauses.push(`start_date <= $${eParams.length}`); }
-    if (payload.status) { eParams.push(str(payload.status)); eClauses.push(`(status_ar = $${eParams.length} OR status_code = $${eParams.length})`); }
-    const eWhere = eClauses.length ? `WHERE ${eClauses.join(' AND ')}` : '';
-    const extRes = await executor.query(`SELECT * FROM extensions ${eWhere} ORDER BY synced_at DESC LIMIT 1000`, eParams);
-    return { reportType: rType, rows: extRes.rows.map(mapExtensionRowToClient), facets };
-  }
+      if (rType === 'problems') {
+        const pParams: any[] = [];
+        const pClauses: string[] = [];
+        if (payload.priority) { pParams.push(str(payload.priority)); pClauses.push(`priority = $${pParams.length}`); }
+        if (payload.status) { pParams.push(str(payload.status)); pClauses.push(`status = $${pParams.length}`); }
+        if (payload.employeeId) { pParams.push(JSON.stringify([str(payload.employeeId)])); pClauses.push(`assigned_employee_ids @> $${pParams.length}::jsonb`); }
+        if (payload.dateFrom) { pParams.push(str(payload.dateFrom)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= $${pParams.length}`); }
+        if (payload.dateTo) { pParams.push(str(payload.dateTo)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= $${pParams.length}`); }
+        const pWhere = pClauses.length ? `WHERE ${pClauses.join(' AND ')}` : '';
+        const prbRes = await executor.query(`SELECT * FROM problems ${pWhere} ORDER BY updated_at DESC LIMIT 1000`, pParams);
+        return { reportType: rType, rows: prbRes.rows.map((p) => formatProblemRow(p)), facets };
+      }
 
-  if (rType === 'sync_log') {
-    const sRes = await executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 500`);
-    return { reportType: rType, rows: sRes.rows, facets };
-  }
+      if (rType === 'extensions') {
+        const eParams: any[] = [];
+        const eClauses: string[] = [];
+        if (payload.dateFrom) { eParams.push(str(payload.dateFrom)); eClauses.push(`start_date >= $${eParams.length}`); }
+        if (payload.dateTo) { eParams.push(str(payload.dateTo)); eClauses.push(`start_date <= $${eParams.length}`); }
+        if (payload.status) { eParams.push(str(payload.status)); eClauses.push(`(status_ar = $${eParams.length} OR status_code = $${eParams.length})`); }
+        const eWhere = eClauses.length ? `WHERE ${eClauses.join(' AND ')}` : '';
+        const extRes = await executor.query(`SELECT * FROM extensions ${eWhere} ORDER BY synced_at DESC LIMIT 1000`, eParams);
+        return { reportType: rType, rows: extRes.rows.map(mapExtensionRowToClient), facets };
+      }
 
-  if (rType === 'activity_log') {
-    const aParams: any[] = [];
-    const aClauses: string[] = [];
-    if (payload.employeeId) { aParams.push(str(payload.employeeId)); aClauses.push(`user_id = $${aParams.length}`); }
-    if (payload.dateFrom) { aParams.push(str(payload.dateFrom)); aClauses.push(`log_date >= $${aParams.length}`); }
-    if (payload.dateTo) { aParams.push(str(payload.dateTo)); aClauses.push(`log_date <= $${aParams.length}`); }
-    const aWhere = aClauses.length ? `WHERE ${aClauses.join(' AND ')}` : '';
-    const aRes = await executor.query(`SELECT * FROM activity_log ${aWhere} ORDER BY created_at DESC LIMIT 1000`, aParams);
-    return { reportType: rType, rows: aRes.rows, facets };
-  }
+      if (rType === 'sync_log') {
+        const sRes = await executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 500`);
+        return { reportType: rType, rows: sRes.rows, facets };
+      }
 
-  const resRows = await executor.query(
-    `SELECT * FROM reservations r ${where} ORDER BY r.updated_at DESC LIMIT 2000`,
-    params
+      if (rType === 'activity_log') {
+        const aParams: any[] = [];
+        const aClauses: string[] = [];
+        if (payload.employeeId) { aParams.push(str(payload.employeeId)); aClauses.push(`user_id = $${aParams.length}`); }
+        if (payload.dateFrom) { aParams.push(str(payload.dateFrom)); aClauses.push(`log_date >= $${aParams.length}`); }
+        if (payload.dateTo) { aParams.push(str(payload.dateTo)); aClauses.push(`log_date <= $${aParams.length}`); }
+        const aWhere = aClauses.length ? `WHERE ${aClauses.join(' AND ')}` : '';
+        const aRes = await executor.query(`SELECT * FROM activity_log ${aWhere} ORDER BY created_at DESC LIMIT 1000`, aParams);
+        return { reportType: rType, rows: aRes.rows, facets };
+      }
+
+      const resRows = await executor.query(
+        `SELECT * FROM reservations r ${where} ORDER BY r.updated_at DESC LIMIT 2000`,
+        params
+      );
+      return {
+        reportType: rType,
+        rows: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
+        facets
+      };
+    }
   );
-  return {
-    reportType: rType,
-    rows: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
-    facets
-  };
 }
 
 export async function exportReportData(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -3768,6 +3960,7 @@ export async function saveGlobalConnectionSettings(
     gasUrl ? `تفعيل الربط التلقائي العام مع Apps Script (${autoBoundGas ? 'ثنائي الاتجاه' : 'محفوظ في Neon'})` : 'إلغاء رابط Apps Script العام'
   );
 
+  invalidateScopes(executor, ['settings']);
   return {
     saved: true,
     gasWebAppUrl: gasUrl,
@@ -3818,6 +4011,7 @@ export async function saveApiToken(executor: DbExecutor, session: AuthSession, p
     connection = await testRentalGateConnection(executor, session).catch(() => null);
   }
 
+  invalidateScopes(executor, ['settings']);
   await logActivity(executor, session.user, 'تحديث توكن Rental Gate', 'Settings', 'RG_TOKEN', 'تم تشفير التوكن وحفظه بأمان في قاعدة البيانات السحابية للربط التلقائي');
   return { saved: true, hasRgToken: true, hasDirectToken: true, connection };
 }
@@ -3934,10 +4128,16 @@ function isAnnouncementCurrentlyActive(item: Record<string, any>, nowMs: number 
 }
 
 export async function getAnnouncements(executor: DbExecutor, _session: AuthSession) {
-  const res = await executor.query(
-    `SELECT * FROM shift_announcements ORDER BY is_pinned DESC, updated_at DESC LIMIT 50`
+  const items = await getCachedOrLoad(
+    executor,
+    { scope: 'announcements', key: 'all', ttlMs: 20000 },
+    async () => {
+      const res = await executor.query(
+        `SELECT * FROM shift_announcements ORDER BY is_pinned DESC, updated_at DESC LIMIT 50`
+      );
+      return res.rows.map(formatAnnouncementRow);
+    }
   );
-  const items = res.rows.map(formatAnnouncementRow);
   const nowMs = Date.now();
   const activeItems = items.filter((it) => isAnnouncementCurrentlyActive(it, nowMs));
   return { items, activeItems };
@@ -4200,7 +4400,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     ? new Date(Date.parse(rawSince) - 2000).toISOString()
     : new Date(Date.now() - 120000).toISOString();
 
-  const [resRows, fuRows, prbRows, notifData, annData, locksData] = await Promise.all([
+  const [resRows, fuRows, prbRows, empRows, notifData, annData, locksData, todayRadarSummary] = await Promise.all([
     executor.query(
       `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
@@ -4217,16 +4417,28 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       `SELECT * FROM problems WHERE updated_at > $1::timestamptz ORDER BY updated_at DESC LIMIT 100`,
       [sinceDate]
     ),
+    executor.query(
+      `SELECT id, name, username, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at
+       FROM employees
+       WHERE updated_at > $1::timestamptz
+       ORDER BY updated_at DESC
+       LIMIT 50`,
+      [sinceDate]
+    ).catch(() => ({ rows: [] as any[] })),
     getNotifications(executor, session),
     getAnnouncements(executor, session).catch(() => ({ items: [], activeItems: [] })),
-    getReservationLocks(executor, session).catch(() => ({ items: [] }))
+    getReservationLocks(executor, session).catch(() => ({ items: [] })),
+    getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: str(payload.todayDate) }).catch(() => ({ counts: null }))
   ]);
 
   return {
     serverTime: new Date().toISOString(),
+    syncVersion: getLocalCacheVersion(executor),
     changedReservations: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
     changedFollowUps: fuRows.rows.map(formatFollowUpRow),
     changedProblems: prbRows.rows.map((p) => formatProblemRow(p)),
+    changedEmployees: empRows.rows.map((e) => mapEmployeeRow(e)),
+    todayRadarCounts: (todayRadarSummary as any)?.counts || null,
     notifications: notifData,
     announcements: annData.activeItems || [],
     locks: locksData.items || [],

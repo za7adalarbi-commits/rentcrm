@@ -234,10 +234,17 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
            );
            CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_reservations_company_updated ON reservations (company_name, updated_at DESC);
+           CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_employee_id, is_read, created_at DESC);
            CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);
            CREATE INDEX IF NOT EXISTS idx_shift_announcements_active ON shift_announcements (is_active, is_pinned, updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_employee_delegations_emp ON employee_delegations (delegate_employee_id, status);
-           CREATE INDEX IF NOT EXISTS idx_reservation_locks_expires ON reservation_locks (expires_at);`
+           CREATE INDEX IF NOT EXISTS idx_reservation_locks_expires ON reservation_locks (expires_at);
+           CREATE INDEX IF NOT EXISTS idx_reservations_start_status ON reservations (start_date, internal_status);
+           CREATE INDEX IF NOT EXISTS idx_reservations_end_status ON reservations (end_date, internal_status);
+           CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_until_date) WHERE extended_until_date <> '';
+           CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);
+           CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
+           CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);`
         ).catch(() => undefined);
       }
       schemaInitialized = true;

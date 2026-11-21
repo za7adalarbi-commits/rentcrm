@@ -1756,7 +1756,7 @@
     var keys = Object.keys(payload);
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
-      if (k === 'visibleCols' || k === 'silentRefresh' || k.charAt(0) === '_') continue;
+      if (k === 'visibleCols' || k === 'silentRefresh' || k === 'abortKey' || k.charAt(0) === '_') continue;
       var v = payload[k];
       if (v !== undefined) out[k] = v;
     }
@@ -1924,6 +1924,7 @@
     getEmployees: { cacheable: true, ttlMs: 300000, scope: 'employees' },
     getEmployeeDetails: { cacheable: true, ttlMs: 60000, scope: 'employees' },
     getDashboard: { cacheable: true, ttlMs: 60000, scope: 'dashboard' },
+    getTodayAndRadar: { cacheable: true, ttlMs: 25000, scope: 'todayRadar' },
     getReservations: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getReservationDetails: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getMyFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
@@ -1946,24 +1947,24 @@
   var MUTATION_INVALIDATIONS = {
     login: ['*'],
     logout: ['*'],
-    claimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    unclaimReservation: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    quickUpdateReservationStatus: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateReservationDetails: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    saveReservationPinnedNote: ['reservations', 'followUps', 'activity'],
+    claimReservation: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    unclaimReservation: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    quickUpdateReservationStatus: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    updateReservationDetails: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    saveReservationPinnedNote: ['reservations', 'todayRadar', 'followUps', 'activity'],
     togglePinnedCriticalReservation: ['followUps', 'reservations'],
-    recordNoAnswerFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    addFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateFollowUp: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    assignEmployees: ['reservations', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    removeAssignment: ['reservations', 'dashboard', 'employees', 'activity', 'reports'],
-    bulkReassignEmployeeReservations: ['reservations', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    createProblem: ['reservations', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    updateProblem: ['reservations', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    recordNoAnswerFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    addFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    updateFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    assignEmployees: ['reservations', 'todayRadar', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    removeAssignment: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    bulkReassignEmployeeReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    createProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    updateProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     createEmployee: ['employees', 'dashboard', 'activity', 'reports'],
     updateEmployee: ['employees', 'dashboard', 'activity', 'reports'],
     disableEmployee: ['employees', 'dashboard', 'activity', 'reports'],
-    deleteEmployee: ['employees', 'reservations', 'problems', 'dashboard', 'activity', 'reports'],
+    deleteEmployee: ['employees', 'reservations', 'todayRadar', 'problems', 'dashboard', 'activity', 'reports'],
     saveDelegation: ['employees', 'activity', 'notifications'],
     revokeDelegation: ['employees', 'activity', 'notifications'],
     saveAnnouncement: ['announcements', 'dashboard', 'activity'],
@@ -1976,13 +1977,13 @@
     savePermissionDefinition: ['employees', 'activity'],
     deletePermissionDefinition: ['employees', 'activity'],
     markNotificationRead: ['notifications'],
-    pullReservations: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
-    importReservationsFromExcel: ['reservations', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    syncRentalGate: ['reservations', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    pullReservations: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    importReservationsFromExcel: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    syncRentalGate: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     saveApiToken: ['settings', 'sync', 'activity'],
     saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
     applyUnifiedConnectionSetup: ['*'],
-    updateSettings: ['settings', 'sync', 'reservations', 'dashboard', 'activity'],
+    updateSettings: ['settings', 'sync', 'reservations', 'todayRadar', 'dashboard', 'activity'],
     saveUserLayoutPrefs: ['dashboard', 'employees'],
     deleteAllReservations: ['*']
   };
@@ -1994,7 +1995,7 @@
 
   function stableSerializePayload(payload) {
     if (!payload || typeof payload !== 'object') return '{}';
-    var ignored = { visibleCols: true, forceRefresh: true, silentRefresh: true };
+    var ignored = { visibleCols: true, forceRefresh: true, silentRefresh: true, abortKey: true, clientRequestId: true };
     var keys = Object.keys(payload).filter(function (k) {
       return !ignored[k] && payload[k] !== undefined;
     }).sort();
@@ -6214,6 +6215,52 @@
     }
   ];
 
+  function mergeDeltaRecords(existingList, changedList, idField) {
+    var base = Array.isArray(existingList) ? existingList.slice() : [];
+    var updates = Array.isArray(changedList) ? changedList : [];
+    if (!updates.length) return base;
+    var keyName = normalizeStr(idField) || 'id';
+    var indexById = {};
+    for (var i = 0; i < base.length; i++) {
+      var rec = base[i];
+      if (rec && rec[keyName] !== undefined && rec[keyName] !== null) {
+        indexById[String(rec[keyName])] = i;
+      }
+    }
+    var prepends = [];
+    for (var j = 0; j < updates.length; j++) {
+      var upd = updates[j];
+      if (!upd || typeof upd !== 'object') continue;
+      var k = (upd[keyName] !== undefined && upd[keyName] !== null) ? String(upd[keyName]) : '';
+      if (k && indexById[k] !== undefined) {
+        var idx = indexById[k];
+        base[idx] = Object.assign({}, base[idx], upd);
+      } else {
+        if (k) indexById[k] = -1;
+        prepends.push(upd);
+      }
+    }
+    return prepends.length ? prepends.concat(base) : base;
+  }
+
+  function resolveAsyncViewState(opts) {
+    var cfg = (opts && typeof opts === 'object') ? opts : {};
+    var items = Array.isArray(cfg.items) ? cfg.items : [];
+    var hasLoaded = Boolean(cfg.hasLoaded);
+    var loading = Boolean(cfg.loading);
+    var error = normalizeStr(cfg.error);
+    if (loading && (!hasLoaded || items.length === 0)) {
+      return 'loading';
+    }
+    if (items.length > 0) {
+      return 'ready';
+    }
+    if (error) {
+      return 'error';
+    }
+    return 'empty';
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -6386,6 +6433,8 @@
     computeDashboardSectionSpans: computeDashboardSectionSpans,
     getFirstAllowedRoute: getFirstAllowedRoute,
     normalizeExcelCellDate: normalizeExcelCellDate,
-    parseImportedReservationRows: parseImportedReservationRows
+    parseImportedReservationRows: parseImportedReservationRows,
+    mergeDeltaRecords: mergeDeltaRecords,
+    resolveAsyncViewState: resolveAsyncViewState
   };
 }));

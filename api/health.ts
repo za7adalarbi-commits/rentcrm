@@ -14,25 +14,28 @@ export default async function handler(_req: any, res: any) {
       }
     }
 
-    let syncMeta: { reservationsCount: number; lastSyncAt: string; lastResUpdatedAt: string; syncEpoch: string } | null = null;
+    let syncMeta: { reservationsCount: number; lastSyncAt: string; lastResUpdatedAt: string; syncVersion: number; syncEpoch: string } | null = null;
     if (health.connected && executor) {
       try {
-        const syncQ = await executor.query<{ res_cnt: string; max_res_upd: any; max_sync_fin: any }>(
+        const syncQ = await executor.query<{ res_cnt: string; max_res_upd: any; max_sync_fin: any; sync_ver: string | null }>(
           `SELECT
              (SELECT COUNT(*)::text FROM reservations) AS res_cnt,
              (SELECT MAX(updated_at) FROM reservations) AS max_res_upd,
-             (SELECT MAX(finished_at) FROM sync_log WHERE status = 'success') AS max_sync_fin`
+             (SELECT MAX(finished_at) FROM sync_log WHERE status = 'success') AS max_sync_fin,
+             (SELECT value FROM settings WHERE key = 'crm_sync_version' LIMIT 1) AS sync_ver`
         );
         const r = syncQ.rows[0];
         if (r) {
           const cnt = Number(r.res_cnt || 0);
           const maxRes = r.max_res_upd instanceof Date ? r.max_res_upd.toISOString() : String(r.max_res_upd || '');
           const maxSync = r.max_sync_fin instanceof Date ? r.max_sync_fin.toISOString() : String(r.max_sync_fin || '');
+          const syncVer = Number(r.sync_ver || 0) || 0;
           syncMeta = {
             reservationsCount: cnt,
             lastSyncAt: maxSync,
             lastResUpdatedAt: maxRes,
-            syncEpoch: `${cnt}|${maxSync}|${maxRes}`
+            syncVersion: syncVer,
+            syncEpoch: `${cnt}|${maxSync}|${maxRes}|${syncVer}`
           };
         }
       } catch {

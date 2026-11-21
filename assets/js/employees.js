@@ -138,7 +138,7 @@
     ) : '';
 
     var stateErrorHtml = empState.error
-      ? '<div class="form-error mb-3" role="alert">' + esc(empState.error) + '</div>'
+      ? '<div class="rg-error-banner" role="alert"><div class="rg-error-banner-body"><div class="rg-error-banner-title">تعذر تحديث قائمة الموظفين</div><div class="rg-error-banner-msg">' + esc(empState.error) + '</div></div><button type="button" class="btn btn-sm btn-primary" id="emp-state-retry-btn">إعادة المحاولة</button></div>'
       : '';
 
     var activeDelegationByEmp = {};
@@ -194,7 +194,7 @@
     ) : '';
 
     var rowsHtml = (empState.loading && items.length === 0)
-      ? '<tr><td colspan="' + (canManage ? 11 : 10) + '" class="px-4 py-8 text-center text-sm" style="color:var(--text-muted);">جاري تحميل بيانات الموظفين...</td></tr>'
+      ? '<tr><td colspan="' + (canManage ? 11 : 10) + '"><div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div></td></tr>'
       : (items.length === 0
         ? '<tr><td colspan="' + (canManage ? 11 : 10) + '" class="px-4 py-8 text-center text-sm" style="color:var(--text-muted);">لا يوجد موظفون مسجلون حاليًا.</td></tr>'
         : items.map(function (e) {
@@ -305,6 +305,13 @@
         return self.appStore.loadEmployeesState({});
       }
       return render(container, ctx);
+    }
+
+    var stateRetryBtn = document.getElementById('emp-state-retry-btn');
+    if (stateRetryBtn) {
+      stateRetryBtn.addEventListener('click', function () {
+        reloadEmployeesFromServer();
+      });
     }
 
     var bulkReassignBtn = document.getElementById('emp-bulk-reassign-btn');
@@ -524,11 +531,24 @@
     var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     var canManage = Boolean(user && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'manage_employees'));
     var [res, delRes] = await Promise.all([
-      root.RGApi.callApi('getEmployees', {}),
-      canManage ? root.RGApi.callApi('getDelegations', {}).catch(function () { return { success: false }; }) : Promise.resolve({ success: true, data: { items: [] } })
+      root.RGApi.callApi('getEmployees', { abortKey: 'emp:list' }),
+      canManage ? root.RGApi.callApi('getDelegations', { abortKey: 'emp:del' }).catch(function () { return { success: false }; }) : Promise.resolve({ success: true, data: { items: [] } })
     ]);
-    if (!res.success) {
-      container.innerHTML = '<div class="form-error">' + esc(res.message) + '</div>';
+    if (res && res.aborted) return;
+    if (!res || !res.success) {
+      container.innerHTML =
+        '<div class="surface-card">' +
+          '<div class="section-header"><div><h2 class="section-title">' + ctx.t('nav_employees') + '</h2></div></div>' +
+          '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">تعذر تحميل الموظفين</div>' +
+              '<div class="rg-error-banner-msg">' + esc((res && res.message) || 'تعذر تحميل قائمة الموظفين.') + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="emp-retry-btn">إعادة المحاولة</button>' +
+          '</div>' +
+        '</div>';
+      var empRetry = document.getElementById('emp-retry-btn');
+      if (empRetry) empRetry.addEventListener('click', function () { render(container, ctx); });
       return;
     }
 
@@ -1717,7 +1737,7 @@
         var count = (resp.data && resp.data.transferredCount) || 0;
         ctx.toast(resp.message || ('تم تحويل ' + count + ' حجز إلى الموظف البديل بنجاح.'));
         if (root.RGApi && root.RGApi.invalidateScopes) {
-          root.RGApi.invalidateScopes(['reservations', 'followups', 'employees', 'dashboard', 'activity']);
+          root.RGApi.invalidateScopes(['reservations', 'followUps', 'employees', 'dashboard', 'activity']);
         }
         closeBr();
         if (onDone) onDone(resp.data);

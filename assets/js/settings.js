@@ -137,17 +137,33 @@
       return;
     }
 
-    var results = await Promise.all([
-      root.RGApi.callApi('getSettings', {}),
-      canSync ? root.RGApi.callApi('getSyncStatus', {}) : Promise.resolve({ success: true, data: { logs: [], lastSync: null } }),
+    var [settingsRes, syncRes, capsRes] = await Promise.all([
+      root.RGApi.callApi('getSettings', { abortKey: 'set:main' }),
+      canSync ? root.RGApi.callApi('getSyncStatus', { abortKey: 'set:sync' }) : Promise.resolve({ success: true, data: { logs: [], lastSync: null } }),
       root.RGApi.getSetupCapabilities ? root.RGApi.getSetupCapabilities().catch(function () { return { success: false }; }) : Promise.resolve({ success: false })
     ]);
+    if (settingsRes && settingsRes.aborted) return;
 
-    var settingsRes = results[0];
-    var syncRes = results[1];
-    var capsRes = results[2];
+    if (!settingsRes || !settingsRes.success) {
+      container.innerHTML =
+        personalCardHtml +
+        '<div class="surface-card">' +
+          '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">تعذر تحميل إعدادات النظام</div>' +
+              '<div class="rg-error-banner-msg">' + escapeHtml((settingsRes && settingsRes.message) || 'تعذر تحميل إعدادات الخادم.') + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="set-retry-btn">إعادة المحاولة</button>' +
+          '</div>' +
+        '</div>';
+      bindPersonalAccountCard(container, ctx);
+      var setRetryBtn = document.getElementById('set-retry-btn');
+      if (setRetryBtn) setRetryBtn.addEventListener('click', function () { render(container, ctx); });
+      return;
+    }
+
     var settings = (settingsRes.success && settingsRes.data) || {};
-    var syncData = (syncRes.success && syncRes.data) || { logs: [], lastSync: null };
+    var syncData = (syncRes && syncRes.success && syncRes.data) || { logs: [], lastSync: null };
     var caps = (capsRes && capsRes.success && capsRes.data) ? capsRes.data : {};
     var lastSync = syncData.lastSync;
 
