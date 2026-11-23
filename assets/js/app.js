@@ -6,7 +6,135 @@
 
   var PREFS_KEY = 'rg_crm_user_prefs';
   var UI_SIMP_STORAGE_KEY = 'rg_crm_ui_simplification_v1';
+  var ROUTE_FILTERS_STORAGE_KEY = 'rg_crm_route_filters_v1';
   var VALID_ROUTES = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+
+  function saveRouteFilters(userOverride) {
+    try {
+      if (typeof sessionStorage === 'undefined') return;
+      var u = userOverride || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
+      var uid = u && u.id ? String(u.id).trim() : '';
+      if (!uid) return;
+      var payload = { userId: uid, filters: {} };
+      if (state.dashboard && typeof state.dashboard === 'object') {
+        payload.filters.dashboard = {
+          range: state.dashboard.range || '30d',
+          dateFrom: state.dashboard.dateFrom || '',
+          dateTo: state.dashboard.dateTo || ''
+        };
+      }
+      if (state.reservations && typeof state.reservations === 'object') {
+        var r = state.reservations;
+        var resFilters = (root.RGCrmCore && root.RGCrmCore.buildReservationQueryPayload)
+          ? root.RGCrmCore.buildReservationQueryPayload(r)
+          : {
+              search: r.search || '',
+              company: r.company || '',
+              branch: r.branch || '',
+              status: r.status || '',
+              employeeId: r.employeeId || '',
+              priority: r.priority || '',
+              dateFrom: r.dateFrom || '',
+              dateTo: r.dateTo || '',
+              timeField: r.timeField || 'both',
+              timeFrom: r.timeFrom || '',
+              timeTo: r.timeTo || '',
+              unfollowedOnly: Boolean(r.unfollowedOnly),
+              hasProblemsOnly: Boolean(r.hasProblemsOnly),
+              overdueUnpaidOnly: Boolean(r.overdueUnpaidOnly),
+              sortBy: r.sortBy || 'lastUpdatedAt',
+              sortDir: r.sortDir === 'asc' ? 'asc' : 'desc',
+              page: Math.max(1, Number(r.page || 1)),
+              pageSize: Math.max(1, Number(r.pageSize || 20))
+            };
+        payload.filters.reservations = Object.assign(resFilters, {
+          viewMode: r.viewMode || 'all',
+          radarFilter: r.radarFilter || 'all',
+          radarSearch: r.radarSearch || '',
+          todayFilter: r.todayFilter || 'all',
+          todaySearch: r.todaySearch || '',
+          todayTimeFrom: r.todayTimeFrom || '',
+          todayTimeTo: r.todayTimeTo || '',
+          todayCalendarEventFilter: r.todayCalendarEventFilter || 'all',
+          todayCalendarSearch: r.todayCalendarSearch || '',
+          todayCalendarAnchorDate: r.todayCalendarAnchorDate || '',
+          pullPreset: r.pullPreset || 'all',
+          pullFrom: r.pullFrom || '',
+          pullTo: r.pullTo || ''
+        });
+      }
+      if (state.problems && typeof state.problems === 'object') {
+        payload.filters.problems = {
+          status: state.problems.status || '',
+          priority: state.problems.priority || '',
+          employeeId: state.problems.employeeId || '',
+          search: state.problems.search || ''
+        };
+      }
+      if (state.teamFollowUps && typeof state.teamFollowUps === 'object') {
+        payload.filters.teamFollowUps = {
+          employeeId: state.teamFollowUps.employeeId || '',
+          status: state.teamFollowUps.status || '',
+          date: state.teamFollowUps.date || ''
+        };
+      }
+      if (state.myFollowUps && typeof state.myFollowUps === 'object') {
+        payload.filters.myFollowUps = {
+          tab: state.myFollowUps.tab === 'mentions' ? 'mentions' : 'assigned'
+        };
+      }
+      if (state.reports && typeof state.reports === 'object') {
+        payload.filters.reports = {
+          reportType: state.reports.reportType || 'all_reservations',
+          dateFrom: state.reports.dateFrom || '',
+          dateTo: state.reports.dateTo || '',
+          employeeId: state.reports.employeeId || '',
+          company: state.reports.company || '',
+          branch: state.reports.branch || ''
+        };
+      }
+      sessionStorage.setItem(ROUTE_FILTERS_STORAGE_KEY, JSON.stringify(payload));
+    } catch (_eRf) {}
+  }
+
+  function restoreRouteFilters(user) {
+    try {
+      if (typeof sessionStorage === 'undefined') return;
+      var uid = user && user.id ? String(user.id).trim() : '';
+      if (!uid) return;
+      var raw = sessionStorage.getItem(ROUTE_FILTERS_STORAGE_KEY);
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      if (!parsed || parsed.userId !== uid || !parsed.filters || typeof parsed.filters !== 'object') return;
+      var f = parsed.filters;
+      if (f.dashboard && typeof f.dashboard === 'object' && !state.dashboard) {
+        state.dashboard = Object.assign({ range: '30d', dateFrom: '', dateTo: '' }, f.dashboard);
+      }
+      if (f.reservations && typeof f.reservations === 'object' && !state.reservations) {
+        state.reservations = Object.assign({}, f.reservations);
+      }
+      if (f.problems && typeof f.problems === 'object' && !state.problems) {
+        state.problems = Object.assign({ status: '', priority: '', employeeId: '', search: '' }, f.problems);
+      }
+      if (f.teamFollowUps && typeof f.teamFollowUps === 'object' && !state.teamFollowUps) {
+        state.teamFollowUps = Object.assign({ employeeId: '', status: '', date: '' }, f.teamFollowUps);
+      }
+      if (f.myFollowUps && typeof f.myFollowUps === 'object' && !state.myFollowUps) {
+        state.myFollowUps = Object.assign({ tab: 'assigned' }, f.myFollowUps);
+      }
+      if (f.reports && typeof f.reports === 'object' && !state.reports) {
+        state.reports = Object.assign({ reportType: 'all_reservations', rows: [] }, f.reports);
+      }
+    } catch (_eRfLoad) {}
+  }
+
+  function clearRouteFiltersStorage() {
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.removeItem(ROUTE_FILTERS_STORAGE_KEY);
+      }
+    } catch (_eRfClr) {}
+  }
 
   var vendorScriptPromises = {};
 
@@ -326,8 +454,9 @@
 
   function handleSiblingTabMessage(msg) {
     if (!msg || msg.originTabId === tabInstanceId) return;
-    if (Array.isArray(msg.scopes) && msg.scopes.length > 0 && root.RGApi && root.RGApi.clearCache) {
-      root.RGApi.clearCache(msg.scopes);
+    if (Array.isArray(msg.scopes) && msg.scopes.length > 0 && root.RGApi) {
+      if (typeof root.RGApi.markScopesStale === 'function') root.RGApi.markScopesStale(msg.scopes);
+      else if (typeof root.RGApi.clearCache === 'function') root.RGApi.clearCache(msg.scopes);
     }
     scheduleDebouncedDeltaSync();
   }
@@ -1590,6 +1719,7 @@
       },
       withActionLock: withActionLock,
       isActionLocked: isActionLocked,
+      saveRouteFilters: function () { saveRouteFilters(); },
       onAuthChanged: bootAuthenticatedApp
     };
   }
@@ -2666,12 +2796,17 @@
       case 'reservations':
         return {
           action: 'getReservations',
-          payload: Object.assign({ page: 1, pageSize: 20 }, state.reservations || {})
+          payload: (root.RGCrmCore && root.RGCrmCore.buildReservationQueryPayload)
+            ? root.RGCrmCore.buildReservationQueryPayload(state.reservations || {})
+            : Object.assign({ page: 1, pageSize: 20 }, state.reservations || {})
         };
       case 'my-followups':
         return { action: 'getMyFollowUps', payload: {} };
       case 'team-followups':
-        return { action: 'getTeamFollowUps', payload: {} };
+        return {
+          action: 'getTeamFollowUps',
+          payload: Object.assign({ employeeId: '', status: '', date: '' }, state.teamFollowUps || {})
+        };
       case 'problems':
         return {
           action: 'getProblems',
@@ -2688,11 +2823,11 @@
           action: 'getReports',
           payload: {
             reportType: rep.reportType || 'all_reservations',
-            dateFrom: rf ? rf.value : '',
-            dateTo: rt ? rt.value : '',
-            employeeId: re ? re.value : '',
-            company: rc ? rc.value : '',
-            branch: rb ? rb.value : '',
+            dateFrom: rep.dateFrom !== undefined ? (rep.dateFrom || '') : (rf ? rf.value : ''),
+            dateTo: rep.dateTo !== undefined ? (rep.dateTo || '') : (rt ? rt.value : ''),
+            employeeId: rep.employeeId !== undefined ? (rep.employeeId || '') : (re ? re.value : ''),
+            company: rep.company !== undefined ? (rep.company || '') : (rc ? rc.value : ''),
+            branch: rep.branch !== undefined ? (rep.branch || '') : (rb ? rb.value : ''),
             logExport: false
           }
         };
@@ -2792,6 +2927,7 @@
     var curUser = root.RGAuth.getUser();
     var activeLayoutPrefs = getLayoutPrefs(curUser);
     state.route = resolveSafeRouteForUser(state.route, curUser, activeLayoutPrefs);
+    saveRouteFilters(curUser);
 
     if (window.location.hash !== '#' + state.route) {
       try {
@@ -2828,8 +2964,11 @@
       isInstantlyReady = !curUser || !root.RGCrmCore.canAccessApi(curUser) || Boolean(primReq && root.RGApi && root.RGApi.hasCached && root.RGApi.hasCached(primReq.action, primReq.payload));
     } else if (state.route === 'employees') {
       isInstantlyReady = Boolean(state.employees && state.employees.loaded);
-    } else if (primReq && root.RGApi && root.RGApi.hasCached) {
-      isInstantlyReady = Boolean(root.RGApi.hasCached(primReq.action, primReq.payload));
+    } else if (primReq && root.RGApi) {
+      isInstantlyReady = Boolean(
+        (root.RGApi.hasCached && root.RGApi.hasCached(primReq.action, primReq.payload)) ||
+        (root.RGApi.getCachedData && root.RGApi.getCachedData(primReq.action, primReq.payload, true))
+      );
     }
 
     if (!isInstantlyReady) {
@@ -3952,7 +4091,8 @@
       quickSearchForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
         var q = String(quickSearchInput.value || '').trim();
-        state.reservations = Object.assign({}, state.reservations || {}, { search: q, page: 1 });
+        state.reservations = Object.assign({}, state.reservations || {}, { search: q, page: 1, viewMode: 'all' });
+        saveRouteFilters();
         state.route = 'reservations';
         quickSearchInput.blur();
         renderRoute();
@@ -4061,6 +4201,10 @@
         delete state.reports;
         delete state.problems;
         delete state.followups;
+        delete state.teamFollowUps;
+        delete state.myFollowUps;
+        delete state.dashboard;
+        clearRouteFiltersStorage();
         state.notifications = { items: [], unreadCount: 0 };
         resetEmployeesState();
         await root.RGAuth.logout();
@@ -4141,14 +4285,26 @@
           lastFingerprints.routes[activeRoute] = nextRouteFp;
           var container = document.getElementById('page-content');
           var slot = container ? container.querySelector('.route-view') : null;
-          if (slot) {
+          if (slot && typeof slot._rgRefreshDataOnly === 'function') {
+            await slot._rgRefreshDataOnly({
+              silent: !options.manual,
+              manual: Boolean(options.manual),
+              prefetchedData: routeRes.data
+            });
+          } else if (slot) {
             await renderActiveRouteView(slot, buildAppCtx(), { silent: false });
           } else {
             await renderRoute();
           }
         }
       } else if (options.manual) {
-        await renderRoute();
+        var manualContainer = document.getElementById('page-content');
+        var manualSlot = manualContainer ? manualContainer.querySelector('.route-view') : null;
+        if (manualSlot && typeof manualSlot._rgRefreshDataOnly === 'function') {
+          await manualSlot._rgRefreshDataOnly({ silent: false, manual: true, forceRefresh: true });
+        } else {
+          await renderRoute();
+        }
       }
     } finally {
       isAutoRefreshInFlight = false;
@@ -4157,6 +4313,7 @@
 
   var seenSseEventIds = {};
   var seenSseEventOrder = [];
+  var lastDeltaRadarCountsSnap = null;
 
   function pushSyncDiagnostic(kind, level, message, detail) {
     try {
@@ -4565,30 +4722,44 @@
         });
       }
 
-      var hasChanges = Boolean(
-        (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
-        (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
-        (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
-        (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
-        hasEmployeeChanges ||
-        Boolean(d.changedSettings) ||
-        Boolean(d.deletedAllReservationsBefore) ||
-        (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
-        Boolean(d.todayRadarCounts)
-      );
+      var prevDeltaMeta = {
+        todayRadarCounts: lastDeltaRadarCountsSnap,
+        announcementsFp: lastFingerprints.announcements
+      };
+      var hasChanges = (root.RGCrmCore && typeof root.RGCrmCore.hasMeaningfulDeltaChanges === 'function')
+        ? root.RGCrmCore.hasMeaningfulDeltaChanges(d, prevDeltaMeta)
+        : Boolean(
+            (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+            (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+            (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+            (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+            hasEmployeeChanges ||
+            Boolean(d.changedSettings) ||
+            Boolean(d.deletedAllReservationsBefore) ||
+            (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0)
+          );
+      if (d.todayRadarCounts && typeof d.todayRadarCounts === 'object') {
+        lastDeltaRadarCountsSnap = Object.assign({}, d.todayRadarCounts);
+      }
 
-      if (hasChanges && root.RGApi && root.RGApi.invalidateScopes) {
+      if (hasChanges && root.RGApi) {
         var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps'];
-        if (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0 || d.deletedAllReservationsBefore) {
+        if ((Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) || d.deletedAllReservationsBefore) {
           scopesToInvalidate.push('reservations', 'followUps', 'problems');
         }
-        if (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0 || d.changedDelegations || d.changedRoles) {
+        if ((Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) || d.changedDelegations || d.changedRoles) {
           scopesToInvalidate.push('employees');
         }
         if (d.changedSettings) {
           scopesToInvalidate.push('settings', 'employees');
         }
-        root.RGApi.invalidateScopes(scopesToInvalidate);
+        if (d.deletedAllReservationsBefore && root.RGApi.clearCache) {
+          root.RGApi.clearCache(scopesToInvalidate);
+        } else if (typeof root.RGApi.markScopesStale === 'function') {
+          root.RGApi.markScopesStale(scopesToInvalidate);
+        } else if (root.RGApi.invalidateScopes) {
+          root.RGApi.invalidateScopes(scopesToInvalidate);
+        }
       }
 
       if (hasChanges) {
@@ -4660,8 +4831,9 @@
 
     var curUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     if (evData && curUser && evData.actorId && String(evData.actorId) === String(curUser.id)) {
-      if (Array.isArray(evData.scopes) && evData.scopes.length && root.RGApi && root.RGApi.clearCache) {
-        root.RGApi.clearCache(evData.scopes);
+      if (Array.isArray(evData.scopes) && evData.scopes.length && root.RGApi) {
+        if (typeof root.RGApi.markScopesStale === 'function') root.RGApi.markScopesStale(evData.scopes);
+        else if (root.RGApi.clearCache) root.RGApi.clearCache(evData.scopes);
       }
       if (evData.originTabId && evData.originTabId === tabInstanceId) {
         return;
@@ -4971,6 +5143,7 @@
       if (consumed.data.employees) syncEmployeesStateFromPayload(consumed.data.employees);
       hydrateRealtimeBootstrapState(consumed.data);
       user = restorePersistedPreviewIfAllowed(user);
+      restoreRouteFilters(user);
       hydrateLayoutPrefsFromServer(consumed.data.layoutPrefs, user);
       renderAppShell(user);
       if (consumed.data.notifications) applyNotificationsState(consumed.data.notifications);
@@ -5000,6 +5173,7 @@
         if (bootRes.data.employees) syncEmployeesStateFromPayload(bootRes.data.employees);
         hydrateRealtimeBootstrapState(bootRes.data);
         user = restorePersistedPreviewIfAllowed(user);
+        restoreRouteFilters(user);
         hydrateLayoutPrefsFromServer(bootRes.data.layoutPrefs, user);
         renderAppShell(user);
         if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
@@ -5032,6 +5206,7 @@
       return;
     }
 
+    restoreRouteFilters(user);
     hydrateLayoutPrefsFromServer(
       (root.RGAuth && root.RGAuth.consumeRestoredLayoutPrefs) ? root.RGAuth.consumeRestoredLayoutPrefs() : null,
       user
@@ -5138,6 +5313,7 @@
 
   document.addEventListener('rg:unauthorized', function () {
     stopAutoRefreshLoop();
+    clearRouteFiltersStorage();
     resetEmployeesState();
     renderLoginScreen();
   });

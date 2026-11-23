@@ -830,6 +830,35 @@
     return idbPromises.length ? Promise.all(idbPromises).catch(function () {}) : Promise.resolve();
   }
 
+  function markScopesStale(scopes) {
+    var ns = getCacheNamespace();
+    var now = Date.now();
+    var SCOPE_ALIASES = {
+      followups: 'followUps',
+      teamfollowups: 'followUps',
+      todayradar: 'todayRadar'
+    };
+    var rawList = Array.isArray(scopes) ? scopes : [scopes];
+    var markAll = !scopes || rawList.indexOf('*') !== -1;
+    var list = rawList.map(function (s) {
+      var low = String(s || '').trim().toLowerCase();
+      return SCOPE_ALIASES[low] || String(s || '').trim();
+    }).filter(Boolean);
+    Object.keys(apiResponseCache).forEach(function (k) {
+      var entry = apiResponseCache[k];
+      if (!entry) return;
+      if (markAll || list.indexOf(entry.scope) !== -1) {
+        entry.expiresAt = 0;
+        entry.staleUntil = Math.max(Number(entry.staleUntil || 0), now + IDB_KV_MAX_AGE_MS);
+        entry.swrValidInPage = true;
+      }
+    });
+    if (markAll || list.indexOf('reservations') !== -1) {
+      localReservationsFreshInPage[ns] = false;
+    }
+    return Promise.resolve();
+  }
+
   function primeCache(action, payload, data) {
     var core = root.RGCrmCore;
     if (!core || !core.getApiCachePolicy || !core.buildApiCacheKey) return;
@@ -884,6 +913,89 @@
     return parts.length >= 3 ? parts[2] : '';
   }
 
+  function parseCachedPayload(entryKey) {
+    var parts = String(entryKey || '').split('|');
+    if (parts.length < 4) return {};
+    try {
+      var parsed = JSON.parse(parts.slice(3).join('|'));
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (_e) {
+      return {};
+    }
+  }
+
+  function resolveApiFilterUserContext() {
+    var curUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    if (!curUser) return null;
+    var ns = getCacheNamespace();
+    var meta = localMetaByNs[ns] || {};
+    var allowAll = meta.allowAgentViewAll !== false;
+    var settingsCache = getCachedData('getSettings', {}, true);
+    if (settingsCache && settingsCache.settings && settingsCache.settings.allowAgentViewAll !== undefined) {
+      allowAll = settingsCache.settings.allowAgentViewAll !== false && settingsCache.settings.allowAgentViewAll !== 'false';
+    }
+    return {
+      role: curUser.role || 'agent',
+      employeeId: curUser.id || '',
+      allowAgentViewAll: allowAll,
+      user: curUser
+    };
+  }
+
+  function patchReservationCachedQuery(data, entryKey, changedList, deletedIds) {
+    if (!data || !Array.isArray(data.items)) return undefined;
+    var core = root.RGCrmCore;
+    if (!core || !core.reapplyReservationDeltaToFilteredList) return undefined;
+    var filters = parseCachedPayload(entryKey);
+    var fuCache = getCachedData('getTeamFollowUps', {}, true) || getCachedData('getMyFollowUps', {}, true);
+    var fuList = fuCache ? (fuCache.items || fuCache.followUps || []) : [];
+    var userCtx = resolveApiFilterUserContext();
+    var page = Math.max(1, Number(filters.page || data.page || 1));
+    var pageSize = Math.max(1, Number(filters.pageSize || data.pageSize || 20));
+    var totalBefore = Number(data.total !== undefined ? data.total : data.items.length);
+    var res = core.reapplyReservationDeltaToFilteredList(data.items, changedList || [], deletedIds || [], filters, fuList, userCtx);
+
+    if (page > 1 && (res.removedCount > 0 || res.addedCount > 0 || totalBefore > pageSize)) {
+      return { __rgDeleteCacheEntry: true };
+    }
+    if (totalBefore > pageSize && res.removedCount > 0) {
+      return { __rgDeleteCacheEntry: true };
+    }
+
+    var nextTotal = Math.max(0, totalBefore - res.removedCount + res.addedCount);
+    var nextItems = res.items.slice(0, pageSize);
+    if (nextTotal < nextItems.length) nextTotal = nextItems.length;
+    return Object.assign({}, data, {
+      items: nextItems,
+      total: nextTotal,
+      totalPages: Math.max(1, Math.ceil(nextTotal / pageSize))
+    });
+  }
+
+  function patchProblemCachedQuery(data, entryKey, changedProblems, deletedResIds) {
+    if (!data || !Array.isArray(data.items)) return undefined;
+    var core = root.RGCrmCore;
+    if (!core || !core.reapplyProblemDeltaToFilteredList) return undefined;
+    var filters = parseCachedPayload(entryKey);
+    var nextItems = core.reapplyProblemDeltaToFilteredList(data.items, changedProblems || [], deletedResIds || [], filters);
+    return Object.assign({}, data, {
+      items: nextItems,
+      total: nextItems.length
+    });
+  }
+
+  function patchFollowUpCachedQuery(data, entryKey, changedFollowUps, deletedResIds) {
+    if (!data || !Array.isArray(data.items)) return undefined;
+    var core = root.RGCrmCore;
+    if (!core || !core.reapplyFollowUpDeltaToFilteredList) return undefined;
+    var filters = parseCachedPayload(entryKey);
+    var nextItems = core.reapplyFollowUpDeltaToFilteredList(data.items, changedFollowUps || [], deletedResIds || [], filters);
+    return Object.assign({}, data, {
+      items: nextItems,
+      total: nextItems.length
+    });
+  }
+
   function patchCachedScopes(scopes, updaterFn) {
     var list = Array.isArray(scopes) ? scopes : [scopes];
     var touched = false;
@@ -894,6 +1006,12 @@
       if (list.indexOf(entry.scope) === -1) return;
       var actName = getCachedActionKey(k);
       var nextData = updaterFn(entry.response.data, actName, k);
+      if (nextData && nextData.__rgDeleteCacheEntry) {
+        delete apiResponseCache[k];
+        delete revalidatedInPage[k];
+        touched = true;
+        return;
+      }
       if (nextData !== undefined && nextData !== null) {
         entry.response = Object.assign({}, entry.response, { data: nextData });
         entry.storedAt = now;
@@ -1318,9 +1436,14 @@
           reservation: applyAssignFn(localDetailsByNs[nsClaim][resIdClaim].reservation)
         }));
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(applyAssignFn) });
+          var hitClaim = (localReservationsByNs[nsClaim] && localReservationsByNs[nsClaim].byId[resIdClaim]) ||
+            data.items.find(function (x) { return x && x.id === resIdClaim; });
+          var changedArrClaim = hitClaim ? [applyAssignFn(hitClaim)] : [];
+          return changedArrClaim.length
+            ? patchReservationCachedQuery(data, entryKey, changedArrClaim, [])
+            : Object.assign({}, data, { items: data.items.map(applyAssignFn) });
         }
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdClaim) {
           return Object.assign({}, data, { reservation: applyAssignFn(data.reservation) });
@@ -1410,9 +1533,13 @@
       } else if (localReservationsByNs[nsOptFu] && localReservationsByNs[nsOptFu].byId[resIdFu]) {
         setLocalReservationsState(nsOptFu, [patchResStatus(localReservationsByNs[nsOptFu].byId[resIdFu])], false);
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchResStatus) });
+          var hitFu = (localReservationsByNs[nsOptFu] && localReservationsByNs[nsOptFu].byId[resIdFu]) ||
+            data.items.find(function (x) { return x && x.id === resIdFu; });
+          return hitFu
+            ? patchReservationCachedQuery(data, entryKey, [patchResStatus(hitFu)], [])
+            : Object.assign({}, data, { items: data.items.map(patchResStatus) });
         }
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdFu) {
           var newFuObj = {
@@ -1533,9 +1660,13 @@
           }].concat(curNaDet.followUps || [])
         }));
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchNa) });
+          var hitNa = (localReservationsByNs[nsNa] && localReservationsByNs[nsNa].byId[resIdNa]) ||
+            data.items.find(function (x) { return x && x.id === resIdNa; });
+          return hitNa
+            ? patchReservationCachedQuery(data, entryKey, [patchNa(hitNa)], [])
+            : Object.assign({}, data, { items: data.items.map(patchNa) });
         }
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdNa) {
           var nextRNa = patchNa(data.reservation);
@@ -1576,19 +1707,16 @@
       var affectedResId = '';
       var stillOpenOnRes = null;
 
-      patchCachedScopes(['problems', 'reservations'], function (data, actName) {
+      patchCachedScopes(['problems', 'reservations'], function (data, actName, entryKey) {
         if (actName === 'getProblems' && Array.isArray(data.items)) {
-          var nextItems = data.items.map(function (item) {
-            if (item.id !== prbId) return item;
-            affectedResId = item.reservationId || affectedResId;
-            return core.applyOptimisticProblemPatch(item, p, actUser, allEmployees);
-          });
-          if (affectedResId) {
-            stillOpenOnRes = nextItems.some(function (it) {
-              return it.reservationId === affectedResId && !core.isProblemClosedStatus(it.status);
-            });
+          var matchedPrbItem = data.items.find(function (item) { return item && item.id === prbId; }) || findCachedProblem(prbId);
+          if (matchedPrbItem) {
+            affectedResId = matchedPrbItem.reservationId || affectedResId;
+            var patchedPrb = core.applyOptimisticProblemPatch(matchedPrbItem, p, actUser, allEmployees);
+            stillOpenOnRes = !core.isProblemClosedStatus(patchedPrb.status);
+            return patchProblemCachedQuery(data, entryKey, [patchedPrb], []);
           }
-          return Object.assign({}, data, { items: nextItems });
+          return undefined;
         }
         if (actName === 'getProblemDetails' && data.problem && data.problem.id === prbId) {
           affectedResId = data.problem.reservationId || affectedResId;
@@ -1620,8 +1748,10 @@
 
       if (affectedResId && stillOpenOnRes !== null) {
         var nsPrbUpd = getCacheNamespace();
+        var updatedHasPrbRes = null;
         if (localReservationsByNs[nsPrbUpd] && localReservationsByNs[nsPrbUpd].byId[affectedResId]) {
-          setLocalReservationsState(nsPrbUpd, [Object.assign({}, localReservationsByNs[nsPrbUpd].byId[affectedResId], { hasProblem: Boolean(stillOpenOnRes) })], false);
+          updatedHasPrbRes = Object.assign({}, localReservationsByNs[nsPrbUpd].byId[affectedResId], { hasProblem: Boolean(stillOpenOnRes) });
+          setLocalReservationsState(nsPrbUpd, [updatedHasPrbRes], false);
         }
         if (localDetailsByNs[nsPrbUpd] && localDetailsByNs[nsPrbUpd][affectedResId]) {
           var detP = localDetailsByNs[nsPrbUpd][affectedResId];
@@ -1633,13 +1763,12 @@
             reservation: detP.reservation ? Object.assign({}, detP.reservation, { hasProblem: Boolean(stillOpenOnRes) }) : detP.reservation
           }));
         }
-        patchCachedScopes(['reservations'], function (data, actName) {
+        patchCachedScopes(['reservations'], function (data, actName, entryKey) {
           if (actName === 'getReservations' && Array.isArray(data.items)) {
-            return Object.assign({}, data, {
-              items: data.items.map(function (r) {
-                return r.id === affectedResId ? Object.assign({}, r, { hasProblem: Boolean(stillOpenOnRes) }) : r;
-              })
-            });
+            var baseTarget = updatedHasPrbRes || data.items.find(function (r) { return r && r.id === affectedResId; });
+            if (baseTarget) {
+              return patchReservationCachedQuery(data, entryKey, [Object.assign({}, baseTarget, { hasProblem: Boolean(stillOpenOnRes) })], []);
+            }
           }
           return undefined;
         });
@@ -1688,23 +1817,20 @@
           problems: [optPrb].concat(detNew.problems || [])
         }));
       }
-      patchCachedScopes(['reservations', 'problems'], function (data, actName) {
+      patchCachedScopes(['reservations', 'problems'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, {
-            items: data.items.map(function (r) {
-              if (r.id !== resIdPrb) return r;
-              return Object.assign({}, r, {
-                hasProblem: true,
-                priority: optPrb.priority === 'مرتفع' ? 'مرتفع' : r.priority
-              });
-            })
-          });
+          var hitNewPrb = (localReservationsByNs[nsPrbNew] && localReservationsByNs[nsPrbNew].byId[resIdPrb]) ||
+            data.items.find(function (r) { return r && r.id === resIdPrb; });
+          if (hitNewPrb) {
+            return patchReservationCachedQuery(data, entryKey, [Object.assign({}, hitNewPrb, {
+              hasProblem: true,
+              priority: optPrb.priority === 'مرتفع' ? 'مرتفع' : hitNewPrb.priority
+            })], []);
+          }
+          return undefined;
         }
         if (actName === 'getProblems' && Array.isArray(data.items)) {
-          return Object.assign({}, data, {
-            items: [optPrb].concat(data.items),
-            total: (data.total || data.items.length) + 1
-          });
+          return patchProblemCachedQuery(data, entryKey, [optPrb], []);
         }
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdPrb) {
           return Object.assign({}, data, {
@@ -1785,9 +1911,13 @@
           reservation: patchDet(localDetailsByNs[nsDet][resIdDet].reservation)
         }));
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchDet) });
+          var hitDet = (localReservationsByNs[nsDet] && localReservationsByNs[nsDet].byId[resIdDet]) ||
+            data.items.find(function (r) { return r && r.id === resIdDet; });
+          return hitDet
+            ? patchReservationCachedQuery(data, entryKey, [patchDet(hitDet)], [])
+            : Object.assign({}, data, { items: data.items.map(patchDet) });
         }
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdDet) {
           return Object.assign({}, data, { reservation: patchDet(data.reservation) });
@@ -1838,9 +1968,13 @@
           followUps: Array.isArray(detFuCur.followUps) ? detFuCur.followUps.map(patchFuItem) : []
         }));
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && resIdFuEdit && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchResFromFu) });
+          var hitFuR = (localReservationsByNs[nsFuEdit] && localReservationsByNs[nsFuEdit].byId[resIdFuEdit]) ||
+            data.items.find(function (r) { return r && r.id === resIdFuEdit; });
+          return hitFuR
+            ? patchReservationCachedQuery(data, entryKey, [patchResFromFu(hitFuR)], [])
+            : Object.assign({}, data, { items: data.items.map(patchResFromFu) });
         }
         if (actName === 'getReservationDetails' && data.reservation && (!resIdFuEdit || data.reservation.id === resIdFuEdit)) {
           return Object.assign({}, data, {
@@ -1855,7 +1989,10 @@
           });
         }
         if (actName === 'getTeamFollowUps' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchFuItem) });
+          var existingFu = data.items.find(function (f) { return f && f.id === fuIdOpt; });
+          return existingFu
+            ? patchFollowUpCachedQuery(data, entryKey, [patchFuItem(existingFu)], [])
+            : undefined;
         }
         return undefined;
       });
@@ -1918,9 +2055,13 @@
           reservation: patchAs(localDetailsByNs[nsAs][resIdAs].reservation)
         }));
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchAs) });
+          var hitAs = (localReservationsByNs[nsAs] && localReservationsByNs[nsAs].byId[resIdAs]) ||
+            data.items.find(function (r) { return r && r.id === resIdAs; });
+          return hitAs
+            ? patchReservationCachedQuery(data, entryKey, [patchAs(hitAs)], [])
+            : Object.assign({}, data, { items: data.items.map(patchAs) });
         }
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdAs) {
           return Object.assign({}, data, { reservation: patchAs(data.reservation) });
@@ -1981,8 +2122,8 @@
         });
       };
       var nsBulk = getCacheNamespace();
+      var bulkPatchedList = [];
       if (localReservationsByNs[nsBulk] && localReservationsByNs[nsBulk].byId) {
-        var bulkPatchedList = [];
         bulkIds.forEach(function (id) {
           if (localReservationsByNs[nsBulk].byId[id]) {
             bulkPatchedList.push(patchBulkRec(localReservationsByNs[nsBulk].byId[id]));
@@ -1999,9 +2140,14 @@
           }
         });
       }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.map(patchBulkRec) });
+          var patchedHits = bulkPatchedList.length
+            ? bulkPatchedList
+            : data.items.filter(function (r) { return r && bulkIdSet[r.id]; }).map(patchBulkRec);
+          return patchedHits.length
+            ? patchReservationCachedQuery(data, entryKey, patchedHits, [])
+            : Object.assign({}, data, { items: data.items.map(patchBulkRec) });
         }
         if (actName === 'getReservationDetails' && data.reservation && bulkIdSet[data.reservation.id]) {
           return Object.assign({}, data, { reservation: patchBulkRec(data.reservation) });
@@ -5935,7 +6081,7 @@
           return Date.parse(r.updatedAt || r.lastUpdatedAt || '') > sinceMs;
         });
         var changedFu = (db.followUps || []).filter(function (f) {
-          return Date.parse(f.createdAt || '') > sinceMs;
+          return Date.parse(f.updatedAt || f.createdAt || '') > sinceMs;
         });
         var changedPrb = (db.problems || []).filter(function (p) {
           return Date.parse(p.updatedAt || p.createdAt || '') > sinceMs;
@@ -6246,9 +6392,9 @@
         }
       });
       if (core && core.mergeDeltaRecords) {
-        patchCachedScopes(['reservations'], function (data, actName) {
+        patchCachedScopes(['reservations'], function (data, actName, entryKey) {
           if (actName === 'getReservations' && Array.isArray(data.items)) {
-            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chRes, 'id') });
+            return patchReservationCachedQuery(data, entryKey, chRes, []);
           }
           if (actName === 'getReservationDetails' && data.reservation) {
             var m = chRes.find(function (x) { return x && x.id === data.reservation.id; });
@@ -6295,12 +6441,22 @@
         });
       }
       if (core && core.mergeDeltaRecords) {
-        patchCachedScopes(['followUps', 'reservations'], function (data, actName) {
-          if ((actName === 'getTeamFollowUps' || actName === 'getMyFollowUps') && Array.isArray(data.items)) {
+        patchCachedScopes(['followUps', 'reservations'], function (data, actName, entryKey) {
+          if (actName === 'getTeamFollowUps' && Array.isArray(data.items)) {
+            return patchFollowUpCachedQuery(data, entryKey, chFu, []);
+          }
+          if (actName === 'getMyFollowUps' && Array.isArray(data.items)) {
             return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chFu, 'id') });
           }
           if (actName === 'getMyFollowUps' && Array.isArray(data.followUps)) {
-            return Object.assign({}, data, { followUps: core.mergeDeltaRecords(data.followUps, chFu, 'id') });
+            var curActUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+            var curActEmpId = curActUser && curActUser.id ? String(curActUser.id) : '';
+            var ownFuChanges = curActEmpId
+              ? chFu.filter(function (f) { return f && String(f.employeeId) === curActEmpId; })
+              : chFu;
+            if (ownFuChanges.length > 0) {
+              return Object.assign({}, data, { followUps: core.mergeDeltaRecords(data.followUps, ownFuChanges, 'id') });
+            }
           }
           if (actName === 'getReservationDetails' && data.reservation && data.reservation.id) {
             var resFus = chFu.filter(function (f) { return f && f.reservationId === data.reservation.id; });
@@ -6352,9 +6508,9 @@
         });
       }
       if (core && core.mergeDeltaRecords) {
-        patchCachedScopes(['problems', 'reservations'], function (data, actName) {
+        patchCachedScopes(['problems', 'reservations'], function (data, actName, entryKey) {
           if (actName === 'getProblems' && Array.isArray(data.items)) {
-            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chPrb, 'id') });
+            return patchProblemCachedQuery(data, entryKey, chPrb, []);
           }
           if (actName === 'getProblemDetails' && data.problem) {
             var mp = chPrb.find(function (x) { return x && x.id === data.problem.id; });
@@ -6438,18 +6594,21 @@
       delResIds.forEach(function (did) {
         if (localDetailsByNs[ns]) delete localDetailsByNs[ns][did];
       });
-      patchCachedScopes(['reservations', 'todayRadar', 'followUps', 'problems'], function (data, actName) {
+      patchCachedScopes(['reservations', 'todayRadar', 'followUps', 'problems'], function (data, actName, entryKey) {
         if (actName === 'getReservations' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.filter(function (r) { return r && !delResMap[String(r.id)]; }) });
+          return patchReservationCachedQuery(data, entryKey, [], delResIds);
         }
         if (actName === 'getTodayAndRadar' && Array.isArray(data.items)) {
           return Object.assign({}, data, { items: data.items.filter(function (r) { return r && !delResMap[String(r.id)]; }) });
+        }
+        if (actName === 'getTeamFollowUps' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.filter(function (f) { return f && !delResMap[String(f.reservationId)]; }) });
         }
         if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
           return Object.assign({}, data, { assignedReservations: data.assignedReservations.filter(function (r) { return r && !delResMap[String(r.id)]; }) });
         }
         if (actName === 'getProblems' && Array.isArray(data.items)) {
-          return Object.assign({}, data, { items: data.items.filter(function (p) { return p && !delResMap[String(p.reservationId)]; }) });
+          return patchProblemCachedQuery(data, entryKey, [], delResIds);
         }
         return undefined;
       });
@@ -6466,7 +6625,11 @@
     if (invalidateList.length > 0) {
       var dedupInv = [];
       invalidateList.forEach(function (sc) { if (sc && dedupInv.indexOf(sc) === -1) dedupInv.push(sc); });
-      clearCache(dedupInv);
+      if (delta.deletedAllReservationsBefore) {
+        clearCache(dedupInv);
+      } else {
+        markScopesStale(dedupInv);
+      }
     }
 
     if (delta.syncVersion && root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
@@ -6585,30 +6748,6 @@
       ? core.buildApiCacheKey(transportUrl, token, action, payload)
       : '';
 
-    var callerController = null;
-    var myAbortSeq = 0;
-    if (abortKey && typeof AbortController !== 'undefined') {
-      if (activeAbortControllers[abortKey]) {
-        try { activeAbortControllers[abortKey].controller.abort(); } catch (_eAbort) {}
-      }
-      callerController = new AbortController();
-      myAbortSeq = ++abortRequestSeq;
-      activeAbortControllers[abortKey] = { controller: callerController, seq: myAbortSeq };
-    }
-
-    var startNetworkOrSandbox = function () {
-      var promise = executeCall().finally(function () {
-        if (cacheKey) delete inFlightRequests[cacheKey];
-        if (abortKey && activeAbortControllers[abortKey] && activeAbortControllers[abortKey].seq === myAbortSeq) {
-          delete activeAbortControllers[abortKey];
-        }
-      });
-      if (cacheKey && !abortKey) {
-        inFlightRequests[cacheKey] = promise;
-      }
-      return promise;
-    };
-
     // Instant local IndexedDB query path for reservations & today/radar filtering/sorting/pagination
     if ((action === 'getReservations' || action === 'getTodayAndRadar') && !skipCache) {
       var activeUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
@@ -6631,6 +6770,38 @@
       }
     }
 
+    // Coalesce identical cacheable in-flight requests even if abortKey is provided with identical params
+    if (policy.cacheable && !isForceRefresh && cacheKey && inFlightRequests[cacheKey]) {
+      var existingCtrl = abortKey ? activeAbortControllers[abortKey] : null;
+      if (!abortKey || !existingCtrl || existingCtrl.cacheKey === cacheKey) {
+        return inFlightRequests[cacheKey];
+      }
+    }
+
+    var callerController = null;
+    var myAbortSeq = 0;
+    if (abortKey && typeof AbortController !== 'undefined') {
+      if (activeAbortControllers[abortKey]) {
+        try { activeAbortControllers[abortKey].controller.abort(); } catch (_eAbort) {}
+      }
+      callerController = new AbortController();
+      myAbortSeq = ++abortRequestSeq;
+      activeAbortControllers[abortKey] = { controller: callerController, seq: myAbortSeq, cacheKey: cacheKey };
+    }
+
+    var startNetworkOrSandbox = function () {
+      var promise = executeCall().finally(function () {
+        if (cacheKey) delete inFlightRequests[cacheKey];
+        if (abortKey && activeAbortControllers[abortKey] && activeAbortControllers[abortKey].seq === myAbortSeq) {
+          delete activeAbortControllers[abortKey];
+        }
+      });
+      if (cacheKey) {
+        inFlightRequests[cacheKey] = promise;
+      }
+      return promise;
+    };
+
     if (policy.cacheable && !skipCache && cacheKey && apiResponseCache[cacheKey]) {
       var cachedEntry = apiResponseCache[cacheKey];
       var nowTs = Date.now();
@@ -6638,7 +6809,7 @@
       if (isPageValidated && nowTs < cachedEntry.expiresAt) {
         return cachedEntry.response;
       }
-      if (isPageValidated && nowTs < (cachedEntry.staleUntil || 0)) {
+      if ((isPageValidated || cachedEntry.swrValidInPage) && nowTs < (cachedEntry.staleUntil || 0)) {
         if (!inFlightRequests[cacheKey]) {
           startNetworkOrSandbox().catch(function () {});
         }
@@ -6647,11 +6818,6 @@
       if (nowTs >= (cachedEntry.staleUntil || 0)) {
         delete apiResponseCache[cacheKey];
       }
-    }
-
-    // Single-flight deduplication for cacheable reads (even during silentRefresh unless forced or using abortKey)
-    if (policy.cacheable && !isForceRefresh && !abortKey && cacheKey && inFlightRequests[cacheKey]) {
-      return inFlightRequests[cacheKey];
     }
 
     var mutLockKey = (!policy.cacheable && core && core.buildMutationLockKey)
@@ -7156,24 +7322,26 @@
             });
             if (secondaryOnly.length > 0) pendingIdbOps.push(clearCache(secondaryOnly));
             if (action === 'createProblem' && parsed.data && parsed.data.id) {
-              patchCachedScopes(['problems'], function (data, actName) {
+              patchCachedScopes(['problems'], function (data, actName, entryKey) {
                 if (actName === 'getProblems' && Array.isArray(data.items)) {
-                  var replaced = data.items.map(function (it) {
-                    return String(it.id || '').indexOf('PRB_OPT_') === 0 && it.reservationId === parsed.data.reservationId
-                      ? parsed.data
-                      : it;
+                  var hasTemp = data.items.some(function (it) {
+                    return String(it.id || '').indexOf('PRB_OPT_') === 0 && it.reservationId === parsed.data.reservationId;
                   });
-                  return Object.assign({}, data, { items: replaced });
+                  if (hasTemp) {
+                    var replaced = data.items.filter(function (it) {
+                      return !(String(it.id || '').indexOf('PRB_OPT_') === 0 && it.reservationId === parsed.data.reservationId);
+                    });
+                    return patchProblemCachedQuery(Object.assign({}, data, { items: replaced }), entryKey, [parsed.data], []);
+                  }
+                  return patchProblemCachedQuery(data, entryKey, [parsed.data], []);
                 }
                 return undefined;
               });
             }
             if (action === 'updateProblem' && parsed.data && parsed.data.id) {
-              patchCachedScopes(['problems'], function (data, actName) {
+              patchCachedScopes(['problems'], function (data, actName, entryKey) {
                 if (actName === 'getProblems' && Array.isArray(data.items)) {
-                  return Object.assign({}, data, {
-                    items: data.items.map(function (it) { return it.id === parsed.data.id ? Object.assign({}, it, parsed.data) : it; })
-                  });
+                  return patchProblemCachedQuery(data, entryKey, [parsed.data], []);
                 }
                 if (actName === 'getProblemDetails' && data.problem && data.problem.id === parsed.data.id) {
                   return Object.assign({}, data, { problem: Object.assign({}, data.problem, parsed.data) });
@@ -7704,6 +7872,7 @@
     warmUpGas: warmUpGas,
     clearCache: clearCache,
     invalidateScopes: clearCache,
+    markScopesStale: markScopesStale,
     wipeAllBrowserCaches: wipeAllBrowserCaches,
     enforceBootSyncCheck: function (force) { return runBootSyncCheck(getCacheNamespace(), force !== false); },
     getSyncCheckStatus: getSyncCheckStatus,

@@ -238,12 +238,32 @@
     if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'all';
     if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'all';
     ctx.state.reservations = state;
+    if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+
+    function getQueryPayload(extra) {
+      var core = root.RGCrmCore;
+      var base = (core && core.buildReservationQueryPayload)
+        ? core.buildReservationQueryPayload(state)
+        : Object.assign({ page: 1, pageSize: 20 }, state);
+      return extra ? Object.assign({}, base, extra) : base;
+    }
+
+    function checkHasActiveResFilters() {
+      var core = root.RGCrmCore;
+      return (core && core.hasActiveReservationFilters)
+        ? core.hasActiveReservationFilters(state)
+        : Boolean(
+            state.search || state.company || state.branch || state.status || state.employeeId ||
+            state.priority || state.dateFrom || state.dateTo || state.timeFrom || state.timeTo ||
+            state.unfollowedOnly || state.hasProblemsOnly || state.overdueUnpaidOnly
+          );
+    }
 
     var empState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
     var hasPreloadedEmps = Boolean(empState && empState.loaded && Array.isArray(empState.items) && empState.items.length > 0);
     var [empRes, resData] = await Promise.all([
       hasPreloadedEmps ? Promise.resolve({ success: true, data: { items: empState.items } }) : root.RGApi.callApi('getEmployees', {}),
-      root.RGApi.callApi('getReservations', Object.assign({}, state, { abortKey: 'res:list' }))
+      root.RGApi.callApi('getReservations', getQueryPayload({ abortKey: 'res:list' }))
     ]);
     if (resData && resData.aborted) return;
 
@@ -368,10 +388,10 @@
           '<div class="filter-grid filter-grid-4">' +
             '<input type="search" class="input" id="res-search" placeholder="' + t('search_placeholder') + '" value="' + esc(state.search || '') + '">' +
             '<select class="select" id="res-company" aria-label="' + t('company') + '"><option value="">' + t('all_companies') + '</option>' +
-              facets.companies.map(function (c) { return '<option value="' + esc(c) + '"' + (state.company === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') +
+              ((state.company && facets.companies.indexOf(state.company) === -1 ? [state.company] : []).concat(facets.companies || [])).map(function (c) { return '<option value="' + esc(c) + '"' + (state.company === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') +
             '</select>' +
             '<select class="select" id="res-branch" aria-label="' + t('branch') + '"><option value="">' + t('all_branches') + '</option>' +
-              facets.branches.map(function (b) { return '<option value="' + esc(b) + '"' + (state.branch === b ? ' selected' : '') + '>' + esc(b) + '</option>'; }).join('') +
+              ((state.branch && facets.branches.indexOf(state.branch) === -1 ? [state.branch] : []).concat(facets.branches || [])).map(function (b) { return '<option value="' + esc(b) + '"' + (state.branch === b ? ' selected' : '') + '>' + esc(b) + '</option>'; }).join('') +
             '</select>' +
             '<select class="select" id="res-status" aria-label="' + t('status') + '"><option value="">' + t('all_statuses') + '</option>' +
               (root.RGCrmCore.WORKFLOW_STATUS_OPTIONS || root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) { return '<option value="' + esc(s) + '"' + (state.status === s ? ' selected' : '') + '>' + esc(s) + '</option>'; }).join('') +
@@ -733,6 +753,7 @@
               var idMap = {};
               idsList.forEach(function (idVal) { idMap[idVal] = true; });
               var nowIso = new Date().toISOString();
+              var changedBulkItems = [];
               currentItems = currentItems.map(function (item) {
                 if (!item || !idMap[item.id]) return item;
                 var curIds = Array.isArray(item.assignedEmployeeIds) ? item.assignedEmployeeIds.slice() : [];
@@ -749,15 +770,17 @@
                   nextIds = [toEmployeeId];
                   nextNames = [targetEmpName];
                 }
-                return Object.assign({}, item, {
+                var updatedBulk = Object.assign({}, item, {
                   assignedEmployeeIds: nextIds,
                   assignedEmployeeNames: nextNames,
                   updatedAt: nowIso
                 });
+                changedBulkItems.push(updatedBulk);
+                return updatedBulk;
               });
               if (Array.isArray(radarRawReservations)) {
                 radarRawReservations = radarRawReservations.map(function (item) {
-                  var updatedMatch = item && idMap[item.id] ? currentItems.find(function (x) { return x && x.id === item.id; }) : null;
+                  var updatedMatch = item && idMap[item.id] ? changedBulkItems.find(function (x) { return x && x.id === item.id; }) : null;
                   return updatedMatch ? Object.assign({}, item, updatedMatch) : item;
                 });
                 paintRadarView();
@@ -772,7 +795,12 @@
                   mode: modeVal
                 }, currentUser);
               }
-              paintCurrentItems();
+              if (changedBulkItems.length && checkHasActiveResFilters()) {
+                currentItems = prevItems;
+                applyLocalResChangesToTable(changedBulkItems);
+              } else {
+                paintCurrentItems();
+              }
               ctx.toast(isEn
                 ? ('Reassigned ' + idsList.length + ' reservation(s) to ' + targetEmpName + '.')
                 : ('تمت إعادة توزيع ' + idsList.length + ' حجز إلى ' + targetEmpName + ' بنجاح.'));
@@ -807,6 +835,7 @@
           var col = th.getAttribute('data-sort');
           if (state.sortBy === col) state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
           else { state.sortBy = col; state.sortDir = 'desc'; }
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           refreshTableRegion();
         });
       });
@@ -814,13 +843,21 @@
       var prevBtn = region.querySelector('#res-prev');
       if (prevBtn) {
         prevBtn.addEventListener('click', function () {
-          if (state.page > 1) { state.page--; refreshTableRegion(); }
+          if (state.page > 1) {
+            state.page--;
+            if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+            refreshTableRegion();
+          }
         });
       }
       var nextBtn = region.querySelector('#res-next');
       if (nextBtn) {
         nextBtn.addEventListener('click', function () {
-          if (state.page < currentTotalPages) { state.page++; refreshTableRegion(); }
+          if (state.page < currentTotalPages) {
+            state.page++;
+            if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+            refreshTableRegion();
+          }
         });
       }
 
@@ -844,9 +881,7 @@
               lastUpdatedAt: nowIso,
               isFollowed: true
             };
-            currentItems = currentItems.map(function (item) {
-              return item.id === rid ? Object.assign({}, item, updatedPatch) : item;
-            });
+            var updatedQuickRes = targetItem ? Object.assign({}, targetItem, updatedPatch) : null;
             if (Array.isArray(radarRawReservations)) {
               radarRawReservations = radarRawReservations.map(function (item) {
                 return item && item.id === rid ? Object.assign({}, item, updatedPatch) : item;
@@ -860,7 +895,14 @@
                 status: nextStatus
               }, currentUser);
             }
-            paintCurrentItems();
+            if (updatedQuickRes && checkHasActiveResFilters()) {
+              applyLocalResChangesToTable([updatedQuickRes]);
+            } else {
+              currentItems = currentItems.map(function (item) {
+                return item.id === rid ? Object.assign({}, item, updatedPatch) : item;
+              });
+              paintCurrentItems();
+            }
             ctx.toast('تم تحديث حالة الحجز إلى: ' + nextStatus);
             return root.RGApi.callApi('quickUpdateReservationStatus', {
               reservationId: rid,
@@ -907,7 +949,7 @@
           runWithLock(btn, 'claimReservation:' + rid, function () {
             var prevItems = currentItems.slice();
             var patchedItem = null;
-            currentItems = currentItems.map(function (item) {
+            var nextClaimedList = currentItems.map(function (item) {
               if (item.id !== rid) return item;
               var claimed = root.RGCrmCore.claimReservationRecord(item, currentUser);
               patchedItem = Object.assign({}, item, {
@@ -926,7 +968,12 @@
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: rid }, currentUser);
             }
-            paintCurrentItems();
+            if (patchedItem && checkHasActiveResFilters()) {
+              applyLocalResChangesToTable([patchedItem]);
+            } else {
+              currentItems = nextClaimedList;
+              paintCurrentItems();
+            }
             ctx.toast('تم استلام الحجز في قائمتك بنجاح.');
             return root.RGApi.callApi('claimReservation', {
               reservationId: rid,
@@ -961,7 +1008,7 @@
           runWithLock(btn, 'unclaimReservation:' + rid, function () {
             var prevItems = currentItems.slice();
             var patchedItem = null;
-            currentItems = currentItems.map(function (item) {
+            var nextUnclaimedList = currentItems.map(function (item) {
               if (item.id !== rid) return item;
               var unclaimed = root.RGCrmCore.unclaimReservationRecord(item, currentEmpId);
               patchedItem = Object.assign({}, item, {
@@ -980,7 +1027,12 @@
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('unclaimReservation', { reservationId: rid }, currentUser);
             }
-            paintCurrentItems();
+            if (patchedItem && checkHasActiveResFilters()) {
+              applyLocalResChangesToTable([patchedItem]);
+            } else {
+              currentItems = nextUnclaimedList;
+              paintCurrentItems();
+            }
             ctx.toast('تم إلغاء استلام الحجز.');
             return root.RGApi.callApi('unclaimReservation', {
               reservationId: rid,
@@ -1043,32 +1095,91 @@
       if (!region) return;
       currentItems = data.items || [];
       currentTotalPages = data.totalPages || 1;
+      if (data.page && Number(data.page) > 0) {
+        state.page = Math.max(1, Math.min(currentTotalPages, Number(data.page)));
+      } else if (state.page > currentTotalPages) {
+        state.page = Math.max(1, currentTotalPages);
+      }
       var totalEl = container.querySelector('#res-total-count');
       if (totalEl) totalEl.textContent = String(data.total || 0);
       region.innerHTML = buildTableRegionHtml(data);
       bindTableRegionEvents(region);
     }
 
-    function paintCurrentItems() {
+    function paintCurrentItems(overrideTotal) {
+      var totalVal = overrideTotal !== undefined
+        ? Number(overrideTotal)
+        : Number((container.querySelector('#res-total-count') && container.querySelector('#res-total-count').textContent) || currentItems.length);
       paintTableRegion({
         items: currentItems,
-        total: Number((container.querySelector('#res-total-count') && container.querySelector('#res-total-count').textContent) || currentItems.length),
+        total: totalVal,
         page: state.page,
         totalPages: currentTotalPages
       });
     }
 
-    function syncLocalReservationSnapshot(updatedRes) {
-      if (updatedRes && updatedRes.id) {
-        var matchedInTable = currentItems.some(function (it) { return it && it.id === updatedRes.id; });
-        if (matchedInTable) {
-          currentItems = currentItems.map(function (it) {
-            return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
-          });
-          paintCurrentItems();
-        } else {
+    function applyLocalResChangesToTable(changedList, deletedIds) {
+      var core = root.RGCrmCore;
+      var totalEl = container.querySelector('#res-total-count');
+      var curTotal = Number((totalEl && totalEl.textContent) || currentItems.length);
+      var delIdsList = Array.isArray(deletedIds) ? deletedIds : [];
+      if (core && core.reapplyReservationDeltaToFilteredList && checkHasActiveResFilters()) {
+        var filterPayload = getQueryPayload();
+        var userCtx = {
+          role: (currentUser && currentUser.role) || 'agent',
+          employeeId: currentEmpId,
+          allowAgentViewAll: true,
+          user: currentUser
+        };
+        var res = core.reapplyReservationDeltaToFilteredList(currentItems, changedList || [], delIdsList, filterPayload, [], userCtx);
+        var pageSize = Math.max(1, Number(state.pageSize || 20));
+        var nextTotal = Math.max(res.items.length, curTotal - res.removedCount + res.addedCount);
+        currentItems = res.items.slice(0, pageSize);
+        currentTotalPages = Math.max(1, Math.ceil(nextTotal / pageSize));
+        paintTableRegion({
+          items: currentItems,
+          total: nextTotal,
+          page: Math.min(state.page, currentTotalPages),
+          totalPages: currentTotalPages
+        });
+        if (currentTotalPages > 1 || (res.removedCount > 0 && curTotal > pageSize)) {
           refreshTableRegion({ silentRefresh: true });
         }
+        return;
+      }
+      var delSet = {};
+      delIdsList.forEach(function (id) { if (id) delSet[id] = true; });
+      var byIdChg = {};
+      (changedList || []).forEach(function (ch) {
+        if (ch && ch.id) byIdChg[ch.id] = ch;
+      });
+      var matchedAny = false;
+      var removedCount = 0;
+      var nextList = [];
+      currentItems.forEach(function (it) {
+        if (it && delSet[it.id]) {
+          matchedAny = true;
+          removedCount += 1;
+          return;
+        }
+        if (it && byIdChg[it.id]) {
+          matchedAny = true;
+          nextList.push(Object.assign({}, it, byIdChg[it.id]));
+          return;
+        }
+        nextList.push(it);
+      });
+      currentItems = nextList;
+      if (matchedAny) {
+        paintCurrentItems(Math.max(currentItems.length, curTotal - removedCount));
+      } else {
+        refreshTableRegion({ silentRefresh: true });
+      }
+    }
+
+    function syncLocalReservationSnapshot(updatedRes) {
+      if (updatedRes && updatedRes.id) {
+        applyLocalResChangesToTable([updatedRes]);
         if (Array.isArray(radarRawReservations)) {
           radarRawReservations = radarRawReservations.map(function (it) {
             return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
@@ -1096,23 +1207,32 @@
     }
 
     async function refreshTableRegion(opts) {
+      var o = opts || {};
       var seq = ++activeFetchSeq;
       var region = container.querySelector('#res-table-region');
-      if (region && !(opts && opts.silentRefresh) && currentItems.length === 0) {
+      if (region && !o.silentRefresh && currentItems.length === 0) {
         region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       }
-      var queryPayload = Object.assign({}, state, {
-        forceRefresh: Boolean(opts && opts.forceRefresh),
-        silentRefresh: Boolean(opts && opts.silentRefresh),
+      var queryPayload = getQueryPayload({
+        forceRefresh: Boolean(o.forceRefresh),
+        silentRefresh: Boolean(o.silentRefresh),
         abortKey: 'res:list'
       });
       var resp = await root.RGApi.callApi('getReservations', queryPayload);
       if (seq !== activeFetchSeq || !container.isConnected) return;
       if (resp && resp.aborted) return;
       if (resp && resp.success && resp.data) {
+        var nextTotalPages = Math.max(1, Number(resp.data.totalPages || 1));
+        if (!o._clampRetried && state.page > nextTotalPages && Number(resp.data.total || 0) > 0) {
+          state.page = nextTotalPages;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          return refreshTableRegion(Object.assign({}, o, { _clampRetried: true, forceRefresh: true }));
+        }
         paintTableRegion(resp.data);
-      } else if (!(opts && opts.silentRefresh) || currentItems.length === 0) {
+      } else if (!o.silentRefresh && currentItems.length === 0) {
         paintTableError((resp && resp.message) || 'تعذر تحميل الحجوزات.');
+      } else if (!o.silentRefresh && ctx && ctx.toast) {
+        ctx.toast((resp && resp.message) || 'تعذر تحديث الحجوزات.', true);
       }
     }
 
@@ -1142,11 +1262,15 @@
       state.hasProblemsOnly = document.getElementById('res-problems').checked;
       state.overdueUnpaidOnly = Boolean(ovEl && ovEl.checked);
       state.page = 1;
+      if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       refreshTableRegion();
     }
 
     var searchTimer = null;
     document.getElementById('res-search').addEventListener('input', function () {
+      state.search = this.value;
+      state.page = 1;
+      if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       clearTimeout(searchTimer);
       searchTimer = setTimeout(applyFilterChange, 220);
     });
@@ -1179,6 +1303,7 @@
       document.getElementById('res-unfollowed').checked = false;
       document.getElementById('res-problems').checked = false;
       if (ovEl) ovEl.checked = false;
+      if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       refreshTableRegion();
       ctx.toast(ctx.lang === 'en' ? 'Filters reset.' : 'تمت إعادة ضبط جميع الفلاتر.');
     });
@@ -1240,13 +1365,20 @@
       pullPresetEl.addEventListener('change', function () {
         state.pullPreset = pullPresetEl.value;
         pullDatesWrap.classList.toggle('hidden', pullPresetEl.value !== 'custom');
+        if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       });
     }
     if (pullFromEl) {
-      pullFromEl.addEventListener('change', function () { state.pullFrom = pullFromEl.value; });
+      pullFromEl.addEventListener('change', function () {
+        state.pullFrom = pullFromEl.value;
+        if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+      });
     }
     if (pullToEl) {
-      pullToEl.addEventListener('change', function () { state.pullTo = pullToEl.value; });
+      pullToEl.addEventListener('change', function () {
+        state.pullTo = pullToEl.value;
+        if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+      });
     }
 
     var pullBtn = document.getElementById('res-pull-btn');
@@ -1441,7 +1573,7 @@
         }
         return;
       }
-      if (!force && !hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+      if (!force && !checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
         calendarLoadError = '';
         calendarRawItems = currentItems.slice();
         if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
@@ -1492,7 +1624,7 @@
       return { gran: gran, win: win, extracted: extracted };
     }
 
-    function renderTodayCalendarSectionHtml() {
+    function renderTodayCalendarBodyHtml(ctxCal) {
       if (calendarRawItems === null) {
         if (calendarLoadError) {
           return '<div class="rg-error-banner" role="alert">' +
@@ -1506,13 +1638,9 @@
         return '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       }
 
-      var ctxCal = buildTodayCalendarContext();
       var gran = ctxCal.gran;
       var win = ctxCal.win;
       var extracted = ctxCal.extracted;
-      var counts = extracted.counts || { total: 0, pickup: 0, return: 0, extension: 0 };
-      var evTypeFilter = state.todayCalendarEventFilter || 'all';
-
       var bodyHtml = '';
       if (gran === 'day') {
         var dayMeta = win.days[0] || { iso: win.startIso, weekdayAr: '', weekdayEn: '', shortDateAr: win.startIso, shortDateEn: win.startIso, isToday: false };
@@ -1638,7 +1766,14 @@
             }).join('') +
           '</div>';
       }
+      return bodyHtml;
+    }
 
+    function renderTodayCalendarShellHtml(ctxCal) {
+      var gran = ctxCal.gran;
+      var win = ctxCal.win;
+      var counts = (ctxCal.extracted && ctxCal.extracted.counts) || { total: 0, pickup: 0, return: 0, extension: 0 };
+      var evTypeFilter = state.todayCalendarEventFilter || 'all';
       return '<div class="rg-cal-shell" id="today-calendar-shell">' +
         '<div class="rg-cal-toolbar">' +
           '<div class="rg-cal-nav-group">' +
@@ -1658,19 +1793,19 @@
         '<div class="rg-cal-subbar">' +
           '<div class="rg-cal-legend" role="group" aria-label="' + (isEn ? 'Calendar Movement Types' : 'أنواع المواعيد') + '">' +
             '<button type="button" class="rg-cal-filter-chip' + (evTypeFilter === 'all' ? ' is-active' : '') + '" data-cal-type="all">' +
-              '<span>' + (isEn ? 'All' : 'الكل') + '</span> <strong class="tabular-nums">' + counts.total + '</strong>' +
+              '<span>' + (isEn ? 'All' : 'الكل') + '</span> <strong class="tabular-nums" data-cal-count="total">' + counts.total + '</strong>' +
             '</button>' +
             '<button type="button" class="rg-cal-filter-chip is-pickup' + (evTypeFilter === 'pickup' ? ' is-active' : '') + '" data-cal-type="pickup">' +
               '<span class="rg-cal-dot is-pickup" aria-hidden="true"></span>' +
-              '<span>' + (isEn ? 'Pickups' : 'التسليم / الاستلام') + '</span> <strong class="tabular-nums">' + counts.pickup + '</strong>' +
+              '<span>' + (isEn ? 'Pickups' : 'التسليم / الاستلام') + '</span> <strong class="tabular-nums" data-cal-count="pickup">' + counts.pickup + '</strong>' +
             '</button>' +
             '<button type="button" class="rg-cal-filter-chip is-return' + (evTypeFilter === 'return' ? ' is-active' : '') + '" data-cal-type="return">' +
               '<span class="rg-cal-dot is-return" aria-hidden="true"></span>' +
-              '<span>' + (isEn ? 'Returns' : 'الإرجاع') + '</span> <strong class="tabular-nums">' + counts.return + '</strong>' +
+              '<span>' + (isEn ? 'Returns' : 'الإرجاع') + '</span> <strong class="tabular-nums" data-cal-count="return">' + counts.return + '</strong>' +
             '</button>' +
             '<button type="button" class="rg-cal-filter-chip is-extension' + (evTypeFilter === 'extension' ? ' is-active' : '') + '" data-cal-type="extension">' +
               '<span class="rg-cal-dot is-extension" aria-hidden="true"></span>' +
-              '<span>' + (isEn ? 'Extensions' : 'التمديدات') + '</span> <strong class="tabular-nums">' + counts.extension + '</strong>' +
+              '<span>' + (isEn ? 'Extensions' : 'التمديدات') + '</span> <strong class="tabular-nums" data-cal-count="extension">' + counts.extension + '</strong>' +
             '</button>' +
           '</div>' +
           '<div class="rg-cal-actions">' +
@@ -1679,93 +1814,73 @@
             '<button type="button" class="btn btn-sm" id="today-cal-refresh-btn">' + (isEn ? 'Refresh' : 'تحديث') + '</button>' +
           '</div>' +
         '</div>' +
-        bodyHtml +
+        '<div id="today-cal-body-host"></div>' +
       '</div>';
     }
 
-    function bindTodayCalendarEvents(todayWrap) {
-      var retryBtn = todayWrap.querySelector('#today-cal-retry-btn');
-      if (retryBtn) {
-        retryBtn.addEventListener('click', function () {
-          ensureTodayCalendarLoaded({ forceRefresh: true });
-        });
-        return;
-      }
-      var ctxCal = buildTodayCalendarContext();
-      var win = ctxCal.win;
-      var extracted = ctxCal.extracted;
-
-      var prevBtn = todayWrap.querySelector('#today-cal-prev-btn');
-      var todayBtn = todayWrap.querySelector('#today-cal-today-btn');
-      var nextBtn = todayWrap.querySelector('#today-cal-next-btn');
+    function bindTodayCalendarToolbarEvents(calShell) {
+      var prevBtn = calShell.querySelector('#today-cal-prev-btn');
+      var todayBtn = calShell.querySelector('#today-cal-today-btn');
+      var nextBtn = calShell.querySelector('#today-cal-next-btn');
       if (prevBtn) {
         prevBtn.addEventListener('click', function () {
-          state.todayCalendarAnchorDate = win.prevAnchorIso;
+          var liveWin = buildTodayCalendarContext().win;
+          state.todayCalendarAnchorDate = liveWin.prevAnchorIso;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
         });
       }
       if (todayBtn) {
         todayBtn.addEventListener('click', function () {
-          state.todayCalendarAnchorDate = win.todayIso;
+          var liveWin = buildTodayCalendarContext().win;
+          state.todayCalendarAnchorDate = liveWin.todayIso;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
         });
       }
       if (nextBtn) {
         nextBtn.addEventListener('click', function () {
-          state.todayCalendarAnchorDate = win.nextAnchorIso;
+          var liveWin = buildTodayCalendarContext().win;
+          state.todayCalendarAnchorDate = liveWin.nextAnchorIso;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
         });
       }
 
-      todayWrap.querySelectorAll('[data-cal-gran]').forEach(function (btn) {
+      calShell.querySelectorAll('[data-cal-gran]').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var rawG = btn.getAttribute('data-cal-gran');
           state.todayCalendarGranularity = (rawG === 'day' || rawG === 'month') ? rawG : 'week';
           saveTodayCalPrefs();
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
         });
       });
 
-      todayWrap.querySelectorAll('[data-cal-type]').forEach(function (btn) {
+      calShell.querySelectorAll('[data-cal-type]').forEach(function (btn) {
         btn.addEventListener('click', function () {
           state.todayCalendarEventFilter = btn.getAttribute('data-cal-type') || 'all';
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
         });
       });
 
-      todayWrap.querySelectorAll('[data-cal-open-day]').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          var targetIso = btn.getAttribute('data-cal-open-day');
-          if (!targetIso) return;
-          state.todayCalendarAnchorDate = targetIso;
-          state.todayCalendarGranularity = 'day';
-          saveTodayCalPrefs();
-          paintTodayView();
-        });
-      });
-
-      var calSearchEl = todayWrap.querySelector('#today-cal-search');
+      var calSearchEl = calShell.querySelector('#today-cal-search');
       if (calSearchEl) {
         calSearchEl.addEventListener('input', function () {
           state.todayCalendarSearch = calSearchEl.value;
-          var pos = calSearchEl.selectionStart;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
-          var nextInp = document.getElementById('today-cal-search');
-          if (nextInp) {
-            nextInp.focus();
-            if (typeof pos === 'number') {
-              try { nextInp.setSelectionRange(pos, pos); } catch (_e) {}
-            }
-          }
         });
       }
 
-      var calIcsBtn = todayWrap.querySelector('#today-cal-ics-btn');
+      var calIcsBtn = calShell.querySelector('#today-cal-ics-btn');
       if (calIcsBtn) {
         calIcsBtn.addEventListener('click', function () {
           var core = root.RGCrmCore;
           if (!core || !core.buildIcsCalendarContent) return;
-          var evs = (extracted.events || []).map(function (ev, idx) {
+          var liveCtx = buildTodayCalendarContext();
+          var evs = ((liveCtx.extracted && liveCtx.extracted.events) || []).map(function (ev, idx) {
             var kindLbl = ev.type === 'pickup'
               ? (isEn ? 'Pickup' : 'تسليم')
               : (ev.type === 'extension' ? (isEn ? 'Extension' : 'تمديد') : (isEn ? 'Return' : 'إرجاع'));
@@ -1785,20 +1900,42 @@
           var icsStr = core.buildIcsCalendarContent(evs, 'Rental Gate CRM — Pickups & Returns');
           var dlFn = (ctx.downloadIcsFile) || (root.RGApp && root.RGApp.downloadIcsFile);
           if (dlFn) {
-            dlFn('rg-calendar-' + (win.startIso || 'schedule') + '.ics', icsStr);
+            dlFn('rg-calendar-' + ((liveCtx.win && liveCtx.win.startIso) || 'schedule') + '.ics', icsStr);
             ctx.toast(isEn ? 'Calendar (.ics) file downloaded.' : 'تم تصدير التقويم بصيغة (.ics).');
           }
         });
       }
 
-      var calRefreshBtn = todayWrap.querySelector('#today-cal-refresh-btn');
+      var calRefreshBtn = calShell.querySelector('#today-cal-refresh-btn');
       if (calRefreshBtn) {
         calRefreshBtn.addEventListener('click', function () {
           ensureTodayCalendarLoaded({ forceRefresh: true, showToast: true });
         });
       }
+    }
 
-      todayWrap.querySelectorAll('.rg-cal-event-card, .rg-cal-month-ev').forEach(function (card) {
+    function bindTodayCalendarBodyEvents(bodyHost) {
+      var retryBtn = bodyHost.querySelector('#today-cal-retry-btn');
+      if (retryBtn) {
+        retryBtn.addEventListener('click', function () {
+          ensureTodayCalendarLoaded({ forceRefresh: true });
+        });
+        return;
+      }
+
+      bodyHost.querySelectorAll('[data-cal-open-day]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var targetIso = btn.getAttribute('data-cal-open-day');
+          if (!targetIso) return;
+          state.todayCalendarAnchorDate = targetIso;
+          state.todayCalendarGranularity = 'day';
+          saveTodayCalPrefs();
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintTodayView();
+        });
+      });
+
+      bodyHost.querySelectorAll('.rg-cal-event-card, .rg-cal-month-ev').forEach(function (card) {
         card.addEventListener('click', function () {
           var rid = card.getAttribute('data-res-id');
           if (!rid) return;
@@ -1812,6 +1949,56 @@
     var radarRawReservations = null;
     var radarLoadError = '';
     var radarFetchSeq = 0;
+
+    function buildRadarShellHtml() {
+      return '<div class="radar-summary-bar" id="radar-summary-bar">' +
+          '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Total in Radar' : 'إجمالي التنبيهات') + '</span><strong class="tabular-nums" data-radar-stat="total">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item is-warning"><span class="radar-stat-label">' + (isEn ? 'Critical ≤ 6h' : 'عاجل ≤ 6 ساعات') + '</span><strong class="tabular-nums" data-radar-stat="critical6h">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item is-danger"><span class="radar-stat-label">' + (isEn ? 'Overdue Unclosed' : 'منتهية لم تُغلق') + '</span><strong class="tabular-nums" data-radar-stat="expired">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item is-info"><span class="radar-stat-label">' + (isEn ? 'Extended Contracts' : 'عقود ممددة') + '</span><strong class="tabular-nums" data-radar-stat="extended">0</strong></div>' +
+        '</div>' +
+        '<div class="radar-toolbar">' +
+          '<div class="segmented-control" role="group" aria-label="' + (isEn ? 'Urgency filter' : 'تصفية الاستعجال') + '">' +
+            '<button type="button" class="segmented-btn" data-radar-filter="all">' + (isEn ? 'All' : 'الكل') + ' (<span data-radar-btn-cnt="all">0</span>)</button>' +
+            '<button type="button" class="segmented-btn" data-radar-filter="critical_6h">' + (isEn ? '≤ 6 Hours' : 'أقل من 6 ساعات') + ' (<span data-radar-btn-cnt="critical_6h">0</span>)</button>' +
+            '<button type="button" class="segmented-btn" data-radar-filter="expired_unclosed">' + (isEn ? 'Overdue Unclosed' : 'منتهية غير مغلقة') + ' (<span data-radar-btn-cnt="expired_unclosed">0</span>)</button>' +
+          '</div>' +
+          '<div class="radar-search-wrap">' +
+            '<input type="search" class="input" id="radar-search-input" placeholder="' + (isEn ? 'Filter expiring bookings...' : 'بحث في رادار الانتهاء...') + '" value="' + esc(state.radarSearch || '') + '">' +
+            '<button type="button" class="btn btn-sm" id="radar-refresh-btn">' + (isEn ? 'Refresh' : 'تحديث') + '</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="radar-results-host"></div>';
+    }
+
+    function bindRadarToolbarEvents(radarWrap) {
+      radarWrap.querySelectorAll('[data-radar-filter]').forEach(function (fBtn) {
+        fBtn.addEventListener('click', function () {
+          state.radarFilter = fBtn.getAttribute('data-radar-filter') || 'all';
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintRadarView();
+        });
+      });
+
+      var radarSearchEl = radarWrap.querySelector('#radar-search-input');
+      if (radarSearchEl) {
+        radarSearchEl.addEventListener('input', function () {
+          state.radarSearch = radarSearchEl.value;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintRadarView();
+        });
+      }
+
+      var radarRefreshBtn = radarWrap.querySelector('#radar-refresh-btn');
+      if (radarRefreshBtn) {
+        radarRefreshBtn.addEventListener('click', function () {
+          refreshRadarData(true);
+        });
+      }
+    }
 
     function paintRadarView() {
       var radarWrap = document.getElementById('res-radar-view');
@@ -1831,9 +2018,42 @@
       }
       if (state.viewMode !== 'radar') return;
 
+      var resultsHost = radarWrap.querySelector('#radar-results-host');
+      if (!resultsHost) {
+        radarWrap.innerHTML = buildRadarShellHtml();
+        bindRadarToolbarEvents(radarWrap);
+        resultsHost = radarWrap.querySelector('#radar-results-host');
+      }
+
+      var statMap = {
+        total: summary.totalCount || 0,
+        critical6h: summary.critical6hCount || 0,
+        expired: summary.expiredUnclosedCount || 0,
+        extended: summary.extendedInRadarCount || 0
+      };
+      Object.keys(statMap).forEach(function (k) {
+        var el = radarWrap.querySelector('[data-radar-stat="' + k + '"]');
+        if (el) el.textContent = String(statMap[k]);
+      });
+      var btnCntMap = {
+        all: summary.totalCount || 0,
+        critical_6h: summary.critical6hCount || 0,
+        expired_unclosed: summary.expiredUnclosedCount || 0
+      };
+      radarWrap.querySelectorAll('[data-radar-filter]').forEach(function (fBtn) {
+        var key = fBtn.getAttribute('data-radar-filter') || 'all';
+        fBtn.classList.toggle('active', state.radarFilter === key);
+        var cntEl = fBtn.querySelector('[data-radar-btn-cnt="' + key + '"]');
+        if (cntEl) cntEl.textContent = String(btnCntMap[key] || 0);
+      });
+      var radarSearchInp = radarWrap.querySelector('#radar-search-input');
+      if (radarSearchInp && document.activeElement !== radarSearchInp && radarSearchInp.value !== (state.radarSearch || '')) {
+        radarSearchInp.value = state.radarSearch || '';
+      }
+
       if (radarRawReservations === null) {
         if (radarLoadError) {
-          radarWrap.innerHTML =
+          resultsHost.innerHTML =
             '<div class="rg-error-banner" role="alert">' +
               '<div class="rg-error-banner-body">' +
                 '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load 24h Radar' : 'تعذر تحميل رادار 24 ساعة') + '</div>' +
@@ -1841,11 +2061,11 @@
               '</div>' +
               '<button type="button" class="btn btn-sm btn-primary" id="radar-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
             '</div>';
-          var rRetry = document.getElementById('radar-retry-btn');
+          var rRetry = resultsHost.querySelector('#radar-retry-btn');
           if (rRetry) rRetry.addEventListener('click', function () { refreshRadarData(true, { forceRefresh: true }); });
           return;
         }
-        radarWrap.innerHTML = '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
+        resultsHost.innerHTML = '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
         return;
       }
 
@@ -1914,60 +2134,9 @@
           '</tbody></table></div>';
       }
 
-      radarWrap.innerHTML =
-        '<div class="radar-summary-bar">' +
-          '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Total in Radar' : 'إجمالي التنبيهات') + '</span><strong class="tabular-nums">' + summary.totalCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item is-warning"><span class="radar-stat-label">' + (isEn ? 'Critical ≤ 6h' : 'عاجل ≤ 6 ساعات') + '</span><strong class="tabular-nums">' + summary.critical6hCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item is-danger"><span class="radar-stat-label">' + (isEn ? 'Overdue Unclosed' : 'منتهية لم تُغلق') + '</span><strong class="tabular-nums">' + summary.expiredUnclosedCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item is-info"><span class="radar-stat-label">' + (isEn ? 'Extended Contracts' : 'عقود ممددة') + '</span><strong class="tabular-nums">' + summary.extendedInRadarCount + '</strong></div>' +
-        '</div>' +
-        '<div class="radar-toolbar">' +
-          '<div class="segmented-control" role="group" aria-label="' + (isEn ? 'Urgency filter' : 'تصفية الاستعجال') + '">' +
-            '<button type="button" class="segmented-btn' + (state.radarFilter === 'all' ? ' active' : '') + '" data-radar-filter="all">' + (isEn ? 'All' : 'الكل') + ' (' + summary.totalCount + ')</button>' +
-            '<button type="button" class="segmented-btn' + (state.radarFilter === 'critical_6h' ? ' active' : '') + '" data-radar-filter="critical_6h">' + (isEn ? '≤ 6 Hours' : 'أقل من 6 ساعات') + ' (' + summary.critical6hCount + ')</button>' +
-            '<button type="button" class="segmented-btn' + (state.radarFilter === 'expired_unclosed' ? ' active' : '') + '" data-radar-filter="expired_unclosed">' + (isEn ? 'Overdue Unclosed' : 'منتهية غير مغلقة') + ' (' + summary.expiredUnclosedCount + ')</button>' +
-          '</div>' +
-          '<div class="radar-search-wrap">' +
-            '<input type="search" class="input" id="radar-search-input" placeholder="' + (isEn ? 'Filter expiring bookings...' : 'بحث في رادار الانتهاء...') + '" value="' + esc(state.radarSearch || '') + '">' +
-            '<button type="button" class="btn btn-sm" id="radar-refresh-btn">' + (isEn ? 'Refresh' : 'تحديث') + '</button>' +
-          '</div>' +
-        '</div>' +
-        rowsHtml;
+      resultsHost.innerHTML = rowsHtml;
 
-      radarWrap.querySelectorAll('[data-radar-filter]').forEach(function (fBtn) {
-        fBtn.addEventListener('click', function () {
-          state.radarFilter = fBtn.getAttribute('data-radar-filter') || 'all';
-          paintRadarView();
-        });
-      });
-
-      var radarSearchEl = radarWrap.querySelector('#radar-search-input');
-      if (radarSearchEl) {
-        radarSearchEl.addEventListener('input', function () {
-          state.radarSearch = radarSearchEl.value;
-          var pos = radarSearchEl.selectionStart;
-          paintRadarView();
-          var nextInp = document.getElementById('radar-search-input');
-          if (nextInp) {
-            nextInp.focus();
-            if (typeof pos === 'number') {
-              try { nextInp.setSelectionRange(pos, pos); } catch (_e) {}
-            }
-          }
-        });
-      }
-
-      var radarRefreshBtn = radarWrap.querySelector('#radar-refresh-btn');
-      if (radarRefreshBtn) {
-        radarRefreshBtn.addEventListener('click', function () {
-          refreshRadarData(true);
-        });
-      }
-
-      radarWrap.querySelectorAll('.radar-open-res').forEach(function (btn) {
+      resultsHost.querySelectorAll('.radar-open-res').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-id');
           openReservationDrawer(rid, ctx, employees, function (updatedRes) {
@@ -1976,7 +2145,7 @@
         });
       });
 
-      radarWrap.querySelectorAll('.radar-copy-offer').forEach(function (btn) {
+      resultsHost.querySelectorAll('.radar-copy-offer').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-id');
           var match = (radarRawReservations || []).find(function (x) { return x && x.id === rid; });
@@ -1987,6 +2156,187 @@
           copyTextToClipboard(textMsg).then(function () {
             ctx.toast(isEn ? 'Extension outreach message copied.' : 'تم نسخ رسالة عرض التمديد بنجاح.');
           });
+        });
+      });
+    }
+
+    function buildTodayModeBarHtml() {
+      return '<div class="rg-today-mode-bar" id="today-mode-bar">' +
+        '<div class="rg-cal-gran-switch" role="tablist" aria-label="' + (isEn ? 'Pickups & Returns Display Mode' : 'طريقة عرض التسليم والاستلام') + '">' +
+          '<button type="button" role="tab" aria-selected="' + (state.todayDisplayMode === 'calendar') + '" class="rg-cal-gran-btn' + (state.todayDisplayMode === 'calendar' ? ' is-active' : '') + '" data-today-mode="calendar">' +
+            '📅 ' + (isEn ? 'Calendar (Month / Week / Day)' : 'التقويم (شهري / أسبوعي / يومي)') +
+          '</button>' +
+          '<button type="button" role="tab" aria-selected="' + (state.todayDisplayMode !== 'calendar') + '" class="rg-cal-gran-btn' + (state.todayDisplayMode !== 'calendar' ? ' is-active' : '') + '" data-today-mode="list">' +
+            (isEn ? 'Today\'s Schedule' : 'جدول اليوم') +
+          '</button>' +
+        '</div>' +
+        '<div class="rg-today-mode-hint" id="today-mode-hint">' +
+          (state.todayDisplayMode === 'calendar'
+            ? (isEn ? 'Interactive calendar for pickups, returns & extensions' : 'عرض تفاعلي لمواعيد التسليم والاستلام والتمديدات')
+            : (isEn ? 'Live schedule of pickups and returns scheduled for today' : 'متابعة جدول التسليم والاستلام المجدول لليوم')) +
+        '</div>' +
+      '</div>';
+    }
+
+    function buildTodayListShellHtml() {
+      return '<div class="radar-summary-bar" id="today-list-summary-bar">' +
+          '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Today Movements' : 'إجمالي حركات اليوم') + '</span><strong class="tabular-nums" data-today-stat="total">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item is-info"><span class="radar-stat-label">' + (isEn ? 'Pickups Today' : 'التسليم اليوم') + '</span><strong class="tabular-nums" data-today-stat="pickup">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item is-warning"><span class="radar-stat-label">' + (isEn ? 'Returns Today' : 'الإرجاع اليوم') + '</span><strong class="tabular-nums" data-today-stat="return">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item is-danger"><span class="radar-stat-label">' + (isEn ? 'Delayed' : 'متأخر عن الوقت') + '</span><strong class="tabular-nums" data-today-stat="overdue">0</strong></div>' +
+          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
+          '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Completed' : 'مكتمل') + '</span><strong class="tabular-nums" data-today-stat="completed">0</strong></div>' +
+        '</div>' +
+        '<div class="radar-toolbar" id="today-list-toolbar" style="flex-wrap:wrap;">' +
+          '<div class="segmented-control" role="group" aria-label="' + (isEn ? 'Movement filter' : 'تصفية حركات اليوم') + '">' +
+            '<button type="button" class="segmented-btn" data-today-filter="all">' + (isEn ? 'All' : 'الكل') + ' (<span data-today-btn-cnt="all">0</span>)</button>' +
+            '<button type="button" class="segmented-btn" data-today-filter="pickup">' + (isEn ? 'Pickups' : 'التسليم اليوم') + ' (<span data-today-btn-cnt="pickup">0</span>)</button>' +
+            '<button type="button" class="segmented-btn" data-today-filter="return">' + (isEn ? 'Returns' : 'الإرجاع اليوم') + ' (<span data-today-btn-cnt="return">0</span>)</button>' +
+          '</div>' +
+          '<div class="radar-search-wrap" style="flex-wrap:wrap;">' +
+            '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-secondary);"><span>' + (isEn ? 'From:' : 'من:') + '</span><input type="time" class="input mono" id="today-time-from" value="' + esc(state.todayTimeFrom || '') + '" style="width:118px;min-height:34px;"></label>' +
+            '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-secondary);"><span>' + (isEn ? 'To:' : 'إلى:') + '</span><input type="time" class="input mono" id="today-time-to" value="' + esc(state.todayTimeTo || '') + '" style="width:118px;min-height:34px;"></label>' +
+            '<button type="button" class="btn btn-sm" id="today-clear-time-btn" style="display:' + ((state.todayTimeFrom || state.todayTimeTo) ? '' : 'none') + ';">' + (isEn ? 'Clear Time' : 'مسح الوقت') + '</button>' +
+            '<input type="search" class="input" id="today-search-input" placeholder="' + (isEn ? 'Search today\'s schedule...' : 'بحث في جدول اليوم...') + '" value="' + esc(state.todaySearch || '') + '">' +
+            '<button type="button" class="btn btn-sm" id="today-ics-btn" title="' + (isEn ? 'Export Today Schedule to Google Calendar (.ics)' : 'تصدير جدول اليوم إلى تقويم Google (.ics)') + '">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
+            '<button type="button" class="btn btn-sm" id="today-refresh-btn">' + (isEn ? 'Refresh' : 'تحديث') + '</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="today-list-body-host"></div>';
+    }
+
+    function bindTodayListToolbarEvents(contentHost) {
+      var core = root.RGCrmCore;
+      contentHost.querySelectorAll('[data-today-filter]').forEach(function (fBtn) {
+        fBtn.addEventListener('click', function () {
+          state.todayFilter = fBtn.getAttribute('data-today-filter') || 'all';
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintTodayView();
+        });
+      });
+
+      var todayTimeFromEl = contentHost.querySelector('#today-time-from');
+      var todayTimeToEl = contentHost.querySelector('#today-time-to');
+      if (todayTimeFromEl) {
+        todayTimeFromEl.addEventListener('change', function () {
+          state.todayTimeFrom = todayTimeFromEl.value || '';
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintTodayView();
+        });
+      }
+      if (todayTimeToEl) {
+        todayTimeToEl.addEventListener('change', function () {
+          state.todayTimeTo = todayTimeToEl.value || '';
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintTodayView();
+        });
+      }
+      var todayClearTimeBtn = contentHost.querySelector('#today-clear-time-btn');
+      if (todayClearTimeBtn) {
+        todayClearTimeBtn.addEventListener('click', function () {
+          state.todayTimeFrom = '';
+          state.todayTimeTo = '';
+          if (todayTimeFromEl) todayTimeFromEl.value = '';
+          if (todayTimeToEl) todayTimeToEl.value = '';
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintTodayView();
+        });
+      }
+      var todayIcsBtn = contentHost.querySelector('#today-ics-btn');
+      if (todayIcsBtn) {
+        todayIcsBtn.addEventListener('click', function () {
+          if (!core || !core.buildTodayScheduleIcsEvents || !core.buildIcsCalendarContent) return;
+          var liveSummary = core.computeTodayMovementsSummary
+            ? core.computeTodayMovementsSummary(radarRawReservations || [], Date.now(), {
+                subFilter: state.todayFilter,
+                search: state.todaySearch,
+                timeFrom: state.todayTimeFrom,
+                timeTo: state.todayTimeTo
+              })
+            : { items: [], todayDate: '' };
+          var evs = core.buildTodayScheduleIcsEvents(liveSummary, ctx.lang);
+          if (!evs.length) {
+            ctx.toast(isEn ? 'No movements in the filtered today schedule to export.' : 'لا توجد حركات في الجدول المصفى لتصديرها إلى التقويم.', true);
+            return;
+          }
+          var icsStr = core.buildIcsCalendarContent(evs, 'Rental Gate CRM — Today');
+          var dlFn = (ctx.downloadIcsFile) || (root.RGApp && root.RGApp.downloadIcsFile);
+          if (dlFn) {
+            dlFn('rg-today-schedule-' + (liveSummary.todayDate || 'today') + '.ics', icsStr);
+            ctx.toast(isEn ? 'Calendar (.ics) file downloaded.' : 'تم تصدير جدول اليوم بصيغة تقويم (.ics).');
+          }
+        });
+      }
+
+      var todaySearchEl = contentHost.querySelector('#today-search-input');
+      if (todaySearchEl) {
+        todaySearchEl.addEventListener('input', function () {
+          state.todaySearch = todaySearchEl.value;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          paintTodayView();
+        });
+      }
+
+      var todayRefreshBtn = contentHost.querySelector('#today-refresh-btn');
+      if (todayRefreshBtn) {
+        todayRefreshBtn.addEventListener('click', function () {
+          refreshRadarData(true);
+        });
+      }
+    }
+
+    function bindTodayListBodyEvents(bodyHost) {
+      var tRetry = bodyHost.querySelector('#today-retry-btn');
+      if (tRetry) {
+        tRetry.addEventListener('click', function () { refreshRadarData(true, { forceRefresh: true }); });
+      }
+      bodyHost.querySelectorAll('.today-open-res').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var rid = btn.getAttribute('data-id');
+          openReservationDrawer(rid, ctx, employees, function (updatedRes) {
+            syncLocalReservationSnapshot(updatedRes);
+          });
+        });
+      });
+      bodyHost.querySelectorAll('.today-claim-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var rid = btn.getAttribute('data-id');
+          var target = (radarRawReservations || []).find(function (x) { return x && x.id === rid; });
+          if (!target || !currentUser) return;
+          runWithLock(btn, 'claimReservation:' + rid, function () {
+            var prevAssignedIds = Array.isArray(target.assignedEmployeeIds) ? target.assignedEmployeeIds.slice() : [];
+            var prevAssignedNames = Array.isArray(target.assignedEmployeeNames) ? target.assignedEmployeeNames.slice() : [];
+            var claimed = root.RGCrmCore.claimReservationRecord(target, currentUser);
+            target.assignedEmployeeIds = claimed.assignedEmployeeIds;
+            target.assignedEmployeeNames = claimed.assignedEmployeeNames;
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: rid }, currentUser);
+            }
+            syncLocalReservationSnapshot(target);
+            ctx.toast(isEn ? 'Reservation claimed successfully.' : 'تم استلام الحجز في قائمتك بنجاح.');
+            return root.RGApi.callApi('claimReservation', {
+              reservationId: rid,
+              _keepOptimisticCache: true,
+              _spamChecked: true
+            }).then(function (resp) {
+              if (resp && resp.success) {
+                ctx.refreshNotifications();
+              } else {
+                target.assignedEmployeeIds = prevAssignedIds;
+                target.assignedEmployeeNames = prevAssignedNames;
+                syncLocalReservationSnapshot(target);
+                ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true);
+              }
+            }).catch(function () {
+              target.assignedEmployeeIds = prevAssignedIds;
+              target.assignedEmployeeNames = prevAssignedNames;
+              syncLocalReservationSnapshot(target);
+              ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
+            });
+          }, { spamAction: 'claimReservation', spamSig: rid });
         });
       });
     }
@@ -2011,24 +2361,9 @@
       }
       if (state.viewMode !== 'today') return;
 
-      var modeBarHtml =
-        '<div class="rg-today-mode-bar">' +
-          '<div class="rg-cal-gran-switch" role="tablist" aria-label="' + (isEn ? 'Pickups & Returns Display Mode' : 'طريقة عرض التسليم والاستلام') + '">' +
-            '<button type="button" role="tab" aria-selected="' + (state.todayDisplayMode === 'calendar') + '" class="rg-cal-gran-btn' + (state.todayDisplayMode === 'calendar' ? ' is-active' : '') + '" data-today-mode="calendar">' +
-              '📅 ' + (isEn ? 'Calendar (Month / Week / Day)' : 'التقويم (شهري / أسبوعي / يومي)') +
-            '</button>' +
-            '<button type="button" role="tab" aria-selected="' + (state.todayDisplayMode !== 'calendar') + '" class="rg-cal-gran-btn' + (state.todayDisplayMode !== 'calendar' ? ' is-active' : '') + '" data-today-mode="list">' +
-              (isEn ? 'Today\'s Schedule' : 'جدول اليوم') +
-            '</button>' +
-          '</div>' +
-          '<div class="rg-today-mode-hint">' +
-            (state.todayDisplayMode === 'calendar'
-              ? (isEn ? 'Interactive calendar for pickups, returns & extensions' : 'عرض تفاعلي لمواعيد التسليم والاستلام والتمديدات')
-              : (isEn ? 'Live schedule of pickups and returns scheduled for today' : 'متابعة جدول التسليم والاستلام المجدول لليوم')) +
-          '</div>' +
-        '</div>';
-
-      function bindTodayModeSwitch() {
+      var contentHost = todayWrap.querySelector('#today-content-host');
+      if (!contentHost) {
+        todayWrap.innerHTML = buildTodayModeBarHtml() + '<div id="today-content-host"></div>';
         todayWrap.querySelectorAll('[data-today-mode]').forEach(function (btn) {
           btn.addEventListener('click', function () {
             var nextMode = btn.getAttribute('data-today-mode') === 'calendar' ? 'calendar' : 'list';
@@ -2041,22 +2376,110 @@
             paintTodayView();
           });
         });
+        contentHost = todayWrap.querySelector('#today-content-host');
+      }
+
+      todayWrap.querySelectorAll('[data-today-mode]').forEach(function (btn) {
+        var isCalMode = btn.getAttribute('data-today-mode') === 'calendar';
+        var isAct = state.todayDisplayMode === 'calendar' ? isCalMode : !isCalMode;
+        btn.classList.toggle('is-active', isAct);
+        btn.setAttribute('aria-selected', String(isAct));
+      });
+      var modeHintEl = todayWrap.querySelector('#today-mode-hint');
+      if (modeHintEl) {
+        modeHintEl.textContent = state.todayDisplayMode === 'calendar'
+          ? (isEn ? 'Interactive calendar for pickups, returns & extensions' : 'عرض تفاعلي لمواعيد التسليم والاستلام والتمديدات')
+          : (isEn ? 'Live schedule of pickups and returns scheduled for today' : 'متابعة جدول التسليم والاستلام المجدول لليوم');
       }
 
       if (state.todayDisplayMode === 'calendar') {
         if (calendarRawItems === null && !calendarLoadError) {
           ensureTodayCalendarLoaded({ forceRefresh: false });
         }
-        todayWrap.innerHTML = modeBarHtml + renderTodayCalendarSectionHtml();
-        bindTodayModeSwitch();
-        bindTodayCalendarEvents(todayWrap);
+        var ctxCal = buildTodayCalendarContext();
+        var calShell = contentHost.querySelector('#today-calendar-shell');
+        if (!calShell) {
+          contentHost.innerHTML = renderTodayCalendarShellHtml(ctxCal);
+          calShell = contentHost.querySelector('#today-calendar-shell');
+          if (calShell) bindTodayCalendarToolbarEvents(calShell);
+        }
+        if (calShell) {
+          var periodTitleEl = calShell.querySelector('#today-cal-period-title');
+          if (periodTitleEl) periodTitleEl.textContent = formatCalPeriodTitle(ctxCal.win);
+          calShell.querySelectorAll('[data-cal-gran]').forEach(function (btn) {
+            btn.classList.toggle('is-active', btn.getAttribute('data-cal-gran') === ctxCal.gran);
+          });
+          var calCounts = (ctxCal.extracted && ctxCal.extracted.counts) || { total: 0, pickup: 0, return: 0, extension: 0 };
+          var evTypeFilter = state.todayCalendarEventFilter || 'all';
+          calShell.querySelectorAll('[data-cal-type]').forEach(function (btn) {
+            btn.classList.toggle('is-active', btn.getAttribute('data-cal-type') === evTypeFilter);
+          });
+          Object.keys(calCounts).forEach(function (ck) {
+            var cel = calShell.querySelector('[data-cal-count="' + ck + '"]');
+            if (cel) cel.textContent = String(calCounts[ck] || 0);
+          });
+          var calSearchInp = calShell.querySelector('#today-cal-search');
+          if (calSearchInp && document.activeElement !== calSearchInp && calSearchInp.value !== (state.todayCalendarSearch || '')) {
+            calSearchInp.value = state.todayCalendarSearch || '';
+          }
+          var calBodyHost = calShell.querySelector('#today-cal-body-host');
+          if (calBodyHost) {
+            calBodyHost.innerHTML = renderTodayCalendarBodyHtml(ctxCal);
+            bindTodayCalendarBodyEvents(calBodyHost);
+          }
+        }
         return;
+      }
+
+      var listBodyHost = contentHost.querySelector('#today-list-body-host');
+      if (!listBodyHost) {
+        contentHost.innerHTML = buildTodayListShellHtml();
+        bindTodayListToolbarEvents(contentHost);
+        listBodyHost = contentHost.querySelector('#today-list-body-host');
+      }
+
+      var todayStatMap = {
+        total: summary.totalCount || 0,
+        pickup: summary.pickupCount || 0,
+        return: summary.returnCount || 0,
+        overdue: summary.overdueCount || 0,
+        completed: summary.completedCount || 0
+      };
+      Object.keys(todayStatMap).forEach(function (tk) {
+        var el = contentHost.querySelector('[data-today-stat="' + tk + '"]');
+        if (el) el.textContent = String(todayStatMap[tk]);
+      });
+      var todayBtnCnts = {
+        all: summary.totalCount || 0,
+        pickup: summary.pickupCount || 0,
+        return: summary.returnCount || 0
+      };
+      contentHost.querySelectorAll('[data-today-filter]').forEach(function (fBtn) {
+        var key = fBtn.getAttribute('data-today-filter') || 'all';
+        fBtn.classList.toggle('active', state.todayFilter === key);
+        var cntEl = fBtn.querySelector('[data-today-btn-cnt="' + key + '"]');
+        if (cntEl) cntEl.textContent = String(todayBtnCnts[key] || 0);
+      });
+      var clearTimeBtnEl = contentHost.querySelector('#today-clear-time-btn');
+      if (clearTimeBtnEl) {
+        clearTimeBtnEl.style.display = (state.todayTimeFrom || state.todayTimeTo) ? '' : 'none';
+      }
+      var tFromInp = contentHost.querySelector('#today-time-from');
+      if (tFromInp && document.activeElement !== tFromInp && tFromInp.value !== (state.todayTimeFrom || '')) {
+        tFromInp.value = state.todayTimeFrom || '';
+      }
+      var tToInp = contentHost.querySelector('#today-time-to');
+      if (tToInp && document.activeElement !== tToInp && tToInp.value !== (state.todayTimeTo || '')) {
+        tToInp.value = state.todayTimeTo || '';
+      }
+      var tSearchInp = contentHost.querySelector('#today-search-input');
+      if (tSearchInp && document.activeElement !== tSearchInp && tSearchInp.value !== (state.todaySearch || '')) {
+        tSearchInp.value = state.todaySearch || '';
       }
 
       if (radarRawReservations === null) {
         if (radarLoadError) {
-          todayWrap.innerHTML =
-            modeBarHtml +
+          listBodyHost.innerHTML =
             '<div class="rg-error-banner" role="alert">' +
               '<div class="rg-error-banner-body">' +
                 '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load Today\'s Pickups & Returns' : 'تعذر تحميل جدول التسليم والاستلام لليوم') + '</div>' +
@@ -2064,13 +2487,10 @@
               '</div>' +
               '<button type="button" class="btn btn-sm btn-primary" id="today-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
             '</div>';
-          bindTodayModeSwitch();
-          var tRetry = document.getElementById('today-retry-btn');
-          if (tRetry) tRetry.addEventListener('click', function () { refreshRadarData(true, { forceRefresh: true }); });
+          bindTodayListBodyEvents(listBodyHost);
           return;
         }
-        todayWrap.innerHTML = modeBarHtml + '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
-        bindTodayModeSwitch();
+        listBodyHost.innerHTML = '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
         return;
       }
 
@@ -2196,155 +2616,8 @@
           '<div class="today-mobile-cards">' + mobileCards.join('') + '</div>';
       }
 
-      todayWrap.innerHTML =
-        modeBarHtml +
-        '<div class="radar-summary-bar">' +
-          '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Today Movements' : 'إجمالي حركات اليوم') + '</span><strong class="tabular-nums">' + summary.totalCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item is-info"><span class="radar-stat-label">' + (isEn ? 'Pickups Today' : 'التسليم اليوم') + '</span><strong class="tabular-nums">' + summary.pickupCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item is-warning"><span class="radar-stat-label">' + (isEn ? 'Returns Today' : 'الإرجاع اليوم') + '</span><strong class="tabular-nums">' + summary.returnCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item is-danger"><span class="radar-stat-label">' + (isEn ? 'Delayed' : 'متأخر عن الوقت') + '</span><strong class="tabular-nums">' + summary.overdueCount + '</strong></div>' +
-          '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
-          '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Completed' : 'مكتمل') + '</span><strong class="tabular-nums">' + summary.completedCount + '</strong></div>' +
-        '</div>' +
-        '<div class="radar-toolbar" style="flex-wrap:wrap;">' +
-          '<div class="segmented-control" role="group" aria-label="' + (isEn ? 'Movement filter' : 'تصفية حركات اليوم') + '">' +
-            '<button type="button" class="segmented-btn' + (state.todayFilter === 'all' ? ' active' : '') + '" data-today-filter="all">' + (isEn ? 'All' : 'الكل') + ' (' + summary.totalCount + ')</button>' +
-            '<button type="button" class="segmented-btn' + (state.todayFilter === 'pickup' ? ' active' : '') + '" data-today-filter="pickup">' + (isEn ? 'Pickups' : 'التسليم اليوم') + ' (' + summary.pickupCount + ')</button>' +
-            '<button type="button" class="segmented-btn' + (state.todayFilter === 'return' ? ' active' : '') + '" data-today-filter="return">' + (isEn ? 'Returns' : 'الإرجاع اليوم') + ' (' + summary.returnCount + ')</button>' +
-          '</div>' +
-          '<div class="radar-search-wrap" style="flex-wrap:wrap;">' +
-            '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-secondary);"><span>' + (isEn ? 'From:' : 'من:') + '</span><input type="time" class="input mono" id="today-time-from" value="' + esc(state.todayTimeFrom || '') + '" style="width:118px;min-height:34px;"></label>' +
-            '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-secondary);"><span>' + (isEn ? 'To:' : 'إلى:') + '</span><input type="time" class="input mono" id="today-time-to" value="' + esc(state.todayTimeTo || '') + '" style="width:118px;min-height:34px;"></label>' +
-            ((state.todayTimeFrom || state.todayTimeTo) ? '<button type="button" class="btn btn-sm" id="today-clear-time-btn">' + (isEn ? 'Clear Time' : 'مسح الوقت') + '</button>' : '') +
-            '<input type="search" class="input" id="today-search-input" placeholder="' + (isEn ? 'Search today\'s schedule...' : 'بحث في جدول اليوم...') + '" value="' + esc(state.todaySearch || '') + '">' +
-            '<button type="button" class="btn btn-sm" id="today-ics-btn" title="' + (isEn ? 'Export Today Schedule to Google Calendar (.ics)' : 'تصدير جدول اليوم إلى تقويم Google (.ics)') + '">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
-            '<button type="button" class="btn btn-sm" id="today-refresh-btn">' + (isEn ? 'Refresh' : 'تحديث') + '</button>' +
-          '</div>' +
-        '</div>' +
-        rowsHtml;
-
-      bindTodayModeSwitch();
-
-      todayWrap.querySelectorAll('[data-today-filter]').forEach(function (fBtn) {
-        fBtn.addEventListener('click', function () {
-          state.todayFilter = fBtn.getAttribute('data-today-filter') || 'all';
-          paintTodayView();
-        });
-      });
-
-      var todayTimeFromEl = todayWrap.querySelector('#today-time-from');
-      var todayTimeToEl = todayWrap.querySelector('#today-time-to');
-      if (todayTimeFromEl) {
-        todayTimeFromEl.addEventListener('change', function () {
-          state.todayTimeFrom = todayTimeFromEl.value || '';
-          paintTodayView();
-        });
-      }
-      if (todayTimeToEl) {
-        todayTimeToEl.addEventListener('change', function () {
-          state.todayTimeTo = todayTimeToEl.value || '';
-          paintTodayView();
-        });
-      }
-      var todayClearTimeBtn = todayWrap.querySelector('#today-clear-time-btn');
-      if (todayClearTimeBtn) {
-        todayClearTimeBtn.addEventListener('click', function () {
-          state.todayTimeFrom = '';
-          state.todayTimeTo = '';
-          paintTodayView();
-        });
-      }
-      var todayIcsBtn = todayWrap.querySelector('#today-ics-btn');
-      if (todayIcsBtn) {
-        todayIcsBtn.addEventListener('click', function () {
-          if (!core || !core.buildTodayScheduleIcsEvents || !core.buildIcsCalendarContent) return;
-          var evs = core.buildTodayScheduleIcsEvents(summary, ctx.lang);
-          if (!evs.length) {
-            ctx.toast(isEn ? 'No movements in the filtered today schedule to export.' : 'لا توجد حركات في الجدول المصفى لتصديرها إلى التقويم.', true);
-            return;
-          }
-          var icsStr = core.buildIcsCalendarContent(evs, 'Rental Gate CRM — Today');
-          var dlFn = (ctx.downloadIcsFile) || (root.RGApp && root.RGApp.downloadIcsFile);
-          if (dlFn) {
-            dlFn('rg-today-schedule-' + (summary.todayDate || 'today') + '.ics', icsStr);
-            ctx.toast(isEn ? 'Calendar (.ics) file downloaded.' : 'تم تصدير جدول اليوم بصيغة تقويم (.ics).');
-          }
-        });
-      }
-
-      var todaySearchEl = todayWrap.querySelector('#today-search-input');
-      if (todaySearchEl) {
-        todaySearchEl.addEventListener('input', function () {
-          state.todaySearch = todaySearchEl.value;
-          var pos = todaySearchEl.selectionStart;
-          paintTodayView();
-          var nextInp = document.getElementById('today-search-input');
-          if (nextInp) {
-            nextInp.focus();
-            if (typeof pos === 'number') {
-              try { nextInp.setSelectionRange(pos, pos); } catch (_e) {}
-            }
-          }
-        });
-      }
-
-      var todayRefreshBtn = todayWrap.querySelector('#today-refresh-btn');
-      if (todayRefreshBtn) {
-        todayRefreshBtn.addEventListener('click', function () {
-          refreshRadarData(true);
-        });
-      }
-
-      todayWrap.querySelectorAll('.today-open-res').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          var rid = btn.getAttribute('data-id');
-          openReservationDrawer(rid, ctx, employees, function (updatedRes) {
-            syncLocalReservationSnapshot(updatedRes);
-          });
-        });
-      });
-
-      todayWrap.querySelectorAll('.today-claim-btn').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          var rid = btn.getAttribute('data-id');
-          var target = (radarRawReservations || []).find(function (x) { return x && x.id === rid; });
-          if (!target || !currentUser) return;
-          runWithLock(btn, 'claimReservation:' + rid, function () {
-            var prevAssignedIds = Array.isArray(target.assignedEmployeeIds) ? target.assignedEmployeeIds.slice() : [];
-            var prevAssignedNames = Array.isArray(target.assignedEmployeeNames) ? target.assignedEmployeeNames.slice() : [];
-            var claimed = root.RGCrmCore.claimReservationRecord(target, currentUser);
-            target.assignedEmployeeIds = claimed.assignedEmployeeIds;
-            target.assignedEmployeeNames = claimed.assignedEmployeeNames;
-            if (root.RGApi.applyOptimisticMutation) {
-              root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: rid }, currentUser);
-            }
-            syncLocalReservationSnapshot(target);
-            ctx.toast(isEn ? 'Reservation claimed successfully.' : 'تم استلام الحجز في قائمتك بنجاح.');
-            return root.RGApi.callApi('claimReservation', {
-              reservationId: rid,
-              _keepOptimisticCache: true,
-              _spamChecked: true
-            }).then(function (resp) {
-              if (resp && resp.success) {
-                ctx.refreshNotifications();
-              } else {
-                target.assignedEmployeeIds = prevAssignedIds;
-                target.assignedEmployeeNames = prevAssignedNames;
-                syncLocalReservationSnapshot(target);
-                ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true);
-              }
-            }).catch(function () {
-              target.assignedEmployeeIds = prevAssignedIds;
-              target.assignedEmployeeNames = prevAssignedNames;
-              syncLocalReservationSnapshot(target);
-              ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
-            });
-          }, { spamAction: 'claimReservation', spamSig: rid });
-        });
-      });
+      listBodyHost.innerHTML = rowsHtml;
+      bindTodayListBodyEvents(listBodyHost);
     }
 
     function extractRadarItemsFromData(data) {
@@ -2401,7 +2674,7 @@
         if (extracted !== null) {
           radarLoadError = '';
           radarRawReservations = extracted;
-        } else if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+        } else if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
           radarLoadError = '';
           radarRawReservations = currentItems.slice();
         } else if (radarRawReservations === null) {
@@ -2421,7 +2694,7 @@
       } catch (_e) {
         if (seq !== radarFetchSeq || !container.isConnected) return;
         if (radarRawReservations === null) {
-          if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+          if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
             radarLoadError = '';
             radarRawReservations = currentItems.slice();
           } else {
@@ -2438,6 +2711,7 @@
       if (targetMode === 'today' && !canViewTodayTab) targetMode = 'all';
       if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'all';
       state.viewMode = targetMode;
+      if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       var allViewEl = document.getElementById('res-all-view');
       var todayViewEl = document.getElementById('res-today-view');
       var radarViewEl = document.getElementById('res-radar-view');
@@ -2467,13 +2741,8 @@
       });
     });
 
-    var hasActiveResFilters = Boolean(
-      state.search || state.company || state.branch || state.status || state.employeeId ||
-      state.priority || state.dateFrom || state.dateTo || state.timeFrom || state.timeTo ||
-      state.unfollowedOnly || state.hasProblemsOnly || state.overdueUnpaidOnly
-    );
     if (canViewTodayTab || canViewRadarTab) {
-      if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+      if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
         radarRawReservations = currentItems.slice();
         calendarRawItems = currentItems.slice();
         paintRadarView();
@@ -2486,25 +2755,72 @@
       }
     }
 
+    var runPendingResDelta = function (opts) {
+      if (!container || !container.isConnected) return Promise.resolve();
+      var o = opts || {};
+      var silent = o.silent !== false;
+      var force = o.forceRefresh !== false;
+      var tablePromise = (o.prefetchedData && Array.isArray(o.prefetchedData.items))
+        ? Promise.resolve().then(function () {
+            var pTotalPages = Math.max(1, Number(o.prefetchedData.totalPages || 1));
+            if (state.page > pTotalPages && Number(o.prefetchedData.total || 0) > 0) {
+              state.page = pTotalPages;
+              if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+              return refreshTableRegion({ silentRefresh: silent, forceRefresh: true });
+            }
+            paintTableRegion(o.prefetchedData);
+          })
+        : refreshTableRegion({ silentRefresh: silent, forceRefresh: force });
+      return Promise.all([
+        tablePromise,
+        refreshRadarData(false, { forceRefresh: force }),
+        (state.viewMode === 'today' && state.todayDisplayMode === 'calendar')
+          ? ensureTodayCalendarLoaded({ silentRefresh: silent, forceRefresh: force })
+          : Promise.resolve().then(function () { calendarRawItems = null; })
+      ]).catch(function () {});
+    };
+
+    var scheduleResRefreshWhenIdle = function (opts) {
+      var activeEl = document.activeElement;
+      var editingControl = Boolean(activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName));
+      if (editingControl && !(opts && opts.manual)) {
+        if (!container._rgPendingResDelta) {
+          container._rgPendingResDelta = true;
+          container.addEventListener('focusout', function onBlurResDelta() {
+            setTimeout(function () {
+              if (!container || !container.isConnected) return;
+              var curAct = document.activeElement;
+              var stillEditing = Boolean(curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName));
+              if (stillEditing) {
+                container.addEventListener('focusout', onBlurResDelta, { once: true });
+                return;
+              }
+              container._rgPendingResDelta = false;
+              runPendingResDelta(opts);
+            }, 120);
+          }, { once: true });
+        }
+        return Promise.resolve();
+      }
+      return runPendingResDelta(opts);
+    };
+
+    container._rgRefreshDataOnly = function (opts) {
+      return scheduleResRefreshWhenIdle(opts || { silent: true, forceRefresh: true });
+    };
+
+    var resDeltaState = { todayRadarCounts: null };
+
     if (!container._rgResDeltaBound) {
       container._rgResDeltaBound = true;
-      var runPendingResDelta = function () {
-        if (!container || !container.isConnected) return;
-        refreshTableRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
-        refreshRadarData(false, { forceRefresh: true }).catch(function () {});
-        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
-          ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true }).catch(function () {});
-        } else {
-          calendarRawItems = null;
-        }
-      };
       var onResDeltaSync = function (ev) {
         if (!container || !container.isConnected) {
           document.removeEventListener('rg:deltasync', onResDeltaSync);
           return;
         }
         var d = (ev && ev.detail) || {};
-        var relevant = Boolean(
+        var core = root.RGCrmCore;
+        var hasResChanges = Boolean(
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
           (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
@@ -2514,32 +2830,41 @@
           Boolean(d.deletedAllReservationsBefore) ||
           Boolean(d.changedSettings) ||
           Boolean(d.changedDelegations) ||
-          Boolean(d.changedRoles) ||
-          Boolean(d.todayRadarCounts)
+          Boolean(d.changedRoles)
         );
-        if (!relevant) return;
-        var activeEl = document.activeElement;
-        var editingControl = Boolean(activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName));
-        if (editingControl) {
-          if (!container._rgPendingResDelta) {
-            container._rgPendingResDelta = true;
-            container.addEventListener('focusout', function onBlurResDelta() {
-              setTimeout(function () {
-                if (!container || !container.isConnected) return;
-                var curAct = document.activeElement;
-                var stillEditing = Boolean(curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName));
-                if (stillEditing) {
-                  container.addEventListener('focusout', onBlurResDelta, { once: true });
-                  return;
-                }
-                container._rgPendingResDelta = false;
-                runPendingResDelta();
-              }, 120);
-            }, { once: true });
+        var prevRadarJson = resDeltaState.todayRadarCounts ? JSON.stringify(resDeltaState.todayRadarCounts) : null;
+        var nextRadarJson = d.todayRadarCounts ? JSON.stringify(d.todayRadarCounts) : null;
+        var radarCountsChanged = Boolean(nextRadarJson && prevRadarJson !== nextRadarJson);
+        if (nextRadarJson) resDeltaState.todayRadarCounts = d.todayRadarCounts;
+        if (!hasResChanges && !radarCountsChanged) return;
+
+        var chgResList = Array.isArray(d.changedReservations) ? d.changedReservations : [];
+        var delResIds = Array.isArray(d.deletedReservationIds) ? d.deletedReservationIds : [];
+        if ((chgResList.length > 0 || delResIds.length > 0) && !d.deletedAllReservationsBefore) {
+          applyLocalResChangesToTable(chgResList, delResIds);
+          if (core && core.mergeDeltaRecords) {
+            var delSet = {};
+            delResIds.forEach(function (id) { if (id) delSet[id] = true; });
+            if (Array.isArray(radarRawReservations)) {
+              radarRawReservations = core.mergeDeltaRecords(radarRawReservations, chgResList, 'id');
+              if (delResIds.length) {
+                radarRawReservations = radarRawReservations.filter(function (it) { return it && !delSet[it.id]; });
+              }
+              paintRadarView();
+              if (state.todayDisplayMode !== 'calendar') paintTodayView();
+            }
+            if (Array.isArray(calendarRawItems)) {
+              calendarRawItems = core.mergeDeltaRecords(calendarRawItems, chgResList, 'id');
+              if (delResIds.length) {
+                calendarRawItems = calendarRawItems.filter(function (it) { return it && !delSet[it.id]; });
+              }
+              if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+                paintTodayView();
+              }
+            }
           }
-          return;
         }
-        runPendingResDelta();
+        scheduleResRefreshWhenIdle({ silent: true, forceRefresh: true });
       };
       document.addEventListener('rg:deltasync', onResDeltaSync);
     }

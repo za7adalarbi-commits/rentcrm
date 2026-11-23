@@ -36,6 +36,14 @@ async function resolveServerFallbackGasUrl(explicitUrl: unknown): Promise<string
   return '';
 }
 
+function verifySetupEnvSecret(candidate: string): { configured: boolean; valid: boolean } {
+  const expected = String(process.env.SETUP_ADMIN_PASSWORD || process.env.SEED_ADMIN_PASSWORD || '').trim();
+  if (!expected) return { configured: false, valid: false };
+  const candBuf = crypto.createHash('sha256').update(String(candidate || ''), 'utf8').digest();
+  const expBuf = crypto.createHash('sha256').update(expected, 'utf8').digest();
+  return { configured: true, valid: crypto.timingSafeEqual(candBuf, expBuf) };
+}
+
 function parseBody(rawBody: any): Record<string, any> {
   if (!rawBody) return {};
   if (typeof Buffer !== 'undefined' && Buffer.isBuffer(rawBody)) {
@@ -193,8 +201,10 @@ export default async function handler(req: any, res: any) {
 
           let verifiedExecutor: ReturnType<typeof createPgExecutor> | undefined;
           let verifiedSession: AuthSession | undefined;
+          const confirmPwd = String(payload.adminPassword || '').trim();
+          const inputDbUrl = String(payload.databaseUrl || '').trim();
+          const envSecretCheck = verifySetupEnvSecret(confirmPwd);
           if (isServerless) {
-            const confirmPwd = String(payload.adminPassword || '').trim();
             if (!confirmPwd) {
               res.status(403).json({
                 success: false,
@@ -204,7 +214,6 @@ export default async function handler(req: any, res: any) {
               });
               return;
             }
-            const inputDbUrl = String(payload.databaseUrl || '').trim();
             if (inputDbUrl && /^postgres(ql)?:\/\//i.test(inputDbUrl)) {
               await testDatabaseConnection(inputDbUrl);
               await resetPoolForReconfig(inputDbUrl);
@@ -214,15 +223,26 @@ export default async function handler(req: any, res: any) {
                 payload.adminUsername || 'admin',
                 confirmPwd
               );
-            } else if (confirmPwd !== 'Admin@123') {
+            } else if (!envSecretCheck.configured || !envSecretCheck.valid) {
               res.status(403).json({
                 success: false,
-                message: 'FORBIDDEN: كلمة مرور المدير العام غير صحيحة.',
+                message: !envSecretCheck.configured
+                  ? 'FORBIDDEN: يرجى إدخال رابط DATABASE_URL للتحقق من حساب المدير العام أو ضبط SETUP_ADMIN_PASSWORD في متغيرات بيئة الخادم.'
+                  : 'FORBIDDEN: كلمة مرور المدير العام غير صحيحة.',
                 data: null,
                 error: 'FORBIDDEN'
               });
               return;
             }
+          } else if (inputDbUrl && /^postgres(ql)?:\/\//i.test(inputDbUrl) && confirmPwd) {
+            await testDatabaseConnection(inputDbUrl);
+            await resetPoolForReconfig(inputDbUrl);
+            verifiedExecutor = createPgExecutor();
+            verifiedSession = await verifyGeneralManagerCredentials(
+              verifiedExecutor,
+              payload.adminUsername || 'admin',
+              confirmPwd
+            );
           }
 
           const result = await applyUnifiedConnectionSetup({

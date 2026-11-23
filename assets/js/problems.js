@@ -75,6 +75,7 @@
     var t = ctx.t;
     var state = ctx.state.problems || { status: '', priority: '', employeeId: '', search: '' };
     ctx.state.problems = state;
+    if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
 
     var isEn = ctx.lang === 'en';
     var core = root.RGCrmCore || {};
@@ -259,13 +260,32 @@
 
     function filterAndApplyLocalProblem(updatedPrb) {
       if (!updatedPrb) return;
-      allProblemsForRate = allProblemsForRate.map(function (x) { return x.id === updatedPrb.id ? updatedPrb : x; });
-      items = items.map(function (x) { return x.id === updatedPrb.id ? updatedPrb : x; });
-      if (state.status) {
-        items = items.filter(function (x) { return x.status === state.status; });
-      }
-      if (state.priority) {
-        items = items.filter(function (x) { return x.priority === state.priority; });
+      var existsInAll = allProblemsForRate.some(function (x) { return x && x.id === updatedPrb.id; });
+      allProblemsForRate = existsInAll
+        ? allProblemsForRate.map(function (x) { return (x && x.id === updatedPrb.id) ? updatedPrb : x; })
+        : [updatedPrb].concat(allProblemsForRate);
+      if (core && core.reapplyProblemDeltaToFilteredList) {
+        items = core.reapplyProblemDeltaToFilteredList(items, [updatedPrb], [], state);
+      } else {
+        var existsInItems = items.some(function (x) { return x && x.id === updatedPrb.id; });
+        items = existsInItems
+          ? items.map(function (x) { return (x && x.id === updatedPrb.id) ? updatedPrb : x; })
+          : [updatedPrb].concat(items);
+        if (state.status) {
+          items = items.filter(function (x) { return x.status === state.status; });
+        }
+        if (state.priority) {
+          items = items.filter(function (x) { return x.priority === state.priority; });
+        }
+        if (state.employeeId) {
+          items = items.filter(function (x) { return Array.isArray(x.assignedEmployeeIds) && x.assignedEmployeeIds.indexOf(state.employeeId) !== -1; });
+        }
+        if (state.search) {
+          var qLow = String(state.search).trim().toLowerCase();
+          items = items.filter(function (x) {
+            return (String(x.problemNumber || '') + ' ' + String(x.reservationNumber || '') + ' ' + String(x.customerName || '') + ' ' + String(x.description || '')).toLowerCase().indexOf(qLow) !== -1;
+          });
+        }
       }
       if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
       paintProblemsRegion(items);
@@ -392,8 +412,12 @@
           allProblemsForRate = resp.data.items || [];
           if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
         }
-      } else if (!(opts && opts.silentRefresh) || items.length === 0) {
-        paintProblemsError((resp && resp.message) || 'تعذر تحميل المشكلات.');
+      } else if (!(opts && opts.silentRefresh)) {
+        if (items.length === 0) {
+          paintProblemsError((resp && resp.message) || 'تعذر تحميل المشكلات.');
+        } else if (ctx && ctx.toast) {
+          ctx.toast((resp && resp.message) || 'تعذر تحديث قائمة المشكلات.', true);
+        }
       }
     }
 
@@ -406,9 +430,10 @@
 
     var searchTimer = null;
     document.getElementById('prb-search').addEventListener('input', function (ev) {
+      state.search = ev.target.value;
+      if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
       clearTimeout(searchTimer);
       searchTimer = setTimeout(function () {
-        state.search = ev.target.value;
         refreshProblemsRegion();
       }, 220);
     });
@@ -418,6 +443,7 @@
         state.status = document.getElementById('prb-status').value;
         state.priority = document.getElementById('prb-prio').value;
         state.employeeId = document.getElementById('prb-emp').value;
+        if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
         refreshProblemsRegion();
       });
     });
@@ -428,8 +454,57 @@
       document.getElementById('prb-status').value = '';
       document.getElementById('prb-prio').value = '';
       document.getElementById('prb-emp').value = '';
+      if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
       refreshProblemsRegion();
     });
+
+    function schedulePrbRefreshWhenIdle(opts) {
+      var activeEl = document.activeElement;
+      if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+        if (!container._rgPendingPrbDelta) {
+          container._rgPendingPrbDelta = true;
+          container.addEventListener('focusout', function onBlurPrbDelta() {
+            setTimeout(function () {
+              if (!container || !container.isConnected) return;
+              var curAct = document.activeElement;
+              if (curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName)) {
+                container.addEventListener('focusout', onBlurPrbDelta, { once: true });
+                return;
+              }
+              container._rgPendingPrbDelta = false;
+              refreshProblemsRegion(opts || { silentRefresh: true, forceRefresh: true }).catch(function () {});
+            }, 120);
+          }, { once: true });
+        }
+        return Promise.resolve();
+      }
+      return refreshProblemsRegion(opts || { silentRefresh: true, forceRefresh: true });
+    }
+
+    container._rgRefreshDataOnly = function (refreshOpts) {
+      var rOpts = refreshOpts || {};
+      if (!rOpts.manual) {
+        var activeEl = document.activeElement;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+          return schedulePrbRefreshWhenIdle({ silentRefresh: true, forceRefresh: true });
+        }
+      }
+      if (rOpts.prefetchedData && Array.isArray(rOpts.prefetchedData.items) && !rOpts.forceRefresh) {
+        var nextItems = (core && core.filterProblemsList)
+          ? core.filterProblemsList(rOpts.prefetchedData.items, state)
+          : rOpts.prefetchedData.items;
+        paintProblemsRegion(nextItems);
+        if (!state.status && !state.priority && !state.employeeId && !state.search) {
+          allProblemsForRate = rOpts.prefetchedData.items || [];
+          if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
+        }
+        return Promise.resolve();
+      }
+      return refreshProblemsRegion({
+        silentRefresh: rOpts.silent !== false,
+        forceRefresh: rOpts.forceRefresh !== false
+      });
+    };
 
     if (!container._rgPrbDeltaBound) {
       container._rgPrbDeltaBound = true;
@@ -439,36 +514,29 @@
           return;
         }
         var d = (ev && ev.detail) || {};
+        var changedProblems = Array.isArray(d.changedProblems) ? d.changedProblems : [];
+        var deletedResIds = Array.isArray(d.deletedReservationIds) ? d.deletedReservationIds : [];
         var relevant = Boolean(
-          (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          changedProblems.length > 0 ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
-          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          deletedResIds.length > 0 ||
           (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
           (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
           Boolean(d.deletedAllReservationsBefore) ||
           Boolean(d.changedSettings)
         );
         if (!relevant) return;
-        var activeEl = document.activeElement;
-        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
-          if (!container._rgPendingPrbDelta) {
-            container._rgPendingPrbDelta = true;
-            container.addEventListener('focusout', function onBlurPrbDelta() {
-              setTimeout(function () {
-                if (!container || !container.isConnected) return;
-                var curAct = document.activeElement;
-                if (curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName)) {
-                  container.addEventListener('focusout', onBlurPrbDelta, { once: true });
-                  return;
-                }
-                container._rgPendingPrbDelta = false;
-                refreshProblemsRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
-              }, 120);
-            }, { once: true });
-          }
-          return;
+        if (changedProblems.length > 0 && core && core.reapplyProblemDeltaToFilteredList) {
+          allProblemsForRate = core.mergeDeltaRecords
+            ? core.mergeDeltaRecords(allProblemsForRate, changedProblems, 'id')
+            : allProblemsForRate;
+          items = core.reapplyProblemDeltaToFilteredList(items, changedProblems, [], state);
+          if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
+          paintProblemsRegion(items);
+        } else if (changedProblems.length > 0) {
+          changedProblems.forEach(function (cp) { filterAndApplyLocalProblem(cp); });
         }
-        refreshProblemsRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+        schedulePrbRefreshWhenIdle({ silentRefresh: true, forceRefresh: true }).catch(function () {});
       };
       document.addEventListener('rg:deltasync', onPrbDelta);
     }

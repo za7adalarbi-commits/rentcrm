@@ -1921,6 +1921,7 @@
           normalizeStr(r.customerName) + ' ' +
           normalizeStr(r.customerPhone) + ' ' +
           normalizeStr(r.carName) + ' ' +
+          normalizeStr(r.plateNumber) + ' ' +
           normalizeStr(r.companyName) + ' ' +
           normalizeStr(r.branchName)
         ).toLowerCase();
@@ -1944,8 +1945,10 @@
         else if (tField === 'end' && !eMatch) continue;
         else if (tField !== 'start' && tField !== 'end' && !sMatch && !eMatch) continue;
       }
-      if (f.unfollowedOnly && followedSet[r.id]) continue;
-      if (f.hasProblemsOnly && !r.hasProblem) continue;
+      var hasFuList = Array.isArray(followUps) && followUps.length > 0;
+      var resolvedFollowed = hasFuList ? Boolean(followedSet[r.id]) : Boolean(followedSet[r.id] || r.isFollowed);
+      if (f.unfollowedOnly && resolvedFollowed) continue;
+      if ((f.hasProblemsOnly || f.hasProblem) && !r.hasProblem) continue;
       if (f.overdueUnpaidOnly) {
         var ovInfo = isReservationOverdueUnpaid(
           r,
@@ -1955,7 +1958,7 @@
         if (!ovInfo.isOverdueUnpaid) continue;
       }
 
-      out.push(Object.assign({}, r, { isFollowed: Boolean(followedSet[r.id]) }));
+      out.push(Object.assign({}, r, { isFollowed: resolvedFollowed }));
     }
 
     var sortBy = f.sortBy || 'lastUpdatedAt';
@@ -1967,6 +1970,299 @@
       return String(va || '').localeCompare(String(vb || '')) * sortDir;
     });
 
+    return out;
+  }
+
+  function buildReservationQueryPayload(resState) {
+    var s = (resState && typeof resState === 'object') ? resState : {};
+    var pageNum = Number(s.page || 1);
+    var pageSizeNum = Number(s.pageSize || 20);
+    return {
+      search: normalizeStr(s.search),
+      company: normalizeStr(s.company),
+      branch: normalizeStr(s.branch),
+      status: normalizeStr(s.status),
+      employeeId: normalizeStr(s.employeeId),
+      priority: normalizeStr(s.priority),
+      dateFrom: normalizeStr(s.dateFrom),
+      dateTo: normalizeStr(s.dateTo),
+      timeField: normalizeStr(s.timeField || 'both') || 'both',
+      timeFrom: normalizeStr(s.timeFrom),
+      timeTo: normalizeStr(s.timeTo),
+      unfollowedOnly: Boolean(s.unfollowedOnly),
+      hasProblemsOnly: Boolean(s.hasProblemsOnly || s.hasProblem),
+      overdueUnpaidOnly: Boolean(s.overdueUnpaidOnly),
+      sortBy: normalizeStr(s.sortBy || 'lastUpdatedAt') || 'lastUpdatedAt',
+      sortDir: normalizeStr(s.sortDir) === 'asc' ? 'asc' : 'desc',
+      page: isFinite(pageNum) && pageNum >= 1 ? Math.floor(pageNum) : 1,
+      pageSize: isFinite(pageSizeNum) && pageSizeNum >= 1 ? Math.floor(pageSizeNum) : 20
+    };
+  }
+
+  function hasActiveReservationFilters(payload) {
+    var f = (payload && typeof payload === 'object') ? payload : {};
+    return Boolean(
+      normalizeStr(f.search) ||
+      normalizeStr(f.company) ||
+      normalizeStr(f.branch) ||
+      normalizeStr(f.status) ||
+      normalizeStr(f.employeeId) ||
+      normalizeStr(f.priority) ||
+      normalizeStr(f.dateFrom) ||
+      normalizeStr(f.dateTo) ||
+      normalizeStr(f.timeFrom) ||
+      normalizeStr(f.timeTo) ||
+      f.unfollowedOnly ||
+      f.hasProblemsOnly ||
+      f.hasProblem ||
+      f.overdueUnpaidOnly
+    );
+  }
+
+  function doesReservationMatchFilters(reservation, followUps, filters, userContext) {
+    if (!reservation || typeof reservation !== 'object') return false;
+    return filterReservations([reservation], followUps, filters || {}, userContext).length > 0;
+  }
+
+  function reapplyReservationDeltaToFilteredList(currentItems, changedReservations, deletedIds, filters, followUps, userContext) {
+    var base = Array.isArray(currentItems) ? currentItems.slice() : [];
+    var changed = Array.isArray(changedReservations) ? changedReservations : [];
+    var deleted = Array.isArray(deletedIds) ? deletedIds : [];
+    var f = filters || {};
+
+    var delMap = {};
+    for (var d = 0; d < deleted.length; d++) {
+      var did = normalizeStr(deleted[d]);
+      if (did) delMap[did] = true;
+    }
+
+    var changedById = {};
+    for (var c = 0; c < changed.length; c++) {
+      var ch = changed[c];
+      if (ch && ch.id) {
+        changedById[String(ch.id)] = ch;
+      }
+    }
+
+    var mergedPool = [];
+    var seen = {};
+    var removedCount = 0;
+    var updatedCount = 0;
+    var addedCount = 0;
+
+    for (var i = 0; i < base.length; i++) {
+      var cur = base[i];
+      if (!cur || !cur.id) continue;
+      var cid = String(cur.id);
+      if (delMap[cid]) {
+        removedCount++;
+        continue;
+      }
+      if (seen[cid]) continue;
+      seen[cid] = true;
+      if (Object.prototype.hasOwnProperty.call(changedById, cid)) {
+        var nextRec = Object.assign({}, cur, changedById[cid]);
+        if (doesReservationMatchFilters(nextRec, followUps, f, userContext)) {
+          mergedPool.push(nextRec);
+          updatedCount++;
+        } else {
+          removedCount++;
+        }
+      } else {
+        if (doesReservationMatchFilters(cur, followUps, f, userContext)) {
+          mergedPool.push(cur);
+        } else {
+          removedCount++;
+        }
+      }
+    }
+
+    for (var j = 0; j < changed.length; j++) {
+      var chNew = changed[j];
+      if (!chNew || !chNew.id) continue;
+      var nid = String(chNew.id);
+      if (delMap[nid] || seen[nid]) continue;
+      seen[nid] = true;
+      if (doesReservationMatchFilters(chNew, followUps, f, userContext)) {
+        mergedPool.push(chNew);
+        addedCount++;
+      }
+    }
+
+    var sortedItems = filterReservations(mergedPool, followUps, f, userContext);
+    return {
+      items: sortedItems,
+      removedCount: removedCount,
+      updatedCount: updatedCount,
+      addedCount: addedCount
+    };
+  }
+
+  function filterProblemsList(problems, filters) {
+    var list = Array.isArray(problems) ? problems : [];
+    var f = (filters && typeof filters === 'object') ? filters : {};
+    var st = normalizeStr(f.status);
+    var pr = normalizeStr(f.priority);
+    var empId = normalizeStr(f.employeeId);
+    var search = normalizeStr(f.search).toLowerCase();
+
+    return list.filter(function (p) {
+      if (!p || typeof p !== 'object') return false;
+      if (st && normalizeStr(p.status) !== st) return false;
+      if (pr && normalizeStr(p.priority) !== pr) return false;
+      if (empId) {
+        var ids = Array.isArray(p.assignedEmployeeIds) ? p.assignedEmployeeIds : [];
+        if (ids.indexOf(empId) === -1) return false;
+      }
+      if (search) {
+        var hay = (
+          normalizeStr(p.problemNumber) + ' ' +
+          normalizeStr(p.reservationNumber) + ' ' +
+          normalizeStr(p.customerName) + ' ' +
+          normalizeStr(p.description)
+        ).toLowerCase();
+        if (hay.indexOf(search) === -1) return false;
+      }
+      return true;
+    });
+  }
+
+  function reapplyProblemDeltaToFilteredList(currentItems, changedProblems, deletedReservationIds, filters) {
+    var base = Array.isArray(currentItems) ? currentItems.slice() : [];
+    var changed = Array.isArray(changedProblems) ? changedProblems : [];
+    var delRes = Array.isArray(deletedReservationIds) ? deletedReservationIds : [];
+    var f = filters || {};
+
+    var delResMap = {};
+    for (var d = 0; d < delRes.length; d++) {
+      var drid = normalizeStr(delRes[d]);
+      if (drid) delResMap[drid] = true;
+    }
+
+    var changedById = {};
+    for (var c = 0; c < changed.length; c++) {
+      var ch = changed[c];
+      if (ch && ch.id) changedById[String(ch.id)] = ch;
+    }
+
+    var out = [];
+    var seen = {};
+
+    for (var c2 = 0; c2 < changed.length; c2++) {
+      var candNew = changed[c2];
+      if (!candNew || !candNew.id) continue;
+      var pidNew = String(candNew.id);
+      if (delResMap[normalizeStr(candNew.reservationId)]) continue;
+      var isAlreadyInBase = base.some(function (x) { return x && String(x.id) === pidNew; });
+      if (!isAlreadyInBase && !seen[pidNew]) {
+        seen[pidNew] = true;
+        if (filterProblemsList([candNew], f).length > 0) {
+          out.push(candNew);
+        }
+      }
+    }
+
+    for (var i = 0; i < base.length; i++) {
+      var cur = base[i];
+      if (!cur || !cur.id) continue;
+      var pid = String(cur.id);
+      if (delResMap[normalizeStr(cur.reservationId)] || seen[pid]) continue;
+      seen[pid] = true;
+      var resolved = Object.prototype.hasOwnProperty.call(changedById, pid)
+        ? Object.assign({}, cur, changedById[pid])
+        : cur;
+      if (delResMap[normalizeStr(resolved.reservationId)]) continue;
+      if (filterProblemsList([resolved], f).length > 0) {
+        out.push(resolved);
+      }
+    }
+
+    out.sort(function (a, b) {
+      return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
+    });
+    return out;
+  }
+
+  function filterTeamFollowUpsList(followUps, filters) {
+    var list = Array.isArray(followUps) ? followUps : [];
+    var f = (filters && typeof filters === 'object') ? filters : {};
+    var empId = normalizeStr(f.employeeId);
+    var st = normalizeStr(f.status);
+    var date = normalizeStr(f.date);
+    var search = normalizeStr(f.search).toLowerCase();
+
+    return list.filter(function (item) {
+      if (!item || typeof item !== 'object') return false;
+      if (empId && normalizeStr(item.employeeId) !== empId) return false;
+      if (st && normalizeStr(item.status) !== st) return false;
+      if (date && normalizeStr(item.followUpDate) !== date) return false;
+      if (search) {
+        var hay = (
+          normalizeStr(item.reservationNumber) + ' ' +
+          normalizeStr(item.customerName) + ' ' +
+          normalizeStr(item.employeeName) + ' ' +
+          normalizeStr(item.action) + ' ' +
+          normalizeStr(item.notes)
+        ).toLowerCase();
+        if (hay.indexOf(search) === -1) return false;
+      }
+      return true;
+    });
+  }
+
+  function reapplyFollowUpDeltaToFilteredList(currentItems, changedFollowUps, deletedReservationIds, filters) {
+    var base = Array.isArray(currentItems) ? currentItems.slice() : [];
+    var changed = Array.isArray(changedFollowUps) ? changedFollowUps : [];
+    var delRes = Array.isArray(deletedReservationIds) ? deletedReservationIds : [];
+    var f = filters || {};
+
+    var delResMap = {};
+    for (var d = 0; d < delRes.length; d++) {
+      var drid = normalizeStr(delRes[d]);
+      if (drid) delResMap[drid] = true;
+    }
+
+    var changedById = {};
+    for (var c = 0; c < changed.length; c++) {
+      var ch = changed[c];
+      if (ch && ch.id) changedById[String(ch.id)] = ch;
+    }
+
+    var out = [];
+    var seen = {};
+
+    for (var c2 = 0; c2 < changed.length; c2++) {
+      var candNew = changed[c2];
+      if (!candNew || !candNew.id) continue;
+      var fidNew = String(candNew.id);
+      if (delResMap[normalizeStr(candNew.reservationId)]) continue;
+      var isAlreadyInBase = base.some(function (x) { return x && String(x.id) === fidNew; });
+      if (!isAlreadyInBase && !seen[fidNew]) {
+        seen[fidNew] = true;
+        if (filterTeamFollowUpsList([candNew], f).length > 0) {
+          out.push(candNew);
+        }
+      }
+    }
+
+    for (var i = 0; i < base.length; i++) {
+      var cur = base[i];
+      if (!cur || !cur.id) continue;
+      var fid = String(cur.id);
+      if (delResMap[normalizeStr(cur.reservationId)] || seen[fid]) continue;
+      seen[fid] = true;
+      var resolved = Object.prototype.hasOwnProperty.call(changedById, fid)
+        ? Object.assign({}, cur, changedById[fid])
+        : cur;
+      if (delResMap[normalizeStr(resolved.reservationId)]) continue;
+      if (filterTeamFollowUpsList([resolved], f).length > 0) {
+        out.push(resolved);
+      }
+    }
+
+    out.sort(function (a, b) {
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    });
     return out;
   }
 
@@ -2578,11 +2874,39 @@
     return API_CACHE_POLICIES[key] || { cacheable: false, ttlMs: 0, scope: '' };
   }
 
+  var RESERVATION_UI_ONLY_KEYS = {
+    visibleCols: true,
+    forceRefresh: true,
+    silentRefresh: true,
+    abortKey: true,
+    clientRequestId: true,
+    nowMs: true,
+    _keepOptimisticCache: true,
+    _spamChecked: true,
+    _replayingOfflineQueue: true,
+    originTabId: true,
+    selectedResIds: true,
+    viewMode: true,
+    radarFilter: true,
+    radarSearch: true,
+    todayFilter: true,
+    todaySearch: true,
+    todayTimeFrom: true,
+    todayTimeTo: true,
+    todayDisplayMode: true,
+    todayCalendarGranularity: true,
+    todayCalendarAnchorDate: true,
+    todayCalendarEventFilter: true,
+    todayCalendarSearch: true,
+    pullPreset: true,
+    pullFrom: true,
+    pullTo: true
+  };
+
   function stableSerializePayload(payload) {
     if (!payload || typeof payload !== 'object') return '{}';
-    var ignored = { visibleCols: true, forceRefresh: true, silentRefresh: true, abortKey: true, clientRequestId: true, nowMs: true };
     var keys = Object.keys(payload).filter(function (k) {
-      return !ignored[k] && payload[k] !== undefined;
+      return !RESERVATION_UI_ONLY_KEYS[k] && payload[k] !== undefined;
     }).sort();
     var clean = {};
     for (var i = 0; i < keys.length; i++) {
@@ -7317,6 +7641,14 @@
     }
   ];
 
+  function parseDeltaRecordTimestampMs(rec) {
+    if (!rec || typeof rec !== 'object') return NaN;
+    var raw = rec.updatedAt || rec.lastUpdatedAt || rec.createdAt || '';
+    if (!raw) return NaN;
+    var ms = Date.parse(String(raw));
+    return isFinite(ms) ? ms : NaN;
+  }
+
   function mergeDeltaRecords(existingList, changedList, idField) {
     var base = Array.isArray(existingList) ? existingList.slice() : [];
     var updates = Array.isArray(changedList) ? changedList : [];
@@ -7334,8 +7666,13 @@
       var upd = updates[j];
       if (!upd || typeof upd !== 'object') continue;
       var k = (upd[keyName] !== undefined && upd[keyName] !== null) ? String(upd[keyName]) : '';
-      if (k && indexById[k] !== undefined) {
+      if (k && indexById[k] !== undefined && indexById[k] >= 0) {
         var idx = indexById[k];
+        var prevMs = parseDeltaRecordTimestampMs(base[idx]);
+        var updMs = parseDeltaRecordTimestampMs(upd);
+        if (!isNaN(prevMs) && !isNaN(updMs) && updMs < prevMs) {
+          continue;
+        }
         base[idx] = Object.assign({}, base[idx], upd);
       } else {
         if (k) indexById[k] = -1;
@@ -7343,6 +7680,104 @@
       }
     }
     return prepends.length ? prepends.concat(base) : base;
+  }
+
+  function mergeRecordsMonotonic(existingList, changedList, idField) {
+    return mergeDeltaRecords(existingList, changedList, idField);
+  }
+
+  function extractRadarCountsTuple(rc) {
+    if (!rc || typeof rc !== 'object') return null;
+    return [
+      Number(rc.todayTotal || 0),
+      Number(rc.pickupCount || 0),
+      Number(rc.returnCount || 0),
+      Number(rc.pendingPickupCount || 0),
+      Number(rc.pendingReturnCount || 0),
+      Number(rc.overdueTodayCount || 0),
+      Number(rc.radarTotal || 0),
+      Number(rc.upcoming24hCount || 0),
+      Number(rc.critical6hCount || 0),
+      Number(rc.soon24hCount || 0),
+      Number(rc.expiredUnclosedCount || 0),
+      Number(rc.extendedInRadarCount || 0),
+      Number(rc.radarCount || 0),
+      Number(rc.todayCount || 0),
+      Number(rc.criticalCount || 0)
+    ].join('|');
+  }
+
+  function hasMeaningfulDeltaChanges(delta, prevState) {
+    var d = (delta && typeof delta === 'object') ? delta : {};
+    if (
+      (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+      (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+      (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+      (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+      (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+      (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+      (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
+      Boolean(d.deletedAllReservationsBefore) ||
+      Boolean(d.changedSettings) ||
+      Boolean(d.changedDelegations) ||
+      Boolean(d.changedRoles)
+    ) {
+      return true;
+    }
+    var prev = (prevState && typeof prevState === 'object') ? prevState : null;
+    if (prev && prev.todayRadarCounts && d.todayRadarCounts) {
+      if (extractRadarCountsTuple(prev.todayRadarCounts) !== extractRadarCountsTuple(d.todayRadarCounts)) {
+        return true;
+      }
+    }
+    if (prev && prev.announcementsFp !== undefined && Array.isArray(d.announcements)) {
+      if (computeDataFingerprint(d.announcements) !== prev.announcementsFp) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function haveDashboardSnapshotsChanged(prevDash, nextDash) {
+    if (!prevDash || typeof prevDash !== 'object' || !prevDash.kpis) return true;
+    if (!nextDash || typeof nextDash !== 'object' || !nextDash.kpis) return false;
+    var norm = function (obj) {
+      return {
+        kpis: obj.kpis || {},
+        charts: obj.charts || {},
+        leaderboard: Array.isArray(obj.leaderboard)
+          ? obj.leaderboard.map(function (r) {
+              return r ? [r.id || r.employeeId || '', r.name || '', r.score || 0, r.followUpsCount || 0, r.completedCount || 0] : null;
+            })
+          : [],
+        todayRadarCounts: extractRadarCountsTuple(obj.todayRadarCounts)
+      };
+    };
+    return computeDataFingerprint(norm(prevDash)) !== computeDataFingerprint(norm(nextDash));
+  }
+
+  function resolveSwrSnapshot(prevValid, nextData, isValidFn) {
+    var hasPrev = Boolean(prevValid && typeof prevValid === 'object');
+    var validNext = Boolean(nextData && typeof nextData === 'object' && (!isValidFn || isValidFn(nextData)));
+    if (!validNext) {
+      return hasPrev ? prevValid : null;
+    }
+    if (!hasPrev) return nextData;
+    var merged = Object.assign({}, prevValid, nextData);
+    if (prevValid.kpis && typeof prevValid.kpis === 'object' && nextData.kpis && typeof nextData.kpis === 'object') {
+      var safeKpis = Object.assign({}, prevValid.kpis);
+      Object.keys(nextData.kpis).forEach(function (k) {
+        var val = nextData.kpis[k];
+        if (val !== null && val !== undefined && !(typeof val === 'number' && !isFinite(val))) {
+          safeKpis[k] = val;
+        }
+      });
+      merged.kpis = safeKpis;
+    }
+    if (prevValid.charts && typeof prevValid.charts === 'object' && (!nextData.charts || typeof nextData.charts !== 'object')) {
+      merged.charts = prevValid.charts;
+    }
+    return merged;
   }
 
   function resolveAsyncViewState(opts) {
@@ -7814,6 +8249,14 @@
     claimReservationRecord: claimReservationRecord,
     unclaimReservationRecord: unclaimReservationRecord,
     filterReservations: filterReservations,
+    buildReservationQueryPayload: buildReservationQueryPayload,
+    hasActiveReservationFilters: hasActiveReservationFilters,
+    doesReservationMatchFilters: doesReservationMatchFilters,
+    reapplyReservationDeltaToFilteredList: reapplyReservationDeltaToFilteredList,
+    filterProblemsList: filterProblemsList,
+    reapplyProblemDeltaToFilteredList: reapplyProblemDeltaToFilteredList,
+    filterTeamFollowUpsList: filterTeamFollowUpsList,
+    reapplyFollowUpDeltaToFilteredList: reapplyFollowUpDeltaToFilteredList,
     computeDashboardMetrics: computeDashboardMetrics,
     resolveAssetUrl: resolveAssetUrl,
     resolveRouteFromLocation: resolveRouteFromLocation,
@@ -7974,6 +8417,10 @@
     normalizeExcelCellDate: normalizeExcelCellDate,
     parseImportedReservationRows: parseImportedReservationRows,
     mergeDeltaRecords: mergeDeltaRecords,
+    mergeRecordsMonotonic: mergeRecordsMonotonic,
+    hasMeaningfulDeltaChanges: hasMeaningfulDeltaChanges,
+    haveDashboardSnapshotsChanged: haveDashboardSnapshotsChanged,
+    resolveSwrSnapshot: resolveSwrSnapshot,
     resolveAsyncViewState: resolveAsyncViewState,
     getRiyadhTodayDateStr: getRiyadhTodayDateStr,
     addDaysIso: addDaysIso,

@@ -702,9 +702,10 @@
     }).join(' ');
     var areaPath = linePath + ' L ' + w + ' ' + h + ' L 0 ' + h + ' Z';
 
-    return '<svg class="kpi-sparkline" viewBox="0 0 ' + w + ' ' + h + '" fill="none" aria-hidden="true">' +
+    var gradIdAttr = gradId || 'spark-g';
+    return '<svg class="kpi-sparkline" data-series-sig="' + esc(nums.join(',') + '|' + strokeHex) + '" viewBox="0 0 ' + w + ' ' + h + '" fill="none" aria-hidden="true">' +
       '<defs>' +
-        '<linearGradient id="' + gradId + '" x1="0" y1="0" x2="0" y2="1">' +
+        '<linearGradient id="' + gradIdAttr + '" x1="0" y1="0" x2="0" y2="1">' +
           '<stop offset="0%" stop-color="' + strokeHex + '" stop-opacity="0.30" />' +
           '<stop offset="100%" stop-color="' + strokeHex + '" stop-opacity="0.0" />' +
         '</linearGradient>' +
@@ -804,13 +805,23 @@
         heroDefs.forEach(function (item) {
           var btn = heroWrap.querySelector('[data-kpi-key="' + item.key + '"]');
           if (!btn) return;
-          btn.className = 'kpi-hero-card kpi-hero-' + item.tone;
+          var nextCls = 'kpi-hero-card kpi-hero-' + item.tone;
+          if (btn.className !== nextCls) btn.className = nextCls;
+          var targetNum = Math.max(0, Math.round(Number(k[item.key] || 0)));
           var valEl = btn.querySelector('.kpi-hero-value');
-          animateKpiNumber(valEl, Number(k[item.key] || 0));
+          if (valEl) {
+            var curDataVal = valEl.getAttribute('data-val');
+            if (curDataVal !== String(targetNum) || valEl.textContent !== String(targetNum)) {
+              animateKpiNumber(valEl, targetNum);
+            }
+          }
           var hintEl = btn.querySelector('.kpi-hero-hint');
-          if (hintEl) hintEl.textContent = item.hint;
+          if (hintEl && hintEl.textContent !== item.hint) hintEl.textContent = item.hint;
           var sparkEl = btn.querySelector('.kpi-sparkline');
-          if (sparkEl) sparkEl.outerHTML = buildSparklineSvg(item.series, item.stroke, 'spark-' + item.key);
+          var nextSparkSig = (Array.isArray(item.series) ? item.series.map(function (v) { return Math.max(0, Number(v || 0)); }).join(',') : '0,0') + '|' + item.stroke;
+          if (sparkEl && sparkEl.getAttribute('data-series-sig') !== nextSparkSig) {
+            sparkEl.outerHTML = buildSparklineSvg(item.series, item.stroke, 'spark-' + item.key);
+          }
         });
       } else {
         heroWrap.innerHTML = heroDefs.map(function (item) {
@@ -1102,6 +1113,7 @@
     var isEn = ctx.lang === 'en';
     var state = ctx.state.dashboard || { range: '30d', dateFrom: '', dateTo: '' };
     ctx.state.dashboard = state;
+    if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
     var currentUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
     var firstName = currentUser && currentUser.name ? String(currentUser.name).split(' ')[0] : '';
     var core = root.RGCrmCore;
@@ -1853,6 +1865,7 @@
         btn.addEventListener('click', function () {
           var nextRange = btn.getAttribute('data-range');
           state.range = nextRange;
+          if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
           container.querySelectorAll('[data-range]').forEach(function (b) {
             b.classList.toggle('active', b === btn);
           });
@@ -1861,6 +1874,18 @@
             customWrap.style.display = nextRange === 'custom' ? '' : 'none';
           }
           loadAndPaint({ isUpdate: true });
+        });
+      });
+
+      ['dash-date-from', 'dash-date-to'].forEach(function (did) {
+        var del = document.getElementById(did);
+        if (!del) return;
+        del.addEventListener('change', function () {
+          var fEl = document.getElementById('dash-date-from');
+          var tEl = document.getElementById('dash-date-to');
+          if (fEl) state.dateFrom = fEl.value || '';
+          if (tEl) state.dateTo = tEl.value || '';
+          if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
         });
       });
 
@@ -1878,6 +1903,7 @@
           var runApply = function () {
             state.dateFrom = document.getElementById('dash-date-from').value;
             state.dateTo = document.getElementById('dash-date-to').value;
+            if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
             return loadAndPaint({ isUpdate: true });
           };
           if (ctx.withActionLock) {
@@ -2074,14 +2100,21 @@
       } catch (e) {}
     }
 
+    var dashDeltaState = {
+      todayRadarCounts: (state._lastDashPayload && state._lastDashPayload.todayRadarCounts) || null,
+      announcementsFp: ''
+    };
+
     async function loadAndPaint(paintOpts) {
       var pOpts = paintOpts || {};
       var seq = ++dashLoadSeq;
       var sectionsHost = container.querySelector('#dash-sections-host');
+      var prevDash = state._lastDashPayload || null;
       var dashData = null;
+      var core = root.RGCrmCore || {};
 
-      if (pOpts.localOnly && state._lastDashPayload) {
-        dashData = state._lastDashPayload;
+      if (pOpts.localOnly && prevDash) {
+        dashData = prevDash;
       } else {
         var res = await root.RGApi.callApi('getDashboard', {
           range: state.range,
@@ -2094,7 +2127,14 @@
         if (seq !== dashLoadSeq || !container.isConnected) return;
         if (res && res.aborted) return;
 
-        if (!res || !res.success) {
+        if (!res || !res.success || !res.data || typeof res.data !== 'object') {
+          var hasRenderedKpis = Boolean(prevDash && sectionsHost && sectionsHost.querySelector('#dash-kpis-hero'));
+          if (hasRenderedKpis) {
+            if (!pOpts.silentRefresh && ctx && typeof ctx.toast === 'function') {
+              ctx.toast((res && res.message) || (isEn ? 'Unable to sync latest stats — showing last verified snapshot.' : 'تعذر مزامنة أحدث الإحصائيات — يتم الاحتفاظ بآخر أرقام صحيحة.'), true);
+            }
+            return;
+          }
           if (!pOpts.silentRefresh && sectionsHost) {
             sectionsHost.innerHTML =
               '<div class="rg-error-banner" role="alert" style="grid-column:span 12;">' +
@@ -2113,35 +2153,54 @@
           }
           return;
         }
-        dashData = res.data || {};
+        dashData = (typeof core.resolveSwrSnapshot === 'function')
+          ? core.resolveSwrSnapshot(prevDash, res.data, function (d) { return Boolean(d && d.kpis && typeof d.kpis === 'object'); })
+          : res.data;
+        if (!dashData) return;
         state._lastDashPayload = dashData;
       }
 
+      if (dashData.todayRadarCounts && typeof dashData.todayRadarCounts === 'object') {
+        dashDeltaState.todayRadarCounts = Object.assign({}, dashData.todayRadarCounts);
+      }
+
+      var hasRenderedHero = Boolean(sectionsHost && sectionsHost.querySelector('#dash-kpis-hero'));
+      var snapshotChanged = !prevDash || !hasRenderedHero || Boolean(pOpts.forceRepaint) || (
+        typeof core.haveDashboardSnapshotsChanged === 'function'
+          ? core.haveDashboardSnapshotsChanged(prevDash, dashData)
+          : true
+      );
+
       var kpisData = dashData.kpis || {};
       var chartsData = dashData.charts || {};
-      paintKpis(sectionsHost, kpisData, chartsData, t, ctx.lang);
 
-      var radarCountEl = container.querySelector('#dash-radar-count');
-      if (radarCountEl && dashData.todayRadarCounts && typeof dashData.todayRadarCounts.radarCount === 'number') {
-        radarCountEl.textContent = String(dashData.todayRadarCounts.radarCount);
-      }
+      if (snapshotChanged) {
+        paintKpis(sectionsHost, kpisData, chartsData, t, ctx.lang);
 
-      var statPill = container.querySelector('#dash-banner-stat-pill');
-      if (statPill) {
-        statPill.textContent = ctx.lang === 'en'
-          ? (Number(kpisData.todayFollowUps || 0) + ' Follow-Ups Today')
-          : (Number(kpisData.todayFollowUps || 0) + ' متابعة اليوم');
-      }
+        var radarCountEl = container.querySelector('#dash-radar-count');
+        if (radarCountEl && dashData.todayRadarCounts && typeof dashData.todayRadarCounts.radarCount === 'number') {
+          radarCountEl.textContent = String(dashData.todayRadarCounts.radarCount);
+        }
 
-      ctx.state.lastDashboardCharts = chartsData;
-      renderCharts(chartsData, t, ctx, Boolean(pOpts.isUpdate || isShellMounted || pOpts.localOnly));
-      if (visBySec.leaderboard && visBySec.leaderboard.shouldRenderData) {
-        renderLeaderboardCard(container.querySelector('#dash-leaderboard-list'), dashData.leaderboard || [], ctx);
+        var statPill = container.querySelector('#dash-banner-stat-pill');
+        if (statPill) {
+          statPill.textContent = ctx.lang === 'en'
+            ? (Number(kpisData.todayFollowUps || 0) + ' Follow-Ups Today')
+            : (Number(kpisData.todayFollowUps || 0) + ' متابعة اليوم');
+        }
+
+        ctx.state.lastDashboardCharts = chartsData;
+        renderCharts(chartsData, t, ctx, Boolean(pOpts.isUpdate || isShellMounted || pOpts.localOnly));
+        if (visBySec.leaderboard && visBySec.leaderboard.shouldRenderData) {
+          renderLeaderboardCard(container.querySelector('#dash-leaderboard-list'), dashData.leaderboard || [], ctx);
+        }
+        if (!hasRenderedHero && sectionsHost && root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {
+          root.RGApp.animateProgressiveReveal(sectionsHost);
+        }
       }
-      if (sectionsHost && root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {
-        root.RGApp.animateProgressiveReveal(sectionsHost);
+      if (!pOpts.isUpdate || snapshotChanged || pOpts.syncSecondary) {
+        loadSecondaryFeeds(seq, dashData.recentActivity, Boolean(pOpts.localOnly));
       }
-      loadSecondaryFeeds(seq, dashData.recentActivity, Boolean(pOpts.localOnly));
     }
 
     if (!container._rgDashDeltaBound) {
@@ -2152,27 +2211,55 @@
           return;
         }
         var d = (ev && ev.detail) || {};
-        var relevant = Boolean(
-          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
-          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
-          (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
-          (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
-          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
-          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
-          (Array.isArray(d.announcements) && d.announcements.length > 0) ||
-          (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
-          Boolean(d.deletedAllReservationsBefore) ||
-          Boolean(d.changedSettings) ||
-          Boolean(d.changedDelegations) ||
-          Boolean(d.changedRoles) ||
-          Boolean(d.todayRadarCounts)
-        );
+        var core = root.RGCrmCore || {};
+        var relevant = (typeof core.hasMeaningfulDeltaChanges === 'function')
+          ? core.hasMeaningfulDeltaChanges(d, dashDeltaState)
+          : Boolean(
+              (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+              (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+              (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+              (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+              (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+              (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+              (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
+              Boolean(d.deletedAllReservationsBefore) ||
+              Boolean(d.changedSettings) ||
+              Boolean(d.changedDelegations) ||
+              Boolean(d.changedRoles)
+            );
+        if (d.todayRadarCounts && typeof d.todayRadarCounts === 'object') {
+          dashDeltaState.todayRadarCounts = Object.assign({}, d.todayRadarCounts);
+        }
+        if (Array.isArray(d.announcements) && typeof core.computeDataFingerprint === 'function') {
+          dashDeltaState.announcementsFp = core.computeDataFingerprint(d.announcements);
+        }
         if (relevant) {
-          loadAndPaint({ isUpdate: true, silentRefresh: true, forceRefresh: true }).catch(function () {});
+          var hasSecondaryChanges = Boolean(
+            (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+            (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+            (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+            (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+            Boolean(d.deletedAllReservationsBefore)
+          );
+          loadAndPaint({
+            isUpdate: true,
+            silentRefresh: true,
+            forceRefresh: true,
+            syncSecondary: hasSecondaryChanges
+          }).catch(function () {});
         }
       };
       document.addEventListener('rg:deltasync', onDashDeltaSync);
     }
+
+    container._rgRefreshDataOnly = function (refreshOpts) {
+      var rOpts = refreshOpts || {};
+      return loadAndPaint({
+        isUpdate: true,
+        silentRefresh: rOpts.silent !== false,
+        forceRefresh: Boolean(rOpts.forceRefresh)
+      });
+    };
 
     await loadAndPaint({
       isUpdate: isShellMounted,

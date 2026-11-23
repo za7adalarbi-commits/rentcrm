@@ -8,6 +8,14 @@
   var cachedDownsampledLogos = {};
   var activeReportChartInstances = [];
 
+  function escAttr(val) {
+    return String(val === null || val === undefined ? '' : val)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function destroyCharts() {
     activeReportChartInstances.forEach(function (ch) {
       try { if (ch && typeof ch.destroy === 'function') ch.destroy(); } catch (_e) {}
@@ -1090,8 +1098,12 @@
 
   async function render(container, ctx) {
     var t = ctx.t;
-    var state = ctx.state.reports || { reportType: 'all_reservations', rows: [] };
+    var state = Object.assign(
+      { reportType: 'all_reservations', dateFrom: '', dateTo: '', employeeId: '', company: '', branch: '', rows: [] },
+      ctx.state.reports || {}
+    );
     ctx.state.reports = state;
+    if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
 
     var empState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
     var hasPreloadedEmps = Boolean(empState && empState.loaded && Array.isArray(empState.items) && empState.items.length > 0);
@@ -1125,13 +1137,17 @@
           }).join('') +
         '</div>' +
         '<div class="filter-grid">' +
-          '<input type="date" class="input" id="rep-from" data-rg-range-pair="rep-range" data-rg-range-role="start" aria-label="' + t('from_date') + '">' +
-          '<input type="date" class="input" id="rep-to" data-rg-range-pair="rep-range" data-rg-range-role="end" aria-label="' + t('to_date') + '">' +
+          '<input type="date" class="input" id="rep-from" data-rg-range-pair="rep-range" data-rg-range-role="start" value="' + escAttr(state.dateFrom || '') + '" aria-label="' + t('from_date') + '">' +
+          '<input type="date" class="input" id="rep-to" data-rg-range-pair="rep-range" data-rg-range-role="end" value="' + escAttr(state.dateTo || '') + '" aria-label="' + t('to_date') + '">' +
           '<select class="select" id="rep-emp" aria-label="' + t('employee') + '"><option value="">' + t('all_employees') + '</option>' +
-            employees.map(function (e) { return '<option value="' + e.id + '">' + e.name + '</option>'; }).join('') +
+            employees.map(function (e) { return '<option value="' + escAttr(e.id) + '"' + (state.employeeId === e.id ? ' selected' : '') + '>' + escAttr(e.name) + '</option>'; }).join('') +
           '</select>' +
-          '<select class="select" id="rep-company" aria-label="' + t('company') + '"><option value="">' + t('all_companies') + '</option></select>' +
-          '<select class="select" id="rep-branch" aria-label="' + t('branch') + '"><option value="">' + t('all_branches') + '</option></select>' +
+          '<select class="select" id="rep-company" aria-label="' + t('company') + '"><option value="">' + t('all_companies') + '</option>' +
+            (state.company ? '<option value="' + escAttr(state.company) + '" selected>' + escAttr(state.company) + '</option>' : '') +
+          '</select>' +
+          '<select class="select" id="rep-branch" aria-label="' + t('branch') + '"><option value="">' + t('all_branches') + '</option>' +
+            (state.branch ? '<option value="' + escAttr(state.branch) + '" selected>' + escAttr(state.branch) + '</option>' : '') +
+          '</select>' +
           '<button type="button" class="btn btn-accent" id="rep-run-btn">' + t('generate_report') + '</button>' +
         '</div>' +
         (canViewRepCharts ? (
@@ -1156,44 +1172,66 @@
       facets = nextFacets;
       var compEl = document.getElementById('rep-company');
       var brEl = document.getElementById('rep-branch');
-      if (compEl && compEl.options.length <= 1 && Array.isArray(facets.companies)) {
-        var prevC = compEl.value;
+      if (compEl && compEl.getAttribute('data-facets-loaded') !== '1' && Array.isArray(facets.companies)) {
+        var prevC = compEl.value || state.company || '';
+        var compList = facets.companies.slice();
+        if (prevC && compList.indexOf(prevC) === -1) compList.unshift(prevC);
         compEl.innerHTML = '<option value="">' + t('all_companies') + '</option>' +
-          facets.companies.map(function (c) { return '<option value="' + c + '">' + c + '</option>'; }).join('');
+          compList.map(function (c) { return '<option value="' + escAttr(c) + '">' + escAttr(c) + '</option>'; }).join('');
         compEl.value = prevC;
+        compEl.setAttribute('data-facets-loaded', '1');
       }
-      if (brEl && brEl.options.length <= 1 && Array.isArray(facets.branches)) {
-        var prevB = brEl.value;
+      if (brEl && brEl.getAttribute('data-facets-loaded') !== '1' && Array.isArray(facets.branches)) {
+        var prevB = brEl.value || state.branch || '';
+        var brList = facets.branches.slice();
+        if (prevB && brList.indexOf(prevB) === -1) brList.unshift(prevB);
         brEl.innerHTML = '<option value="">' + t('all_branches') + '</option>' +
-          facets.branches.map(function (b) { return '<option value="' + b + '">' + b + '</option>'; }).join('');
+          brList.map(function (b) { return '<option value="' + escAttr(b) + '">' + escAttr(b) + '</option>'; }).join('');
         brEl.value = prevB;
+        brEl.setAttribute('data-facets-loaded', '1');
       }
     }
 
     var previewSeq = 0;
 
-    async function loadPreview(logExport) {
+    async function loadPreview(logExport, previewOpts) {
+      var pOpts = previewOpts || {};
       var seq = ++previewSeq;
       var wrap = document.getElementById('report-preview-wrap');
-      if (wrap && !logExport) {
+      if (wrap && !logExport && !pOpts.silentRefresh) {
         wrap.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       }
+      state.dateFrom = document.getElementById('rep-from') ? document.getElementById('rep-from').value : (state.dateFrom || '');
+      state.dateTo = document.getElementById('rep-to') ? document.getElementById('rep-to').value : (state.dateTo || '');
+      state.employeeId = document.getElementById('rep-emp') ? document.getElementById('rep-emp').value : (state.employeeId || '');
+      state.company = document.getElementById('rep-company') ? document.getElementById('rep-company').value : (state.company || '');
+      state.branch = document.getElementById('rep-branch') ? document.getElementById('rep-branch').value : (state.branch || '');
       var params = {
         reportType: state.reportType,
-        dateFrom: document.getElementById('rep-from').value,
-        dateTo: document.getElementById('rep-to').value,
-        employeeId: document.getElementById('rep-emp').value,
-        company: document.getElementById('rep-company').value,
-        branch: document.getElementById('rep-branch').value,
+        dateFrom: state.dateFrom,
+        dateTo: state.dateTo,
+        employeeId: state.employeeId,
+        company: state.company,
+        branch: state.branch,
         logExport: Boolean(logExport),
+        silentRefresh: Boolean(pOpts.silentRefresh),
+        forceRefresh: Boolean(pOpts.forceRefresh),
         abortKey: 'rep:preview'
       };
-      var r = await root.RGApi.callApi('getReports', params);
+      var r = (pOpts.prefetchedData && !pOpts.forceRefresh && Array.isArray(pOpts.prefetchedData.rows))
+        ? { success: true, data: pOpts.prefetchedData }
+        : await root.RGApi.callApi('getReports', params);
       if (seq !== previewSeq || !container.isConnected) return;
       if (r && r.aborted) return;
       wrap = document.getElementById('report-preview-wrap');
       if (!wrap) return;
       if (!r || !r.success) {
+        if (Array.isArray(state.rows) && state.rows.length > 0) {
+          if (!pOpts.silentRefresh && ctx && typeof ctx.toast === 'function') {
+            ctx.toast((r && r.message) || (ctx.lang === 'en' ? 'Failed to refresh report — showing previous results.' : 'تعذر تحديث التقرير — يتم عرض آخر نتائج متاحة.'), true);
+          }
+          return;
+        }
         wrap.innerHTML =
           '<div class="rg-error-banner" role="alert">' +
             '<div class="rg-error-banner-body">' +
@@ -1411,10 +1449,27 @@
     container.querySelectorAll('[data-rtype]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         state.reportType = btn.getAttribute('data-rtype');
+        if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
         container.querySelectorAll('[data-rtype]').forEach(function (el) {
           el.classList.toggle('active', el === btn);
         });
         loadPreview(false);
+      });
+    });
+
+    ['rep-from', 'rep-to', 'rep-emp', 'rep-company', 'rep-branch'].forEach(function (fid) {
+      var fel = document.getElementById(fid);
+      if (!fel) return;
+      fel.addEventListener('change', function () {
+        state.dateFrom = (document.getElementById('rep-from') && document.getElementById('rep-from').value) || '';
+        state.dateTo = (document.getElementById('rep-to') && document.getElementById('rep-to').value) || '';
+        state.employeeId = (document.getElementById('rep-emp') && document.getElementById('rep-emp').value) || '';
+        state.company = (document.getElementById('rep-company') && document.getElementById('rep-company').value) || '';
+        state.branch = (document.getElementById('rep-branch') && document.getElementById('rep-branch').value) || '';
+        if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
+        loadPreview(false).then(function () {
+          loadReportHeatmap(state.reportType === 'all_reservations' ? state.rows : null);
+        });
       });
     });
 
@@ -1467,11 +1522,11 @@
         var rParams = {
           page: 1,
           pageSize: 200,
-          dateFrom: document.getElementById('rep-from') ? document.getElementById('rep-from').value : '',
-          dateTo: document.getElementById('rep-to') ? document.getElementById('rep-to').value : '',
-          employeeId: document.getElementById('rep-emp') ? document.getElementById('rep-emp').value : '',
-          company: document.getElementById('rep-company') ? document.getElementById('rep-company').value : '',
-          branch: document.getElementById('rep-branch') ? document.getElementById('rep-branch').value : '',
+          dateFrom: document.getElementById('rep-from') ? document.getElementById('rep-from').value : (state.dateFrom || ''),
+          dateTo: document.getElementById('rep-to') ? document.getElementById('rep-to').value : (state.dateTo || ''),
+          employeeId: document.getElementById('rep-emp') ? document.getElementById('rep-emp').value : (state.employeeId || ''),
+          company: document.getElementById('rep-company') ? document.getElementById('rep-company').value : (state.company || ''),
+          branch: document.getElementById('rep-branch') ? document.getElementById('rep-branch').value : (state.branch || ''),
           silentRefresh: true
         };
         var pParams = {
@@ -1507,6 +1562,12 @@
           return;
         }
       }
+      state.dateFrom = (document.getElementById('rep-from') && document.getElementById('rep-from').value) || '';
+      state.dateTo = (document.getElementById('rep-to') && document.getElementById('rep-to').value) || '';
+      state.employeeId = (document.getElementById('rep-emp') && document.getElementById('rep-emp').value) || '';
+      state.company = (document.getElementById('rep-company') && document.getElementById('rep-company').value) || '';
+      state.branch = (document.getElementById('rep-branch') && document.getElementById('rep-branch').value) || '';
+      if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
       var runFlow = async function () {
         await loadPreview(false);
         loadReportHeatmap(state.reportType === 'all_reservations' ? state.rows : null);
@@ -1532,6 +1593,73 @@
       });
     }
 
+    function scheduleRepRefreshWhenIdle(rOpts) {
+      var activeEl = document.activeElement;
+      if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+        if (!container._rgPendingRepDelta) {
+          container._rgPendingRepDelta = true;
+          container.addEventListener('focusout', function onBlurRepDelta() {
+            setTimeout(function () {
+              if (!container || !container.isConnected) return;
+              var curAct = document.activeElement;
+              if (curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName)) {
+                container.addEventListener('focusout', onBlurRepDelta, { once: true });
+                return;
+              }
+              container._rgPendingRepDelta = false;
+              loadPreview(false, rOpts || { silentRefresh: true, forceRefresh: true }).then(function () {
+                loadReportHeatmap(state.reportType === 'all_reservations' ? state.rows : null);
+              }).catch(function () {});
+            }, 120);
+          }, { once: true });
+        }
+        return Promise.resolve();
+      }
+      return loadPreview(false, rOpts || { silentRefresh: true, forceRefresh: true }).then(function () {
+        return loadReportHeatmap(state.reportType === 'all_reservations' ? state.rows : null);
+      });
+    }
+
+    container._rgRefreshDataOnly = async function (refreshOpts) {
+      var rOpts = refreshOpts || {};
+      if (!rOpts.manual) {
+        var activeEl = document.activeElement;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+          return scheduleRepRefreshWhenIdle({ silentRefresh: true, forceRefresh: true });
+        }
+      }
+      await loadPreview(false, {
+        silentRefresh: rOpts.silent !== false,
+        forceRefresh: Boolean(rOpts.forceRefresh),
+        prefetchedData: rOpts.prefetchedData
+      });
+      loadReportHeatmap(state.reportType === 'all_reservations' ? state.rows : null);
+    };
+
+    if (!container._rgRepDeltaBound) {
+      container._rgRepDeltaBound = true;
+      var onRepDelta = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onRepDelta);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        var relevant = Boolean(
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+          Boolean(d.deletedAllReservationsBefore) ||
+          Boolean(d.changedSettings)
+        );
+        if (!relevant) return;
+        scheduleRepRefreshWhenIdle({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+      };
+      document.addEventListener('rg:deltasync', onRepDelta);
+    }
+
     await loadPreview(false);
     loadReportHeatmap(state.reportType === 'all_reservations' ? state.rows : null);
   }
@@ -1545,11 +1673,11 @@
       : RESERVATION_COLUMNS;
     var defaultSelectedKeys = activeCols.slice(0, Math.min(10, activeCols.length)).map(function (c) { return c.key; });
 
-    var curEmpFilter = document.getElementById('rep-emp') ? document.getElementById('rep-emp').value : '';
-    var curFromFilter = document.getElementById('rep-from') ? document.getElementById('rep-from').value : '';
-    var curToFilter = document.getElementById('rep-to') ? document.getElementById('rep-to').value : '';
-    var curCompFilter = document.getElementById('rep-company') ? document.getElementById('rep-company').value : '';
-    var curBranchFilter = document.getElementById('rep-branch') ? document.getElementById('rep-branch').value : '';
+    var curEmpFilter = (document.getElementById('rep-emp') ? document.getElementById('rep-emp').value : '') || state.employeeId || '';
+    var curFromFilter = (document.getElementById('rep-from') ? document.getElementById('rep-from').value : '') || state.dateFrom || '';
+    var curToFilter = (document.getElementById('rep-to') ? document.getElementById('rep-to').value : '') || state.dateTo || '';
+    var curCompFilter = (document.getElementById('rep-company') ? document.getElementById('rep-company').value : '') || state.company || '';
+    var curBranchFilter = (document.getElementById('rep-branch') ? document.getElementById('rep-branch').value : '') || state.branch || '';
     var reportTitleAr = getReportLabel(state.reportType, ctx.lang);
 
     var sheetCountOptions = '';
