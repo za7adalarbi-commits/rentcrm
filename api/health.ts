@@ -1,7 +1,9 @@
 import { checkDatabaseHealth, createPgExecutor, isDatabaseConfigured } from '../backend/db.js';
 import { readPublicHealthAutoBind } from '../backend/serverConfig.js';
+import { attachAppVersionHeaders } from '../backend/versionManifest.js';
 
 export default async function handler(_req: any, res: any) {
+  const versionInfo = attachAppVersionHeaders(res);
   try {
     const health = await checkDatabaseHealth();
     let executor: ReturnType<typeof createPgExecutor> | undefined;
@@ -58,6 +60,9 @@ export default async function handler(_req: any, res: any) {
       ok: true,
       service: 'RENTAL GATE CRM',
       timestamp: new Date().toISOString(),
+      appVersion: versionInfo.version,
+      buildId: versionInfo.buildId,
+      builtAt: versionInfo.builtAt,
       ...health,
       mode,
       backendApiUrl,
@@ -73,6 +78,9 @@ export default async function handler(_req: any, res: any) {
         ok: false,
         service: 'RENTAL GATE CRM',
         timestamp: new Date().toISOString(),
+        appVersion: versionInfo.version,
+        buildId: versionInfo.buildId,
+        builtAt: versionInfo.builtAt,
         databaseConfigured: isDatabaseConfigured(),
         connected: false,
         error: String(err?.message || 'HEALTH_CHECK_FAILED'),

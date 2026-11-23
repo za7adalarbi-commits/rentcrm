@@ -442,11 +442,32 @@
         var relevant = Boolean(
           (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
-          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0)
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+          Boolean(d.deletedAllReservationsBefore) ||
+          Boolean(d.changedSettings)
         );
         if (!relevant) return;
         var activeEl = document.activeElement;
-        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+          if (!container._rgPendingPrbDelta) {
+            container._rgPendingPrbDelta = true;
+            container.addEventListener('focusout', function onBlurPrbDelta() {
+              setTimeout(function () {
+                if (!container || !container.isConnected) return;
+                var curAct = document.activeElement;
+                if (curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName)) {
+                  container.addEventListener('focusout', onBlurPrbDelta, { once: true });
+                  return;
+                }
+                container._rgPendingPrbDelta = false;
+                refreshProblemsRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+              }, 120);
+            }, { once: true });
+          }
+          return;
+        }
         refreshProblemsRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
       };
       document.addEventListener('rg:deltasync', onPrbDelta);

@@ -18,6 +18,7 @@ import { applyUnifiedConnectionSetup, getSetupCapabilities } from '../backend/se
 import { fetchGasServerSide } from '../backend/gasProxy.js';
 import { FIXED_SERVER_CONFIG } from '../backend/fixedConfig.js';
 import { resolveServerConfig } from '../backend/serverConfig.js';
+import { attachAppVersionHeaders } from '../backend/versionManifest.js';
 
 async function resolveServerFallbackGasUrl(explicitUrl: unknown): Promise<string> {
   const direct = String(explicitUrl || '').trim();
@@ -104,6 +105,7 @@ async function verifyGeneralManagerCredentials(
 }
 
 export default async function handler(req: any, res: any) {
+  attachAppVersionHeaders(res);
   if (typeof res.setHeader === 'function') {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   }

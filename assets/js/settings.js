@@ -388,10 +388,13 @@
           '<button type="button" class="btn" id="btn-test-neon-db">فحص قاعدة البيانات (Neon)</button>' +
           '<button type="button" class="btn" id="btn-ping-gas-url">فحص Google Apps Script</button>' +
           '<button type="button" class="btn" id="btn-test-rg-top">فحص Rental Gate API</button>' +
+          '<button type="button" class="btn" id="btn-check-app-update">فحص التحديثات الآن</button>' +
+          '<button type="button" class="btn" id="btn-show-sync-diagnostics">سجل التحديث والمزامنة</button>' +
           '<button type="button" class="btn btn-danger" id="btn-clear-browser-cache">مسح كاش المتصفح بالكامل</button>' +
         '</div>' +
 
         '<div id="conn-test-results" class="hidden" style="margin-top:12px;display:grid;gap:8px;"></div>' +
+        '<div id="sync-diag-results" class="hidden" style="margin-top:10px;display:grid;gap:6px;"></div>' +
       '</div>' +
 
       (canManageSettings ? (
@@ -881,6 +884,117 @@
           }
         });
       });
+    }
+
+    var checkAppUpdateBtn = document.getElementById('btn-check-app-update');
+    if (checkAppUpdateBtn) {
+      checkAppUpdateBtn.addEventListener('click', function () {
+        runWithLock(checkAppUpdateBtn, 'checkAppUpdate', async function () {
+          var prevText = checkAppUpdateBtn.textContent;
+          checkAppUpdateBtn.textContent = 'جاري الفحص...';
+          setDiagResult('app_update', 'نظام تحديث التطبيق التلقائي', 'pending', 'جاري التحقق من أحدث إصدار متاح على الخادم...', 0);
+          var t0 = Date.now();
+          try {
+            var updRes = (root.RGApp && typeof root.RGApp.checkForUpdates === 'function')
+              ? await root.RGApp.checkForUpdates({ trigger: 'manual', manual: true })
+              : { updated: false, status: 'unavailable' };
+            var ms = Math.max(1, Date.now() - t0);
+            if (updRes && updRes.updated) {
+              setDiagResult('app_update', 'نظام تحديث التطبيق التلقائي', 'ok', 'تم العثور على إصدار جديد (' + (updRes.remoteVersion || '') + ') — جاري التحديث التلقائي الآن.', ms);
+            } else if (updRes && updRes.upToDate) {
+              setDiagResult('app_update', 'نظام تحديث التطبيق التلقائي', 'ok', 'التطبيق يعمل على أحدث إصدار (' + (updRes.currentVersion || '') + ').', ms);
+            } else if (updRes && updRes.deferred) {
+              setDiagResult('app_update', 'نظام تحديث التطبيق التلقائي', 'pending', 'يتوفر إصدار جديد (' + (updRes.remoteVersion || '') + ') وسيُطبّق تلقائياً فور حفظ التعديلات الجارية.', ms);
+            } else {
+              setDiagResult('app_update', 'نظام تحديث التطبيق التلقائي', 'fail', 'تعذر التحقق من ملف الإصدار في الخادم (' + ((updRes && updRes.status) || 'unknown') + ').', ms);
+            }
+          } finally {
+            if (checkAppUpdateBtn.isConnected !== false) checkAppUpdateBtn.textContent = prevText;
+          }
+        });
+      });
+    }
+
+    var syncDiagEl = document.getElementById('sync-diag-results');
+    var showSyncDiagBtn = document.getElementById('btn-show-sync-diagnostics');
+
+    function renderSyncDiagPanel() {
+      if (!syncDiagEl || syncDiagEl.classList.contains('hidden')) return;
+      var summary = (root.RGApp && typeof root.RGApp.getSyncStatusSummary === 'function')
+        ? root.RGApp.getSyncStatusSummary()
+        : {};
+      var logs = (root.RGApp && typeof root.RGApp.getSyncDiagnostics === 'function')
+        ? root.RGApp.getSyncDiagnostics()
+        : [];
+      var channelLabel = summary.offline
+        ? 'غير متصل (Offline)'
+        : (summary.sseConnected ? 'بث فوري (SSE Live)' : 'مزامنة سريعة تلقائية (Polling 3s)');
+      var channelCls = summary.offline
+        ? 'status-danger'
+        : (summary.networkDegraded ? 'status-warning' : 'status-success');
+      var headerHtml =
+        '<div style="padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+            '<strong style="font-size:13px;">حالة المزامنة والإصدار</strong>' +
+            '<span class="status-tag ' + channelCls + '">' + escapeHtml(channelLabel) + '</span>' +
+            '<span class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-secondary);">v=' + escapeHtml(summary.currentVersion || 'dev') + '</span>' +
+            (summary.offlineQueueCount > 0 ? ('<span class="status-tag status-warning">طابور معلق: ' + summary.offlineQueueCount + '</span>') : '') +
+          '</div>' +
+          '<div class="mono" dir="ltr" style="font-size:11.5px;color:var(--text-muted);">sync#' + escapeHtml(String(summary.lastSyncVersion || 0)) + (summary.lastDeltaSyncAt ? (' · ' + escapeHtml(summary.lastDeltaSyncAt.slice(11, 19))) : '') + '</div>' +
+        '</div>';
+      var rowsHtml = logs.length === 0
+        ? '<div style="padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);font-size:12.5px;color:var(--text-muted);">لا توجد أحداث مسجلة بعد في هذه الجلسة.</div>'
+        : logs.slice(0, 20).map(function (item) {
+            var lvCls = item.level === 'warn' || item.level === 'error' ? 'status-warning' : 'status-info';
+            return '<div style="padding:8px 10px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
+              '<div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap;">' +
+                '<span class="status-tag ' + lvCls + '">' + escapeHtml(item.kind || 'sync') + '</span>' +
+                '<span style="font-size:12.5px;color:var(--text-primary);">' + escapeHtml(item.message || '') + '</span>' +
+                (item.detail ? ('<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + escapeHtml(item.detail) + '</span>') : '') +
+              '</div>' +
+              '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + escapeHtml(String(item.time || '').slice(11, 19)) + '</span>' +
+            '</div>';
+          }).join('');
+      syncDiagEl.innerHTML = headerHtml + rowsHtml;
+    }
+
+    if (showSyncDiagBtn && syncDiagEl) {
+      showSyncDiagBtn.addEventListener('click', function () {
+        var willShow = syncDiagEl.classList.contains('hidden');
+        syncDiagEl.classList.toggle('hidden', !willShow);
+        showSyncDiagBtn.textContent = willShow ? 'إخفاء سجل التحديث والمزامنة' : 'سجل التحديث والمزامنة';
+        if (willShow) renderSyncDiagPanel();
+      });
+    }
+
+    if (!container._rgSyncDiagBound) {
+      container._rgSyncDiagBound = true;
+      var onSyncDiagUpdate = function () {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:syncdiagupdate', onSyncDiagUpdate);
+          return;
+        }
+        renderSyncDiagPanel();
+      };
+      document.addEventListener('rg:syncdiagupdate', onSyncDiagUpdate);
+    }
+
+    if (!container._rgSettingsDeltaBound) {
+      container._rgSettingsDeltaBound = true;
+      var onSettingsDeltaSync = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:deltasync', onSettingsDeltaSync);
+          return;
+        }
+        var d = (ev && ev.detail) || {};
+        if (!(d.changedSettings || d.changedRoles || d.changedDelegations || d.deletedAllReservationsBefore)) return;
+        var modalRoot = document.getElementById('modal-root');
+        if (modalRoot && modalRoot.firstElementChild) return;
+        var activeEl = document.activeElement;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        render(container, ctx).catch(function () {});
+      };
+      document.addEventListener('rg:deltasync', onSettingsDeltaSync);
     }
 
     var clearBrowserCacheBtn = document.getElementById('btn-clear-browser-cache');

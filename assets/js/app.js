@@ -26,7 +26,10 @@
   }
 
   function loadVendorScript(rel) {
-    var url = assetUrl(rel);
+    var rawUrl = assetUrl(rel);
+    var url = (root.RGCrmCore && root.RGCrmCore.buildCacheBustedUrl)
+      ? root.RGCrmCore.buildCacheBustedUrl(rawUrl, root.__RG_BUILD_VERSION__)
+      : rawUrl;
     if (vendorScriptPromises[url]) return vendorScriptPromises[url];
     vendorScriptPromises[url] = new Promise(function (resolve, reject) {
       var existing = document.querySelector('script[data-rg-vendor="' + rel + '"]');
@@ -277,6 +280,21 @@
   var lastFingerprints = { notifications: '', routes: {}, announcements: '', locks: '' };
   var employeeSubscribers = [];
   var tabInstanceId = 'TAB_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
+  root.__RG_TAB_ID__ = tabInstanceId;
+  var syncDiagnostics = [];
+  var sseConnected = false;
+  var sseErrorCount = 0;
+  var consecutiveSyncErrors = 0;
+  var networkDegraded = false;
+  var lastSyncVersion = 0;
+  var lastVersionCheckAt = '';
+  var lastCheckedRemoteVersion = '';
+  var lastUpdateStatus = 'idle';
+  var isVersionCheckInFlight = false;
+  var isUpdateReloadInFlight = false;
+  var versionCheckTimer = null;
+  var pendingUpdateDeferTimer = null;
+  var notifiedUnsavedUpdateVer = '';
   var syncBroadcastChannel = null;
   var BC_PING_KEY = 'rg_crm_bc_ping';
   try {
@@ -4140,6 +4158,263 @@
   var seenSseEventIds = {};
   var seenSseEventOrder = [];
 
+  function pushSyncDiagnostic(kind, level, message, detail) {
+    try {
+      var core = root.RGCrmCore;
+      var entry = {
+        kind: kind || 'sync',
+        level: level || 'info',
+        message: message || '',
+        detail: detail || ''
+      };
+      if (core && typeof core.appendSyncDiagnosticLog === 'function') {
+        syncDiagnostics = core.appendSyncDiagnosticLog(syncDiagnostics, entry, 80);
+      } else if (entry.message) {
+        syncDiagnostics = [Object.assign({ id: 'LOG_' + Date.now(), time: new Date().toISOString() }, entry)].concat(syncDiagnostics).slice(0, 80);
+      }
+      if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+        document.dispatchEvent(new CustomEvent('rg:syncdiagupdate', {
+          detail: { logs: syncDiagnostics.slice(), entry: syncDiagnostics[0] || null }
+        }));
+      }
+    } catch (_eDiag) {}
+  }
+
+  function getSyncDiagnostics() {
+    return syncDiagnostics.slice();
+  }
+
+  function getSyncStatusSummary() {
+    return {
+      currentVersion: String(root.__RG_BUILD_VERSION__ || 'dev'),
+      lastCheckedRemoteVersion: lastCheckedRemoteVersion,
+      lastVersionCheckAt: lastVersionCheckAt,
+      lastUpdateStatus: lastUpdateStatus,
+      sseConnected: sseConnected,
+      sseErrorCount: sseErrorCount,
+      consecutiveSyncErrors: consecutiveSyncErrors,
+      networkDegraded: networkDegraded,
+      lastSyncVersion: lastSyncVersion,
+      lastDeltaSyncAt: state.lastDeltaSyncAt || '',
+      offline: isAppOfflineNow(),
+      offlineQueueCount: Number((state.offlineQueue && state.offlineQueue.count) || 0)
+    };
+  }
+
+  var AUTO_UPDATE_ATTEMPT_KEY = 'rg_crm_auto_update_attempt';
+  var JUST_UPDATED_KEY = 'rg_crm_just_updated_to';
+
+  function purgeAppCachesForReload() {
+    var ops = [];
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.removeItem('rg_crm_swr_v1');
+      }
+    } catch (_eS) {}
+    try {
+      if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
+        ops.push(caches.keys().then(function (names) {
+          return Promise.all((names || []).map(function (name) {
+            return caches.delete(name).catch(function () {});
+          }));
+        }).catch(function () {}));
+      }
+    } catch (_eC) {}
+    try {
+      if (typeof navigator !== 'undefined' && navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+        ops.push(navigator.serviceWorker.getRegistrations().then(function (regs) {
+          (regs || []).forEach(function (reg) {
+            if (reg && reg.waiting) {
+              try { reg.waiting.postMessage({ type: 'SKIP_WAITING' }); } catch (_eP) {}
+            }
+          });
+        }).catch(function () {}));
+      }
+    } catch (_eSw) {}
+    return Promise.all(ops).catch(function () {});
+  }
+
+  async function fetchRemoteVersionManifest() {
+    if (typeof fetch !== 'function') return null;
+    var ts = Date.now();
+    var core = root.RGCrmCore;
+    var candidates = ['/api/version?_ts=' + ts, assetUrl('version.json') + '?_ts=' + ts];
+    for (var i = 0; i < candidates.length; i++) {
+      var u = candidates[i];
+      var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      var timer = ctrl ? setTimeout(function () { try { ctrl.abort(); } catch (_e) {} }, 6000) : null;
+      try {
+        var opts = { method: 'GET', cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } };
+        if (ctrl) opts.signal = ctrl.signal;
+        var resp = await fetch(u, opts);
+        if (timer) clearTimeout(timer);
+        if (!resp || !resp.ok) continue;
+        var cType = resp.headers && resp.headers.get ? String(resp.headers.get('content-type') || '').toLowerCase() : '';
+        var text = await resp.text();
+        var trimmed = String(text || '').trim();
+        if (!trimmed || trimmed.charAt(0) === '<' || cType.indexOf('text/html') !== -1) continue;
+        var json = JSON.parse(trimmed);
+        var norm = (core && typeof core.normalizeVersionManifest === 'function')
+          ? core.normalizeVersionManifest(json)
+          : { version: String((json && (json.version || json.buildId)) || '').trim(), buildId: String((json && (json.buildId || json.version)) || '').trim(), builtAt: String((json && json.builtAt) || '') };
+        if (norm && norm.version) return norm;
+      } catch (_err) {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    return null;
+  }
+
+  function performSafeAutoReload(targetVersion, trigger) {
+    if (isUpdateReloadInFlight) return;
+    isUpdateReloadInFlight = true;
+    lastUpdateStatus = 'updating';
+    if (pendingUpdateDeferTimer) {
+      clearTimeout(pendingUpdateDeferTimer);
+      pendingUpdateDeferTimer = null;
+    }
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.setItem(AUTO_UPDATE_ATTEMPT_KEY, JSON.stringify({ version: targetVersion, at: Date.now() }));
+        sessionStorage.setItem(JUST_UPDATED_KEY, String(targetVersion || ''));
+      }
+    } catch (_eSess) {}
+    try {
+      if (typeof localStorage !== 'undefined' && targetVersion) {
+        localStorage.setItem('rg_crm_client_build', String(targetVersion));
+      }
+    } catch (_eLoc) {}
+    pushSyncDiagnostic('update', 'info', 'تم اكتشاف إصدار جديد (' + targetVersion + ') — جاري التحديث وإعادة التحميل تلقائياً', 'Trigger: ' + String(trigger || 'auto'));
+    stopAutoRefreshLoop();
+    toast((state.prefs.lang === 'en') ? 'New update detected — refreshing automatically...' : 'يتوفر إصدار جديد من النظام — جاري التحديث التلقائي...');
+    purgeAppCachesForReload().finally(function () {
+      setTimeout(function () {
+        try {
+          window.location.reload();
+        } catch (_eRel) {
+          window.location.href = window.location.href;
+        }
+      }, 450);
+    });
+  }
+
+  async function checkForUpdates(opts) {
+    var options = opts || {};
+    if (isUpdateReloadInFlight) return { updated: true, status: 'reloading' };
+    if (isAppOfflineNow()) return { updated: false, status: 'offline' };
+    if (isVersionCheckInFlight && !options.manual) return { updated: false, status: 'busy' };
+
+    isVersionCheckInFlight = true;
+    var core = root.RGCrmCore;
+    var curVer = String(root.__RG_BUILD_VERSION__ || '').trim();
+    try {
+      if (typeof root.__RG_CHECK_SW_UPDATE__ === 'function') {
+        root.__RG_CHECK_SW_UPDATE__().catch(function () {});
+      }
+      var manifest = await fetchRemoteVersionManifest();
+      lastVersionCheckAt = new Date().toISOString();
+      var remVer = String((manifest && manifest.version) || options.remoteVersionHint || '').trim();
+      if (remVer) lastCheckedRemoteVersion = remVer;
+
+      if (!remVer) {
+        lastUpdateStatus = 'unavailable';
+        if (options.manual) {
+          pushSyncDiagnostic('update', 'warn', 'تعذر قراءة ملف بيان الإصدار من الخادم', 'Trigger: ' + String(options.trigger || 'manual'));
+        }
+        return { updated: false, status: 'unavailable', currentVersion: curVer };
+      }
+
+      var lastAttempt = { version: '', at: 0 };
+      try {
+        var rawAtt = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(AUTO_UPDATE_ATTEMPT_KEY) : '';
+        if (rawAtt) lastAttempt = JSON.parse(rawAtt) || lastAttempt;
+      } catch (_eAtt) {}
+
+      var hasInFlightMut = Boolean(root.RGApi && typeof root.RGApi.hasInFlightMutations === 'function' && root.RGApi.hasInFlightMutations());
+      var hasUnsaved = Boolean(activeUnsavedGuard && typeof activeUnsavedGuard.isDirty === 'function' && activeUnsavedGuard.isDirty());
+
+      var decision = (core && typeof core.shouldTriggerAutoUpdateReload === 'function')
+        ? core.shouldTriggerAutoUpdateReload({
+            currentVersion: curVer,
+            remoteVersion: remVer,
+            isUpdating: isUpdateReloadInFlight,
+            lastAttemptVer: lastAttempt.version,
+            lastAttemptAt: lastAttempt.at,
+            cooldownMs: 30000,
+            hasInFlightMutations: hasInFlightMut,
+            hasUnsavedChanges: hasUnsaved,
+            ignoreUnsaved: Boolean(options.ignoreUnsaved)
+          })
+        : {
+            shouldReload: Boolean(curVer && remVer && curVer !== 'dev' && remVer !== 'dev' && curVer !== remVer && !hasInFlightMut && !hasUnsaved),
+            reason: (curVer === remVer) ? 'up_to_date' : 'new_version_detected',
+            targetVersion: remVer,
+            deferMs: 2500
+          };
+
+      if (decision.shouldReload) {
+        performSafeAutoReload(decision.targetVersion || remVer, options.trigger || 'version_check');
+        return { updated: true, status: 'reloading', currentVersion: curVer, remoteVersion: remVer };
+      }
+
+      if (decision.reason === 'up_to_date') {
+        lastUpdateStatus = 'up_to_date';
+        if (options.manual) {
+          pushSyncDiagnostic('update', 'info', 'التطبيق يعمل على أحدث إصدار متاح (' + curVer + ')', 'Trigger: ' + String(options.trigger || 'manual'));
+        }
+        return { updated: false, upToDate: true, status: 'up_to_date', currentVersion: curVer, remoteVersion: remVer };
+      }
+
+      if (decision.reason === 'cooldown_antiloop') {
+        lastUpdateStatus = 'cooldown';
+        pushSyncDiagnostic('update', 'warn', 'تم تأجيل إعادة التحميل التلقائي مؤقتاً لمنع التكرار السريع (' + remVer + ')', 'Wait: ' + Math.round(Number(decision.waitMs || 0) / 1000) + 's');
+        return { updated: false, status: 'cooldown', currentVersion: curVer, remoteVersion: remVer };
+      }
+
+      if (decision.reason === 'inflight_mutations' || decision.reason === 'unsaved_changes') {
+        lastUpdateStatus = 'deferred';
+        pushSyncDiagnostic('update', 'warn', 'تحديث جديد متاح (' + remVer + ') — مؤجل لحين انتهاء التعديلات الجارية', decision.reason);
+        if (decision.reason === 'unsaved_changes' && notifiedUnsavedUpdateVer !== remVer) {
+          notifiedUnsavedUpdateVer = remVer;
+          toast((state.prefs.lang === 'en') ? 'Update available — will apply automatically once unsaved edits are completed.' : 'يتوفر إصدار جديد — سيتم التحديث تلقائياً فور حفظ أو إغلاق التعديلات الحالية.');
+        }
+        if (pendingUpdateDeferTimer) clearTimeout(pendingUpdateDeferTimer);
+        pendingUpdateDeferTimer = setTimeout(function () {
+          pendingUpdateDeferTimer = null;
+          checkForUpdates({ trigger: 'deferred_retry', remoteVersionHint: remVer }).catch(function () {});
+        }, Number(decision.deferMs || 2500));
+        return { updated: false, deferred: true, status: decision.reason, currentVersion: curVer, remoteVersion: remVer };
+      }
+
+      return { updated: false, status: decision.reason || 'skipped', currentVersion: curVer, remoteVersion: remVer };
+    } finally {
+      isVersionCheckInFlight = false;
+    }
+  }
+
+  function handleSwControllerChange() {
+    if (isUpdateReloadInFlight) return;
+    var hasInFlightMut = Boolean(root.RGApi && typeof root.RGApi.hasInFlightMutations === 'function' && root.RGApi.hasInFlightMutations());
+    var hasUnsaved = Boolean(activeUnsavedGuard && typeof activeUnsavedGuard.isDirty === 'function' && activeUnsavedGuard.isDirty());
+    if (hasInFlightMut || hasUnsaved) {
+      pushSyncDiagnostic('update', 'warn', 'تم تفعيل عامل الخدمة الجديد (Service Worker) — في انتظار انتهاء التعديلات للتحديث', '');
+      if (pendingUpdateDeferTimer) clearTimeout(pendingUpdateDeferTimer);
+      pendingUpdateDeferTimer = setTimeout(function () {
+        pendingUpdateDeferTimer = null;
+        handleSwControllerChange();
+      }, 2500);
+      return;
+    }
+    pushSyncDiagnostic('update', 'info', 'تم تفعيل إصدار جديد من Service Worker — جاري تحديث الواجهة تلقائياً', 'controllerchange');
+    performSafeAutoReload(lastCheckedRemoteVersion || String(root.__RG_BUILD_VERSION__ || ''), 'sw_controllerchange');
+  }
+
+  root.RGUpdateManager = {
+    checkForUpdates: checkForUpdates,
+    handleSwControllerChange: handleSwControllerChange,
+    getStatus: getSyncStatusSummary
+  };
+
   function recordSseEventOnce(evData) {
     if (!evData || typeof evData !== 'object') return true;
     var key = String(evData.version || evData.at || '') + ':' + String(evData.type || '') + ':' + String(evData.action || '');
@@ -4152,6 +4427,57 @@
       delete seenSseEventIds[oldest];
     }
     return true;
+  }
+
+  function scheduleNextDeltaPoll() {
+    if (deltaSyncTimer) {
+      clearTimeout(deltaSyncTimer);
+      deltaSyncTimer = null;
+    }
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (isAppOfflineNow()) return;
+    var curUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    if (!curUser) return;
+    var core = root.RGCrmCore;
+    var delayMs = (core && typeof core.computeAdaptiveSyncDelay === 'function')
+      ? core.computeAdaptiveSyncDelay({
+          isOnline: !isAppOfflineNow(),
+          isVisible: typeof document === 'undefined' || document.visibilityState !== 'hidden',
+          sseConnected: sseConnected,
+          consecutiveErrors: consecutiveSyncErrors,
+          sseHeartbeatMs: 15000,
+          fallbackPollMs: 3000
+        })
+      : (sseConnected ? 15000 : 3000);
+    if (!delayMs || delayMs <= 0) return;
+    deltaSyncTimer = setTimeout(function () {
+      deltaSyncTimer = null;
+      runDeltaSync().catch(function () {});
+    }, delayMs);
+  }
+
+  async function syncSettingsChangesSilently(curUser) {
+    try {
+      if (!root.RGApi || !root.RGApi.callApi) return;
+      var sRes = await root.RGApi.callApi('getSettings', { forceRefresh: true, silentRefresh: true });
+      if (!sRes || !sRes.success || !sRes.data) return;
+      var sData = sRes.data;
+      if (sData.role_ui_defaults) {
+        setRoleUiDefaults(sData.role_ui_defaults);
+      }
+      if (sData.stats_control_config) {
+        setStatsControlConfig(sData.stats_control_config);
+      }
+      if (sData.ui_simplification) {
+        applyUiSimplification(sData.ui_simplification, true);
+      }
+      if (sData.handover_settings) {
+        setHandoverSettings(sData.handover_settings);
+      }
+      if (curUser) {
+        refreshSidebarNavDom(curUser);
+      }
+    } catch (_eSet) {}
   }
 
   async function runDeltaSync() {
@@ -4167,9 +4493,22 @@
         updatedAfter: state.lastDeltaSyncAt || '',
         silentRefresh: true
       });
-      if (!res || !res.success || !res.data) return;
+      if (!res || !res.success || !res.data) {
+        consecutiveSyncErrors += 1;
+        if (consecutiveSyncErrors === 1 || !networkDegraded) {
+          networkDegraded = true;
+          pushSyncDiagnostic('sync', 'warn', 'تعثر فحص المزامنة اللحظية — ستُعاد المحاولة تلقائياً', (res && res.message) || (res && res.error) || 'SYNC_RETRY');
+        }
+        return;
+      }
+      var wasRecovering = consecutiveSyncErrors > 0 || networkDegraded;
+      consecutiveSyncErrors = 0;
+      networkDegraded = false;
       var d = res.data;
       if (d.serverTime) state.lastDeltaSyncAt = d.serverTime;
+      if (typeof d.syncVersion === 'number' && d.syncVersion > lastSyncVersion) {
+        lastSyncVersion = d.syncVersion;
+      }
 
       if (root.RGApi && typeof root.RGApi.applyDeltaSyncToCache === 'function') {
         root.RGApi.applyDeltaSyncToCache(d);
@@ -4200,14 +4539,20 @@
         }
       }
 
+      if (d.changedSettings) {
+        syncSettingsChangesSilently(d.user || curUser).catch(function () {});
+      }
+
       var hasEmployeeChanges = Boolean(
         (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
-        (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0)
+        (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+        Boolean(d.changedDelegations) ||
+        Boolean(d.changedRoles)
       );
       if (hasEmployeeChanges && state.employees && state.employees.loaded) {
         var prevEmpItems = Array.isArray(state.employees.items) ? state.employees.items.slice() : [];
-        var mergedEmps = (root.RGCrmCore && root.RGCrmCore.mergeDeltaRecords)
-          ? root.RGCrmCore.mergeDeltaRecords(prevEmpItems, d.changedEmployees || [], 'id')
+        var mergedEmps = (root.RGCrmCore && root.RGCrmCore.mergeDeltaRecords && Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0)
+          ? root.RGCrmCore.mergeDeltaRecords(prevEmpItems, d.changedEmployees, 'id')
           : prevEmpItems;
         if (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) {
           var delEmpMap = {};
@@ -4226,31 +4571,59 @@
         (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
         (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
         hasEmployeeChanges ||
+        Boolean(d.changedSettings) ||
+        Boolean(d.deletedAllReservationsBefore) ||
+        (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
         Boolean(d.todayRadarCounts)
       );
 
       if (hasChanges && root.RGApi && root.RGApi.invalidateScopes) {
         var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps'];
-        if (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) {
+        if (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0 || d.deletedAllReservationsBefore) {
           scopesToInvalidate.push('reservations', 'followUps', 'problems');
         }
-        if (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) {
+        if (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0 || d.changedDelegations || d.changedRoles) {
           scopesToInvalidate.push('employees');
+        }
+        if (d.changedSettings) {
+          scopesToInvalidate.push('settings', 'employees');
         }
         root.RGApi.invalidateScopes(scopesToInvalidate);
       }
 
+      if (hasChanges) {
+        pushSyncDiagnostic(
+          'delta',
+          'info',
+          'تمت مزامنة تحديثات لحظية من الخادم',
+          'Res:' + ((d.changedReservations && d.changedReservations.length) || 0) +
+          ' · FU:' + ((d.changedFollowUps && d.changedFollowUps.length) || 0) +
+          ' · Prb:' + ((d.changedProblems && d.changedProblems.length) || 0)
+        );
+      }
+
       document.dispatchEvent(new CustomEvent('rg:deltasync', { detail: d }));
 
-      if (hasChanges && canRunSilentAutoRefreshNow()) {
+      if (wasRecovering) {
+        pushSyncDiagnostic('sync', 'info', 'تمت استعادة المزامنة مع الخادم وتحديث البيانات', '');
+        if (root.RGApi && typeof root.RGApi.syncOfflineQueue === 'function') {
+          root.RGApi.syncOfflineQueue().then(function () { updateOfflineBanner().catch(function () {}); }).catch(function () {});
+        }
+        refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
+      } else if (hasChanges && canRunSilentAutoRefreshNow()) {
         if (state.route === 'activity' || state.route === 'reports') {
           refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
         }
       }
-    } catch (_err) {
-      // silent delta poll failure
+    } catch (err) {
+      consecutiveSyncErrors += 1;
+      if (!networkDegraded) {
+        networkDegraded = true;
+        pushSyncDiagnostic('sync', 'warn', 'انقطاع مؤقت في الاتصال أثناء المزامنة', (err && err.message) || 'NETWORK_ERROR');
+      }
     } finally {
       isDeltaSyncInFlight = false;
+      scheduleNextDeltaPoll();
     }
   }
 
@@ -4263,6 +4636,7 @@
   }
 
   function stopSseConnection() {
+    sseConnected = false;
     if (sseReconnectTimer) {
       clearTimeout(sseReconnectTimer);
       sseReconnectTimer = null;
@@ -4277,6 +4651,10 @@
     var evData = null;
     if (ev && ev.data) {
       try { evData = JSON.parse(ev.data); } catch (_e) { evData = null; }
+    }
+    if (ev && ev.type === 'ready' && evData && evData.appVersion) {
+      checkForUpdates({ trigger: 'sse_ready', remoteVersionHint: evData.appVersion }).catch(function () {});
+      return;
     }
     if (evData && !recordSseEventOnce(evData)) return;
 
@@ -4303,14 +4681,32 @@
     try {
       var src = new EventSource('/api/events?token=' + encodeURIComponent(token));
       sseSource = src;
+      src.addEventListener('open', function () {
+        var wasDisconnected = sseErrorCount > 0;
+        sseConnected = true;
+        sseErrorCount = 0;
+        scheduleNextDeltaPoll();
+        if (wasDisconnected) {
+          pushSyncDiagnostic('sse', 'info', 'تمت استعادة قناة البث اللحظي (SSE)', '');
+          runDeltaSync().catch(function () {});
+        }
+      });
+      src.addEventListener('ready', handleIncomingSseEvent);
       src.addEventListener('crm', handleIncomingSseEvent);
       src.addEventListener('delta', handleIncomingSseEvent);
       src.addEventListener('announcement', handleIncomingSseEvent);
       src.addEventListener('lock', handleIncomingSseEvent);
+      src.addEventListener('settings', handleIncomingSseEvent);
       src.onerror = function () {
         stopSseConnection();
-        if (root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser() && !isAppOfflineNow()) {
-          sseReconnectTimer = setTimeout(startSseConnection, 10000);
+        sseErrorCount += 1;
+        if (sseErrorCount === 1) {
+          pushSyncDiagnostic('sse', 'info', 'تم تفعيل وضع المزامنة السريعة التلقائي (Polling 3s)', 'SSE fallback');
+        }
+        scheduleNextDeltaPoll();
+        if (root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser() && !isAppOfflineNow() && (!document || document.visibilityState !== 'hidden')) {
+          var backoffMs = Math.min(30000, 3000 * Math.pow(2, Math.min(3, sseErrorCount - 1)));
+          sseReconnectTimer = setTimeout(startSseConnection, backoffMs);
         }
       };
     } catch (_e) {}
@@ -4322,8 +4718,12 @@
       autoRefreshTimer = null;
     }
     if (deltaSyncTimer) {
-      clearInterval(deltaSyncTimer);
+      clearTimeout(deltaSyncTimer);
       deltaSyncTimer = null;
+    }
+    if (versionCheckTimer) {
+      clearInterval(versionCheckTimer);
+      versionCheckTimer = null;
     }
     stopSseConnection();
   }
@@ -4334,14 +4734,16 @@
     autoRefreshTimer = setInterval(function () {
       refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
     }, 60000);
-    deltaSyncTimer = setInterval(function () {
-      runDeltaSync().catch(function () {});
-    }, 20000);
+    versionCheckTimer = setInterval(function () {
+      checkForUpdates({ trigger: 'periodic' }).catch(function () {});
+    }, 45000);
     startSseConnection();
+    scheduleNextDeltaPoll();
   }
 
   function startAutoRefreshLoop() {
     scheduleRefreshInterval();
+    checkForUpdates({ trigger: 'boot' }).catch(function () {});
 
     if (!autoRefreshListenersBound) {
       autoRefreshListenersBound = true;
@@ -4353,6 +4755,7 @@
         }
         if (document.visibilityState === 'visible') {
           scheduleRefreshInterval();
+          checkForUpdates({ trigger: 'visibility' }).catch(function () {});
           runDeltaSync().catch(function () {});
           if (lastHiddenAt && (Date.now() - lastHiddenAt >= 5000)) {
             lastHiddenAt = 0;
@@ -4360,8 +4763,44 @@
           }
         }
       });
+      window.addEventListener('focus', function () {
+        if (document && document.visibilityState === 'hidden') return;
+        checkForUpdates({ trigger: 'focus' }).catch(function () {});
+      });
+      document.addEventListener('rg:versionmismatch', function (ev) {
+        var det = (ev && ev.detail) || {};
+        checkForUpdates({ trigger: 'header_mismatch', remoteVersionHint: det.remoteVersion || '' }).catch(function () {});
+      });
+      document.addEventListener('rg:swupdatefound', function () {
+        checkForUpdates({ trigger: 'sw_updatefound' }).catch(function () {});
+      });
+      document.addEventListener('rg:swcontrollerchange', function () {
+        handleSwControllerChange();
+      });
+      document.addEventListener('rg:optimisticrollback', function (ev) {
+        var det = (ev && ev.detail) || {};
+        pushSyncDiagnostic('conflict', 'warn', 'تم التراجع عن تعديل محلي لعدم حفظه على الخادم ومزامنة الحالة الصحيحة', String(det.action || ''));
+        toast((state.prefs.lang === 'en') ? 'Change was not confirmed on server — synchronized latest database state.' : 'تعذر اعتماد التعديل أو تم تغييره من مستخدم آخر — تمت مزامنة أحدث بيانات من الخادم.', true);
+        runDeltaSync().catch(function () {});
+        refreshCurrentRouteAndNotifications({ manual: true }).catch(function () {});
+      });
+      document.addEventListener('rg:networkstate', function (ev) {
+        var det = (ev && ev.detail) || {};
+        updateOfflineBanner().catch(function () {});
+        if (det.online === false) {
+          pushSyncDiagnostic('network', 'warn', 'انقطاع الاتصال بالخادم — تفعيل الوضع المؤقت وإعادة المحاولة التلقائية', String(det.reason || ''));
+        } else if (det.online === true) {
+          pushSyncDiagnostic('network', 'info', 'استعادة الاتصال بالخادم — جاري مزامنة التغييرات وفحص التحديثات', String(det.reason || ''));
+          if (root.RGApi && typeof root.RGApi.syncOfflineQueue === 'function') {
+            root.RGApi.syncOfflineQueue().then(function () { updateOfflineBanner().catch(function () {}); }).catch(function () {});
+          }
+          runDeltaSync().catch(function () {});
+          checkForUpdates({ trigger: 'network_recovered' }).catch(function () {});
+        }
+      });
       window.addEventListener('online', function () {
         updateOfflineBanner().catch(function () {});
+        pushSyncDiagnostic('network', 'info', 'عودة اتصال الإنترنت — مزامنة الطابور المحلي وفحص الإصدار', '');
         if (root.RGApi && typeof root.RGApi.syncOfflineQueue === 'function') {
           root.RGApi.syncOfflineQueue().then(function (sRes) {
             updateOfflineBanner().catch(function () {});
@@ -4371,11 +4810,13 @@
           }).catch(function () {});
         }
         scheduleRefreshInterval();
+        checkForUpdates({ trigger: 'online' }).catch(function () {});
         runDeltaSync().catch(function () {});
         refreshCurrentRouteAndNotifications({ manual: false }).catch(function () {});
       });
       window.addEventListener('offline', function () {
         updateOfflineBanner().catch(function () {});
+        pushSyncDiagnostic('network', 'warn', 'تم فقدان الاتصال بالإنترنت (Offline Mode)', '');
         stopSseConnection();
       });
       window.addEventListener('rg:offlinequeuechange', function () {
@@ -4679,6 +5120,10 @@
     updateOfflineBanner: updateOfflineBanner,
     openPwaInstallFlow: openPwaInstallFlow,
     runDeltaSync: runDeltaSync,
+    checkForUpdates: checkForUpdates,
+    getSyncDiagnostics: getSyncDiagnostics,
+    getSyncStatusSummary: getSyncStatusSummary,
+    pushSyncDiagnostic: pushSyncDiagnostic,
     openPersonalAccountSettingsModal: openPersonalAccountSettingsModal,
     openScreenOrganizerModal: openScreenOrganizerModal,
     getEmployeesState: getEmployeesState,
@@ -4826,6 +5271,16 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     applyThemeAndLang();
+    try {
+      var justUpdatedVer = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(JUST_UPDATED_KEY) : '';
+      if (justUpdatedVer) {
+        sessionStorage.removeItem(JUST_UPDATED_KEY);
+        pushSyncDiagnostic('update', 'info', 'اكتمل التحديث التلقائي إلى الإصدار ' + justUpdatedVer, '');
+        setTimeout(function () {
+          toast((state.prefs.lang === 'en') ? ('Updated automatically to version ' + justUpdatedVer) : ('تم تحديث النظام تلقائياً إلى أحدث إصدار (' + justUpdatedVer + ')'));
+        }, 650);
+      }
+    } catch (_eBootUpd) {}
     bootAuthenticatedApp().catch(function (err) {
       toast((err && err.message) || 'تعذر تهيئة التطبيق.', true);
     });

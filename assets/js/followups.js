@@ -529,11 +529,32 @@
         var relevant = Boolean(
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
-          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0)
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+          Boolean(d.deletedAllReservationsBefore) ||
+          Boolean(d.changedSettings)
         );
         if (!relevant) return;
         var activeEl = document.activeElement;
-        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+          if (!container._rgPendingMyFuDelta) {
+            container._rgPendingMyFuDelta = true;
+            container.addEventListener('focusout', function onBlurMyFuDelta() {
+              setTimeout(function () {
+                if (!container || !container.isConnected) return;
+                var curAct = document.activeElement;
+                if (curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName)) {
+                  container.addEventListener('focusout', onBlurMyFuDelta, { once: true });
+                  return;
+                }
+                container._rgPendingMyFuDelta = false;
+                renderMyFollowUps(container, ctx);
+              }, 120);
+            }, { once: true });
+          }
+          return;
+        }
         renderMyFollowUps(container, ctx);
       };
       document.addEventListener('rg:deltasync', onMyFuDelta);
@@ -695,11 +716,32 @@
         var relevant = Boolean(
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
-          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0)
+          (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+          Boolean(d.deletedAllReservationsBefore) ||
+          Boolean(d.changedSettings)
         );
         if (!relevant) return;
         var activeEl = document.activeElement;
-        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+          if (!container._rgPendingTeamFuDelta) {
+            container._rgPendingTeamFuDelta = true;
+            container.addEventListener('focusout', function onBlurTeamFuDelta() {
+              setTimeout(function () {
+                if (!container || !container.isConnected) return;
+                var curAct = document.activeElement;
+                if (curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName)) {
+                  container.addEventListener('focusout', onBlurTeamFuDelta, { once: true });
+                  return;
+                }
+                container._rgPendingTeamFuDelta = false;
+                renderTeamFollowUps(container, ctx);
+              }, 120);
+            }, { once: true });
+          }
+          return;
+        }
         renderTeamFollowUps(container, ctx);
       };
       document.addEventListener('rg:deltasync', onTeamFuDelta);

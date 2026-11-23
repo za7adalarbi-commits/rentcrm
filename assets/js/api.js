@@ -43,6 +43,52 @@
   var detectedServerSyncMeta = null;
   var backendProbeDone = false;
   var backendProbePromise = null;
+  var lastKnownNetworkOnline = true;
+  var lastDispatchedRemoteVersion = '';
+
+  function notifyNetworkState(online, reason, detail) {
+    try {
+      var nextOnline = Boolean(online);
+      if (nextOnline !== lastKnownNetworkOnline) {
+        lastKnownNetworkOnline = nextOnline;
+        if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+          document.dispatchEvent(new CustomEvent('rg:networkstate', {
+            detail: {
+              online: nextOnline,
+              reason: reason || (nextOnline ? 'recovered' : 'failed'),
+              detail: detail || '',
+              at: Date.now()
+            }
+          }));
+        }
+      }
+    } catch (_eNet) {}
+  }
+
+  function detectVersionHeader(resp) {
+    try {
+      if (!resp || !resp.headers || typeof resp.headers.get !== 'function') return;
+      var remoteVer = String(resp.headers.get('x-app-version') || resp.headers.get('X-App-Version') || '').trim();
+      var curVer = String(root.__RG_BUILD_VERSION__ || '').trim();
+      var core = root.RGCrmCore;
+      if (!remoteVer || !curVer) return;
+      var isDifferent = (core && typeof core.compareAppVersions === 'function')
+        ? core.compareAppVersions(curVer, remoteVer)
+        : (curVer !== 'dev' && remoteVer !== 'dev' && curVer !== 'local' && remoteVer !== 'local' && curVer !== remoteVer);
+      if (isDifferent && remoteVer !== lastDispatchedRemoteVersion) {
+        lastDispatchedRemoteVersion = remoteVer;
+        if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+          document.dispatchEvent(new CustomEvent('rg:versionmismatch', {
+            detail: {
+              remoteVersion: remoteVer,
+              currentVersion: curVer,
+              at: Date.now()
+            }
+          }));
+        }
+      }
+    } catch (_eVer) {}
+  }
 
   function getConfiguredMode() {
     var search = typeof window !== 'undefined' ? window.location.search : '';
@@ -128,7 +174,9 @@
         }
         var resp = await fetch('/api/health', opts);
         if (timer) clearTimeout(timer);
+        if (resp) detectVersionHeader(resp);
         if (resp && resp.ok) {
+          notifyNetworkState(true, 'health_ok', '/api/health');
           var healthContentType = resp.headers && resp.headers.get ? String(resp.headers.get('content-type') || '').toLowerCase() : '';
           var healthText = await resp.text();
           var trimmedHealth = String(healthText || '').trim();
@@ -6164,6 +6212,20 @@
     var ns = getCacheNamespace();
     var core = root.RGCrmCore;
     var touchedScopes = {};
+    var extraInvalidates = [];
+
+    if (delta.deletedAllReservationsBefore) {
+      touchedScopes.reservations = true;
+      touchedScopes.todayRadar = true;
+      touchedScopes.dashboard = true;
+      touchedScopes.followUps = true;
+      touchedScopes.problems = true;
+      touchedScopes.reports = true;
+      touchedScopes.activity = true;
+      setLocalReservationsState(ns, [], false);
+      localDetailsByNs[ns] = {};
+      extraInvalidates.push('reservations', 'todayRadar', 'dashboard', 'followUps', 'problems', 'reports', 'activity');
+    }
 
     var chRes = Array.isArray(delta.changedReservations) ? delta.changedReservations : [];
     if (chRes.length > 0) {
@@ -6211,13 +6273,43 @@
         });
         if (fuResPatch.length) writeLocalReservationsState(ns, fuResPatch, false);
       }
+      if (localDetailsByNs[ns] && core && core.mergeDeltaRecords) {
+        var fuByRes = {};
+        chFu.forEach(function (f) {
+          if (!f || !f.reservationId) return;
+          if (!fuByRes[f.reservationId]) fuByRes[f.reservationId] = [];
+          fuByRes[f.reservationId].push(f);
+        });
+        Object.keys(fuByRes).forEach(function (rid) {
+          var detEntry = localDetailsByNs[ns][rid];
+          if (detEntry) {
+            var cleanExisting = (Array.isArray(detEntry.followUps) ? detEntry.followUps : []).filter(function (f) {
+              return f && String(f.id || '').indexOf('FU_OPT_') !== 0;
+            });
+            detEntry.followUps = core.mergeDeltaRecords(cleanExisting, fuByRes[rid], 'id');
+            detEntry.cachedAt = Date.now();
+            if (root.RGIdbCache) {
+              root.RGIdbCache.upsertReservationDetail(ns, detEntry).catch(function () {});
+            }
+          }
+        });
+      }
       if (core && core.mergeDeltaRecords) {
-        patchCachedScopes(['followUps'], function (data, actName) {
+        patchCachedScopes(['followUps', 'reservations'], function (data, actName) {
           if ((actName === 'getTeamFollowUps' || actName === 'getMyFollowUps') && Array.isArray(data.items)) {
             return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chFu, 'id') });
           }
           if (actName === 'getMyFollowUps' && Array.isArray(data.followUps)) {
             return Object.assign({}, data, { followUps: core.mergeDeltaRecords(data.followUps, chFu, 'id') });
+          }
+          if (actName === 'getReservationDetails' && data.reservation && data.reservation.id) {
+            var resFus = chFu.filter(function (f) { return f && f.reservationId === data.reservation.id; });
+            if (resFus.length > 0) {
+              var existingFus = (Array.isArray(data.followUps) ? data.followUps : []).filter(function (f) {
+                return f && String(f.id || '').indexOf('FU_OPT_') !== 0;
+              });
+              return Object.assign({}, data, { followUps: core.mergeDeltaRecords(existingFus, resFus, 'id') });
+            }
           }
           return undefined;
         });
@@ -6229,8 +6321,38 @@
       touchedScopes.problems = true;
       touchedScopes.dashboard = true;
       touchedScopes.reports = true;
+      if (localReservationsByNs[ns] && localReservationsByNs[ns].byId) {
+        var prbResPatch = [];
+        chPrb.forEach(function (p) {
+          if (p && p.reservationId && localReservationsByNs[ns].byId[p.reservationId]) {
+            prbResPatch.push(Object.assign({}, localReservationsByNs[ns].byId[p.reservationId], { hasProblem: true }));
+          }
+        });
+        if (prbResPatch.length) writeLocalReservationsState(ns, prbResPatch, false);
+      }
+      if (localDetailsByNs[ns] && core && core.mergeDeltaRecords) {
+        var prbByRes = {};
+        chPrb.forEach(function (p) {
+          if (!p || !p.reservationId) return;
+          if (!prbByRes[p.reservationId]) prbByRes[p.reservationId] = [];
+          prbByRes[p.reservationId].push(p);
+        });
+        Object.keys(prbByRes).forEach(function (rid) {
+          var detEntry = localDetailsByNs[ns][rid];
+          if (detEntry) {
+            var cleanExistingPrb = (Array.isArray(detEntry.problems) ? detEntry.problems : []).filter(function (p) {
+              return p && String(p.id || '').indexOf('PRB_OPT_') !== 0;
+            });
+            detEntry.problems = core.mergeDeltaRecords(cleanExistingPrb, prbByRes[rid], 'id');
+            detEntry.cachedAt = Date.now();
+            if (root.RGIdbCache) {
+              root.RGIdbCache.upsertReservationDetail(ns, detEntry).catch(function () {});
+            }
+          }
+        });
+      }
       if (core && core.mergeDeltaRecords) {
-        patchCachedScopes(['problems'], function (data, actName) {
+        patchCachedScopes(['problems', 'reservations'], function (data, actName) {
           if (actName === 'getProblems' && Array.isArray(data.items)) {
             return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chPrb, 'id') });
           }
@@ -6238,18 +6360,34 @@
             var mp = chPrb.find(function (x) { return x && x.id === data.problem.id; });
             if (mp) return Object.assign({}, data, { problem: Object.assign({}, data.problem, mp) });
           }
+          if (actName === 'getReservationDetails' && data.reservation && data.reservation.id) {
+            var resPrbs = chPrb.filter(function (p) { return p && p.reservationId === data.reservation.id; });
+            if (resPrbs.length > 0) {
+              var existingPrbs = (Array.isArray(data.problems) ? data.problems : []).filter(function (p) {
+                return p && String(p.id || '').indexOf('PRB_OPT_') !== 0;
+              });
+              return Object.assign({}, data, { problems: core.mergeDeltaRecords(existingPrbs, resPrbs, 'id') });
+            }
+          }
           return undefined;
         });
       }
     }
 
     var chEmp = Array.isArray(delta.changedEmployees) ? delta.changedEmployees : [];
-    if (chEmp.length > 0) {
+    var delEmpIds = Array.isArray(delta.deletedEmployeeIds) ? delta.deletedEmployeeIds : [];
+    if (chEmp.length > 0 || delEmpIds.length > 0) {
       touchedScopes.employees = true;
+      var delEmpMap = {};
+      delEmpIds.forEach(function (id) { if (id) delEmpMap[String(id)] = true; });
       if (core && core.mergeDeltaRecords) {
         patchCachedScopes(['employees'], function (data, actName) {
           if (actName === 'getEmployees' && Array.isArray(data.items)) {
-            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chEmp, 'id') });
+            var nextItems = chEmp.length > 0 ? core.mergeDeltaRecords(data.items, chEmp, 'id') : data.items.slice();
+            if (delEmpIds.length > 0) {
+              nextItems = nextItems.filter(function (emp) { return emp && !delEmpMap[String(emp.id)]; });
+            }
+            return Object.assign({}, data, { items: nextItems });
           }
           return undefined;
         });
@@ -6266,6 +6404,21 @@
       patchCachedScopes(['announcements'], function (data) {
         return Object.assign({}, data, { activeItems: delta.announcements });
       });
+    }
+
+    if (Array.isArray(delta.deletedAnnouncementIds) && delta.deletedAnnouncementIds.length > 0) {
+      touchedScopes.announcements = true;
+      extraInvalidates.push('announcements');
+    }
+
+    if (delta.changedDelegations || delta.changedRoles) {
+      touchedScopes.employees = true;
+      extraInvalidates.push('employees');
+    }
+    if (delta.changedSettings) {
+      touchedScopes.settings = true;
+      touchedScopes.dashboard = true;
+      extraInvalidates.push('settings', 'dashboard', 'employees');
     }
 
     var delResIds = Array.isArray(delta.deletedReservationIds) ? delta.deletedReservationIds : [];
@@ -6302,12 +6455,18 @@
       });
     }
 
-    var invalidateList = [];
+    if (delta.hasMoreReservations) extraInvalidates.push('reservations', 'todayRadar');
+    if (delta.hasMoreFollowUps) extraInvalidates.push('followUps');
+    if (delta.hasMoreProblems) extraInvalidates.push('problems');
+
+    var invalidateList = extraInvalidates.slice();
     if (touchedScopes.dashboard) invalidateList.push('dashboard');
     if (touchedScopes.todayRadar) invalidateList.push('todayRadar');
     if (touchedScopes.reports) invalidateList.push('reports');
     if (invalidateList.length > 0) {
-      clearCache(invalidateList);
+      var dedupInv = [];
+      invalidateList.forEach(function (sc) { if (sc && dedupInv.indexOf(sc) === -1) dedupInv.push(sc); });
+      clearCache(dedupInv);
     }
 
     if (delta.syncVersion && root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
@@ -6344,7 +6503,7 @@
     var obj = (payload && typeof payload === 'object') ? payload : {};
     var clone = {};
     Object.keys(obj).sort().forEach(function (k) {
-      if (k === 'clientRequestId' || k === 'expectedUpdatedAt' || k === 'nowMs' || k === '_keepOptimisticCache' || k === '_replayingOfflineQueue') return;
+      if (k === 'clientRequestId' || k === 'expectedUpdatedAt' || k === 'nowMs' || k === '_keepOptimisticCache' || k === '_replayingOfflineQueue' || k === 'originTabId') return;
       clone[k] = obj[k];
     });
     var serialized = '';
@@ -6412,9 +6571,11 @@
     if (!reqPayload.clientRequestId && !(core && core.SPAM_GUARD_EXEMPT_ACTIONS && core.SPAM_GUARD_EXEMPT_ACTIONS[action])) {
       reqPayload.clientRequestId = generateClientRequestId(action);
     }
-    payload = reqPayload;
-
     var policy = (core && core.getApiCachePolicy) ? core.getApiCachePolicy(action) : { cacheable: false, ttlMs: 0, scope: '' };
+    if (!policy.cacheable && !reqPayload.originTabId && root.__RG_TAB_ID__) {
+      reqPayload.originTabId = String(root.__RG_TAB_ID__);
+    }
+    payload = reqPayload;
     var isSilentRefresh = Boolean(payload && payload.silentRefresh);
     var isForceRefresh = Boolean(payload && payload.forceRefresh);
     var abortKey = payload && payload.abortKey ? String(payload.abortKey).trim() : '';
@@ -6641,6 +6802,10 @@
               }, bTimeoutMs);
             }
             var bResponse = await fetch(backendUrl, bOpts);
+            if (bResponse) {
+              detectVersionHeader(bResponse);
+              notifyNetworkState(true, 'api_ok', action);
+            }
             var bContentType = bResponse.headers && bResponse.headers.get ? (bResponse.headers.get('content-type') || '') : '';
             var bText = await bResponse.text();
             if (bTimeoutId) clearTimeout(bTimeoutId);
@@ -6679,6 +6844,7 @@
             }
             var isBAbort = bTimedOut || (bErr && (bErr.name === 'AbortError' || String(bErr.message || '').indexOf('abort') !== -1));
             networkFailed = true;
+            notifyNetworkState(false, isBAbort ? 'timeout' : 'network_error', action);
             parsed = {
               success: false,
               message: isBAbort
@@ -7237,6 +7403,7 @@
           payload: payload || {}
         })
       });
+      if (resp) detectVersionHeader(resp);
       if (resp.status === 404 || resp.status === 405) {
         return { success: false, staticHostOnly: true, message: 'الخادم الخلفي غير متاح على هذه الاستضافة.' };
       }
@@ -7280,6 +7447,7 @@
     }
     try {
       var resp = await fetch('/api/health', { method: 'GET', cache: 'no-store' });
+      if (resp) detectVersionHeader(resp);
       var latencyMs = Math.max(1, Date.now() - startedAt);
       var cType = resp.headers && resp.headers.get ? String(resp.headers.get('content-type') || '').toLowerCase() : '';
       var text = await resp.text();
@@ -7551,6 +7719,7 @@
     getLocalCacheStats: getLocalCacheStats,
     applyOptimisticMutation: applyOptimisticMutation,
     restoreLatestOptimisticSnapshot: restoreLatestOptimisticSnapshot,
+    hasInFlightMutations: function () { return Object.keys(inFlightMutations).length > 0; },
     isOfflineQueueableAction: isOfflineQueueableAction,
     getOfflineQueueStatus: getOfflineQueueStatus,
     syncOfflineQueue: syncOfflineQueue,

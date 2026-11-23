@@ -2488,6 +2488,16 @@
 
     if (!container._rgResDeltaBound) {
       container._rgResDeltaBound = true;
+      var runPendingResDelta = function () {
+        if (!container || !container.isConnected) return;
+        refreshTableRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+        refreshRadarData(false, { forceRefresh: true }).catch(function () {});
+        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+          ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+        } else {
+          calendarRawItems = null;
+        }
+      };
       var onResDeltaSync = function (ev) {
         if (!container || !container.isConnected) {
           document.removeEventListener('rg:deltasync', onResDeltaSync);
@@ -2499,19 +2509,37 @@
           (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
           (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+          Boolean(d.deletedAllReservationsBefore) ||
+          Boolean(d.changedSettings) ||
+          Boolean(d.changedDelegations) ||
+          Boolean(d.changedRoles) ||
           Boolean(d.todayRadarCounts)
         );
         if (!relevant) return;
         var activeEl = document.activeElement;
         var editingControl = Boolean(activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName));
-        if (editingControl) return;
-        refreshTableRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
-        refreshRadarData(false, { forceRefresh: true }).catch(function () {});
-        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
-          ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true }).catch(function () {});
-        } else {
-          calendarRawItems = null;
+        if (editingControl) {
+          if (!container._rgPendingResDelta) {
+            container._rgPendingResDelta = true;
+            container.addEventListener('focusout', function onBlurResDelta() {
+              setTimeout(function () {
+                if (!container || !container.isConnected) return;
+                var curAct = document.activeElement;
+                var stillEditing = Boolean(curAct && container.contains(curAct) && /^(INPUT|TEXTAREA|SELECT)$/.test(curAct.tagName));
+                if (stillEditing) {
+                  container.addEventListener('focusout', onBlurResDelta, { once: true });
+                  return;
+                }
+                container._rgPendingResDelta = false;
+                runPendingResDelta();
+              }, 120);
+            }, { once: true });
+          }
+          return;
         }
+        runPendingResDelta();
       };
       document.addEventListener('rg:deltasync', onResDeltaSync);
     }
@@ -2856,6 +2884,21 @@
       var det = ev.detail;
       var curBackdrop = document.getElementById('res-drawer-backdrop');
       if (!curBackdrop || curBackdrop.getAttribute('data-res-id') !== String(d.reservation.id)) return;
+      var curResId = String(d.reservation.id);
+
+      var wasDeleted = Boolean(det.deletedAllReservationsBefore) || (
+        Array.isArray(det.deletedReservationIds) &&
+        det.deletedReservationIds.some(function (did) { return String(did) === curResId; })
+      );
+      if (wasDeleted) {
+        cleanupDrawerLifecycle();
+        curBackdrop.remove();
+        if (ctx && typeof ctx.toast === 'function') {
+          ctx.toast(isEn ? 'This reservation was removed from the database.' : 'تم حذف هذا الحجز من قاعدة البيانات.');
+        }
+        return;
+      }
+
       if (Array.isArray(det.locks)) {
         var foundLock = det.locks.find(function (l) {
           return l && l.reservationId === d.reservation.id && user && l.lockedById !== user.id;
@@ -2870,30 +2913,57 @@
           }
         }
       }
-      if (Array.isArray(det.changedReservations)) {
-        var changed = det.changedReservations.find(function (x) { return x && x.id === d.reservation.id; });
-        if (changed && changed.updatedAt && changed.updatedAt !== d.reservation.updatedAt) {
-          var byName = changed.lastUpdatedByName || (isEn ? 'colleague' : 'زميل');
-          if (user && changed.lastUpdatedById === user.id) return;
-          remoteConflictInfo = { byName: byName, updatedAt: changed.updatedAt };
-          var cHost = document.getElementById('drawer-conflict-host');
-          if (cHost) {
-            cHost.innerHTML =
-              '<div class="rg-conflict-banner" role="alert">' +
-                '<span>⚡ ' + (isEn ? ('This booking was updated by ' + esc(byName) + '.') : ('تم تحديث هذا الحجز بواسطة ' + esc(byName) + '.')) + '</span>' +
-                '<button type="button" class="btn btn-sm btn-primary" id="drawer-reload-conflict-btn">' + (isEn ? 'Reload Latest' : 'اضغط للتحديث') + '</button>' +
-              '</div>';
-            var rBtn = document.getElementById('drawer-reload-conflict-btn');
-            if (rBtn) {
-              rBtn.addEventListener('click', async function () {
-                remoteConflictInfo = null;
-                var fresh = await root.RGApi.callApi('getReservationDetails', { reservationId: d.reservation.id, forceRefresh: true });
-                if (fresh && fresh.success && fresh.data && fresh.data.reservation) {
-                  d = fresh.data;
-                  paintDrawer();
-                }
-              });
+
+      var changedRes = Array.isArray(det.changedReservations)
+        ? det.changedReservations.find(function (x) { return x && String(x.id) === curResId; })
+        : null;
+      var changedResFollowUp = Array.isArray(det.changedFollowUps)
+        ? det.changedFollowUps.some(function (f) { return f && String(f.reservationId) === curResId && (!user || String(f.employeeId || '') !== String(user.id || '')); })
+        : false;
+      var changedResProblem = Array.isArray(det.changedProblems)
+        ? det.changedProblems.some(function (p) { return p && String(p.reservationId) === curResId; })
+        : false;
+
+      var hasResUpdate = Boolean(
+        (changedRes && changedRes.updatedAt && changedRes.updatedAt !== d.reservation.updatedAt && (!user || changedRes.lastUpdatedById !== user.id)) ||
+        changedResFollowUp ||
+        changedResProblem
+      );
+      if (hasResUpdate) {
+        var byName = (changedRes && changedRes.lastUpdatedByName) || (isEn ? 'colleague' : 'زميل');
+        var activeEl = document.activeElement;
+        var isTypingInDrawer = Boolean(activeEl && modalRoot.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/i.test(activeEl.tagName));
+        if (!isTypingInDrawer) {
+          root.RGApi.callApi('getReservationDetails', { reservationId: curResId, forceRefresh: true, silentRefresh: true }).then(function (fresh) {
+            if (drawerCleanedUp) return;
+            var latestBackdrop = document.getElementById('res-drawer-backdrop');
+            if (!latestBackdrop || latestBackdrop.getAttribute('data-res-id') !== curResId) return;
+            if (fresh && fresh.success && fresh.data && fresh.data.reservation) {
+              remoteConflictInfo = null;
+              d = fresh.data;
+              paintDrawer();
             }
+          }).catch(function () {});
+          return;
+        }
+        remoteConflictInfo = { byName: byName, updatedAt: (changedRes && changedRes.updatedAt) || new Date().toISOString() };
+        var cHost = document.getElementById('drawer-conflict-host');
+        if (cHost) {
+          cHost.innerHTML =
+            '<div class="rg-conflict-banner" role="alert">' +
+              '<span>⚡ ' + (isEn ? ('This booking was updated by ' + esc(byName) + '.') : ('تم تحديث هذا الحجز بواسطة ' + esc(byName) + '.')) + '</span>' +
+              '<button type="button" class="btn btn-sm btn-primary" id="drawer-reload-conflict-btn">' + (isEn ? 'Reload Latest' : 'اضغط للتحديث') + '</button>' +
+            '</div>';
+          var rBtn = document.getElementById('drawer-reload-conflict-btn');
+          if (rBtn) {
+            rBtn.addEventListener('click', async function () {
+              remoteConflictInfo = null;
+              var fresh = await root.RGApi.callApi('getReservationDetails', { reservationId: curResId, forceRefresh: true });
+              if (fresh && fresh.success && fresh.data && fresh.data.reservation) {
+                d = fresh.data;
+                paintDrawer();
+              }
+            });
           }
         }
       }

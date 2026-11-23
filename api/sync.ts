@@ -4,6 +4,7 @@ import { logBackendError } from '../backend/logger.js';
 import { ensureSeededDatabase } from '../backend/queries.js';
 import { ensureSyncApiSecret } from '../backend/serverConfig.js';
 import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch } from '../backend/syncService.js';
+import { attachAppVersionHeaders } from '../backend/versionManifest.js';
 
 function parseBody(rawBody: any): Record<string, any> {
   if (!rawBody) return {};
@@ -32,6 +33,7 @@ function extractProvidedSecret(req: any, body: Record<string, any>): string {
 }
 
 export default async function handler(req: any, res: any) {
+  attachAppVersionHeaders(res);
   if (typeof res.setHeader === 'function') {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   }

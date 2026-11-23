@@ -2106,6 +2106,20 @@
     return base + cleanRel;
   }
 
+  function buildCacheBustedUrl(url, buildVersion) {
+    var cleanUrl = normalizeStr(url);
+    var ver = normalizeStr(buildVersion);
+    if (!cleanUrl || !ver || ver === 'dev' || ver === 'local') return cleanUrl;
+    var hashIdx = cleanUrl.indexOf('#');
+    var basePart = hashIdx === -1 ? cleanUrl : cleanUrl.slice(0, hashIdx);
+    var hashPart = hashIdx === -1 ? '' : cleanUrl.slice(hashIdx);
+    if (/(?:[?&])v=/.test(basePart)) {
+      return basePart.replace(/([?&]v=)[^&#]*/, '$1' + encodeURIComponent(ver)) + hashPart;
+    }
+    var sep = basePart.indexOf('?') === -1 ? '?' : '&';
+    return basePart + sep + 'v=' + encodeURIComponent(ver) + hashPart;
+  }
+
   function resolveRouteFromLocation(pathname, hash, search, basePath, validRoutes, fallbackRoute) {
     var allowed = Array.isArray(validRoutes) && validRoutes.length
       ? validRoutes
@@ -7670,6 +7684,85 @@
     };
   }
 
+  function normalizeVersionManifest(raw) {
+    var obj = (raw && typeof raw === 'object') ? raw : {};
+    var ver = normalizeStr(obj.version || obj.buildId || obj.appVersion || obj.release);
+    var buildId = normalizeStr(obj.buildId || ver);
+    var builtAt = normalizeStr(obj.builtAt || obj.timestamp || '');
+    return {
+      version: ver,
+      buildId: buildId,
+      builtAt: builtAt
+    };
+  }
+
+  function compareAppVersions(currentVer, remoteVer) {
+    var cur = normalizeStr(currentVer);
+    var rem = normalizeStr(remoteVer);
+    if (!cur || !rem) return false;
+    if (cur === 'dev' || rem === 'dev' || cur === 'local' || rem === 'local') return false;
+    return cur !== rem;
+  }
+
+  function shouldTriggerAutoUpdateReload(options) {
+    var opts = (options && typeof options === 'object') ? options : {};
+    var cur = normalizeStr(opts.currentVersion);
+    var rem = normalizeStr(opts.remoteVersion);
+    if (!compareAppVersions(cur, rem)) {
+      return { shouldReload: false, reason: 'up_to_date', targetVersion: cur || rem };
+    }
+    if (opts.isUpdating) {
+      return { shouldReload: false, reason: 'already_updating', targetVersion: rem };
+    }
+    var nowMs = typeof opts.nowMs === 'number' && isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+    var lastVer = normalizeStr(opts.lastAttemptVer);
+    var lastAt = toNum(opts.lastAttemptAt, 0);
+    var cooldownMs = Math.max(5000, toNum(opts.cooldownMs, 30000));
+    if (lastVer && lastVer === rem && lastAt > 0 && (nowMs - lastAt) < cooldownMs) {
+      return { shouldReload: false, reason: 'cooldown_antiloop', targetVersion: rem, waitMs: cooldownMs - (nowMs - lastAt) };
+    }
+    if (opts.hasInFlightMutations) {
+      return { shouldReload: false, reason: 'inflight_mutations', deferMs: 800, targetVersion: rem };
+    }
+    if (opts.hasUnsavedChanges && !opts.ignoreUnsaved) {
+      return { shouldReload: false, reason: 'unsaved_changes', deferMs: 2500, targetVersion: rem };
+    }
+    return { shouldReload: true, reason: 'new_version_detected', targetVersion: rem };
+  }
+
+  function computeAdaptiveSyncDelay(options) {
+    var opts = (options && typeof options === 'object') ? options : {};
+    if (opts.isOnline === false) return 0;
+    if (opts.isVisible === false) return 0;
+    var errs = Math.max(0, Math.min(5, Math.floor(toNum(opts.consecutiveErrors, 0))));
+    if (opts.sseConnected) {
+      var sseBase = Math.max(8000, toNum(opts.sseHeartbeatMs, 15000));
+      return errs > 0 ? Math.min(30000, Math.round(sseBase * Math.pow(1.4, Math.min(3, errs)))) : sseBase;
+    }
+    var fallbackBase = Math.max(2000, toNum(opts.fallbackPollMs, 3000));
+    if (errs === 0) return fallbackBase;
+    return Math.min(15000, Math.round(fallbackBase * Math.pow(1.5, Math.min(4, errs))));
+  }
+
+  function appendSyncDiagnosticLog(list, entry, maxEntries) {
+    var cap = Math.max(10, Math.min(200, Math.floor(toNum(maxEntries, 80))));
+    var src = Array.isArray(list) ? list : [];
+    var e = (entry && typeof entry === 'object') ? entry : {};
+    var msg = normalizeStr(e.message || e.msg || '');
+    if (!msg) return src.slice(0, cap);
+    var item = {
+      id: normalizeStr(e.id) || ('LOG_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6)),
+      time: normalizeStr(e.time) || new Date().toISOString(),
+      kind: normalizeStr(e.kind) || 'sync',
+      level: normalizeStr(e.level) || 'info',
+      message: msg.slice(0, 260),
+      detail: normalizeStr(e.detail || '').slice(0, 300)
+    };
+    var next = [item].concat(src);
+    if (next.length > cap) next.length = cap;
+    return next;
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -7885,6 +7978,13 @@
     getRiyadhTodayDateStr: getRiyadhTodayDateStr,
     addDaysIso: addDaysIso,
     buildCalendarPeriodWindow: buildCalendarPeriodWindow,
-    extractReservationCalendarEvents: extractReservationCalendarEvents
+    extractReservationCalendarEvents: extractReservationCalendarEvents,
+    resolveAssetUrl: resolveAssetUrl,
+    buildCacheBustedUrl: buildCacheBustedUrl,
+    normalizeVersionManifest: normalizeVersionManifest,
+    compareAppVersions: compareAppVersions,
+    shouldTriggerAutoUpdateReload: shouldTriggerAutoUpdateReload,
+    computeAdaptiveSyncDelay: computeAdaptiveSyncDelay,
+    appendSyncDiagnosticLog: appendSyncDiagnosticLog
   };
 }));

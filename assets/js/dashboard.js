@@ -2157,6 +2157,14 @@
           (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
           (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+          (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+          (Array.isArray(d.announcements) && d.announcements.length > 0) ||
+          (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
+          Boolean(d.deletedAllReservationsBefore) ||
+          Boolean(d.changedSettings) ||
+          Boolean(d.changedDelegations) ||
+          Boolean(d.changedRoles) ||
           Boolean(d.todayRadarCounts)
         );
         if (relevant) {
