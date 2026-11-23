@@ -453,12 +453,21 @@
     if (!activeSession || !activeSession.isRange || !activeSession.popover) return;
     var sVal = activeSession.startInput ? (activeSession.startInput._rgDatePicker.committedValue || '') : '';
     var eVal = activeSession.endInput ? (activeSession.endInput._rgDatePicker.committedValue || '') : '';
-    if (!sVal || eVal || !hoverIso) return;
+    if (!hoverIso) return;
+
+    var dayButtons = activeSession.popover.querySelectorAll('.rg-dp-day[data-iso]');
+    if (!sVal || eVal) {
+      dayButtons.forEach(function (btn) {
+        var dIso = btn.getAttribute('data-iso') || '';
+        btn.classList.remove('is-preview-in-range');
+        btn.classList.toggle('is-preview-edge', Boolean(!eVal && dIso === hoverIso));
+      });
+      return;
+    }
 
     var effStart = hoverIso < sVal ? hoverIso : sVal;
     var effEnd = hoverIso < sVal ? sVal : hoverIso;
 
-    var dayButtons = activeSession.popover.querySelectorAll('.rg-dp-day[data-iso]');
     dayButtons.forEach(function (btn) {
       var dIso = btn.getAttribute('data-iso') || '';
       btn.classList.toggle('is-preview-in-range', Boolean(dIso > effStart && dIso < effEnd));
@@ -503,6 +512,7 @@
       var fromLbl = lang === 'en' ? 'From' : 'من';
       var toLbl = lang === 'en' ? 'To' : 'إلى';
       var unsetLbl = lang === 'en' ? 'Select' : 'اختر';
+      var optStartLbl = activeSession.activeRole === 'end' ? (lang === 'en' ? 'Optional' : 'اختياري') : unsetLbl;
       var rangeArrowSvg = rtl
         ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>'
         : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>';
@@ -510,7 +520,7 @@
         '<div class="rg-dp-range-bar">' +
           '<button type="button" class="rg-dp-range-pill' + (activeSession.activeRole === 'start' ? ' is-active' : '') + '" data-dp-role="start">' +
             '<span class="rg-dp-range-k">' + fromLbl + '</span>' +
-            '<span class="rg-dp-range-v mono" dir="ltr">' + (startVal || unsetLbl) + '</span>' +
+            '<span class="rg-dp-range-v mono" dir="ltr">' + (startVal || optStartLbl) + '</span>' +
           '</button>' +
           '<span class="rg-dp-range-arrow" aria-hidden="true">' + rangeArrowSvg + '</span>' +
           '<button type="button" class="rg-dp-range-pill' + (activeSession.activeRole === 'end' ? ' is-active' : '') + '" data-dp-role="end">' +
@@ -754,7 +764,10 @@
     var pair = getPairInputs(inputEl);
     var isRange = Boolean(pair);
     var meta = getRangeMeta(inputEl);
-    var initialIso = inputEl._rgDatePicker.committedValue || (pair && pair.startInput._rgDatePicker.committedValue) || getTodayIso();
+    var initialIso = inputEl._rgDatePicker.committedValue ||
+      (pair && pair.startInput._rgDatePicker.committedValue) ||
+      (pair && pair.endInput._rgDatePicker.committedValue) ||
+      getTodayIso();
     var parsed = parseIso(initialIso) || parseIso(getTodayIso());
 
     var portal = ensurePortal();

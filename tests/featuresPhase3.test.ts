@@ -68,7 +68,7 @@ function createSandboxApiHarness() {
 }
 
 test('Phase 1: resolveEffectivePermissions 2-arg signature & canUserViewDashboardSection strict enforcement', () => {
-  assert.equal(core.DASHBOARD_PERMISSION_KEYS.length, 9);
+  assert.equal(core.DASHBOARD_PERMISSION_KEYS.length, 10);
 
   // 2-arg signature with explicit array
   const customExplicit = ['view_dashboard', 'dash_perms_configured', 'dash_view_hero_kpis'];

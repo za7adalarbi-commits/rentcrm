@@ -1044,5 +1044,223 @@ test('normalizeAutoSyncInterval, formatAutoSyncIntervalAr, and validateDeleteAll
   assert.equal(core.validateDeleteAllReservationsConfirmation({ acknowledged: true, confirmPhrase: 'حذف جميع الحجوزات', password: 'Admin@123' }).valid, true);
 });
 
+test('per-employee section show/hide helpers preserve sentinels and control routes, sub-sections, and dashboard widgets', () => {
+  const basePerms = core.applyEmployeeSectionToggle('agent', [], 'view_reports', false);
+  assert.equal(basePerms.includes('perms_sections_configured'), true);
+  assert.equal(basePerms.includes('perms_subsections_configured'), true);
+  assert.equal(basePerms.includes('dash_perms_configured'), true);
+  assert.equal(core.canUserViewRoute({ role: 'agent', permissions: basePerms }, 'reports'), false);
+  assert.equal(core.canUserViewRoute({ role: 'agent', permissions: basePerms }, 'reservations'), true);
+
+  const reEnabled = core.applyEmployeeSectionToggle('agent', basePerms, 'view_reports', true);
+  assert.equal(core.canUserViewRoute({ role: 'agent', permissions: reEnabled }, 'reports'), true);
+
+  const subHidden = core.setEmployeeSectionGroupVisibility(
+    'agent',
+    reEnabled,
+    ['sub_view_today_tab', 'sub_view_radar_tab'],
+    false
+  );
+  assert.equal(core.canUserViewSubSection({ role: 'agent', permissions: subHidden }, 'sub_view_today_tab'), false);
+  assert.equal(core.canUserViewSubSection({ role: 'agent', permissions: subHidden }, 'sub_view_radar_tab'), false);
+  assert.equal(core.canUserViewSubSection({ role: 'agent', permissions: subHidden }, 'sub_view_myfu_mentions'), true);
+
+  const summary = core.getEmployeeSectionVisibilitySummary({ role: 'agent', permissions: subHidden });
+  assert.equal(summary.hiddenKeys.includes('sub_view_today_tab'), true);
+  assert.equal(summary.totalVisible < summary.totalAvailable, true);
+});
+
+test('developer statistics visibility control filters leaderboard and performance without altering booking totals', () => {
+  const cfg = core.normalizeStatsControlConfig({
+    excludedFromStatsEmployeeIds: ['EMP_GM', 'EMP_DEV', 'EMP_GM']
+  });
+  assert.deepEqual(cfg.excludedFromStatsEmployeeIds, ['EMP_GM', 'EMP_DEV']);
+  assert.equal(core.isEmployeeIncludedInStats({ id: 'EMP_GM', status: 'active' }, cfg), false);
+  assert.equal(core.isEmployeeIncludedInStats({ id: 'EMP_AG1', status: 'active' }, cfg), true);
+
+  const employees = [
+    { id: 'EMP_DEV', name: 'المبرمج', role: 'developer', status: 'active', permissions: [] },
+    { id: 'EMP_GM', name: 'المدير العام', role: 'general_manager', status: 'active', permissions: [] },
+    { id: 'EMP_AG1', name: 'سارة العتيبي', role: 'agent', status: 'active', permissions: [] }
+  ];
+  const filteredEmps = core.filterEmployeesForStats(employees, cfg);
+  assert.deepEqual(filteredEmps.map((e: any) => e.id), ['EMP_AG1']);
+
+  const reservations = [
+    { id: 'R1', startDate: '2026-11-16', internalStatus: 'مؤكد', assignedEmployeeIds: ['EMP_GM'], totalAmount: 1000, createdAt: '2026-11-16T08:00:00Z' },
+    { id: 'R2', startDate: '2026-11-16', internalStatus: 'تم التسليم', assignedEmployeeIds: ['EMP_AG1'], totalAmount: 500, createdAt: '2026-11-16T09:00:00Z' }
+  ];
+  const followUps = [
+    { id: 'F1', reservationId: 'R1', employeeId: 'EMP_GM', employeeName: 'المدير العام', followUpDate: '2026-11-16' },
+    { id: 'F2', reservationId: 'R2', employeeId: 'EMP_AG1', employeeName: 'سارة العتيبي', followUpDate: '2026-11-16' }
+  ];
+
+  const dash = core.computeDashboardMetrics(reservations, followUps, [], employees, {}, '2026-11-16', { statsControlConfig: cfg });
+  assert.equal(dash.kpis.totalReservations, 2);
+  assert.equal(dash.charts.employeeComparison.some((x: any) => x.name === 'المدير العام'), false);
+  assert.equal(dash.charts.employeeComparison.some((x: any) => x.name === 'سارة العتيبي'), true);
+
+  const lb = core.computeEmployeeLeaderboard(employees, reservations, followUps, [], { statsControlConfig: cfg });
+  assert.deepEqual(lb.map((x: any) => x.employeeId), ['EMP_AG1']);
+
+  const restrictedViewPerms = core.applyEmployeeStatsViewToggle('agent', [], false);
+  assert.equal(core.canEmployeeViewStatistics({ role: 'agent', permissions: restrictedViewPerms }), false);
+  assert.equal(core.canEmployeeViewStatistics({ role: 'developer', permissions: restrictedViewPerms }), true);
+});
+
+test('filterReservations and resolvePullDateRange support end-date-only filtering without startDate', () => {
+  const reservations = [
+    { id: 'R1', startDate: '2026-11-10', lastUpdatedAt: '2026-11-10T10:00:00Z' },
+    { id: 'R2', startDate: '2026-11-18', lastUpdatedAt: '2026-11-18T10:00:00Z' },
+    { id: 'R3', startDate: '2026-11-25', lastUpdatedAt: '2026-11-25T10:00:00Z' }
+  ];
+  const endOnlyFiltered = core.filterReservations(reservations, [], { dateFrom: '', dateTo: '2026-11-18' });
+  assert.deepEqual(endOnlyFiltered.map((r: any) => r.id), ['R2', 'R1']);
+
+  const endOnlyPull = core.resolvePullDateRange({ preset: 'custom', dateFrom: '', dateTo: '2026-11-18' }, '2026-11-22');
+  assert.equal(endOnlyPull.hasCustomRange, true);
+  assert.equal(endOnlyPull.dateFrom, '');
+  assert.equal(endOnlyPull.dateTo, '2026-11-18');
+});
+
+test('per-employee table action button permissions default ON for legacy employees and toggle cleanly', () => {
+  const legacyAgent = { role: 'agent', permissions: ['view_reservations', 'perms_sections_configured'] };
+  assert.equal(core.canUserUseActionButton(legacyAgent, 'act_export_excel'), true);
+  assert.equal(core.canUserUseActionButton(legacyAgent, 'act_close_delete_ticket'), true);
+
+  const migrated = core.ensureSectionPermissionSentinels('agent', legacyAgent.permissions);
+  assert.equal(migrated.includes('perms_actions_configured'), true);
+  assert.equal(migrated.includes('act_export_excel'), true);
+  assert.equal(migrated.includes('act_bulk_reassign'), true);
+
+  const hiddenExport = core.applyEmployeeSectionToggle('agent', migrated, 'act_export_excel', false);
+  const hiddenBoth = core.applyEmployeeSectionToggle('agent', hiddenExport, 'act_close_delete_ticket', false);
+  assert.equal(core.canUserUseActionButton({ role: 'agent', permissions: hiddenBoth }, 'act_export_excel'), false);
+  assert.equal(core.canUserUseActionButton({ role: 'agent', permissions: hiddenBoth }, 'act_close_delete_ticket'), false);
+  assert.equal(core.canUserUseActionButton({ role: 'agent', permissions: hiddenBoth }, 'act_claim_reservation'), true);
+  assert.equal(core.canUserUseActionButton({ role: 'developer', permissions: hiddenBoth }, 'act_export_excel'), true);
+
+  const summary = core.getEmployeeSectionVisibilitySummary({ role: 'agent', permissions: hiddenBoth });
+  assert.equal(summary.hiddenKeys.includes('act_export_excel'), true);
+  assert.equal(summary.hiddenKeys.includes('act_close_delete_ticket'), true);
+  assert.equal(summary.visibleActionCount, summary.totalActionCount - 2);
+});
+
+test('personal layout prefs and calendar timeline helpers support monthly, weekly, and daily views with search filtering', () => {
+  assert.equal(core.normalizeReservationsDisplayMode('calendar'), 'calendar');
+  assert.equal(core.normalizeReservationsDisplayMode('invalid'), 'table');
+  assert.equal(core.normalizeCalendarGranularity('month'), 'month');
+  assert.equal(core.normalizeCalendarGranularity('day'), 'day');
+  assert.equal(core.normalizeCalendarGranularity('unknown'), 'week');
+
+  const prefs = core.normalizeUserLayoutPrefs({
+    timeFormat: '12h',
+    sidebarPosition: 'top',
+    timezoneMode: 'eg',
+    reservationsDisplayMode: 'calendar',
+    calendarGranularity: 'month'
+  });
+  assert.equal(prefs.reservationsDisplayMode, 'calendar');
+  assert.equal(prefs.calendarGranularity, 'month');
+
+  // Monthly window anchored on November 2026 spans Saturday-led full weeks covering 2026-11-01 .. 2026-11-30
+  const monthWin = core.buildCalendarPeriodWindow('2026-11-18', 'month', { todayIso: '2026-11-18' });
+  assert.equal(monthWin.granularity, 'month');
+  assert.equal(monthWin.year, 2026);
+  assert.equal(monthWin.month, 11);
+  assert.equal(monthWin.monthStartIso, '2026-11-01');
+  assert.equal(monthWin.monthEndIso, '2026-11-30');
+  assert.equal(monthWin.prevAnchorIso, '2026-10-01');
+  assert.equal(monthWin.nextAnchorIso, '2026-12-01');
+  assert.equal(monthWin.weekdayHeaders.length, 7);
+  assert.equal(monthWin.days.length >= 28 && monthWin.days.length % 7 === 0, true);
+  assert.equal(monthWin.days.find((d: any) => d.iso === '2026-11-18').isToday, true);
+  assert.equal(monthWin.days.find((d: any) => d.iso === '2026-11-18').isCurrentMonth, true);
+  assert.equal(monthWin.days.find((d: any) => d.iso === '2026-10-31').isCurrentMonth, false);
+
+  // Weekly window anchored on Wednesday 2026-11-18 spans Saturday 2026-11-14 .. Friday 2026-11-20
+  const weekWin = core.buildCalendarPeriodWindow('2026-11-18', 'week', { todayIso: '2026-11-18' });
+  assert.equal(weekWin.startIso, '2026-11-14');
+  assert.equal(weekWin.endIso, '2026-11-20');
+  assert.equal(weekWin.days.length, 7);
+  assert.equal(weekWin.days.find((d: any) => d.iso === '2026-11-18').isToday, true);
+
+  const dayWin = core.buildCalendarPeriodWindow('2026-11-18', 'day', { todayIso: '2026-11-18' });
+  assert.equal(dayWin.startIso, '2026-11-18');
+  assert.equal(dayWin.endIso, '2026-11-18');
+  assert.equal(dayWin.days.length, 1);
+
+  const defaultTodayWin = core.buildCalendarPeriodWindow('', 'week');
+  assert.equal(defaultTodayWin.days.length, 7);
+  assert.equal(/^\d{4}-\d{2}-\d{2}$/.test(defaultTodayWin.todayIso), true);
+
+  const sampleReservations = [
+    {
+      id: 'RES_A',
+      reservationNumber: 'RG-1001',
+      customerName: 'أحمد علي',
+      carName: 'تويوتا كامري',
+      branchName: 'الرياض',
+      startDate: '2026-11-15',
+      startTime: '10:00',
+      originalEndDate: '2026-11-17',
+      originalEndTime: '14:00',
+      endDate: '2026-11-19',
+      endTime: '16:00',
+      extendedUntilDate: '2026-11-19',
+      extendedUntilTime: '16:00',
+      extensionsCount: 1,
+      extendedDaysCount: 2,
+      extensions: [
+        { id: 'EXT_1', extensionNumber: 'EXT-101', endDate: '2026-11-18', endTime: '12:00', extendDays: 2, amount: 300 }
+      ]
+    },
+    {
+      id: 'RES_B',
+      reservationNumber: 'RG-1002',
+      customerName: 'خالد سعد',
+      carName: 'هيونداي سوناتا',
+      startDate: '2026-11-18',
+      startTime: '08:30',
+      endDate: '2026-11-19',
+      endTime: '11:00',
+      hasExtensions: true,
+      extensionsCount: 1,
+      extendedDaysCount: 1,
+      extendedUntilDate: '2026-11-19',
+      extendedUntilTime: '11:00'
+    },
+    {
+      id: 'RES_C',
+      reservationNumber: 'RG-1003',
+      customerName: 'ملغي',
+      originalStatusAr: 'ملغي',
+      internalStatus: 'ملغي',
+      startDate: '2026-11-18',
+      endDate: '2026-11-19'
+    }
+  ];
+
+  const allCal = core.extractReservationCalendarEvents(sampleReservations, weekWin.startIso, weekWin.endIso);
+  assert.equal(allCal.counts.pickup, 2);
+  assert.equal(allCal.counts.return, 2);
+  assert.equal(allCal.counts.extension, 2);
+  assert.equal(allCal.counts.total, 6);
+  assert.equal(allCal.events.some((e: any) => e.reservationId === 'RES_C'), false);
+  assert.equal(allCal.byDate['2026-11-18'].some((e: any) => e.type === 'pickup' && e.reservationId === 'RES_B'), true);
+  assert.equal(allCal.byDate['2026-11-18'].some((e: any) => e.type === 'extension' && e.extensionNumber === 'EXT-101'), true);
+
+  const extOnly = core.extractReservationCalendarEvents(sampleReservations, weekWin.startIso, weekWin.endIso, { eventType: 'extension' });
+  assert.equal(extOnly.events.length, 2);
+  assert.equal(extOnly.counts.total, 6);
+
+  const searchFiltered = core.extractReservationCalendarEvents(sampleReservations, monthWin.startIso, monthWin.endIso, { search: 'سوناتا' });
+  assert.equal(searchFiltered.counts.total, 3);
+  assert.equal(searchFiltered.events.every((e: any) => e.reservationId === 'RES_B'), true);
+});
+
+
+
+
 
 

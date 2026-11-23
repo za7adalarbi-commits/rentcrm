@@ -1,4 +1,9 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DbClient, DbExecutor } from './db.js';
+import crmCoreModule from './coreBridge.cjs';
+
+const crmCore: any = (crmCoreModule as any)?.default || crmCoreModule;
+const activeIdemKeysStorage = new AsyncLocalStorage<Set<string>>();
 
 export type CacheScope =
   | 'settings'
@@ -26,6 +31,7 @@ interface ExecutorCacheState {
   entries: Map<string, CacheEntry>;
   inFlight: Map<string, Promise<any>>;
   idempotency: Map<string, { expiresAt: number; result?: any; promise?: Promise<any> }>;
+  spamGuards: Map<string, { timestamps: number[]; signatures: Record<string, number> }>;
   localVersion: number;
   lastVersionCheckAt: number;
   versionCheckPromise: Promise<number> | null;
@@ -46,6 +52,7 @@ function getState(executor: object): ExecutorCacheState {
       entries: new Map(),
       inFlight: new Map(),
       idempotency: new Map(),
+      spamGuards: new Map(),
       localVersion: 0,
       lastVersionCheckAt: 0,
       versionCheckPromise: null,
@@ -236,6 +243,11 @@ export async function runWithIdempotency<T>(
   }
 
   const key = `${userId}|${action}|${cleanReqId}`;
+  const currentActiveKeys = activeIdemKeysStorage.getStore();
+  if (currentActiveKeys && currentActiveKeys.has(key)) {
+    return fn();
+  }
+
   const existing = state.idempotency.get(key);
   if (existing) {
     if (existing.promise) {
@@ -246,8 +258,11 @@ export async function runWithIdempotency<T>(
     }
   }
 
+  const nextActiveKeys = new Set(currentActiveKeys ? Array.from(currentActiveKeys) : []);
+  nextActiveKeys.add(key);
+
   const p = Promise.resolve()
-    .then(() => fn())
+    .then(() => activeIdemKeysStorage.run(nextActiveKeys, fn))
     .then((result) => {
       state.idempotency.set(key, {
         expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
@@ -281,6 +296,7 @@ const ACTION_SCOPE_MAP: Record<string, { eventType: 'delta' | 'announcement' | '
   assignEmployees: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'dashboard', 'employees', 'notifications', 'reports', 'activity'], persistVersion: true },
   removeAssignment: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'dashboard', 'employees', 'reports', 'activity'], persistVersion: true },
   bulkReassignEmployeeReservations: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'reports', 'activity'], persistVersion: true },
+  bulkReassignSelectedReservations: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'reports', 'activity'], persistVersion: true },
   createProblem: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'reports', 'activity'], persistVersion: true },
   updateProblem: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'reports', 'activity'], persistVersion: true },
   createEmployee: { eventType: 'delta', scopes: ['employees', 'dashboard', 'reports', 'activity'], persistVersion: true },
@@ -311,4 +327,50 @@ const ACTION_SCOPE_MAP: Record<string, { eventType: 'delta' | 'announcement' | '
 
 export function getMutationSyncSpec(action: string) {
   return ACTION_SCOPE_MAP[String(action || '').trim()] || null;
+}
+
+export function buildSpamSignature(action: string, payload?: Record<string, any>): string {
+  const obj = payload && typeof payload === 'object' ? payload : {};
+  const clone: Record<string, any> = {};
+  const keys = Object.keys(obj).sort();
+  for (const k of keys) {
+    if (k === 'clientRequestId' || k === 'expectedUpdatedAt' || k === 'siteOrigin' || k === 'nowMs') continue;
+    clone[k] = obj[k];
+  }
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(clone);
+  } catch {
+    serialized = '';
+  }
+  return `${String(action || '').trim()}:${serialized.slice(0, 320)}`;
+}
+
+export function checkMutationSpamLimit(
+  executor: object,
+  actorKey: string,
+  action: string,
+  payload?: Record<string, any>
+): { allowed: boolean; reason: string; waitMs: number; message?: string } {
+  const cleanAction = String(action || '').trim();
+  const syncSpec = getMutationSyncSpec(cleanAction);
+  if (!syncSpec || !crmCore || typeof crmCore.evaluateSpamGuard !== 'function') {
+    return { allowed: true, reason: '', waitMs: 0 };
+  }
+  const state = getState(executor);
+  if (state.spamGuards.size > 500) {
+    state.spamGuards.clear();
+  }
+  const key = String(actorKey || 'anon');
+  let actorState = state.spamGuards.get(key);
+  if (!actorState) {
+    actorState = { timestamps: [], signatures: {} };
+    state.spamGuards.set(key, actorState);
+  }
+  const signature = buildSpamSignature(cleanAction, payload);
+  return crmCore.evaluateSpamGuard(actorState, cleanAction, signature, {
+    duplicateWindowMs: 1200,
+    burstWindowMs: 10000,
+    maxBurst: 22
+  });
 }

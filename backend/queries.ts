@@ -381,13 +381,49 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
   const p = (async () => {
     const countRes = await executor.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM employees`);
     const cnt = Number(countRes.rows[0]?.cnt || 0);
+    const nowIso = new Date().toISOString();
+    const devSeed = {
+      id: 'EMP_DEV',
+      name: 'المبرمج - مسؤول الموقع',
+      username: 'developer',
+      password: process.env.SEED_DEVELOPER_PASSWORD || 'Dev@123',
+      salt: 'RG_SEED_DEVELOPER',
+      phone: '0500000009',
+      email: 'dev@rentalgate.net',
+      jobTitle: 'مبرمج ومسؤول إعدادات الموقع',
+      role: 'developer',
+      permissions: ['all']
+    };
+
     if (cnt > 0) {
+      try {
+        const devCheck = await executor.query<{ cnt: string }>(
+          `SELECT COUNT(*)::text AS cnt FROM employees WHERE role = 'developer' OR LOWER(username) = 'developer'`
+        );
+        if (Number(devCheck.rows[0]?.cnt || 0) === 0) {
+          const pHash = hashPassword(devSeed.password, devSeed.salt);
+          await executor.query(
+            `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11::text,$12::timestamptz,$12::timestamptz)
+             ON CONFLICT (username) DO NOTHING`,
+            [devSeed.id, devSeed.name, devSeed.username, pHash, devSeed.salt, devSeed.phone, devSeed.email, devSeed.jobTitle, devSeed.role, JSON.stringify(devSeed.permissions), nowIso, nowIso]
+          );
+          await executor.query(
+            `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'active',$9,$10::timestamptz,$10::timestamptz)
+             ON CONFLICT (username) DO NOTHING`,
+            [devSeed.id, devSeed.name, devSeed.username, devSeed.phone, devSeed.email, devSeed.jobTitle, devSeed.role, JSON.stringify(devSeed.permissions), nowIso, nowIso]
+          );
+        }
+      } catch {
+        // Non-fatal fallback for custom/mock executors
+      }
       seededExecutors.add(executor);
       return;
     }
 
-  const nowIso = new Date().toISOString();
   const seeds = [
+    devSeed,
     {
       id: 'EMP_ADMIN',
       name: 'فهد الدوسري',
@@ -629,7 +665,12 @@ export async function getDashboard(
 
   const restrictAgent = session.user.role === 'agent' && !allowAgentViewAll;
   const canSync = crmCore.canAccessApi(session.user);
-  const cacheKey = `${restrictAgent ? session.user.id : 'all'}|${canSync ? 'sync' : 'nosync'}|${range}|${dateFrom}|${dateTo}|${today}`;
+  const statsControlCfg = typeof crmCore.normalizeStatsControlConfig === 'function'
+    ? crmCore.normalizeStatsControlConfig(settings.stats_control_config)
+    : { excludedFromStatsEmployeeIds: [] };
+  const excludedStatsSet = new Set<string>(statsControlCfg.excludedFromStatsEmployeeIds || []);
+  const statsSig = Array.from(excludedStatsSet).sort().join(',');
+  const cacheKey = `${restrictAgent ? session.user.id : 'all'}|${canSync ? 'sync' : 'nosync'}|${range}|${dateFrom}|${dateTo}|${today}|${statsSig}`;
 
   return getCachedOrLoad(
     executor,
@@ -665,6 +706,30 @@ export async function getDashboard(
       }
       const fuWhere = fuClauses.length ? `WHERE ${fuClauses.join(' AND ')}` : '';
 
+      const lbResParams: any[] = [];
+      const lbResClauses: string[] = [];
+      if (dateFrom) {
+        lbResParams.push(dateFrom);
+        lbResClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) >= $${lbResParams.length}`);
+      }
+      if (dateTo) {
+        lbResParams.push(dateTo);
+        lbResClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) <= $${lbResParams.length}`);
+      }
+      const lbResWhere = lbResClauses.length ? `WHERE ${lbResClauses.join(' AND ')}` : '';
+
+      const lbPrbParams: any[] = [];
+      const lbPrbClauses: string[] = [];
+      if (dateFrom) {
+        lbPrbParams.push(dateFrom);
+        lbPrbClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= $${lbPrbParams.length}`);
+      }
+      if (dateTo) {
+        lbPrbParams.push(dateTo);
+        lbPrbClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= $${lbPrbParams.length}`);
+      }
+      const lbPrbWhere = lbPrbClauses.length ? `WHERE ${lbPrbClauses.join(' AND ')}` : '';
+
       const [
         resTotalsQuery,
         resStatusQuery,
@@ -676,7 +741,10 @@ export async function getDashboard(
         empQuery,
         recentActivityRes,
         syncRes,
-        todayRadarSummary
+        todayRadarSummary,
+        lbResQuery,
+        lbFuQuery,
+        lbPrbQuery
       ] = await Promise.all([
         executor.query<{ total_cnt: number; today_cnt: number }>(
           `SELECT COUNT(*)::int AS total_cnt,
@@ -704,10 +772,10 @@ export async function getDashboard(
            GROUP BY emp_id`,
           resParams
         ),
-        executor.query<{ follow_up_date: string; employee_name: string; cnt: number }>(
-          `SELECT follow_up_date, employee_name, COUNT(*)::int AS cnt
+        executor.query<{ follow_up_date: string; employee_id: string; employee_name: string; cnt: number }>(
+          `SELECT follow_up_date, employee_id, employee_name, COUNT(*)::int AS cnt
            FROM follow_ups ${fuWhere}
-           GROUP BY follow_up_date, employee_name`,
+           GROUP BY follow_up_date, employee_id, employee_name`,
           fuParams
         ),
         executor.query<{ today_cnt: number }>(
@@ -717,10 +785,13 @@ export async function getDashboard(
         executor.query<{ status: string; priority: string; cnt: number }>(
           `SELECT status, priority, COUNT(*)::int AS cnt FROM problems GROUP BY status, priority`
         ),
-        executor.query(`SELECT id, name, status FROM employees WHERE status = 'active'`),
+        executor.query(`SELECT id, name, username, role, job_title, status FROM employees WHERE status = 'active'`),
         executor.query(`SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 8`),
         canSync ? executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 1`) : Promise.resolve({ rows: [] as any[], rowCount: 0 }),
-        getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: today }).catch(() => ({ counts: null }))
+        getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: today }).catch(() => ({ counts: null })),
+        executor.query(`SELECT assigned_employee_ids, internal_status, original_status_code, original_status_ar FROM reservations ${lbResWhere} LIMIT 5000`, lbResParams),
+        executor.query(`SELECT employee_id, employee_name FROM follow_ups ${fuWhere} LIMIT 10000`, fuParams),
+        executor.query(`SELECT assigned_employee_ids, created_by_id, status FROM problems ${lbPrbWhere} LIMIT 2000`, lbPrbParams)
       ]);
 
   const statusCounts: Record<string, number> = {};
@@ -744,14 +815,24 @@ export async function getDashboard(
     assignedByEmpId.set(str(row.emp_id), num(row.cnt));
   }
 
+  const excludedEmpNames = new Set<string>(
+    empQuery.rows
+      .filter((e: any) => excludedStatsSet.has(str(e.id)))
+      .map((e: any) => str(e.name))
+      .filter(Boolean)
+  );
+  const statsEmpRows = empQuery.rows.filter((e: any) => !excludedStatsSet.has(str(e.id)));
+
   const dailyFollowUps: Record<string, number> = {};
   const empFollowUpCounts: Record<string, number> = {};
   for (const row of fuAggQuery.rows) {
     const cnt = num(row.cnt);
     const fDate = str(row.follow_up_date);
+    const eId = str(row.employee_id);
     const eName = str(row.employee_name);
     if (fDate) dailyFollowUps[fDate] = (dailyFollowUps[fDate] || 0) + cnt;
-    if (eName) empFollowUpCounts[eName] = (empFollowUpCounts[eName] || 0) + cnt;
+    const isExcludedFu = (eId && excludedStatsSet.has(eId)) || (!eId && eName && excludedEmpNames.has(eName));
+    if (eName && !isExcludedFu) empFollowUpCounts[eName] = (empFollowUpCounts[eName] || 0) + cnt;
   }
 
   let openProblems = 0;
@@ -769,7 +850,7 @@ export async function getDashboard(
     }
   }
 
-  const employeeComparison = empQuery.rows.map((emp) => ({
+  const employeeComparison = statsEmpRows.map((emp) => ({
     name: str(emp.name),
     followUps: empFollowUpCounts[str(emp.name)] || 0,
     assigned: assignedByEmpId.get(str(emp.id)) || 0
@@ -835,11 +916,41 @@ export async function getDashboard(
     };
   }
 
+      const leaderboard = typeof crmCore.computeEmployeeLeaderboard === 'function'
+        ? crmCore.computeEmployeeLeaderboard(
+            statsEmpRows.map((e: any) => ({
+              id: str(e.id),
+              name: str(e.name),
+              username: str(e.username),
+              role: str(e.role || 'agent'),
+              jobTitle: str(e.job_title),
+              status: str(e.status || 'active')
+            })),
+            lbResQuery.rows.map((r: any) => ({
+              assignedEmployeeIds: parseJsonArray<string>(r.assigned_employee_ids),
+              internalStatus: str(r.internal_status),
+              originalStatusCode: str(r.original_status_code),
+              originalStatusAr: str(r.original_status_ar)
+            })),
+            lbFuQuery.rows.map((f: any) => ({
+              employeeId: str(f.employee_id),
+              employeeName: str(f.employee_name)
+            })),
+            lbPrbQuery.rows.map((p: any) => ({
+              assignedEmployeeIds: parseJsonArray<string>(p.assigned_employee_ids),
+              createdById: str(p.created_by_id),
+              status: str(p.status)
+            })),
+            { limit: 10, excludedEmployeeIds: Array.from(excludedStatsSet) }
+          )
+        : [];
+
       return {
         ...metrics,
         recentActivity,
         lastSync,
-        todayRadarCounts: (todayRadarSummary as any)?.counts || null
+        todayRadarCounts: (todayRadarSummary as any)?.counts || null,
+        leaderboard
       };
     }
   );
@@ -890,6 +1001,12 @@ export async function getAppBootstrap(
   ]);
 
   const uiSimplification = crmCore.normalizeUiSimplificationSettings(settings.ui_simplification);
+  const roleUiDefaults = typeof crmCore.normalizeRoleUiDefaults === 'function'
+    ? crmCore.normalizeRoleUiDefaults(settings.role_ui_defaults)
+    : {};
+  const statsControlConfig = typeof crmCore.normalizeStatsControlConfig === 'function'
+    ? crmCore.normalizeStatsControlConfig(settings.stats_control_config)
+    : { excludedFromStatsEmployeeIds: [] };
   const handoverSettings = crmCore.normalizeHandoverSettings(settings.handover_settings);
   const layoutPrefs = crmCore.normalizeUserLayoutPrefs(parseJsonValue(settings[`layout_prefs_u_${session.user.id}`], {}));
   const rawPinnedCritical = parseJsonValue<any[]>(settings[`pinned_res_u_${session.user.id}`], []);
@@ -910,6 +1027,8 @@ export async function getAppBootstrap(
     settingsOut = {
       ...settings,
       ui_simplification: uiSimplification,
+      role_ui_defaults: roleUiDefaults,
+      stats_control_config: statsControlConfig,
       handover_settings: handoverSettings,
       gas_webapp_url: serverCfg.gasWebAppUrl,
       auto_sync_enabled: settings.auto_sync_enabled !== false,
@@ -930,6 +1049,8 @@ export async function getAppBootstrap(
     employees: employeesData,
     settings: settingsOut,
     uiSimplification,
+    roleUiDefaults,
+    statsControlConfig,
     handoverSettings,
     announcements: announcementsData.activeItems || [],
     activeLocks: locksData.items || [],
@@ -1694,8 +1815,8 @@ export async function saveReservationPinnedNote(
   payload: Record<string, any> = {}
 ) {
   requirePermission(session, 'pin_reservation_note');
-  if (session.user.role !== 'general_manager' && session.user.role !== 'supervisor') {
-    throw new Error('FORBIDDEN: إضافة الملاحظة المثبتة متاحة للمشرف والمدير العام فقط.');
+  if (!crmCore.isPrivilegedRole(session.user.role) && session.user.role !== 'supervisor') {
+    throw new Error('FORBIDDEN: إضافة الملاحظة المثبتة متاحة للمبرمج والمشرف والمدير العام فقط.');
   }
   const resId = str(payload.reservationId);
   const note = str(payload.note);
@@ -2798,17 +2919,48 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
     const res = await tx.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [empId]);
     if (!res.rows[0]) throw new Error('NOT_FOUND: الموظف غير موجود.');
     const cur = res.rows[0];
+    if (str(cur.role) === 'developer' && session.user.role !== 'developer') {
+      throw new Error('FORBIDDEN: تعديل حساب المبرمج متاح للمبرمج فقط.');
+    }
 
     const nextRole = payload.role !== undefined ? str(payload.role) : str(cur.role);
+    if (nextRole === 'developer' && session.user.role !== 'developer') {
+      throw new Error('FORBIDDEN: ترقية حساب إلى دور المبرمج متاحة للمبرمج فقط.');
+    }
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : parseJsonArray(cur.permissions);
     const nextPerms = crmCore.resolveEffectivePermissions(nextRole, rawPerms);
+
+    let nextUsername = str(cur.username);
+    if (payload.username !== undefined) {
+      const requestedUsername = str(payload.username).trim().toLowerCase();
+      if (!requestedUsername) {
+        throw new Error('VALIDATION_ERROR: اسم المستخدم مطلوب.');
+      }
+      if (requestedUsername !== nextUsername.toLowerCase()) {
+        const dupRes = await tx.query(
+          `SELECT id FROM employees WHERE LOWER(username) = LOWER($1) AND id <> $2 LIMIT 1`,
+          [requestedUsername, empId]
+        );
+        if (dupRes.rows[0]) {
+          throw new Error('CONFLICT: اسم المستخدم مسجل بالفعل لموظف آخر.');
+        }
+      }
+      nextUsername = requestedUsername;
+    }
 
     let nextSalt = str(cur.salt);
     let nextHash = str(cur.password_hash);
     if (payload.newPassword && String(payload.newPassword).trim().length >= 4) {
       nextSalt = crypto.randomBytes(8).toString('hex').toUpperCase();
       nextHash = hashPassword(String(payload.newPassword).trim(), nextSalt);
-      await revokeEmployeeSessions(tx, empId);
+      if (empId === session.employeeId && session.tokenHash) {
+        await tx.query(
+          `UPDATE sessions SET is_revoked = TRUE WHERE employee_id = $1 AND token_hash <> $2`,
+          [empId, session.tokenHash]
+        );
+      } else {
+        await revokeEmployeeSessions(tx, empId);
+      }
     }
 
     const nowIso = new Date().toISOString();
@@ -2820,17 +2972,17 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
 
     await tx.query(
       `UPDATE employees
-       SET name = $2, phone = $3, email = $4, job_title = $5, role = $6,
-           permissions = $7::jsonb, status = $8, password_hash = $9, salt = $10, updated_at = $11::timestamptz
+       SET name = $2, username = $3, phone = $4, email = $5, job_title = $6, role = $7,
+           permissions = $8::jsonb, status = $9, password_hash = $10, salt = $11, updated_at = $12::timestamptz
        WHERE id = $1`,
-      [empId, nextName, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), nextStatus, nextHash, nextSalt, nowIso]
+      [empId, nextName, nextUsername, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), nextStatus, nextHash, nextSalt, nowIso]
     );
     await tx.query(
       `UPDATE users
-       SET name = $2, phone = $3, email = $4, job_title = $5, role = $6,
-           permissions = $7::jsonb, status = $8, updated_at = $9::timestamptz
+       SET name = $2, username = $3, phone = $4, email = $5, job_title = $6, role = $7,
+           permissions = $8::jsonb, status = $9, updated_at = $10::timestamptz
        WHERE id = $1`,
-      [empId, nextName, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), nextStatus, nowIso]
+      [empId, nextName, nextUsername, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), nextStatus, nowIso]
     );
 
     if (nextStatus !== 'active') {
@@ -2838,20 +2990,21 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
     }
 
     const empDiffs = crmCore.computeAuditFieldDiffs(
-      { name: cur.name, jobTitle: cur.job_title, role: cur.role, status: cur.status, phone: cur.phone },
-      { name: nextName, jobTitle: nextJob, role: nextRole, status: nextStatus, phone: nextPhone },
+      { name: cur.name, username: cur.username, jobTitle: cur.job_title, role: cur.role, status: cur.status, phone: cur.phone },
+      { name: nextName, username: nextUsername, jobTitle: nextJob, role: nextRole, status: nextStatus, phone: nextPhone },
       [
         { field: 'name', label: 'الاسم' },
+        { field: 'username', label: 'اسم المستخدم' },
         { field: 'jobTitle', label: 'المسمى الوظيفي' },
         { field: 'role', label: 'الدور الوظيفي' },
         { field: 'status', label: 'حالة الحساب' },
         { field: 'phone', label: 'الجوال' }
       ]
     );
-    await logActivity(tx, session.user, 'تحديث بيانات موظف', 'Employee', cur.username, `تحديث ${nextName}`, empDiffs);
+    await logActivity(tx, session.user, 'تحديث بيانات موظف', 'Employee', nextUsername, `تحديث ${nextName}`, empDiffs);
     const emp = mapEmployeeRow({
       ...cur,
-      name: nextName, phone: nextPhone, email: nextEmail, job_title: nextJob,
+      name: nextName, username: nextUsername, phone: nextPhone, email: nextEmail, job_title: nextJob,
       role: nextRole, permissions: nextPerms, status: nextStatus, updated_at: nowIso
     });
     await enqueueSheetsMirror(tx, 'Employee', empId, 'upsertEmployee', { ...emp, passwordHash: nextHash, salt: nextSalt });
@@ -2859,6 +3012,7 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
   });
 
   invalidateAuthSessionCache(executor, { employeeId: empId });
+  invalidateScopes(executor, ['employees', 'dashboard', 'reports']);
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
@@ -2885,6 +3039,10 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
     const res = await tx.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [empId]);
     const cur = res.rows[0];
     if (!cur) throw new Error('NOT_FOUND: الموظف غير موجود.');
+
+    if (str(cur.role) === 'developer' && session.user.role !== 'developer') {
+      throw new Error('FORBIDDEN: حذف حساب المبرمج متاح للمبرمج فقط.');
+    }
 
     if (str(cur.role) === 'general_manager' && str(cur.status) === 'active') {
       const activeGmRes = await tx.query<{ cnt: string }>(
@@ -3117,6 +3275,8 @@ export async function getSettings(executor: DbExecutor, session: AuthSession) {
   return {
     ...map,
     ui_simplification: crmCore.normalizeUiSimplificationSettings(map.ui_simplification),
+    role_ui_defaults: typeof crmCore.normalizeRoleUiDefaults === 'function' ? crmCore.normalizeRoleUiDefaults(map.role_ui_defaults) : {},
+    stats_control_config: typeof crmCore.normalizeStatsControlConfig === 'function' ? crmCore.normalizeStatsControlConfig(map.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
     handover_settings: crmCore.normalizeHandoverSettings(map.handover_settings),
     connection_mode: serverCfg.mode || 'neon',
     gas_webapp_url: serverCfg.gasWebAppUrl,
@@ -3167,9 +3327,14 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     payload.default_language !== undefined ||
     payload.auto_sync_enabled !== undefined ||
     payload.ui_simplification !== undefined ||
+    payload.role_ui_defaults !== undefined ||
+    payload.stats_control_config !== undefined ||
     payload.auto_sync_interval_hours !== undefined ||
     payload.auto_sync_interval_minutes !== undefined
   );
+  if (payload.stats_control_config !== undefined && session.user.role !== 'developer') {
+    throw new Error('FORBIDDEN: التحكم في ظهور الموظفين بالإحصائيات متاح للمبرمج فقط.');
+  }
   if (hasSystemSettingFields || payload.handover_settings === undefined) {
     requirePermission(session, 'manage_settings');
   } else {
@@ -3186,6 +3351,16 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   if (payload.ui_simplification !== undefined) {
     const normUi = crmCore.normalizeUiSimplificationSettings(payload.ui_simplification);
     updates.push(['ui_simplification', JSON.stringify(normUi)]);
+  }
+  if (payload.role_ui_defaults !== undefined && typeof crmCore.normalizeRoleUiDefaults === 'function') {
+    const normRoleUi = crmCore.normalizeRoleUiDefaults(payload.role_ui_defaults);
+    updates.push(['role_ui_defaults', JSON.stringify(normRoleUi)]);
+  }
+  if (payload.stats_control_config !== undefined && typeof crmCore.normalizeStatsControlConfig === 'function') {
+    const normStatsCfg = crmCore.normalizeStatsControlConfig(payload.stats_control_config);
+    normStatsCfg.updatedAt = new Date().toISOString();
+    normStatsCfg.updatedBy = session.user.name;
+    updates.push(['stats_control_config', JSON.stringify(normStatsCfg)]);
   }
   let handoverChangedDiff: { field: string; label: string; before: string; after: string } | null = null;
   if (payload.handover_settings !== undefined) {
@@ -3208,7 +3383,7 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   }
 
   const settingDiffs = updates
-    .filter(([k]) => k !== 'ui_simplification' && k !== 'handover_settings')
+    .filter(([k]) => k !== 'ui_simplification' && k !== 'role_ui_defaults' && k !== 'handover_settings' && k !== 'stats_control_config')
     .map(([k, nextVal]) => ({
       field: k,
       label: k,
@@ -3231,7 +3406,7 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     await logActivity(tx, session.user, 'تحديث الإعدادات', 'Settings', 'system', 'تحديث إعدادات النظام في قاعدة البيانات', settingDiffs);
   });
 
-  invalidateScopes(executor, ['settings']);
+  invalidateScopes(executor, ['settings', 'dashboard', 'reports']);
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return getSettings(executor, session);
 }
@@ -3679,6 +3854,11 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
     requirePermission(session, 'export_reports');
   }
   const rType = str(payload.reportType || 'all_reservations');
+  const settingsMapForReports = await getSettingsMap(executor);
+  const statsCfgRep = typeof crmCore.normalizeStatsControlConfig === 'function'
+    ? crmCore.normalizeStatsControlConfig(settingsMapForReports.stats_control_config)
+    : { excludedFromStatsEmployeeIds: [] };
+  const excludedStatsIdsRep = new Set<string>(statsCfgRep.excludedFromStatsEmployeeIds || []);
   const cacheKey = JSON.stringify({
     rType,
     status: str(payload.status),
@@ -3687,7 +3867,8 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
     branch: str(payload.branch),
     employeeId: str(payload.employeeId),
     dateFrom: str(payload.dateFrom),
-    dateTo: str(payload.dateTo)
+    dateTo: str(payload.dateTo),
+    statsSig: Array.from(excludedStatsIdsRep).sort().join(',')
   });
 
   return getCachedOrLoad(
@@ -3711,7 +3892,7 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
 
       if (rType === 'employee_performance') {
         const [empRes, resCountsRes, fuCountsRes, prbCountsRes] = await Promise.all([
-          executor.query(`SELECT id, name, job_title, role, last_activity FROM employees ORDER BY created_at ASC`),
+          executor.query(`SELECT id, name, job_title, role, status, last_activity FROM employees ORDER BY created_at ASC`),
           executor.query<{ emp_id: string; cnt: number }>(
             `SELECT emp_id, COUNT(*)::int AS cnt
              FROM reservations r, LATERAL jsonb_array_elements_text(r.assigned_employee_ids) AS emp_id
@@ -3729,16 +3910,18 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
         const resMap = new Map(resCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
         const fuMap = new Map(fuCountsRes.rows.map((r) => [str(r.employee_id), num(r.cnt)]));
         const prbMap = new Map(prbCountsRes.rows.map((r) => [str(r.emp_id), num(r.cnt)]));
-        const rows = empRes.rows.map((e) => ({
-          employeeId: str(e.id),
-          employeeName: str(e.name),
-          jobTitle: str(e.job_title),
-          role: str(e.role),
-          assignedReservations: resMap.get(str(e.id)) || 0,
-          followUpsCount: fuMap.get(str(e.id)) || 0,
-          problemsCount: prbMap.get(str(e.id)) || 0,
-          lastActivity: str(e.last_activity)
-        }));
+        const rows = empRes.rows
+          .filter((e) => str(e.status || 'active') !== 'disabled' && !excludedStatsIdsRep.has(str(e.id)))
+          .map((e) => ({
+            employeeId: str(e.id),
+            employeeName: str(e.name),
+            jobTitle: str(e.job_title),
+            role: str(e.role),
+            assignedReservations: resMap.get(str(e.id)) || 0,
+            followUpsCount: fuMap.get(str(e.id)) || 0,
+            problemsCount: prbMap.get(str(e.id)) || 0,
+            lastActivity: str(e.last_activity)
+          }));
         return { reportType: rType, rows, facets };
       }
 
@@ -4150,8 +4333,8 @@ export async function getAnnouncements(executor: DbExecutor, _session: AuthSessi
 }
 
 export async function saveAnnouncement(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  if (session.user.role !== 'general_manager' && session.user.role !== 'supervisor') {
-    throw new Error('FORBIDDEN: إدارة تعميمات وإعلانات الوردية متاحة للمشرف والمدير العام فقط.');
+  if (!crmCore.isPrivilegedRole(session.user.role) && session.user.role !== 'supervisor') {
+    throw new Error('FORBIDDEN: إدارة تعميمات وإعلانات الوردية متاحة للمبرمج والمشرف والمدير العام فقط.');
   }
   const title = str(payload.title);
   const message = str(payload.message);
@@ -4191,8 +4374,8 @@ export async function saveAnnouncement(executor: DbExecutor, session: AuthSessio
 }
 
 export async function deleteAnnouncement(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  if (session.user.role !== 'general_manager' && session.user.role !== 'supervisor') {
-    throw new Error('FORBIDDEN: حذف تعميمات الوردية متاح للمشرف والمدير العام فقط.');
+  if (!crmCore.isPrivilegedRole(session.user.role) && session.user.role !== 'supervisor') {
+    throw new Error('FORBIDDEN: حذف تعميمات الوردية متاح للمبرمج والمشرف والمدير العام فقط.');
   }
   const annId = str(payload.id || payload.announcementId);
   if (!annId) throw new Error('VALIDATION_ERROR: معرف التعميم مطلوب.');
@@ -4231,7 +4414,7 @@ function formatDelegationRow(row: any, nowMs: number = Date.now()): Record<strin
 }
 
 export async function getDelegations(executor: DbExecutor, session: AuthSession) {
-  const canManage = session.user.role === 'general_manager' || crmCore.canUserPerform(session.user, 'manage_employees') || crmCore.canUserPerform(session.user, 'view_employees');
+  const canManage = crmCore.isPrivilegedRole(session.user.role) || crmCore.canUserPerform(session.user, 'manage_employees') || crmCore.canUserPerform(session.user, 'view_employees');
   const res = canManage
     ? await executor.query(`SELECT * FROM employee_delegations ORDER BY created_at DESC LIMIT 100`)
     : await executor.query(`SELECT * FROM employee_delegations WHERE delegate_employee_id = $1 ORDER BY created_at DESC LIMIT 20`, [session.user.id]);
@@ -4242,7 +4425,7 @@ export async function getDelegations(executor: DbExecutor, session: AuthSession)
 }
 
 export async function saveDelegation(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  if (session.user.role !== 'general_manager' && !crmCore.canUserPerform(session.user, 'manage_employees')) {
+  if (!crmCore.isPrivilegedRole(session.user.role) && !crmCore.canUserPerform(session.user, 'manage_employees')) {
     throw new Error('FORBIDDEN: منح تفويض الصلاحيات المؤقت متاح للمدير العام أو مسؤول إدارة الموظفين فقط.');
   }
   const empId = str(payload.delegateEmployeeId);
@@ -4301,7 +4484,7 @@ export async function saveDelegation(executor: DbExecutor, session: AuthSession,
 }
 
 export async function revokeDelegation(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
-  if (session.user.role !== 'general_manager' && !crmCore.canUserPerform(session.user, 'manage_employees')) {
+  if (!crmCore.isPrivilegedRole(session.user.role) && !crmCore.canUserPerform(session.user, 'manage_employees')) {
     throw new Error('FORBIDDEN: إلغاء التفويض المؤقت متاح للمدير العام أو مسؤول إدارة الموظفين فقط.');
   }
   const delId = str(payload.id || payload.delegationId);
@@ -4599,4 +4782,165 @@ export async function bulkReassignEmployeeReservations(
   });
 
   return out;
+}
+
+export async function bulkReassignSelectedReservations(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'assign_employees');
+  const rawIds: string[] = Array.isArray(payload.reservationIds)
+    ? payload.reservationIds.map((x: any) => str(x)).filter(Boolean)
+    : [];
+  const reservationIds = Array.from(new Set(rawIds)).slice(0, 250);
+  const targetEmployeeId = str(payload.targetEmployeeId || payload.toEmployeeId || payload.employeeId);
+  const mode = str(payload.mode).toLowerCase() === 'add' ? 'add' : 'replace';
+
+  if (reservationIds.length === 0) {
+    throw new Error('VALIDATION_ERROR: يرجى تحديد حجز واحد على الأقل لإعادة التوزيع.');
+  }
+  if (!targetEmployeeId) {
+    throw new Error('VALIDATION_ERROR: يرجى اختيار الموظف المستلم.');
+  }
+
+  return runWithIdempotency(executor, session.user.id, 'bulkReassignSelectedReservations', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const empRes = await tx.query(
+        `SELECT id, name, status FROM employees WHERE id = $1 LIMIT 1`,
+        [targetEmployeeId]
+      );
+      const targetEmp = empRes.rows[0];
+      if (!targetEmp) {
+        throw new Error('NOT_FOUND: الموظف المستلم غير موجود.');
+      }
+      if (str(targetEmp.status || 'active') !== 'active') {
+        throw new Error('VALIDATION_ERROR: الموظف المستلم غير نشط.');
+      }
+
+      const resRows = await tx.query(
+        `SELECT * FROM reservations WHERE id = ANY($1::text[]) FOR UPDATE`,
+        [reservationIds]
+      );
+      if (resRows.rows.length === 0) {
+        throw new Error('NOT_FOUND: لم يتم العثور على الحجوزات المحددة.');
+      }
+
+      const nowIso = new Date().toISOString();
+      const targetName = str(targetEmp.name);
+      const updatedReservations: Record<string, any>[] = [];
+      const updatedNumbers: string[] = [];
+      const lastText = mode === 'add'
+        ? `إسناد جماعي إلى: ${targetName}`
+        : `إعادة توزيع جماعي إلى: ${targetName}`;
+
+      for (const rawRow of resRows.rows) {
+        const mapped = mapReservationRowToClient(rawRow, false);
+        const curIds: string[] = Array.isArray(mapped.assignedEmployeeIds) ? mapped.assignedEmployeeIds : [];
+        const curNames: string[] = Array.isArray(mapped.assignedEmployeeNames) ? mapped.assignedEmployeeNames : [];
+
+        let nextIds: string[];
+        let nextNames: string[];
+        if (mode === 'add') {
+          const seen = new Set<string>();
+          nextIds = [];
+          nextNames = [];
+          for (let i = 0; i < curIds.length; i++) {
+            const eid = str(curIds[i]);
+            if (!eid || seen.has(eid)) continue;
+            seen.add(eid);
+            nextIds.push(eid);
+            nextNames.push(str(curNames[i]) || eid);
+          }
+          if (!seen.has(targetEmployeeId)) {
+            nextIds.push(targetEmployeeId);
+            nextNames.push(targetName);
+          }
+        } else {
+          nextIds = [targetEmployeeId];
+          nextNames = [targetName];
+        }
+
+        await tx.query(
+          `UPDATE reservations
+           SET assigned_employee_ids = $2::jsonb,
+               assigned_employee_names = $3::jsonb,
+               last_update_text = $4,
+               last_updated_by_id = $5,
+               last_updated_by_name = $6,
+               last_updated_at = $7,
+               updated_at = $8::timestamptz
+           WHERE id = $1`,
+          [
+            mapped.id,
+            JSON.stringify(nextIds),
+            JSON.stringify(nextNames),
+            lastText,
+            session.user.id,
+            session.user.name,
+            nowIso,
+            nowIso
+          ]
+        );
+
+        if (mode === 'replace') {
+          await tx.query(
+            `UPDATE assignments SET status = 'transferred', updated_at = $2::timestamptz
+             WHERE reservation_id = $1 AND status = 'active'`,
+            [mapped.id, nowIso]
+          );
+        }
+        await tx.query(
+          `INSERT INTO assignments (id, reservation_id, reservation_number, employee_id, employee_name, assigned_by_id, assigned_by_name, role_type, status, assigned_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'bulk_reassign','active',$8::timestamptz,$8::timestamptz)`,
+          [generateId('ASN'), mapped.id, mapped.reservationNumber, targetEmployeeId, targetName, session.user.id, session.user.name, nowIso]
+        );
+
+        const nextObj: Record<string, any> = {
+          ...mapped,
+          assignedEmployeeIds: nextIds,
+          assignedEmployeeNames: nextNames,
+          lastUpdateText: lastText,
+          lastUpdatedById: session.user.id,
+          lastUpdatedByName: session.user.name,
+          lastUpdatedAt: nowIso,
+          updatedAt: nowIso
+        };
+        updatedReservations.push(nextObj);
+        updatedNumbers.push(mapped.reservationNumber);
+        await enqueueSheetsMirror(tx, 'Reservation', nextObj.id, 'upsertReservation', nextObj);
+      }
+
+      await createNotification(tx, {
+        recipientEmployeeId: targetEmployeeId,
+        type: 'assignment',
+        title: `إسناد جماعي: ${updatedReservations.length} حجز`,
+        message: `تم إسناد ${updatedReservations.length} حجزًا إليك بواسطة ${session.user.name} (${mode === 'add' ? 'إضافة للمشاركين' : 'استبدال الإسناد'}).`,
+        entityType: 'Reservation',
+        entityId: updatedNumbers[0] || ''
+      });
+
+      await logActivity(
+        tx,
+        session.user,
+        'إعادة توزيع جماعي',
+        'Reservation',
+        updatedNumbers.slice(0, 4).join(', '),
+        `${mode === 'add' ? 'إضافة إسناد' : 'إعادة توزيع'} ${updatedReservations.length} حجز إلى ${targetName}`
+      );
+
+      return {
+        targetEmployeeId,
+        targetEmployeeName: targetName,
+        mode,
+        updatedCount: updatedReservations.length,
+        reservationIds: updatedReservations.map((r) => r.id),
+        reservationNumbers: updatedNumbers,
+        updatedReservations
+      };
+    });
+
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
+  });
 }

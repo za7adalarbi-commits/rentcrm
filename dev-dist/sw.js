@@ -78,7 +78,7 @@ define(['./workbox-f7a01684'], (function (workbox) { 'use strict';
    */
   workbox.precacheAndRoute([{
     "url": "index.html",
-    "revision": "0.knggrgsr7ug"
+    "revision": "0.4fk94gujce"
   }], {
     "ignoreURLParametersMatching": [/^v$/]
   });

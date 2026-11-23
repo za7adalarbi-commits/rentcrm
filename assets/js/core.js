@@ -11,6 +11,7 @@
   'use strict';
 
   var ROLES = {
+    DEVELOPER: 'developer',
     GENERAL_MANAGER: 'general_manager',
     SUPERVISOR: 'supervisor',
     AGENT: 'agent'
@@ -18,11 +19,13 @@
 
   var ROLE_LABELS = {
     ar: {
+      developer: 'المبرمج',
       general_manager: 'المدير العام',
       supervisor: 'المشرف',
       agent: 'موظف خدمة العملاء'
     },
     en: {
+      developer: 'Developer',
       general_manager: 'General Manager',
       supervisor: 'Supervisor',
       agent: 'Customer Support Agent'
@@ -224,6 +227,9 @@
 
   var TIME_FORMATS = ['24h', '12h'];
   var SIDEBAR_POSITIONS = ['side', 'top', 'bottom'];
+  var TIMEZONE_DISPLAY_MODES = ['both', 'sa', 'eg'];
+  var RESERVATIONS_DISPLAY_MODES = ['table', 'calendar'];
+  var CALENDAR_GRANULARITIES = ['month', 'week', 'day'];
 
   function normalizeTimeFormat(val) {
     return String(val || '').trim().toLowerCase() === '12h' ? '12h' : '24h';
@@ -232,6 +238,25 @@
   function normalizeSidebarPosition(val) {
     var s = String(val || '').trim().toLowerCase();
     return (s === 'top' || s === 'bottom') ? s : 'side';
+  }
+
+  function normalizeTimezoneMode(val) {
+    var s = String(val || '').trim().toLowerCase();
+    if (s === 'sa' || s === 'ksa' || s === 'saudi') return 'sa';
+    if (s === 'eg' || s === 'egypt' || s === 'cairo') return 'eg';
+    return 'both';
+  }
+
+  function normalizeReservationsDisplayMode(val) {
+    var s = String(val || '').trim().toLowerCase();
+    return s === 'calendar' ? 'calendar' : 'table';
+  }
+
+  function normalizeCalendarGranularity(val) {
+    var s = String(val || '').trim().toLowerCase();
+    if (s === 'day') return 'day';
+    if (s === 'month') return 'month';
+    return 'week';
   }
 
   function extractTimeOnly(val) {
@@ -274,6 +299,182 @@
     var m = dt.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})$/);
     if (!m) return dt;
     return m[1] + ' ' + formatTimePreference(m[2], '12h', lang);
+  }
+
+  function getRiyadhTodayDateStr(nowMs) {
+    var ms = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
+    return new Date(ms + 3 * 3600000).toISOString().substring(0, 10);
+  }
+
+  function convertKsaDateTimeToEgypt(dateStr, timeStr, nowMs) {
+    var dClean = formatDisplayDate(dateStr);
+    var tClean = extractTimeOnly(timeStr);
+    if (!tClean) {
+      return {
+        hasTime: false,
+        saDate: dClean,
+        saTime: '',
+        egDate: dClean,
+        egTime: '',
+        dateShifted: false
+      };
+    }
+
+    var refDate = /^\d{4}-\d{2}-\d{2}$/.test(dClean) ? dClean : getRiyadhTodayDateStr(nowMs);
+    var partsD = refDate.split('-');
+    var partsT = tClean.split(':');
+    var yr = parseInt(partsD[0], 10);
+    var mo = parseInt(partsD[1], 10);
+    var dy = parseInt(partsD[2], 10);
+    var hh = parseInt(partsT[0], 10);
+    var mm = parseInt(partsT[1], 10);
+    var utcMs = Date.UTC(yr, mo - 1, dy, hh - 3, mm, 0);
+
+    var egDate = refDate;
+    var egTime = tClean;
+    var resolved = false;
+
+    try {
+      if (typeof Intl !== 'undefined' && typeof Intl.DateTimeFormat === 'function') {
+        var fmt = new Intl.DateTimeFormat('en-CA', {
+          timeZone: 'Africa/Cairo',
+          hourCycle: 'h23',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+        if (typeof fmt.formatToParts === 'function') {
+          var fParts = fmt.formatToParts(new Date(utcMs));
+          var map = {};
+          for (var i = 0; i < fParts.length; i++) {
+            map[fParts[i].type] = fParts[i].value;
+          }
+          if (map.year && map.month && map.day && map.hour !== undefined && map.minute !== undefined) {
+            var egH = map.hour === '24' ? '00' : String(map.hour);
+            if (egH.length < 2) egH = '0' + egH;
+            var egM = String(map.minute);
+            if (egM.length < 2) egM = '0' + egM;
+            var egMo = String(map.month);
+            if (egMo.length < 2) egMo = '0' + egMo;
+            var egDy = String(map.day);
+            if (egDy.length < 2) egDy = '0' + egDy;
+            egDate = map.year + '-' + egMo + '-' + egDy;
+            egTime = egH + ':' + egM;
+            resolved = true;
+          }
+        }
+      }
+    } catch (_e) {}
+
+    if (!resolved) {
+      var fallbackCairo = new Date(utcMs + 2 * 3600000);
+      egDate = fallbackCairo.toISOString().substring(0, 10);
+      egTime = fallbackCairo.toISOString().substring(11, 16);
+    }
+
+    var outEgDate = dClean ? egDate : '';
+    return {
+      hasTime: true,
+      saDate: dClean,
+      saTime: tClean,
+      egDate: outEgDate,
+      egTime: egTime,
+      dateShifted: Boolean(dClean && outEgDate && outEgDate !== dClean)
+    };
+  }
+
+  function buildBookingTimezoneDisplay(dateStr, timeStr, options) {
+    var opts = (options && typeof options === 'object') ? options : {};
+    var lang = opts.lang === 'en' ? 'en' : 'ar';
+    var tf = normalizeTimeFormat(opts.timeFormat);
+    var tzMode = normalizeTimezoneMode(opts.timezoneMode);
+    var compact = Boolean(opts.compact);
+    var timeOnly = Boolean(opts.timeOnly);
+    var conv = convertKsaDateTimeToEgypt(dateStr, timeStr, opts.nowMs);
+
+    var saLabel = lang === 'en'
+      ? (compact ? 'Saudi (Orig.)' : 'Original Saudi Time')
+      : (compact ? 'السعودي (الأصلي)' : 'التوقيت الأصلي السعودي');
+    var egLabel = lang === 'en'
+      ? (compact ? 'Egypt' : 'Egypt Time')
+      : (compact ? 'المصري' : 'التوقيت المصري');
+
+    if (!conv.hasTime) {
+      var dateFallbackEntry = conv.saDate ? [{
+        zone: 'sa',
+        date: conv.saDate,
+        time: '',
+        rawTime: '',
+        dateShifted: false,
+        valueText: conv.saDate,
+        label: saLabel
+      }] : [];
+      return {
+        mode: tzMode,
+        hasTime: false,
+        saDate: conv.saDate,
+        saTime: '',
+        egDate: conv.egDate,
+        egTime: '',
+        dateShifted: false,
+        entries: dateFallbackEntry
+      };
+    }
+
+    var saTimeDisp = formatTimePreference(conv.saTime, tf, lang);
+    var egTimeDisp = formatTimePreference(conv.egTime, tf, lang);
+
+    var saValueText = timeOnly
+      ? saTimeDisp
+      : (conv.saDate ? (conv.saDate + ' · ' + saTimeDisp) : saTimeDisp);
+    var egValueText = timeOnly
+      ? (conv.dateShifted && conv.egDate ? (egTimeDisp + ' (' + conv.egDate + ')') : egTimeDisp)
+      : (conv.egDate
+          ? ((compact && !conv.dateShifted) ? egTimeDisp : (conv.egDate + ' · ' + egTimeDisp))
+          : egTimeDisp);
+
+    var saEntry = {
+      zone: 'sa',
+      date: conv.saDate,
+      time: saTimeDisp,
+      rawTime: conv.saTime,
+      dateShifted: false,
+      valueText: saValueText,
+      label: saLabel
+    };
+    var egEntry = {
+      zone: 'eg',
+      date: conv.egDate,
+      time: egTimeDisp,
+      rawTime: conv.egTime,
+      dateShifted: conv.dateShifted,
+      valueText: egValueText,
+      label: egLabel
+    };
+
+    var entries = [];
+    if (tzMode === 'sa') {
+      entries = [saEntry];
+    } else if (tzMode === 'eg') {
+      entries = [egEntry];
+    } else {
+      entries = [saEntry, egEntry];
+    }
+
+    return {
+      mode: tzMode,
+      hasTime: true,
+      saDate: conv.saDate,
+      saTime: saTimeDisp,
+      egDate: conv.egDate,
+      egTime: egTimeDisp,
+      dateShifted: conv.dateShifted,
+      saEntry: saEntry,
+      egEntry: egEntry,
+      entries: entries
+    };
   }
 
   function translateOriginalStatus(code) {
@@ -981,23 +1182,76 @@
     'dash_view_charts_grid',
     'dash_view_radar',
     'dash_view_heatmap',
+    'dash_view_leaderboard',
     'dash_view_bottom_bento',
     'dash_view_handover'
   ];
 
+  var SECTION_VIEW_PERMISSION_KEYS = [
+    'view_reservations',
+    'view_my_followups',
+    'view_team_followups',
+    'view_problems',
+    'view_reports',
+    'view_employees',
+    'view_activity',
+    'view_settings'
+  ];
+
+  var SUBSECTION_VIEW_PERMISSION_KEYS = [
+    'sub_view_today_tab',
+    'sub_view_radar_tab',
+    'sub_view_myfu_mentions',
+    'sub_view_myfu_history',
+    'sub_view_prb_rates',
+    'sub_view_rep_charts',
+    'sub_view_emp_delegations',
+    'sub_view_emp_presets'
+  ];
+
+  var ACTION_BUTTON_PERMISSION_KEYS = [
+    'act_export_excel',
+    'act_export_pdf',
+    'act_pull_reservations',
+    'act_import_excel',
+    'act_bulk_reassign',
+    'act_handover_pdf',
+    'act_res_columns',
+    'act_claim_reservation',
+    'act_close_delete_ticket',
+    'act_report_problem',
+    'act_delete_employee'
+  ];
+
+  var ROUTE_PERMISSION_MAP = {
+    dashboard: 'view_dashboard',
+    reservations: 'view_reservations',
+    'my-followups': 'view_my_followups',
+    'team-followups': 'view_team_followups',
+    problems: 'view_problems',
+    reports: 'view_reports',
+    employees: 'view_employees',
+    activity: 'view_activity',
+    settings: 'view_settings'
+  };
+
+  var ALL_FULL_ACCESS_PERMS = [
+    'view_dashboard', 'dash_perms_configured', 'perms_sections_configured', 'perms_subsections_configured', 'perms_actions_configured'
+  ].concat(DASHBOARD_PERMISSION_KEYS).concat(SECTION_VIEW_PERMISSION_KEYS).concat(SUBSECTION_VIEW_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
+    'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
+    'claim_reservation', 'unclaim_reservation', 'quick_update_status',
+    'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
+    'create_problem', 'update_problem', 'delete_reservations', 'view_employees', 'manage_employees',
+    'view_all_logs', 'sync_data', 'manage_api_connection', 'manage_settings',
+    'manage_role_ui_defaults', 'manage_announcements', 'manage_developer_tools', 'export_reports'
+  ]);
+
   var ROLE_PERMISSION_MATRIX = {
-    general_manager: [
-      'view_dashboard', 'dash_perms_configured'
-    ].concat(DASHBOARD_PERMISSION_KEYS).concat([
-      'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
-      'claim_reservation', 'unclaim_reservation', 'quick_update_status',
-      'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
-      'create_problem', 'update_problem', 'view_employees', 'manage_employees',
-      'view_all_logs', 'sync_data', 'manage_settings', 'export_reports'
-    ]),
+    developer: ALL_FULL_ACCESS_PERMS.slice(),
+    general_manager: ALL_FULL_ACCESS_PERMS.filter(function (k) { return k !== 'manage_developer_tools'; }),
     supervisor: [
-      'view_dashboard', 'dash_perms_configured'
-    ].concat(DASHBOARD_PERMISSION_KEYS).concat([
+      'view_dashboard', 'dash_perms_configured', 'perms_sections_configured', 'perms_subsections_configured', 'perms_actions_configured'
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat(SECTION_VIEW_PERMISSION_KEYS).concat(SUBSECTION_VIEW_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
       'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
       'claim_reservation', 'unclaim_reservation', 'quick_update_status',
       'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
@@ -1005,15 +1259,45 @@
       'sync_data', 'export_reports'
     ]),
     agent: [
-      'view_dashboard', 'dash_perms_configured'
-    ].concat(DASHBOARD_PERMISSION_KEYS).concat([
+      'view_dashboard', 'dash_perms_configured', 'perms_subsections_configured', 'perms_actions_configured'
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
+      'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
+      'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_myfu_mentions', 'sub_view_myfu_history',
+      'sub_view_prb_rates', 'sub_view_rep_charts',
       'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
       'quick_update_status', 'create_problem', 'update_problem', 'export_reports'
     ])
   };
 
   var PERMISSIONS_CATALOG = [
-    { key: 'view_dashboard', label: 'عرض لوحة التحكم والإحصائيات', group: 'عام' },
+    { key: 'view_dashboard', label: 'عرض قسم: لوحة التحكم والإحصائيات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_reservations', label: 'عرض قسم: الحجوزات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_my_followups', label: 'عرض قسم: متابعاتي', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_team_followups', label: 'عرض قسم: متابعات الفريق', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_problems', label: 'عرض قسم: المشكلات والتذاكر', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_reports', label: 'عرض قسم: التقارير والإحصائيات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_employees', label: 'عرض قسم: الموظفين وملفات عملائهم', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_activity', label: 'عرض قسم: سجل النشاطات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_settings', label: 'عرض قسم: الإعدادات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_today_tab', label: 'عرض تبويب: التسليم والاستلام اليوم', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_radar_tab', label: 'عرض تبويب: رادار انتهاء الحجوزات (24 ساعة)', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_myfu_mentions', label: 'عرض تبويب: إشارات @Mention في متابعاتي', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_myfu_history', label: 'عرض قسم: سجل متابعاتي السابقة', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_prb_rates', label: 'عرض مؤشر: نسبة المشكلات لكل 100 حجز', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_rep_charts', label: 'عرض الرسوم البيانية ومصفوفة الذروة في التقارير', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_emp_delegations', label: 'عرض قسم: تفويض الصلاحيات المؤقت (الإنابة)', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_emp_presets', label: 'عرض قسم: الصلاحيات الجاهزة (القوالب الوظيفية)', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'act_export_excel', label: 'زر تصدير Excel في الجداول والتقارير', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_export_pdf', label: 'زر تصدير ومعاينة PDF', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_pull_reservations', label: 'زر وشريط سحب الحجوزات', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_import_excel', label: 'زر استيراد من Excel', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_bulk_reassign', label: 'زر التحويل والتوزيع الجماعي للحجوزات', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_handover_pdf', label: 'زر تسليم الوردية (PDF)', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_res_columns', label: 'زر إظهار / إخفاء أعمدة الجدول', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_claim_reservation', label: 'أزرار استلام وإلغاء استلام الحجز', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_close_delete_ticket', label: 'أزرار إغلاق / حذف التذاكر والمشكلات', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_report_problem', label: 'زر تحويل الحجز إلى مشكلة', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_delete_employee', label: 'أزرار حذف وإيقاف الموظفين', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'dash_view_hero_kpis', label: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', group: 'لوحة التحكم' },
     { key: 'dash_view_strip_kpis', label: 'شريط مؤشرات الحالات التفصيلية (KPI Strip)', group: 'لوحة التحكم' },
     { key: 'dash_view_daily_chart', label: 'رسم المتابعات اليومية', group: 'لوحة التحكم' },
@@ -1021,6 +1305,7 @@
     { key: 'dash_view_charts_grid', label: 'شبكة الرسوم البيانية التحليلية (6 مخططات)', group: 'لوحة التحكم' },
     { key: 'dash_view_radar', label: 'رادار انتهاء الحجوزات (24 ساعة)', group: 'لوحة التحكم' },
     { key: 'dash_view_heatmap', label: 'مصفوفة ساعات الذروة (تخطيط الورديات)', group: 'لوحة التحكم' },
+    { key: 'dash_view_leaderboard', label: 'لوحة صدارة الموظفين (Leaderboard)', group: 'لوحة التحكم' },
     { key: 'dash_view_bottom_bento', label: 'أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة', group: 'لوحة التحكم' },
     { key: 'dash_view_handover', label: 'زر تسليم الوردية (PDF) داخل لوحة التحكم', group: 'لوحة التحكم' },
     { key: 'view_all_reservations', label: 'استعراض جميع الحجوزات', group: 'الحجوزات' },
@@ -1036,12 +1321,16 @@
     { key: 'create_problem', label: 'تحويل الحجز إلى مشكلة / تذكرة', group: 'المشكلات' },
     { key: 'update_problem', label: 'تحديث حالة التذاكر والمشكلات', group: 'المشكلات' },
     { key: 'edit_ticket_details', label: 'تعديل بيانات ووصف التذاكر', group: 'الإشراف' },
-    { key: 'view_employees', label: 'عرض الموظفين وملفات عملائهم', group: 'الإشراف' },
     { key: 'view_all_logs', label: 'الاطلاع على سجل نشاطات الفريق', group: 'التقارير والرقابة' },
     { key: 'export_reports', label: 'تصدير تقارير Excel وPDF', group: 'التقارير والرقابة' },
     { key: 'sync_data', label: 'الوصول إلى Rental Gate API والمزامنة', group: 'الإدارة والربط (API)' },
+    { key: 'manage_api_connection', label: 'إدارة مفاتيح وربط API (RG_TOKEN / GAS)', group: 'الإدارة والربط (API)' },
     { key: 'manage_employees', label: 'إدارة حسابات الموظفين وصلاحياتهم', group: 'الإدارة والربط (API)' },
-    { key: 'manage_settings', label: 'تعديل إعدادات النظام والتحديث التلقائي', group: 'الإدارة والربط (API)' }
+    { key: 'manage_settings', label: 'تعديل إعدادات النظام والتحديث التلقائي', group: 'الإدارة والربط (API)' },
+    { key: 'manage_role_ui_defaults', label: 'التحكم المركزي بإعدادات وأعمدة واجهة الأدوار والوظائف', group: 'الإدارة والربط (API)' },
+    { key: 'manage_announcements', label: 'إدارة تعميمات وإعلانات الوردية', group: 'الإدارة والربط (API)' },
+    { key: 'delete_reservations', label: 'حذف الحجوزات الجماعي والنسخ الاحتياطي', group: 'الإدارة والربط (API)' },
+    { key: 'manage_developer_tools', label: 'الصلاحيات البرمجية الكاملة وفحص الخادم وكاش الموقع', group: 'الإدارة والربط (API)' }
   ];
 
   var JOB_ROLE_PRESETS = [
@@ -1065,10 +1354,12 @@
       jobTitle: 'أخصائي جودة وتقارير',
       role: ROLES.AGENT,
       permissions: [
-        'view_dashboard', 'dash_perms_configured',
+        'view_dashboard', 'dash_perms_configured', 'perms_subsections_configured',
         'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
         'dash_view_recent_activity', 'dash_view_charts_grid', 'dash_view_radar',
-        'dash_view_heatmap', 'dash_view_bottom_bento',
+        'dash_view_heatmap', 'dash_view_leaderboard', 'dash_view_bottom_bento',
+        'view_reservations', 'view_reports', 'view_activity',
+        'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_prb_rates', 'sub_view_rep_charts',
         'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports'
       ]
     },
@@ -1085,8 +1376,20 @@
       jobTitle: 'المدير العام',
       role: ROLES.GENERAL_MANAGER,
       permissions: ROLE_PERMISSION_MATRIX.general_manager.slice()
+    },
+    {
+      id: 'developer_admin',
+      label: 'المبرمج (مسؤول الموقع والإعدادات الكاملة)',
+      jobTitle: 'مبرمج ومسؤول الموقع',
+      role: ROLES.DEVELOPER,
+      permissions: ROLE_PERMISSION_MATRIX.developer.slice()
     }
   ];
+
+  function isPrivilegedRole(roleOrUser) {
+    var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
+    return role === ROLES.DEVELOPER || role === ROLES.GENERAL_MANAGER;
+  }
 
   function resolveEffectivePermissions(roleOrUser, optionalPerms) {
     if (!roleOrUser) return [];
@@ -1099,11 +1402,11 @@
     var role = roleOrUser.role || ROLES.AGENT;
     var rawPerms = Array.isArray(roleOrUser.permissions) ? roleOrUser.permissions : [];
     if (rawPerms.indexOf('all') !== -1) {
-      return ROLE_PERMISSION_MATRIX.general_manager.slice();
+      return (ROLE_PERMISSION_MATRIX[role === ROLES.DEVELOPER ? ROLES.DEVELOPER : ROLES.GENERAL_MANAGER]).slice();
     }
     var isLegacyRoleOnly = rawPerms.length === 0 || (
       rawPerms.length === 1 &&
-      [ROLES.AGENT, ROLES.SUPERVISOR, ROLES.GENERAL_MANAGER].indexOf(rawPerms[0]) !== -1
+      [ROLES.DEVELOPER, ROLES.AGENT, ROLES.SUPERVISOR, ROLES.GENERAL_MANAGER].indexOf(rawPerms[0]) !== -1
     );
     if (isLegacyRoleOnly) {
       return (ROLE_PERMISSION_MATRIX[role] || []).slice();
@@ -1113,11 +1416,13 @@
 
   function canAccessApi(roleOrUser) {
     var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
-    return role === ROLES.GENERAL_MANAGER || role === ROLES.SUPERVISOR;
+    return role === ROLES.DEVELOPER || role === ROLES.GENERAL_MANAGER || role === ROLES.SUPERVISOR;
   }
 
   function canUserPerform(roleOrUser, action) {
     if (!roleOrUser || !action) return false;
+    var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
+    if (role === ROLES.DEVELOPER) return true;
     if (action === 'sync_data' || action === 'manage_api_connection') {
       if (!canAccessApi(roleOrUser)) return false;
     }
@@ -1127,14 +1432,258 @@
 
   function canUserViewDashboardSection(roleOrUser, permKey) {
     if (!roleOrUser || !permKey) return false;
+    var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
     var allowed = resolveEffectivePermissions(roleOrUser);
-    if (allowed.indexOf('view_dashboard') === -1) return false;
+    if (role !== ROLES.DEVELOPER && allowed.indexOf('view_dashboard') === -1) return false;
     var hasGranularConfig = allowed.indexOf('dash_perms_configured') !== -1 ||
       DASHBOARD_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
     if (hasGranularConfig) {
       return allowed.indexOf(permKey) !== -1;
     }
     return true;
+  }
+
+  function canUserViewRoute(roleOrUser, routeId) {
+    if (!roleOrUser || !routeId) return false;
+    var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
+    if (role === ROLES.DEVELOPER) return NAV_ROUTE_IDS.indexOf(routeId) !== -1;
+    var allowed = resolveEffectivePermissions(roleOrUser);
+    var hasSectionConfig = allowed.indexOf('perms_sections_configured') !== -1 ||
+      SECTION_VIEW_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
+
+    if (routeId === 'dashboard') {
+      return allowed.indexOf('view_dashboard') !== -1;
+    }
+    if (routeId === 'employees') {
+      if (hasSectionConfig || allowed.indexOf('view_employees') !== -1) {
+        return allowed.indexOf('view_employees') !== -1;
+      }
+      return role === ROLES.GENERAL_MANAGER;
+    }
+    if (routeId === 'settings') {
+      if (hasSectionConfig) return allowed.indexOf('view_settings') !== -1;
+      return true;
+    }
+    var permKey = ROUTE_PERMISSION_MAP[routeId];
+    if (!permKey) return false;
+    if (hasSectionConfig) {
+      return allowed.indexOf(permKey) !== -1;
+    }
+    return true;
+  }
+
+  function canUserViewSubSection(roleOrUser, subKey) {
+    if (!roleOrUser || !subKey) return false;
+    var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
+    if (role === ROLES.DEVELOPER) return true;
+    var allowed = resolveEffectivePermissions(roleOrUser);
+    var hasSubConfig = allowed.indexOf('perms_subsections_configured') !== -1 ||
+      SUBSECTION_VIEW_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
+    if (hasSubConfig) {
+      return allowed.indexOf(subKey) !== -1;
+    }
+    return true;
+  }
+
+  function canUserUseActionButton(roleOrUser, actionKey) {
+    if (!roleOrUser || !actionKey) return false;
+    var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
+    if (role === ROLES.DEVELOPER) return true;
+    var allowed = resolveEffectivePermissions(roleOrUser);
+    var hasActionsConfig = allowed.indexOf('perms_actions_configured') !== -1 ||
+      ACTION_BUTTON_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
+    if (hasActionsConfig) {
+      return allowed.indexOf(actionKey) !== -1;
+    }
+    return true;
+  }
+
+  var EMPLOYEE_SECTION_GROUPS = [
+    {
+      id: 'main_sections',
+      labelAr: 'الأقسام والصفحات الرئيسية',
+      labelEn: 'Main Pages & Sections',
+      sentinelKey: 'perms_sections_configured',
+      items: [
+        { key: 'view_dashboard', routeId: 'dashboard', labelAr: 'لوحة التحكم والإحصائيات', labelEn: 'Dashboard & KPIs' },
+        { key: 'view_reservations', routeId: 'reservations', labelAr: 'الحجوزات', labelEn: 'Reservations' },
+        { key: 'view_my_followups', routeId: 'my-followups', labelAr: 'متابعاتي', labelEn: 'My Follow-Ups' },
+        { key: 'view_team_followups', routeId: 'team-followups', labelAr: 'متابعات الفريق', labelEn: 'Team Follow-Ups' },
+        { key: 'view_problems', routeId: 'problems', labelAr: 'المشكلات والتذاكر', labelEn: 'Problems & Tickets' },
+        { key: 'view_reports', routeId: 'reports', labelAr: 'التقارير والإحصائيات', labelEn: 'Reports & Analytics' },
+        { key: 'view_employees', routeId: 'employees', labelAr: 'الموظفون وملفات العملاء', labelEn: 'Employees & Profiles' },
+        { key: 'view_activity', routeId: 'activity', labelAr: 'سجل النشاطات', labelEn: 'Activity Log' },
+        { key: 'view_settings', routeId: 'settings', labelAr: 'الإعدادات', labelEn: 'Settings' }
+      ]
+    },
+    {
+      id: 'sub_sections',
+      labelAr: 'التبويبات والأقسام الفرعية',
+      labelEn: 'Tabs & Sub-Sections',
+      sentinelKey: 'perms_subsections_configured',
+      items: [
+        { key: 'sub_view_today_tab', labelAr: 'تبويب التسليم والاستلام اليوم', labelEn: 'Today Pickups & Returns Tab' },
+        { key: 'sub_view_radar_tab', labelAr: 'تبويب رادار انتهاء الحجوزات (24 ساعة)', labelEn: '24h Expiry Radar Tab' },
+        { key: 'sub_view_myfu_mentions', labelAr: 'تبويب إشارات @Mention في متابعاتي', labelEn: '@Mentions Tab' },
+        { key: 'sub_view_myfu_history', labelAr: 'قسم سجل متابعاتي السابقة', labelEn: 'My Follow-Ups History' },
+        { key: 'sub_view_prb_rates', labelAr: 'مؤشر نسبة المشكلات لكل 100 حجز', labelEn: 'Problems Per 100 Bookings' },
+        { key: 'sub_view_rep_charts', labelAr: 'الرسوم البيانية ومصفوفة الذروة بالتقارير', labelEn: 'Reports Charts & Heatmap' },
+        { key: 'sub_view_emp_delegations', labelAr: 'قسم تفويض الصلاحيات المؤقت (الإنابة)', labelEn: 'Temporary Delegations Section' },
+        { key: 'sub_view_emp_presets', labelAr: 'قسم الصلاحيات الجاهزة (القوالب الوظيفية)', labelEn: 'Role Presets Section' }
+      ]
+    },
+    {
+      id: 'dashboard_cards',
+      labelAr: 'بطاقات وإحصائيات لوحة التحكم',
+      labelEn: 'Dashboard Widgets & Stats',
+      sentinelKey: 'dash_perms_configured',
+      items: [
+        { key: 'dash_view_hero_kpis', labelAr: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', labelEn: 'Hero KPIs' },
+        { key: 'dash_view_strip_kpis', labelAr: 'شريط مؤشرات الحالات التفصيلية', labelEn: 'Status Strip KPIs' },
+        { key: 'dash_view_daily_chart', labelAr: 'رسم المتابعات اليومية', labelEn: 'Daily Follow-Ups Chart' },
+        { key: 'dash_view_recent_activity', labelAr: 'بطاقة أحدث النشاطات', labelEn: 'Recent Activity Feed' },
+        { key: 'dash_view_charts_grid', labelAr: 'شبكة الرسوم البيانية التحليلية', labelEn: 'Analytical Charts Grid' },
+        { key: 'dash_view_radar', labelAr: 'رادار انتهاء الحجوزات (24 ساعة)', labelEn: '24h Expiry Radar Card' },
+        { key: 'dash_view_heatmap', labelAr: 'مصفوفة ساعات الذروة (تخطيط الورديات)', labelEn: 'Peak Hours Heatmap' },
+        { key: 'dash_view_leaderboard', labelAr: 'لوحة الصدارة وأداء الفريق', labelEn: 'Team Leaderboard' },
+        { key: 'dash_view_bottom_bento', labelAr: 'أحدث الحجوزات والمشكلات والإجراءات السريعة', labelEn: 'Bottom Bento Feeds' },
+        { key: 'dash_view_handover', labelAr: 'زر تسليم الوردية (PDF)', labelEn: 'Shift Handover Button' }
+      ]
+    },
+    {
+      id: 'table_actions',
+      labelAr: 'أزرار وإجراءات الجداول والتصدير',
+      labelEn: 'Table & Toolbar Action Buttons',
+      sentinelKey: 'perms_actions_configured',
+      items: [
+        { key: 'act_export_excel', labelAr: 'زر تصدير Excel', labelEn: 'Export Excel Button' },
+        { key: 'act_export_pdf', labelAr: 'أزرار تصدير ومعاينة PDF', labelEn: 'Export / Preview PDF Buttons' },
+        { key: 'act_pull_reservations', labelAr: 'زر وشريط سحب الحجوزات', labelEn: 'Pull Reservations Button' },
+        { key: 'act_import_excel', labelAr: 'زر استيراد من Excel', labelEn: 'Import Excel Button' },
+        { key: 'act_bulk_reassign', label: 'التحويل والتوزيع الجماعي للحجوزات', labelAr: 'التحويل والتوزيع الجماعي للحجوزات', labelEn: 'Bulk Reassign Actions' },
+        { key: 'act_handover_pdf', labelAr: 'زر تسليم الوردية (PDF)', labelEn: 'Shift Handover (PDF) Button' },
+        { key: 'act_res_columns', labelAr: 'زر إظهار / إخفاء الأعمدة', labelEn: 'Table Columns Button' },
+        { key: 'act_claim_reservation', labelAr: 'أزرار استلام / إلغاء استلام الحجز', labelEn: 'Claim / Unclaim Booking Buttons' },
+        { key: 'act_close_delete_ticket', labelAr: 'أزرار إغلاق / حذف التذاكر والمشكلات', labelEn: 'Close / Delete Ticket Buttons' },
+        { key: 'act_report_problem', labelAr: 'زر تحويل الحجز إلى مشكلة', labelEn: 'Report Problem Button' },
+        { key: 'act_delete_employee', labelAr: 'أزرار حذف وإيقاف الموظفين', labelEn: 'Delete / Toggle Employee Buttons' }
+      ]
+    }
+  ];
+
+  function ensureSectionPermissionSentinels(role, currentPerms) {
+    var base = resolveEffectivePermissions(role || ROLES.AGENT, currentPerms);
+    var map = {};
+    var out = [];
+    for (var i = 0; i < base.length; i++) {
+      var k = normalizeStr(base[i]);
+      if (k && !map[k]) {
+        map[k] = true;
+        out.push(k);
+      }
+    }
+    var hadActionsConfig = Boolean(map['perms_actions_configured']) ||
+      ACTION_BUTTON_PERMISSION_KEYS.some(function (ak) { return Boolean(map[ak]); });
+    if (!hadActionsConfig) {
+      for (var akIdx = 0; akIdx < ACTION_BUTTON_PERMISSION_KEYS.length; akIdx++) {
+        var actKey = ACTION_BUTTON_PERMISSION_KEYS[akIdx];
+        if (!map[actKey]) {
+          map[actKey] = true;
+          out.push(actKey);
+        }
+      }
+    }
+    var sentinels = ['perms_sections_configured', 'perms_subsections_configured', 'dash_perms_configured', 'perms_actions_configured'];
+    for (var s = 0; s < sentinels.length; s++) {
+      if (!map[sentinels[s]]) {
+        map[sentinels[s]] = true;
+        out.push(sentinels[s]);
+      }
+    }
+    return out;
+  }
+
+  function applyEmployeeSectionToggle(role, currentPerms, permKey, visible) {
+    var key = normalizeStr(permKey);
+    var base = ensureSectionPermissionSentinels(role, currentPerms);
+    if (!key) return base;
+    var exists = base.indexOf(key) !== -1;
+    if (visible && !exists) {
+      return base.concat([key]);
+    }
+    if (!visible && exists) {
+      return base.filter(function (k) { return k !== key; });
+    }
+    return base;
+  }
+
+  function setEmployeeSectionGroupVisibility(role, currentPerms, groupKeys, visible) {
+    var keys = Array.isArray(groupKeys) ? groupKeys.map(normalizeStr).filter(Boolean) : [];
+    var base = ensureSectionPermissionSentinels(role, currentPerms);
+    var keySet = {};
+    for (var i = 0; i < keys.length; i++) keySet[keys[i]] = true;
+    var filtered = base.filter(function (k) { return !keySet[k]; });
+    if (!visible) return filtered;
+    var seen = {};
+    var out = [];
+    for (var a = 0; a < filtered.length; a++) {
+      if (!seen[filtered[a]]) { seen[filtered[a]] = true; out.push(filtered[a]); }
+    }
+    for (var b = 0; b < keys.length; b++) {
+      if (!seen[keys[b]]) { seen[keys[b]] = true; out.push(keys[b]); }
+    }
+    return out;
+  }
+
+  function getEmployeeSectionVisibilitySummary(roleOrUser, optionalPerms) {
+    var userObj = typeof roleOrUser === 'string'
+      ? { role: roleOrUser, permissions: Array.isArray(optionalPerms) ? optionalPerms : [] }
+      : (roleOrUser || { role: ROLES.AGENT, permissions: [] });
+    var visibleMainCount = 0;
+    var totalMainCount = EMPLOYEE_SECTION_GROUPS[0].items.length;
+    var visibleSubCount = 0;
+    var totalSubCount = EMPLOYEE_SECTION_GROUPS[1].items.length;
+    var visibleDashCount = 0;
+    var totalDashCount = EMPLOYEE_SECTION_GROUPS[2].items.length;
+    var visibleActionCount = 0;
+    var totalActionCount = EMPLOYEE_SECTION_GROUPS[3].items.length;
+    var hiddenKeys = [];
+
+    for (var m = 0; m < EMPLOYEE_SECTION_GROUPS[0].items.length; m++) {
+      var mItem = EMPLOYEE_SECTION_GROUPS[0].items[m];
+      if (canUserViewRoute(userObj, mItem.routeId)) visibleMainCount++;
+      else hiddenKeys.push(mItem.key);
+    }
+    for (var s = 0; s < EMPLOYEE_SECTION_GROUPS[1].items.length; s++) {
+      var sItem = EMPLOYEE_SECTION_GROUPS[1].items[s];
+      if (canUserViewSubSection(userObj, sItem.key)) visibleSubCount++;
+      else hiddenKeys.push(sItem.key);
+    }
+    for (var d = 0; d < EMPLOYEE_SECTION_GROUPS[2].items.length; d++) {
+      var dItem = EMPLOYEE_SECTION_GROUPS[2].items[d];
+      if (canUserViewDashboardSection(userObj, dItem.key)) visibleDashCount++;
+      else hiddenKeys.push(dItem.key);
+    }
+    for (var a = 0; a < EMPLOYEE_SECTION_GROUPS[3].items.length; a++) {
+      var aItem = EMPLOYEE_SECTION_GROUPS[3].items[a];
+      if (canUserUseActionButton(userObj, aItem.key)) visibleActionCount++;
+      else hiddenKeys.push(aItem.key);
+    }
+
+    return {
+      visibleMainCount: visibleMainCount,
+      totalMainCount: totalMainCount,
+      visibleSubCount: visibleSubCount,
+      totalSubCount: totalSubCount,
+      visibleDashCount: visibleDashCount,
+      totalDashCount: totalDashCount,
+      visibleActionCount: visibleActionCount,
+      totalActionCount: totalActionCount,
+      totalVisible: visibleMainCount + visibleSubCount + visibleDashCount + visibleActionCount,
+      totalAvailable: totalMainCount + totalSubCount + totalDashCount + totalActionCount,
+      hiddenCount: hiddenKeys.length,
+      hiddenKeys: hiddenKeys
+    };
   }
 
   function mergePermissionsCatalog(customItems) {
@@ -1210,7 +1759,7 @@
       var pid = normalizeStr(p.id) || ('preset_' + (i + 1));
       if (seen[pid]) continue;
       seen[pid] = true;
-      var role = [ROLES.GENERAL_MANAGER, ROLES.SUPERVISOR, ROLES.AGENT].indexOf(p.role) !== -1 ? p.role : ROLES.AGENT;
+      var role = [ROLES.DEVELOPER, ROLES.GENERAL_MANAGER, ROLES.SUPERVISOR, ROLES.AGENT].indexOf(p.role) !== -1 ? p.role : ROLES.AGENT;
       out.push({
         id: pid,
         label: normalizeStr(p.label) || normalizeStr(p.jobTitle) || pid,
@@ -1226,7 +1775,7 @@
     var list = normalizeRolePresets(presets);
     var label = normalizeStr(input && input.label);
     if (!label) throw new Error('اسم الصلاحية الجاهزة مطلوب.');
-    var role = [ROLES.GENERAL_MANAGER, ROLES.SUPERVISOR, ROLES.AGENT].indexOf(input.role) !== -1 ? input.role : ROLES.AGENT;
+    var role = [ROLES.DEVELOPER, ROLES.GENERAL_MANAGER, ROLES.SUPERVISOR, ROLES.AGENT].indexOf(input.role) !== -1 ? input.role : ROLES.AGENT;
     var jobTitle = normalizeStr(input && input.jobTitle) || label;
     var perms = sanitizePresetPermissions(role, input && input.permissions);
     var pid = normalizeStr(input && input.id);
@@ -1421,10 +1970,28 @@
     return out;
   }
 
-  function computeDashboardMetrics(reservations, followUps, problems, employees, dateRange, todayStr) {
+  function computeDashboardMetrics(reservations, followUps, problems, employees, dateRange, todayStr, options) {
     var today = todayStr || new Date().toISOString().substring(0, 10);
     var start = (dateRange && dateRange.start) || '';
     var end = (dateRange && dateRange.end) || '';
+    var opts = options || {};
+    var excludedList = Array.isArray(opts.excludedEmployeeIds)
+      ? opts.excludedEmployeeIds
+      : (opts.statsControlConfig && Array.isArray(opts.statsControlConfig.excludedFromStatsEmployeeIds)
+        ? opts.statsControlConfig.excludedFromStatsEmployeeIds
+        : []);
+    var excludedIdMap = {};
+    for (var exi = 0; exi < excludedList.length; exi++) {
+      var exId = normalizeStr(excludedList[exi]);
+      if (exId) excludedIdMap[exId] = true;
+    }
+    var excludedNameMap = {};
+    for (var empIdx = 0; empIdx < (employees || []).length; empIdx++) {
+      var empItem = employees[empIdx];
+      if (empItem && excludedIdMap[empItem.id] && empItem.name) {
+        excludedNameMap[empItem.name] = true;
+      }
+    }
 
     var filteredRes = (reservations || []).filter(function (r) {
       var d = normalizeStr(r.startDate || r.createdAt).substring(0, 10);
@@ -1466,7 +2033,10 @@
       if (start && fu.followUpDate < start) continue;
       if (end && fu.followUpDate > end) continue;
       dailyFollowUps[fu.followUpDate] = (dailyFollowUps[fu.followUpDate] || 0) + 1;
-      empFollowUpCounts[fu.employeeName] = (empFollowUpCounts[fu.employeeName] || 0) + 1;
+      var isExcludedFu = (fu.employeeId && excludedIdMap[fu.employeeId]) || (!fu.employeeId && fu.employeeName && excludedNameMap[fu.employeeName]);
+      if (!isExcludedFu && fu.employeeName) {
+        empFollowUpCounts[fu.employeeName] = (empFollowUpCounts[fu.employeeName] || 0) + 1;
+      }
     }
 
     var openProblems = 0;
@@ -1486,7 +2056,7 @@
     }
 
     var employeeComparison = (employees || [])
-      .filter(function (e) { return e.status === 'active'; })
+      .filter(function (e) { return e && e.status === 'active' && !excludedIdMap[e.id]; })
       .map(function (emp) {
         var assignedCount = 0;
         for (var r2 = 0; r2 < filteredRes.length; r2++) {
@@ -1959,6 +2529,7 @@
     assignEmployees: ['reservations', 'todayRadar', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     removeAssignment: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     bulkReassignEmployeeReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    bulkReassignSelectedReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     createProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     updateProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     createEmployee: ['employees', 'dashboard', 'activity', 'reports'],
@@ -1983,7 +2554,7 @@
     saveApiToken: ['settings', 'sync', 'activity'],
     saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
     applyUnifiedConnectionSetup: ['*'],
-    updateSettings: ['settings', 'sync', 'reservations', 'todayRadar', 'dashboard', 'activity'],
+    updateSettings: ['settings', 'sync', 'reservations', 'todayRadar', 'dashboard', 'reports', 'activity'],
     saveUserLayoutPrefs: ['dashboard', 'employees'],
     deleteAllReservations: ['*']
   };
@@ -2912,7 +3483,11 @@
     var end = parseIsoDateStrict(currentEnd) ? currentEnd : '';
     if (!clicked) return { start: start, end: end, nextRole: activeRole === 'end' ? 'end' : 'start', completed: false };
 
-    if (activeRole === 'end' && start) {
+    if (activeRole === 'end') {
+      if (!start) {
+        // Allow picking only end date without forcing start date
+        return { start: '', end: clicked, nextRole: 'end', completed: true };
+      }
       if (clicked < start) {
         return { start: clicked, end: start, nextRole: 'end', completed: true };
       }
@@ -3847,6 +4422,7 @@
   var HANDOVER_PDF_VISIBILITY_DEFAULTS = {
     includeSummaryKpis: true,
     includeTodayMovements: true,
+    splitPickupsAndReturns: false,
     includePending: true,
     includeClosed: true,
     includeOpenProblems: true,
@@ -3885,6 +4461,7 @@
     return {
       includeSummaryKpis: pickFlag('includeSummaryKpis'),
       includeTodayMovements: pickFlag('includeTodayMovements'),
+      splitPickupsAndReturns: pickFlag('splitPickupsAndReturns'),
       includePending: pickFlag('includePending'),
       includeClosed: pickFlag('includeClosed'),
       includeOpenProblems: pickFlag('includeOpenProblems'),
@@ -4234,7 +4811,53 @@
 
     var extraSections = [];
     var todayMvs = s.todayMovements || [];
-    if (vis.includeTodayMovements && todayMvs.length > 0) {
+    var tables = [];
+
+    if (vis.includeTodayMovements && vis.splitPickupsAndReturns) {
+      var pickupRows = [];
+      var returnRows = [];
+      todayMvs.forEach(function (it) {
+        var r = it.reservation || {};
+        var tDisp = it.scheduledTime ? formatTimePreference(it.scheduledTime, timeFmt, lang) : '-';
+        var branchVal = it.movementType === 'return'
+          ? ((r.deliverBranchName || r.branchName || '-'))
+          : (r.branchName || '-');
+        var rowObj = {
+          scheduledTime: tDisp,
+          reservationNumber: r.reservationNumber || r.id || '-',
+          customerName: (r.customerName || '-') + (vis.includeCustomerPhone && r.customerPhone ? (' (' + r.customerPhone + ')') : ''),
+          carName: r.carName || '-',
+          branchLocation: [r.companyName || '', branchVal].filter(Boolean).join(' — ') || '-',
+          statusText: it.isCompleted
+            ? (isEn ? 'Completed' : 'مكتمل')
+            : (it.isOverdue ? (isEn ? 'Overdue' : 'متأخر') : (r.internalStatus || (isEn ? 'Scheduled' : 'مجدول')))
+        };
+        if (it.movementType === 'return') returnRows.push(rowObj);
+        else pickupRows.push(rowObj);
+      });
+
+      var movementCols = [
+        { key: 'scheduledTime', label: 'الوقت', labelEn: 'Time', formatType: 'ltr', widthWeight: 0.85 },
+        { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Booking #', formatType: 'ltr', widthWeight: 1.05 },
+        { key: 'customerName', label: 'العميل', labelEn: 'Customer', widthWeight: 1.35 },
+        { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.15 },
+        { key: 'branchLocation', label: 'الشركة / الفرع', labelEn: 'Company / Branch', widthWeight: 1.25 },
+        { key: 'statusText', label: 'الحالة', labelEn: 'Status', widthWeight: 0.9 }
+      ];
+
+      tables.push({
+        kind: 'pickups',
+        title: (isEn ? "Today's Pickups — Handing Over to Customer (" : 'قسم التسليم اليوم — تسليم السيارة للعميل (') + pickupRows.length + ')',
+        columns: movementCols,
+        rows: pickupRows
+      });
+      tables.push({
+        kind: 'returns',
+        title: (isEn ? "Today's Returns — Receiving Back from Customer (" : 'قسم الاستلام / الإرجاع اليوم — استلام السيارة من العميل (') + returnRows.length + ')',
+        columns: movementCols,
+        rows: returnRows
+      });
+    } else if (vis.includeTodayMovements && todayMvs.length > 0) {
       extraSections.push({
         title: (isEn ? "Today's Pickups & Returns (" : 'التسليم والاستلام اليوم (') + todayMvs.length + ')',
         lines: todayMvs.map(function (it) {
@@ -4274,6 +4897,15 @@
       });
     }
 
+    if (tables.length > 0 && columns.length > 0) {
+      tables.push({
+        kind: 'shift_bookings',
+        title: (isEn ? 'Pending & Closed Shift Bookings (' : 'الحجوزات قيد المتابعة والمغلقة في الوردية (') + rows.length + ')',
+        columns: columns,
+        rows: rows
+      });
+    }
+
     var dateSlug = String(s.generatedAtIso || '').substring(0, 10) || 'shift';
     return {
       title: title,
@@ -4281,6 +4913,7 @@
       summaryItems: summaryItems,
       columns: columns,
       rows: rows,
+      tables: tables,
       extraSections: extraSections
     };
   }
@@ -4898,6 +5531,16 @@
     { key: 'hideTopbarNotifications', legacyId: 'set-ui-hide-topbar-notif', cssClass: 'rg-ui-hide-topbar-notif', group: 'nav_topbar', labelAr: 'إخفاء جرس الإشعارات من الشريط العلوي', labelEn: 'Hide topbar notifications bell' },
     { key: 'hideTopbarThemeToggle', legacyId: 'set-ui-hide-topbar-theme', cssClass: 'rg-ui-hide-topbar-theme', group: 'nav_topbar', labelAr: 'إخفاء زر الوضع الليلي/النهاري من الشريط العلوي', labelEn: 'Hide topbar theme toggle button' },
     { key: 'hideTopbarLangToggle', legacyId: 'set-ui-hide-topbar-lang', cssClass: 'rg-ui-hide-topbar-lang', group: 'nav_topbar', labelAr: 'إخفاء زر تبديل اللغة (EN / عربي) من الشريط العلوي', labelEn: 'Hide topbar language toggle button' },
+    { key: 'hideTopbarAnnouncements', legacyId: 'set-ui-hide-topbar-announcements', cssClass: 'rg-ui-hide-topbar-announcements', group: 'nav_topbar', labelAr: 'إخفاء زر إدارة التعميمات والشريط الإعلاني', labelEn: 'Hide shift announcements banner & manager button' },
+    { key: 'hideTopbarPreviewRole', legacyId: 'set-ui-hide-topbar-preview', cssClass: 'rg-ui-hide-topbar-preview', group: 'nav_topbar', labelAr: 'إخفاء زر «وضع المحاكاة (معاينة دور)» من الشريط العلوي', labelEn: 'Hide topbar Role Impersonation preview button' },
+    { key: 'hideSidebarCollapseBtn', legacyId: 'set-ui-hide-sidebar-collapse', cssClass: 'rg-ui-hide-sidebar-collapse', group: 'nav_topbar', labelAr: 'إخفاء زر طي وتوسيع القائمة الجانبية', labelEn: 'Hide sidebar collapse/expand button' },
+    { key: 'hideProfilePersonalBtn', legacyId: 'set-ui-hide-profile-personal', cssClass: 'rg-ui-hide-profile-personal', group: 'nav_topbar', labelAr: 'إخفاء زر «إعدادات الحساب الشخصي» من قائمة المستخدم', labelEn: 'Hide Personal Account Settings button in profile menu' },
+    { key: 'hideProfileInstallAppBtn', legacyId: 'set-ui-hide-profile-install', cssClass: 'rg-ui-hide-profile-install', group: 'nav_topbar', labelAr: 'إخفاء زر «تثبيت التطبيق على الجهاز (PWA)» من قائمة المستخدم', labelEn: 'Hide Install App (PWA) button in profile menu' },
+    { key: 'hideProfileThemeBtn', legacyId: 'set-ui-hide-profile-theme', cssClass: 'rg-ui-hide-profile-theme', group: 'nav_topbar', labelAr: 'إخفاء زر «تبديل المظهر» من قائمة المستخدم', labelEn: 'Hide Theme toggle button in profile menu' },
+    { key: 'hideProfileLangBtn', legacyId: 'set-ui-hide-profile-lang', cssClass: 'rg-ui-hide-profile-lang', group: 'nav_topbar', labelAr: 'إخفاء زر «تبديل اللغة» من قائمة المستخدم', labelEn: 'Hide Language toggle button in profile menu' },
+    { key: 'hideProfileLogoutBtn', legacyId: 'set-ui-hide-profile-logout', cssClass: 'rg-ui-hide-profile-logout', group: 'nav_topbar', labelAr: 'إخفاء زر «تسجيل الخروج» من قائمة المستخدم', labelEn: 'Hide Sign Out button in profile menu' },
+    { key: 'hideNotifMarkAllBtn', legacyId: 'set-ui-hide-notif-mark-all', cssClass: 'rg-ui-hide-notif-mark-all', group: 'nav_topbar', labelAr: 'إخفاء زر «تحديد الكل كمقروء» داخل قائمة الإشعارات', labelEn: 'Hide "Mark all read" button in Notifications popover' },
+    { key: 'hideLogoutBtn', legacyId: 'set-ui-hide-logout-btn', cssClass: 'rg-ui-hide-logout-btn', group: 'nav_topbar', labelAr: 'إخفاء زر «تسجيل الخروج» من الشريط العلوي', labelEn: 'Hide topbar Sign Out button' },
 
     // Group 2: Dashboard Sections
     { key: 'hideDashHeroKpis', legacyId: 'set-ui-hide-dash-hero-kpis', cssClass: 'rg-ui-hide-dash-hero-kpis', group: 'dashboard', labelAr: 'إخفاء بطاقات المؤشرات الرئيسية (Hero KPIs) في لوحة التحكم', labelEn: 'Hide Dashboard Hero KPI cards' },
@@ -4907,9 +5550,12 @@
     { key: 'hideDashChartsGrid', legacyId: 'set-ui-hide-dash-charts-grid', cssClass: 'rg-ui-hide-dash-charts-grid', group: 'dashboard', labelAr: 'إخفاء شبكة الرسوم البيانية التحليلية (توزيع الحالات، الشركات، الموظفين، المشكلات)', labelEn: 'Hide Dashboard analytics charts grid' },
     { key: 'hideDashboardRadar', legacyId: 'set-ui-hide-dash-radar', cssClass: 'rg-ui-hide-dash-radar', group: 'dashboard', labelAr: 'إخفاء رادار 24 ساعة في لوحة التحكم', labelEn: 'Hide 24h Expiry Radar section on Dashboard' },
     { key: 'hideDashboardHeatmap', legacyId: 'set-ui-hide-dash-heatmap', cssClass: 'rg-ui-hide-dash-heatmap', group: 'dashboard', labelAr: 'إخفاء مصفوفة ساعات الذروة من لوحة التحكم والتقارير', labelEn: 'Hide Peak Hours Heatmap from Dashboard & Reports' },
+    { key: 'hideDashLeaderboard', legacyId: 'set-ui-hide-dash-leaderboard', cssClass: 'rg-ui-hide-dash-leaderboard', group: 'dashboard', labelAr: 'إخفاء بطاقة «لوحة الصدارة (Leaderboard)» في لوحة التحكم', labelEn: 'Hide Team Leaderboard section on Dashboard' },
     { key: 'hideDashBottomBento', legacyId: 'set-ui-hide-dash-bottom', cssClass: 'rg-ui-hide-dash-bottom', group: 'dashboard', labelAr: 'إخفاء بطاقات أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة أسفل لوحة التحكم', labelEn: 'Hide Dashboard bottom bookings/problems/actions cards' },
     { key: 'hideDashCustomizeBtn', legacyId: 'set-ui-hide-dash-customize', cssClass: 'rg-ui-hide-dash-customize', group: 'dashboard', labelAr: 'إخفاء زر «تخصيص وترتيب الشاشات» في لوحة التحكم والشريط الجانبي', labelEn: 'Hide "Customize & Reorder Layout" buttons' },
     { key: 'hideShiftHandoverBtn', legacyId: 'set-ui-hide-handover-btn', cssClass: 'rg-ui-hide-handover-btn', group: 'dashboard', labelAr: 'إخفاء أزرار «تسليم الوردية (PDF)» من لوحة التحكم والحجوزات والتقارير', labelEn: 'Hide "Shift Handover (PDF)" buttons across pages' },
+    { key: 'hideDashTimeFilter', legacyId: 'set-ui-hide-dash-time-filter', cssClass: 'rg-ui-hide-dash-time-filter', group: 'dashboard', labelAr: 'إخفاء شريط الفلتر الزمني في لوحة التحكم', labelEn: 'Hide Dashboard time-range filter bar' },
+    { key: 'hideDashViewAllBtns', legacyId: 'set-ui-hide-dash-view-all', cssClass: 'rg-ui-hide-dash-view-all', group: 'dashboard', labelAr: 'إخفاء أزرار «عرض الكل» في بطاقات لوحة التحكم', labelEn: 'Hide "View All" buttons on Dashboard cards' },
 
     // Group 3: Reservations Page & Toolbar
     { key: 'hideResTodayTab', legacyId: 'set-ui-hide-res-today-tab', cssClass: 'rg-ui-hide-res-today-tab', group: 'reservations', labelAr: 'إخفاء تبويب وزر «التسليم والاستلام اليوم»', labelEn: 'Hide "Today\'s Pickups & Returns" tab & button' },
@@ -4918,15 +5564,26 @@
     { key: 'hideResImportExcel', legacyId: 'set-ui-hide-res-import-btn', cssClass: 'rg-ui-hide-res-import-btn', group: 'reservations', labelAr: 'إخفاء زر «استيراد من Excel» في صفحة الحجوزات', labelEn: 'Hide "Import Excel" button in Reservations' },
     { key: 'hideResColsToggle', legacyId: 'set-ui-hide-res-cols-btn', cssClass: 'rg-ui-hide-res-cols-btn', group: 'reservations', labelAr: 'إخفاء زر «إظهار/إخفاء الأعمدة» في جدول الحجوزات', labelEn: 'Hide "Toggle Columns" button in Reservations' },
     { key: 'hideResExportExcel', legacyId: 'set-ui-hide-res-export-btn', cssClass: 'rg-ui-hide-res-export-btn', group: 'reservations', labelAr: 'إخفاء زر «تصدير Excel» في صفحة الحجوزات', labelEn: 'Hide "Export Excel" button in Reservations' },
+    { key: 'hideResBulkReassign', legacyId: 'set-ui-hide-res-bulk', cssClass: 'rg-ui-hide-res-bulk', group: 'reservations', labelAr: 'إخفاء مربعات التحديد وشريط «إعادة التوزيع الجماعي» في الحجوزات', labelEn: 'Hide row multi-select & Bulk Reassign bar' },
+    { key: 'hideResQuickStatus', legacyId: 'set-ui-hide-res-quick-status', cssClass: 'rg-ui-hide-res-quick-status', group: 'reservations', labelAr: 'إخفاء قائمة تغيير الحالة السريع من جدول الحجوزات', labelEn: 'Hide quick status select inside Reservations table' },
+    { key: 'hideResClaimBtns', legacyId: 'set-ui-hide-res-claim-btns', cssClass: 'rg-ui-hide-res-claim-btns', group: 'reservations', labelAr: 'إخفاء أزرار «استلام عندي / إلغاء الاستلام» في جدول الحجوزات', labelEn: 'Hide Claim / Unclaim buttons in Reservations table' },
     { key: 'hideResFiltersExtras', legacyId: 'set-ui-hide-res-filters-extras', cssClass: 'rg-ui-hide-res-filters-extras', group: 'reservations', labelAr: 'إخفاء فلاتر التاريخ والأولوية وخيارات «لم تتم متابعتها / بها مشكلات»', labelEn: 'Hide extra date/priority/checkbox filters in Reservations' },
+    { key: 'hideResResetBtn', legacyId: 'set-ui-hide-res-reset', cssClass: 'rg-ui-hide-res-reset', group: 'reservations', labelAr: 'إخفاء زر «إعادة ضبط» الفلاتر في الحجوزات', labelEn: 'Hide "Reset Filters" button in Reservations' },
+    { key: 'hideTodayRefreshBtn', legacyId: 'set-ui-hide-today-refresh', cssClass: 'rg-ui-hide-today-refresh', group: 'reservations', labelAr: 'إخفاء أزرار «تحديث» داخل تبويبي اليوم ورادار 24 ساعة', labelEn: 'Hide Refresh buttons in Today & Radar tabs' },
+    { key: 'hideRadarWhatsappBtns', legacyId: 'set-ui-hide-radar-wa', cssClass: 'rg-ui-hide-radar-wa', group: 'reservations', labelAr: 'إخفاء أزرار «واتساب» و«نسخ التمديد» في جدولي اليوم والرادار', labelEn: 'Hide WhatsApp & Copy Offer buttons in Today & Radar' },
 
     // Group 4: Reservation Details Drawer
+    { key: 'hideDrawerBackBtn', legacyId: 'set-ui-hide-drawer-back', cssClass: 'rg-ui-hide-drawer-back', group: 'drawer', labelAr: 'إخفاء زر «العودة لملف الموظف» في رأس تفاصيل الحجز', labelEn: 'Hide "Back to Employee Profile" button in Drawer' },
+    { key: 'hideDrawerClaimBtns', legacyId: 'set-ui-hide-drawer-claim', cssClass: 'rg-ui-hide-drawer-claim', group: 'drawer', labelAr: 'إخفاء أزرار «استلام الحجز عندي / إلغاء الاستلام» داخل التفاصيل', labelEn: 'Hide Claim / Unclaim buttons inside Drawer' },
     { key: 'hideDrawerCopySummary', legacyId: 'set-ui-hide-drawer-copy', cssClass: 'rg-ui-hide-drawer-copy', group: 'drawer', labelAr: 'إخفاء زر «نسخ ملخص الحجز» داخل التفاصيل', labelEn: 'Hide "Copy Summary" button in Drawer' },
-    { key: 'hideDirectCallBtn', legacyId: 'set-ui-hide-direct-call', cssClass: 'rg-ui-hide-direct-call', group: 'drawer', labelAr: 'إخفاء أزرار «اتصال 90» المباشرة', labelEn: 'Hide "Call 90" direct call buttons' },
+    { key: 'hideDirectCallBtn', legacyId: 'set-ui-hide-direct-call', cssClass: 'rg-ui-hide-direct-call', group: 'drawer', labelAr: 'إخفاء أزرار «اتصال 9» المباشرة', labelEn: 'Hide "Call 9" direct call buttons' },
+    { key: 'hideDrawerIcsBtn', legacyId: 'set-ui-hide-drawer-ics', cssClass: 'rg-ui-hide-drawer-ics', group: 'drawer', labelAr: 'إخفاء زر «تقويم .ics» داخل تفاصيل الحجز', labelEn: 'Hide "Calendar .ics" button in Drawer' },
+    { key: 'hideDrawerQuickStatus', legacyId: 'set-ui-hide-drawer-quick-status', cssClass: 'rg-ui-hide-drawer-quick-status', group: 'drawer', labelAr: 'إخفاء شريط «التحديث السريع للحالة» داخل تفاصيل الحجز', labelEn: 'Hide quick status update bar in Drawer' },
     { key: 'hideDrawerEditBtn', legacyId: 'set-ui-hide-drawer-edit', cssClass: 'rg-ui-hide-drawer-edit', group: 'drawer', labelAr: 'إخفاء زر «تعديل تفاصيل الحجز» داخل التفاصيل', labelEn: 'Hide "Edit Booking" button in Drawer' },
     { key: 'hideDrawerPdfBtn', legacyId: 'set-ui-hide-drawer-pdf', cssClass: 'rg-ui-hide-drawer-pdf', group: 'drawer', labelAr: 'إخفاء زر «تصدير PDF» داخل تفاصيل الحجز', labelEn: 'Hide "Export PDF" button in Drawer' },
     { key: 'hideDrawerReportProblemBtn', legacyId: 'set-ui-hide-drawer-problem', cssClass: 'rg-ui-hide-drawer-problem', group: 'drawer', labelAr: 'إخفاء زر «تحويل إلى مشكلة» داخل تفاصيل الحجز', labelEn: 'Hide "Report Problem" button in Drawer' },
     { key: 'hideDrawerPinnedNote', legacyId: 'set-ui-hide-drawer-pinned-note', cssClass: 'rg-ui-hide-drawer-pinned-note', group: 'drawer', labelAr: 'إخفاء قسم «الملاحظة المثبتة» أعلى تفاصيل الحجز', labelEn: 'Hide "Pinned Note" card in Drawer' },
+    { key: 'hideDrawerHeaderPinBtn', legacyId: 'set-ui-hide-drawer-header-pin', cssClass: 'rg-ui-hide-drawer-header-pin', group: 'drawer', labelAr: 'إخفاء زر «ملاحظة مشرف/مدير مثبتة» من رأس الحجز', labelEn: 'Hide "Supervisor Pinned Note" button in Drawer header' },
     { key: 'hideNoAnswerBtn', legacyId: 'set-ui-hide-no-answer-btn', cssClass: 'rg-ui-hide-no-answer-btn', group: 'drawer', labelAr: 'إخفاء زر وعداد «لم يرد» في الحجز ومتابعاتي', labelEn: 'Hide "No Answer" button & counter' },
     { key: 'hideSharedBadge', legacyId: 'set-ui-hide-shared-badge', cssClass: 'rg-ui-hide-shared-badge', group: 'drawer', labelAr: 'إخفاء شارة «حصري لك / مشترك مع»', labelEn: 'Hide "Exclusive / Shared" collaboration badges' },
     { key: 'hideCustomerContactExtras', legacyId: 'set-ui-hide-customer-extra', cssClass: 'rg-ui-hide-customer-extra', group: 'drawer', labelAr: 'إخفاء البريد الإلكتروني ورقم الهوية من رأس الحجز', labelEn: 'Hide customer email & ID in Drawer header' },
@@ -4938,15 +5595,37 @@
     { key: 'hideDrawerExtensions', legacyId: 'set-ui-hide-drawer-extensions', cssClass: 'rg-ui-hide-drawer-extensions', group: 'drawer', labelAr: 'إخفاء قسم «سجل التمديدات» داخل تفاصيل الحجز', labelEn: 'Hide "Extensions History" section in Drawer' },
     { key: 'hideDrawerCharts', legacyId: 'set-ui-hide-drawer-charts', cssClass: 'rg-ui-hide-drawer-charts', group: 'drawer', labelAr: 'إخفاء الرسوم البيانية داخل تفاصيل الحجز', labelEn: 'Hide secondary charts in Drawer' },
     { key: 'hideDrawerTimeline', legacyId: 'set-ui-hide-drawer-timeline', cssClass: 'rg-ui-hide-drawer-timeline', group: 'drawer', labelAr: 'إخفاء سجل المتابعات والمشكلات المرتبطة داخل الحجز', labelEn: 'Hide follow-up log & linked tickets in Drawer' },
+    { key: 'hideDrawerAddFollowupForm', legacyId: 'set-ui-hide-drawer-add-fu', cssClass: 'rg-ui-hide-drawer-add-fu', group: 'drawer', labelAr: 'إخفاء نموذج «إضافة متابعة جديدة» داخل تفاصيل الحجز', labelEn: 'Hide "Add Follow-Up" form inside Drawer' },
+    { key: 'hideDrawerEditFollowupBtns', legacyId: 'set-ui-hide-drawer-edit-fu', cssClass: 'rg-ui-hide-drawer-edit-fu', group: 'drawer', labelAr: 'إخفاء أزرار «تعديل / إغلاق» داخل سجل المتابعات والتذاكر', labelEn: 'Hide Edit/Close buttons in Drawer timeline & tickets' },
 
     // Group 5: Other Modules
     { key: 'hideMyfuPinnedStrip', legacyId: 'set-ui-hide-myfu-pinned', cssClass: 'rg-ui-hide-myfu-pinned', group: 'modules', labelAr: 'إخفاء شريط وأزرار تثبيت «الحجوزات الحرجة» في متابعاتي', labelEn: 'Hide "Pinned Critical Bookings" strip & pin buttons' },
     { key: 'hideMyfuMentionsTab', legacyId: 'set-ui-hide-myfu-mentions', cssClass: 'rg-ui-hide-myfu-mentions', group: 'modules', labelAr: 'إخفاء تبويب «إشارات @Mention» في متابعاتي', labelEn: 'Hide "@Mentions" tab in My Follow-Ups' },
     { key: 'hideMyfuHistoryCard', legacyId: 'set-ui-hide-myfu-history', cssClass: 'rg-ui-hide-myfu-history', group: 'modules', labelAr: 'إخفاء قسم «سجل متابعاتي السابقة» في متابعاتي', labelEn: 'Hide "My Previous Follow-Ups" history card' },
+    { key: 'hideMyfuIcsBtn', legacyId: 'set-ui-hide-myfu-ics', cssClass: 'rg-ui-hide-myfu-ics', group: 'modules', labelAr: 'إخفاء زر «تقويم .ics» في صفحة متابعاتي', labelEn: 'Hide "Calendar .ics" button in My Follow-Ups' },
+    { key: 'hideTeamFuBulkBtn', legacyId: 'set-ui-hide-tfu-bulk', cssClass: 'rg-ui-hide-tfu-bulk', group: 'modules', labelAr: 'إخفاء أزرار «تحويل جماعي» و«ملف عملاء الموظف» و«إعادة ضبط» في متابعات الفريق', labelEn: 'Hide Team Follow-Ups bulk reassign, profile & reset buttons' },
     { key: 'hideProblemsRateIndicator', legacyId: 'set-ui-hide-prb-rates', cssClass: 'rg-ui-hide-prb-rates', group: 'modules', labelAr: 'إخفاء مؤشر «نسبة المشكلات لكل 100 حجز» في المشكلات والتقارير', labelEn: 'Hide "Problems per 100 Bookings" indicator & toggle' },
+    { key: 'hideProblemsManageBtns', legacyId: 'set-ui-hide-prb-manage', cssClass: 'rg-ui-hide-prb-manage', group: 'modules', labelAr: 'إخفاء أزرار «تحديث / إدارة» التذاكر في جدول المشكلات', labelEn: 'Hide "Manage / Update" buttons in Problems table' },
+    { key: 'hideProblemsOpenResBtn', legacyId: 'set-ui-hide-prb-open-res', cssClass: 'rg-ui-hide-prb-open-res', group: 'modules', labelAr: 'إخفاء أزرار «فتح الحجز» من المشكلات وتفاصيل التذكرة', labelEn: 'Hide "Open Booking" buttons in Problems view & modal' },
+    { key: 'hideProblemsResetBtn', legacyId: 'set-ui-hide-prb-reset', cssClass: 'rg-ui-hide-prb-reset', group: 'modules', labelAr: 'إخفاء أزرار «إعادة ضبط» و«إغلاق المشكلة» السريع في المشكلات', labelEn: 'Hide Problems reset filter & quick close buttons' },
     { key: 'hideReportsCharts', legacyId: 'set-ui-hide-reports-charts', cssClass: 'rg-ui-hide-reports-charts', group: 'modules', labelAr: 'إخفاء الرسوم البيانية في صفحة التقارير', labelEn: 'Hide charts section in Reports page' },
     { key: 'hideReportsExportModalBtn', legacyId: 'set-ui-hide-reports-export', cssClass: 'rg-ui-hide-reports-export', group: 'modules', labelAr: 'إخفاء زر «إعدادات التصدير (PDF / Excel)» في التقارير', labelEn: 'Hide "Export Settings (PDF / Excel)" button in Reports' },
-    { key: 'hideRolePresetsSection', legacyId: 'set-ui-hide-role-presets', cssClass: 'rg-ui-hide-role-presets', group: 'modules', labelAr: 'إخفاء قسم «إدارة الصلاحيات الجاهزة (القوالب الوظيفية)» في الموظفين', labelEn: 'Hide "Role Presets" section in Employees page' }
+    { key: 'hideReportsTypeTabs', legacyId: 'set-ui-hide-rep-tabs', cssClass: 'rg-ui-hide-rep-tabs', group: 'modules', labelAr: 'إخفاء تبويبات أنواع التقارير وزر «تحديث التقرير» في التقارير', labelEn: 'Hide Report Type tabs & Generate button in Reports' },
+    { key: 'hideRolePresetsSection', legacyId: 'set-ui-hide-role-presets', cssClass: 'rg-ui-hide-role-presets', group: 'modules', labelAr: 'إخفاء قسم «إدارة الصلاحيات الجاهزة (القوالب الوظيفية)» في الموظفين', labelEn: 'Hide "Role Presets" section in Employees page' },
+    { key: 'hideEmpRolePresetBtns', legacyId: 'set-ui-hide-emp-preset-btns', cssClass: 'rg-ui-hide-emp-preset-btns', group: 'modules', labelAr: 'إخفاء أزرار إضافة وتعديل وحذف القوالب الوظيفية في الموظفين', labelEn: 'Hide Role Preset add/edit/delete/use buttons' },
+    { key: 'hideEmpManagePermsBtn', legacyId: 'set-ui-hide-emp-manage-perms', cssClass: 'rg-ui-hide-emp-manage-perms', group: 'modules', labelAr: 'إخفاء أزرار «إدارة وتعديل الصلاحيات الفردية» في الموظفين', labelEn: 'Hide "Manage Individual Permissions" buttons' },
+    { key: 'hideEmployeesDelegations', legacyId: 'set-ui-hide-emp-delegations', cssClass: 'rg-ui-hide-emp-delegations', group: 'modules', labelAr: 'إخفاء قسم «الإنابة المؤقتة» في صفحة الموظفين', labelEn: 'Hide "Temporary Delegations" section in Employees page' },
+    { key: 'hideEmployeesShiftTransfer', legacyId: 'set-ui-hide-emp-transfer', cssClass: 'rg-ui-hide-emp-transfer', group: 'modules', labelAr: 'إخفاء زر «نقل جماعي لحجوزات موظف» في صفحة الموظفين', labelEn: 'Hide "Bulk Shift Transfer" button in Employees page' },
+    { key: 'hideEmployeesAddBtn', legacyId: 'set-ui-hide-emp-add', cssClass: 'rg-ui-hide-emp-add', group: 'modules', labelAr: 'إخفاء زر «إضافة موظف جديد» في صفحة الموظفين', labelEn: 'Hide "Add New Employee" button in Employees page' },
+    { key: 'hideEmployeesRowActions', legacyId: 'set-ui-hide-emp-row-actions', cssClass: 'rg-ui-hide-emp-row-actions', group: 'modules', labelAr: 'إخفاء أزرار «إيقاف/تفعيل» و«حذف» و«محاكاة» من جدول الموظفين', labelEn: 'Hide Disable, Delete & Impersonate row buttons in Employees' },
+    { key: 'hideEditDeveloperBtn', legacyId: 'set-ui-hide-edit-dev-btn', cssClass: 'rg-ui-hide-edit-dev-btn', group: 'modules', labelAr: 'إخفاء أزرار «تعديل بيانات المبرمج» من الإعدادات والموظفين وقائمة الحساب', labelEn: 'Hide "Edit Developer Data" buttons' },
+    { key: 'hidePersonalSettingsCardBtn', legacyId: 'set-ui-hide-personal-card-btn', cssClass: 'rg-ui-hide-personal-card-btn', group: 'modules', labelAr: 'إخفاء زر فتح «إعدادات الحساب الشخصي» داخل بطاقة الإعدادات', labelEn: 'Hide Personal Settings button inside Settings card' },
+    { key: 'hideSettingsDiagnostics', legacyId: 'set-ui-hide-set-diag', cssClass: 'rg-ui-hide-set-diag', group: 'modules', labelAr: 'إخفاء أزرار فحص الاتصال ومسح الكاش من صفحة الإعدادات', labelEn: 'Hide connection test & clear cache buttons in Settings' },
+    { key: 'hideSettingsRgTokenCard', legacyId: 'set-ui-hide-set-rg-token', cssClass: 'rg-ui-hide-set-rg-token', group: 'modules', labelAr: 'إخفاء بطاقة تحديث توكن RG_TOKEN في صفحة الإعدادات', labelEn: 'Hide RG_TOKEN update card in Settings' },
+    { key: 'hideSettingsSyncSection', legacyId: 'set-ui-hide-set-sync', cssClass: 'rg-ui-hide-set-sync', group: 'modules', labelAr: 'إخفاء قسم وأزرار «مزامنة بيانات Rental Gate API» في الإعدادات', labelEn: 'Hide Rental Gate Sync section & buttons in Settings' },
+    { key: 'hideSettingsHandoverCard', legacyId: 'set-ui-hide-set-handover', cssClass: 'rg-ui-hide-set-handover', group: 'modules', labelAr: 'إخفاء بطاقة «إعدادات تسليم الوردية وتعميمات الفريق» في الإعدادات', labelEn: 'Hide Shift Handover & Announcements card in Settings' },
+    { key: 'hideSettingsRoleUiDefaults', legacyId: 'set-ui-hide-set-role-defaults', cssClass: 'rg-ui-hide-set-role-defaults', group: 'modules', labelAr: 'إخفاء لوحة «التحكم المركزي بواجهة الأدوار (Role UI Defaults)» في الإعدادات', labelEn: 'Hide Role UI Defaults control panel in Settings' },
+    { key: 'hideSettingsDangerZone', legacyId: 'set-ui-hide-set-danger', cssClass: 'rg-ui-hide-set-danger', group: 'modules', labelAr: 'إخفاء زر وقسم «حذف الحجوزات» من صفحة الإعدادات', labelEn: 'Hide Delete Reservations zone in Settings' }
   ];
 
   var TEAM_UI_PRESETS = {
@@ -5030,13 +5709,413 @@
     return normalized;
   }
 
+  // ---------- CENTRALIZED PER-ROLE UI DEFAULTS ----------
+
+  var DEFAULT_RESERVATIONS_VISIBLE_COLS = [
+    'reservationNumber',
+    'customerName',
+    'carName',
+    'startDate',
+    'totalAmount',
+    'originalStatusAr',
+    'internalStatus'
+  ];
+
+  function normalizeRoleUiDefaults(raw) {
+    var input = raw;
+    if (typeof raw === 'string') {
+      try { input = JSON.parse(raw); } catch (_e) { input = {}; }
+    }
+    var obj = (input && typeof input === 'object' && !Array.isArray(input)) ? input : {};
+    var rolesList = [ROLES.AGENT, ROLES.SUPERVISOR, ROLES.GENERAL_MANAGER, ROLES.DEVELOPER];
+    var out = {};
+    for (var i = 0; i < rolesList.length; i++) {
+      var rKey = rolesList[i];
+      var rCfg = (obj[rKey] && typeof obj[rKey] === 'object') ? obj[rKey] : {};
+      var rawCols = Array.isArray(rCfg.visibleCols) ? rCfg.visibleCols.map(normalizeStr).filter(Boolean) : [];
+      var dedupCols = [];
+      var seenCol = {};
+      for (var c = 0; c < rawCols.length; c++) {
+        if (!seenCol[rawCols[c]]) { seenCol[rawCols[c]] = true; dedupCols.push(rawCols[c]); }
+      }
+      out[rKey] = {
+        enabled: Boolean(rCfg.enabled),
+        uiSimplification: rCfg.uiSimplification ? normalizeUiSimplificationSettings(rCfg.uiSimplification) : null,
+        visibleCols: dedupCols.length ? dedupCols : DEFAULT_RESERVATIONS_VISIBLE_COLS.slice(),
+        forceForRole: Boolean(rCfg.forceForRole)
+      };
+    }
+    return out;
+  }
+
+  function resolveRoleUiDefaultsForUser(user, roleUiDefaults, globalUiSimp) {
+    var role = (user && user.role) ? normalizeStr(user.role) : ROLES.AGENT;
+    var normDefaults = normalizeRoleUiDefaults(roleUiDefaults);
+    var cfg = normDefaults[role] || normDefaults[ROLES.AGENT];
+    var baseGlobal = normalizeUiSimplificationSettings(globalUiSimp);
+    var effectiveUi = (cfg && cfg.enabled && cfg.uiSimplification)
+      ? cfg.uiSimplification
+      : baseGlobal;
+    return {
+      role: role,
+      hasRoleOverride: Boolean(cfg && cfg.enabled),
+      forceForRole: Boolean(cfg && cfg.enabled && cfg.forceForRole),
+      uiSimplification: effectiveUi,
+      visibleCols: (cfg && Array.isArray(cfg.visibleCols) && cfg.visibleCols.length)
+        ? cfg.visibleCols.slice()
+        : DEFAULT_RESERVATIONS_VISIBLE_COLS.slice()
+    };
+  }
+
+  // ---------- IMPERSONATION / PREVIEW ROLE ----------
+
+  function canUserImpersonate(user) {
+    if (!user || typeof user !== 'object') return false;
+    var role = normalizeStr(user.baseRole || user.role);
+    return role === ROLES.DEVELOPER || role === ROLES.GENERAL_MANAGER || role === ROLES.SUPERVISOR;
+  }
+
+  function getAllowedPreviewRoles(actorUser) {
+    if (!canUserImpersonate(actorUser)) return [];
+    var role = normalizeStr(actorUser.baseRole || actorUser.role);
+    if (role === ROLES.DEVELOPER) {
+      return [ROLES.AGENT, ROLES.SUPERVISOR, ROLES.GENERAL_MANAGER, ROLES.DEVELOPER];
+    }
+    if (role === ROLES.GENERAL_MANAGER) {
+      return [ROLES.AGENT, ROLES.SUPERVISOR, ROLES.GENERAL_MANAGER];
+    }
+    return [ROLES.AGENT, ROLES.SUPERVISOR];
+  }
+
+  function resolvePreviewUserSession(realUser, previewSpec, employeesList, rolePresets) {
+    if (!canUserImpersonate(realUser) || !previewSpec || typeof previewSpec !== 'object') {
+      return null;
+    }
+    var allowedRoles = getAllowedPreviewRoles(realUser);
+    var emps = Array.isArray(employeesList) ? employeesList : [];
+    var targetEmp = null;
+    if (previewSpec.employeeId) {
+      var eid = normalizeStr(previewSpec.employeeId);
+      for (var i = 0; i < emps.length; i++) {
+        if (emps[i] && normalizeStr(emps[i].id) === eid) {
+          targetEmp = emps[i];
+          break;
+        }
+      }
+    }
+    var targetRole = targetEmp
+      ? normalizeStr(targetEmp.role)
+      : normalizeStr(previewSpec.role || ROLES.AGENT);
+    if (allowedRoles.indexOf(targetRole) === -1) {
+      return null;
+    }
+
+    var perms = null;
+    if (Array.isArray(previewSpec.customPermissions)) {
+      perms = sanitizePresetPermissions(targetRole, previewSpec.customPermissions);
+    } else if (targetEmp) {
+      perms = resolveEffectivePermissions(targetEmp);
+    } else if (previewSpec.presetId && Array.isArray(rolePresets)) {
+      var pid = normalizeStr(previewSpec.presetId);
+      for (var j = 0; j < rolePresets.length; j++) {
+        if (rolePresets[j] && rolePresets[j].id === pid && allowedRoles.indexOf(rolePresets[j].role) !== -1) {
+          targetRole = rolePresets[j].role;
+          perms = sanitizePresetPermissions(targetRole, rolePresets[j].permissions);
+          break;
+        }
+      }
+    }
+    if (!perms) {
+      perms = (ROLE_PERMISSION_MATRIX[targetRole] || ROLE_PERMISSION_MATRIX.agent).slice();
+    }
+
+    var labelAr = (ROLE_LABELS.ar && ROLE_LABELS.ar[targetRole]) || targetRole;
+    var customLbl = normalizeStr(previewSpec.customLabel);
+    var previewDisplayName = targetEmp
+      ? targetEmp.name
+      : (customLbl ? ('معاينة: ' + customLbl) : ('معاينة: ' + labelAr));
+    return {
+      id: targetEmp ? targetEmp.id : (realUser.id || 'PREVIEW_USER'),
+      name: previewDisplayName,
+      username: targetEmp ? targetEmp.username : ('preview_' + targetRole),
+      jobTitle: targetEmp ? targetEmp.jobTitle : (customLbl || labelAr),
+      role: targetRole,
+      permissions: perms,
+      status: 'active',
+      isPreviewSession: true,
+      previewMode: targetEmp ? 'employee' : 'role',
+      previewTargetEmployeeId: targetEmp ? targetEmp.id : '',
+      previewTargetRole: targetRole,
+      realActorId: realUser.id,
+      realActorName: realUser.name,
+      realActorRole: realUser.role
+    };
+  }
+
+  // ---------- DEVELOPER STATS CONTROL CONFIG ----------
+
+  var DEFAULT_STATS_CONTROL_CONFIG = {
+    excludedFromStatsEmployeeIds: [],
+    updatedAt: '',
+    updatedBy: ''
+  };
+
+  var STATS_VIEW_PERMISSION_KEYS = [
+    'view_reports',
+    'sub_view_rep_charts',
+    'sub_view_prb_rates',
+    'dash_view_charts_grid',
+    'dash_view_leaderboard',
+    'dash_view_heatmap',
+    'dash_view_daily_chart'
+  ];
+
+  function normalizeStatsControlConfig(raw) {
+    var parsed = raw;
+    if (typeof raw === 'string') {
+      try {
+        parsed = JSON.parse(raw);
+      } catch (_e) {
+        parsed = {};
+      }
+    }
+    var src = (parsed && typeof parsed === 'object') ? parsed : {};
+    var rawIds = Array.isArray(src.excludedFromStatsEmployeeIds)
+      ? src.excludedFromStatsEmployeeIds
+      : (Array.isArray(src.excludedEmployeeIds) ? src.excludedEmployeeIds : []);
+    var seen = {};
+    var excludedIds = [];
+    for (var i = 0; i < rawIds.length; i++) {
+      var id = normalizeStr(rawIds[i]);
+      if (id && !seen[id]) {
+        seen[id] = true;
+        excludedIds.push(id);
+      }
+    }
+    return {
+      excludedFromStatsEmployeeIds: excludedIds,
+      updatedAt: normalizeStr(src.updatedAt),
+      updatedBy: normalizeStr(src.updatedBy)
+    };
+  }
+
+  function isEmployeeIncludedInStats(empOrId, config) {
+    if (!empOrId) return false;
+    var empId = typeof empOrId === 'string' ? normalizeStr(empOrId) : normalizeStr(empOrId.id);
+    if (!empId) return false;
+    if (typeof empOrId === 'object' && empOrId.status === 'disabled') return false;
+    var norm = normalizeStatsControlConfig(config);
+    return norm.excludedFromStatsEmployeeIds.indexOf(empId) === -1;
+  }
+
+  function filterEmployeesForStats(employees, config) {
+    var norm = normalizeStatsControlConfig(config);
+    var excludedMap = {};
+    for (var i = 0; i < norm.excludedFromStatsEmployeeIds.length; i++) {
+      excludedMap[norm.excludedFromStatsEmployeeIds[i]] = true;
+    }
+    return (Array.isArray(employees) ? employees : []).filter(function (e) {
+      return e && e.status !== 'disabled' && !excludedMap[e.id];
+    });
+  }
+
+  function canEmployeeViewStatistics(empOrUser) {
+    if (!empOrUser) return false;
+    if (empOrUser.role === ROLES.DEVELOPER) return true;
+    var canReports = canUserViewRoute(empOrUser, 'reports');
+    var canCharts = canUserViewDashboardSection(empOrUser, 'dash_view_charts_grid') ||
+      canUserViewDashboardSection(empOrUser, 'dash_view_leaderboard');
+    return Boolean(canReports || canCharts);
+  }
+
+  function applyEmployeeStatsViewToggle(role, currentPerms, canViewStats) {
+    return setEmployeeSectionGroupVisibility(role, currentPerms, STATS_VIEW_PERMISSION_KEYS, Boolean(canViewStats));
+  }
+
+  // ---------- DASHBOARD EMPLOYEE LEADERBOARD ----------
+
+  function computeEmployeeLeaderboard(employees, reservations, followUps, problems, options) {
+    var opts = options || {};
+    var excludedList = Array.isArray(opts.excludedEmployeeIds)
+      ? opts.excludedEmployeeIds
+      : (opts.statsControlConfig && Array.isArray(opts.statsControlConfig.excludedFromStatsEmployeeIds)
+        ? opts.statsControlConfig.excludedFromStatsEmployeeIds
+        : []);
+    var excludedMap = {};
+    for (var ex = 0; ex < excludedList.length; ex++) {
+      var exKey = normalizeStr(excludedList[ex]);
+      if (exKey) excludedMap[exKey] = true;
+    }
+    var emps = (Array.isArray(employees) ? employees : []).filter(function (e) {
+      return e && e.status !== 'disabled' && !excludedMap[e.id];
+    });
+    var resList = Array.isArray(reservations) ? reservations : [];
+    var fuList = Array.isArray(followUps) ? followUps : [];
+    var prbList = Array.isArray(problems) ? problems : [];
+    var limit = Math.max(1, Math.min(50, Math.round(toNum(opts.limit, 10))));
+
+    var fuByEmpId = {};
+    var fuByEmpName = {};
+    for (var f = 0; f < fuList.length; f++) {
+      var fu = fuList[f];
+      if (!fu) continue;
+      if (fu.employeeId) fuByEmpId[fu.employeeId] = (fuByEmpId[fu.employeeId] || 0) + 1;
+      if (fu.employeeName) fuByEmpName[fu.employeeName] = (fuByEmpName[fu.employeeName] || 0) + 1;
+    }
+
+    var assignedByEmpId = {};
+    var closedByEmpId = {};
+    for (var r = 0; r < resList.length; r++) {
+      var rec = resList[r];
+      if (!rec) continue;
+      var ids = Array.isArray(rec.assignedEmployeeIds) ? rec.assignedEmployeeIds : [];
+      var isClosed = isReservationClosedStatus(rec);
+      for (var k = 0; k < ids.length; k++) {
+        var eid = ids[k];
+        if (!eid) continue;
+        assignedByEmpId[eid] = (assignedByEmpId[eid] || 0) + 1;
+        if (isClosed) closedByEmpId[eid] = (closedByEmpId[eid] || 0) + 1;
+      }
+    }
+
+    var resolvedPrbByEmpId = {};
+    for (var p = 0; p < prbList.length; p++) {
+      var prb = prbList[p];
+      if (!prb || !isProblemClosedStatus(prb.status)) continue;
+      var pIds = Array.isArray(prb.assignedEmployeeIds) ? prb.assignedEmployeeIds : [];
+      var targetIds = pIds.length ? pIds : (prb.createdById ? [prb.createdById] : []);
+      for (var q = 0; q < targetIds.length; q++) {
+        var peid = targetIds[q];
+        if (peid) resolvedPrbByEmpId[peid] = (resolvedPrbByEmpId[peid] || 0) + 1;
+      }
+    }
+
+    var entries = emps.map(function (emp) {
+      var followUpsCount = fuByEmpId[emp.id] !== undefined ? fuByEmpId[emp.id] : (fuByEmpName[emp.name] || 0);
+      var assignedCount = assignedByEmpId[emp.id] || 0;
+      var closedCount = closedByEmpId[emp.id] || 0;
+      var resolvedProblemsCount = resolvedPrbByEmpId[emp.id] || 0;
+      var score = (followUpsCount * 3) + (closedCount * 4) + (resolvedProblemsCount * 5) + assignedCount;
+      var completionRate = assignedCount > 0 ? Math.min(100, Math.round((closedCount / assignedCount) * 100)) : (followUpsCount > 0 ? 100 : 0);
+      return {
+        employeeId: emp.id,
+        name: emp.name || emp.username || emp.id,
+        role: emp.role || ROLES.AGENT,
+        jobTitle: emp.jobTitle || '',
+        followUpsCount: followUpsCount,
+        assignedCount: assignedCount,
+        closedCount: closedCount,
+        closedBookingsCount: closedCount,
+        resolvedProblemsCount: resolvedProblemsCount,
+        completionRate: completionRate,
+        score: score
+      };
+    });
+
+    entries.sort(function (a, b) {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.followUpsCount !== a.followUpsCount) return b.followUpsCount - a.followUpsCount;
+      if (b.closedCount !== a.closedCount) return b.closedCount - a.closedCount;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+
+    return entries.slice(0, limit).map(function (entry, idx) {
+      return Object.assign({}, entry, { rank: idx + 1 });
+    });
+  }
+
+  // ---------- ANTI-SPAM & DUPLICATE ACTION GUARD ----------
+
+  var SPAM_GUARD_EXEMPT_ACTIONS = {
+    ping: true,
+    login: true,
+    logout: true,
+    getMe: true,
+    getAppBootstrap: true,
+    getDashboard: true,
+    getTodayAndRadar: true,
+    getReservations: true,
+    getReservationDetails: true,
+    getMyFollowUps: true,
+    getTeamFollowUps: true,
+    getFollowUpHistory: true,
+    getProblems: true,
+    getProblemDetails: true,
+    getNotifications: true,
+    getActivityLogs: true,
+    getReports: true,
+    getSettings: true,
+    getSyncStatus: true,
+    getTriggerStatus: true,
+    getAnnouncements: true,
+    getDelegations: true,
+    getReservationLocks: true,
+    getDeltaSync: true,
+    heartbeatReservationLock: true,
+    releaseReservationLock: true,
+    saveUserLayoutPrefs: true
+  };
+
+  function evaluateSpamGuard(stateObj, action, signature, opts) {
+    var act = normalizeStr(action);
+    if (!act || SPAM_GUARD_EXEMPT_ACTIONS[act]) {
+      return { allowed: true, reason: '', waitMs: 0 };
+    }
+    var o = opts || {};
+    var nowMs = (typeof o.nowMs === 'number' && isFinite(o.nowMs)) ? o.nowMs : Date.now();
+    var dupWindowMs = Math.max(200, toNum(o.duplicateWindowMs, 1500));
+    var burstWindowMs = Math.max(1000, toNum(o.burstWindowMs, 10000));
+    var maxBurst = Math.max(3, Math.round(toNum(o.maxBurst, 18)));
+
+    var store = (stateObj && typeof stateObj === 'object') ? stateObj : {};
+    if (!Array.isArray(store.timestamps)) store.timestamps = [];
+    if (!store.signatures || typeof store.signatures !== 'object') store.signatures = {};
+
+    // Prune expired records
+    store.timestamps = store.timestamps.filter(function (ts) {
+      return (nowMs - ts) < burstWindowMs;
+    });
+    var sigKeys = Object.keys(store.signatures);
+    for (var i = 0; i < sigKeys.length; i++) {
+      if ((nowMs - store.signatures[sigKeys[i]]) >= dupWindowMs) {
+        delete store.signatures[sigKeys[i]];
+      }
+    }
+
+    var sig = normalizeStr(signature) || act;
+    if (store.signatures[sig] !== undefined) {
+      var waitDup = Math.max(100, dupWindowMs - (nowMs - store.signatures[sig]));
+      return {
+        allowed: false,
+        reason: 'DUPLICATE_SUBMISSION',
+        waitMs: waitDup,
+        message: 'تم إرسال نفس العملية قبل لحظات، تم منع التكرار التلقائي (مانع Spam).'
+      };
+    }
+
+    if (store.timestamps.length >= maxBurst) {
+      var oldest = store.timestamps[0] || nowMs;
+      var waitBurst = Math.max(250, burstWindowMs - (nowMs - oldest));
+      return {
+        allowed: false,
+        reason: 'RATE_LIMITED',
+        waitMs: waitBurst,
+        message: 'تم إرسال عدد كبير من الطلبات المتتالية بسرعة. يرجى الانتظار لحظة ثم المحاولة.'
+      };
+    }
+
+    store.timestamps.push(nowMs);
+    store.signatures[sig] = nowMs;
+    return { allowed: true, reason: '', waitMs: 0 };
+  }
+
   function formatDirectCallTelHref(phone, prefix) {
     var ascii = convertEasternDigitsToAscii(phone === undefined || phone === null ? '' : String(phone));
     var digitsOnly = ascii.replace(/\D/g, '');
     if (!digitsOnly) return '';
 
-    var pfx = convertEasternDigitsToAscii(prefix === undefined || prefix === null ? '90' : String(prefix)).replace(/\D/g, '');
-    if (!pfx) pfx = '90';
+    var pfx = convertEasternDigitsToAscii(prefix === undefined || prefix === null ? '9' : String(prefix)).replace(/\D/g, '');
+    if (!pfx) pfx = '9';
 
     var local = digitsOnly;
     if (local.indexOf('00966') === 0 && local.length >= 14) {
@@ -5062,6 +6141,7 @@
     var r = (reservation && typeof reservation === 'object') ? reservation : {};
     var isEn = lang === 'en';
     var timeFmt = normalizeTimeFormat(options && options.timeFormat);
+    var tzMode = normalizeTimezoneMode(options && options.timezoneMode);
     var resNum = normalizeStr(r.reservationNumber || r.id) || '-';
     var customer = normalizeStr(r.customerName) || '-';
     var phone = normalizeStr(r.customerPhone) || '-';
@@ -5069,11 +6149,24 @@
     var plate = normalizeStr(r.plateNumber) || '-';
     var company = normalizeStr(r.companyName) || '-';
     var branch = normalizeStr(r.branchName) || '-';
-    var startT = r.startTime ? formatTimePreference(r.startTime, timeFmt, lang) : '';
-    var endTRaw = r.extendedUntilTime || r.endTime;
-    var endT = endTRaw ? formatTimePreference(endTRaw, timeFmt, lang) : '';
-    var startD = (formatDisplayDate(r.startDate) || '-') + (startT ? (' ' + startT) : '');
-    var endD = (formatDisplayDate(r.extendedUntilDate || r.endDate) || '-') + (endT ? (' ' + endT) : '');
+
+    function fmtEndpoint(dateVal, timeVal) {
+      if (!dateVal && !timeVal) return '-';
+      if (!timeVal) return formatDisplayDate(dateVal) || '-';
+      var disp = buildBookingTimezoneDisplay(dateVal, timeVal, {
+        lang: lang,
+        timeFormat: timeFmt,
+        timezoneMode: tzMode,
+        compact: false
+      });
+      if (!disp.entries || !disp.entries.length) return formatDisplayDate(dateVal) || '-';
+      return disp.entries.map(function (e) {
+        return e.valueText + ' (' + e.label + ')';
+      }).join(' / ');
+    }
+
+    var startD = fmtEndpoint(r.startDate, r.startTime);
+    var endD = fmtEndpoint(r.extendedUntilDate || r.endDate, r.extendedUntilTime || r.endTime);
     var totalAmt = Number(r.totalAmount || 0);
     var status = normalizeStr(r.internalStatus || r.originalStatusAr) || '-';
 
@@ -5406,6 +6499,7 @@
     { id: 'charts_grid', domId: 'dash-charts-grid', permKey: 'dash_view_charts_grid', uiSimpKey: 'hideDashChartsGrid', labelAr: 'شبكة الرسوم البيانية التحليلية', labelEn: 'Analytics Charts Grid' },
     { id: 'expiry_radar', domId: 'dash-expiry-radar-section', permKey: 'dash_view_radar', uiSimpKey: 'hideDashboardRadar', labelAr: 'رادار انتهاء الحجوزات (24 ساعة)', labelEn: '24h Expiry Radar' },
     { id: 'peak_heatmap', domId: 'dash-peak-heatmap-section', permKey: 'dash_view_heatmap', uiSimpKey: 'hideDashboardHeatmap', labelAr: 'مصفوفة ساعات الذروة', labelEn: 'Peak Hours Heatmap' },
+    { id: 'leaderboard', domId: 'dash-leaderboard-section', permKey: 'dash_view_leaderboard', uiSimpKey: 'hideDashLeaderboard', labelAr: 'لوحة صدارة الموظفين (Leaderboard)', labelEn: 'Team Leaderboard' },
     { id: 'bottom_bento', domId: 'dash-bottom-bento', permKey: 'dash_view_bottom_bento', uiSimpKey: 'hideDashBottomBento', labelAr: 'أحدث الحجوزات والمشكلات والإجراءات', labelEn: 'Recent Bookings, Problems & Actions' }
   ];
 
@@ -5472,6 +6566,9 @@
       dashHidden: dashHidden,
       timeFormat: normalizeTimeFormat(obj.timeFormat),
       sidebarPosition: normalizeSidebarPosition(obj.sidebarPosition),
+      timezoneMode: normalizeTimezoneMode(obj.timezoneMode),
+      reservationsDisplayMode: normalizeReservationsDisplayMode(obj.reservationsDisplayMode),
+      calendarGranularity: normalizeCalendarGranularity(obj.calendarGranularity),
       theme: theme,
       lang: lang,
       sidebarCollapsed: Boolean(sidebarCollapsed)
@@ -5532,16 +6629,7 @@
 
     function isAllowed(routeId) {
       if (!user || !routeId) return false;
-      if (routeId === 'dashboard') {
-        return canUserPerform(user, 'view_dashboard');
-      }
-      if (routeId === 'employees') {
-        return canUserPerform(user, 'view_employees') || user.role === ROLES.GENERAL_MANAGER;
-      }
-      if (routeId === 'settings') {
-        return canAccessApi(user) || canUserPerform(user, 'manage_settings');
-      }
-      return NAV_ROUTE_IDS.indexOf(routeId) !== -1;
+      return canUserViewRoute(user, routeId);
     }
 
     var searchOrder = [];
@@ -5565,7 +6653,7 @@
     for (var m = 0; m < searchOrder.length; m++) {
       if (isAllowed(searchOrder[m])) return searchOrder[m];
     }
-    return 'reservations';
+    return '';
   }
 
   function normalizeExcelCellDate(val) {
@@ -5969,7 +7057,7 @@
       }
     }
 
-    if (!activeDel || baseRole === ROLES.GENERAL_MANAGER) {
+    if (!activeDel || baseRole === ROLES.GENERAL_MANAGER || baseRole === ROLES.DEVELOPER) {
       return Object.assign({}, user, {
         role: baseRole,
         baseRole: baseRole,
@@ -6261,10 +7349,333 @@
     return 'empty';
   }
 
+  var CALENDAR_WEEKDAYS_AR = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
+  var CALENDAR_WEEKDAYS_EN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var CALENDAR_MONTHS_AR = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+  var CALENDAR_MONTHS_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var CALENDAR_MONTHS_FULL_EN = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+  function addDaysIso(isoDate, deltaDays) {
+    var clean = formatDisplayDate(isoDate);
+    if (!clean) return '';
+    var parts = clean.split('-');
+    var dt = new Date(Date.UTC(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10)));
+    if (isNaN(dt.getTime())) return '';
+    dt.setUTCDate(dt.getUTCDate() + Math.trunc(Number(deltaDays) || 0));
+    return dt.toISOString().substring(0, 10);
+  }
+
+  function buildCalendarDayMeta(iso, todayIso, isCurrentMonth) {
+    var dParts = iso.split('-');
+    var yr = parseInt(dParts[0], 10);
+    var mo = parseInt(dParts[1], 10);
+    var dy = parseInt(dParts[2], 10);
+    var utcDt = new Date(Date.UTC(yr, mo - 1, dy));
+    var wIdx = utcDt.getUTCDay();
+    return {
+      iso: iso,
+      year: yr,
+      month: mo,
+      day: dy,
+      weekdayIndex: wIdx,
+      weekdayAr: CALENDAR_WEEKDAYS_AR[wIdx] || '',
+      weekdayEn: CALENDAR_WEEKDAYS_EN[wIdx] || '',
+      shortDateAr: dy + ' ' + (CALENDAR_MONTHS_AR[mo - 1] || ''),
+      shortDateEn: (CALENDAR_MONTHS_EN[mo - 1] || '') + ' ' + dy,
+      isToday: iso === todayIso,
+      isCurrentMonth: isCurrentMonth !== false
+    };
+  }
+
+  function buildCalendarPeriodWindow(anchorIso, granularity, options) {
+    var opts = options || {};
+    var gran = normalizeCalendarGranularity(granularity);
+    var todayIso = formatDisplayDate(opts.todayIso) || getRiyadhTodayDateStr(opts.nowMs);
+    var cleanAnchor = formatDisplayDate(anchorIso) || todayIso;
+    var weekStartsOn = typeof opts.weekStartsOn === 'number' ? opts.weekStartsOn : 6; // Saturday default
+
+    var weekdayHeaders = [];
+    for (var wh = 0; wh < 7; wh++) {
+      var wIdxH = (weekStartsOn + wh) % 7;
+      weekdayHeaders.push({
+        weekdayIndex: wIdxH,
+        weekdayAr: CALENDAR_WEEKDAYS_AR[wIdxH] || '',
+        weekdayEn: CALENDAR_WEEKDAYS_EN[wIdxH] || ''
+      });
+    }
+
+    if (gran === 'month') {
+      var mParts = cleanAnchor.split('-');
+      var mYear = parseInt(mParts[0], 10);
+      var mMonth = parseInt(mParts[1], 10);
+      var gridCells = buildCalendarMonthGrid(mYear, mMonth, {
+        weekStartsOn: weekStartsOn === 6 ? 6 : 0,
+        todayIso: todayIso
+      });
+      var lastRowOutside = gridCells.length >= 42 && gridCells.slice(35, 42).every(function (c) { return !c.isCurrentMonth; });
+      var trimmedCells = lastRowOutside ? gridCells.slice(0, 35) : gridCells;
+      var monthDays = trimmedCells.map(function (c) {
+        return buildCalendarDayMeta(c.iso, todayIso, c.isCurrentMonth);
+      });
+      var prevYM = shiftCalendarMonth(mYear, mMonth, -1);
+      var nextYM = shiftCalendarMonth(mYear, mMonth, 1);
+      var firstOfMonth = formatIsoDateParts(mYear, mMonth, 1);
+      var lastOfMonth = formatIsoDateParts(mYear, mMonth, getDaysInMonth(mYear, mMonth));
+      return {
+        granularity: 'month',
+        anchorIso: cleanAnchor,
+        todayIso: todayIso,
+        year: mYear,
+        month: mMonth,
+        monthNameAr: CALENDAR_MONTHS_AR[mMonth - 1] || '',
+        monthNameEn: CALENDAR_MONTHS_FULL_EN[mMonth - 1] || '',
+        monthStartIso: firstOfMonth,
+        monthEndIso: lastOfMonth,
+        startIso: monthDays.length ? monthDays[0].iso : firstOfMonth,
+        endIso: monthDays.length ? monthDays[monthDays.length - 1].iso : lastOfMonth,
+        prevAnchorIso: formatIsoDateParts(prevYM.year, prevYM.month, 1),
+        nextAnchorIso: formatIsoDateParts(nextYM.year, nextYM.month, 1),
+        weekdayHeaders: weekdayHeaders,
+        days: monthDays
+      };
+    }
+
+    var startIso = cleanAnchor;
+    var endIso = cleanAnchor;
+    var stepDays = 1;
+
+    if (gran === 'week') {
+      var aParts = cleanAnchor.split('-');
+      var aDt = new Date(Date.UTC(parseInt(aParts[0], 10), parseInt(aParts[1], 10) - 1, parseInt(aParts[2], 10)));
+      var dow = aDt.getUTCDay();
+      var diffToStart = (dow - weekStartsOn + 7) % 7;
+      startIso = addDaysIso(cleanAnchor, -diffToStart);
+      endIso = addDaysIso(startIso, 6);
+      stepDays = 7;
+    }
+
+    var days = [];
+    var totalDays = gran === 'week' ? 7 : 1;
+    for (var i = 0; i < totalDays; i++) {
+      var iso = i === 0 ? startIso : addDaysIso(startIso, i);
+      days.push(buildCalendarDayMeta(iso, todayIso, true));
+    }
+
+    return {
+      granularity: gran,
+      anchorIso: cleanAnchor,
+      todayIso: todayIso,
+      startIso: startIso,
+      endIso: endIso,
+      prevAnchorIso: addDaysIso(startIso, -stepDays),
+      nextAnchorIso: addDaysIso(startIso, stepDays),
+      weekdayHeaders: weekdayHeaders,
+      days: days
+    };
+  }
+
+  function extractReservationCalendarEvents(reservations, startIso, endIso, options) {
+    var list = Array.isArray(reservations) ? reservations : [];
+    var opts = options || {};
+    var sIso = formatDisplayDate(startIso) || '0000-01-01';
+    var eIso = formatDisplayDate(endIso) || '9999-12-31';
+    var typeFilter = normalizeStr(opts.eventType || opts.typeFilter || 'all').toLowerCase();
+    var searchTerm = normalizeStr(opts.search).toLowerCase();
+    var includeCancelled = Boolean(opts.includeCancelled);
+
+    var events = [];
+    var seenKeys = {};
+    var counts = { total: 0, pickup: 0, return: 0, extension: 0 };
+
+    function pushEv(ev) {
+      if (!ev || !ev.dateIso) return;
+      if (ev.dateIso < sIso || ev.dateIso > eIso) return;
+      if (seenKeys[ev.eventKey]) return;
+      if (searchTerm) {
+        var hay = [
+          ev.reservationNumber,
+          ev.customerName,
+          ev.customerPhone,
+          ev.carName,
+          ev.plateNumber,
+          ev.companyName,
+          ev.branchName,
+          ev.extensionNumber
+        ].join(' ').toLowerCase();
+        if (hay.indexOf(searchTerm) === -1) return;
+      }
+      seenKeys[ev.eventKey] = true;
+      counts.total += 1;
+      if (ev.type === 'pickup') counts.pickup += 1;
+      else if (ev.type === 'return') counts.return += 1;
+      else if (ev.type === 'extension') counts.extension += 1;
+      if (typeFilter && typeFilter !== 'all' && ev.type !== typeFilter) return;
+      events.push(ev);
+    }
+
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (!r || typeof r !== 'object') continue;
+      if (!includeCancelled && isExcludedMovementStatus(r)) continue;
+
+      var rid = String(r.id || r.reservationNumber || i);
+      var resNum = normalizeStr(r.reservationNumber || r.id) || rid;
+      var cust = normalizeStr(r.customerName) || '-';
+      var phone = normalizeStr(r.customerPhone);
+      var car = normalizeStr(r.carName) || '-';
+      var plate = normalizeStr(r.plateNumber);
+      var comp = normalizeStr(r.companyName);
+      var branch = normalizeStr(r.branchName);
+      var statusTxt = normalizeStr(r.internalStatus || r.originalStatusAr) || '-';
+      var extCount = Number(r.extensionsCount || 0);
+      var hasExt = Boolean(r.hasExtensions || extCount > 0 || Number(r.extendedDaysCount || 0) > 0);
+
+      var pInfo = resolveReservationStartInfo(r);
+      if (pInfo.date) {
+        pushEv({
+          eventKey: rid + ':pickup:' + pInfo.date,
+          type: 'pickup',
+          dateIso: pInfo.date,
+          timeStr: pInfo.time || '09:00',
+          minutesOfDay: pInfo.minutesOfDay !== null ? pInfo.minutesOfDay : 540,
+          hourSlot: Math.floor((pInfo.minutesOfDay !== null ? pInfo.minutesOfDay : 540) / 60),
+          reservationId: r.id || rid,
+          reservationNumber: resNum,
+          customerName: cust,
+          customerPhone: phone,
+          carName: car,
+          plateNumber: plate,
+          companyName: comp,
+          branchName: branch,
+          status: statusTxt,
+          isExtended: hasExt,
+          extensionDays: 0,
+          extensionNumber: '',
+          amount: Number(r.baseAmount || r.totalAmount || 0)
+        });
+      }
+
+      var effEnd = resolveReservationEffectiveEnd(r);
+      var returnDate = effEnd.date || formatDisplayDate(r.originalEndDate || r.endDate || '');
+      var returnTime = normalizeTimeHHmm(effEnd.time || r.endTime || r.originalEndTime, '12:00');
+      var returnMins = parseMinutesOfDay(returnTime);
+      if (returnDate) {
+        pushEv({
+          eventKey: rid + ':return:' + returnDate,
+          type: 'return',
+          dateIso: returnDate,
+          timeStr: returnTime || '12:00',
+          minutesOfDay: returnMins !== null ? returnMins : 720,
+          hourSlot: Math.floor((returnMins !== null ? returnMins : 720) / 60),
+          reservationId: r.id || rid,
+          reservationNumber: resNum,
+          customerName: cust,
+          customerPhone: phone,
+          carName: car,
+          plateNumber: plate,
+          companyName: comp,
+          branchName: normalizeStr(r.deliverBranchName) || branch,
+          status: statusTxt,
+          isExtended: Boolean(effEnd.isExtended || hasExt),
+          extensionDays: Number(r.extendedDaysCount || 0),
+          extensionNumber: '',
+          amount: Number(r.totalAmount || 0)
+        });
+      }
+
+      var exts = Array.isArray(r.extensions) ? r.extensions : [];
+      var emittedExt = false;
+      for (var j = 0; j < exts.length; j++) {
+        var ext = exts[j];
+        if (!ext || typeof ext !== 'object') continue;
+        var extDate = formatDisplayDate(ext.endDate || ext.extendedUntilDate || ext.end_date || ext.startDate || r.extendedUntilDate || r.endDate);
+        if (!extDate) continue;
+        var extTime = normalizeTimeHHmm(ext.endTime || ext.extendedUntilTime || r.extendedUntilTime || returnTime, '12:00');
+        var extMins = parseMinutesOfDay(extTime);
+        emittedExt = true;
+        pushEv({
+          eventKey: rid + ':extension:' + String(ext.id || ext.extensionNumber || (j + 1)) + ':' + extDate,
+          type: 'extension',
+          dateIso: extDate,
+          timeStr: extTime || '12:00',
+          minutesOfDay: extMins !== null ? extMins : 720,
+          hourSlot: Math.floor((extMins !== null ? extMins : 720) / 60),
+          reservationId: r.id || rid,
+          reservationNumber: resNum,
+          customerName: cust,
+          customerPhone: phone,
+          carName: car,
+          plateNumber: plate,
+          companyName: comp,
+          branchName: branch,
+          status: statusTxt,
+          isExtended: true,
+          extensionDays: Number(ext.extendDays || ext.daysCount || r.extendedDaysCount || 0),
+          extensionNumber: normalizeStr(ext.extensionNumber || ext.code || ('#' + (j + 1))),
+          amount: Number(ext.amount || ext.totalAmount || r.extensionsAmount || 0)
+        });
+      }
+
+      if (!emittedExt && hasExt) {
+        var sumExtDate = formatDisplayDate(r.extendedUntilDate || r.endDate || returnDate);
+        var sumExtTime = normalizeTimeHHmm(r.extendedUntilTime || returnTime, '12:00');
+        var sumExtMins = parseMinutesOfDay(sumExtTime);
+        if (sumExtDate) {
+          pushEv({
+            eventKey: rid + ':extension:summary:' + sumExtDate,
+            type: 'extension',
+            dateIso: sumExtDate,
+            timeStr: sumExtTime || '12:00',
+            minutesOfDay: sumExtMins !== null ? sumExtMins : 720,
+            hourSlot: Math.floor((sumExtMins !== null ? sumExtMins : 720) / 60),
+            reservationId: r.id || rid,
+            reservationNumber: resNum,
+            customerName: cust,
+            customerPhone: phone,
+            carName: car,
+            plateNumber: plate,
+            companyName: comp,
+            branchName: branch,
+            status: statusTxt,
+            isExtended: true,
+            extensionDays: Number(r.extendedDaysCount || 0),
+            extensionNumber: extCount > 1 ? ('×' + extCount) : '#1',
+            amount: Number(r.extensionsAmount || 0)
+          });
+        }
+      }
+    }
+
+    var typeOrder = { pickup: 0, extension: 1, return: 2 };
+    events.sort(function (a, b) {
+      if (a.dateIso !== b.dateIso) return a.dateIso < b.dateIso ? -1 : 1;
+      if (a.minutesOfDay !== b.minutesOfDay) return a.minutesOfDay - b.minutesOfDay;
+      var ta = typeOrder[a.type] !== undefined ? typeOrder[a.type] : 9;
+      var tb = typeOrder[b.type] !== undefined ? typeOrder[b.type] : 9;
+      if (ta !== tb) return ta - tb;
+      return a.reservationNumber < b.reservationNumber ? -1 : (a.reservationNumber > b.reservationNumber ? 1 : 0);
+    });
+
+    var byDate = {};
+    for (var k = 0; k < events.length; k++) {
+      var item = events[k];
+      if (!byDate[item.dateIso]) byDate[item.dateIso] = [];
+      byDate[item.dateIso].push(item);
+    }
+
+    return {
+      events: events,
+      byDate: byDate,
+      counts: counts
+    };
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
     DASHBOARD_PERMISSION_KEYS: DASHBOARD_PERMISSION_KEYS,
+    SECTION_VIEW_PERMISSION_KEYS: SECTION_VIEW_PERMISSION_KEYS,
+    ROUTE_PERMISSION_MAP: ROUTE_PERMISSION_MAP,
     ROLE_PERMISSION_MATRIX: ROLE_PERMISSION_MATRIX,
     PERMISSIONS_CATALOG: PERMISSIONS_CATALOG,
     JOB_ROLE_PRESETS: JOB_ROLE_PRESETS,
@@ -6295,10 +7706,12 @@
     summarizeReservationExtensions: summarizeReservationExtensions,
     computeTotalAmount: computeTotalAmount,
     mergeSyncedReservation: mergeSyncedReservation,
+    isPrivilegedRole: isPrivilegedRole,
     resolveEffectivePermissions: resolveEffectivePermissions,
     canAccessApi: canAccessApi,
     canUserPerform: canUserPerform,
     canUserViewDashboardSection: canUserViewDashboardSection,
+    canUserViewRoute: canUserViewRoute,
     mergePermissionsCatalog: mergePermissionsCatalog,
     normalizeRolePresets: normalizeRolePresets,
     upsertRolePreset: upsertRolePreset,
@@ -6330,10 +7743,18 @@
     extractTimeOnly: extractTimeOnly,
     TIME_FORMATS: TIME_FORMATS,
     SIDEBAR_POSITIONS: SIDEBAR_POSITIONS,
+    TIMEZONE_DISPLAY_MODES: TIMEZONE_DISPLAY_MODES,
+    RESERVATIONS_DISPLAY_MODES: RESERVATIONS_DISPLAY_MODES,
+    CALENDAR_GRANULARITIES: CALENDAR_GRANULARITIES,
     normalizeTimeFormat: normalizeTimeFormat,
     normalizeSidebarPosition: normalizeSidebarPosition,
+    normalizeTimezoneMode: normalizeTimezoneMode,
+    normalizeReservationsDisplayMode: normalizeReservationsDisplayMode,
+    normalizeCalendarGranularity: normalizeCalendarGranularity,
     formatTimePreference: formatTimePreference,
     formatDateTimePreference: formatDateTimePreference,
+    convertKsaDateTimeToEgypt: convertKsaDateTimeToEgypt,
+    buildBookingTimezoneDisplay: buildBookingTimezoneDisplay,
     normalizeLoginUsername: normalizeLoginUsername,
     getReportColumns: getReportColumns,
     formatReportCellValue: formatReportCellValue,
@@ -6414,6 +7835,15 @@
     UI_SIMPLIFICATION_OPTIONS: UI_SIMPLIFICATION_OPTIONS,
     TEAM_UI_PRESETS: TEAM_UI_PRESETS,
     normalizeUiSimplificationSettings: normalizeUiSimplificationSettings,
+    DEFAULT_RESERVATIONS_VISIBLE_COLS: DEFAULT_RESERVATIONS_VISIBLE_COLS,
+    normalizeRoleUiDefaults: normalizeRoleUiDefaults,
+    resolveRoleUiDefaultsForUser: resolveRoleUiDefaultsForUser,
+    canUserImpersonate: canUserImpersonate,
+    getAllowedPreviewRoles: getAllowedPreviewRoles,
+    resolvePreviewUserSession: resolvePreviewUserSession,
+    computeEmployeeLeaderboard: computeEmployeeLeaderboard,
+    SPAM_GUARD_EXEMPT_ACTIONS: SPAM_GUARD_EXEMPT_ACTIONS,
+    evaluateSpamGuard: evaluateSpamGuard,
     formatDirectCallTelHref: formatDirectCallTelHref,
     formatDirectCallDisplayNumber: formatDirectCallDisplayNumber,
     formatBookingSummaryText: formatBookingSummaryText,
@@ -6425,6 +7855,22 @@
     normalizeProblemRateVisibility: normalizeProblemRateVisibility,
     formatProblemRateToggleLabel: formatProblemRateToggleLabel,
     NAV_ROUTE_IDS: NAV_ROUTE_IDS,
+    SUBSECTION_VIEW_PERMISSION_KEYS: SUBSECTION_VIEW_PERMISSION_KEYS,
+    canUserViewSubSection: canUserViewSubSection,
+    ACTION_BUTTON_PERMISSION_KEYS: ACTION_BUTTON_PERMISSION_KEYS,
+    canUserUseActionButton: canUserUseActionButton,
+    EMPLOYEE_SECTION_GROUPS: EMPLOYEE_SECTION_GROUPS,
+    ensureSectionPermissionSentinels: ensureSectionPermissionSentinels,
+    applyEmployeeSectionToggle: applyEmployeeSectionToggle,
+    setEmployeeSectionGroupVisibility: setEmployeeSectionGroupVisibility,
+    getEmployeeSectionVisibilitySummary: getEmployeeSectionVisibilitySummary,
+    DEFAULT_STATS_CONTROL_CONFIG: DEFAULT_STATS_CONTROL_CONFIG,
+    STATS_VIEW_PERMISSION_KEYS: STATS_VIEW_PERMISSION_KEYS,
+    normalizeStatsControlConfig: normalizeStatsControlConfig,
+    isEmployeeIncludedInStats: isEmployeeIncludedInStats,
+    filterEmployeesForStats: filterEmployeesForStats,
+    canEmployeeViewStatistics: canEmployeeViewStatistics,
+    applyEmployeeStatsViewToggle: applyEmployeeStatsViewToggle,
     PROTECTED_NAV_ROUTES: PROTECTED_NAV_ROUTES,
     DASHBOARD_SECTION_DEFS: DASHBOARD_SECTION_DEFS,
     normalizeUserLayoutPrefs: normalizeUserLayoutPrefs,
@@ -6435,6 +7881,10 @@
     normalizeExcelCellDate: normalizeExcelCellDate,
     parseImportedReservationRows: parseImportedReservationRows,
     mergeDeltaRecords: mergeDeltaRecords,
-    resolveAsyncViewState: resolveAsyncViewState
+    resolveAsyncViewState: resolveAsyncViewState,
+    getRiyadhTodayDateStr: getRiyadhTodayDateStr,
+    addDaysIso: addDaysIso,
+    buildCalendarPeriodWindow: buildCalendarPeriodWindow,
+    extractReservationCalendarEvents: extractReservationCalendarEvents
   };
 }));

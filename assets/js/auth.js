@@ -16,6 +16,12 @@
     currentUser = user;
   }
 
+  function updateCurrentUser(patch) {
+    if (!currentUser || !patch || typeof patch !== 'object') return currentUser;
+    currentUser = Object.assign({}, currentUser, patch);
+    return currentUser;
+  }
+
   function primeBootstrapCaches(bs, range) {
     if (!bs || !root.RGApi || !root.RGApi.primeCache) return;
     var r = range || '30d';
@@ -121,6 +127,7 @@
   root.RGAuth = {
     getUser: getUser,
     setUser: setUser,
+    updateCurrentUser: updateCurrentUser,
     restoreSession: restoreSession,
     login: login,
     logout: logout,

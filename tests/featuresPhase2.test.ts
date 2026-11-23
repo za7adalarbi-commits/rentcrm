@@ -97,14 +97,23 @@ test('Feature 1: formatBookingSummaryText produces complete bilingual booking su
   assert.match(en, /Total: 1450 SAR/);
 });
 
-test('Feature 4: formatDirectCallTelHref strips +966/00966/966 and prepends prefix 90', () => {
-  assert.equal(core.formatDirectCallTelHref('+966501234567', '90'), 'tel:900501234567');
-  assert.equal(core.formatDirectCallTelHref('00966 55 987 6543', '90'), 'tel:900559876543');
-  assert.equal(core.formatDirectCallTelHref('966541112233', '90'), 'tel:900541112233');
-  assert.equal(core.formatDirectCallTelHref('0501234567', '90'), 'tel:900501234567');
-  assert.equal(core.formatDirectCallTelHref('٠٥٠١٢٣٤٥٦٧', '90'), 'tel:900501234567');
-  assert.equal(core.formatDirectCallDisplayNumber('+966501234567', '90'), '900501234567');
-  assert.equal(core.formatDirectCallTelHref('', '90'), '');
+test('Feature 4: formatDirectCallTelHref strips +966/00966/966 and prepends prefix 9 by default', () => {
+  assert.equal(core.formatDirectCallTelHref('+966501234567'), 'tel:90501234567');
+  assert.equal(core.formatDirectCallTelHref('+966501234567', '9'), 'tel:90501234567');
+  assert.equal(core.formatDirectCallTelHref('00966 55 987 6543', '9'), 'tel:90559876543');
+  assert.equal(core.formatDirectCallTelHref('966541112233', '9'), 'tel:90541112233');
+  assert.equal(core.formatDirectCallTelHref('0501234567', '9'), 'tel:90501234567');
+  assert.equal(core.formatDirectCallTelHref('٠٥٠١٢٣٤٥٦٧', '9'), 'tel:90501234567');
+  assert.equal(core.formatDirectCallDisplayNumber('+966501234567', '9'), '90501234567');
+  assert.equal(core.formatDirectCallTelHref('', '9'), '');
+
+  for (const rel of ['assets/js/reservations.js', 'assets/js/followups.js', 'assets/js/handover.js']) {
+    const src = fs.readFileSync(path.resolve(process.cwd(), rel), 'utf8');
+    assert.ok(!src.includes('اتصال 90'), `${rel} should not contain old اتصال 90 label`);
+    assert.ok(!src.includes('Call 90'), `${rel} should not contain old Call 90 label`);
+    assert.match(src, /اتصال 9/);
+    assert.match(src, /Call 9/);
+  }
 });
 
 test('Feature 7: computeSharedAssignmentInfo distinguishes exclusive, shared, and unassigned states', () => {
@@ -262,12 +271,12 @@ test('Sandbox E2E: Features 2, 3, 5, 6, 8, and 10 enforce RBAC, caps, notificati
   assert.ok(myFu.data.mentionFollowUps.some((f: any) => f.reservationId === targetResId && String(f.action).includes('@agent1')));
 
   // Feature 5: recordNoAnswerFollowUp increments counter atomically and updates lastUpdateText
-  const na1 = await api.callApi('recordNoAnswerFollowUp', { reservationId: targetResId });
+  const na1 = await api.callApi('recordNoAnswerFollowUp', { reservationId: targetResId, _spamChecked: true });
   assert.equal(na1.success, true);
   assert.equal(na1.data.noAnswerCount, 1);
   assert.match(na1.data.followUp.action, /لم يرد.*#1/);
 
-  const na2 = await api.callApi('recordNoAnswerFollowUp', { reservationId: targetResId });
+  const na2 = await api.callApi('recordNoAnswerFollowUp', { reservationId: targetResId, _spamChecked: true });
   assert.equal(na2.success, true);
   assert.equal(na2.data.noAnswerCount, 2);
   assert.match(na2.data.followUp.action, /لم يرد.*#2/);

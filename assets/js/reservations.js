@@ -39,11 +39,23 @@
 
   var COLS_STORAGE_KEY = 'rg_crm_visible_cols_v4';
 
-  function loadSavedVisibleCols() {
+  function loadSavedVisibleCols(currentUser) {
+    var roleUiRes = (root.RGApp && typeof root.RGApp.getEffectiveRoleUiResolution === 'function')
+      ? root.RGApp.getEffectiveRoleUiResolution(currentUser)
+      : null;
+    var parsed = null;
+    var hasLocal = false;
     try {
-      var parsed = JSON.parse(localStorage.getItem(COLS_STORAGE_KEY) || 'null');
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      var raw = localStorage.getItem(COLS_STORAGE_KEY);
+      if (raw) {
+        parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) hasLocal = true;
+      }
     } catch (_e) {}
+    if (roleUiRes && roleUiRes.hasRoleOverride && (roleUiRes.forceForRole || !hasLocal)) {
+      return roleUiRes.visibleCols.slice();
+    }
+    if (hasLocal) return parsed;
     return DEFAULT_VISIBLE_COLS.slice();
   }
 
@@ -91,6 +103,41 @@
     return (root.RGApp && typeof root.RGApp.getTimeFormat === 'function') ? root.RGApp.getTimeFormat() : '24h';
   }
 
+  function activeTimezoneMode() {
+    return (root.RGApp && typeof root.RGApp.getTimezoneMode === 'function') ? root.RGApp.getTimezoneMode() : 'both';
+  }
+
+  function renderBookingTimezoneHtml(dateStr, timeStr, options) {
+    var opts = (options && typeof options === 'object') ? options : {};
+    var lang = document.documentElement.getAttribute('lang') === 'en' ? 'en' : 'ar';
+    var core = root.RGCrmCore;
+    if (core && typeof core.buildBookingTimezoneDisplay === 'function') {
+      var info = core.buildBookingTimezoneDisplay(dateStr, timeStr, {
+        lang: lang,
+        timeFormat: activeTimeFormat(),
+        timezoneMode: opts.timezoneMode || activeTimezoneMode(),
+        compact: Boolean(opts.compact),
+        timeOnly: Boolean(opts.timeOnly)
+      });
+      if (!info.hasTime) {
+        if (opts.timeOnly) return '';
+        return info.saDate ? '<span class="mono tabular-nums" dir="ltr">' + esc(info.saDate) + '</span>' : '-';
+      }
+      return '<span class="rg-tz-stack' + (opts.compact ? ' is-compact' : '') + '">' +
+        info.entries.map(function (entry) {
+          return '<span class="rg-tz-line is-' + esc(entry.zone) + '">' +
+            '<span class="rg-tz-val mono tabular-nums" dir="ltr">' + esc(entry.valueText) + '</span>' +
+            '<span class="rg-tz-tag">' + esc(entry.label) + '</span>' +
+          '</span>';
+        }).join('') +
+      '</span>';
+    }
+    var dTxt = dateStr ? formatDateOnly(dateStr) : '';
+    var tTxt = timeStr ? formatTimeOnly(timeStr, lang) : '';
+    if (opts.timeOnly) return tTxt ? '<span class="mono tabular-nums" dir="ltr">' + esc(tTxt) + '</span>' : '';
+    return '<span class="mono tabular-nums" dir="ltr">' + esc([dTxt, tTxt].filter(Boolean).join(' · ') || '-') + '</span>';
+  }
+
   function formatTimeOnly(val, lang) {
     if (!val) return '';
     if (root.RGApp && typeof root.RGApp.formatTime === 'function') {
@@ -116,9 +163,9 @@
     return String(iso).replace('T', ' ').substring(0, 16);
   }
 
-  function runWithLock(btnEl, lockKey, fn) {
+  function runWithLock(btnEl, lockKey, fn, opts) {
     if (root.RGApp && root.RGApp.withActionLock) {
-      return root.RGApp.withActionLock(btnEl, lockKey, fn);
+      return root.RGApp.withActionLock(btnEl, lockKey, fn, opts);
     }
     return Promise.resolve().then(fn);
   }
@@ -162,13 +209,14 @@
     var currentUser = root.RGAuth.getUser();
     var currentEmpId = currentUser ? currentUser.id : '';
 
-    var defaultCols = loadSavedVisibleCols();
+    var defaultCols = loadSavedVisibleCols(currentUser);
     var state = Object.assign({
       search: '', company: '', branch: '', status: '', employeeId: '', priority: '',
       dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '',
       unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false,
       sortBy: 'lastUpdatedAt', sortDir: 'desc', page: 1, pageSize: 20,
       visibleCols: defaultCols,
+      selectedResIds: {},
       viewMode: 'all',
       radarFilter: 'all',
       radarSearch: '',
@@ -180,7 +228,15 @@
     if (!Array.isArray(state.visibleCols) || state.visibleCols.length === 0) {
       state.visibleCols = defaultCols;
     }
+    if (!state.selectedResIds || typeof state.selectedResIds !== 'object') {
+      state.selectedResIds = {};
+    }
+    var selectedResIds = state.selectedResIds;
+    var canViewTodayTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_today_tab');
+    var canViewRadarTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_radar_tab');
     if (state.viewMode !== 'radar' && state.viewMode !== 'today') state.viewMode = 'all';
+    if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'all';
+    if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'all';
     ctx.state.reservations = state;
 
     var empState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
@@ -192,45 +248,107 @@
     if (resData && resData.aborted) return;
 
     var employees = (empRes.success && empRes.data && empRes.data.items) || [];
+    var activeEmployeesList = employees.filter(function (e) { return e && e.status === 'active'; });
     var initialLoadError = (!resData || !resData.success) ? ((resData && resData.message) || 'تعذر تحميل قائمة الحجوزات.') : '';
     var payload = (resData && resData.success && resData.data) || { items: [], total: 0, page: 1, totalPages: 1, facets: { companies: [], branches: [] } };
     var currentItems = payload.items || [];
     var currentTotalPages = payload.totalPages || 1;
     var facets = payload.facets || { companies: [], branches: [] };
 
-    var canPullReservations = Boolean(currentUser && root.RGCrmCore.canUserPerform(currentUser, 'pull_reservations'));
-    var canImportExcel = Boolean(currentUser && (canPullReservations || root.RGCrmCore.canUserPerform(currentUser, 'manage_settings')));
-    var isGeneralManager = Boolean(currentUser && currentUser.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
+    var canAction = function (actKey) {
+      return !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(currentUser, actKey);
+    };
+    var canPullReservations = Boolean(currentUser && root.RGCrmCore.canUserPerform(currentUser, 'pull_reservations') && canAction('act_pull_reservations'));
+    var canImportExcel = Boolean(currentUser && (root.RGCrmCore.canUserPerform(currentUser, 'pull_reservations') || root.RGCrmCore.canUserPerform(currentUser, 'manage_settings')) && canAction('act_import_excel'));
+    var canBulkReassign = Boolean(
+      currentUser &&
+      root.RGCrmCore &&
+      (root.RGCrmCore.canUserPerform(currentUser, 'assign_employees') ||
+       (root.RGCrmCore.isPrivilegedRole && root.RGCrmCore.isPrivilegedRole(currentUser))) &&
+      canAction('act_bulk_reassign')
+    );
+    var canHandoverPdf = Boolean(root.RGHandover && canAction('act_handover_pdf'));
+    var canResColumns = canAction('act_res_columns');
+    var canExportExcel = canAction('act_export_excel');
+    var canClaimButtons = canAction('act_claim_reservation');
+    var isGeneralManager = Boolean(
+      currentUser &&
+      (currentUser.role === root.RGCrmCore.ROLES.GENERAL_MANAGER ||
+       currentUser.role === root.RGCrmCore.ROLES.DEVELOPER)
+    );
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var pullPresetState = state.pullPreset || 'all';
+
+    var TODAY_CAL_PREFS_KEY = 'rg_crm_today_cal_prefs_v1';
+    function loadTodayCalPrefs() {
+      try {
+        var raw = localStorage.getItem(TODAY_CAL_PREFS_KEY);
+        return raw ? (JSON.parse(raw) || {}) : {};
+      } catch (_e) {
+        return {};
+      }
+    }
+    function saveTodayCalPrefs() {
+      try {
+        localStorage.setItem(TODAY_CAL_PREFS_KEY, JSON.stringify({
+          todayDisplayMode: state.todayDisplayMode === 'list' ? 'list' : 'calendar',
+          todayCalendarGranularity: state.todayCalendarGranularity || 'month'
+        }));
+      } catch (_e) {}
+    }
+
+    var savedTodayCal = loadTodayCalPrefs();
+    if (state.todayDisplayMode !== 'calendar' && state.todayDisplayMode !== 'list') {
+      state.todayDisplayMode = savedTodayCal.todayDisplayMode === 'list' ? 'list' : 'calendar';
+    }
+    var rawCalGran = state.todayCalendarGranularity || savedTodayCal.todayCalendarGranularity || 'month';
+    state.todayCalendarGranularity = (root.RGCrmCore && root.RGCrmCore.normalizeCalendarGranularity)
+      ? root.RGCrmCore.normalizeCalendarGranularity(rawCalGran)
+      : ((rawCalGran === 'day' || rawCalGran === 'week') ? rawCalGran : 'month');
+
+    if (!state.todayCalendarAnchorDate) {
+      state.todayCalendarAnchorDate = (root.RGCrmCore && root.RGCrmCore.getRiyadhTodayDateStr)
+        ? root.RGCrmCore.getRiyadhTodayDateStr()
+        : new Date().toISOString().substring(0, 10);
+    }
+    if (!state.todayCalendarEventFilter) {
+      state.todayCalendarEventFilter = 'all';
+    }
+    if (state.todayCalendarSearch === undefined) {
+      state.todayCalendarSearch = '';
+    }
 
     container.innerHTML =
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div>' +
             '<h2 class="section-title">' + t('nav_reservations') + '</h2>' +
-            '<p class="section-subtitle">' + (isEn ? 'Matching results:' : 'إجمالي النتائج المطابقة:') + ' <strong class="tabular-nums" id="res-total-count">' + payload.total + '</strong> · ' + (isEn ? 'Claim bookings, track today\'s pickups/returns, or monitor 24h expiry radar' : 'يمكنك استلام أي حجز، متابعة جدول التسليم والاستلام لليوم، أو مراقبة رادار الانتهاء') + '</p>' +
+            '<p class="section-subtitle">' + (isEn ? 'Matching results:' : 'إجمالي النتائج المطابقة:') + ' <strong class="tabular-nums" id="res-total-count">' + payload.total + '</strong> · ' + (isEn ? 'Claim bookings, track pickups/returns & calendar, or monitor 24h expiry radar' : 'يمكنك استلام أي حجز، متابعة التسليم والاستلام والتقويم، أو مراقبة رادار الانتهاء') + '</p>' +
           '</div>' +
           '<div class="toolbar-row" style="margin-bottom:0;">' +
-            (root.RGHandover ? '<button type="button" class="btn btn-sm" id="res-handover-btn">' + (isEn ? 'Shift Handover (PDF)' : 'تسليم الوردية (PDF)') + '</button>' : '') +
-            (canPullReservations ? '<button type="button" class="btn btn-charcoal" id="res-pull-btn" title="جلب أحدث الحجوزات والتمديدات">' + t('pull_reservations') + '</button>' : '') +
-            (canImportExcel ? '<button type="button" class="btn" id="res-import-xlsx">' + (isEn ? 'Import Excel' : 'استيراد من Excel') + '</button>' : '') +
-            '<button type="button" class="btn" id="res-cols-btn">' + t('toggle_columns') + '</button>' +
-            '<button type="button" class="btn btn-primary" id="res-export-xlsx">' + t('export_excel') + '</button>' +
+            (canHandoverPdf ? '<button type="button" class="btn btn-sm rg-ui-handover-btn" id="res-handover-btn">' + (isEn ? 'Shift Handover (PDF)' : 'تسليم الوردية (PDF)') + '</button>' : '') +
+            (canPullReservations ? '<button type="button" class="btn btn-charcoal rg-ui-res-pull-btn" id="res-pull-btn" title="جلب أحدث الحجوزات والتمديدات">' + t('pull_reservations') + '</button>' : '') +
+            (canImportExcel ? '<button type="button" class="btn rg-ui-res-import-btn" id="res-import-xlsx">' + (isEn ? 'Import Excel' : 'استيراد من Excel') + '</button>' : '') +
+            (canResColumns ? '<button type="button" class="btn rg-ui-res-cols-btn" id="res-cols-btn">' + t('toggle_columns') + '</button>' : '') +
+            (canExportExcel ? '<button type="button" class="btn btn-primary rg-ui-res-export-btn" id="res-export-xlsx">' + t('export_excel') + '</button>' : '') +
           '</div>' +
         '</div>' +
         '<div class="res-view-tabs" role="tablist" aria-label="' + (isEn ? 'Reservations View' : 'عرض الحجوزات') + '">' +
           '<button type="button" class="res-view-tab' + (state.viewMode === 'all' ? ' is-active' : '') + '" data-res-view="all" role="tab" aria-selected="' + (state.viewMode === 'all') + '">' +
             (isEn ? 'All Reservations' : 'كل الحجوزات') +
           '</button>' +
-          '<button type="button" class="res-view-tab' + (state.viewMode === 'today' ? ' is-active' : '') + '" data-res-view="today" role="tab" aria-selected="' + (state.viewMode === 'today') + '">' +
-            '<span>' + (isEn ? 'Today\'s Pickups & Returns' : 'التسليم والاستلام اليوم') + '</span>' +
-            '<span class="res-tab-count tabular-nums" data-testid="today-tab-count" id="res-today-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
-          '</button>' +
-          '<button type="button" class="res-view-tab' + (state.viewMode === 'radar' ? ' is-active' : '') + '" data-res-view="radar" role="tab" aria-selected="' + (state.viewMode === 'radar') + '">' +
-            '<span>' + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات (24 ساعة)') + '</span>' +
-            '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
-          '</button>' +
+          (canViewTodayTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'today' ? ' is-active' : '') + '" data-res-view="today" role="tab" aria-selected="' + (state.viewMode === 'today') + '">' +
+              '<span>' + (isEn ? 'Pickups & Returns' : 'التسليم والاستلام') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="today-tab-count" id="res-today-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
+            '</button>'
+          ) : '') +
+          (canViewRadarTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'radar' ? ' is-active' : '') + '" data-res-view="radar" role="tab" aria-selected="' + (state.viewMode === 'radar') + '">' +
+              '<span>' + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات (24 ساعة)') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
+            '</button>'
+          ) : '') +
         '</div>' +
         '<div id="res-all-view"' + (state.viewMode !== 'all' ? ' class="hidden"' : '') + '>' +
           (canPullReservations && isGeneralManager ? (
@@ -311,9 +429,35 @@
       var visibleCols = ALL_COLUMNS.filter(function (c) { return state.visibleCols.indexOf(c.key) !== -1; });
       var colVisible = {};
       visibleCols.forEach(function (c) { colVisible[c.key] = true; });
-      return (list.length === 0
+      var selectedIdsList = Object.keys(selectedResIds).filter(function (k) { return Boolean(selectedResIds[k]); });
+      var allPageSelected = list.length > 0 && list.every(function (x) { return Boolean(selectedResIds[x.id]); });
+
+      var bulkBarHtml = canBulkReassign ? (
+        '<div id="res-bulk-action-bar" class="rg-bulk-bar rg-ui-res-bulk' + (selectedIdsList.length === 0 ? ' hidden' : '') + '">' +
+          '<div class="rg-bulk-bar-info">' +
+            '<span class="rg-bulk-count-badge tabular-nums" id="res-bulk-count">' + selectedIdsList.length + '</span>' +
+            '<span>' + (isEn ? 'selected reservations ready for bulk reassign' : 'حجز محدد — إعادة توزيع جماعي:') + '</span>' +
+          '</div>' +
+          '<div class="rg-bulk-bar-controls">' +
+            '<select class="select" id="res-bulk-target-emp" aria-label="' + (isEn ? 'Target Employee' : 'الموظف المستلم') + '">' +
+              activeEmployeesList.map(function (emp) {
+                return '<option value="' + esc(emp.id) + '">' + esc(emp.name) + '</option>';
+              }).join('') +
+            '</select>' +
+            '<select class="select" id="res-bulk-mode" aria-label="' + (isEn ? 'Assignment Mode' : 'نمط التوزيع') + '">' +
+              '<option value="replace">' + (isEn ? 'Replace existing assignees' : 'استبدال الإسناد الحالي بالموظف') + '</option>' +
+              '<option value="add">' + (isEn ? 'Add alongside current' : 'إضافة مع الموظفين الحاليين') + '</option>' +
+            '</select>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="res-bulk-apply-btn"' + (activeEmployeesList.length ? '' : ' disabled') + '>' + (isEn ? 'Apply Reassign' : 'تنفيذ التوزيع الجماعي') + '</button>' +
+            '<button type="button" class="btn btn-sm" id="res-bulk-clear-btn">' + (isEn ? 'Clear Selection' : 'إلغاء التحديد') + '</button>' +
+          '</div>' +
+        '</div>'
+      ) : '';
+
+      return bulkBarHtml + (list.length === 0
         ? '<div class="empty-state">لا توجد حجوزات مطابقة للفلاتر الحالية.</div>'
         : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+            (canBulkReassign ? '<th class="res-bulk-th rg-ui-res-bulk"><input type="checkbox" id="res-bulk-select-all" aria-label="' + (isEn ? 'Select all on page' : 'تحديد كل الحجوزات في الصفحة') + '"' + (allPageSelected ? ' checked' : '') + '></th>' : '') +
             visibleCols.map(function (c) {
               var arrow = state.sortBy === c.key ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
               return '<th class="sortable" data-sort="' + c.key + '">' + c.label + arrow + '</th>';
@@ -376,8 +520,9 @@
                   var subAssignee = !colVisible.assignedEmployeeNames
                     ? (assignedNames.length ? assignedNames.join('، ') : 'متاح للاستلام')
                     : '';
+                  var isStatusLocked = Boolean(root.RGApp && root.RGApp.isActionLocked && root.RGApp.isActionLocked('quickUpdateReservationStatus:' + r.id));
                   return '<td>' +
-                    '<select class="quick-status-select tbl-quick-status" data-id="' + esc(r.id) + '" aria-label="تحديث حالة الحجز ' + esc(r.reservationNumber) + '">' +
+                    '<select class="quick-status-select tbl-quick-status" data-id="' + esc(r.id) + '" aria-label="تحديث حالة الحجز ' + esc(r.reservationNumber) + '"' + (isStatusLocked ? ' disabled aria-busy="true"' : '') + '>' +
                       (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(r.internalStatus) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
                         return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                       }).join('') +
@@ -405,14 +550,19 @@
                   if (!colVisible.endDate && r.endDate) periodParts.push('حتى ' + formatDateOnly(r.endDate));
                   if (!colVisible.daysCount) periodParts.push(totStartDays + ' يوم');
                   return '<td class="tabular-nums" style="white-space:nowrap;">' +
-                    '<div class="cell-primary mono" dir="ltr">' + esc(formatDateOnly(r.startDate)) + (r.startTime ? ' <span class="time-sub">' + esc(formatTimeOnly(r.startTime, ctx.lang)) + '</span>' : '') + '</div>' +
+                    (r.startTime
+                      ? renderBookingTimezoneHtml(r.startDate, r.startTime, { compact: true })
+                      : '<div class="cell-primary mono" dir="ltr">' + esc(formatDateOnly(r.startDate)) + '</div>') +
                     (periodParts.length ? '<div class="cell-sub">' + esc(periodParts.join(' · ')) + '</div>' : '') +
                   '</td>';
                 }
                 if (c.key === 'endDate') {
                   var endTm = r.endTime || r.originalEndTime || '';
-                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.endDate)) + '</div>' +
-                    (endTm ? '<div class="time-sub" dir="ltr">' + esc(formatTimeOnly(endTm, ctx.lang)) + '</div>' : '') + '</td>';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
+                    (endTm
+                      ? renderBookingTimezoneHtml(r.endDate, endTm, { compact: true })
+                      : '<div>' + esc(formatDateOnly(r.endDate)) + '</div>') +
+                  '</td>';
                 }
                 if (c.key === 'daysCount') {
                   var totDays = Number(r.totalDaysCount || r.daysCount || 1);
@@ -427,8 +577,11 @@
                 }
                 if (c.key === 'extendedUntilDate') {
                   if (!r.extendedUntilDate) return '<td class="mono tabular-nums">-</td>';
-                  return '<td class="mono tabular-nums" style="white-space:nowrap;"><div>' + esc(formatDateOnly(r.extendedUntilDate)) + '</div>' +
-                    (r.extendedUntilTime ? '<div class="time-sub" dir="ltr">' + esc(formatTimeOnly(r.extendedUntilTime, ctx.lang)) + '</div>' : '') + '</td>';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
+                    (r.extendedUntilTime
+                      ? renderBookingTimezoneHtml(r.extendedUntilDate, r.extendedUntilTime, { compact: true })
+                      : '<div>' + esc(formatDateOnly(r.extendedUntilDate)) + '</div>') +
+                  '</td>';
                 }
                 if (c.key === 'extensionsAmount') {
                   var extAmtCol = Number(r.extensionsAmount || 0);
@@ -458,11 +611,22 @@
                 return '<td class="tabular-nums">' + esc(r[c.key] || '-') + '</td>';
               }).join('');
 
-              var claimBtnHtml = isMine
-                ? '<button type="button" class="btn btn-sm btn-danger btn-unclaim-res" data-id="' + esc(r.id) + '" title="إلغاء الاستلام من حسابك">مستلم ✓ · إلغاء</button>'
-                : '<button type="button" class="btn btn-sm btn-charcoal btn-claim-res" data-id="' + esc(r.id) + '" title="استلام الحجز عندي للمتابعة">استلام عندي</button>';
+              var isClaimLocked = Boolean(
+                root.RGApp &&
+                root.RGApp.isActionLocked &&
+                (root.RGApp.isActionLocked('claimReservation:' + r.id) || root.RGApp.isActionLocked('unclaimReservation:' + r.id))
+              );
+              var claimBtnHtml = canClaimButtons
+                ? (isMine
+                  ? '<button type="button" class="btn btn-sm btn-danger btn-unclaim-res" data-id="' + esc(r.id) + '" title="إلغاء الاستلام من حسابك"' + (isClaimLocked ? ' disabled aria-busy="true"' : '') + '>مستلم ✓ · إلغاء</button>'
+                  : '<button type="button" class="btn btn-sm btn-charcoal btn-claim-res" data-id="' + esc(r.id) + '" title="استلام الحجز عندي للمتابعة"' + (isClaimLocked ? ' disabled aria-busy="true"' : '') + '>استلام عندي</button>')
+                : '';
 
-              return '<tr data-res-id="' + esc(r.id) + '" class="' + (overdueInfo && overdueInfo.isOverdueUnpaid ? 'is-overdue-unpaid' : '') + '">' + tds +
+              return '<tr data-res-id="' + esc(r.id) + '" class="' +
+                (overdueInfo && overdueInfo.isOverdueUnpaid ? 'is-overdue-unpaid ' : '') +
+                (selectedResIds[r.id] ? 'is-selected-row' : '') + '">' +
+                (canBulkReassign ? '<td class="res-bulk-td rg-ui-res-bulk"><input type="checkbox" class="res-row-select-chk" data-id="' + esc(r.id) + '" aria-label="تحديد الحجز ' + esc(r.reservationNumber) + '"' + (selectedResIds[r.id] ? ' checked' : '') + '></td>' : '') +
+                tds +
                 '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   claimBtnHtml +
                   '<button type="button" class="btn btn-sm btn-primary btn-open-res" data-id="' + esc(r.id) + '">التفاصيل</button>' +
@@ -484,6 +648,158 @@
       var tbl = region.querySelector('.data-table');
       if (wrap && tbl && tbl.scrollWidth > wrap.clientWidth + 4) {
         tbl.classList.add('has-sticky-actions');
+      }
+
+      if (canBulkReassign) {
+        var syncBulkBarUi = function () {
+          var bar = region.querySelector('#res-bulk-action-bar');
+          var countEl = region.querySelector('#res-bulk-count');
+          var selectAllEl = region.querySelector('#res-bulk-select-all');
+          var rowChks = Array.prototype.slice.call(region.querySelectorAll('.res-row-select-chk'));
+          var selCount = Object.keys(selectedResIds).filter(function (k) { return Boolean(selectedResIds[k]); }).length;
+          if (countEl) countEl.textContent = String(selCount);
+          if (bar) bar.classList.toggle('hidden', selCount === 0);
+          if (selectAllEl) {
+            selectAllEl.checked = rowChks.length > 0 && rowChks.every(function (c) { return c.checked; });
+          }
+        };
+
+        var selectAllChk = region.querySelector('#res-bulk-select-all');
+        if (selectAllChk) {
+          selectAllChk.addEventListener('change', function () {
+            var checked = Boolean(selectAllChk.checked);
+            region.querySelectorAll('.res-row-select-chk').forEach(function (chk) {
+              var rid = chk.getAttribute('data-id');
+              chk.checked = checked;
+              if (rid) {
+                if (checked) selectedResIds[rid] = true;
+                else delete selectedResIds[rid];
+              }
+              var tr = chk.closest('tr');
+              if (tr) tr.classList.toggle('is-selected-row', checked);
+            });
+            syncBulkBarUi();
+          });
+        }
+
+        region.querySelectorAll('.res-row-select-chk').forEach(function (chk) {
+          chk.addEventListener('change', function () {
+            var rid = chk.getAttribute('data-id');
+            if (rid) {
+              if (chk.checked) selectedResIds[rid] = true;
+              else delete selectedResIds[rid];
+            }
+            var tr = chk.closest('tr');
+            if (tr) tr.classList.toggle('is-selected-row', Boolean(chk.checked));
+            syncBulkBarUi();
+          });
+        });
+
+        var bulkClearBtn = region.querySelector('#res-bulk-clear-btn');
+        if (bulkClearBtn) {
+          bulkClearBtn.addEventListener('click', function () {
+            Object.keys(selectedResIds).forEach(function (k) { delete selectedResIds[k]; });
+            region.querySelectorAll('.res-row-select-chk').forEach(function (chk) {
+              chk.checked = false;
+              var tr = chk.closest('tr');
+              if (tr) tr.classList.remove('is-selected-row');
+            });
+            syncBulkBarUi();
+          });
+        }
+
+        var bulkApplyBtn = region.querySelector('#res-bulk-apply-btn');
+        if (bulkApplyBtn) {
+          bulkApplyBtn.addEventListener('click', function () {
+            var targetEmpSel = region.querySelector('#res-bulk-target-emp');
+            var modeSel = region.querySelector('#res-bulk-mode');
+            var toEmployeeId = targetEmpSel ? targetEmpSel.value : '';
+            var modeVal = (modeSel && modeSel.value === 'add') ? 'add' : 'replace';
+            var idsList = Object.keys(selectedResIds).filter(function (k) { return Boolean(selectedResIds[k]); });
+            if (!idsList.length) {
+              ctx.toast(isEn ? 'Select at least one reservation first.' : 'يرجى تحديد حجز واحد على الأقل أولاً.', true);
+              return;
+            }
+            if (!toEmployeeId) {
+              ctx.toast(isEn ? 'Select target employee first.' : 'يرجى اختيار الموظف المستلم.', true);
+              return;
+            }
+            var targetEmpObj = employees.find(function (e) { return e && e.id === toEmployeeId; });
+            var targetEmpName = (targetEmpObj && targetEmpObj.name) || toEmployeeId;
+            var bulkSpamSig = toEmployeeId + ':' + modeVal + ':' + idsList.slice().sort().join(',');
+            runWithLock(bulkApplyBtn, 'bulkReassignSelectedReservations:' + toEmployeeId, function () {
+              var prevItems = currentItems.slice();
+              var prevSelected = Object.assign({}, selectedResIds);
+              var idMap = {};
+              idsList.forEach(function (idVal) { idMap[idVal] = true; });
+              var nowIso = new Date().toISOString();
+              currentItems = currentItems.map(function (item) {
+                if (!item || !idMap[item.id]) return item;
+                var curIds = Array.isArray(item.assignedEmployeeIds) ? item.assignedEmployeeIds.slice() : [];
+                var curNames = Array.isArray(item.assignedEmployeeNames) ? item.assignedEmployeeNames.slice() : [];
+                var nextIds, nextNames;
+                if (modeVal === 'add') {
+                  nextIds = curIds.slice();
+                  nextNames = curNames.slice();
+                  if (nextIds.indexOf(toEmployeeId) === -1) {
+                    nextIds.push(toEmployeeId);
+                    nextNames.push(targetEmpName);
+                  }
+                } else {
+                  nextIds = [toEmployeeId];
+                  nextNames = [targetEmpName];
+                }
+                return Object.assign({}, item, {
+                  assignedEmployeeIds: nextIds,
+                  assignedEmployeeNames: nextNames,
+                  updatedAt: nowIso
+                });
+              });
+              if (Array.isArray(radarRawReservations)) {
+                radarRawReservations = radarRawReservations.map(function (item) {
+                  var updatedMatch = item && idMap[item.id] ? currentItems.find(function (x) { return x && x.id === item.id; }) : null;
+                  return updatedMatch ? Object.assign({}, item, updatedMatch) : item;
+                });
+                paintRadarView();
+                paintTodayView();
+              }
+              Object.keys(selectedResIds).forEach(function (k) { delete selectedResIds[k]; });
+              if (root.RGApi && root.RGApi.applyOptimisticMutation) {
+                root.RGApi.applyOptimisticMutation('bulkReassignSelectedReservations', {
+                  reservationIds: idsList,
+                  targetEmployeeId: toEmployeeId,
+                  targetEmployeeName: targetEmpName,
+                  mode: modeVal
+                }, currentUser);
+              }
+              paintCurrentItems();
+              ctx.toast(isEn
+                ? ('Reassigned ' + idsList.length + ' reservation(s) to ' + targetEmpName + '.')
+                : ('تمت إعادة توزيع ' + idsList.length + ' حجز إلى ' + targetEmpName + ' بنجاح.'));
+              return root.RGApi.callApi('bulkReassignSelectedReservations', {
+                reservationIds: idsList,
+                targetEmployeeId: toEmployeeId,
+                mode: modeVal,
+                _keepOptimisticCache: true,
+                _spamChecked: true
+              }).then(function (resp) {
+                if (resp && resp.success) {
+                  ctx.refreshNotifications();
+                } else {
+                  currentItems = prevItems;
+                  Object.keys(prevSelected).forEach(function (k) { selectedResIds[k] = prevSelected[k]; });
+                  paintCurrentItems();
+                  ctx.toast((resp && resp.message) || 'تعذر تنفيذ إعادة التوزيع الجماعي.', true);
+                }
+              }).catch(function () {
+                currentItems = prevItems;
+                Object.keys(prevSelected).forEach(function (k) { selectedResIds[k] = prevSelected[k]; });
+                paintCurrentItems();
+                ctx.toast('تعذر الاتصال بالخادم أثناء التوزيع الجماعي.', true);
+              });
+            }, { spamAction: 'bulkReassignSelectedReservations', spamSig: bulkSpamSig });
+          });
+        }
       }
 
       region.querySelectorAll('th[data-sort]').forEach(function (th) {
@@ -512,23 +828,32 @@
         sel.addEventListener('change', function () {
           var rid = sel.getAttribute('data-id');
           var nextStatus = sel.value;
+          var targetItemPre = currentItems.find(function (x) { return x && x.id === rid; });
+          var prevStatusVal = (targetItemPre && targetItemPre.internalStatus) || '';
           runWithLock(sel, 'quickUpdateReservationStatus:' + rid, function () {
             var prevItems = currentItems.slice();
             var targetItem = prevItems.find(function (x) { return x && x.id === rid; });
             var expectedUpdatedAt = (targetItem && (targetItem.updatedAt || targetItem.lastUpdatedAt)) || '';
             var nowIso = new Date().toISOString();
             var actionText = 'تحديث سريع للحالة إلى: ' + nextStatus;
+            var updatedPatch = {
+              internalStatus: nextStatus,
+              lastUpdateText: actionText,
+              lastUpdatedById: currentEmpId || (targetItem && targetItem.lastUpdatedById),
+              lastUpdatedByName: (currentUser && currentUser.name) || (targetItem && targetItem.lastUpdatedByName),
+              lastUpdatedAt: nowIso,
+              isFollowed: true
+            };
             currentItems = currentItems.map(function (item) {
-              if (item.id !== rid) return item;
-              return Object.assign({}, item, {
-                internalStatus: nextStatus,
-                lastUpdateText: actionText,
-                lastUpdatedById: currentEmpId || item.lastUpdatedById,
-                lastUpdatedByName: (currentUser && currentUser.name) || item.lastUpdatedByName,
-                lastUpdatedAt: nowIso,
-                isFollowed: true
-              });
+              return item.id === rid ? Object.assign({}, item, updatedPatch) : item;
             });
+            if (Array.isArray(radarRawReservations)) {
+              radarRawReservations = radarRawReservations.map(function (item) {
+                return item && item.id === rid ? Object.assign({}, item, updatedPatch) : item;
+              });
+              paintRadarView();
+              paintTodayView();
+            }
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
                 reservationId: rid,
@@ -541,11 +866,11 @@
               reservationId: rid,
               status: nextStatus,
               expectedUpdatedAt: expectedUpdatedAt,
-              _keepOptimisticCache: true
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) {
                 ctx.refreshNotifications();
-                refreshRadarData(false, { forceRefresh: true });
               } else {
                 currentItems = prevItems;
                 paintCurrentItems();
@@ -562,6 +887,16 @@
               paintCurrentItems();
               ctx.toast('تعذر الاتصال بالخادم أثناء تحديث الحالة.', true);
             });
+          }, { spamAction: 'quickUpdateReservationStatus', spamSig: rid + ':' + nextStatus }).then(function (lockRes) {
+            if (lockRes && lockRes.spamBlocked && prevStatusVal) {
+              sel.value = prevStatusVal;
+            }
+          }).finally(function () {
+            var liveSel = region.querySelector('.tbl-quick-status[data-id="' + rid + '"]');
+            if (liveSel && (!root.RGApp || !root.RGApp.isActionLocked || !root.RGApp.isActionLocked('quickUpdateReservationStatus:' + rid))) {
+              liveSel.disabled = false;
+              liveSel.removeAttribute('aria-busy');
+            }
           });
         });
       });
@@ -571,14 +906,23 @@
           var rid = btn.getAttribute('data-id');
           runWithLock(btn, 'claimReservation:' + rid, function () {
             var prevItems = currentItems.slice();
+            var patchedItem = null;
             currentItems = currentItems.map(function (item) {
               if (item.id !== rid) return item;
               var claimed = root.RGCrmCore.claimReservationRecord(item, currentUser);
-              return Object.assign({}, item, {
+              patchedItem = Object.assign({}, item, {
                 assignedEmployeeIds: claimed.assignedEmployeeIds,
                 assignedEmployeeNames: claimed.assignedEmployeeNames
               });
+              return patchedItem;
             });
+            if (patchedItem && Array.isArray(radarRawReservations)) {
+              radarRawReservations = radarRawReservations.map(function (item) {
+                return item && item.id === rid ? Object.assign({}, item, patchedItem) : item;
+              });
+              paintRadarView();
+              paintTodayView();
+            }
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: rid }, currentUser);
             }
@@ -586,7 +930,8 @@
             ctx.toast('تم استلام الحجز في قائمتك بنجاح.');
             return root.RGApi.callApi('claimReservation', {
               reservationId: rid,
-              _keepOptimisticCache: true
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) {
                 ctx.refreshNotifications();
@@ -600,6 +945,12 @@
               paintCurrentItems();
               ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
             });
+          }, { spamAction: 'claimReservation', spamSig: rid }).finally(function () {
+            var liveBtn = region.querySelector('.btn-claim-res[data-id="' + rid + '"], .btn-unclaim-res[data-id="' + rid + '"]');
+            if (liveBtn && (!root.RGApp || !root.RGApp.isActionLocked || (!root.RGApp.isActionLocked('claimReservation:' + rid) && !root.RGApp.isActionLocked('unclaimReservation:' + rid)))) {
+              liveBtn.disabled = false;
+              liveBtn.removeAttribute('aria-busy');
+            }
           });
         });
       });
@@ -609,14 +960,23 @@
           var rid = btn.getAttribute('data-id');
           runWithLock(btn, 'unclaimReservation:' + rid, function () {
             var prevItems = currentItems.slice();
+            var patchedItem = null;
             currentItems = currentItems.map(function (item) {
               if (item.id !== rid) return item;
               var unclaimed = root.RGCrmCore.unclaimReservationRecord(item, currentEmpId);
-              return Object.assign({}, item, {
+              patchedItem = Object.assign({}, item, {
                 assignedEmployeeIds: unclaimed.assignedEmployeeIds,
                 assignedEmployeeNames: unclaimed.assignedEmployeeNames
               });
+              return patchedItem;
             });
+            if (patchedItem && Array.isArray(radarRawReservations)) {
+              radarRawReservations = radarRawReservations.map(function (item) {
+                return item && item.id === rid ? Object.assign({}, item, patchedItem) : item;
+              });
+              paintRadarView();
+              paintTodayView();
+            }
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('unclaimReservation', { reservationId: rid }, currentUser);
             }
@@ -624,7 +984,8 @@
             ctx.toast('تم إلغاء استلام الحجز.');
             return root.RGApi.callApi('unclaimReservation', {
               reservationId: rid,
-              _keepOptimisticCache: true
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) {
                 ctx.refreshNotifications();
@@ -638,6 +999,12 @@
               paintCurrentItems();
               ctx.toast('تعذر الاتصال بالخادم أثناء إلغاء الاستلام.', true);
             });
+          }, { spamAction: 'unclaimReservation', spamSig: rid }).finally(function () {
+            var liveBtn = region.querySelector('.btn-claim-res[data-id="' + rid + '"], .btn-unclaim-res[data-id="' + rid + '"]');
+            if (liveBtn && (!root.RGApp || !root.RGApp.isActionLocked || (!root.RGApp.isActionLocked('claimReservation:' + rid) && !root.RGApp.isActionLocked('unclaimReservation:' + rid)))) {
+              liveBtn.disabled = false;
+              liveBtn.removeAttribute('aria-busy');
+            }
           });
         });
       });
@@ -645,8 +1012,8 @@
       region.querySelectorAll('.btn-open-res').forEach(function (btn) {
         var rid = btn.getAttribute('data-id');
         btn.addEventListener('click', function () {
-          openReservationDrawer(rid, ctx, employees, function () {
-            refreshTableRegion();
+          openReservationDrawer(rid, ctx, employees, function (updatedRes) {
+            syncLocalReservationSnapshot(updatedRes);
           });
         });
       });
@@ -689,6 +1056,43 @@
         page: state.page,
         totalPages: currentTotalPages
       });
+    }
+
+    function syncLocalReservationSnapshot(updatedRes) {
+      if (updatedRes && updatedRes.id) {
+        var matchedInTable = currentItems.some(function (it) { return it && it.id === updatedRes.id; });
+        if (matchedInTable) {
+          currentItems = currentItems.map(function (it) {
+            return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
+          });
+          paintCurrentItems();
+        } else {
+          refreshTableRegion({ silentRefresh: true });
+        }
+        if (Array.isArray(radarRawReservations)) {
+          radarRawReservations = radarRawReservations.map(function (it) {
+            return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
+          });
+          paintRadarView();
+          paintTodayView();
+        }
+        if (Array.isArray(calendarRawItems)) {
+          calendarRawItems = calendarRawItems.map(function (it) {
+            return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
+          });
+          if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+            paintTodayView();
+          }
+        }
+      } else {
+        refreshTableRegion({ silentRefresh: true });
+        refreshRadarData(false);
+        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+          ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true });
+        } else {
+          calendarRawItems = null;
+        }
+      }
     }
 
     async function refreshTableRegion(opts) {
@@ -762,6 +1166,9 @@
       document.getElementById('res-prio').value = '';
       document.getElementById('res-from').value = '';
       document.getElementById('res-to').value = '';
+      if (root.RGCrmDatePicker && root.RGCrmDatePicker.enhanceAll) {
+        root.RGCrmDatePicker.enhanceAll(container);
+      }
       var tfEl = document.getElementById('res-time-field');
       var tfFromEl = document.getElementById('res-time-from');
       var tfToEl = document.getElementById('res-time-to');
@@ -773,11 +1180,16 @@
       document.getElementById('res-problems').checked = false;
       if (ovEl) ovEl.checked = false;
       refreshTableRegion();
+      ctx.toast(ctx.lang === 'en' ? 'Filters reset.' : 'تمت إعادة ضبط جميع الفلاتر.');
     });
 
-    document.getElementById('res-cols-btn').addEventListener('click', function () {
-      document.getElementById('res-cols-panel').classList.toggle('hidden');
-    });
+    var colsBtnEl = document.getElementById('res-cols-btn');
+    if (colsBtnEl) {
+      colsBtnEl.addEventListener('click', function () {
+        var panel = document.getElementById('res-cols-panel');
+        if (panel) panel.classList.toggle('hidden');
+      });
+    }
 
     container.querySelectorAll('.res-col-toggle').forEach(function (chk) {
       chk.addEventListener('change', function () {
@@ -798,8 +1210,15 @@
     var colsResetBtn = document.getElementById('res-cols-reset');
     if (colsResetBtn) {
       colsResetBtn.addEventListener('click', function () {
-        state.visibleCols = DEFAULT_VISIBLE_COLS.slice();
-        localStorage.setItem(COLS_STORAGE_KEY, JSON.stringify(state.visibleCols));
+        var roleResetRes = (root.RGApp && typeof root.RGApp.getEffectiveRoleUiResolution === 'function')
+          ? root.RGApp.getEffectiveRoleUiResolution(currentUser)
+          : null;
+        state.visibleCols = (roleResetRes && roleResetRes.hasRoleOverride && Array.isArray(roleResetRes.visibleCols) && roleResetRes.visibleCols.length)
+          ? roleResetRes.visibleCols.slice()
+          : DEFAULT_VISIBLE_COLS.slice();
+        try {
+          localStorage.removeItem(COLS_STORAGE_KEY);
+        } catch (_e) {}
         container.querySelectorAll('.res-col-toggle').forEach(function (chk) {
           chk.checked = state.visibleCols.indexOf(chk.value) !== -1;
         });
@@ -851,7 +1270,7 @@
                   }
                 }
                 if (!chosenFrom && !chosenTo) {
-                  ctx.toast('يرجى تحديد تاريخ البداية عند اختيار السحب من تاريخ معين.', true);
+                  ctx.toast('يرجى تحديد تاريخ البداية أو تاريخ النهاية على الأقل.', true);
                   return;
                 }
               }
@@ -864,9 +1283,16 @@
             var resp = await root.RGApi.callApi('pullReservations', pullPayload);
             if (resp.success && resp.data) {
               var d = resp.data;
-              var rangeNote = (d.appliedRange && d.appliedRange.hasCustomRange && d.appliedRange.dateFrom)
-                ? (' (' + d.appliedRange.dateFrom + (d.appliedRange.dateTo ? ' → ' + d.appliedRange.dateTo : '') + ')')
-                : '';
+              var rangeNote = '';
+              if (d.appliedRange && d.appliedRange.hasCustomRange && (d.appliedRange.dateFrom || d.appliedRange.dateTo)) {
+                if (d.appliedRange.dateFrom && d.appliedRange.dateTo) {
+                  rangeNote = ' (' + d.appliedRange.dateFrom + ' → ' + d.appliedRange.dateTo + ')';
+                } else if (d.appliedRange.dateFrom) {
+                  rangeNote = ' (من ' + d.appliedRange.dateFrom + ')';
+                } else {
+                  rangeNote = ' (حتى ' + d.appliedRange.dateTo + ')';
+                }
+              }
               var imported = d.importedCount || 0;
               var updated = d.updatedCount || 0;
               var exts = d.extensionsCount || 0;
@@ -888,6 +1314,11 @@
               ctx.refreshNotifications();
               refreshTableRegion({ forceRefresh: true });
               refreshRadarData();
+              if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+                ensureTodayCalendarLoaded({ forceRefresh: true });
+              } else {
+                calendarRawItems = null;
+              }
             } else {
               ctx.toast((resp && resp.message) || 'تعذر سحب الحجوزات.', true);
             }
@@ -899,21 +1330,23 @@
     }
 
     var exportBtn = document.getElementById('res-export-xlsx');
-    exportBtn.addEventListener('click', async function () {
-      exportBtn.disabled = true;
-      try {
-        await root.RGReports.exportExcelWorkbook([{
-          name: 'Reservations',
-          headers: ALL_COLUMNS.slice(),
-          rows: currentItems
-        }], 'rental-gate-reservations.xlsx');
-        ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
-      } catch (err) {
-        ctx.toast((err && err.message) || 'تعذر تصدير ملف Excel.', true);
-      } finally {
-        exportBtn.disabled = false;
-      }
-    });
+    if (exportBtn) {
+      exportBtn.addEventListener('click', async function () {
+        exportBtn.disabled = true;
+        try {
+          await root.RGReports.exportExcelWorkbook([{
+            name: 'Reservations',
+            headers: ALL_COLUMNS.slice(),
+            rows: currentItems
+          }], 'rental-gate-reservations.xlsx');
+          ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
+        } catch (err) {
+          ctx.toast((err && err.message) || 'تعذر تصدير ملف Excel.', true);
+        } finally {
+          exportBtn.disabled = false;
+        }
+      });
+    }
 
     var importBtn = document.getElementById('res-import-xlsx');
     if (importBtn) {
@@ -921,6 +1354,11 @@
         openImportExcelModal(ctx, function () {
           refreshTableRegion();
           refreshRadarData();
+          if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+            ensureTodayCalendarLoaded({ forceRefresh: true });
+          } else {
+            calendarRawItems = null;
+          }
         }, currentItems);
       });
     }
@@ -929,6 +1367,445 @@
     if (handoverBtn && root.RGHandover) {
       handoverBtn.addEventListener('click', function () {
         root.RGHandover.openHandoverModal(ctx);
+      });
+    }
+
+    var calendarRawItems = null;
+    var calendarLoadError = '';
+    var calendarFetchSeq = 0;
+
+    function formatCalPeriodTitle(win) {
+      if (!win) return '';
+      if (win.granularity === 'month') {
+        return isEn
+          ? ((win.monthNameEn || '') + ' ' + (win.year || ''))
+          : ((win.monthNameAr || '') + ' ' + (win.year || ''));
+      }
+      if (!Array.isArray(win.days) || win.days.length === 0) return '';
+      if (win.granularity === 'day') {
+        var d0 = win.days[0];
+        return isEn
+          ? (d0.weekdayEn + ' · ' + d0.shortDateEn + ' ' + d0.year)
+          : (d0.weekdayAr + ' · ' + d0.shortDateAr + ' ' + d0.year);
+      }
+      var first = win.days[0];
+      var last = win.days[win.days.length - 1];
+      return isEn
+        ? (first.shortDateEn + ' – ' + last.shortDateEn + ' ' + last.year)
+        : (first.shortDateAr + ' – ' + last.shortDateAr + ' ' + last.year);
+    }
+
+    function renderCalEventCardHtml(ev, compactMode) {
+      var typeMeta = ev.type === 'pickup'
+        ? { cls: 'is-pickup', label: isEn ? 'Pickup' : 'استلام' }
+        : (ev.type === 'extension'
+          ? { cls: 'is-extension', label: isEn ? 'Extension' : 'تمديد' }
+          : { cls: 'is-return', label: isEn ? 'Return' : 'إرجاع' });
+      var timeDisplay = ev.timeStr ? formatTimeOnly(ev.timeStr, ctx.lang) : '';
+      var metaLine = [formatCarNameDisplay(ev.carName), ev.branchName].filter(Boolean).join(' · ');
+      var extMeta = ev.type === 'extension' && (ev.extensionDays > 0 || ev.extensionNumber)
+        ? ('<span class="rg-cal-ext-meta tabular-nums">' +
+            (ev.extensionNumber ? esc(ev.extensionNumber) + ' ' : '') +
+            (ev.extensionDays > 0 ? ('+' + ev.extensionDays + (isEn ? 'd' : 'ي')) : '') +
+          '</span>')
+        : '';
+
+      if (compactMode) {
+        return '<button type="button" class="rg-cal-month-ev ' + typeMeta.cls + '" data-res-id="' + esc(ev.reservationId) + '" title="' + esc(typeMeta.label + ' · ' + ev.reservationNumber + ' · ' + (ev.customerName || '-') + (timeDisplay ? (' · ' + timeDisplay) : '')) + '">' +
+          '<span class="rg-cal-dot ' + typeMeta.cls + '" aria-hidden="true"></span>' +
+          '<span class="rg-cal-month-ev-time mono tabular-nums" dir="ltr">' + esc(timeDisplay || ev.timeStr || '') + '</span>' +
+          '<span class="rg-cal-month-ev-title">' + esc(ev.customerName !== '-' ? ev.customerName : ev.reservationNumber) + '</span>' +
+        '</button>';
+      }
+
+      return '<button type="button" class="rg-cal-event-card ' + typeMeta.cls + '" data-res-id="' + esc(ev.reservationId) + '" title="' + esc(ev.reservationNumber + ' · ' + ev.customerName) + '">' +
+        '<div class="rg-cal-event-top">' +
+          '<span class="rg-cal-event-type ' + typeMeta.cls + '">' + esc(typeMeta.label) + '</span>' +
+          '<span class="rg-cal-event-time mono tabular-nums" dir="ltr">' + esc(timeDisplay || ev.timeStr || '') + '</span>' +
+        '</div>' +
+        '<div class="rg-cal-event-head">' +
+          '<span class="rg-cal-event-num mono tabular-nums" dir="ltr">' + esc(ev.reservationNumber) + '</span>' +
+          extMeta +
+        '</div>' +
+        '<div class="rg-cal-event-cust">' + esc(ev.customerName || '-') + '</div>' +
+        (metaLine ? '<div class="rg-cal-event-car">' + esc(metaLine) + '</div>' : '') +
+      '</button>';
+    }
+
+    async function ensureTodayCalendarLoaded(opts) {
+      var o = opts || {};
+      var force = Boolean(o.forceRefresh);
+      if (!force && Array.isArray(calendarRawItems)) {
+        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+          paintTodayView();
+        }
+        return;
+      }
+      if (!force && !hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+        calendarLoadError = '';
+        calendarRawItems = currentItems.slice();
+        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+          paintTodayView();
+        }
+        return;
+      }
+      var seq = ++calendarFetchSeq;
+      calendarLoadError = '';
+      var resp = await root.RGApi.callApi('getReservations', {
+        page: 1,
+        pageSize: 500,
+        forceRefresh: force,
+        silentRefresh: Boolean(o.silentRefresh),
+        abortKey: 'res:todayCalendar'
+      });
+      if (seq !== calendarFetchSeq || !container.isConnected) return;
+      if (resp && resp.aborted) return;
+      if (resp && resp.success && resp.data) {
+        calendarLoadError = '';
+        calendarRawItems = Array.isArray(resp.data.items) ? resp.data.items : [];
+      } else if (!Array.isArray(calendarRawItems)) {
+        calendarLoadError = (resp && resp.message) || (isEn ? 'Failed to load calendar data.' : 'تعذر تحميل بيانات التقويم.');
+      }
+      if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+        paintTodayView();
+      }
+      if (o.showToast && resp && resp.success) {
+        ctx.toast(isEn ? 'Pickups & Returns calendar updated.' : 'تم تحديث تقويم التسليم والاستلام بنجاح.');
+      }
+    }
+
+    function buildTodayCalendarContext() {
+      var core = root.RGCrmCore;
+      var gran = (core && core.normalizeCalendarGranularity)
+        ? core.normalizeCalendarGranularity(state.todayCalendarGranularity)
+        : (state.todayCalendarGranularity || 'week');
+      var anchorIso = state.todayCalendarAnchorDate || (core && core.getRiyadhTodayDateStr ? core.getRiyadhTodayDateStr() : new Date().toISOString().substring(0, 10));
+      var win = (core && core.buildCalendarPeriodWindow)
+        ? core.buildCalendarPeriodWindow(anchorIso, gran, { weekStartsOn: 6 })
+        : { granularity: gran, anchorIso: anchorIso, todayIso: anchorIso, startIso: anchorIso, endIso: anchorIso, prevAnchorIso: anchorIso, nextAnchorIso: anchorIso, weekdayHeaders: [], days: [] };
+      var extracted = (core && core.extractReservationCalendarEvents)
+        ? core.extractReservationCalendarEvents(calendarRawItems || [], win.startIso, win.endIso, {
+            eventType: state.todayCalendarEventFilter || 'all',
+            search: state.todayCalendarSearch || ''
+          })
+        : { events: [], byDate: {}, counts: { total: 0, pickup: 0, return: 0, extension: 0 } };
+      return { gran: gran, win: win, extracted: extracted };
+    }
+
+    function renderTodayCalendarSectionHtml() {
+      if (calendarRawItems === null) {
+        if (calendarLoadError) {
+          return '<div class="rg-error-banner" role="alert">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load calendar' : 'تعذر تحميل التقويم الزمني') + '</div>' +
+              '<div class="rg-error-banner-msg">' + esc(calendarLoadError) + '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="today-cal-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
+          '</div>';
+        }
+        return '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+      }
+
+      var ctxCal = buildTodayCalendarContext();
+      var gran = ctxCal.gran;
+      var win = ctxCal.win;
+      var extracted = ctxCal.extracted;
+      var counts = extracted.counts || { total: 0, pickup: 0, return: 0, extension: 0 };
+      var evTypeFilter = state.todayCalendarEventFilter || 'all';
+
+      var bodyHtml = '';
+      if (gran === 'day') {
+        var dayMeta = win.days[0] || { iso: win.startIso, weekdayAr: '', weekdayEn: '', shortDateAr: win.startIso, shortDateEn: win.startIso, isToday: false };
+        var dayEvents = extracted.byDate[dayMeta.iso] || [];
+        var eventsByHour = {};
+        dayEvents.forEach(function (ev) {
+          var hr = typeof ev.hourSlot === 'number' && ev.hourSlot >= 0 && ev.hourSlot <= 23 ? ev.hourSlot : 9;
+          if (!eventsByHour[hr]) eventsByHour[hr] = [];
+          eventsByHour[hr].push(ev);
+        });
+        var visibleHours = [];
+        for (var h = 0; h < 24; h++) {
+          if ((h >= 7 && h <= 22) || (eventsByHour[h] && eventsByHour[h].length > 0)) {
+            visibleHours.push(h);
+          }
+        }
+        bodyHtml =
+          '<div class="rg-cal-day-banner' + (dayMeta.isToday ? ' is-today' : '') + '">' +
+            '<div>' +
+              '<strong>' + esc(isEn ? (dayMeta.weekdayEn + ' · ' + dayMeta.shortDateEn) : (dayMeta.weekdayAr + ' · ' + dayMeta.shortDateAr)) + '</strong>' +
+              (dayMeta.isToday ? ' <span class="rg-cal-today-tag">' + (isEn ? 'Today' : 'اليوم') + '</span>' : '') +
+            '</div>' +
+            '<span class="rg-cal-day-count tabular-nums">' + dayEvents.length + ' ' + (isEn ? 'movements' : 'حركة') + '</span>' +
+          '</div>' +
+          (dayEvents.length === 0
+            ? '<div class="empty-state" style="margin-top:10px;">' + (isEn ? 'No pickups, returns, or extensions scheduled on this day.' : 'لا توجد مواعيد استلام أو إرجاع أو تمديدات في هذا اليوم.') + '</div>'
+            : '') +
+          '<div class="rg-cal-day-timeline">' +
+            visibleHours.map(function (hr) {
+              var hh = String(hr).padStart(2, '0') + ':00';
+              var lblTime = formatTimeOnly(hh, ctx.lang) || hh;
+              var slotEvents = eventsByHour[hr] || [];
+              return '<div class="rg-cal-hour-row' + (slotEvents.length === 0 ? ' is-empty' : ' has-events') + '">' +
+                '<div class="rg-cal-hour-label mono tabular-nums" dir="ltr">' + esc(lblTime) + '</div>' +
+                '<div class="rg-cal-hour-slot">' +
+                  (slotEvents.length > 0
+                    ? slotEvents.map(function (ev) { return renderCalEventCardHtml(ev, false); }).join('')
+                    : '<span class="rg-cal-hour-empty-line" aria-hidden="true"></span>') +
+                '</div>' +
+              '</div>';
+            }).join('') +
+          '</div>';
+      } else if (gran === 'month') {
+        var headers = Array.isArray(win.weekdayHeaders) ? win.weekdayHeaders : [];
+        var MAX_MONTH_CELL_EVENTS = 3;
+        bodyHtml =
+          '<div class="rg-cal-month-wrap">' +
+            '<div class="rg-cal-month-weekdays">' +
+              headers.map(function (wh) {
+                return '<div class="rg-cal-month-weekday">' + esc(isEn ? wh.weekdayEn : wh.weekdayAr) + '</div>';
+              }).join('') +
+            '</div>' +
+            '<div class="rg-cal-month-grid">' +
+              win.days.map(function (day) {
+                var dayList = extracted.byDate[day.iso] || [];
+                var visibleList = dayList.slice(0, MAX_MONTH_CELL_EVENTS);
+                var overflowCount = Math.max(0, dayList.length - MAX_MONTH_CELL_EVENTS);
+                var pickupCnt = 0;
+                var returnCnt = 0;
+                var extCnt = 0;
+                dayList.forEach(function (ev) {
+                  if (ev.type === 'pickup') pickupCnt += 1;
+                  else if (ev.type === 'return') returnCnt += 1;
+                  else if (ev.type === 'extension') extCnt += 1;
+                });
+                var cellClasses = 'rg-cal-month-cell' +
+                  (day.isCurrentMonth === false ? ' is-outside' : '') +
+                  (day.isToday ? ' is-today' : '') +
+                  (dayList.length > 0 ? ' has-events' : '');
+                return '<section class="' + cellClasses + '" data-cal-date="' + esc(day.iso) + '">' +
+                  '<div class="rg-cal-month-cell-head">' +
+                    '<button type="button" class="rg-cal-month-day-btn tabular-nums" data-cal-open-day="' + esc(day.iso) + '" title="' + esc(isEn ? ('Open day ' + day.iso) : ('عرض تفاصيل يوم ' + day.shortDateAr)) + '">' +
+                      '<span>' + esc(day.day) + '</span>' +
+                      (day.isToday ? '<span class="rg-cal-today-tag">' + (isEn ? 'Today' : 'اليوم') + '</span>' : '') +
+                    '</button>' +
+                    (dayList.length > 0
+                      ? '<button type="button" class="rg-cal-month-total tabular-nums" data-cal-open-day="' + esc(day.iso) + '" aria-label="' + esc(dayList.length + ' ' + (isEn ? 'movements' : 'حركة')) + '">' + dayList.length + '</button>'
+                      : '') +
+                  '</div>' +
+                  '<div class="rg-cal-month-cell-events">' +
+                    visibleList.map(function (ev) { return renderCalEventCardHtml(ev, true); }).join('') +
+                    (overflowCount > 0
+                      ? '<button type="button" class="rg-cal-month-more tabular-nums" data-cal-open-day="' + esc(day.iso) + '">' +
+                          (isEn ? ('+' + overflowCount + ' more') : ('+' + overflowCount + ' أخرى')) +
+                        '</button>'
+                      : '') +
+                  '</div>' +
+                  (dayList.length > 0
+                    ? '<button type="button" class="rg-cal-month-mobile-dots" data-cal-open-day="' + esc(day.iso) + '" aria-label="' + esc(dayList.length + ' ' + (isEn ? 'movements — open day' : 'حركة — فتح جدول اليوم')) + '">' +
+                        (pickupCnt > 0 ? '<span class="rg-cal-m-badge is-pickup tabular-nums">' + pickupCnt + '</span>' : '') +
+                        (returnCnt > 0 ? '<span class="rg-cal-m-badge is-return tabular-nums">' + returnCnt + '</span>' : '') +
+                        (extCnt > 0 ? '<span class="rg-cal-m-badge is-extension tabular-nums">' + extCnt + '</span>' : '') +
+                      '</button>'
+                    : '') +
+                '</section>';
+              }).join('') +
+            '</div>' +
+          '</div>';
+      } else {
+        bodyHtml =
+          '<div class="rg-cal-week-grid">' +
+            win.days.map(function (day) {
+              var dayList = extracted.byDate[day.iso] || [];
+              return '<section class="rg-cal-day-col' + (day.isToday ? ' is-today' : '') + '" data-cal-date="' + esc(day.iso) + '">' +
+                '<header class="rg-cal-day-head">' +
+                  '<button type="button" class="rg-cal-day-head-btn" data-cal-open-day="' + esc(day.iso) + '" title="' + esc(isEn ? 'Open hourly view for this day' : 'فتح جدول الساعات لهذا اليوم') + '">' +
+                    '<div class="rg-cal-day-head-main">' +
+                      '<span class="rg-cal-day-name">' + esc(isEn ? day.weekdayEn : day.weekdayAr) + '</span>' +
+                      '<span class="rg-cal-day-date tabular-nums">' + esc(isEn ? day.shortDateEn : day.shortDateAr) + '</span>' +
+                    '</div>' +
+                    '<div class="rg-cal-day-head-meta">' +
+                      (day.isToday ? '<span class="rg-cal-today-tag">' + (isEn ? 'Today' : 'اليوم') + '</span>' : '') +
+                      '<span class="rg-cal-day-count tabular-nums">' + dayList.length + '</span>' +
+                    '</div>' +
+                  '</button>' +
+                '</header>' +
+                '<div class="rg-cal-day-body">' +
+                  (dayList.length === 0
+                    ? '<div class="rg-cal-empty-day">' + (isEn ? 'No movements' : 'لا توجد مواعيد') + '</div>'
+                    : dayList.map(function (ev) { return renderCalEventCardHtml(ev, false); }).join('')) +
+                '</div>' +
+              '</section>';
+            }).join('') +
+          '</div>';
+      }
+
+      return '<div class="rg-cal-shell" id="today-calendar-shell">' +
+        '<div class="rg-cal-toolbar">' +
+          '<div class="rg-cal-nav-group">' +
+            '<button type="button" class="btn btn-sm" id="today-cal-prev-btn">' + (isEn ? 'Previous' : 'السابق') + '</button>' +
+            '<button type="button" class="btn btn-sm btn-charcoal" id="today-cal-today-btn">' + (isEn ? 'Today' : 'اليوم') + '</button>' +
+            '<button type="button" class="btn btn-sm" id="today-cal-next-btn">' + (isEn ? 'Next' : 'التالي') + '</button>' +
+            '<h3 class="rg-cal-period-title" id="today-cal-period-title">' + esc(formatCalPeriodTitle(win)) + '</h3>' +
+          '</div>' +
+          '<div class="rg-cal-gran-group">' +
+            '<div class="rg-cal-gran-switch" role="group" aria-label="' + (isEn ? 'Calendar Scale' : 'نطاق التقويم') + '">' +
+              '<button type="button" class="rg-cal-gran-btn' + (gran === 'month' ? ' is-active' : '') + '" data-cal-gran="month">' + (isEn ? 'Monthly' : 'شهري') + '</button>' +
+              '<button type="button" class="rg-cal-gran-btn' + (gran === 'week' ? ' is-active' : '') + '" data-cal-gran="week">' + (isEn ? 'Weekly' : 'أسبوعي') + '</button>' +
+              '<button type="button" class="rg-cal-gran-btn' + (gran === 'day' ? ' is-active' : '') + '" data-cal-gran="day">' + (isEn ? 'Daily' : 'يومي') + '</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="rg-cal-subbar">' +
+          '<div class="rg-cal-legend" role="group" aria-label="' + (isEn ? 'Calendar Movement Types' : 'أنواع المواعيد') + '">' +
+            '<button type="button" class="rg-cal-filter-chip' + (evTypeFilter === 'all' ? ' is-active' : '') + '" data-cal-type="all">' +
+              '<span>' + (isEn ? 'All' : 'الكل') + '</span> <strong class="tabular-nums">' + counts.total + '</strong>' +
+            '</button>' +
+            '<button type="button" class="rg-cal-filter-chip is-pickup' + (evTypeFilter === 'pickup' ? ' is-active' : '') + '" data-cal-type="pickup">' +
+              '<span class="rg-cal-dot is-pickup" aria-hidden="true"></span>' +
+              '<span>' + (isEn ? 'Pickups' : 'التسليم / الاستلام') + '</span> <strong class="tabular-nums">' + counts.pickup + '</strong>' +
+            '</button>' +
+            '<button type="button" class="rg-cal-filter-chip is-return' + (evTypeFilter === 'return' ? ' is-active' : '') + '" data-cal-type="return">' +
+              '<span class="rg-cal-dot is-return" aria-hidden="true"></span>' +
+              '<span>' + (isEn ? 'Returns' : 'الإرجاع') + '</span> <strong class="tabular-nums">' + counts.return + '</strong>' +
+            '</button>' +
+            '<button type="button" class="rg-cal-filter-chip is-extension' + (evTypeFilter === 'extension' ? ' is-active' : '') + '" data-cal-type="extension">' +
+              '<span class="rg-cal-dot is-extension" aria-hidden="true"></span>' +
+              '<span>' + (isEn ? 'Extensions' : 'التمديدات') + '</span> <strong class="tabular-nums">' + counts.extension + '</strong>' +
+            '</button>' +
+          '</div>' +
+          '<div class="rg-cal-actions">' +
+            '<input type="search" class="input" id="today-cal-search" placeholder="' + (isEn ? 'Search in calendar...' : 'بحث في التقويم...') + '" value="' + esc(state.todayCalendarSearch || '') + '">' +
+            '<button type="button" class="btn btn-sm" id="today-cal-ics-btn" title="' + (isEn ? 'Export visible calendar events (.ics)' : 'تصدير مواعيد التقويم الظاهرة (.ics)') + '">📅 ' + (isEn ? 'Export .ics' : 'تقويم .ics') + '</button>' +
+            '<button type="button" class="btn btn-sm" id="today-cal-refresh-btn">' + (isEn ? 'Refresh' : 'تحديث') + '</button>' +
+          '</div>' +
+        '</div>' +
+        bodyHtml +
+      '</div>';
+    }
+
+    function bindTodayCalendarEvents(todayWrap) {
+      var retryBtn = todayWrap.querySelector('#today-cal-retry-btn');
+      if (retryBtn) {
+        retryBtn.addEventListener('click', function () {
+          ensureTodayCalendarLoaded({ forceRefresh: true });
+        });
+        return;
+      }
+      var ctxCal = buildTodayCalendarContext();
+      var win = ctxCal.win;
+      var extracted = ctxCal.extracted;
+
+      var prevBtn = todayWrap.querySelector('#today-cal-prev-btn');
+      var todayBtn = todayWrap.querySelector('#today-cal-today-btn');
+      var nextBtn = todayWrap.querySelector('#today-cal-next-btn');
+      if (prevBtn) {
+        prevBtn.addEventListener('click', function () {
+          state.todayCalendarAnchorDate = win.prevAnchorIso;
+          paintTodayView();
+        });
+      }
+      if (todayBtn) {
+        todayBtn.addEventListener('click', function () {
+          state.todayCalendarAnchorDate = win.todayIso;
+          paintTodayView();
+        });
+      }
+      if (nextBtn) {
+        nextBtn.addEventListener('click', function () {
+          state.todayCalendarAnchorDate = win.nextAnchorIso;
+          paintTodayView();
+        });
+      }
+
+      todayWrap.querySelectorAll('[data-cal-gran]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var rawG = btn.getAttribute('data-cal-gran');
+          state.todayCalendarGranularity = (rawG === 'day' || rawG === 'month') ? rawG : 'week';
+          saveTodayCalPrefs();
+          paintTodayView();
+        });
+      });
+
+      todayWrap.querySelectorAll('[data-cal-type]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          state.todayCalendarEventFilter = btn.getAttribute('data-cal-type') || 'all';
+          paintTodayView();
+        });
+      });
+
+      todayWrap.querySelectorAll('[data-cal-open-day]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var targetIso = btn.getAttribute('data-cal-open-day');
+          if (!targetIso) return;
+          state.todayCalendarAnchorDate = targetIso;
+          state.todayCalendarGranularity = 'day';
+          saveTodayCalPrefs();
+          paintTodayView();
+        });
+      });
+
+      var calSearchEl = todayWrap.querySelector('#today-cal-search');
+      if (calSearchEl) {
+        calSearchEl.addEventListener('input', function () {
+          state.todayCalendarSearch = calSearchEl.value;
+          var pos = calSearchEl.selectionStart;
+          paintTodayView();
+          var nextInp = document.getElementById('today-cal-search');
+          if (nextInp) {
+            nextInp.focus();
+            if (typeof pos === 'number') {
+              try { nextInp.setSelectionRange(pos, pos); } catch (_e) {}
+            }
+          }
+        });
+      }
+
+      var calIcsBtn = todayWrap.querySelector('#today-cal-ics-btn');
+      if (calIcsBtn) {
+        calIcsBtn.addEventListener('click', function () {
+          var core = root.RGCrmCore;
+          if (!core || !core.buildIcsCalendarContent) return;
+          var evs = (extracted.events || []).map(function (ev, idx) {
+            var kindLbl = ev.type === 'pickup'
+              ? (isEn ? 'Pickup' : 'تسليم')
+              : (ev.type === 'extension' ? (isEn ? 'Extension' : 'تمديد') : (isEn ? 'Return' : 'إرجاع'));
+            return {
+              uid: 'rg-cal-' + (ev.eventKey || idx) + '@rentalgate.crm',
+              startDate: ev.dateIso,
+              startTime: ev.timeStr || '09:00',
+              summary: '[' + kindLbl + '] #' + (ev.reservationNumber || ev.reservationId) + ' — ' + (ev.customerName || '-'),
+              description: [ev.carName, ev.customerPhone, ev.status].filter(Boolean).join(' | '),
+              location: [ev.companyName, ev.branchName].filter(Boolean).join(' — ')
+            };
+          });
+          if (!evs.length) {
+            ctx.toast(isEn ? 'No calendar events in the current view to export.' : 'لا توجد مواعيد في العرض الحالي لتصديرها.', true);
+            return;
+          }
+          var icsStr = core.buildIcsCalendarContent(evs, 'Rental Gate CRM — Pickups & Returns');
+          var dlFn = (ctx.downloadIcsFile) || (root.RGApp && root.RGApp.downloadIcsFile);
+          if (dlFn) {
+            dlFn('rg-calendar-' + (win.startIso || 'schedule') + '.ics', icsStr);
+            ctx.toast(isEn ? 'Calendar (.ics) file downloaded.' : 'تم تصدير التقويم بصيغة (.ics).');
+          }
+        });
+      }
+
+      var calRefreshBtn = todayWrap.querySelector('#today-cal-refresh-btn');
+      if (calRefreshBtn) {
+        calRefreshBtn.addEventListener('click', function () {
+          ensureTodayCalendarLoaded({ forceRefresh: true, showToast: true });
+        });
+      }
+
+      todayWrap.querySelectorAll('.rg-cal-event-card, .rg-cal-month-ev').forEach(function (card) {
+        card.addEventListener('click', function () {
+          var rid = card.getAttribute('data-res-id');
+          if (!rid) return;
+          openReservationDrawer(rid, ctx, employees, function (updatedRes) {
+            syncLocalReservationSnapshot(updatedRes);
+          });
+        });
       });
     }
 
@@ -1017,8 +1894,9 @@
                 '<div class="cell-sub">' + esc([r.companyName, r.branchName].filter(Boolean).join(' · ') || '-') + '</div>' +
               '</td>' +
               '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                '<div>' + esc(formatDateOnly(entry.effectiveEndDate)) + '</div>' +
-                (entry.effectiveEndTime ? '<div class="time-sub" dir="ltr">' + esc(formatTimeOnly(entry.effectiveEndTime, ctx.lang)) + '</div>' : '') +
+                (entry.effectiveEndTime
+                  ? renderBookingTimezoneHtml(entry.effectiveEndDate, entry.effectiveEndTime, { compact: true })
+                  : '<div>' + esc(formatDateOnly(entry.effectiveEndDate)) + '</div>') +
               '</td>' +
               '<td style="white-space:nowrap;">' +
                 '<span class="radar-countdown ' + toneCls + ' tabular-nums">' + esc(remLabel) + '</span>' +
@@ -1028,7 +1906,7 @@
                 '<button type="button" class="btn btn-sm btn-primary radar-open-res" data-id="' + esc(r.id) + '">' + (isEn ? 'Details' : 'التفاصيل') + '</button>' +
                 '<button type="button" class="btn btn-sm radar-copy-offer" data-id="' + esc(r.id) + '">' + (isEn ? 'Copy Offer' : 'نسخ التمديد') + '</button>' +
                 (waHref
-                  ? '<a class="btn btn-sm btn-charcoal" href="' + esc(waHref) + '" target="_blank" rel="noopener noreferrer">' + (isEn ? 'WhatsApp' : 'واتساب') + '</a>'
+                  ? '<a class="btn btn-sm btn-charcoal rg-ui-wa-btn" href="' + esc(waHref) + '" target="_blank" rel="noopener noreferrer">' + (isEn ? 'WhatsApp' : 'واتساب') + '</a>'
                   : '') +
               '</div></td>' +
             '</tr>';
@@ -1092,9 +1970,8 @@
       radarWrap.querySelectorAll('.radar-open-res').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-id');
-          openReservationDrawer(rid, ctx, employees, function () {
-            refreshTableRegion();
-            refreshRadarData(false);
+          openReservationDrawer(rid, ctx, employees, function (updatedRes) {
+            syncLocalReservationSnapshot(updatedRes);
           });
         });
       });
@@ -1134,9 +2011,52 @@
       }
       if (state.viewMode !== 'today') return;
 
+      var modeBarHtml =
+        '<div class="rg-today-mode-bar">' +
+          '<div class="rg-cal-gran-switch" role="tablist" aria-label="' + (isEn ? 'Pickups & Returns Display Mode' : 'طريقة عرض التسليم والاستلام') + '">' +
+            '<button type="button" role="tab" aria-selected="' + (state.todayDisplayMode === 'calendar') + '" class="rg-cal-gran-btn' + (state.todayDisplayMode === 'calendar' ? ' is-active' : '') + '" data-today-mode="calendar">' +
+              '📅 ' + (isEn ? 'Calendar (Month / Week / Day)' : 'التقويم (شهري / أسبوعي / يومي)') +
+            '</button>' +
+            '<button type="button" role="tab" aria-selected="' + (state.todayDisplayMode !== 'calendar') + '" class="rg-cal-gran-btn' + (state.todayDisplayMode !== 'calendar' ? ' is-active' : '') + '" data-today-mode="list">' +
+              (isEn ? 'Today\'s Schedule' : 'جدول اليوم') +
+            '</button>' +
+          '</div>' +
+          '<div class="rg-today-mode-hint">' +
+            (state.todayDisplayMode === 'calendar'
+              ? (isEn ? 'Interactive calendar for pickups, returns & extensions' : 'عرض تفاعلي لمواعيد التسليم والاستلام والتمديدات')
+              : (isEn ? 'Live schedule of pickups and returns scheduled for today' : 'متابعة جدول التسليم والاستلام المجدول لليوم')) +
+          '</div>' +
+        '</div>';
+
+      function bindTodayModeSwitch() {
+        todayWrap.querySelectorAll('[data-today-mode]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var nextMode = btn.getAttribute('data-today-mode') === 'calendar' ? 'calendar' : 'list';
+            if (state.todayDisplayMode === nextMode) return;
+            state.todayDisplayMode = nextMode;
+            saveTodayCalPrefs();
+            if (nextMode === 'calendar' && calendarRawItems === null) {
+              ensureTodayCalendarLoaded({ forceRefresh: false });
+            }
+            paintTodayView();
+          });
+        });
+      }
+
+      if (state.todayDisplayMode === 'calendar') {
+        if (calendarRawItems === null && !calendarLoadError) {
+          ensureTodayCalendarLoaded({ forceRefresh: false });
+        }
+        todayWrap.innerHTML = modeBarHtml + renderTodayCalendarSectionHtml();
+        bindTodayModeSwitch();
+        bindTodayCalendarEvents(todayWrap);
+        return;
+      }
+
       if (radarRawReservations === null) {
         if (radarLoadError) {
           todayWrap.innerHTML =
+            modeBarHtml +
             '<div class="rg-error-banner" role="alert">' +
               '<div class="rg-error-banner-body">' +
                 '<div class="rg-error-banner-title">' + (isEn ? 'Failed to load Today\'s Pickups & Returns' : 'تعذر تحميل جدول التسليم والاستلام لليوم') + '</div>' +
@@ -1144,11 +2064,13 @@
               '</div>' +
               '<button type="button" class="btn btn-sm btn-primary" id="today-retry-btn">' + (isEn ? 'Retry' : 'إعادة المحاولة') + '</button>' +
             '</div>';
+          bindTodayModeSwitch();
           var tRetry = document.getElementById('today-retry-btn');
           if (tRetry) tRetry.addEventListener('click', function () { refreshRadarData(true, { forceRefresh: true }); });
           return;
         }
-        todayWrap.innerHTML = '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
+        todayWrap.innerHTML = modeBarHtml + '<div class="rg-skeleton-card"><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div></div>';
+        bindTodayModeSwitch();
         return;
       }
 
@@ -1182,14 +2104,17 @@
                 : ('مرحباً ' + (r.customerName || 'عميلنا الكريم') + '، نذكّركم بموعد استلام مركبتكم (' + (r.carName || '') + ') اليوم الساعة ' + schedTimeDisp + ' للحجز رقم ' + (r.reservationNumber || '') + '.'))
             : (core && core.buildExtensionOfferMessage ? core.buildExtensionOfferMessage(r, ctx.lang, { agentName: currentUser && currentUser.name }) : '');
           var waHref = waPhone ? ('https://wa.me/' + waPhone + '?text=' + encodeURIComponent(waText)) : '';
-          var telHref = (core && core.formatDirectCallTelHref) ? core.formatDirectCallTelHref(r.customerPhone, '90') : '';
-          var telDisp = (core && core.formatDirectCallDisplayNumber) ? core.formatDirectCallDisplayNumber(r.customerPhone, '90') : '';
+          var telHref = (core && core.formatDirectCallTelHref) ? core.formatDirectCallTelHref(r.customerPhone, '9') : '';
+          var telDisp = (core && core.formatDirectCallDisplayNumber) ? core.formatDirectCallDisplayNumber(r.customerPhone, '9') : '';
           var rowStateCls = entry.isOverdue ? ' is-overdue' : (entry.isCompleted ? ' is-done' : '');
+          var schedTzHtml = entry.scheduledTime
+            ? renderBookingTimezoneHtml(summary.todayDate || '', entry.scheduledTime, { timeOnly: true, compact: true })
+            : '<span class="mono" dir="ltr">-</span>';
 
           desktopRows.push(
             '<tr data-today-key="' + esc(entry.key) + '" class="today-move-row' + rowStateCls + '">' +
               '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                '<div class="today-time-slot" dir="ltr">' + esc(schedTimeDisp || '-') + '</div>' +
+                '<div class="today-time-slot has-tz-stack">' + schedTzHtml + '</div>' +
                 '<div class="cell-badges" style="margin-top:4px;">' + timingStateHtml + '</div>' +
               '</td>' +
               '<td style="white-space:nowrap;">' +
@@ -1211,14 +2136,14 @@
               '<td><span class="status-tag ' + statusClass(r.internalStatus || r.originalStatusAr) + '">' + esc(r.internalStatus || r.originalStatusAr || '-') + '</span></td>' +
               '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                 '<button type="button" class="btn btn-sm btn-primary today-open-res" data-id="' + esc(r.id) + '">' + (isEn ? 'Details' : 'التفاصيل') + '</button>' +
-                (!isMine
+                (canClaimButtons && !isMine
                   ? '<button type="button" class="btn btn-sm today-claim-btn" data-id="' + esc(r.id) + '">' + (isEn ? 'Claim' : 'استلام عندي') + '</button>'
                   : '') +
                 (telHref
-                  ? '<a class="btn btn-sm rg-tel-btn" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || r.id) + '" data-call-customer="' + esc(r.customerName || '-') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '" title="' + esc(telDisp) + '">' + (isEn ? 'Call 90' : 'اتصال 90') + '</a>'
+                  ? '<a class="btn btn-sm rg-tel-btn" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || r.id) + '" data-call-customer="' + esc(r.customerName || '-') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '" title="' + esc(telDisp) + '">' + (isEn ? 'Call 9' : 'اتصال 9') + '</a>'
                   : '') +
                 (waHref
-                  ? '<a class="btn btn-sm btn-charcoal" href="' + esc(waHref) + '" target="_blank" rel="noopener noreferrer">' + (isEn ? 'WhatsApp' : 'واتساب') + '</a>'
+                  ? '<a class="btn btn-sm btn-charcoal rg-ui-wa-btn" href="' + esc(waHref) + '" target="_blank" rel="noopener noreferrer">' + (isEn ? 'WhatsApp' : 'واتساب') + '</a>'
                   : '') +
               '</div></td>' +
             '</tr>'
@@ -1228,7 +2153,7 @@
             '<article data-today-key="' + esc(entry.key) + '" class="today-mobile-card' + rowStateCls + '">' +
               '<div class="today-mobile-card-top">' +
                 '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
-                  '<span class="today-time-slot" dir="ltr">' + esc(schedTimeDisp || '-') + '</span>' +
+                  '<div class="today-time-slot has-tz-stack">' + schedTzHtml + '</div>' +
                   timingStateHtml +
                   '<span class="status-tag ' + moveTone + '">' + esc(moveLabel) + '</span>' +
                 '</div>' +
@@ -1244,14 +2169,14 @@
               '</div>' +
               '<div class="today-mobile-card-actions">' +
                 '<button type="button" class="btn btn-sm btn-primary today-open-res" data-id="' + esc(r.id) + '">' + (isEn ? 'Details' : 'التفاصيل') + '</button>' +
-                (!isMine
+                (canClaimButtons && !isMine
                   ? '<button type="button" class="btn btn-sm today-claim-btn" data-id="' + esc(r.id) + '">' + (isEn ? 'Claim' : 'استلام عندي') + '</button>'
                   : '') +
                 (telHref
-                  ? '<a class="btn btn-sm rg-tel-btn" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || r.id) + '" data-call-customer="' + esc(r.customerName || '-') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '" title="' + esc(telDisp) + '">' + (isEn ? 'Call 90' : 'اتصال 90') + '</a>'
+                  ? '<a class="btn btn-sm rg-tel-btn" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || r.id) + '" data-call-customer="' + esc(r.customerName || '-') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '" title="' + esc(telDisp) + '">' + (isEn ? 'Call 9' : 'اتصال 9') + '</a>'
                   : '') +
                 (waHref
-                  ? '<a class="btn btn-sm btn-charcoal" href="' + esc(waHref) + '" target="_blank" rel="noopener noreferrer">' + (isEn ? 'WhatsApp' : 'واتساب') + '</a>'
+                  ? '<a class="btn btn-sm btn-charcoal rg-ui-wa-btn" href="' + esc(waHref) + '" target="_blank" rel="noopener noreferrer">' + (isEn ? 'WhatsApp' : 'واتساب') + '</a>'
                   : '') +
               '</div>' +
             '</article>'
@@ -1272,6 +2197,7 @@
       }
 
       todayWrap.innerHTML =
+        modeBarHtml +
         '<div class="radar-summary-bar">' +
           '<div class="radar-stat-item"><span class="radar-stat-label">' + (isEn ? 'Today Movements' : 'إجمالي حركات اليوم') + '</span><strong class="tabular-nums">' + summary.totalCount + '</strong></div>' +
           '<span class="radar-stat-sep" aria-hidden="true">·</span>' +
@@ -1299,6 +2225,8 @@
           '</div>' +
         '</div>' +
         rowsHtml;
+
+      bindTodayModeSwitch();
 
       todayWrap.querySelectorAll('[data-today-filter]').forEach(function (fBtn) {
         fBtn.addEventListener('click', function () {
@@ -1373,9 +2301,8 @@
       todayWrap.querySelectorAll('.today-open-res').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-id');
-          openReservationDrawer(rid, ctx, employees, function () {
-            refreshTableRegion();
-            refreshRadarData(false);
+          openReservationDrawer(rid, ctx, employees, function (updatedRes) {
+            syncLocalReservationSnapshot(updatedRes);
           });
         });
       });
@@ -1394,25 +2321,28 @@
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('claimReservation', { reservationId: rid }, currentUser);
             }
-            paintTodayView();
+            syncLocalReservationSnapshot(target);
             ctx.toast(isEn ? 'Reservation claimed successfully.' : 'تم استلام الحجز في قائمتك بنجاح.');
-            return root.RGApi.callApi('claimReservation', { reservationId: rid, _keepOptimisticCache: true }).then(function (resp) {
+            return root.RGApi.callApi('claimReservation', {
+              reservationId: rid,
+              _keepOptimisticCache: true,
+              _spamChecked: true
+            }).then(function (resp) {
               if (resp && resp.success) {
                 ctx.refreshNotifications();
-                refreshTableRegion({ silentRefresh: true });
               } else {
                 target.assignedEmployeeIds = prevAssignedIds;
                 target.assignedEmployeeNames = prevAssignedNames;
-                paintTodayView();
+                syncLocalReservationSnapshot(target);
                 ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true);
               }
             }).catch(function () {
               target.assignedEmployeeIds = prevAssignedIds;
               target.assignedEmployeeNames = prevAssignedNames;
-              paintTodayView();
+              syncLocalReservationSnapshot(target);
               ctx.toast('تعذر الاتصال بالخادم أثناء استلام الحجز.', true);
             });
-          });
+          }, { spamAction: 'claimReservation', spamSig: rid });
         });
       });
     }
@@ -1504,7 +2434,10 @@
     }
 
     function setViewMode(nextMode) {
-      state.viewMode = nextMode === 'radar' ? 'radar' : (nextMode === 'today' ? 'today' : 'all');
+      var targetMode = nextMode === 'radar' ? 'radar' : (nextMode === 'today' ? 'today' : 'all');
+      if (targetMode === 'today' && !canViewTodayTab) targetMode = 'all';
+      if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'all';
+      state.viewMode = targetMode;
       var allViewEl = document.getElementById('res-all-view');
       var todayViewEl = document.getElementById('res-today-view');
       var radarViewEl = document.getElementById('res-radar-view');
@@ -1520,6 +2453,9 @@
         if (radarRawReservations === null) refreshRadarData(false);
         else paintRadarView();
       } else if (state.viewMode === 'today') {
+        if (state.todayDisplayMode === 'calendar' && calendarRawItems === null) {
+          ensureTodayCalendarLoaded({ forceRefresh: false });
+        }
         if (radarRawReservations === null) refreshRadarData(false);
         else paintTodayView();
       }
@@ -1536,12 +2472,18 @@
       state.priority || state.dateFrom || state.dateTo || state.timeFrom || state.timeTo ||
       state.unfollowedOnly || state.hasProblemsOnly || state.overdueUnpaidOnly
     );
-    if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
-      radarRawReservations = currentItems.slice();
-      paintRadarView();
-      paintTodayView();
-    } else {
-      refreshRadarData(false);
+    if (canViewTodayTab || canViewRadarTab) {
+      if (!hasActiveResFilters && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+        radarRawReservations = currentItems.slice();
+        calendarRawItems = currentItems.slice();
+        paintRadarView();
+        paintTodayView();
+      } else {
+        refreshRadarData(false);
+        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+          ensureTodayCalendarLoaded({ forceRefresh: false });
+        }
+      }
     }
 
     if (!container._rgResDeltaBound) {
@@ -1565,8 +2507,28 @@
         if (editingControl) return;
         refreshTableRegion({ silentRefresh: true, forceRefresh: true }).catch(function () {});
         refreshRadarData(false, { forceRefresh: true }).catch(function () {});
+        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
+          ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true }).catch(function () {});
+        } else {
+          calendarRawItems = null;
+        }
       };
       document.addEventListener('rg:deltasync', onResDeltaSync);
+    }
+
+    if (!container._rgResPrefsBound) {
+      container._rgResPrefsBound = true;
+      var onResPersonalPrefs = function () {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:personalprefschange', onResPersonalPrefs);
+          return;
+        }
+        paintCurrentItems();
+        if (state.viewMode === 'today') {
+          paintTodayView();
+        }
+      };
+      document.addEventListener('rg:personalprefschange', onResPersonalPrefs);
     }
   }
 
@@ -1616,18 +2578,67 @@
     }
 
     var user = root.RGAuth.getUser();
+    var canDrawerAct = function (actKey) {
+      return !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, actKey);
+    };
     var canAssign = root.RGCrmCore.canUserPerform(user, 'assign_employees');
     var canEditReservation = root.RGCrmCore.canUserPerform(user, 'edit_reservation_details');
     var canEditAnyFollowUp = root.RGCrmCore.canUserPerform(user, 'edit_any_followup');
     var canEditTicket = root.RGCrmCore.canUserPerform(user, 'edit_ticket_details');
+    var canExportPdfBtn = canDrawerAct('act_export_pdf');
+    var canReportProblemBtn = canDrawerAct('act_report_problem');
+    var canClaimDrawerBtn = canDrawerAct('act_claim_reservation');
+    var canCloseTicketDrawerBtn = canDrawerAct('act_close_delete_ticket');
 
-    function reopenSelf() {
-      openReservationDrawer(d.reservation.id, ctx, resolvedEmployees, onUpdated, opts);
-      if (onUpdated) onUpdated();
+    function notifyParentUpdated(updatedObj) {
+      if (updatedObj && typeof updatedObj === 'object' && updatedObj.id && d && d.reservation) {
+        d.reservation = Object.assign({}, d.reservation, updatedObj);
+      }
+      if (onUpdated) onUpdated((updatedObj && typeof updatedObj === 'object' && updatedObj.id) ? updatedObj : (d && d.reservation ? d.reservation : null));
     }
 
-    function notifyParentUpdated() {
-      if (onUpdated) onUpdated();
+    function reopenSelf(updatedObj) {
+      if (updatedObj === null) {
+        var openBd = document.getElementById('res-drawer-backdrop');
+        if (openBd && openBd.getAttribute('data-res-id') === String(d.reservation.id)) {
+          root.RGApi.callApi('getReservationDetails', { reservationId: d.reservation.id, forceRefresh: true }).then(function (fresh) {
+            if (fresh && fresh.success && fresh.data && fresh.data.reservation) {
+              d = fresh.data;
+              paintDrawer();
+              notifyParentUpdated(d.reservation);
+            }
+          }).catch(function () {});
+        } else {
+          notifyParentUpdated(null);
+        }
+        return;
+      }
+      if (updatedObj && typeof updatedObj === 'object') {
+        var resPatch = (updatedObj.reservation && typeof updatedObj.reservation === 'object' && updatedObj.reservation.id)
+          ? updatedObj.reservation
+          : (updatedObj.id ? updatedObj : null);
+        if (resPatch && d && d.reservation) {
+          d.reservation = Object.assign({}, d.reservation, resPatch);
+        }
+        if (updatedObj.followUp && updatedObj.followUp.id && Array.isArray(d.followUps)) {
+          var matchedFu = false;
+          d.followUps = d.followUps.map(function (f) {
+            if (f && f.id === updatedObj.followUp.id) {
+              matchedFu = true;
+              return Object.assign({}, f, updatedObj.followUp);
+            }
+            return f;
+          });
+          if (!matchedFu) {
+            d.followUps = [updatedObj.followUp].concat(d.followUps);
+          }
+        }
+      }
+      notifyParentUpdated(d && d.reservation ? d.reservation : null);
+      if (typeof startDrawerLifecycle === 'function') {
+        startDrawerLifecycle();
+      }
+      paintDrawer();
     }
 
     function buildStatusStagesHtml(r) {
@@ -1724,13 +2735,13 @@
           '<div class="ext-compare-grid">' +
             '<div class="ext-compare-col is-original">' +
               '<span class="ext-compare-col-label">' + (isEn ? 'Original Contract (Before Extension)' : 'العقد الأصلي (قبل التمديد)') + '</span>' +
-              '<div class="ext-compare-row"><span>' + (isEn ? 'Original Return Date' : 'تاريخ الإرجاع الأصلي') + '</span><strong class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(origEndDate)) + (origEndTime ? ' · ' + esc(formatTimeOnly(origEndTime, ctx.lang)) : '') + '</strong></div>' +
+              '<div class="ext-compare-row"><span>' + (isEn ? 'Original Return Date' : 'تاريخ الإرجاع الأصلي') + '</span><strong>' + renderBookingTimezoneHtml(origEndDate, origEndTime, { compact: false }) + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Base Days' : 'الأيام الأساسية') + '</span><strong class="tabular-nums">' + baseDays + ' ' + dayUnit + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Base Amount' : 'قيمة العقد الأساسي') + '</span><strong class="mono tabular-nums">' + baseAmt + ' ' + curLabel + '</strong></div>' +
             '</div>' +
             '<div class="ext-compare-col is-extended">' +
               '<span class="ext-compare-col-label">' + (hasExtended ? (isEn ? 'After Extension & Modification' : 'بعد التمديد والتعديل') : (isEn ? 'Current Contract Status' : 'الوضع الحالي للعقد')) + '</span>' +
-              '<div class="ext-compare-row"><span>' + (isEn ? 'Extended Return Date' : 'تاريخ الإرجاع الممدد') + '</span><strong class="mono tabular-nums" dir="ltr">' + (hasExtended && extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(formatTimeOnly(extUntilTime, ctx.lang)) : '')) : (isEn ? 'Not extended' : 'لم يُمدد')) + '</strong></div>' +
+              '<div class="ext-compare-row"><span>' + (isEn ? 'Extended Return Date' : 'تاريخ الإرجاع الممدد') + '</span><strong>' + (hasExtended && extUntilDate ? renderBookingTimezoneHtml(extUntilDate, extUntilTime, { compact: false }) : (isEn ? 'Not extended' : 'لم يُمدد')) + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Total Duration' : 'إجمالي المدة') + '</span><strong class="tabular-nums">' + totalDaysComp + ' ' + dayUnit + (extDays > 0 ? ' <span class="ext-delta-inline">(+' + extDays + ')</span>' : '') + '</strong></div>' +
               '<div class="ext-compare-row"><span>' + (isEn ? 'Final Total' : 'الإجمالي النهائي') + '</span><strong class="mono tabular-nums">' + totalAmt + ' ' + curLabel + (extAmount > 0 ? ' <span class="ext-delta-inline">(+' + extAmount + ' ' + curLabel + ')</span>' : '') + '</strong></div>' +
             '</div>' +
@@ -1747,7 +2758,7 @@
           '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extensions Count' : 'كم مرة ممدد') + '</span><span class="detail-v tabular-nums">' + extCount + ' ' + (isEn ? (extCount === 1 ? 'time' : 'times') : (extCount === 1 ? 'مرة' : 'مرات')) + '</span></div>' +
           '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Days' : 'إجمالي أيام التمديد') + '</span><span class="detail-v tabular-nums">' + extDays + ' ' + dayUnit + '</span></div>' +
           '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extensions Amount' : 'إجمالي سعر التمديد') + '</span><span class="detail-v mono tabular-nums">' + extAmount + ' ' + curLabel + '</span></div>' +
-          '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Until' : 'التمديد لحد') + '</span><span class="detail-v mono tabular-nums" dir="ltr">' + (extUntilDate ? (esc(formatDateOnly(extUntilDate)) + (extUntilTime ? ' · ' + esc(formatTimeOnly(extUntilTime, ctx.lang)) : '')) : (isEn ? 'None' : 'لا يوجد تمديد')) + '</span></div>' +
+          '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Until' : 'التمديد لحد') + '</span><span class="detail-v">' + (extUntilDate ? renderBookingTimezoneHtml(extUntilDate, extUntilTime, { compact: false }) : (isEn ? 'None' : 'لا يوجد تمديد')) + '</span></div>' +
         '</div>' +
         (items.length === 0
           ? '<div style="margin-top:10px;font-size:13px;color:var(--text-muted);">' + (isEn ? 'No extensions recorded for this reservation yet.' : 'لا توجد تمديدات مسجلة لهذا الحجز حتى الآن.') + '</div>'
@@ -1773,7 +2784,7 @@
                     '<strong class="mono tabular-nums" style="color:var(--brand-primary);font-size:14px;">' + Number(ex.amount || 0) + ' ' + curLabel + '</strong>' +
                   '</div>' +
                   '<div class="meta-inline">' +
-                    '<span class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(ex.startDate)) + (ex.startTime ? ' ' + esc(formatTimeOnly(ex.startTime, ctx.lang)) : '') + ' ← ' + esc(formatDateOnly(ex.endDate)) + (ex.endTime ? ' ' + esc(formatTimeOnly(ex.endTime, ctx.lang)) : '') + '</span>' +
+                    renderBookingTimezoneHtml(ex.startDate, ex.startTime, { compact: true }) + ' <span>←</span> ' + renderBookingTimezoneHtml(ex.endDate, ex.endTime, { compact: true }) +
                     '<span>·</span>' +
                     '<span class="tabular-nums"><strong>' + Number(ex.extendDays || 0) + '</strong> ' + dayUnit + '</span>' +
                     (vatNote ? '<span>·</span><span class="tabular-nums">' + esc(vatNote) + '</span>' : '') +
@@ -1796,6 +2807,9 @@
     function cleanupDrawerLifecycle() {
       if (drawerCleanedUp) return;
       drawerCleanedUp = true;
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      }
       if (lockHeartbeatTimer) {
         clearInterval(lockHeartbeatTimer);
         lockHeartbeatTimer = null;
@@ -1805,9 +2819,36 @@
         modalObserver = null;
       }
       document.removeEventListener('rg:deltasync', onDeltaSyncDrawer);
+      document.removeEventListener('rg:personalprefschange', onPersonalPrefsDrawer);
+      if (root.Chart && typeof root.Chart.getChart === 'function') {
+        ['res-drawer-chart-finance', 'res-drawer-chart-activity'].forEach(function (cid) {
+          var el = document.getElementById(cid);
+          var existing = el ? root.Chart.getChart(el) : null;
+          if (existing) {
+            try { existing.destroy(); } catch (_e) {}
+          }
+        });
+      }
       if (root.RGApi && root.RGApi.callApi && d && d.reservation && d.reservation.id) {
         root.RGApi.callApi('releaseReservationLock', { reservationId: d.reservation.id, silentRefresh: true }).catch(function () {});
       }
+    }
+
+    function requestDrawerExit(proceedFn) {
+      if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+        root.RGApp.requestCloseWithGuard(proceedFn);
+      } else if (typeof proceedFn === 'function') {
+        proceedFn();
+      }
+    }
+
+    function onPersonalPrefsDrawer() {
+      if (drawerCleanedUp) return;
+      var curBackdrop = document.getElementById('res-drawer-backdrop');
+      if (!curBackdrop || curBackdrop.getAttribute('data-res-id') !== String(d.reservation.id)) return;
+      var activeEl = document.activeElement;
+      var isTyping = activeEl && modalRoot.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/i.test(activeEl.tagName);
+      if (!isTyping) paintDrawer();
     }
 
     function onDeltaSyncDrawer(ev) {
@@ -1874,8 +2915,8 @@
       var extUntilD = r.extendedUntilDate || (hasExtended ? r.endDate : '');
       var extUntilT = r.extendedUntilTime || (hasExtended ? r.endTime : '');
 
-      var telHref = core.formatDirectCallTelHref ? core.formatDirectCallTelHref(r.customerPhone, '90') : '';
-      var telDisp = core.formatDirectCallDisplayNumber ? core.formatDirectCallDisplayNumber(r.customerPhone, '90') : '';
+      var telHref = core.formatDirectCallTelHref ? core.formatDirectCallTelHref(r.customerPhone, '9') : '';
+      var telDisp = core.formatDirectCallDisplayNumber ? core.formatDirectCallDisplayNumber(r.customerPhone, '9') : '';
       var sharedInfo = core.computeSharedAssignmentInfo
         ? core.computeSharedAssignmentInfo(assignedIds, assignedNames, user.id, ctx.lang)
         : null;
@@ -1906,12 +2947,12 @@
               '<div class="toolbar-row" style="margin-bottom:0;">' +
                 (opts && opts.onBack ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-back-btn">' + esc(opts.backLabel || (isEn ? 'Back' : 'العودة لملف الموظف')) + '</button>' : '') +
                 '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-copy-summary-btn">' + (isEn ? 'Copy Summary' : 'نسخ ملخص الحجز') + '</button>' +
-                (telHref ? '<a class="btn btn-sm rg-tel-btn" id="drawer-direct-call-link" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || r.id) + '" data-call-customer="' + esc(r.customerName || '-') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '" title="' + esc(telDisp) + '">' + (isEn ? 'Call 90' : 'اتصال 90') + '</a>' : '') +
+                (telHref ? '<a class="btn btn-sm rg-tel-btn" id="drawer-direct-call-link" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || r.id) + '" data-call-customer="' + esc(r.customerName || '-') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '" title="' + esc(telDisp) + '">' + (isEn ? 'Call 9' : 'اتصال 9') + '</a>' : '') +
                 (canPinNote ? '<button type="button" class="btn btn-sm btn-warning" id="drawer-header-pin-note-btn">📌 ' + (isEn ? 'Supervisor Pinned Note' : 'ملاحظة مشرف/مدير مثبتة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-ics-btn" title="' + (isEn ? 'Add pickup & return to Google Calendar (.ics)' : 'إضافة موعد الاستلام والتسليم للتقويم (.ics)') + '">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
                 (canEditReservation ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-edit-res-btn">' + (isEn ? 'Edit Booking' : 'تعديل تفاصيل الحجز') + '</button>' : '') +
-                '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' +
-                '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">' + (isEn ? 'Report Problem' : 'تحويل إلى مشكلة') + '</button>' +
+                (canExportPdfBtn ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '') +
+                (canReportProblemBtn ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">' + (isEn ? 'Report Problem' : 'تحويل إلى مشكلة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-close-btn">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
               '</div>' +
             '</div>' +
@@ -1962,12 +3003,14 @@
                   '<span style="font-size:12.5px;color:var(--text-secondary);">المستلمون حاليًا: <strong class="tabular-nums">' + assignedIds.length + '</strong></span>' +
                 '</div>' +
                 '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-                  '<button type="button" class="btn btn-sm rg-no-answer-btn" id="drawer-no-answer-btn">' +
+                  '<button type="button" class="btn btn-sm rg-no-answer-btn" id="drawer-no-answer-btn"' + ((root.RGApp && root.RGApp.isActionLocked && root.RGApp.isActionLocked('recordNoAnswer:' + r.id)) ? ' disabled aria-busy="true"' : '') + '>' +
                     (isEn ? 'No Answer' : 'لم يرد') + ' <span class="rg-attempt-badge tabular-nums" id="drawer-no-answer-count">' + noAnswerCount + '</span>' +
                   '</button>' +
-                  (isClaimedByMe
-                    ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-unclaim-btn">إلغاء الاستلام من عندي</button>'
-                    : '<button type="button" class="btn btn-sm btn-primary" id="drawer-claim-btn">استلام الحجز عندي</button>') +
+                  (canClaimDrawerBtn
+                    ? (isClaimedByMe
+                      ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-unclaim-btn"' + ((root.RGApp && root.RGApp.isActionLocked && (root.RGApp.isActionLocked('claimReservation:' + r.id) || root.RGApp.isActionLocked('unclaimReservation:' + r.id))) ? ' disabled aria-busy="true"' : '') + '>إلغاء الاستلام من عندي</button>'
+                      : '<button type="button" class="btn btn-sm btn-primary" id="drawer-claim-btn"' + ((root.RGApp && root.RGApp.isActionLocked && (root.RGApp.isActionLocked('claimReservation:' + r.id) || root.RGApp.isActionLocked('unclaimReservation:' + r.id))) ? ' disabled aria-busy="true"' : '') + '>استلام الحجز عندي</button>')
+                    : '') +
                 '</div>' +
               '</div>' +
               '<div class="quick-status-bar grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)_auto] gap-2 items-center">' +
@@ -1986,13 +3029,14 @@
                 (r.deliverBranchName && r.deliverBranchName !== r.branchName ? ' (التسليم: ' + esc(r.deliverBranchName) + ')' : '') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">السيارة والفئة واللوحة</span><span class="detail-v">' + esc(r.carName) +
                 (r.carCategory ? '<span class="rg-ui-field-car-meta"> · ' + esc(r.carCategory) + '</span>' : '') + ' (' + esc(r.plateNumber || '-') + ')</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">بداية الحجز</span><span class="detail-v mono tabular-nums" dir="ltr">' + esc(formatDateOnly(r.startDate)) +
-                (r.startTime ? ' · ' + esc(formatTimeOnly(r.startTime, ctx.lang)) : '') + '</span>' +
-                (r.sourceCreatedAt ? '<span class="time-sub">أُنشئ بالمنصة: <span class="mono" dir="ltr">' + esc(formatTimestamp(r.sourceCreatedAt, ctx.lang)) + '</span></span>' : '') + '</div>' +
-              '<div class="detail-kv"><span class="detail-k">نهاية الحجز الأصلية</span><span class="detail-v mono tabular-nums" dir="ltr">' + esc(formatDateOnly(origEndD)) +
-                (origEndT ? ' · ' + esc(formatTimeOnly(origEndT, ctx.lang)) : '') + ' (' + Number(r.daysCount || 1) + ' يوم أساسي)</span></div>' +
-              '<div class="detail-kv"><span class="detail-k">التمديد لحد (الإرجاع الفعلي)</span><span class="detail-v mono tabular-nums" dir="ltr">' +
-                (extUntilD ? (esc(formatDateOnly(extUntilD)) + (extUntilT ? ' · ' + esc(formatTimeOnly(extUntilT, ctx.lang)) : '')) : 'لا يوجد تمديد') + '</span></div>' +
+              '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Booking Start' : 'بداية الحجز') + '</span><span class="detail-v">' +
+                renderBookingTimezoneHtml(r.startDate, r.startTime, { compact: false }) + '</span>' +
+                (r.sourceCreatedAt ? '<span class="time-sub">' + (isEn ? 'Created at platform: ' : 'أُنشئ بالمنصة: ') + '<span class="mono" dir="ltr">' + esc(formatTimestamp(r.sourceCreatedAt, ctx.lang)) + '</span></span>' : '') + '</div>' +
+              '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Original End' : 'نهاية الحجز الأصلية') + '</span><span class="detail-v">' +
+                renderBookingTimezoneHtml(origEndD, origEndT, { compact: false }) +
+                '<span class="time-sub">(' + Number(r.daysCount || 1) + ' ' + (isEn ? 'base days' : 'يوم أساسي') + ')</span></span></div>' +
+              '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Extended Until (Actual Return)' : 'التمديد لحد (الإرجاع الفعلي)') + '</span><span class="detail-v">' +
+                (extUntilD ? renderBookingTimezoneHtml(extUntilD, extUntilT, { compact: false }) : (isEn ? 'No extension' : 'لا يوجد تمديد')) + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">ملخص التمديد</span><span class="detail-v tabular-nums">' +
                 (extCount > 0 ? (extCount + ' مرات · ' + extDays + ' يوم إضافي · ' + Number(r.extensionsAmount || 0) + ' ر.س') : 'غير ممدد') + '</span></div>' +
               '<div class="detail-kv rg-ui-field-car-meta"><span class="detail-k">الاستلام / التسليم</span><span class="detail-v">' + esc(r.pickupTypeAr) + ' / ' + esc(r.returnTypeAr) + '</span></div>' +
@@ -2110,7 +3154,7 @@
                       '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                         '<span class="status-tag ' + priorityClass(p.priority) + '">' + esc(p.priority) + '</span>' +
                         '<span class="status-tag ' + (prbClosed ? 'status-success' : 'status-info') + '">' + esc(p.status) + '</span>' +
-                        (!prbClosed ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb-in-drawer" data-prb-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
+                        ((!prbClosed && canCloseTicketDrawerBtn) ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb-in-drawer" data-prb-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
                         '<button type="button" class="btn btn-sm btn-primary btn-edit-prb-in-drawer" data-prb-id="' + esc(p.id) + '">' +
                           (canEditTicket ? 'تعديل التذكرة' : 'تحديث التذكرة') +
                         '</button>' +
@@ -2126,15 +3170,136 @@
         '</div>';
 
       isPaintingDrawer = false;
+      var initialPinnedNote = String(r.pinnedNote || '').trim();
+      if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+        root.RGApp.setUnsavedGuard({
+          label: (isEn ? 'Booking #' : 'الحجز رقم ') + (r.reservationNumber || r.id),
+          isDirty: function () {
+            if (drawerCleanedUp) return false;
+            var bd = document.getElementById('res-drawer-backdrop');
+            if (!bd || bd.getAttribute('data-res-id') !== String(r.id)) return false;
+            var actEl = document.getElementById('fu-action');
+            var notesEl = document.getElementById('fu-notes');
+            var qNoteEl = document.getElementById('drawer-quick-note');
+            var pinEl = document.getElementById('drawer-pinned-note-input');
+            if (actEl && String(actEl.value || '').trim().length > 0) return true;
+            if (notesEl && String(notesEl.value || '').trim().length > 0) return true;
+            if (qNoteEl && String(qNoteEl.value || '').trim().length > 0) return true;
+            if (pinEl && String(pinEl.value || '').trim() !== initialPinnedNote) return true;
+            return false;
+          },
+          onSave: async function () {
+            var actEl = document.getElementById('fu-action');
+            var notesEl = document.getElementById('fu-notes');
+            var qNoteEl = document.getElementById('drawer-quick-note');
+            var pinEl = document.getElementById('drawer-pinned-note-input');
+            var actVal = actEl ? String(actEl.value || '').trim() : '';
+            var notesVal = notesEl ? String(notesEl.value || '').trim() : '';
+            var qVal = qNoteEl ? String(qNoteEl.value || '').trim() : '';
+            var pinVal = pinEl ? String(pinEl.value || '').trim() : initialPinnedNote;
+            if (notesVal && !actVal) {
+              actVal = notesVal;
+            }
+            if (actVal) {
+              var fuStatusVal = (document.getElementById('fu-status') && document.getElementById('fu-status').value) || r.internalStatus;
+              if (root.RGApi.applyOptimisticMutation) {
+                root.RGApi.applyOptimisticMutation('addFollowUp', {
+                  reservationId: r.id,
+                  status: fuStatusVal,
+                  action: actVal,
+                  notes: notesVal
+                }, user);
+              }
+              var saveFuResp = await root.RGApi.callApi('addFollowUp', {
+                reservationId: r.id,
+                status: fuStatusVal,
+                action: actVal,
+                notes: notesVal,
+                _keepOptimisticCache: true
+              });
+              if (!saveFuResp || !saveFuResp.success) {
+                ctx.toast((saveFuResp && saveFuResp.message) || 'تعذر حفظ المتابعة.', true);
+                return false;
+              }
+              notifyParentUpdated();
+              ctx.toast('تم حفظ المتابعة بنجاح.');
+              return true;
+            }
+            if (qVal) {
+              var qsVal = (document.getElementById('drawer-quick-status') && document.getElementById('drawer-quick-status').value) || r.internalStatus;
+              if (root.RGApi.applyOptimisticMutation) {
+                root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
+                  reservationId: r.id,
+                  status: qsVal,
+                  note: qVal
+                }, user);
+              }
+              var saveQsResp = await root.RGApi.callApi('quickUpdateReservationStatus', {
+                reservationId: r.id,
+                status: qsVal,
+                note: qVal,
+                expectedUpdatedAt: r.updatedAt || r.lastUpdatedAt || '',
+                _keepOptimisticCache: true
+              });
+              if (!saveQsResp || !saveQsResp.success) {
+                ctx.toast((saveQsResp && saveQsResp.message) || 'تعذر تحديث الحالة.', true);
+                return false;
+              }
+              notifyParentUpdated();
+              ctx.toast('تم تحديث الحالة والملاحظة بنجاح.');
+              return true;
+            }
+            if (pinEl && pinVal !== initialPinnedNote) {
+              if (root.RGApi.applyOptimisticMutation) {
+                root.RGApi.applyOptimisticMutation('saveReservationPinnedNote', { reservationId: r.id, note: pinVal }, user);
+              }
+              var savePinResp = await root.RGApi.callApi('saveReservationPinnedNote', {
+                reservationId: r.id,
+                note: pinVal,
+                _keepOptimisticCache: true
+              });
+              if (!savePinResp || !savePinResp.success) {
+                ctx.toast((savePinResp && savePinResp.message) || 'تعذر حفظ الملاحظة المثبتة.', true);
+                return false;
+              }
+              notifyParentUpdated();
+              ctx.toast('تم حفظ الملاحظة المثبتة.');
+              return true;
+            }
+            return true;
+          },
+          onDiscard: function () {
+            cleanupDrawerLifecycle();
+            modalRoot.innerHTML = '';
+          }
+        });
+      }
+
+      var drawerBackdropEl = document.getElementById('res-drawer-backdrop');
+      if (drawerBackdropEl) {
+        drawerBackdropEl.addEventListener('click', function (ev) {
+          if (ev.target === drawerBackdropEl) {
+            requestDrawerExit(function () {
+              cleanupDrawerLifecycle();
+              modalRoot.innerHTML = '';
+            });
+          }
+        });
+      }
+
       document.getElementById('drawer-close-btn').addEventListener('click', function () {
-        cleanupDrawerLifecycle();
-        modalRoot.innerHTML = '';
+        requestDrawerExit(function () {
+          cleanupDrawerLifecycle();
+          modalRoot.innerHTML = '';
+        });
       });
       var backBtn = document.getElementById('drawer-back-btn');
       if (backBtn && opts && opts.onBack) {
         backBtn.addEventListener('click', function () {
-          cleanupDrawerLifecycle();
-          opts.onBack();
+          requestDrawerExit(function () {
+            cleanupDrawerLifecycle();
+            opts.onBack();
+          });
         });
       }
       var pinHdrBtn = document.getElementById('drawer-header-pin-note-btn');
@@ -2190,13 +3355,19 @@
             paintDrawer();
             notifyParentUpdated();
             ctx.toast('تم استلام الحجز في قائمتك بنجاح.');
-            return root.RGApi.callApi('claimReservation', { reservationId: r.id, _keepOptimisticCache: true }).then(function (resp) {
+            return root.RGApi.callApi('claimReservation', { reservationId: r.id, _keepOptimisticCache: true, _spamChecked: true }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر استلام الحجز.', true); reopenSelf(null); }
             }).catch(function () {
               ctx.toast('تعذر الاتصال بالخادم.', true);
-              reopenSelf();
+              reopenSelf(null);
             });
+          }, { spamAction: 'claimReservation', spamSig: r.id }).finally(function () {
+            var b = document.getElementById('drawer-claim-btn') || document.getElementById('drawer-unclaim-btn');
+            if (b && (!root.RGApp || !root.RGApp.isActionLocked || (!root.RGApp.isActionLocked('claimReservation:' + r.id) && !root.RGApp.isActionLocked('unclaimReservation:' + r.id)))) {
+              b.disabled = false;
+              b.removeAttribute('aria-busy');
+            }
           });
         });
       }
@@ -2216,13 +3387,19 @@
             paintDrawer();
             notifyParentUpdated();
             ctx.toast('تم إلغاء استلام الحجز من حسابك.');
-            return root.RGApi.callApi('unclaimReservation', { reservationId: r.id, _keepOptimisticCache: true }).then(function (resp) {
+            return root.RGApi.callApi('unclaimReservation', { reservationId: r.id, _keepOptimisticCache: true, _spamChecked: true }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر إلغاء الاستلام.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر إلغاء الاستلام.', true); reopenSelf(null); }
             }).catch(function () {
               ctx.toast('تعذر الاتصال بالخادم.', true);
-              reopenSelf();
+              reopenSelf(null);
             });
+          }, { spamAction: 'unclaimReservation', spamSig: r.id }).finally(function () {
+            var b = document.getElementById('drawer-claim-btn') || document.getElementById('drawer-unclaim-btn');
+            if (b && (!root.RGApp || !root.RGApp.isActionLocked || (!root.RGApp.isActionLocked('claimReservation:' + r.id) && !root.RGApp.isActionLocked('unclaimReservation:' + r.id)))) {
+              b.disabled = false;
+              b.removeAttribute('aria-busy');
+            }
           });
         });
       }
@@ -2287,15 +3464,16 @@
               status: nextStatus,
               note: quickNote,
               expectedUpdatedAt: expectedUpdatedAt,
-              _keepOptimisticCache: true
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر تحديث الحالة.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر تحديث الحالة.', true); reopenSelf(null); }
             }).catch(function () {
               ctx.toast('تعذر الاتصال بالخادم.', true);
-              reopenSelf();
+              reopenSelf(null);
             });
-          });
+          }, { spamAction: 'quickUpdateReservationStatus', spamSig: r.id + ':' + nextStatus + ':' + quickNote });
         });
       }
 
@@ -2323,41 +3501,72 @@
               assignedEmployeeIds: nextIds,
               assignedEmployeeNames: nextNames
             });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('removeAssignment', {
+                reservationId: r.id,
+                employeeId: empId
+              }, user);
+            }
             paintDrawer();
             notifyParentUpdated();
             ctx.toast('تمت إزالة ' + empName + ' من الحجز.');
             return root.RGApi.callApi('removeAssignment', {
               reservationId: r.id,
-              employeeId: empId
+              employeeId: empId,
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر إزالة الموظف.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر إزالة الموظف.', true); reopenSelf(null); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم.', true);
+              reopenSelf(null);
             });
-          });
+          }, { spamAction: 'removeAssignment', spamSig: r.id + ':' + empId });
         });
       });
 
       var saveAssignBtn = document.getElementById('drawer-save-assign');
       if (saveAssignBtn) {
         saveAssignBtn.addEventListener('click', function () {
-          var ids = Array.from(modalRoot.querySelectorAll('.drawer-assign-chk:checked')).map(function (c) { return c.value; });
+          var checkedIds = Array.from(modalRoot.querySelectorAll('.drawer-assign-chk:checked')).map(function (c) { return c.value; });
+          var baseIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds.slice() : [];
+          var ids = baseIds.slice();
+          checkedIds.forEach(function (eid) {
+            if (ids.indexOf(eid) === -1) ids.push(eid);
+          });
           runWithLock(saveAssignBtn, 'assignEmployees:' + r.id, function () {
             var names = ids.map(function (eid) {
+              var idxOld = baseIds.indexOf(eid);
               var emp = resolvedEmployees.find(function (e) { return e.id === eid; });
-              return emp ? emp.name : eid;
+              return (emp && emp.name) || (idxOld !== -1 && assignedNames[idxOld]) || eid;
             });
             d.reservation = Object.assign({}, r, {
               assignedEmployeeIds: ids,
               assignedEmployeeNames: names
             });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('assignEmployees', {
+                reservationId: r.id,
+                employeeIds: ids
+              }, user);
+            }
             paintDrawer();
             notifyParentUpdated();
             ctx.toast('تم تحديث الموظفين المسؤولين عن الحجز.');
-            return root.RGApi.callApi('assignEmployees', { reservationId: r.id, employeeIds: ids }).then(function (resp) {
+            return root.RGApi.callApi('assignEmployees', {
+              reservationId: r.id,
+              employeeIds: ids,
+              _keepOptimisticCache: true,
+              _spamChecked: true
+            }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر حفظ الإسناد.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر حفظ الإسناد.', true); reopenSelf(null); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم.', true);
+              reopenSelf(null);
             });
-          });
+          }, { spamAction: 'assignEmployees', spamSig: r.id + ':' + ids.slice().sort().join(',') });
         });
       }
 
@@ -2428,15 +3637,16 @@
             status: fuStatus,
             action: fuAction,
             notes: fuNotes,
-            _keepOptimisticCache: true
+            _keepOptimisticCache: true,
+            _spamChecked: true
           }).then(function (resp) {
             if (resp && resp.success) ctx.refreshNotifications();
-            else { ctx.toast((resp && resp.message) || 'تعذر حفظ المتابعة.', true); reopenSelf(); }
+            else { ctx.toast((resp && resp.message) || 'تعذر حفظ المتابعة.', true); reopenSelf(null); }
           }).catch(function () {
             ctx.toast('تعذر الاتصال بالخادم أثناء حفظ المتابعة.', true);
-            reopenSelf();
+            reopenSelf(null);
           });
-        });
+        }, { spamAction: 'addFollowUp', spamSig: r.id + ':' + fuStatus + ':' + fuAction + ':' + fuNotes });
       });
 
       modalRoot.querySelectorAll('.btn-edit-fu').forEach(function (btn) {
@@ -2474,11 +3684,14 @@
             paintDrawer();
             notifyParentUpdated();
             ctx.toast('تم إغلاق المشكلة ' + prb.problemNumber + ' بنجاح.');
-            return root.RGApi.callApi('updateProblem', Object.assign({ _keepOptimisticCache: true }, closePayload)).then(function (resp) {
+            return root.RGApi.callApi('updateProblem', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, closePayload)).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر إغلاق المشكلة.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر إغلاق المشكلة.', true); reopenSelf(null); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم أثناء إغلاق المشكلة.', true);
+              reopenSelf(null);
             });
-          });
+          }, { spamAction: 'updateProblem', spamSig: prbId + ':مغلقة' });
         });
       });
 
@@ -2490,7 +3703,7 @@
             var enriched = Object.assign({}, prb, {
               updates: (d.problemUpdates || []).filter(function (u) { return u.problemId === prb.id; })
             });
-            root.RGProblems.openProblemUpdateModal(enriched, resolvedEmployees, ctx, notifyParentUpdated, reopenSelf);
+            root.RGProblems.openProblemUpdateModal(enriched, resolvedEmployees, ctx, function () { reopenSelf(); }, reopenSelf);
           }
         });
       });
@@ -2499,7 +3712,7 @@
       if (copySummaryBtn) {
         copySummaryBtn.addEventListener('click', function () {
           var summaryText = core.formatBookingSummaryText
-            ? core.formatBookingSummaryText(r, ctx.lang, { timeFormat: activeTimeFormat() })
+            ? core.formatBookingSummaryText(r, ctx.lang, { timeFormat: activeTimeFormat(), timezoneMode: activeTimezoneMode() })
             : (r.reservationNumber + ' — ' + r.customerName + ' — ' + r.carName);
           copyTextToClipboard(summaryText).then(function () {
             ctx.toast(isEn ? 'Full booking summary copied.' : 'تم نسخ ملخص الحجز الكامل بنجاح.');
@@ -2547,14 +3760,21 @@
             ctx.toast('تم تسجيل محاولة اتصال — لم يرد (المحاولة #' + nextCount + ')');
             return root.RGApi.callApi('recordNoAnswerFollowUp', {
               reservationId: r.id,
-              _keepOptimisticCache: true
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر تسجيل محاولة الاتصال.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر تسجيل محاولة الاتصال.', true); reopenSelf(null); }
             }).catch(function () {
               ctx.toast('تعذر الاتصال بالخادم.', true);
-              reopenSelf();
+              reopenSelf(null);
             });
+          }, { spamAction: 'recordNoAnswerFollowUp', spamSig: r.id }).finally(function () {
+            var b = document.getElementById('drawer-no-answer-btn');
+            if (b && (!root.RGApp || !root.RGApp.isActionLocked || !root.RGApp.isActionLocked('recordNoAnswer:' + r.id))) {
+              b.disabled = false;
+              b.removeAttribute('aria-busy');
+            }
           });
         });
       }
@@ -2580,15 +3800,16 @@
             return root.RGApi.callApi('saveReservationPinnedNote', {
               reservationId: r.id,
               note: clean,
-              _keepOptimisticCache: true
+              _keepOptimisticCache: true,
+              _spamChecked: true
             }).then(function (resp) {
               if (resp && resp.success) ctx.refreshNotifications();
-              else { ctx.toast((resp && resp.message) || 'تعذر حفظ الملاحظة المثبتة.', true); reopenSelf(); }
+              else { ctx.toast((resp && resp.message) || 'تعذر حفظ الملاحظة المثبتة.', true); reopenSelf(null); }
             }).catch(function () {
               ctx.toast('تعذر الاتصال بالخادم.', true);
-              reopenSelf();
+              reopenSelf(null);
             });
-          });
+          }, { spamAction: 'saveReservationPinnedNote', spamSig: r.id + ':' + clean });
         };
         if (pinnedForm) {
           pinnedForm.addEventListener('submit', function (ev) {
@@ -2614,31 +3835,72 @@
         root.RGCrmMentions.attach(document.getElementById('fu-notes'), getPool);
       }
 
-      document.getElementById('drawer-problem-btn').addEventListener('click', function () {
-        openCreateProblemModal(r, resolvedEmployees, ctx, notifyParentUpdated, reopenSelf);
-      });
+      var drawerPrbBtn = document.getElementById('drawer-problem-btn');
+      if (drawerPrbBtn) {
+        drawerPrbBtn.addEventListener('click', function () {
+          requestDrawerExit(function () {
+            cleanupDrawerLifecycle();
+            openCreateProblemModal(r, resolvedEmployees, ctx, function (optPrb) {
+              if (optPrb) {
+                notifyParentUpdated(Object.assign({}, r, { hasProblem: true }));
+              } else {
+                reopenSelf();
+              }
+            }, reopenSelf);
+          });
+        });
+      }
 
       var drawerCharts = renderDrawerCharts(d);
 
-      document.getElementById('drawer-pdf-btn').addEventListener('click', function () {
-        cleanupDrawerLifecycle();
-        openSingleReservationPdfModal(d, ctx, drawerCharts, reopenSelf);
-      });
+      var drawerPdfBtn = document.getElementById('drawer-pdf-btn');
+      if (drawerPdfBtn) {
+        drawerPdfBtn.addEventListener('click', function () {
+          requestDrawerExit(function () {
+            cleanupDrawerLifecycle();
+            openSingleReservationPdfModal(d, ctx, drawerCharts, reopenSelf);
+          });
+        });
+      }
+    }
+
+    function startDrawerLifecycle() {
+      if (!drawerCleanedUp && lockHeartbeatTimer) return;
+      drawerCleanedUp = false;
+      document.removeEventListener('rg:deltasync', onDeltaSyncDrawer);
+      document.removeEventListener('rg:personalprefschange', onPersonalPrefsDrawer);
+      document.addEventListener('rg:deltasync', onDeltaSyncDrawer);
+      document.addEventListener('rg:personalprefschange', onPersonalPrefsDrawer);
+      if (typeof MutationObserver !== 'undefined') {
+        if (modalObserver) {
+          try { modalObserver.disconnect(); } catch (_e) {}
+        }
+        modalObserver = new MutationObserver(function () {
+          if (isPaintingDrawer || drawerCleanedUp) return;
+          var bd = document.getElementById('res-drawer-backdrop');
+          if (!bd || bd.getAttribute('data-res-id') !== String(d.reservation.id)) {
+            cleanupDrawerLifecycle();
+          }
+        });
+        modalObserver.observe(modalRoot, { childList: true });
+      }
+      if (root.RGApi && root.RGApi.callApi) {
+        if (lockHeartbeatTimer) clearInterval(lockHeartbeatTimer);
+        lockHeartbeatTimer = setInterval(function () {
+          if (drawerCleanedUp) return;
+          var bd = document.getElementById('res-drawer-backdrop');
+          if (!bd || bd.getAttribute('data-res-id') !== String(d.reservation.id)) {
+            cleanupDrawerLifecycle();
+            return;
+          }
+          root.RGApi.callApi('acquireReservationLock', { reservationId: d.reservation.id, silentRefresh: true }).catch(function () {});
+        }, 45000);
+      }
     }
 
     paintDrawer();
-
-    document.addEventListener('rg:deltasync', onDeltaSyncDrawer);
-    if (typeof MutationObserver !== 'undefined') {
-      modalObserver = new MutationObserver(function () {
-        if (isPaintingDrawer || drawerCleanedUp) return;
-        var bd = document.getElementById('res-drawer-backdrop');
-        if (!bd || bd.getAttribute('data-res-id') !== String(d.reservation.id)) {
-          cleanupDrawerLifecycle();
-        }
-      });
-      modalObserver.observe(modalRoot, { childList: true });
-    }
+    drawerCleanedUp = true;
+    startDrawerLifecycle();
     if (root.RGApi && root.RGApi.callApi) {
       root.RGApi.callApi('acquireReservationLock', { reservationId: d.reservation.id, silentRefresh: true }).then(function (lockRes) {
         if (drawerCleanedUp) return;
@@ -2650,15 +3912,6 @@
           }
         }
       }).catch(function () {});
-      lockHeartbeatTimer = setInterval(function () {
-        if (drawerCleanedUp) return;
-        var bd = document.getElementById('res-drawer-backdrop');
-        if (!bd || bd.getAttribute('data-res-id') !== String(d.reservation.id)) {
-          cleanupDrawerLifecycle();
-          return;
-        }
-        root.RGApi.callApi('acquireReservationLock', { reservationId: d.reservation.id, silentRefresh: true }).catch(function () {});
-      }, 45000);
     }
 
     if (!resolvedEmployees.length && root.RGApi && root.RGApi.callApi) {
@@ -2763,25 +4016,24 @@
     baseEl.addEventListener('input', syncTotal);
     extEl.addEventListener('input', syncTotal);
 
-    document.getElementById('res-edit-cancel').addEventListener('click', function () {
-      if (onCancel) onCancel();
-      else modalRoot.innerHTML = '';
-    });
+    var editResFieldIds = [
+      're-customer', 're-phone', 're-email', 're-idnum', 're-company', 're-branch', 're-deliv-branch',
+      're-car', 're-car-cat', 're-plate', 're-start', 're-start-time', 're-end', 're-ext-until',
+      're-pickup', 're-return', 're-pay-method', 're-pay-status', 're-status', 're-prio',
+      're-days', 're-ext-days', 're-ext-count', 're-base', 're-ext', 're-total', 're-last'
+    ];
+    var snapshotEditResValues = function () {
+      return editResFieldIds.map(function (fid) {
+        var el = document.getElementById(fid);
+        return el ? String(el.value || '') : '';
+      }).join('\x00');
+    };
+    var initialEditResSnapshot = snapshotEditResValues();
 
-    document.getElementById('res-edit-form').addEventListener('submit', async function (ev) {
-      ev.preventDefault();
-      if (root.RGCrmDatePicker && root.RGCrmDatePicker.validateContainerDates) {
-        var dateCheck = root.RGCrmDatePicker.validateContainerDates(ev.target);
-        if (!dateCheck.valid) {
-          var errBox = document.getElementById('res-edit-err');
-          errBox.textContent = dateCheck.message || 'يرجى تصحيح صيغة التاريخ المدخل.';
-          errBox.classList.remove('hidden');
-          return;
-        }
-      }
+    function buildEditResPayload() {
       var baseDaysVal = Math.max(1, Number(document.getElementById('re-days').value || 1));
       var extDaysVal = Math.max(0, Number(document.getElementById('re-ext-days').value || 0));
-      var res = await root.RGApi.callApi('updateReservationDetails', {
+      return {
         reservationId: reservation.id,
         expectedUpdatedAt: reservation.updatedAt || reservation.lastUpdatedAt || '',
         customerName: document.getElementById('re-customer').value,
@@ -2812,22 +4064,112 @@
         extensionsAmount: Number(extEl.value || 0),
         totalAmount: Number(totalEl.value || 0),
         lastUpdateText: document.getElementById('re-last').value
+      };
+    }
+
+    function executeEditResSave(fromGuard) {
+      var formEl = document.getElementById('res-edit-form');
+      if (root.RGCrmDatePicker && root.RGCrmDatePicker.validateContainerDates && formEl) {
+        var dateCheck = root.RGCrmDatePicker.validateContainerDates(formEl);
+        if (!dateCheck.valid) {
+          var errBox = document.getElementById('res-edit-err');
+          if (errBox) {
+            errBox.textContent = dateCheck.message || 'يرجى تصحيح صيغة التاريخ المدخل.';
+            errBox.classList.remove('hidden');
+          }
+          return Promise.resolve(false);
+        }
+      }
+      var editUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+      var payload = buildEditResPayload();
+      if (!String(payload.customerName || '').trim()) {
+        var errBoxName = document.getElementById('res-edit-err');
+        if (errBoxName) {
+          errBoxName.textContent = 'يرجى إدخال اسم العميل.';
+          errBoxName.classList.remove('hidden');
+        }
+        return Promise.resolve(false);
+      }
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      }
+      if (root.RGApi && root.RGApi.applyOptimisticMutation) {
+        root.RGApi.applyOptimisticMutation('updateReservationDetails', payload, editUser);
+      }
+      var patchedResObj = Object.assign({}, reservation, payload, {
+        updatedAt: new Date().toISOString(),
+        lastUpdatedAt: new Date().toISOString(),
+        lastUpdatedByName: (editUser && editUser.name) || reservation.lastUpdatedByName
       });
-      if (!res.success) {
-        var e = document.getElementById('res-edit-err');
-        e.textContent = (res.error === 'CONFLICT_STALE_DATA')
-          ? ((res.message || 'تم تعديل الحجز من مستخدم آخر.') + ' يرجى إغلاق النافذة وإعادة فتح الحجز لتحديث البيانات.')
-          : res.message;
-        e.classList.remove('hidden');
-        return;
-      }
-      if (root.RGApi && root.RGApi.clearCache) {
-        root.RGApi.clearCache(['dashboard', 'reports', 'employees']);
-      }
       ctx.toast('تم حفظ تعديلات تفاصيل الحجز بنجاح.');
-      ctx.refreshNotifications();
-      if (onSaved) onSaved();
-      else modalRoot.innerHTML = '';
+      if (!fromGuard) {
+        if (onSaved) onSaved(patchedResObj);
+        else modalRoot.innerHTML = '';
+      }
+      return root.RGApi.callApi('updateReservationDetails', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, payload)).then(function (res) {
+        if (res && res.success) {
+          ctx.refreshNotifications();
+          return true;
+        }
+        ctx.toast((res && res.message) || 'تعذر حفظ التعديلات على الخادم.', true);
+        if (onSaved) onSaved(null);
+        return false;
+      }).catch(function () {
+        ctx.toast('تعذر الاتصال بالخادم أثناء حفظ التعديلات.', true);
+        if (onSaved) onSaved(null);
+        return false;
+      });
+    }
+
+    if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+      root.RGApp.setUnsavedGuard({
+        label: 'تعديل تفاصيل الحجز ' + (reservation.reservationNumber || ''),
+        isDirty: function () {
+          var form = document.getElementById('res-edit-form');
+          if (!form) return false;
+          return snapshotEditResValues() !== initialEditResSnapshot;
+        },
+        onSave: function () { return executeEditResSave(true); },
+        onDiscard: function () {
+          if (onCancel) onCancel();
+          else modalRoot.innerHTML = '';
+        }
+      });
+    }
+
+    document.getElementById('res-edit-cancel').addEventListener('click', function () {
+      var proceed = function () {
+        if (onCancel) onCancel();
+        else modalRoot.innerHTML = '';
+      };
+      if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+        root.RGApp.requestCloseWithGuard(proceed);
+      } else {
+        proceed();
+      }
+    });
+
+    document.getElementById('res-edit-form').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var saveBtn = document.getElementById('res-edit-save');
+      var sigPayload = buildEditResPayload();
+      var fullSig = [
+        sigPayload.reservationId,
+        sigPayload.customerName,
+        sigPayload.customerPhone,
+        sigPayload.carName,
+        sigPayload.plateNumber,
+        sigPayload.startDate,
+        sigPayload.endDate,
+        sigPayload.extendedUntilDate,
+        sigPayload.internalStatus,
+        sigPayload.priority,
+        sigPayload.totalAmount,
+        sigPayload.lastUpdateText
+      ].join('|');
+      runWithLock(saveBtn, 'updateReservationDetails:' + reservation.id, function () {
+        return executeEditResSave(false);
+      }, { spamAction: 'updateReservationDetails', spamSig: fullSig });
     });
   }
 
@@ -2858,7 +4200,7 @@
           '<label class="checkbox-item"><input type="checkbox" id="fue-sync" checked> مزامنة الحالة وآخر تحديث مع بطاقة الحجز الرئيسية</label>' +
           '<div id="fu-edit-err" class="form-error hidden"></div>' +
           '<div class="modal-footer">' +
-            '<button type="submit" class="btn btn-primary">حفظ التعديل</button>' +
+            '<button type="submit" class="btn btn-primary" id="fu-edit-save-btn">حفظ التعديل</button>' +
           '</div>' +
         '</form>' +
       '</div>';
@@ -2868,150 +4210,243 @@
       root.RGCrmMentions.attach(document.getElementById('fue-notes'));
     }
 
+    var snapshotFuEdit = function () {
+      var st = document.getElementById('fue-status');
+      var ac = document.getElementById('fue-action');
+      var nt = document.getElementById('fue-notes');
+      var sy = document.getElementById('fue-sync');
+      return [st ? st.value : '', ac ? ac.value : '', nt ? nt.value : '', sy ? String(Boolean(sy.checked)) : ''].join('\x00');
+    };
+    var initialFuSnapshot = snapshotFuEdit();
+
+    function executeFuEditSave(fromGuard) {
+      var stVal = document.getElementById('fue-status').value;
+      var actVal = String(document.getElementById('fue-action').value || '').trim();
+      var notesVal = document.getElementById('fue-notes').value;
+      var syncVal = document.getElementById('fue-sync').checked;
+      if (!actVal) {
+        var errFu = document.getElementById('fu-edit-err');
+        if (errFu) {
+          errFu.textContent = 'يرجى كتابة الإجراء المتخذ.';
+          errFu.classList.remove('hidden');
+        }
+        return Promise.resolve(false);
+      }
+      var fuUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+      var fuPayload = {
+        followUpId: followUp.id,
+        status: stVal,
+        action: actVal,
+        notes: notesVal,
+        syncToReservation: syncVal
+      };
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      }
+      if (root.RGApi && root.RGApi.applyOptimisticMutation) {
+        root.RGApi.applyOptimisticMutation('updateFollowUp', fuPayload, fuUser);
+      }
+      var patchedFuObj = Object.assign({}, followUp, {
+        status: stVal,
+        action: actVal,
+        notes: notesVal
+      });
+      var patchedResFromFu = syncVal ? Object.assign({}, reservation, {
+        internalStatus: stVal,
+        lastUpdateText: actVal + (notesVal ? ' — ' + notesVal : ''),
+        lastUpdatedAt: new Date().toISOString(),
+        lastUpdatedByName: (fuUser && fuUser.name) || reservation.lastUpdatedByName
+      }) : undefined;
+      ctx.toast('تم تعديل سجل المتابعة بنجاح.');
+      if (!fromGuard) {
+        if (onSaved) onSaved({ followUp: patchedFuObj, reservation: patchedResFromFu });
+        else modalRoot.innerHTML = '';
+      }
+      return root.RGApi.callApi('updateFollowUp', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, fuPayload)).then(function (res) {
+        if (res && res.success) {
+          ctx.refreshNotifications();
+          return true;
+        }
+        ctx.toast((res && res.message) || 'تعذر حفظ تعديل المتابعة.', true);
+        if (onSaved) onSaved(null);
+        return false;
+      }).catch(function () {
+        ctx.toast('تعذر الاتصال بالخادم أثناء حفظ المتابعة.', true);
+        if (onSaved) onSaved(null);
+        return false;
+      });
+    }
+
+    if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+      root.RGApp.setUnsavedGuard({
+        label: 'تعديل المتابعة #' + (reservation.reservationNumber || ''),
+        isDirty: function () {
+          var form = document.getElementById('fu-edit-form');
+          if (!form) return false;
+          return snapshotFuEdit() !== initialFuSnapshot;
+        },
+        onSave: function () { return executeFuEditSave(true); },
+        onDiscard: function () {
+          if (onCancel) onCancel();
+          else modalRoot.innerHTML = '';
+        }
+      });
+    }
+
     document.getElementById('fu-edit-cancel').addEventListener('click', function () {
-      if (onCancel) onCancel();
-      else modalRoot.innerHTML = '';
+      var proceed = function () {
+        if (onCancel) onCancel();
+        else modalRoot.innerHTML = '';
+      };
+      if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+        root.RGApp.requestCloseWithGuard(proceed);
+      } else {
+        proceed();
+      }
     });
 
-    document.getElementById('fu-edit-form').addEventListener('submit', async function (ev) {
+    document.getElementById('fu-edit-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
-      var res = await root.RGApi.callApi('updateFollowUp', {
-        followUpId: followUp.id,
-        status: document.getElementById('fue-status').value,
-        action: document.getElementById('fue-action').value,
-        notes: document.getElementById('fue-notes').value,
-        syncToReservation: document.getElementById('fue-sync').checked
-      });
-      if (!res.success) {
-        var e = document.getElementById('fu-edit-err');
-        e.textContent = res.message;
-        e.classList.remove('hidden');
-        return;
-      }
-      ctx.toast('تم تعديل سجل المتابعة بنجاح.');
-      ctx.refreshNotifications();
-      if (onSaved) onSaved();
-      else modalRoot.innerHTML = '';
+      var saveFuBtn = document.getElementById('fu-edit-save-btn');
+      runWithLock(saveFuBtn, 'updateFollowUp:' + followUp.id, function () {
+        return executeFuEditSave(false);
+      }, { spamAction: 'updateFollowUp', spamSig: followUp.id + ':' + document.getElementById('fue-status').value + ':' + document.getElementById('fue-action').value });
     });
   }
 
   function renderDrawerCharts(details) {
-    var images = { finance: '', activity: '' };
-    if (!root.Chart) return images;
     var r = details.reservation;
-    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-    var reduced = Boolean(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches);
-    var txtColor = isDark ? '#E5E7EB' : '#292929';
-    var mutedColor = isDark ? '#9CA3AF' : '#686868';
-    var gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(41,41,41,0.08)';
-    var segBorder = isDark ? '#1E1E21' : '#FFFFFF';
-    var charcoalSeg = isDark ? '#8A8A8A' : '#292929';
-    var tooltipOpt = {
-      backgroundColor: 'rgba(41, 41, 41, 0.96)',
-      titleColor: '#FFFFFF',
-      bodyColor: '#F3F4F6',
-      borderColor: 'rgba(217, 31, 43, 0.45)',
-      borderWidth: 1,
-      cornerRadius: 11,
-      padding: 10,
-      titleFont: { family: "'IBM Plex Sans Arabic', sans-serif", weight: '700' },
-      bodyFont: { family: "'IBM Plex Sans Arabic', sans-serif" },
-      callbacks: {
-        label: function (ctxItem) {
-          var arr = (ctxItem.dataset && Array.isArray(ctxItem.dataset.data)) ? ctxItem.dataset.data : [];
-          var total = arr.reduce(function (acc, val) { return acc + Math.max(0, Number(val || 0)); }, 0);
-          var val = Number(ctxItem.raw !== undefined ? ctxItem.raw : 0);
-          var pct = total > 0 ? Math.round((val / total) * 100) : 0;
-          var lbl = ctxItem.label || ctxItem.dataset.label || '';
-          return ' ' + (lbl ? lbl + ': ' : '') + val + ' (' + pct + '%)';
-        }
-      }
-    };
 
-    var finEl = document.getElementById('res-drawer-chart-finance');
-    if (finEl) {
-      new root.Chart(finEl.getContext('2d'), {
-        type: 'doughnut',
-        data: {
-          labels: ['المبلغ الأساسي', 'التمديدات المعتمدة'],
-          datasets: [{
-            data: [Number(r.baseAmount || 0), Number(r.extensionsAmount || 0)],
-            backgroundColor: [charcoalSeg, '#D91F2B'],
-            borderColor: segBorder,
-            borderWidth: 2.5,
-            hoverOffset: 8
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          animation: reduced ? false : { animateRotate: true, animateScale: true, duration: 720, easing: 'easeOutQuart' },
-          cutout: '66%',
-          plugins: {
-            legend: { position: 'bottom', labels: { color: txtColor, usePointStyle: true, pointStyle: 'circle', boxWidth: 8, padding: 12, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } } },
-            tooltip: tooltipOpt
+    function paintCharts() {
+      if (!root.Chart) return;
+      var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      var reduced = Boolean(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches);
+      var txtColor = isDark ? '#E5E7EB' : '#292929';
+      var mutedColor = isDark ? '#9CA3AF' : '#686868';
+      var gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(41,41,41,0.08)';
+      var segBorder = isDark ? '#1E1E21' : '#FFFFFF';
+      var charcoalSeg = isDark ? '#8A8A8A' : '#292929';
+      var tooltipOpt = {
+        backgroundColor: 'rgba(41, 41, 41, 0.96)',
+        titleColor: '#FFFFFF',
+        bodyColor: '#F3F4F6',
+        borderColor: 'rgba(217, 31, 43, 0.45)',
+        borderWidth: 1,
+        cornerRadius: 11,
+        padding: 10,
+        titleFont: { family: "'IBM Plex Sans Arabic', sans-serif", weight: '700' },
+        bodyFont: { family: "'IBM Plex Sans Arabic', sans-serif" },
+        callbacks: {
+          label: function (ctxItem) {
+            var arr = (ctxItem.dataset && Array.isArray(ctxItem.dataset.data)) ? ctxItem.dataset.data : [];
+            var total = arr.reduce(function (acc, val) { return acc + Math.max(0, Number(val || 0)); }, 0);
+            var val = Number(ctxItem.raw !== undefined ? ctxItem.raw : 0);
+            var pct = total > 0 ? Math.round((val / total) * 100) : 0;
+            var lbl = ctxItem.label || ctxItem.dataset.label || '';
+            return ' ' + (lbl ? lbl + ': ' : '') + val + ' (' + pct + '%)';
           }
         }
-      });
-    }
+      };
 
-    var empFollowUpCounts = {};
-    (r.assignedEmployeeNames || []).forEach(function (name) {
-      empFollowUpCounts[name] = 0;
-    });
-    details.followUps.forEach(function (f) {
-      var n = f.employeeName || 'غير محدد';
-      empFollowUpCounts[n] = (empFollowUpCounts[n] || 0) + 1;
-    });
-
-    var actLabels = Object.keys(empFollowUpCounts);
-    var actValues = actLabels.map(function (k) { return empFollowUpCounts[k]; });
-    if (actLabels.length === 0) {
-      actLabels = ['المتابعات', 'المشكلات', 'التمديدات'];
-      actValues = [details.followUps.length, details.problems.length, details.extensions.length];
-    } else {
-      actLabels.push('المشكلات');
-      actValues.push(details.problems.length);
-    }
-
-    var actEl = document.getElementById('res-drawer-chart-activity');
-    if (actEl) {
-      new root.Chart(actEl.getContext('2d'), {
-        type: 'bar',
-        data: {
-          labels: actLabels,
-          datasets: [{
-            label: 'النشاط',
-            data: actValues,
-            backgroundColor: actLabels.map(function (lbl, idx) {
-              return lbl === 'المشكلات' ? '#D91F2B' : (idx % 2 === 0 ? charcoalSeg : '#10B981');
-            }),
-            borderRadius: 8,
-            borderSkipped: false,
-            maxBarThickness: 38
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          animation: reduced ? false : {
-            duration: 600,
-            easing: 'easeOutQuart',
-            delay: function (context) {
-              return (context.type === 'data' && context.mode === 'default') ? context.dataIndex * 70 : 0;
-            }
+      var finEl = document.getElementById('res-drawer-chart-finance');
+      if (finEl && finEl.isConnected) {
+        if (typeof root.Chart.getChart === 'function') {
+          var existingFin = root.Chart.getChart(finEl);
+          if (existingFin) existingFin.destroy();
+        }
+        new root.Chart(finEl.getContext('2d'), {
+          type: 'doughnut',
+          data: {
+            labels: ['المبلغ الأساسي', 'التمديدات المعتمدة'],
+            datasets: [{
+              data: [Number(r.baseAmount || 0), Number(r.extensionsAmount || 0)],
+              backgroundColor: [charcoalSeg, '#D91F2B'],
+              borderColor: segBorder,
+              borderWidth: 2.5,
+              hoverOffset: 8
+            }]
           },
-          plugins: { legend: { display: false }, tooltip: tooltipOpt },
-          scales: {
-            x: { ticks: { color: txtColor, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } }, grid: { display: false } },
-            y: { ticks: { color: mutedColor, precision: 0, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } }, grid: { color: gridColor }, beginAtZero: true, grace: '15%' }
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: reduced ? false : { animateRotate: true, animateScale: true, duration: 720, easing: 'easeOutQuart' },
+            cutout: '66%',
+            plugins: {
+              legend: { position: 'bottom', labels: { color: txtColor, usePointStyle: true, pointStyle: 'circle', boxWidth: 8, padding: 12, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } } },
+              tooltip: tooltipOpt
+            }
           }
-        }
+        });
+      }
+
+      var empFollowUpCounts = {};
+      (r.assignedEmployeeNames || []).forEach(function (name) {
+        empFollowUpCounts[name] = 0;
       });
+      details.followUps.forEach(function (f) {
+        var n = f.employeeName || 'غير محدد';
+        empFollowUpCounts[n] = (empFollowUpCounts[n] || 0) + 1;
+      });
+
+      var actLabels = Object.keys(empFollowUpCounts);
+      var actValues = actLabels.map(function (k) { return empFollowUpCounts[k]; });
+      if (actLabels.length === 0) {
+        actLabels = ['المتابعات', 'المشكلات', 'التمديدات'];
+        actValues = [details.followUps.length, details.problems.length, details.extensions.length];
+      } else {
+        actLabels.push('المشكلات');
+        actValues.push(details.problems.length);
+      }
+
+      var actEl = document.getElementById('res-drawer-chart-activity');
+      if (actEl && actEl.isConnected) {
+        if (typeof root.Chart.getChart === 'function') {
+          var existingAct = root.Chart.getChart(actEl);
+          if (existingAct) existingAct.destroy();
+        }
+        new root.Chart(actEl.getContext('2d'), {
+          type: 'bar',
+          data: {
+            labels: actLabels,
+            datasets: [{
+              label: 'النشاط',
+              data: actValues,
+              backgroundColor: actLabels.map(function (lbl, idx) {
+                return lbl === 'المشكلات' ? '#D91F2B' : (idx % 2 === 0 ? charcoalSeg : '#10B981');
+              }),
+              borderRadius: 8,
+              borderSkipped: false,
+              maxBarThickness: 38
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: reduced ? false : {
+              duration: 600,
+              easing: 'easeOutQuart',
+              delay: function (context) {
+                return (context.type === 'data' && context.mode === 'default') ? context.dataIndex * 70 : 0;
+              }
+            },
+            plugins: { legend: { display: false }, tooltip: tooltipOpt },
+            scales: {
+              x: { ticks: { color: txtColor, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } }, grid: { display: false } },
+              y: { ticks: { color: mutedColor, precision: 0, font: { family: "'IBM Plex Sans Arabic', sans-serif", size: 11 } }, grid: { color: gridColor }, beginAtZero: true, grace: '15%' }
+            }
+          }
+        });
+      }
+    }
+
+    if (root.Chart) {
+      paintCharts();
+    } else if (typeof root.RGEnsureChartLoaded === 'function') {
+      root.RGEnsureChartLoaded().then(paintCharts).catch(function () {});
     }
 
     function fallbackCapture(el, title) {
-      if (!el) return null;
+      if (!el || !el.width || !el.height) return null;
       if (root.RGReports && typeof root.RGReports.captureChartForPdf === 'function') {
         return root.RGReports.captureChartForPdf(el, title);
       }
@@ -3027,6 +4462,8 @@
 
     return {
       getImages: function () {
+        var finEl = document.getElementById('res-drawer-chart-finance');
+        var actEl = document.getElementById('res-drawer-chart-activity');
         return [
           fallbackCapture(finEl, 'حالة الحجز والتفصيل المالي (' + r.internalStatus + ')'),
           fallbackCapture(actEl, 'أداء الموظفين ونشاط الحجز')
@@ -3136,7 +4573,8 @@
           priority: prioVal,
           description: descVal,
           assignedEmployeeIds: empIds,
-          _keepOptimisticCache: true
+          _keepOptimisticCache: true,
+          _spamChecked: true
         }).then(function (res) {
           if (res && res.success) {
             ctx.refreshNotifications();
@@ -3148,7 +4586,7 @@
           ctx.toast('تعذر الاتصال بالخادم أثناء حفظ المشكلة.', true);
           if (onCreated) onCreated(null);
         });
-      });
+      }, { spamAction: 'createProblem', spamSig: reservation.id + ':' + prioVal + ':' + descVal });
     });
   }
 

@@ -6,6 +6,14 @@
 
   var cachedLogoImagePromise = null;
   var cachedDownsampledLogos = {};
+  var activeReportChartInstances = [];
+
+  function destroyCharts() {
+    activeReportChartInstances.forEach(function (ch) {
+      try { if (ch && typeof ch.destroy === 'function') ch.destroy(); } catch (_e) {}
+    });
+    activeReportChartInstances = [];
+  }
 
   function loadRawLogoImage() {
     if (cachedLogoImagePromise) return cachedLogoImagePromise;
@@ -347,6 +355,15 @@
     }, 0);
     var validCharts = chartImages.filter(function (c) { return c && c.dataUrl; });
 
+    var tables = Array.isArray(options.tables) ? options.tables : [];
+    var totalTableRows = rows.length + tables.reduce(function (acc, tb) {
+      return acc + (Array.isArray(tb && tb.rows) ? tb.rows.length : 0);
+    }, 0);
+    var maxTableCols = tables.reduce(function (acc, tb) {
+      var len = Array.isArray(tb && tb.columns) ? tb.columns.length : 0;
+      return Math.max(acc, len);
+    }, columns.length);
+
     var plan = (core && core.computePdfLayoutPlan)
       ? core.computePdfLayoutPlan({
           targetPages: options.targetPages,
@@ -356,11 +373,11 @@
           paperSize: options.paperSize || 'a4',
           orientation: options.orientation || 'landscape',
           lang: lang,
-          rowCount: rows.length,
-          columnCount: columns.length,
+          rowCount: totalTableRows,
+          columnCount: maxTableCols,
           kpiCount: kpiItems.length,
           wideSummaryCount: wideItems.length,
-          extraSectionsCount: extraSections.length,
+          extraSectionsCount: extraSections.length + tables.length,
           extraLinesCount: extraLinesTotal,
           chartCount: validCharts.length
         })
@@ -608,16 +625,33 @@
       }
     }
 
-    // 2. Main Data Table with Dynamic Density, Proportional Column Widths & No Clipping
-    if (columns.length > 0) {
+    // 2. Reusable Structured Table Renderer + Main Table & Sub-Tables (options.tables[])
+    async function renderStructuredTable(tblTitle, tblCols, tblRows, tblMeta) {
+      if (!Array.isArray(tblCols) || !tblCols.length) return;
+      var tableKind = (tblMeta && tblMeta.kind) || '';
+      var headerFill = tableKind === 'pickups'
+        ? '#1e3a8a'
+        : (tableKind === 'returns' ? '#92400e' : '#313232');
+      var headerBorder = tableKind === 'pickups'
+        ? '#1d4ed8'
+        : (tableKind === 'returns' ? '#b45309' : '#1e293b');
+      var titleAccentColor = tableKind === 'pickups'
+        ? '#1d4ed8'
+        : (tableKind === 'returns' ? '#b45309' : '#d32228');
+      var titleBannerBg = tableKind === 'pickups'
+        ? '#eff6ff'
+        : (tableKind === 'returns' ? '#fffbeb' : '');
+      var titleBannerBorder = tableKind === 'pickups'
+        ? '#bfdbfe'
+        : (tableKind === 'returns' ? '#fde68a' : '');
       var tableW = cw - pad * 2;
       var colWidths = (core && core.computePdfColumnWidths)
-        ? core.computePdfColumnWidths(columns, tableW)
-        : columns.map(function () { return tableW / columns.length; });
+        ? core.computePdfColumnWidths(tblCols, tableW)
+        : tblCols.map(function () { return tableW / tblCols.length; });
 
       var colOffsets = [];
       var running = isRtl ? cw - pad : pad;
-      for (var ci = 0; ci < columns.length; ci++) {
+      for (var ci = 0; ci < tblCols.length; ci++) {
         var cwItem = colWidths[ci];
         if (isRtl) {
           running -= cwItem;
@@ -638,7 +672,7 @@
       var maxCellLines = Math.max(2, Number(plan.maxCellLines || 3));
 
       page.ctx.font = headerFont;
-      var headerWrapped = columns.map(function (col, idx) {
+      var headerWrapped = tblCols.map(function (col, idx) {
         var lbl = (lang === 'en' && col.labelEn) ? col.labelEn : col.label;
         return wrapCanvasText(page.ctx, lbl || col.key || '', Math.max(20, colWidths[idx] - cellPadX * 2), 2);
       });
@@ -646,15 +680,15 @@
       var headerRowH = Math.max(Math.round((headerFontSize * 2.1) * scale), maxHeaderLines * cellLineH + cellPadY * 2);
 
       function drawTableHeader(p) {
-        p.ctx.fillStyle = '#313232';
+        p.ctx.fillStyle = headerFill;
         p.ctx.fillRect(pad, p.y, tableW, headerRowH);
-        p.ctx.strokeStyle = '#1e293b';
+        p.ctx.strokeStyle = headerBorder;
         p.ctx.lineWidth = Math.max(1, 0.8 * scale);
         p.ctx.strokeRect(pad, p.y, tableW, headerRowH);
 
         p.ctx.fillStyle = '#ffffff';
         p.ctx.font = headerFont;
-        columns.forEach(function (col, cIdx) {
+        tblCols.forEach(function (col, cIdx) {
           var cellX = colOffsets[cIdx];
           var cellW = colWidths[cIdx];
           p.ctx.save();
@@ -681,8 +715,37 @@
         p.y += headerRowH;
       }
 
-      if (rows.length === 0) {
-        page = ensureSpace(page, headerRowH + Math.round(28 * scale));
+      var titleBlockH = tblTitle ? Math.round(Math.max(24, plan.baseFont * 2.5) * scale) : 0;
+      page = ensureSpace(page, titleBlockH + headerRowH + Math.round(28 * scale));
+
+      if (tblTitle) {
+        var tblTitleSz = Math.round(Math.max(10, plan.baseFont * 1.18) * scale);
+        if (titleBannerBg) {
+          var banH = Math.round(20 * scale);
+          page.ctx.save();
+          page.ctx.fillStyle = titleBannerBg;
+          page.ctx.strokeStyle = titleBannerBorder;
+          page.ctx.lineWidth = Math.max(1, 0.8 * scale);
+          page.ctx.fillRect(pad, page.y, tableW, banH);
+          page.ctx.strokeRect(pad, page.y, tableW, banH);
+          var barW = Math.round(4 * scale);
+          page.ctx.fillStyle = titleAccentColor;
+          page.ctx.fillRect(isRtl ? (cw - pad - barW) : pad, page.y, barW, banH);
+          page.ctx.fillStyle = titleAccentColor;
+          page.ctx.font = 'bold ' + tblTitleSz + 'px ' + fontStack;
+          var textOffset = Math.round(10 * scale);
+          drawSmartLine(page.ctx, tblTitle, isRtl ? (cw - pad - textOffset) : (pad + textOffset), page.y + Math.round(13.5 * scale), tableW - textOffset * 2, isRtl);
+          page.ctx.restore();
+          page.y += banH + Math.round(4 * scale);
+        } else {
+          page.ctx.fillStyle = titleAccentColor;
+          page.ctx.font = 'bold ' + tblTitleSz + 'px ' + fontStack;
+          drawSmartLine(page.ctx, tblTitle, isRtl ? cw - pad : pad, page.y + Math.round(13 * scale), tableW, isRtl);
+          page.y += titleBlockH;
+        }
+      }
+
+      if (!Array.isArray(tblRows) || tblRows.length === 0) {
         drawTableHeader(page);
         page.ctx.fillStyle = '#f8fafc';
         page.ctx.fillRect(pad, page.y, tableW, Math.round(26 * scale));
@@ -691,22 +754,21 @@
         page.ctx.fillStyle = '#64748b';
         page.ctx.font = bodyFont;
         page.ctx.textAlign = 'center';
-        page.ctx.fillText(isRtl ? 'لا توجد سجلات مطابقة لمعايير التقرير.' : 'No matching records found.', cw / 2, page.y + Math.round(17 * scale));
+        page.ctx.fillText(isRtl ? 'لا توجد سجلات مطابقة في هذا القسم.' : 'No matching records found in this section.', cw / 2, page.y + Math.round(17 * scale));
         page.y += Math.round(32 * scale);
       } else {
-        page = ensureSpace(page, headerRowH + Math.round(24 * scale));
         drawTableHeader(page);
 
         var rowsOnPage = 0;
         var maxRowsLimit = Number(plan.maxRowsPerPage || 0);
-        for (var ri = 0; ri < rows.length; ri++) {
+        for (var ri = 0; ri < tblRows.length; ri++) {
           if (ri > 0 && ri % 18 === 0) {
             await yieldMainThread();
             throwIfAborted(signal);
           }
-          var row = rows[ri];
+          var row = tblRows[ri];
           page.ctx.font = bodyFont;
-          var cellLines = columns.map(function (col, cIdx) {
+          var cellLines = tblCols.map(function (col, cIdx) {
             var formatted = (core && core.formatReportCellValue)
               ? core.formatReportCellValue(col, row, lang, { timeFormat: activePdfTf })
               : (function () {
@@ -736,7 +798,7 @@
           page.ctx.fillStyle = '#0f172a';
           page.ctx.font = bodyFont;
 
-          columns.forEach(function (col, cIdx) {
+          tblCols.forEach(function (col, cIdx) {
             var cellX = colOffsets[cIdx];
             var cellW = colWidths[cIdx];
 
@@ -767,6 +829,16 @@
         }
         page.y += Math.round(plan.sectionGap * scale);
       }
+    }
+
+    for (var ti = 0; ti < tables.length; ti++) {
+      var tbItem = tables[ti];
+      if (!tbItem || !Array.isArray(tbItem.columns) || !tbItem.columns.length) continue;
+      await renderStructuredTable(tbItem.title || '', tbItem.columns, tbItem.rows || [], { kind: tbItem.kind || '' });
+    }
+
+    if (columns.length > 0) {
+      await renderStructuredTable('', columns, rows, { kind: 'main' });
     }
 
     // 3. Extra Sections (Notes, FollowUps, Extensions, Problems)
@@ -1028,14 +1100,21 @@
       : await root.RGApi.callApi('getEmployees', {});
     var employees = (empRes.success && empRes.data.items) || [];
     var facets = { companies: [], branches: [] };
+    var coreRep = root.RGCrmCore || {};
+    var curRepUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var canViewRepCharts = !coreRep.canUserViewSubSection || coreRep.canUserViewSubSection(curRepUser, 'sub_view_rep_charts');
+    var canViewRepRates = !coreRep.canUserViewSubSection || coreRep.canUserViewSubSection(curRepUser, 'sub_view_prb_rates');
+    var canUseRepHandover = !coreRep.canUserUseActionButton || coreRep.canUserUseActionButton(curRepUser, 'act_handover_pdf');
+    var canUseRepExcel = !coreRep.canUserUseActionButton || coreRep.canUserUseActionButton(curRepUser, 'act_export_excel');
+    var canUseRepPdf = !coreRep.canUserUseActionButton || coreRep.canUserUseActionButton(curRepUser, 'act_export_pdf');
 
     container.innerHTML =
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div><h2 class="section-title">' + t('nav_reports') + '</h2><p class="section-subtitle">' + t('reports_subtitle') + '</p></div>' +
           '<div class="toolbar-row" style="margin-bottom:0;">' +
-            (root.RGHandover ? '<button type="button" class="btn" id="btn-shift-handover-modal">' + (ctx.lang === 'en' ? 'Shift Handover (PDF)' : 'ملخص تسليم الوردية (PDF)') + '</button>' : '') +
-            '<button type="button" class="btn btn-primary" id="btn-open-export-modal">' + t('export_settings_btn') + '</button>' +
+            ((root.RGHandover && canUseRepHandover) ? '<button type="button" class="btn" id="btn-shift-handover-modal">' + (ctx.lang === 'en' ? 'Shift Handover (PDF)' : 'ملخص تسليم الوردية (PDF)') + '</button>' : '') +
+            ((canUseRepExcel || canUseRepPdf) ? '<button type="button" class="btn btn-primary" id="btn-open-export-modal">' + t('export_settings_btn') + '</button>' : '') +
           '</div>' +
         '</div>' +
         '<div class="segmented-control" id="report-type-tabs" style="margin-bottom:16px;">' +
@@ -1055,18 +1134,20 @@
           '<select class="select" id="rep-branch" aria-label="' + t('branch') + '"><option value="">' + t('all_branches') + '</option></select>' +
           '<button type="button" class="btn btn-accent" id="rep-run-btn">' + t('generate_report') + '</button>' +
         '</div>' +
-        '<div id="report-charts-wrap" class="charts-grid" style="margin-bottom:16px;">' +
-          '<div class="chart-card"><h3 class="chart-card-title">توزيع بيانات التقرير</h3><div class="chart-canvas-wrap" style="height:220px;"><canvas id="report-chart-primary"></canvas></div></div>' +
-          '<div class="chart-card"><h3 class="chart-card-title">التوزيع حسب الشركة / الأولوية</h3><div class="chart-canvas-wrap" style="height:220px;"><canvas id="report-chart-secondary"></canvas></div></div>' +
-        '</div>' +
-        '<div class="chart-card" id="rep-peak-heatmap-card" style="margin-bottom:16px;">' +
-          '<div class="chart-card-head">' +
-            '<h3 class="chart-card-title">' + (ctx.lang === 'en' ? 'Peak Hours Heatmap (Shift Planning)' : 'مصفوفة ساعات الذروة (تخطيط الورديات)') + '</h3>' +
-            '<span class="chart-sub-hint">' + (ctx.lang === 'en' ? '7 Days × 24 Hours' : '7 أيام × 24 ساعة') + '</span>' +
+        (canViewRepCharts ? (
+          '<div id="report-charts-wrap" class="charts-grid" style="margin-bottom:16px;">' +
+            '<div class="chart-card"><h3 class="chart-card-title">توزيع بيانات التقرير</h3><div class="chart-canvas-wrap" style="height:220px;"><canvas id="report-chart-primary"></canvas></div></div>' +
+            '<div class="chart-card"><h3 class="chart-card-title">التوزيع حسب الشركة / الأولوية</h3><div class="chart-canvas-wrap" style="height:220px;"><canvas id="report-chart-secondary"></canvas></div></div>' +
           '</div>' +
-          '<div id="rep-peak-heatmap"></div>' +
-        '</div>' +
-        '<div class="chart-card rg-problem-rate-card" id="rep-problem-rates-card" style="margin-bottom:16px;"></div>' +
+          '<div class="chart-card" id="rep-peak-heatmap-card" style="margin-bottom:16px;">' +
+            '<div class="chart-card-head">' +
+              '<h3 class="chart-card-title">' + (ctx.lang === 'en' ? 'Peak Hours Heatmap (Shift Planning)' : 'مصفوفة ساعات الذروة (تخطيط الورديات)') + '</h3>' +
+              '<span class="chart-sub-hint">' + (ctx.lang === 'en' ? '7 Days × 24 Hours' : '7 أيام × 24 ساعة') + '</span>' +
+            '</div>' +
+            '<div id="rep-peak-heatmap"></div>' +
+          '</div>'
+        ) : '') +
+        (canViewRepRates ? '<div class="chart-card rg-problem-rate-card" id="rep-problem-rates-card" style="margin-bottom:16px;"></div>' : '') +
         '<div id="report-preview-wrap"></div>' +
       '</div>';
 
@@ -1165,13 +1246,20 @@
         '</tbody></table></div>';
     }
 
-    var reportChartInstances = [];
     var latestChartsParams = null;
     function renderReportCharts(reportType, rows, chartOpts) {
       latestChartsParams = { reportType: reportType, rows: rows || [] };
-      if (!root.Chart) return;
-      reportChartInstances.forEach(function (ch) { ch.destroy(); });
-      reportChartInstances = [];
+      if (!root.Chart) {
+        if (typeof root.RGEnsureChartLoaded === 'function') {
+          root.RGEnsureChartLoaded().then(function () {
+            if (container && container.isConnected && latestChartsParams) {
+              renderReportCharts(latestChartsParams.reportType, latestChartsParams.rows, chartOpts);
+            }
+          }).catch(function () {});
+        }
+        return;
+      }
+      destroyCharts();
 
       var cOpts = chartOpts || {};
       var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
@@ -1242,11 +1330,15 @@
       var c1 = document.getElementById('report-chart-primary');
       var c2 = document.getElementById('report-chart-secondary');
       if (c1) {
+        if (typeof root.Chart.getChart === 'function') {
+          var ex1 = root.Chart.getChart(c1);
+          if (ex1) ex1.destroy();
+        }
         var ctx1 = c1.getContext('2d');
         var grad1 = ctx1.createLinearGradient(0, 0, 0, 220);
         grad1.addColorStop(0, '#D91F2B');
         grad1.addColorStop(1, 'rgba(153, 19, 28, 0.72)');
-        reportChartInstances.push(new root.Chart(ctx1, {
+        activeReportChartInstances.push(new root.Chart(ctx1, {
           type: 'bar',
           data: {
             labels: Object.keys(primaryCounts),
@@ -1279,7 +1371,11 @@
         }));
       }
       if (c2) {
-        reportChartInstances.push(new root.Chart(c2.getContext('2d'), {
+        if (typeof root.Chart.getChart === 'function') {
+          var ex2 = root.Chart.getChart(c2);
+          if (ex2) ex2.destroy();
+        }
+        activeReportChartInstances.push(new root.Chart(c2.getContext('2d'), {
           type: 'doughnut',
           data: {
             labels: Object.keys(secondaryCounts),
@@ -1422,9 +1518,12 @@
       }
     });
 
-    document.getElementById('btn-open-export-modal').addEventListener('click', function () {
-      openExportConfigModal(ctx, state, employees, facets);
-    });
+    var openExpModalBtn = document.getElementById('btn-open-export-modal');
+    if (openExpModalBtn) {
+      openExpModalBtn.addEventListener('click', function () {
+        openExportConfigModal(ctx, state, employees, facets);
+      });
+    }
 
     var shiftHandoverBtn = document.getElementById('btn-shift-handover-modal');
     if (shiftHandoverBtn && root.RGHandover) {
@@ -1524,6 +1623,10 @@
         })
       : advancedModalExtras;
 
+    var repUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var canModalExcel = !core || !core.canUserUseActionButton || core.canUserUseActionButton(repUser, 'act_export_excel');
+    var canModalPdf = !core || !core.canUserUseActionButton || core.canUserUseActionButton(repUser, 'act_export_pdf');
+
     modalRoot.innerHTML =
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">' +
         '<div class="modal-panel modal-panel-wide">' +
@@ -1533,9 +1636,9 @@
           '</div>' +
           pdfControlsHtml +
           '<div class="modal-footer">' +
-            '<button type="button" class="btn" id="exp-excel-btn">' + (isEn ? 'Export Excel (.xlsx)' : 'تصدير Excel (.xlsx)') + '</button>' +
-            '<button type="button" class="btn" id="exp-pdf-download-btn">' + (isEn ? 'Download PDF' : 'تحميل PDF') + '</button>' +
-            '<button type="button" class="btn btn-primary" id="exp-pdf-btn">' + (isEn ? 'Preview PDF' : 'معاينة PDF') + '</button>' +
+            (canModalExcel ? '<button type="button" class="btn" id="exp-excel-btn">' + (isEn ? 'Export Excel (.xlsx)' : 'تصدير Excel (.xlsx)') + '</button>' : '') +
+            (canModalPdf ? '<button type="button" class="btn" id="exp-pdf-download-btn">' + (isEn ? 'Download PDF' : 'تحميل PDF') + '</button>' : '') +
+            (canModalPdf ? '<button type="button" class="btn btn-primary" id="exp-pdf-btn">' + (isEn ? 'Preview PDF' : 'معاينة PDF') + '</button>' : '') +
           '</div>' +
         '</div>' +
       '</div>';
@@ -1611,7 +1714,7 @@
     }
 
     var expExcelBtn = document.getElementById('exp-excel-btn');
-    expExcelBtn.addEventListener('click', function () {
+    if (expExcelBtn) expExcelBtn.addEventListener('click', function () {
       var runExcel = async function () {
         try {
           var incNotes = document.getElementById('exp-inc-notes').checked;
@@ -1783,48 +1886,50 @@
     }
 
     var expPdfBtn = document.getElementById('exp-pdf-btn');
-    expPdfBtn.addEventListener('click', function () {
-      var snap = createReportPdfSnapshot();
-      var runPdf = async function () {
-        try {
-          if (root.RGPdfPreview && typeof root.RGPdfPreview.open === 'function') {
-            await root.RGPdfPreview.open({
-              title: snap.pdfTitle,
-              filename: snap.pdfFilename,
-              initialSettings: snap.baseSettings,
-              getContentStats: snap.getContentStats,
-              generatePdf: function (liveSettings, signal) {
-                return snap.generate(liveSettings, signal, true);
-              },
-              onSettingsChange: function (nextSettings) {
-                if (pdfCtrl) pdfCtrl.setSettings(nextSettings, true);
-              },
-              onDownloadToast: function (meta) {
-                var kb = Math.max(1, Math.round((meta.sizeBytes || 0) / 1024));
-                ctx.toast(isEn
-                  ? ('Downloaded PDF (' + meta.pages + ' pages · ' + kb + ' KB).')
-                  : ('تم تحميل ملف PDF (' + meta.pages + ' صفحة · ' + kb + ' KB).'));
-              }
-            });
-          } else {
-            var pdfMeta = await snap.generate(snap.baseSettings, null, false);
-            var kb = Math.max(1, Math.round((pdfMeta.sizeBytes || 0) / 1024));
-            ctx.toast('تم تصدير PDF (' + pdfMeta.pages + ' صفحة · ' + kb + ' KB).');
-            modalRoot.innerHTML = '';
+    if (expPdfBtn) {
+      expPdfBtn.addEventListener('click', function () {
+        var snap = createReportPdfSnapshot();
+        var runPdf = async function () {
+          try {
+            if (root.RGPdfPreview && typeof root.RGPdfPreview.open === 'function') {
+              await root.RGPdfPreview.open({
+                title: snap.pdfTitle,
+                filename: snap.pdfFilename,
+                initialSettings: snap.baseSettings,
+                getContentStats: snap.getContentStats,
+                generatePdf: function (liveSettings, signal) {
+                  return snap.generate(liveSettings, signal, true);
+                },
+                onSettingsChange: function (nextSettings) {
+                  if (pdfCtrl) pdfCtrl.setSettings(nextSettings, true);
+                },
+                onDownloadToast: function (meta) {
+                  var kb = Math.max(1, Math.round((meta.sizeBytes || 0) / 1024));
+                  ctx.toast(isEn
+                    ? ('Downloaded PDF (' + meta.pages + ' pages · ' + kb + ' KB).')
+                    : ('تم تحميل ملف PDF (' + meta.pages + ' صفحة · ' + kb + ' KB).'));
+                }
+              });
+            } else {
+              var pdfMeta = await snap.generate(snap.baseSettings, null, false);
+              var kb = Math.max(1, Math.round((pdfMeta.sizeBytes || 0) / 1024));
+              ctx.toast('تم تصدير PDF (' + pdfMeta.pages + ' صفحة · ' + kb + ' KB).');
+              modalRoot.innerHTML = '';
+            }
+          } catch (err) {
+            if (err && err.name === 'AbortError') return;
+            ctx.toast((err && err.message) || 'تعذر تجهيز ملف PDF.', true);
           }
-        } catch (err) {
-          if (err && err.name === 'AbortError') return;
-          ctx.toast((err && err.message) || 'تعذر تجهيز ملف PDF.', true);
-        }
-      };
+        };
 
-      if (ctx.withActionLock) {
-        ctx.withActionLock(expPdfBtn, 'reports:exportPdf', runPdf);
-      } else {
-        expPdfBtn.disabled = true;
-        runPdf().finally(function () { expPdfBtn.disabled = false; });
-      }
-    });
+        if (ctx.withActionLock) {
+          ctx.withActionLock(expPdfBtn, 'reports:exportPdf', runPdf);
+        } else {
+          expPdfBtn.disabled = true;
+          runPdf().finally(function () { expPdfBtn.disabled = false; });
+        }
+      });
+    }
 
     var expPdfDlBtn = document.getElementById('exp-pdf-download-btn');
     if (expPdfDlBtn) {
@@ -1862,6 +1967,7 @@
   root.RGReports = {
     render: render,
     refreshTheme: refreshTheme,
+    destroyCharts: destroyCharts,
     ensureXlsxLoaded: ensureXlsxLoaded,
     readExcelWorkbookRows: readExcelWorkbookRows,
     exportExcelWorkbook: exportExcelWorkbook,

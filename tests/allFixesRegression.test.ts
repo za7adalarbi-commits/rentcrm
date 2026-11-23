@@ -541,3 +541,58 @@ test('GAS Backend: all 12 new handlers + Today/Radar + Filters + Activity + Hand
   assert.equal(timeFiltered.success, true);
   assert.ok(timeFiltered.data.items.some((r: any) => r.id === resId));
 });
+
+test('Lightweight payload, lazy Chart.js lifecycle, gzip serving, and mirror parity guarantees', () => {
+  const read = (rel: string) => fs.readFileSync(path.resolve(process.cwd(), rel), 'utf8');
+
+  // 1. Source mirrors stay byte-identical (no missing features or drift)
+  assert.equal(read('assets/js/app.js'), read('src/assets/js/app.js'), 'app.js mirror parity');
+  assert.equal(read('assets/js/employees.js'), read('src/assets/js/employees.js'), 'employees.js mirror parity');
+  assert.equal(read('assets/js/core.js'), read('backend/coreBridge.cjs'), 'core.js bridge parity');
+
+  // 2. React overlay shell uses zero heavy animation/icon runtimes
+  const appTsx = read('src/App.tsx');
+  assert.equal(appTsx.includes('motion/react'), false, 'src/App.tsx must not import motion/react');
+  assert.equal(appTsx.includes('lucide-react'), false, 'src/App.tsx must not import lucide-react');
+  assert.ok(appTsx.includes('data-testid="global-sync-overlay"'), 'src/App.tsx must preserve global sync overlay');
+
+  // 3. index.html does not eagerly execute or duplicate Chart.js (loaded on demand via RGEnsureChartLoaded)
+  const html = read('index.html');
+  assert.equal(/chart\.umd\.min\.js/.test(html), false, 'index.html must not eagerly load or bundle chart.umd.min.js');
+
+  // 4. App, Dashboard, Reports, Employees, Reservations all wire lazy Chart.js & proper chart cleanup
+  const appJs = read('assets/js/app.js');
+  assert.ok(appJs.includes('root.RGEnsureChartLoaded'), 'app.js must export RGEnsureChartLoaded');
+  assert.ok(appJs.includes('root.RGReports.destroyCharts()'), 'app.js must destroy report charts on route change');
+
+  const dashJs = read('assets/js/dashboard.js');
+  assert.ok(dashJs.includes('root.RGEnsureChartLoaded'), 'dashboard.js must support lazy Chart.js loading');
+
+  const repJs = read('assets/js/reports.js');
+  assert.ok(repJs.includes('destroyCharts: destroyCharts'), 'reports.js must expose destroyCharts');
+  assert.ok(repJs.includes('root.RGEnsureChartLoaded'), 'reports.js must support lazy Chart.js loading');
+
+  const empJs = read('assets/js/employees.js');
+  assert.ok(empJs.includes('destroyEmpDrawerChart'), 'employees.js must destroy drawer chart on close');
+  assert.ok(empJs.includes('root.RGEnsureChartLoaded'), 'employees.js must support lazy Chart.js loading');
+
+  const resJs = read('assets/js/reservations.js');
+  assert.ok(resJs.includes("'res-drawer-chart-finance', 'res-drawer-chart-activity'"), 'reservations.js must clean drawer charts in cleanupDrawerLifecycle');
+  assert.ok(resJs.includes('root.RGEnsureChartLoaded'), 'reservations.js must support lazy Chart.js loading');
+
+  // 5. Settings personal account listener guarded against duplicate registration
+  const settingsJs = read('assets/js/settings.js');
+  assert.ok(settingsJs.includes('_rgSettingsPrefsBound'), 'settings.js must guard duplicate rg:personalprefschange listeners');
+
+  // 6. Vite config minifies copied assets & excludes heavy export vendors from precache
+  const viteCfg = read('vite.config.ts');
+  assert.ok(viteCfg.includes('minifyCopiedAssets'), 'vite.config.ts must minify copied dist assets');
+  assert.ok(viteCfg.includes('globIgnores'), 'vite.config.ts must exclude heavy vendor libs from initial precache');
+  assert.equal(viteCfg.includes("resolve(distDir, 'src', 'assets')"), false, 'vite.config.ts must not duplicate src/assets into dist');
+
+  // 7. Server gzips static & JSON responses and serves /assets before Vite dev sourcemap wrapper
+  const srv = read('server.ts');
+  assert.ok(srv.includes('sendCompressedTextAsset'), 'server.ts must serve gzip-compressed static assets');
+  assert.ok(srv.indexOf("app.use('/assets'") < srv.indexOf('vite.middlewares'), 'server.ts must serve /assets before vite.middlewares in dev');
+});
+

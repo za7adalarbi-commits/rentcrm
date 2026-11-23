@@ -256,13 +256,30 @@ function updateEmployee(session, payload) {
   return withScriptLock(function () {
     var existing = findRecordById(RG_SHEETS.EMPLOYEES, 'id', employeeId);
     if (!existing) throw new Error('الموظف غير موجود.');
+    if (existing.role === RG_ROLES.DEVELOPER && session.role !== RG_ROLES.DEVELOPER) {
+      throw new Error('FORBIDDEN: تعديل حساب المبرمج متاح للمبرمج فقط.');
+    }
 
     var patch = { updatedAt: nowIso() };
+    if (p.username !== undefined) {
+      var nextUsername = normalizeStr(p.username).toLowerCase();
+      if (!nextUsername) throw new Error('اسم المستخدم مطلوب.');
+      if (nextUsername !== String(existing.username || '').toLowerCase()) {
+        var dupUser = findEmployeeByUsername(nextUsername);
+        if (dupUser && dupUser.id !== employeeId) {
+          throw new Error('اسم المستخدم مسجل بالفعل لموظف آخر.');
+        }
+      }
+      patch.username = nextUsername;
+    }
     if (p.name) patch.name = normalizeStr(p.name);
     if (p.phone !== undefined) patch.phone = normalizeStr(p.phone);
     if (p.email !== undefined) patch.email = normalizeStr(p.email);
-    if (p.jobTitle) patch.jobTitle = normalizeStr(p.jobTitle);
-    if (p.role && [RG_ROLES.GENERAL_MANAGER, RG_ROLES.SUPERVISOR, RG_ROLES.AGENT].indexOf(p.role) !== -1) {
+    if (p.jobTitle !== undefined) patch.jobTitle = normalizeStr(p.jobTitle);
+    if (p.role && [RG_ROLES.DEVELOPER, RG_ROLES.GENERAL_MANAGER, RG_ROLES.SUPERVISOR, RG_ROLES.AGENT].indexOf(p.role) !== -1) {
+      if (p.role === RG_ROLES.DEVELOPER && session.role !== RG_ROLES.DEVELOPER) {
+        throw new Error('FORBIDDEN: ترقية حساب إلى دور المبرمج متاحة للمبرمج فقط.');
+      }
       patch.role = p.role;
     }
     if (Array.isArray(p.permissions)) {
@@ -278,12 +295,14 @@ function updateEmployee(session, payload) {
       var newSalt = generateId('SALT');
       patch.salt = newSalt;
       patch.passwordHash = hashPassword(String(p.newPassword), newSalt);
-      revokeEmployeeSessions(employeeId);
+      if (employeeId !== session.employeeId) {
+        revokeEmployeeSessions(employeeId);
+      }
     }
 
     var updated = updateRecordByKey(RG_SHEETS.EMPLOYEES, 'id', employeeId, patch);
     if (updated) syncUserSheetRecord(updated);
-    if (patch.role || patch.permissions || patch.name) {
+    if (patch.role || patch.permissions || patch.name || patch.username) {
       clearEmployeeSessionCache_(employeeId);
     }
     logActivity(session.user, 'تحديث موظف', 'Employee', employeeId, 'تحديث بيانات/صلاحيات الموظف ' + (patch.name || existing.name));

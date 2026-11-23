@@ -103,6 +103,10 @@ test('resolveRangeSelectionClick supports intuitive start/end picking and revers
   // Clicking earlier than start while picking end swaps smoothly
   const reversed = core.resolveRangeSelectionClick('2026-11-15', '', '2026-11-08', 'end');
   assert.deepEqual(reversed, { start: '2026-11-08', end: '2026-11-15', nextRole: 'end', completed: true });
+
+  // Picking end date alone when start is empty sets only end date without forcing start date
+  const endOnly = core.resolveRangeSelectionClick('', '', '2026-11-20', 'end');
+  assert.deepEqual(endOnly, { start: '', end: '2026-11-20', nextRole: 'end', completed: true });
 });
 
 test('clampPdfPage and computePdfZoom enforce page boundaries and compute zoom modes cleanly', () => {

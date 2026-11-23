@@ -100,7 +100,7 @@ export function mapEmployeeRow(row: any): AuthEmployee {
 }
 
 export async function applyDelegationForUser(client: DbClient, user: AuthEmployee): Promise<AuthEmployee> {
-  if (!user || !user.id || user.role === 'general_manager') return user;
+  if (!user || !user.id || crmCore.isPrivilegedRole(user.role)) return user;
   try {
     const res = await client.query(
       `SELECT * FROM employee_delegations
@@ -168,7 +168,7 @@ export function requireApiAccess(session: AuthSession): void {
     throw new Error('UNAUTHORIZED: يلزم تسجيل الدخول.');
   }
   if (!canAccessApi(session.user)) {
-    throw new Error('FORBIDDEN: الوصول إلى إعدادات API والمزامنة متاح للمدير العام والمشرف فقط.');
+    throw new Error('FORBIDDEN: الوصول إلى إعدادات API والمزامنة متاح للمبرمج والمدير العام والمشرف فقط.');
   }
 }
 

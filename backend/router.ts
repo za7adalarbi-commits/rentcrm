@@ -1,5 +1,5 @@
 import { handleLogin, handleLogout, hashToken, invalidateAuthSessionCache, requireAuth, type AuthSession } from './auth.js';
-import { getMutationSyncSpec, invalidateAndBumpVersion } from './cache.js';
+import { checkMutationSpamLimit, getMutationSyncSpec, invalidateAndBumpVersion, runWithIdempotency } from './cache.js';
 import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent } from './realtime.js';
@@ -67,6 +67,13 @@ export async function dispatchCrmRequest(
     }
 
     const session = await requireAuth(executor, token);
+    const spamCheck = checkMutationSpamLimit(executor, session.user.id, action, payload);
+    if (!spamCheck.allowed) {
+      const code = spamCheck.reason || 'RATE_LIMITED';
+      throw new Error(`${code}: ${spamCheck.message || 'تم رفض الطلب مؤقتًا بواسطة مانع التكرار.'}`);
+    }
+    const syncSpec = getMutationSyncSpec(action);
+    const executeAction = async () => {
     let result: any = null;
 
     switch (action) {
@@ -280,6 +287,9 @@ export async function dispatchCrmRequest(
       case 'bulkReassignEmployeeReservations':
         result = await queries.bulkReassignEmployeeReservations(executor, session, payload);
         break;
+      case 'bulkReassignSelectedReservations':
+        result = await queries.bulkReassignSelectedReservations(executor, session, payload);
+        break;
       default:
         return {
           success: false,
@@ -289,6 +299,7 @@ export async function dispatchCrmRequest(
         };
     }
 
+    const outResult = result;
     if (
       action === 'saveRolePreset' ||
       action === 'deleteRolePreset' ||
@@ -301,14 +312,13 @@ export async function dispatchCrmRequest(
       invalidateAuthSessionCache(executor, { all: true });
     }
 
-    const syncSpec = getMutationSyncSpec(action);
     if (syncSpec) {
       let version = 0;
       if (syncSpec.scopes.length > 0) {
         version = await invalidateAndBumpVersion(executor, syncSpec.scopes, syncSpec.persistVersion).catch(() => 0);
       }
       const entityIds: string[] = [];
-      const candidateResId = String(payload?.reservationId || result?.reservation?.id || result?.id || '').trim();
+      const candidateResId = String(payload?.reservationId || outResult?.reservation?.id || outResult?.id || '').trim();
       if (candidateResId) entityIds.push(candidateResId);
       broadcastCrmEvent({
         type: syncSpec.eventType,
@@ -321,16 +331,24 @@ export async function dispatchCrmRequest(
       });
     }
 
+    return outResult;
+    };
+
+    const useIdempotency = Boolean(syncSpec && syncSpec.eventType !== 'lock' && payload?.clientRequestId);
+    const finalResult = useIdempotency
+      ? await runWithIdempotency(executor, session.user.id, action, String(payload.clientRequestId), executeAction)
+      : await executeAction();
+
     return {
       success: true,
       message: 'تمت العملية بنجاح.',
-      data: result,
+      data: finalResult,
       error: null
     };
   } catch (err: any) {
     const msg = String(err?.message || 'حدث خطأ غير متوقع.');
     const errorCode = msg.includes(':') ? msg.split(':')[0].trim() : 'SERVER_ERROR';
-    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA)/.test(errorCode);
+    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA|RATE_LIMITED|DUPLICATE_SUBMISSION)/.test(errorCode);
     if (!isExpectedClientErr) {
       await logBackendError(executor, 'router', action, err, { payload });
     }

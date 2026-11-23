@@ -48,15 +48,15 @@
       : (s === 'مغلقة' || s === 'تم الحل');
   }
 
-  function runWithLock(btnEl, lockKey, fn) {
+  function runWithLock(btnEl, lockKey, fn, opts) {
     if (root.RGApp && root.RGApp.withActionLock) {
-      return root.RGApp.withActionLock(btnEl, lockKey, fn);
+      return root.RGApp.withActionLock(btnEl, lockKey, fn, opts);
     }
     return Promise.resolve().then(fn);
   }
 
   function syncProblemUpdateInBackground(payload, ctx, onErrorRefresh) {
-    var reqPayload = Object.assign({ _keepOptimisticCache: true }, payload);
+    var reqPayload = Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, payload);
     return root.RGApi.callApi('updateProblem', reqPayload).then(function (res) {
       if (res && res.success) {
         if (ctx && ctx.refreshNotifications) ctx.refreshNotifications();
@@ -78,8 +78,11 @@
 
     var isEn = ctx.lang === 'en';
     var core = root.RGCrmCore || {};
+    var currentUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var canViewPrbRates = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_prb_rates');
+    var canCloseTicketBtn = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_close_delete_ticket');
     var RATES_VISIBLE_STORAGE_KEY = core.PROBLEM_RATE_VISIBILITY_STORAGE_KEY || 'rg_crm_problems_rate_visible_v1';
-    var isRatesVisible = (function () {
+    var isRatesVisible = canViewPrbRates && (function () {
       if (typeof ctx.state.problemsRateVisible === 'boolean') return ctx.state.problemsRateVisible;
       try {
         var rawSaved = localStorage.getItem(RATES_VISIBLE_STORAGE_KEY);
@@ -97,8 +100,8 @@
     var [prbRes, empRes, resListRes, allPrbRes] = await Promise.all([
       root.RGApi.callApi('getProblems', Object.assign({}, state, { abortKey: 'prb:list' })),
       hasPreloadedEmps ? Promise.resolve({ success: true, data: { items: empState.items } }) : root.RGApi.callApi('getEmployees', {}),
-      isRatesVisible ? root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true }) : Promise.resolve(null),
-      (isRatesVisible && hasPrbFilter)
+      (canViewPrbRates && isRatesVisible) ? root.RGApi.callApi('getReservations', { page: 1, pageSize: 200, silentRefresh: true }) : Promise.resolve(null),
+      (canViewPrbRates && isRatesVisible && hasPrbFilter)
         ? root.RGApi.callApi('getProblems', { silentRefresh: true })
         : Promise.resolve(null)
     ]);
@@ -108,7 +111,7 @@
     var employees = (empRes.success && empRes.data && empRes.data.items) || [];
     var resItems = (resListRes && resListRes.success && resListRes.data && Array.isArray(resListRes.data.items)) ? resListRes.data.items : [];
     var allProblemsForRate = (allPrbRes && allPrbRes.success && allPrbRes.data && Array.isArray(allPrbRes.data.items)) ? allPrbRes.data.items : items;
-    var ratesLoaded = Boolean(isRatesVisible);
+    var ratesLoaded = Boolean(canViewPrbRates && isRatesVisible);
 
     function getToggleBtnHtml(visible) {
       var lbl = core.formatProblemRateToggleLabel
@@ -119,18 +122,20 @@
     }
 
     container.innerHTML =
-      '<div class="surface-card rg-problem-rate-card' + (isRatesVisible ? '' : ' hidden') + '" id="prb-rates-card"></div>' +
+      (canViewPrbRates ? '<div class="surface-card rg-problem-rate-card' + (isRatesVisible ? '' : ' hidden') + '" id="prb-rates-card"></div>' : '') +
       '<div class="surface-card">' +
         '<div class="section-header">' +
           '<div>' +
             '<h2 class="section-title">' + t('nav_problems') + '</h2>' +
             '<p class="section-subtitle">' + (isEn ? 'Matching problems total: ' : 'إجمالي المشكلات المطابقة: ') + '<strong class="tabular-nums" id="prb-total-count">' + items.length + '</strong></p>' +
           '</div>' +
-          '<div class="toolbar-row" style="margin-bottom:0;">' +
-            '<button type="button" class="btn btn-sm rg-rate-toggle-btn' + (isRatesVisible ? ' is-visible' : '') + '" id="prb-toggle-rates-btn" aria-expanded="' + (isRatesVisible ? 'true' : 'false') + '" aria-controls="prb-rates-card">' +
-              getToggleBtnHtml(isRatesVisible) +
-            '</button>' +
-          '</div>' +
+          (canViewPrbRates ? (
+            '<div class="toolbar-row" style="margin-bottom:0;">' +
+              '<button type="button" class="btn btn-sm rg-rate-toggle-btn' + (isRatesVisible ? ' is-visible' : '') + '" id="prb-toggle-rates-btn" aria-expanded="' + (isRatesVisible ? 'true' : 'false') + '" aria-controls="prb-rates-card">' +
+                getToggleBtnHtml(isRatesVisible) +
+              '</button>' +
+            '</div>'
+          ) : '') +
         '</div>' +
         '<div class="filter-grid">' +
           '<input type="search" class="input" id="prb-search" placeholder="بحث برقم المشكلة أو الحجز أو العميل..." value="' + esc(state.search || '') + '">' +
@@ -306,7 +311,7 @@
                 '<td class="mono tabular-nums" dir="ltr" style="white-space:nowrap;">' + esc(fmtDateTime(p.updatedAt, ctx)) + '</td>' +
                 '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   '<button type="button" class="btn btn-sm btn-primary btn-manage-prb" data-id="' + esc(p.id) + '">متابعة / تحديث</button>' +
-                  (!closed ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb" data-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
+                  ((!closed && canCloseTicketBtn) ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb" data-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
                 '</div></td>' +
               '</tr>';
             }).join('') +
@@ -363,7 +368,7 @@
               if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
               refreshProblemsRegion({ forceRefresh: true, silentRefresh: true });
             });
-          });
+          }, { spamAction: 'updateProblem', spamSig: pid + ':مغلقة' });
         });
       });
     }
@@ -451,6 +456,7 @@
   function openProblemUpdateModal(problem, employees, ctx, onSaved, onCancel) {
     var user = root.RGAuth.getUser();
     var canEditTicket = Boolean(user && root.RGCrmCore.canUserPerform(user, 'edit_ticket_details'));
+    var canCloseTicketModalBtn = !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_close_delete_ticket');
     var modalRoot = document.getElementById('modal-root');
     var empList = Array.isArray(employees) && employees.length ? employees.slice() : [];
     if (!empList.length && root.RGApp && root.RGApp.getEmployeesState) {
@@ -522,7 +528,7 @@
           '</div>' +
           '<div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-              (!isAlreadyClosed ? '<button type="button" class="btn btn-danger" id="prb-close-ticket-btn">إغلاق المشكلة</button>' : '') +
+              ((!isAlreadyClosed && canCloseTicketModalBtn) ? '<button type="button" class="btn btn-danger" id="prb-close-ticket-btn">إغلاق المشكلة</button>' : '') +
               '<button type="button" class="btn" id="prb-open-res-btn">فتح الحجز المرتبط</button>' +
             '</div>' +
             '<button type="submit" class="btn btn-primary" id="prb-save-ticket-btn">' + (canEditTicket ? 'حفظ التذكرة والتحديث' : 'حفظ التحديث') + '</button>' +
@@ -538,25 +544,66 @@
 
     var handledSubmit = false;
 
+    function snapshotPrbForm() {
+      var stEl = document.getElementById('pu-status');
+      var prEl = document.getElementById('pu-prio');
+      var custEl = document.getElementById('pu-customer');
+      var descEl = document.getElementById('pu-desc');
+      var emps = Array.from(modalRoot.querySelectorAll('.pu-emp-chk:checked')).map(function (c) { return c.value; }).sort();
+      return JSON.stringify({
+        status: stEl ? stEl.value : '',
+        priority: prEl ? prEl.value : '',
+        customer: custEl ? String(custEl.value || '').trim() : '',
+        description: descEl ? String(descEl.value || '').trim() : '',
+        emps: emps
+      });
+    }
+    var initialPrbSnapshot = snapshotPrbForm();
+
     function closeModalNow() {
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      } else if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+        root.RGApp.setUnsavedGuard(null);
+      }
       modalRoot.innerHTML = '';
     }
 
-    document.getElementById('prb-upd-close').addEventListener('click', function () {
-      if (onCancel) onCancel();
-      else closeModalNow();
-    });
+    function requestPrbClose() {
+      var proceed = function () {
+        if (onCancel) {
+          closeModalNow();
+          onCancel();
+        } else {
+          closeModalNow();
+        }
+      };
+      if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+        root.RGApp.requestCloseWithGuard(proceed);
+      } else {
+        proceed();
+      }
+    }
+
+    document.getElementById('prb-upd-close').addEventListener('click', requestPrbClose);
 
     var openResBtn = document.getElementById('prb-open-res-btn');
     if (openResBtn && problem.reservationId && root.RGReservations && root.RGReservations.openReservationDrawer) {
       openResBtn.addEventListener('click', function () {
-        root.RGReservations.openReservationDrawer(problem.reservationId, ctx, empList, onSaved);
+        var proceedRes = function () {
+          closeModalNow();
+          root.RGReservations.openReservationDrawer(problem.reservationId, ctx, empList, onSaved);
+        };
+        if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+          root.RGApp.requestCloseWithGuard(proceedRes);
+        } else {
+          proceedRes();
+        }
       });
     }
 
     function submitProblemUpdate(forceCloseStatus, triggerBtn) {
-      if (handledSubmit) return;
-      handledSubmit = true;
+      if (handledSubmit) return false;
 
       var selectedEmpIds = empList.length
         ? Array.from(modalRoot.querySelectorAll('.pu-emp-chk:checked')).map(function (c) { return c.value; })
@@ -581,6 +628,7 @@
       }
 
       runWithLock(triggerBtn, 'updateProblem:' + problem.id, function () {
+        handledSubmit = true;
         // Close immediately after save/close action
         closeModalNow();
 
@@ -599,6 +647,32 @@
         return syncProblemUpdateInBackground(payload, ctx, function () {
           if (onSaved) onSaved(null);
         });
+      }, { spamAction: 'updateProblem', spamSig: problem.id + ':' + nextStatus + ':' + nextPrio + ':' + noteVal });
+      return true;
+    }
+
+    if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+      root.RGApp.setUnsavedGuard({
+        label: 'تحديث المشكلة ' + (problem.problemNumber || ''),
+        isDirty: function () {
+          if (handledSubmit) return false;
+          var formEl = document.getElementById('prb-upd-form');
+          if (!formEl) return false;
+          var noteEl = document.getElementById('pu-note');
+          if (noteEl && String(noteEl.value || '').trim().length > 0) return true;
+          return snapshotPrbForm() !== initialPrbSnapshot;
+        },
+        onSave: function () {
+          return submitProblemUpdate('', document.getElementById('prb-save-ticket-btn'));
+        },
+        onDiscard: function () {
+          if (onCancel) {
+            closeModalNow();
+            onCancel();
+          } else {
+            closeModalNow();
+          }
+        }
       });
     }
 

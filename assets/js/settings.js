@@ -31,7 +31,7 @@
     });
   }
 
-  function formatPersonalSummaryLabels(tf, np, lang) {
+  function formatPersonalSummaryLabels(tf, np, lang, tzMode) {
     var isEn = lang === 'en';
     var timeTxt = tf === '12h'
       ? (isEn ? '12-Hour (AM/PM)' : 'نظام 12 ساعة (ص / م)')
@@ -41,7 +41,12 @@
       : (np === 'bottom'
           ? (isEn ? 'Bottom Dock (Icons Only)' : 'في الأسفل (أيقونات فقط)')
           : (isEn ? 'Side Bar' : 'على الجانب'));
-    return { timeTxt: timeTxt, posTxt: posTxt };
+    var tzTxt = tzMode === 'sa'
+      ? (isEn ? 'Original Saudi Time Only' : 'التوقيت الأصلي السعودي فقط')
+      : (tzMode === 'eg'
+          ? (isEn ? 'Egypt Time Only' : 'التوقيت المصري فقط')
+          : (isEn ? 'Both (Saudi Orig. + Egypt)' : 'كلاهما معاً (السعودي + المصري)'));
+    return { timeTxt: timeTxt, posTxt: posTxt, tzTxt: tzTxt };
   }
 
   function formatSettingDateTime(val, ctx) {
@@ -60,15 +65,16 @@
     var isEn = ctx && ctx.lang === 'en';
     var tf = (ctx && ctx.getTimeFormat) ? ctx.getTimeFormat() : ((root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h');
     var np = (ctx && ctx.getSidebarPosition) ? ctx.getSidebarPosition() : ((root.RGApp && root.RGApp.getSidebarPosition) ? root.RGApp.getSidebarPosition() : 'side');
-    var labels = formatPersonalSummaryLabels(tf, np, ctx && ctx.lang);
+    var tz = (ctx && ctx.getTimezoneMode) ? ctx.getTimezoneMode() : ((root.RGApp && root.RGApp.getTimezoneMode) ? root.RGApp.getTimezoneMode() : 'both');
+    var labels = formatPersonalSummaryLabels(tf, np, ctx && ctx.lang, tz);
     var userName = (user && user.name) ? user.name : '';
     return '<div class="surface-card rg-personal-entry-card" id="personal-settings-card">' +
       '<div class="section-header" style="margin-bottom:12px;">' +
         '<div>' +
           '<h2 class="section-title">' + (isEn ? 'Personal Account Settings' : 'الحساب الشخصي وتفضيلات العرض') + '</h2>' +
           '<p class="section-subtitle">' + (isEn
-            ? ('Control your preferred 12h/24h time format and Top, Side, or Bottom icon navigation bar' + (userName ? (' — ' + escapeHtml(userName)) : '') + '.')
-            : ('تحكم في طريقة عرض الوقت (12 أو 24 ساعة) وموضع شريط الأقسام (على الجانب أو في الأعلى أو في الأسفل كأيقونات بدون كتابة)' + (userName ? (' — ' + escapeHtml(userName)) : '') + '.')) + '</p>' +
+            ? ('Control your preferred 12h/24h time format, Saudi/Egypt booking timezone, and navigation bar' + (userName ? (' — ' + escapeHtml(userName)) : '') + '.')
+            : ('تحكم في طريقة عرض الوقت (12 أو 24 ساعة) وتوقيت مواعيد الحجوزات وموضع الشريط' + (userName ? (' — ' + escapeHtml(userName)) : '') + '.')) + '</p>' +
         '</div>' +
         '<div class="toolbar-row" style="margin-bottom:0;">' +
           '<button type="button" class="btn btn-primary" id="btn-open-personal-settings">' +
@@ -81,6 +87,10 @@
         '<div class="rg-personal-chip">' +
           '<span class="rg-personal-chip-k">' + (isEn ? 'Time Display' : 'نظام عرض الوقت') + '</span>' +
           '<strong class="rg-personal-chip-v" id="personal-summary-time">' + escapeHtml(labels.timeTxt) + '</strong>' +
+        '</div>' +
+        '<div class="rg-personal-chip">' +
+          '<span class="rg-personal-chip-k">' + (isEn ? 'Booking Timezone' : 'توقيت مواعيد الحجوزات') + '</span>' +
+          '<strong class="rg-personal-chip-v" id="personal-summary-tz">' + escapeHtml(labels.tzTxt) + '</strong>' +
         '</div>' +
         '<div class="rg-personal-chip">' +
           '<span class="rg-personal-chip-k">' + (isEn ? 'Navigation Bar' : 'موضع الشريط الجانبي') + '</span>' +
@@ -101,21 +111,28 @@
         }
       });
     }
-    var onPersonalChange = function (ev) {
-      if (!container || !container.isConnected) {
-        document.removeEventListener('rg:personalprefschange', onPersonalChange);
-        return;
-      }
-      var det = (ev && ev.detail) || {};
-      var tf = det.timeFormat || ((ctx && ctx.getTimeFormat) ? ctx.getTimeFormat() : '24h');
-      var np = det.sidebarPosition || ((ctx && ctx.getSidebarPosition) ? ctx.getSidebarPosition() : 'side');
-      var labels = formatPersonalSummaryLabels(tf, np, ctx && ctx.lang);
-      var timeEl = document.getElementById('personal-summary-time');
-      var posEl = document.getElementById('personal-summary-pos');
-      if (timeEl) timeEl.textContent = labels.timeTxt;
-      if (posEl) posEl.textContent = labels.posTxt;
-    };
-    document.addEventListener('rg:personalprefschange', onPersonalChange);
+    if (container && !container._rgSettingsPrefsBound) {
+      container._rgSettingsPrefsBound = true;
+      var onPersonalChange = function (ev) {
+        if (!container || !container.isConnected) {
+          document.removeEventListener('rg:personalprefschange', onPersonalChange);
+          container._rgSettingsPrefsBound = false;
+          return;
+        }
+        var det = (ev && ev.detail) || {};
+        var tf = det.timeFormat || ((ctx && ctx.getTimeFormat) ? ctx.getTimeFormat() : '24h');
+        var np = det.sidebarPosition || ((ctx && ctx.getSidebarPosition) ? ctx.getSidebarPosition() : 'side');
+        var tz = det.timezoneMode || ((ctx && ctx.getTimezoneMode) ? ctx.getTimezoneMode() : 'both');
+        var labels = formatPersonalSummaryLabels(tf, np, ctx && ctx.lang, tz);
+        var timeEl = document.getElementById('personal-summary-time');
+        var tzEl = document.getElementById('personal-summary-tz');
+        var posEl = document.getElementById('personal-summary-pos');
+        if (timeEl) timeEl.textContent = labels.timeTxt;
+        if (tzEl) tzEl.textContent = labels.tzTxt;
+        if (posEl) posEl.textContent = labels.posTxt;
+      };
+      document.addEventListener('rg:personalprefschange', onPersonalChange);
+    }
   }
 
   async function render(container, ctx) {
@@ -124,23 +141,30 @@
     var canAccessApi = root.RGCrmCore.canAccessApi(user);
     var canSync = root.RGCrmCore.canUserPerform(user, 'sync_data');
     var canManageSettings = root.RGCrmCore.canUserPerform(user, 'manage_settings');
+    var canManageRoleUiDefaults = root.RGCrmCore.canUserPerform(user, 'manage_role_ui_defaults') || canManageSettings;
+    var cachedEmpData = root.RGApi.getCachedData ? root.RGApi.getCachedData('getEmployees', {}, true) : null;
     var personalCardHtml = buildPersonalAccountCardHtml(user, ctx);
 
-    if (!canAccessApi && !canManageSettings) {
+    if (!canAccessApi && !canManageSettings && !canManageRoleUiDefaults) {
       container.innerHTML =
         personalCardHtml +
         '<div class="surface-card">' +
           '<h2 class="section-title">إعدادات النظام وفحص الاتصال</h2>' +
-          '<p class="section-subtitle">إعدادات النظام واختبارات الاتصال والمزامنة مخصصة للمدير العام والمشرف فقط، بينما تبقى إعدادات الحساب الشخصي متاحة لك أعلاه.</p>' +
+          '<p class="section-subtitle">إعدادات النظام واختبارات الاتصال والمزامنة مخصصة للمبرمج والمدير العام والمشرف فقط، بينما تبقى إعدادات الحساب الشخصي متاحة لك أعلاه.</p>' +
         '</div>';
       bindPersonalAccountCard(container, ctx);
       return;
     }
 
-    var [settingsRes, syncRes, capsRes] = await Promise.all([
+    var [settingsRes, syncRes, capsRes, empPresetsRes] = await Promise.all([
       root.RGApi.callApi('getSettings', { abortKey: 'set:main' }),
       canSync ? root.RGApi.callApi('getSyncStatus', { abortKey: 'set:sync' }) : Promise.resolve({ success: true, data: { logs: [], lastSync: null } }),
-      root.RGApi.getSetupCapabilities ? root.RGApi.getSetupCapabilities().catch(function () { return { success: false }; }) : Promise.resolve({ success: false })
+      root.RGApi.getSetupCapabilities ? root.RGApi.getSetupCapabilities().catch(function () { return { success: false }; }) : Promise.resolve({ success: false }),
+      cachedEmpData
+        ? Promise.resolve({ success: true, data: cachedEmpData })
+        : ((canManageSettings || canManageRoleUiDefaults)
+            ? root.RGApi.callApi('getEmployees', { silentRefresh: true }).catch(function () { return { success: false }; })
+            : Promise.resolve({ success: false }))
     ]);
     if (settingsRes && settingsRes.aborted) return;
 
@@ -211,7 +235,13 @@
       ? ('الوضع الحالي: <strong>متصل بقاعدة البيانات السحابية (Neon PostgreSQL)</strong> · وسيط الخادم: <strong>' + (isVercelProxyAlive ? 'مفعّل (/api/crm)' : 'استضافة محلية') + '</strong>')
       : ('الوضع الحالي: <strong>' + (root.RGApi.isLiveMode() ? 'متصل بـ Google Apps Script (/exec)' : 'وضع المعاينة المحلية (Sandbox)') + '</strong>');
 
-    var isGeneralManager = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER);
+    var isGeneralManager = Boolean(
+      user && root.RGCrmCore && (
+        (typeof root.RGCrmCore.isPrivilegedRole === 'function' && root.RGCrmCore.isPrivilegedRole(user)) ||
+        (root.RGCrmCore.ROLES && (user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER || user.role === root.RGCrmCore.ROLES.DEVELOPER))
+      )
+    );
+    var isDeveloperUser = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.DEVELOPER);
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var cacheStats = (root.RGApi && root.RGApi.getLocalCacheStats) ? root.RGApi.getLocalCacheStats() : { reservationsCount: 0, customersCount: 0, detailsCount: 0 };
     var uiPresetsMap = (root.RGCrmCore && root.RGCrmCore.TEAM_UI_PRESETS) || {};
@@ -232,6 +262,52 @@
       ? root.RGCrmCore.normalizeUiSimplificationSettings(settings.ui_simplification)
       : { preset: 'full', hideSecondaryCarMeta: false, hideCustomerContactExtras: false, hideFinancialBreakdown: false, hideDrawerCharts: false, hideDashboardRadar: false, hideDashboardHeatmap: false };
     var initialHiddenCount = uiOptionsList.filter(function (opt) { return Boolean(uiSimp[opt.key]); }).length;
+
+    var roleUiDefaultsDraft = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+      ? root.RGCrmCore.normalizeRoleUiDefaults(
+          settings.role_ui_defaults ||
+          (ctx && ctx.getRoleUiDefaults && ctx.getRoleUiDefaults()) ||
+          (root.RGApp && root.RGApp.getRoleUiDefaults && root.RGApp.getRoleUiDefaults()) ||
+          {}
+        )
+      : {};
+    var activeRoleDefaultTab = 'agent';
+    var ROLE_UI_COLS = [
+      { key: 'reservationNumber', label: 'رقم الحجز' },
+      { key: 'customerName', label: 'اسم العميل' },
+      { key: 'customerPhone', label: 'الجوال' },
+      { key: 'companyName', label: 'الشركة' },
+      { key: 'branchName', label: 'الفرع' },
+      { key: 'carName', label: 'السيارة' },
+      { key: 'startDate', label: 'بداية الحجز' },
+      { key: 'endDate', label: 'نهاية الحجز' },
+      { key: 'daysCount', label: 'الأيام' },
+      { key: 'extensionsCount', label: 'عدد التمديدات' },
+      { key: 'extendedUntilDate', label: 'التمديد لحد' },
+      { key: 'extensionsAmount', label: 'سعر التمديد' },
+      { key: 'totalAmount', label: 'الإجمالي' },
+      { key: 'originalStatusAr', label: 'الحالة الأصلية' },
+      { key: 'internalStatus', label: 'المتابعة الداخلية' },
+      { key: 'assignedEmployeeNames', label: 'الموظفون المسؤولون' },
+      { key: 'priority', label: 'الأولوية' },
+      { key: 'lastUpdateText', label: 'آخر تحديث' },
+      { key: 'lastUpdatedByName', label: 'آخر موظف' },
+      { key: 'lastUpdatedAt', label: 'التاريخ والوقت' }
+    ];
+    var ROLE_TABS_META = [
+      { key: 'agent', label: 'موظف خدمة العملاء' },
+      { key: 'supervisor', label: 'المشرف' },
+      { key: 'general_manager', label: 'المدير العام' },
+      { key: 'developer', label: 'المبرمج' }
+    ];
+    var rolePresetsList = (root.RGCrmCore && root.RGCrmCore.normalizeRolePresets)
+      ? root.RGCrmCore.normalizeRolePresets(empPresetsRes && empPresetsRes.success && empPresetsRes.data ? empPresetsRes.data.rolePresets : null)
+      : [];
+    var realSetActor = (root.RGApp && root.RGApp.getPreviewState) ? root.RGApp.getPreviewState().realUser : user;
+    var canPreviewSettings = Boolean(realSetActor && root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realSetActor));
+    var allowedPreviewRolesSettings = (root.RGCrmCore && root.RGCrmCore.getAllowedPreviewRoles)
+      ? root.RGCrmCore.getAllowedPreviewRoles(realSetActor)
+      : [];
 
     var hoPresets = (root.RGCrmCore && root.RGCrmCore.SHIFT_HANDOVER_PRESETS) || [
       { key: '8h', labelAr: 'آخر 8 ساعات', labelEn: 'Last 8 Hours' },
@@ -259,6 +335,33 @@
 
     container.innerHTML =
       personalCardHtml +
+      (isDeveloperUser ? (
+        '<div class="surface-card rg-dev-badge-card" style="border-top:3px solid var(--brand-primary);margin-bottom:16px;">' +
+          '<div class="section-header" style="margin-bottom:0;">' +
+            '<div>' +
+              '<h2 class="section-title">وضع المبرمج (صلاحيات الإدارة التقنية الكاملة)</h2>' +
+              '<p class="section-subtitle">أنت تستخدم حساب المبرمج المسؤول عن الإعدادات، الربط البرمجي، الأعمدة الافتراضية لكل دور، وحماية حسابات النظام.</p>' +
+            '</div>' +
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+              '<button type="button" class="btn btn-sm" id="btn-dev-open-sections">إظهار / إخفاء الأقسام لكل موظف</button>' +
+              '<button type="button" class="btn btn-sm btn-primary" id="btn-edit-developer-data">تعديل بيانات المبرمج</button>' +
+              '<span class="status-tag status-danger">DEVELOPER</span>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="surface-card" id="dev-stats-control-card" style="border-top:3px solid var(--brand-primary);margin-bottom:16px;">' +
+          '<div class="section-header">' +
+            '<div>' +
+              '<h2 class="section-title">تحكم المبرمج في الإحصائيات — من يظهر ومن يشاهد</h2>' +
+              '<p class="section-subtitle">تحكم مستقل في الموظفين الذين تظهر أرقامهم وأسماؤهم في لوحة الصدارة والتقارير، ومن يملك صلاحية مشاهدة الإحصائيات.</p>' +
+            '</div>' +
+            '<span class="status-tag status-info">DEVELOPER STATS</span>' +
+          '</div>' +
+          '<div id="dev-stats-control-host">' +
+            '<div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
+          '</div>' +
+        '</div>'
+      ) : '') +
       '<div class="surface-card" id="connection-diagnostics-card">' +
         '<div class="section-header">' +
           '<div>' +
@@ -279,7 +382,7 @@
           'تمت إزالة جميع نماذج ربط قاعدة البيانات و<span class="mono" dir="ltr">Google Apps Script</span> و<span class="mono" dir="ltr">Vercel</span> من واجهة الموقع؛ تُضبط هذه المتغيرات من بيئة الخادم فقط، وتُستخدم الأزرار التالية لفحص الاتصال ومسح كاش المتصفح، مع إتاحة تحديث توكن <span class="mono" dir="ltr">RG_TOKEN</span> فقط.' +
         '</div>' +
 
-        '<div class="toolbar-row" style="margin-top:0;margin-bottom:0;flex-wrap:wrap;">' +
+        '<div class="toolbar-row rg-ui-set-diag" style="margin-top:0;margin-bottom:0;flex-wrap:wrap;">' +
           '<button type="button" class="btn btn-primary" id="btn-test-all-connections">فحص جميع الاتصالات</button>' +
           '<button type="button" class="btn" id="btn-test-server-health">فحص الخادم (/api/health)</button>' +
           '<button type="button" class="btn" id="btn-test-neon-db">فحص قاعدة البيانات (Neon)</button>' +
@@ -319,7 +422,7 @@
       ) : '') +
 
       (canSync ? (
-        '<div class="surface-card">' +
+        '<div class="surface-card" id="settings-sync-card">' +
           '<div class="section-header">' +
             '<div><h2 class="section-title">مزامنة بيانات Rental Gate API</h2>' +
             '<p class="section-subtitle">يتم السحب عبر الخادم السحابي وGoogle Apps Script · الكاش المحلي (IndexedDB): <strong class="tabular-nums">' + cacheStats.reservationsCount + '</strong> حجز · <strong class="tabular-nums">' + cacheStats.customersCount + '</strong> عميل</p></div>' +
@@ -516,9 +619,34 @@
             '</div>' +
           '</div>' +
 
-          '<div style="margin-top:14px;"><button type="submit" class="btn btn-primary" id="btn-save-sys-settings">حفظ الإعدادات وتحديث المزامنة التلقائية</button></div>' +
+          '<div class="rg-ui-simp-panel rg-role-defaults-panel" id="set-role-ui-defaults-panel">' +
+            '<div class="rg-ui-simp-header">' +
+              '<div>' +
+                '<strong style="font-size:14px;">التحكم المركزي بإعدادات الواجهة الافتراضية لكل دور (Role UI Defaults)</strong>' +
+                '<div style="font-size:12px;color:var(--text-muted);">اضبط نمط التبسيط والأعمدة الافتراضية لجدول الحجوزات لكل دور (موظف / مشرف / مدير / مبرمج)، مع خيار الفرض المركزي ومنع التجاوز المحلي.</div>' +
+              '</div>' +
+              '<div class="rg-role-tabs" id="set-role-ui-tabs">' +
+                ROLE_TABS_META.map(function (rt) {
+                  var rCfg = roleUiDefaultsDraft[rt.key] || {};
+                  return '<button type="button" class="btn btn-sm rg-role-tab-btn' + (activeRoleDefaultTab === rt.key ? ' btn-primary' : '') + '" data-role-tab="' + escapeHtml(rt.key) + '">' +
+                    escapeHtml(rt.label) + (rCfg.enabled ? ' ✓' : '') +
+                  '</button>';
+                }).join('') +
+              '</div>' +
+            '</div>' +
+            '<div id="set-role-ui-editor-body"></div>' +
+          '</div>' +
+
+          '<div style="margin-top:14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+              '<button type="submit" class="btn btn-primary" id="btn-save-sys-settings">حفظ الإعدادات وتحديث المزامنة التلقائية</button>' +
+              (canPreviewSettings
+                ? '<button type="button" class="btn rg-preview-inline-btn" id="btn-preview-role-defaults">👁️ معاينة النظام بدور: موظف خدمة العملاء</button>'
+                : '') +
+            '</div>' +
+          '</div>' +
         '</form>' +
-        '<div class="surface-card" id="danger-zone-reservations-card" style="border-top:3px solid var(--status-danger-text, #f43f5e);">' +
+        '<div class="surface-card rg-ui-set-danger" id="danger-zone-reservations-card" style="border-top:3px solid var(--status-danger-text, #f43f5e);">' +
           '<div class="section-header" style="margin-bottom:8px;">' +
             '<div>' +
               '<h2 class="section-title" style="color:var(--status-danger-text, #f43f5e);">إدارة بيانات الحجوزات (الاستيراد والحذف الآمن)</h2>' +
@@ -533,6 +661,63 @@
       ) : '');
 
     bindPersonalAccountCard(container, ctx);
+
+    var editDevBtn = document.getElementById('btn-edit-developer-data');
+    if (editDevBtn) {
+      editDevBtn.addEventListener('click', function () {
+        if (root.RGEmployees && typeof root.RGEmployees.openEditDeveloperModal === 'function') {
+          root.RGEmployees.openEditDeveloperModal(ctx, function () {
+            render(container, ctx);
+          });
+        }
+      });
+    }
+
+    var devOpenSectionsBtn = document.getElementById('btn-dev-open-sections');
+    if (devOpenSectionsBtn) {
+      devOpenSectionsBtn.addEventListener('click', function () {
+        if (root.RGEmployees && typeof root.RGEmployees.openEmployeeSectionsModal === 'function') {
+          var empList = (root.RGApp && typeof root.RGApp.getEmployeesState === 'function')
+            ? (root.RGApp.getEmployeesState().items || [])
+            : [];
+          root.RGEmployees.openEmployeeSectionsModal(null, empList, ctx, function () {
+            render(container, ctx);
+          });
+        }
+      });
+    }
+
+    var devStatsHost = document.getElementById('dev-stats-control-host');
+    if (isDeveloperUser && devStatsHost && root.RGEmployees && typeof root.RGEmployees.mountStatsControlPanel === 'function') {
+      (async function () {
+        try {
+          var emps = (root.RGApp && typeof root.RGApp.getEmployeesState === 'function')
+            ? (root.RGApp.getEmployeesState().items || [])
+            : [];
+          if (!emps.length && root.RGApi) {
+            var eResp = await root.RGApi.callApi('getEmployees', { silentRefresh: true });
+            if (eResp && eResp.success && eResp.data && Array.isArray(eResp.data.items)) {
+              emps = eResp.data.items;
+              if (root.RGApp && typeof root.RGApp.syncEmployeesStateFromPayload === 'function') {
+                root.RGApp.syncEmployeesStateFromPayload(eResp.data);
+              }
+            }
+          }
+          if (!devStatsHost.isConnected) return;
+          root.RGEmployees.mountStatsControlPanel(devStatsHost, emps, ctx, {
+            saveBtnId: 'btn-save-dev-stats-control'
+          });
+        } catch (_e) {
+          if (devStatsHost.isConnected) {
+            devStatsHost.innerHTML = '<div class="empty-state" style="padding:14px;">تعذر تحميل قائمة الموظفين لتحكم الإحصائيات.</div>';
+          }
+        }
+      })();
+    }
+
+    if (root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {
+      root.RGApp.animateProgressiveReveal(container);
+    }
 
     var connResultsEl = document.getElementById('conn-test-results');
     var diagCardsByKey = {};
@@ -828,7 +1013,7 @@
                 }
               }
               if (!spFrom && !spTo) {
-                ctx.toast('يرجى تحديد تاريخ البداية عند اختيار السحب من تاريخ معين.', true);
+                ctx.toast('يرجى تحديد تاريخ البداية أو تاريخ النهاية على الأقل.', true);
                 syncNowBtn.textContent = prevText;
                 return;
               }
@@ -982,59 +1167,341 @@
       });
     }
 
+    var roleEditorBody = document.getElementById('set-role-ui-editor-body');
+    var roleTabsWrap = document.getElementById('set-role-ui-tabs');
+
+    function renderRoleDefaultsEditor() {
+      if (!roleEditorBody) return;
+      var curCfg = roleUiDefaultsDraft[activeRoleDefaultTab] || {
+        enabled: false,
+        forceForRole: false,
+        uiSimplification: null,
+        visibleCols: (root.RGCrmCore && root.RGCrmCore.DEFAULT_RESERVATIONS_VISIBLE_COLS) ? root.RGCrmCore.DEFAULT_RESERVATIONS_VISIBLE_COLS.slice() : ['reservationNumber', 'customerName', 'carName', 'startDate', 'totalAmount', 'originalStatusAr', 'internalStatus']
+      };
+      var roleUiObj = curCfg.uiSimplification || (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings ? root.RGCrmCore.normalizeUiSimplificationSettings({ preset: 'full' }) : { preset: 'full' });
+      var roleCols = Array.isArray(curCfg.visibleCols) ? curCfg.visibleCols : [];
+      if (roleTabsWrap) {
+        roleTabsWrap.querySelectorAll('.rg-role-tab-btn').forEach(function (btn) {
+          var rKey = btn.getAttribute('data-role-tab');
+          var rtMeta = ROLE_TABS_META.find(function (m) { return m.key === rKey; });
+          var cfgItem = roleUiDefaultsDraft[rKey] || {};
+          btn.classList.toggle('btn-primary', rKey === activeRoleDefaultTab);
+          if (rtMeta) btn.textContent = rtMeta.label + (cfgItem.enabled ? ' ✓' : '');
+        });
+      }
+
+      var matchingJobs = rolePresetsList.filter(function (p) { return p && p.role === activeRoleDefaultTab; });
+      var activeRoleMeta = ROLE_TABS_META.find(function (m) { return m.key === activeRoleDefaultTab; }) || { key: activeRoleDefaultTab, label: activeRoleDefaultTab };
+
+      var previewFooterBtn = document.getElementById('btn-preview-role-defaults');
+      if (previewFooterBtn) {
+        var canPreviewTab = allowedPreviewRolesSettings.indexOf(activeRoleDefaultTab) !== -1;
+        previewFooterBtn.textContent = '👁️ معاينة النظام بدور: ' + activeRoleMeta.label;
+        previewFooterBtn.disabled = !canPreviewTab;
+        previewFooterBtn.title = canPreviewTab
+          ? ('معاينة النظام مباشرة بإعدادات وأعمدة دور ' + activeRoleMeta.label)
+          : 'لا يمكنك محاكاة هذا الدور';
+      }
+
+      roleEditorBody.innerHTML =
+        '<div class="rg-role-defaults-body">' +
+          (activeRoleDefaultTab === 'developer'
+            ? '<div class="rg-dev-role-note"><strong>صلاحيات المبرمج الكاملة:</strong> يمتلك المبرمج كافة الصلاحيات البرمجية وإدارة الموقع والإعدادات والربط التقني وفحص الخادم وقاعدة البيانات والأعمدة الافتراضية، مع إمكانية معاينة أي دور أو وظيفة.</div>'
+            : '') +
+          '<div class="rg-role-toggles-row">' +
+            '<label class="checkbox-item" style="font-weight:700;"><input type="checkbox" id="role-ui-enabled"' + (curCfg.enabled ? ' checked' : '') + '> تفعيل إعدادات واجهة خاصة بهذا الدور</label>' +
+            '<label class="checkbox-item"><input type="checkbox" id="role-ui-force"' + (curCfg.forceForRole ? ' checked' : '') + '> فرض الأعمدة والإعدادات ومنع التجاوز المحلي للموظفين</label>' +
+          '</div>' +
+          '<div class="rg-role-jobs-strip">' +
+            '<div class="rg-role-jobs-head"><strong>الوظائف المرتبطة بهذا الدور (' + matchingJobs.length + '):</strong></div>' +
+            (matchingJobs.length
+              ? '<div class="rg-role-jobs-list">' + matchingJobs.map(function (jp) {
+                  var canPrevJob = canPreviewSettings && allowedPreviewRolesSettings.indexOf(jp.role) !== -1;
+                  return '<div class="rg-role-job-chip">' +
+                    '<div class="rg-role-job-info"><strong>' + escapeHtml(jp.label) + '</strong><span>' + escapeHtml(jp.jobTitle) + ' · <span class="tabular-nums">' + ((jp.permissions || []).length) + ' صلاحية</span></span></div>' +
+                    (canPrevJob
+                      ? '<button type="button" class="btn btn-sm rg-role-job-preview-btn" data-preset-id="' + escapeHtml(jp.id) + '" data-role="' + escapeHtml(jp.role) + '" data-label="' + escapeHtml(jp.label) + '">👁️ معاينة الوظيفة</button>'
+                      : '') +
+                  '</div>';
+                }).join('') + '</div>'
+              : '<span style="font-size:12px;color:var(--text-muted);">لا توجد قوالب وظائف مرتبطة بهذا الدور حالياً (يمكنك إضافتها من شاشة الموظفين).</span>') +
+          '</div>' +
+          '<div class="form-grid-2" style="margin-top:4px;">' +
+            '<div class="form-group">' +
+              '<label class="form-label" for="role-ui-preset">نمط تبسيط الواجهة الافتراضي للدور</label>' +
+              '<select class="select" id="role-ui-preset">' +
+                ['full', 'medium', 'small', 'custom'].map(function (pid) {
+                  var pr = uiPresetsMap[pid] || { id: pid, labelAr: pid };
+                  return '<option value="' + escapeHtml(pid) + '"' + (roleUiObj.preset === pid ? ' selected' : '') + '>' + escapeHtml(pr.labelAr || pid) + '</option>';
+                }).join('') +
+              '</select>' +
+            '</div>' +
+            '<div class="form-group">' +
+              '<label class="form-label" for="role-ui-flag-filter">تصفية خيارات التبسيط للدور</label>' +
+              '<input type="search" class="input" id="role-ui-flag-filter" placeholder="ابحث لإظهار أو إخفاء أزرار معينة لهذا الدور...">' +
+            '</div>' +
+          '</div>' +
+          '<details class="rg-ui-group-card" style="margin-top:8px;" open>' +
+            '<summary class="rg-ui-group-summary"><span class="rg-ui-group-title">الأعمدة الافتراضية لجدول الحجوزات لهذا الدور</span><span class="rg-ui-group-count tabular-nums">' + roleCols.length + ' / ' + ROLE_UI_COLS.length + '</span></summary>' +
+            '<div class="rg-ui-group-body">' +
+              '<div class="checkbox-grid">' +
+                ROLE_UI_COLS.map(function (col) {
+                  var isChk = roleCols.indexOf(col.key) !== -1;
+                  return '<label class="checkbox-item"><input type="checkbox" class="role-ui-col-chk" value="' + escapeHtml(col.key) + '"' + (isChk ? ' checked' : '') + '> <span>' + escapeHtml(col.label) + '</span></label>';
+                }).join('') +
+              '</div>' +
+            '</div>' +
+          '</details>' +
+          '<details class="rg-ui-group-card" style="margin-top:8px;">' +
+            '<summary class="rg-ui-group-summary"><span class="rg-ui-group-title">خيارات إظهار/إخفاء العناصر الخاصة بهذا الدور</span><span class="rg-ui-group-count tabular-nums" id="role-ui-flags-cnt">' + uiOptionsList.filter(function (o) { return Boolean(roleUiObj[o.key]); }).length + ' / ' + uiOptionsList.length + ' مخفي</span></summary>' +
+            '<div class="rg-ui-group-body">' +
+              '<div class="checkbox-grid" id="role-ui-flags-grid">' +
+                uiOptionsList.map(function (opt) {
+                  var isOn = Boolean(roleUiObj[opt.key]);
+                  var sTxt = ((opt.labelAr || '') + ' ' + (opt.labelEn || '') + ' ' + opt.key).toLowerCase();
+                  return '<label class="checkbox-item role-ui-opt-item" data-search="' + escapeHtml(sTxt) + '">' +
+                    '<input type="checkbox" class="role-ui-flag-chk" value="' + escapeHtml(opt.key) + '"' + (isOn ? ' checked' : '') + '> <span>' + escapeHtml(opt.labelAr) + '</span>' +
+                  '</label>';
+                }).join('') +
+              '</div>' +
+            '</div>' +
+          '</details>' +
+        '</div>';
+
+      var ensureRoleDraftObj = function () {
+        if (!roleUiDefaultsDraft[activeRoleDefaultTab]) {
+          roleUiDefaultsDraft[activeRoleDefaultTab] = { enabled: false, forceForRole: false, uiSimplification: null, visibleCols: ROLE_UI_COLS.slice(0, 7).map(function (c) { return c.key; }) };
+        }
+        return roleUiDefaultsDraft[activeRoleDefaultTab];
+      };
+
+      roleEditorBody.querySelectorAll('.rg-role-job-preview-btn').forEach(function (jBtn) {
+        jBtn.addEventListener('click', function () {
+          var pId = jBtn.getAttribute('data-preset-id') || '';
+          var pRole = jBtn.getAttribute('data-role') || activeRoleDefaultTab;
+          var pLabel = jBtn.getAttribute('data-label') || '';
+          if (root.RGApp && typeof root.RGApp.startPreviewSession === 'function') {
+            root.RGApp.startPreviewSession({
+              role: pRole,
+              presetId: pId,
+              customLabel: pLabel,
+              draftRoleUiDefaults: roleUiDefaultsDraft
+            });
+          }
+        });
+      });
+
+      var enChk = document.getElementById('role-ui-enabled');
+      var forceChk = document.getElementById('role-ui-force');
+      var rPreset = document.getElementById('role-ui-preset');
+      var rFilter = document.getElementById('role-ui-flag-filter');
+
+      if (enChk) {
+        enChk.addEventListener('change', function () {
+          ensureRoleDraftObj().enabled = Boolean(enChk.checked);
+          renderRoleDefaultsEditor();
+        });
+      }
+      if (forceChk) {
+        forceChk.addEventListener('change', function () {
+          var d = ensureRoleDraftObj();
+          d.forceForRole = Boolean(forceChk.checked);
+          if (d.forceForRole && !d.enabled) {
+            d.enabled = true;
+            renderRoleDefaultsEditor();
+          }
+        });
+      }
+      if (rPreset) {
+        rPreset.addEventListener('change', function () {
+          var pid = rPreset.value;
+          var d = ensureRoleDraftObj();
+          var base = uiPresetsMap[pid] || { preset: pid };
+          d.uiSimplification = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+            ? root.RGCrmCore.normalizeUiSimplificationSettings(Object.assign({ preset: pid }, base))
+            : Object.assign({ preset: pid }, base);
+          d.enabled = true;
+          renderRoleDefaultsEditor();
+        });
+      }
+      if (rFilter) {
+        rFilter.addEventListener('input', function () {
+          var q = String(rFilter.value || '').trim().toLowerCase();
+          var grid = document.getElementById('role-ui-flags-grid');
+          if (!grid) return;
+          grid.querySelectorAll('.role-ui-opt-item').forEach(function (lbl) {
+            var s = lbl.getAttribute('data-search') || '';
+            lbl.classList.toggle('hidden', Boolean(q) && s.indexOf(q) === -1);
+          });
+          var detailsWrap = grid.closest('details');
+          if (q && detailsWrap) detailsWrap.open = true;
+        });
+      }
+
+      roleEditorBody.querySelectorAll('.role-ui-col-chk').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          var d = ensureRoleDraftObj();
+          var selected = Array.prototype.slice.call(roleEditorBody.querySelectorAll('.role-ui-col-chk:checked')).map(function (x) { return x.value; });
+          if (selected.length === 0) {
+            cb.checked = true;
+            ctx.toast('يجب الإبقاء على عمود واحد على الأقل.', true);
+            return;
+          }
+          d.visibleCols = selected;
+          d.enabled = true;
+          renderRoleDefaultsEditor();
+        });
+      });
+
+      roleEditorBody.querySelectorAll('.role-ui-flag-chk').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          var d = ensureRoleDraftObj();
+          var nextUi = Object.assign({}, d.uiSimplification || { preset: 'custom' }, { preset: 'custom' });
+          roleEditorBody.querySelectorAll('.role-ui-flag-chk').forEach(function (x) {
+            nextUi[x.value] = Boolean(x.checked);
+          });
+          d.uiSimplification = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+            ? root.RGCrmCore.normalizeUiSimplificationSettings(nextUi)
+            : nextUi;
+          d.enabled = true;
+          var cntEl = document.getElementById('role-ui-flags-cnt');
+          if (cntEl) {
+            var hCnt = uiOptionsList.filter(function (o) { return Boolean(d.uiSimplification[o.key]); }).length;
+            cntEl.textContent = hCnt + ' / ' + uiOptionsList.length + ' مخفي';
+          }
+          if (rPreset) rPreset.value = 'custom';
+          if (enChk && !enChk.checked) {
+            enChk.checked = true;
+            if (roleTabsWrap) renderRoleDefaultsEditor();
+          }
+        });
+      });
+    }
+
+    if (roleTabsWrap) {
+      roleTabsWrap.querySelectorAll('.rg-role-tab-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          activeRoleDefaultTab = btn.getAttribute('data-role-tab') || 'agent';
+          renderRoleDefaultsEditor();
+        });
+      });
+    }
+    renderRoleDefaultsEditor();
+
+    var previewRoleDefaultsBtn = document.getElementById('btn-preview-role-defaults');
+    if (previewRoleDefaultsBtn) {
+      previewRoleDefaultsBtn.addEventListener('click', function () {
+        if (allowedPreviewRolesSettings.indexOf(activeRoleDefaultTab) === -1) {
+          ctx.toast('لا يمكنك محاكاة هذا الدور.', true);
+          return;
+        }
+        var normDraftRoleUi = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+          ? root.RGCrmCore.normalizeRoleUiDefaults(roleUiDefaultsDraft)
+          : roleUiDefaultsDraft;
+        if (root.RGApp && typeof root.RGApp.startPreviewSession === 'function') {
+          root.RGApp.startPreviewSession({
+            role: activeRoleDefaultTab,
+            draftRoleUiDefaults: normDraftRoleUi
+          });
+        }
+      });
+    }
+
+    function clearSettingsUnsavedGuard() {
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      } else if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+        root.RGApp.setUnsavedGuard(null);
+      }
+    }
+
+    async function saveSystemSettingsCore(skipReload) {
+      var hoursEl = document.getElementById('set-auto-sync-hours');
+      var minutesEl = document.getElementById('set-auto-sync-minutes');
+      var rawHours = Number(hoursEl && hoursEl.value !== '' ? hoursEl.value : 0);
+      var rawMinutes = Number(minutesEl && minutesEl.value !== '' ? minutesEl.value : 0);
+      var autoEnabled = Boolean((document.getElementById('set-auto-sync-enabled') || {}).checked);
+
+      if (autoEnabled && (!isFinite(rawHours) || rawHours <= 0) && (!isFinite(rawMinutes) || rawMinutes <= 0)) {
+        ctx.toast('يرجى تحديد مدة لا تقل عن دقيقة واحدة للتحديث التلقائي.', true);
+        if (minutesEl) minutesEl.focus();
+        return false;
+      }
+
+      var normInterval = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncInterval)
+        ? root.RGCrmCore.normalizeAutoSyncInterval(rawHours, rawMinutes)
+        : { hours: Math.max(0, Math.min(168, Math.round(rawHours || 0))), minutes: Math.max(0, Math.min(59, Math.round(rawMinutes || 0))) };
+
+      var nextUiRaw = {
+        preset: uiPresetSelect ? uiPresetSelect.value : 'full'
+      };
+      uiFlagEls.forEach(function (chk) {
+        var key = chk.getAttribute('data-ui-key');
+        if (key) nextUiRaw[key] = Boolean(chk.checked);
+      });
+      var normUiSimp = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+        ? root.RGCrmCore.normalizeUiSimplificationSettings(nextUiRaw)
+        : nextUiRaw;
+      var normRoleDefaults = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+        ? root.RGCrmCore.normalizeRoleUiDefaults(roleUiDefaultsDraft)
+        : roleUiDefaultsDraft;
+
+      var excluded = (document.getElementById('set-excluded').value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+      var prevUiSimp = (root.RGApp && root.RGApp.getUiSimplification) ? root.RGApp.getUiSimplification() : null;
+      var prevRoleDefaults = (root.RGApp && root.RGApp.getRoleUiDefaults) ? root.RGApp.getRoleUiDefaults() : null;
+
+      if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(normRoleDefaults);
+      else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(normRoleDefaults);
+
+      if (ctx.applyUiSimplification) ctx.applyUiSimplification(normUiSimp);
+      else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(normUiSimp);
+
+      clearSettingsUnsavedGuard();
+      ctx.toast('تم حفظ الإعدادات وإعدادات الأدوار وتحديث المزامنة التلقائية (' + (autoEnabled ? formatIntervalAr(normInterval.hours, normInterval.minutes) : 'متوقف') + ').');
+
+      var res = await root.RGApi.callApi('updateSettings', {
+        _keepOptimisticCache: true,
+        _spamChecked: true,
+        company_name: document.getElementById('set-company').value,
+        session_ttl_hours: Number(document.getElementById('set-ttl').value || 24),
+        excluded_statuses: excluded,
+        allow_agent_view_all: document.getElementById('set-agent-all').checked,
+        auto_sync_enabled: autoEnabled,
+        auto_sync_interval_hours: normInterval.hours,
+        auto_sync_interval_minutes: normInterval.minutes,
+        ui_simplification: normUiSimp,
+        role_ui_defaults: normRoleDefaults
+      });
+      if (res.success) {
+        var appliedRoleDefaults = (res.data && res.data.role_ui_defaults) ? res.data.role_ui_defaults : normRoleDefaults;
+        if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(appliedRoleDefaults);
+        else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(appliedRoleDefaults);
+
+        var appliedUi = (res.data && res.data.ui_simplification) ? res.data.ui_simplification : normUiSimp;
+        if (ctx.applyUiSimplification) ctx.applyUiSimplification(appliedUi);
+        else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(appliedUi);
+        if (!skipReload) render(container, ctx);
+        return true;
+      }
+      if (prevRoleDefaults) {
+        if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(prevRoleDefaults);
+        else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(prevRoleDefaults);
+      }
+      if (prevUiSimp) {
+        if (ctx.applyUiSimplification) ctx.applyUiSimplification(prevUiSimp);
+        else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(prevUiSimp);
+      }
+      ctx.toast(res.message, true);
+      return false;
+    }
+
     var sysForm = document.getElementById('sys-settings-form');
     if (sysForm) {
       sysForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
-        var hoursEl = document.getElementById('set-auto-sync-hours');
-        var minutesEl = document.getElementById('set-auto-sync-minutes');
-        var rawHours = Number(hoursEl && hoursEl.value !== '' ? hoursEl.value : 0);
-        var rawMinutes = Number(minutesEl && minutesEl.value !== '' ? minutesEl.value : 0);
-        var autoEnabled = document.getElementById('set-auto-sync-enabled').checked;
-
-        if (autoEnabled && (!isFinite(rawHours) || rawHours <= 0) && (!isFinite(rawMinutes) || rawMinutes <= 0)) {
-          ctx.toast('يرجى تحديد مدة لا تقل عن دقيقة واحدة للتحديث التلقائي.', true);
-          if (minutesEl) minutesEl.focus();
-          return;
-        }
-
-        var normInterval = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncInterval)
-          ? root.RGCrmCore.normalizeAutoSyncInterval(rawHours, rawMinutes)
-          : { hours: Math.max(0, Math.min(168, Math.round(rawHours || 0))), minutes: Math.max(0, Math.min(59, Math.round(rawMinutes || 0))) };
-
-        var nextUiRaw = {
-          preset: uiPresetSelect ? uiPresetSelect.value : 'full'
-        };
-        uiFlagEls.forEach(function (chk) {
-          var key = chk.getAttribute('data-ui-key');
-          if (key) nextUiRaw[key] = Boolean(chk.checked);
-        });
-        var normUiSimp = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
-          ? root.RGCrmCore.normalizeUiSimplificationSettings(nextUiRaw)
-          : nextUiRaw;
-
         var submitBtn = document.getElementById('btn-save-sys-settings');
-        runWithLock(submitBtn, 'updateSettings', async function () {
-          var excluded = document.getElementById('set-excluded').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-          var res = await root.RGApi.callApi('updateSettings', {
-            company_name: document.getElementById('set-company').value,
-            session_ttl_hours: Number(document.getElementById('set-ttl').value || 24),
-            excluded_statuses: excluded,
-            allow_agent_view_all: document.getElementById('set-agent-all').checked,
-            auto_sync_enabled: autoEnabled,
-            auto_sync_interval_hours: normInterval.hours,
-            auto_sync_interval_minutes: normInterval.minutes,
-            ui_simplification: normUiSimp
-          });
-          if (res.success) {
-            var appliedUi = (res.data && res.data.ui_simplification) ? res.data.ui_simplification : normUiSimp;
-            if (ctx.applyUiSimplification) ctx.applyUiSimplification(appliedUi);
-            else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(appliedUi);
-            ctx.toast('تم حفظ الإعدادات وتبسيط الواجهة وتحديث المزامنة التلقائية (' + (autoEnabled ? formatIntervalAr(normInterval.hours, normInterval.minutes) : 'متوقف') + ').');
-            render(container, ctx);
-          } else {
-            ctx.toast(res.message, true);
-          }
+        runWithLock(submitBtn, 'updateSettings', function () {
+          return saveSystemSettingsCore(false);
         });
       });
     }
@@ -1067,42 +1534,117 @@
       });
     }
 
+    async function saveHandoverSettingsCore(skipReload) {
+      var rawNextHo = {
+        defaultPreset: (document.getElementById('ho-set-preset') || {}).value || '8h',
+        defaultTimeFrom: (document.getElementById('ho-set-time-from') || {}).value || '',
+        defaultTimeTo: (document.getElementById('ho-set-time-to') || {}).value || '',
+        includeTodayMovements: Boolean((document.getElementById('ho-inc-today') || {}).checked),
+        includePending: Boolean((document.getElementById('ho-inc-pending') || {}).checked),
+        includeClosed: Boolean((document.getElementById('ho-inc-closed') || {}).checked),
+        includeOpenProblems: Boolean((document.getElementById('ho-inc-problems') || {}).checked),
+        includeExpiring24h: Boolean((document.getElementById('ho-inc-expiring') || {}).checked),
+        autoIncludeNotes: Boolean((document.getElementById('ho-inc-notes') || {}).checked)
+      };
+      var nextHo = (root.RGCrmCore && root.RGCrmCore.normalizeHandoverSettings)
+        ? root.RGCrmCore.normalizeHandoverSettings(rawNextHo)
+        : rawNextHo;
+      var res = await root.RGApi.callApi('updateSettings', {
+        handover_settings: nextHo
+      });
+      if (res && res.success) {
+        var applied = (res.data && res.data.handover_settings) ? res.data.handover_settings : nextHo;
+        if (ctx && typeof ctx.setHandoverSettings === 'function') {
+          ctx.setHandoverSettings(applied);
+        } else if (root.RGApp && typeof root.RGApp.setHandoverSettings === 'function') {
+          root.RGApp.setHandoverSettings(applied);
+        }
+        clearSettingsUnsavedGuard();
+        ctx.toast('تم حفظ إعدادات تسليم الوردية وتعميمها بنجاح.');
+        if (!skipReload) render(container, ctx);
+        return true;
+      }
+      ctx.toast((res && res.message) || 'تعذر حفظ إعدادات تسليم الوردية.', true);
+      return false;
+    }
+
     var hoForm = document.getElementById('set-handover-card');
     if (hoForm) {
       hoForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
         var saveHoBtn = document.getElementById('btn-save-handover-settings');
-        var rawNextHo = {
-          defaultPreset: (document.getElementById('ho-set-preset') || {}).value || '8h',
-          defaultTimeFrom: (document.getElementById('ho-set-time-from') || {}).value || '',
-          defaultTimeTo: (document.getElementById('ho-set-time-to') || {}).value || '',
-          includeTodayMovements: Boolean((document.getElementById('ho-inc-today') || {}).checked),
-          includePending: Boolean((document.getElementById('ho-inc-pending') || {}).checked),
-          includeClosed: Boolean((document.getElementById('ho-inc-closed') || {}).checked),
-          includeOpenProblems: Boolean((document.getElementById('ho-inc-problems') || {}).checked),
-          includeExpiring24h: Boolean((document.getElementById('ho-inc-expiring') || {}).checked),
-          autoIncludeNotes: Boolean((document.getElementById('ho-inc-notes') || {}).checked)
-        };
-        var nextHo = (root.RGCrmCore && root.RGCrmCore.normalizeHandoverSettings)
-          ? root.RGCrmCore.normalizeHandoverSettings(rawNextHo)
-          : rawNextHo;
-        runWithLock(saveHoBtn, 'updateHandoverSettings', async function () {
-          var res = await root.RGApi.callApi('updateSettings', {
-            handover_settings: nextHo
-          });
-          if (res && res.success) {
-            var applied = (res.data && res.data.handover_settings) ? res.data.handover_settings : nextHo;
-            if (ctx && typeof ctx.setHandoverSettings === 'function') {
-              ctx.setHandoverSettings(applied);
-            } else if (root.RGApp && typeof root.RGApp.setHandoverSettings === 'function') {
-              root.RGApp.setHandoverSettings(applied);
-            }
-            ctx.toast('تم حفظ إعدادات تسليم الوردية وتعميمها بنجاح.');
-            render(container, ctx);
-          } else {
-            ctx.toast((res && res.message) || 'تعذر حفظ إعدادات تسليم الوردية.', true);
-          }
+        runWithLock(saveHoBtn, 'updateHandoverSettings', function () {
+          return saveHandoverSettingsCore(false);
         });
+      });
+    }
+
+    function captureSysSnapshot() {
+      if (!sysForm) return '';
+      var uiFlags = {};
+      uiFlagEls.forEach(function (chk) {
+        var k = chk.getAttribute('data-ui-key');
+        if (k) uiFlags[k] = Boolean(chk.checked);
+      });
+      return JSON.stringify({
+        company: (document.getElementById('set-company') || {}).value || '',
+        ttl: (document.getElementById('set-ttl') || {}).value || '',
+        excluded: (document.getElementById('set-excluded') || {}).value || '',
+        agentAll: Boolean((document.getElementById('set-agent-all') || {}).checked),
+        autoEnabled: Boolean((document.getElementById('set-auto-sync-enabled') || {}).checked),
+        autoHours: (document.getElementById('set-auto-sync-hours') || {}).value || '0',
+        autoMinutes: (document.getElementById('set-auto-sync-minutes') || {}).value || '0',
+        uiPreset: uiPresetSelect ? uiPresetSelect.value : 'full',
+        uiFlags: uiFlags,
+        roleUiDefaults: roleUiDefaultsDraft
+      });
+    }
+    function captureHoSnapshot() {
+      if (!hoForm) return '';
+      return JSON.stringify({
+        preset: (document.getElementById('ho-set-preset') || {}).value || '8h',
+        timeFrom: (document.getElementById('ho-set-time-from') || {}).value || '',
+        timeTo: (document.getElementById('ho-set-time-to') || {}).value || '',
+        today: Boolean((document.getElementById('ho-inc-today') || {}).checked),
+        pending: Boolean((document.getElementById('ho-inc-pending') || {}).checked),
+        closed: Boolean((document.getElementById('ho-inc-closed') || {}).checked),
+        problems: Boolean((document.getElementById('ho-inc-problems') || {}).checked),
+        expiring: Boolean((document.getElementById('ho-inc-expiring') || {}).checked),
+        notes: Boolean((document.getElementById('ho-inc-notes') || {}).checked)
+      });
+    }
+    var initialSysSnapshot = captureSysSnapshot();
+    var initialHoSnapshot = captureHoSnapshot();
+
+    if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+      root.RGApp.setUnsavedGuard({
+        label: 'إعدادات النظام والأدوار',
+        isDirty: function () {
+          if (!container || !container.isConnected) return false;
+          var tokEl = document.getElementById('set-rg-token');
+          if (tokEl && String(tokEl.value || '').trim().length > 0) return true;
+          if (sysForm && captureSysSnapshot() !== initialSysSnapshot) return true;
+          if (hoForm && captureHoSnapshot() !== initialHoSnapshot) return true;
+          return false;
+        },
+        onSave: async function () {
+          var ok = true;
+          if (sysForm && captureSysSnapshot() !== initialSysSnapshot) {
+            ok = await saveSystemSettingsCore(true);
+            if (!ok) return false;
+            initialSysSnapshot = captureSysSnapshot();
+          }
+          if (hoForm && captureHoSnapshot() !== initialHoSnapshot) {
+            ok = await saveHandoverSettingsCore(true);
+            if (!ok) return false;
+            initialHoSnapshot = captureHoSnapshot();
+          }
+          clearSettingsUnsavedGuard();
+          return true;
+        },
+        onDiscard: function () {
+          clearSettingsUnsavedGuard();
+        }
       });
     }
   }

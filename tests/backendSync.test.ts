@@ -257,7 +257,10 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: state.employees as any[], rowCount: state.employees.length };
     }
 
-    if (sql.startsWith('SELECT id, name, job_title, role, last_activity FROM employees')) {
+    if (
+      sql.startsWith('SELECT id, name, job_title, role, last_activity FROM employees') ||
+      sql.startsWith('SELECT id, name, job_title, role, status, last_activity FROM employees')
+    ) {
       return { rows: state.employees as any[], rowCount: state.employees.length };
     }
 

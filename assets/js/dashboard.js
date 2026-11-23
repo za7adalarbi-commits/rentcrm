@@ -266,7 +266,16 @@
   }
 
   function renderCharts(chartsData, t, ctx, isUpdate, instantUpdate) {
-    if (!root.Chart) return;
+    if (!root.Chart) {
+      if (typeof root.RGEnsureChartLoaded === 'function') {
+        root.RGEnsureChartLoaded().then(function () {
+          if (document.getElementById('chart-daily-followups') || document.getElementById('dash-charts-grid')) {
+            renderCharts(chartsData, t, ctx, isUpdate, instantUpdate);
+          }
+        }).catch(function () {});
+      }
+      return;
+    }
     var c = themeColors();
     var reduced = prefersReducedMotion();
     var isEn = ctx && ctx.lang === 'en';
@@ -1142,9 +1151,10 @@
       };
     });
 
-    var canHandover = (core && core.canUserViewDashboardSection)
-      ? core.canUserViewDashboardSection(currentUser, 'dash_view_handover')
-      : true;
+    var canHandover = (
+      (!core || !core.canUserViewDashboardSection || core.canUserViewDashboardSection(currentUser, 'dash_view_handover')) &&
+      (!core || !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_handover_pdf'))
+    );
 
     var orderedVisibleDefs = activeOrder.map(function (id) {
       return visBySec[id] ? visBySec[id].def : null;
@@ -1208,6 +1218,120 @@
           var resId = btn.getAttribute('data-res-id');
           if (root.RGReservations && root.RGReservations.openReservationDrawer) {
             root.RGReservations.openReservationDrawer(resId, ctx, [], function () {
+              render(wrap.closest('.route-view') || document.getElementById('page-content'), ctx, { silent: true });
+            });
+          }
+        });
+      });
+    }
+
+    function renderLeaderboardCard(wrap, leaderboard, ctx) {
+      if (!wrap) return;
+      var isEn = ctx && ctx.lang === 'en';
+      var list = Array.isArray(leaderboard) ? leaderboard : [];
+      if (!list.length) {
+        wrap.innerHTML = '<div class="empty-state" style="padding:20px;">' +
+          (isEn ? 'No active staff activity recorded yet for the leaderboard.' : 'لا توجد بيانات أداء مسجلة لعرض لوحة الصدارة حالياً.') +
+        '</div>';
+        return;
+      }
+      var roleLabels = (core && core.ROLE_LABELS && (core.ROLE_LABELS[isEn ? 'en' : 'ar'] || core.ROLE_LABELS.ar)) || {};
+      var topScore = Math.max(1, Number((list[0] && list[0].score) || 1));
+
+      function getInitials(nameStr) {
+        var clean = String(nameStr || '').trim();
+        if (!clean) return '؟';
+        var parts = clean.split(/[\s\-·\/]+/).filter(function (w) { return /[\p{L}\p{N}]/u.test(w); });
+        if (parts.length >= 2) return parts[0].charAt(0) + parts[1].charAt(0);
+        if (parts.length === 1) return parts[0].slice(0, 2);
+        return clean.slice(0, 2);
+      }
+
+      function podiumMedalSvg(rankNum) {
+        if (rankNum === 1) {
+          return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7l4.5 4.5L12 4l4.5 7.5L21 7l-2 11H5L3 7z"/><path d="M5 20h14"/></svg>';
+        }
+        return '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="9" r="5"/><path d="M8.5 13.5L7 21l5-2.5L17 21l-1.5-7.5"/></svg>';
+      }
+
+      var topThree = list.slice(0, 3);
+      var restList = list.slice(3, 10);
+
+      var podiumHtml = '<div class="rg-lb-podium">' + topThree.map(function (item, idx) {
+        var rank = Number(item.rank || (idx + 1));
+        var rankCls = rank === 1 ? 'is-gold' : (rank === 2 ? 'is-silver' : 'is-bronze');
+        var scoreNum = Number(item.score || 0);
+        var pct = scoreNum > 0 ? Math.max(8, Math.min(100, Math.round((scoreNum / topScore) * 100))) : 0;
+        var ratePct = Math.max(0, Math.min(100, Number(item.completionRate || 0)));
+        var closedVal = Number(item.closedBookingsCount !== undefined ? item.closedBookingsCount : (item.closedCount || 0));
+        var roleText = roleLabels[item.role] || item.jobTitle || item.role || '';
+        return '<button type="button" class="rg-lb-podium-card ' + rankCls + '" data-emp-id="' + esc(item.employeeId || '') + '">' +
+          '<div class="rg-lb-podium-top">' +
+            '<span class="rg-lb-medal ' + rankCls + '">' +
+              podiumMedalSvg(rank) +
+              '<span class="tabular-nums">#' + rank + (rank === 1 ? (' · ' + (isEn ? 'Top #1' : 'المركز الأول')) : '') + '</span>' +
+            '</span>' +
+            '<span class="rg-lb-podium-pts tabular-nums"><strong>' + scoreNum + '</strong> <small>' + (isEn ? 'pts' : 'نقطة') + '</small></span>' +
+          '</div>' +
+          '<div class="rg-lb-podium-person">' +
+            '<span class="rg-lb-avatar ' + rankCls + '" aria-hidden="true">' + esc(getInitials(item.name)) + '</span>' +
+            '<div class="rg-lb-person-meta">' +
+              '<strong class="rg-lb-name">' + esc(item.name || '-') + '</strong>' +
+              (roleText ? '<span class="rg-lb-role">' + esc(roleText) + '</span>' : '') +
+            '</div>' +
+          '</div>' +
+          '<div class="rg-lb-bar-track" aria-hidden="true"><div class="rg-lb-bar-fill ' + rankCls + '" style="width:' + pct + '%;"></div></div>' +
+          '<div class="rg-lb-stats tabular-nums">' +
+            '<span class="rg-lb-metric-chip">' + (isEn ? 'FU:' : 'متابعات:') + ' <strong>' + Number(item.followUpsCount || 0) + '</strong></span>' +
+            '<span class="rg-lb-metric-chip">' + (isEn ? 'Closed:' : 'منجز:') + ' <strong>' + closedVal + '</strong></span>' +
+            '<span class="rg-lb-metric-chip">' + (isEn ? 'Res:' : 'حل:') + ' <strong>' + Number(item.resolvedProblemsCount || 0) + '</strong></span>' +
+            '<span class="rg-lb-metric-chip is-rate">' + ratePct + '%</span>' +
+          '</div>' +
+        '</button>';
+      }).join('') + '</div>';
+
+      var restHtml = restList.length
+        ? '<div class="rg-lb-ranked-list">' + restList.map(function (item, idx) {
+            var rank = Number(item.rank || (idx + 4));
+            var scoreNum = Number(item.score || 0);
+            var pct = scoreNum > 0 ? Math.max(6, Math.min(100, Math.round((scoreNum / topScore) * 100))) : 0;
+            var ratePct = Math.max(0, Math.min(100, Number(item.completionRate || 0)));
+            var closedVal = Number(item.closedBookingsCount !== undefined ? item.closedBookingsCount : (item.closedCount || 0));
+            var roleText = roleLabels[item.role] || item.jobTitle || item.role || '';
+            return '<button type="button" class="rg-lb-ranked-row" data-emp-id="' + esc(item.employeeId || '') + '">' +
+              '<span class="rg-lb-rank-num tabular-nums">#' + rank + '</span>' +
+              '<span class="rg-lb-avatar is-sm" aria-hidden="true">' + esc(getInitials(item.name)) + '</span>' +
+              '<div class="rg-lb-main">' +
+                '<div class="rg-lb-top">' +
+                  '<strong class="rg-lb-name">' + esc(item.name || '-') + '</strong>' +
+                  (roleText ? '<span class="rg-lb-role">' + esc(roleText) + '</span>' : '') +
+                '</div>' +
+                '<div class="rg-lb-bar-track is-slim" aria-hidden="true"><div class="rg-lb-bar-fill" style="width:' + pct + '%;"></div></div>' +
+                '<div class="rg-lb-stats tabular-nums">' +
+                  '<span class="rg-lb-metric-chip">' + (isEn ? 'Follow-ups:' : 'متابعات:') + ' <strong>' + Number(item.followUpsCount || 0) + '</strong></span>' +
+                  '<span class="rg-lb-metric-chip">' + (isEn ? 'Closed:' : 'منجز:') + ' <strong>' + closedVal + '</strong></span>' +
+                  '<span class="rg-lb-metric-chip">' + (isEn ? 'Resolved:' : 'حل مشكلات:') + ' <strong>' + Number(item.resolvedProblemsCount || 0) + '</strong></span>' +
+                  '<span class="rg-lb-metric-chip is-rate">' + (isEn ? 'Rate:' : 'الإنجاز:') + ' <strong>' + ratePct + '%</strong></span>' +
+                '</div>' +
+              '</div>' +
+              '<div class="rg-lb-score">' +
+                '<span class="rg-lb-score-val tabular-nums">' + scoreNum + '</span>' +
+                '<span class="rg-lb-score-lbl">' + (isEn ? 'pts' : 'نقطة') + '</span>' +
+              '</div>' +
+            '</button>';
+          }).join('') + '</div>'
+        : '';
+
+      wrap.innerHTML = '<div class="rg-leaderboard-shell">' + podiumHtml + restHtml + '</div>';
+
+      wrap.querySelectorAll('[data-emp-id]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var empId = btn.getAttribute('data-emp-id');
+          if (!empId) return;
+          if (root.RGEmployees && typeof root.RGEmployees.openEmployeeDetailsDrawer === 'function') {
+            var empsState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
+            var allEmps = (empsState && Array.isArray(empsState.items)) ? empsState.items : [];
+            root.RGEmployees.openEmployeeDetailsDrawer(empId, ctx, allEmps, function () {
               render(wrap.closest('.route-view') || document.getElementById('page-content'), ctx, { silent: true });
             });
           }
@@ -1302,6 +1426,14 @@
             '</div>' +
             '<div id="dash-peak-heatmap">' + feedSkel + '</div>' +
           '</section>';
+        case 'leaderboard':
+          return '<section class="chart-card rg-ui-dash-leaderboard" id="dash-leaderboard-section">' +
+            '<div class="chart-card-head">' +
+              '<h3 class="chart-card-title">' + chartHeaderIcon('M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0V4zM5 6H3v2a3 3 0 0 0 3 3M19 6h2v2a3 3 0 0 1-3 3') + (isEn ? 'Team Performance Leaderboard' : 'لوحة الصدارة وأداء الفريق (Leaderboard)') + '</h3>' +
+              '<span class="chart-sub-hint">' + (isEn ? 'Top performers by follow-ups, closures & resolutions' : 'الترتيب حسب المتابعات والإغلاقات وحل المشكلات') + '</span>' +
+            '</div>' +
+            '<div id="dash-leaderboard-list">' + feedSkel + '</div>' +
+          '</section>';
         case 'bottom_bento':
           return '<div class="dash-bento-bottom" id="dash-bottom-bento">' +
             '<section class="chart-card">' +
@@ -1329,7 +1461,7 @@
               '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:relative;z-index:1;">' +
                 '<button type="button" class="btn btn-primary dash-jump-btn" data-jump="reservations">' + t('open_reservations') + '</button>' +
                 '<button type="button" class="btn dash-jump-btn" data-jump="reports" style="color:#FFFFFF;border-color:rgba(255,255,255,0.26);background:rgba(255,255,255,0.08);">' + t('open_reports') + '</button>' +
-                (canHandover && root.RGHandover ? '<button type="button" class="btn" id="dash-banner-handover-btn" style="color:#FFFFFF;border-color:rgba(255,255,255,0.26);background:rgba(255,255,255,0.08);">' + (isEn ? 'Shift Handover' : 'تسليم الوردية') + '</button>' : '') +
+                (canHandover && root.RGHandover ? '<button type="button" class="btn rg-ui-handover-btn" id="dash-banner-handover-btn" style="color:#FFFFFF;border-color:rgba(255,255,255,0.26);background:rgba(255,255,255,0.08);">' + (isEn ? 'Shift Handover' : 'تسليم الوردية') + '</button>' : '') +
               '</div>' +
             '</section>' +
           '</div>';
@@ -1404,8 +1536,9 @@
             '<p class="dash-welcome-sub">' + esc(t('dash_sub_ops')) + '</p>' +
           '</div>' +
           '<div class="dashboard-filter-bar">' +
-            '<button type="button" class="btn btn-sm' + (isCustomizeMode ? ' btn-primary' : '') + '" id="dash-customize-btn">' + (isEn ? (isCustomizeMode ? 'Done Customizing' : 'Customize Layout') : (isCustomizeMode ? 'إنهاء التخصيص' : 'تخصيص وترتيب اللوحة')) + '</button>' +
-            (canHandover && root.RGHandover ? '<button type="button" class="btn btn-sm btn-charcoal" id="dash-shift-handover-btn">' + (isEn ? 'Shift Handover (PDF)' : 'تسليم الوردية (PDF)') + '</button>' : '') +
+            ((currentUser && currentUser.role === 'developer') ? '<button type="button" class="btn btn-sm" id="dash-dev-stats-btn">' + (isEn ? 'Stats Visibility Control' : 'تحكم الإحصائيات') + '</button>' : '') +
+            '<button type="button" class="btn btn-sm rg-ui-dash-customize' + (isCustomizeMode ? ' btn-primary' : '') + '" id="dash-customize-btn">' + (isEn ? (isCustomizeMode ? 'Done Customizing' : 'Customize Layout') : (isCustomizeMode ? 'إنهاء التخصيص' : 'تخصيص وترتيب اللوحة')) + '</button>' +
+            (canHandover && root.RGHandover ? '<button type="button" class="btn btn-sm btn-charcoal rg-ui-handover-btn" id="dash-shift-handover-btn">' + (isEn ? 'Shift Handover (PDF)' : 'تسليم الوردية (PDF)') + '</button>' : '') +
             '<div class="segmented-control" role="tablist" aria-label="' + t('time_filter') + '">' +
               ['today', '7d', '30d', 'month', 'custom'].map(function (r) {
                 var active = state.range === r ? ' active' : '';
@@ -1436,6 +1569,19 @@
           }
           var navBtn = document.querySelector('.nav-item[data-route="' + rTarget + '"]');
           if (navBtn) navBtn.click();
+        });
+      }
+
+      var devStatsDashBtn = container.querySelector('#dash-dev-stats-btn');
+      if (devStatsDashBtn) {
+        devStatsDashBtn.addEventListener('click', function () {
+          if (root.RGEmployees && typeof root.RGEmployees.openDeveloperStatsControlModal === 'function') {
+            root.RGEmployees.openDeveloperStatsControlModal(ctx, function () {
+              loadAndPaint({ forceRefresh: true, isUpdate: true });
+            });
+          } else {
+            ctx.toast('يرجى التوجه إلى صفحة الإعدادات لفتح تحكم الإحصائيات.');
+          }
         });
       }
 
@@ -1989,6 +2135,12 @@
 
       ctx.state.lastDashboardCharts = chartsData;
       renderCharts(chartsData, t, ctx, Boolean(pOpts.isUpdate || isShellMounted || pOpts.localOnly));
+      if (visBySec.leaderboard && visBySec.leaderboard.shouldRenderData) {
+        renderLeaderboardCard(container.querySelector('#dash-leaderboard-list'), dashData.leaderboard || [], ctx);
+      }
+      if (sectionsHost && root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {
+        root.RGApp.animateProgressiveReveal(sectionsHost);
+      }
       loadSecondaryFeeds(seq, dashData.recentActivity, Boolean(pOpts.localOnly));
     }
 

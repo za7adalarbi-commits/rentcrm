@@ -17,9 +17,9 @@
     return groups;
   }
 
-  function runWithLock(btnEl, lockKey, fn) {
+  function runWithLock(btnEl, lockKey, fn, opts) {
     if (root.RGApp && root.RGApp.withActionLock) {
-      return root.RGApp.withActionLock(btnEl, lockKey, fn);
+      return root.RGApp.withActionLock(btnEl, lockKey, fn, opts);
     }
     return Promise.resolve().then(fn);
   }
@@ -69,8 +69,14 @@
     var ctx = this.ctx;
     var t = ctx.t || function (k) { return k; };
     var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var realOrCurUser = (root.RGAuth && typeof root.RGAuth.getRealUser === 'function' ? root.RGAuth.getRealUser() : null) || user;
     var canManage = Boolean(user && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'manage_employees'));
     var canReassign = Boolean(user && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'assign_employees'));
+    var isActorDeveloper = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.DEVELOPER);
+    var canActorImpersonate = Boolean(root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realOrCurUser));
+    var allowedPreviewRoles = (canActorImpersonate && root.RGCrmCore.getAllowedPreviewRoles)
+      ? root.RGCrmCore.getAllowedPreviewRoles(realOrCurUser)
+      : [];
 
     var empState = (this.appStore && typeof this.appStore.getEmployeesState === 'function')
       ? this.appStore.getEmployeesState()
@@ -84,10 +90,12 @@
     var catalogMap = {};
     catalog.forEach(function (c) { catalogMap[c.key] = c; });
 
+    var canViewPresetsSub = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(user, 'sub_view_emp_presets');
+    var canViewDelegationsSub = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(user, 'sub_view_emp_delegations');
     var roleLabels = root.RGCrmCore.ROLE_LABELS[ctx.lang] || root.RGCrmCore.ROLE_LABELS.ar;
 
-    var presetsSectionHtml = canManage ? (
-      '<section class="surface-card" id="role-presets-section">' +
+    var presetsSectionHtml = (canManage && canViewPresetsSub) ? (
+      '<section class="surface-card rg-ui-role-presets" id="role-presets-section">' +
         '<div class="section-header">' +
           '<div>' +
             '<h2 class="section-title">إدارة الصلاحيات الجاهزة (القوالب الوظيفية)</h2>' +
@@ -106,7 +114,7 @@
               return (catalogMap[k] && catalogMap[k].label) || k;
             });
             var extraCount = Math.max(0, permKeys.length - previewLabels.length);
-            var roleTagClass = pr.role === 'general_manager'
+            var roleTagClass = (pr.role === 'general_manager' || pr.role === 'developer')
               ? 'status-danger'
               : (pr.role === 'supervisor' ? 'status-warning' : 'status-info');
 
@@ -148,8 +156,8 @@
       }
     });
 
-    var delegationsSectionHtml = canManage ? (
-      '<section class="surface-card" id="delegations-section">' +
+    var delegationsSectionHtml = (canManage && canViewDelegationsSub) ? (
+      '<section class="surface-card rg-ui-emp-delegations" id="delegations-section">' +
         '<div class="section-header">' +
           '<div>' +
             '<h2 class="section-title">تفويض الصلاحيات المؤقت (Temporary Delegation)</h2>' +
@@ -200,7 +208,20 @@
         : items.map(function (e) {
           var isActive = e.status === 'active';
           var isSelf = Boolean(user && e.id === user.id);
+          var isTargetDev = e.role === 'developer';
+          var canUseDeleteEmpAction = !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_delete_employee');
+          var canMutateTarget = canManage && !isSelf && (!isTargetDev || isActorDeveloper);
+          var canEditTarget = canManage && (canMutateTarget || (isSelf && isTargetDev && isActorDeveloper));
+          var canImpersonateRow = Boolean(
+            canActorImpersonate &&
+            !isSelf &&
+            allowedPreviewRoles.indexOf(e.role) !== -1 &&
+            root.RGApp && typeof root.RGApp.startPreviewSession === 'function'
+          );
           var permsList = root.RGCrmCore.resolveEffectivePermissions(e);
+          var secSummary = (root.RGCrmCore && typeof root.RGCrmCore.getEmployeeSectionVisibilitySummary === 'function')
+            ? root.RGCrmCore.getEmployeeSectionVisibilitySummary(e)
+            : { visibleMainCount: 9, totalMainCount: 9 };
           var initialChar = String(e.name || 'م').trim().charAt(0) || 'م';
           var resCnt = e.reservationsCount !== undefined ? e.reservationsCount : ((e.stats && e.stats.assignedCount) || 0);
           var fuCnt = e.followUpsCount !== undefined ? e.followUpsCount : ((e.stats && e.stats.followUpsCount) || 0);
@@ -216,8 +237,9 @@
                 '<span class="inline-flex items-center justify-center w-7 h-7 rounded-lg font-bold text-xs shrink-0" style="background:var(--brand-soft);color:var(--brand-primary);border:1px solid rgba(217,31,43,0.26);">' + esc(initialChar) + '</span>' +
                 '<button type="button" class="btn-link-inline emp-view-btn" data-id="' + esc(e.id) + '">' + esc(e.name) + '</button>' +
                 (isSelf ? '<span class="status-tag status-neutral">أنت</span>' : '') +
+                (isTargetDev ? '<span class="status-tag status-danger">المبرمج</span>' : '') +
                 (activeDel ? '<span class="rg-delegation-pill">تفويض مشرف مؤقت</span>' : '') +
-                (canManage && !isSelf ? (
+                ((canMutateTarget && canUseDeleteEmpAction) ? (
                   '<button type="button" class="btn btn-sm btn-danger emp-del-btn" data-id="' + esc(e.id) + '" data-name="' + esc(e.name) + '" data-confirm="0" aria-label="حذف الموظف ' + esc(e.name) + '">حذف</button>'
                 ) : '') +
               '</div>' +
@@ -227,14 +249,14 @@
             '<td class="text-xs" style="color:var(--text-primary);">' + esc(e.jobTitle) + '</td>' +
             '<td>' +
               '<div class="text-xs font-semibold" style="color:var(--text-primary);">' + esc(roleLabels[e.role] || e.role) + '</div>' +
-              '<div class="text-[11px] tabular-nums" style="color:var(--text-muted);">' + permsList.length + ' صلاحية</div>' +
+              '<div class="text-[11px] tabular-nums" style="color:var(--text-muted);">' + permsList.length + ' صلاحية · ' + secSummary.visibleMainCount + '/' + secSummary.totalMainCount + ' قسم</div>' +
             '</td>' +
             '<td>' +
               '<div class="flex items-center gap-1.5 flex-wrap">' +
                 '<span class="status-tag emp-status-tag ' + (isActive ? 'status-success' : 'status-danger') + '">' +
                   (isActive ? 'نشط' : 'متوقف عن النشاط') +
                 '</span>' +
-                (canManage && !isSelf ? (
+                ((canMutateTarget && canUseDeleteEmpAction) ? (
                   '<button type="button" class="btn btn-sm emp-toggle-btn ' + (isActive ? 'btn-danger' : 'btn-primary') + '" data-id="' + esc(e.id) + '" data-next="' + (isActive ? 'disabled' : 'active') + '" title="' + (isActive ? 'إيقاف نشاط الموظف فوراً' : 'تشغيل نشاط الموظف') + '">' +
                     (isActive ? 'إيقاف' : 'تفعيل') +
                   '</button>'
@@ -245,11 +267,19 @@
             '<td class="tabular-nums text-xs font-semibold">' + fuCnt + '</td>' +
             '<td class="tabular-nums text-xs font-semibold">' + prbCnt + '</td>' +
             '<td class="mono tabular-nums text-xs whitespace-nowrap" style="color:var(--text-muted);">' + lastActText + '</td>' +
-            '<td><button type="button" class="btn btn-sm btn-primary emp-view-btn" data-id="' + esc(e.id) + '">العملاء</button></td>' +
+            '<td>' +
+              '<div class="flex items-center gap-1.5">' +
+                '<button type="button" class="btn btn-sm btn-primary emp-view-btn" data-id="' + esc(e.id) + '">العملاء</button>' +
+                ((!canManage && canImpersonateRow) ? '<button type="button" class="btn btn-sm emp-impersonate-btn" data-id="' + esc(e.id) + '" title="معاينة النظام بصلاحيات هذا الموظف">محاكاة</button>' : '') +
+              '</div>' +
+            '</td>' +
             (canManage ? (
               '<td class="whitespace-nowrap">' +
                 '<div class="flex items-center gap-1.5">' +
-                  '<button type="button" class="btn btn-sm emp-edit-btn" data-id="' + esc(e.id) + '" aria-label="تعديل بيانات ' + esc(e.name) + '">تعديل</button>' +
+                  (canEditTarget ? '<button type="button" class="btn btn-sm ' + (isTargetDev ? 'btn-primary emp-edit-dev-btn rg-ui-edit-dev-btn ' : '') + 'emp-edit-btn" data-id="' + esc(e.id) + '" aria-label="تعديل بيانات ' + esc(e.name) + '">' + (isTargetDev ? 'تعديل بيانات المبرمج' : 'تعديل') + '</button>' : '') +
+                  ((isActorDeveloper && canManage) ? '<button type="button" class="btn btn-sm emp-sections-btn" data-id="' + esc(e.id) + '" title="إظهار أو إخفاء الأقسام لهذا الموظف">الأقسام</button>' : '') +
+                  (canImpersonateRow ? '<button type="button" class="btn btn-sm emp-impersonate-btn" data-id="' + esc(e.id) + '" title="معاينة النظام بصلاحيات هذا الموظف">محاكاة</button>' : '') +
+                  ((!canEditTarget && !canImpersonateRow && !(isActorDeveloper && canManage)) ? '<span class="text-xs" style="color:var(--text-muted);">—</span>' : '') +
                 '</div>' +
               '</td>'
             ) : '') +
@@ -266,9 +296,13 @@
             '</div>' +
             ((canManage || canReassign) ? (
               '<div class="toolbar-actions">' +
-                (canReassign ? '<button type="button" class="btn" id="emp-bulk-reassign-btn">🔄 تحويل حجوزات نهاية الوردية</button>' : '') +
-                (canManage ? '<button type="button" class="btn" id="emp-scroll-presets-btn">الصلاحيات الجاهزة (' + rolePresets.length + ')</button>' : '') +
-                (canManage ? '<button type="button" class="btn btn-primary" id="emp-add-btn">إضافة موظف جديد</button>' : '') +
+                ((canReassign && (!root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_bulk_reassign'))) ? '<button type="button" class="btn rg-ui-emp-transfer" id="emp-bulk-reassign-btn">🔄 تحويل حجوزات نهاية الوردية</button>' : '') +
+                ((canManage && canViewPresetsSub) ? '<button type="button" class="btn rg-ui-role-presets" id="emp-scroll-presets-btn">الصلاحيات الجاهزة (' + rolePresets.length + ')</button>' : '') +
+                ((isActorDeveloper && canManage) ? '<button type="button" class="btn" id="emp-dev-sections-btn">إظهار / إخفاء الأقسام لكل موظف</button>' : '') +
+                ((isActorDeveloper && canManage) ? '<button type="button" class="btn" id="emp-dev-actions-btn">أزرار وإجراءات الجداول</button>' : '') +
+                ((isActorDeveloper && canManage) ? '<button type="button" class="btn" id="emp-dev-stats-btn">تحكم المبرمج في الإحصائيات</button>' : '') +
+                ((isActorDeveloper && canManage) ? '<button type="button" class="btn btn-charcoal rg-ui-edit-dev-btn" id="emp-edit-dev-btn">تعديل بيانات المبرمج</button>' : '') +
+                (canManage ? '<button type="button" class="btn btn-primary rg-ui-emp-add" id="emp-add-btn">إضافة موظف جديد</button>' : '') +
               '</div>'
             ) : '') +
           '</div>' +
@@ -300,7 +334,10 @@
         presetsSectionHtml +
       '</div>';
 
-    function reloadEmployeesFromServer() {
+    function reloadEmployeesFromServer(savedObj) {
+      if (savedObj && savedObj.id && self.appStore) {
+        return Promise.resolve(savedObj);
+      }
       if (self.appStore && typeof self.appStore.loadEmployeesState === 'function' && !canManage) {
         return self.appStore.loadEmployeesState({});
       }
@@ -347,6 +384,45 @@
       });
     });
 
+    var editDevHeaderBtn = document.getElementById('emp-edit-dev-btn');
+    if (editDevHeaderBtn) {
+      editDevHeaderBtn.addEventListener('click', function () {
+        openEditDeveloperModal(ctx, reloadEmployeesFromServer);
+      });
+    }
+
+    var devSectionsHeaderBtn = document.getElementById('emp-dev-sections-btn');
+    if (devSectionsHeaderBtn) {
+      devSectionsHeaderBtn.addEventListener('click', function () {
+        var defaultEmp = items.find(function (x) { return x && x.role !== 'developer'; }) || items[0] || null;
+        openEmployeeSectionsModal(defaultEmp, items, ctx, reloadEmployeesFromServer);
+      });
+    }
+
+    var devActionsHeaderBtn = document.getElementById('emp-dev-actions-btn');
+    if (devActionsHeaderBtn) {
+      devActionsHeaderBtn.addEventListener('click', function () {
+        var defaultEmp = items.find(function (x) { return x && x.role !== 'developer'; }) || items[0] || null;
+        openEmployeeSectionsModal(defaultEmp, items, ctx, reloadEmployeesFromServer, { focusGroup: 'table_actions' });
+      });
+    }
+
+    var devStatsHeaderBtn = document.getElementById('emp-dev-stats-btn');
+    if (devStatsHeaderBtn) {
+      devStatsHeaderBtn.addEventListener('click', function () {
+        openDeveloperStatsControlModal(ctx, reloadEmployeesFromServer);
+      });
+    }
+
+    container.querySelectorAll('.emp-sections-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var emp = items.find(function (x) { return x.id === btn.getAttribute('data-id'); });
+        if (emp) {
+          openEmployeeSectionsModal(emp, items, ctx, reloadEmployeesFromServer);
+        }
+      });
+    });
+
     container.querySelectorAll('.emp-edit-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var emp = items.find(function (x) { return x.id === btn.getAttribute('data-id'); });
@@ -359,6 +435,15 @@
       });
     });
 
+    container.querySelectorAll('.emp-impersonate-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var empId = btn.getAttribute('data-id');
+        if (empId && root.RGApp && typeof root.RGApp.startPreviewSession === 'function') {
+          root.RGApp.startPreviewSession({ employeeId: empId });
+        }
+      });
+    });
+
     container.querySelectorAll('.emp-toggle-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var empId = btn.getAttribute('data-id');
@@ -367,11 +452,11 @@
           ctx.toast(nextStatus === 'disabled' ? 'تم إيقاف نشاط الموظف وإلغاء جلساته.' : 'تم تشغيل نشاط الموظف بنجاح.');
           var resToggle = (self.appStore && typeof self.appStore.toggleEmployeeStatusInState === 'function')
             ? await self.appStore.toggleEmployeeStatusInState(empId, nextStatus, user)
-            : await root.RGApi.callApi('disableEmployee', { employeeId: empId, status: nextStatus });
+            : await root.RGApi.callApi('disableEmployee', { employeeId: empId, status: nextStatus, _spamChecked: true });
           if (!resToggle || !resToggle.success) {
             ctx.toast((resToggle && resToggle.message) || 'تعذر تحديث حالة الموظف.', true);
           }
-        });
+        }, { spamAction: 'disableEmployee', spamSig: 'disableEmployee:' + empId + ':' + nextStatus });
       });
     });
 
@@ -393,7 +478,7 @@
         runWithLock(btn, 'deleteEmployee:' + empId, async function () {
           var delResp = (self.appStore && typeof self.appStore.deleteEmployeeFromState === 'function')
             ? await self.appStore.deleteEmployeeFromState(empId, user)
-            : await root.RGApi.callApi('deleteEmployee', { employeeId: empId });
+            : await root.RGApi.callApi('deleteEmployee', { employeeId: empId, _spamChecked: true });
           if (delResp && delResp.success) {
             ctx.toast(delResp.message || ('تم حذف الموظف ' + empName + ' بنجاح.'));
             if (!self.appStore || typeof self.appStore.deleteEmployeeFromState !== 'function') {
@@ -406,7 +491,7 @@
               btn.textContent = 'حذف';
             }
           }
-        });
+        }, { spamAction: 'deleteEmployee', spamSig: 'deleteEmployee:' + empId });
       });
     });
 
@@ -424,14 +509,30 @@
         btn.addEventListener('click', function () {
           var did = btn.getAttribute('data-id');
           runWithLock(btn, 'revokeDelegation:' + did, async function () {
-            var revResp = await root.RGApi.callApi('revokeDelegation', { id: did });
-            if (revResp && revResp.success) {
-              ctx.toast(revResp.message || 'تم إلغاء التفويض المؤقت.');
-              await render(container, ctx);
-            } else {
-              ctx.toast((revResp && revResp.message) || 'تعذر إلغاء التفويض.', true);
+            var rowEl = btn.closest('tr');
+            if (rowEl) {
+              var tagEl = rowEl.querySelector('.status-tag');
+              if (tagEl) {
+                tagEl.className = 'status-tag status-neutral';
+                tagEl.textContent = 'ملغى';
+              }
+              btn.replaceWith((function () {
+                var sp = document.createElement('span');
+                sp.style.cssText = 'color:var(--text-muted);font-size:12px;';
+                sp.textContent = '—';
+                return sp;
+              })());
             }
-          });
+            if (root.RGApi && root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('revokeDelegation', { id: did }, user);
+            }
+            ctx.toast('تم إلغاء التفويض المؤقت.');
+            var revResp = await root.RGApi.callApi('revokeDelegation', { id: did, _keepOptimisticCache: true, _spamChecked: true });
+            if (!revResp || !revResp.success) {
+              ctx.toast((revResp && revResp.message) || 'تعذر إلغاء التفويض.', true);
+              await render(container, ctx);
+            }
+          }, { spamAction: 'revokeDelegation', spamSig: 'revokeDelegation:' + did });
         });
       });
 
@@ -524,6 +625,10 @@
         });
       });
     }
+
+    if (root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {
+      root.RGApp.animateProgressiveReveal(container);
+    }
   };
 
   async function render(container, ctx) {
@@ -583,6 +688,14 @@
       ? existingPreset.permissions.slice()
       : root.RGCrmCore.resolveEffectivePermissions(initialRole);
 
+    var curActor = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var realPresetActor = (root.RGApp && root.RGApp.getPreviewState) ? root.RGApp.getPreviewState().realUser : curActor;
+    var isActorDevPreset = Boolean(curActor && curActor.role === 'developer');
+    var canPreviewPreset = Boolean(realPresetActor && root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realPresetActor));
+    var allowedPreviewRolesPreset = (root.RGCrmCore && root.RGCrmCore.getAllowedPreviewRoles)
+      ? root.RGCrmCore.getAllowedPreviewRoles(realPresetActor)
+      : [];
+
     modalRoot.innerHTML =
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title">' +
         '<form class="modal-panel" id="preset-form" style="max-width:760px;">' +
@@ -598,6 +711,7 @@
               '<option value="agent"' + (initialRole === 'agent' ? ' selected' : '') + '>موظف خدمة العملاء</option>' +
               '<option value="supervisor"' + (initialRole === 'supervisor' ? ' selected' : '') + '>المشرف</option>' +
               '<option value="general_manager"' + (initialRole === 'general_manager' ? ' selected' : '') + '>المدير العام</option>' +
+              ((isActorDevPreset || initialRole === 'developer') ? '<option value="developer"' + (initialRole === 'developer' ? ' selected' : '') + '>المبرمج (صلاحيات النظام الكاملة)</option>' : '') +
             '</select></div>' +
           '</div>' +
 
@@ -622,7 +736,10 @@
           '</div>' +
 
           '<div id="pr-form-err" class="form-error hidden"></div>' +
-          '<div class="modal-footer">' +
+          '<div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">' +
+            (canPreviewPreset
+              ? '<button type="button" class="btn rg-preview-inline-btn" id="pr-preview-role-btn">👁️ معاينة النظام بهذا الدور</button>'
+              : '<span></span>') +
             '<button type="submit" class="btn btn-primary" id="pr-save-btn">' + (isEdit ? 'حفظ تعديلات الصلاحية الجاهزة' : 'حفظ الصلاحية الجاهزة') + '</button>' +
           '</div>' +
         '</form>' +
@@ -705,7 +822,36 @@
 
     renderGrid();
 
-    roleSelect.addEventListener('change', renderGrid);
+    var prPreviewBtn = document.getElementById('pr-preview-role-btn');
+    function syncPresetPreviewBtn() {
+      if (!prPreviewBtn) return;
+      var allowed = allowedPreviewRolesPreset.indexOf(roleSelect.value) !== -1;
+      prPreviewBtn.disabled = !allowed;
+      prPreviewBtn.title = allowed ? 'معاينة النظام مباشرة بصلاحيات هذا القالب' : 'لا يمكنك محاكاة هذا الدور';
+    }
+    syncPresetPreviewBtn();
+
+    roleSelect.addEventListener('change', function () {
+      syncPresetPreviewBtn();
+      renderGrid();
+    });
+
+    if (prPreviewBtn) {
+      prPreviewBtn.addEventListener('click', function () {
+        var perms = Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; });
+        if (perms.indexOf('dash_perms_configured') === -1) perms.push('dash_perms_configured');
+        if (perms.indexOf('perms_sections_configured') === -1) perms.push('perms_sections_configured');
+        if (perms.indexOf('perms_actions_configured') === -1) perms.push('perms_actions_configured');
+        var lblVal = (document.getElementById('pr-label') || {}).value || (document.getElementById('pr-job') || {}).value || '';
+        if (root.RGApp && typeof root.RGApp.startPreviewSession === 'function') {
+          root.RGApp.startPreviewSession({
+            role: roleSelect.value,
+            customPermissions: perms,
+            customLabel: String(lblVal).trim()
+          });
+        }
+      });
+    }
 
     document.getElementById('pr-perm-defaults').addEventListener('click', function () {
       selectedSet = {};
@@ -754,47 +900,119 @@
       });
     });
 
-    document.getElementById('preset-modal-cancel').addEventListener('click', function () {
+    function snapshotPresetForm() {
+      var lEl = document.getElementById('pr-label');
+      var jEl = document.getElementById('pr-job');
+      return JSON.stringify({
+        label: lEl ? String(lEl.value || '').trim() : '',
+        jobTitle: jEl ? String(jEl.value || '').trim() : '',
+        role: roleSelect ? roleSelect.value : 'agent',
+        perms: Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; }).sort()
+      });
+    }
+    var initialPresetSnapshot = snapshotPresetForm();
+
+    function clearPresetGuard() {
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      } else if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+        root.RGApp.setUnsavedGuard(null);
+      }
+    }
+
+    async function executeSavePreset() {
+      var errEl = document.getElementById('pr-form-err');
+      if (errEl) errEl.classList.add('hidden');
+      var lblInput = document.getElementById('pr-label');
+      var lblVal = lblInput ? String(lblInput.value || '').trim() : '';
+      if (!lblVal) {
+        if (errEl) {
+          errEl.textContent = 'اسم الصلاحية الجاهزة (القالب) مطلوب.';
+          errEl.classList.remove('hidden');
+        }
+        if (lblInput) lblInput.focus();
+        return false;
+      }
+      var perms = Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; });
+      if (perms.indexOf('dash_perms_configured') === -1) {
+        perms.push('dash_perms_configured');
+      }
+      if (perms.indexOf('perms_sections_configured') === -1) {
+        perms.push('perms_sections_configured');
+      }
+      if (perms.indexOf('perms_actions_configured') === -1) {
+        perms.push('perms_actions_configured');
+      }
+      var resp = await root.RGApi.callApi('saveRolePreset', {
+        id: isEdit ? existingPreset.id : '',
+        label: lblVal,
+        jobTitle: document.getElementById('pr-job').value,
+        role: roleSelect.value,
+        permissions: perms
+      });
+
+      if (!resp.success) {
+        if (errEl) {
+          errEl.textContent = resp.message;
+          errEl.classList.remove('hidden');
+        }
+        return false;
+      }
+
+      clearPresetGuard();
+      ctx.toast(resp.message || 'تم حفظ الصلاحية الجاهزة.');
+      modalRoot.innerHTML = '';
+      if (onSaved) {
+        onSaved({
+          rolePresets: resp.data.rolePresets,
+          savedPreset: resp.data.savedPreset,
+          customPermissions: liveCustomPerms
+        });
+      }
+      return true;
+    }
+
+    function cancelPresetModal() {
+      clearPresetGuard();
       if (onSaved && existingPreset && existingPreset._fromEmployeeModal) {
         onSaved({ cancelled: true, customPermissions: liveCustomPerms });
       } else {
         modalRoot.innerHTML = '';
       }
+    }
+
+    if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+      root.RGApp.setUnsavedGuard({
+        label: isEdit ? ('تعديل الصلاحية الجاهزة: ' + existingPreset.label) : 'إضافة صلاحية جاهزة جديدة',
+        isDirty: function () {
+          var f = document.getElementById('preset-form');
+          if (!f) return false;
+          var qLbl = document.getElementById('pr-quick-perm-label');
+          if (qLbl && String(qLbl.value || '').trim().length > 0) return true;
+          return snapshotPresetForm() !== initialPresetSnapshot;
+        },
+        onSave: function () {
+          return executeSavePreset();
+        },
+        onDiscard: function () {
+          cancelPresetModal();
+        }
+      });
+    }
+
+    document.getElementById('preset-modal-cancel').addEventListener('click', function () {
+      if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+        root.RGApp.requestCloseWithGuard(cancelPresetModal);
+      } else {
+        cancelPresetModal();
+      }
     });
 
     document.getElementById('preset-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
-      var errEl = document.getElementById('pr-form-err');
-      errEl.classList.add('hidden');
       var saveBtn = document.getElementById('pr-save-btn');
-      runWithLock(saveBtn, 'saveRolePreset:' + (isEdit ? existingPreset.id : 'new'), async function () {
-        var perms = Object.keys(selectedSet).filter(function (k) { return selectedSet[k]; });
-        if (perms.indexOf('dash_perms_configured') === -1) {
-          perms.push('dash_perms_configured');
-        }
-        var resp = await root.RGApi.callApi('saveRolePreset', {
-          id: isEdit ? existingPreset.id : '',
-          label: document.getElementById('pr-label').value,
-          jobTitle: document.getElementById('pr-job').value,
-          role: roleSelect.value,
-          permissions: perms
-        });
-
-        if (!resp.success) {
-          errEl.textContent = resp.message;
-          errEl.classList.remove('hidden');
-          return;
-        }
-
-        ctx.toast(resp.message || 'تم حفظ الصلاحية الجاهزة.');
-        modalRoot.innerHTML = '';
-        if (onSaved) {
-          onSaved({
-            rolePresets: resp.data.rolePresets,
-            savedPreset: resp.data.savedPreset,
-            customPermissions: liveCustomPerms
-          });
-        }
+      runWithLock(saveBtn, 'saveRolePreset:' + (isEdit ? existingPreset.id : 'new'), function () {
+        return executeSavePreset();
       });
     });
   }
@@ -923,6 +1141,14 @@
     var reservations = d.assignedReservations || [];
     var followUps = d.followUps || [];
     var roleLabels = root.RGCrmCore.ROLE_LABELS[ctx.lang] || root.RGCrmCore.ROLE_LABELS.ar;
+    var curUserD = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var realActorD = (root.RGAuth && typeof root.RGAuth.getRealUser === 'function' ? root.RGAuth.getRealUser() : null) || curUserD;
+    var canPreviewTargetD = Boolean(
+      emp && curUserD && emp.id !== curUserD.id &&
+      root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realActorD) &&
+      root.RGCrmCore.getAllowedPreviewRoles(realActorD).indexOf(emp.role) !== -1 &&
+      root.RGApp && typeof root.RGApp.startPreviewSession === 'function'
+    );
 
     modalRoot.innerHTML =
       '<div class="drawer-backdrop" id="emp-drawer-backdrop" role="dialog" aria-modal="true" aria-labelledby="emp-drawer-title">' +
@@ -931,7 +1157,10 @@
             '<div><h3 class="modal-title" id="emp-drawer-title">' + esc(emp.name) + '</h3>' +
             '<div class="meta-inline"><span>' + esc(emp.jobTitle) + '</span><span>·</span><span>' + esc(roleLabels[emp.role] || emp.role) + '</span>' +
             (emp.phone ? '<span>·</span><span class="mono cell-phone" dir="ltr">' + esc(emp.phone) + '</span>' : '') + '</div></div>' +
-            '<button type="button" class="btn btn-sm" id="emp-drawer-close">إغلاق</button>' +
+            '<div class="toolbar-row" style="margin-bottom:0;">' +
+              (canPreviewTargetD ? '<button type="button" class="btn btn-sm btn-charcoal" id="emp-drawer-impersonate-btn">👁️ معاينة النظام بهذا الحساب</button>' : '') +
+              '<button type="button" class="btn btn-sm" id="emp-drawer-close">إغلاق</button>' +
+            '</div>' +
           '</div>' +
 
           '<div class="kpi-grid-4">' +
@@ -997,7 +1226,26 @@
         '</div>' +
       '</div>';
 
-    document.getElementById('emp-drawer-close').addEventListener('click', function () { modalRoot.innerHTML = ''; });
+    function destroyEmpDrawerChart() {
+      var el = document.getElementById('emp-drawer-chart');
+      if (el && root.Chart && typeof root.Chart.getChart === 'function') {
+        var existing = root.Chart.getChart(el);
+        if (existing) existing.destroy();
+      }
+    }
+
+    document.getElementById('emp-drawer-close').addEventListener('click', function () {
+      destroyEmpDrawerChart();
+      modalRoot.innerHTML = '';
+    });
+    var impDrawerBtn = document.getElementById('emp-drawer-impersonate-btn');
+    if (impDrawerBtn) {
+      impDrawerBtn.addEventListener('click', function () {
+        destroyEmpDrawerChart();
+        modalRoot.innerHTML = '';
+        root.RGApp.startPreviewSession({ employeeId: emp.id });
+      });
+    }
 
     modalRoot.querySelectorAll('.emp-open-res').forEach(function (el) {
       el.addEventListener('click', function () {
@@ -1011,8 +1259,9 @@
       });
     });
 
-    var chartEl = document.getElementById('emp-drawer-chart');
-    if (chartEl && root.Chart) {
+    function paintEmpDrawerChart() {
+      var chartEl = document.getElementById('emp-drawer-chart');
+      if (!chartEl || !chartEl.isConnected || !root.Chart) return;
       if (typeof root.Chart.getChart === 'function') {
         var existingEmpChart = root.Chart.getChart(chartEl);
         if (existingEmpChart) existingEmpChart.destroy();
@@ -1083,6 +1332,15 @@
         }
       });
     }
+
+    var empChartEl = document.getElementById('emp-drawer-chart');
+    if (empChartEl) {
+      if (root.Chart) {
+        paintEmpDrawerChart();
+      } else if (typeof root.RGEnsureChartLoaded === 'function') {
+        root.RGEnsureChartLoaded().then(paintEmpDrawerChart).catch(function () {});
+      }
+    }
   }
 
   function openEmployeeModal(existing, ctx, onSaved, opts) {
@@ -1110,10 +1368,29 @@
         ? initialPreset.permissions.slice()
         : (existing ? root.RGCrmCore.resolveEffectivePermissions(existing) : root.RGCrmCore.resolveEffectivePermissions('agent'))
     };
+    var initialEmpSnapshot = JSON.stringify({
+      name: String(draftState.name || '').trim(),
+      username: String(draftState.username || '').trim(),
+      phone: String(draftState.phone || '').trim(),
+      email: String(draftState.email || '').trim(),
+      jobTitle: String(draftState.jobTitle || '').trim(),
+      role: draftState.role || 'agent',
+      presetId: draftState.presetId || 'custom',
+      permissions: (draftState.permissions || []).filter(function (k) {
+        return k !== 'dash_perms_configured' && k !== 'perms_sections_configured' && k !== 'perms_subsections_configured' && k !== 'perms_actions_configured';
+      }).slice().sort()
+    });
 
     function drawModal() {
       catalog = root.RGCrmCore.mergePermissionsCatalog(customPermissions);
       groups = groupCatalogItems(catalog);
+      var curEmpActor = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+      var realEmpActor = (root.RGApp && root.RGApp.getPreviewState) ? root.RGApp.getPreviewState().realUser : curEmpActor;
+      var isActorDevModal = Boolean(curEmpActor && curEmpActor.role === 'developer');
+      var canPreviewEmp = Boolean(realEmpActor && root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realEmpActor));
+      var allowedPreviewRolesEmp = (root.RGCrmCore && root.RGCrmCore.getAllowedPreviewRoles)
+        ? root.RGCrmCore.getAllowedPreviewRoles(realEmpActor)
+        : [];
 
       modalRoot.innerHTML =
         '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="emp-modal-title">' +
@@ -1148,14 +1425,15 @@
 
             '<div class="form-grid-2">' +
               '<div class="form-group"><label class="form-label" for="ef-name">الاسم الكامل</label><input class="input" id="ef-name" value="' + esc(draftState.name) + '" required></div>' +
-              '<div class="form-group"><label class="form-label" for="ef-username">اسم المستخدم</label><input class="input mono" id="ef-username" value="' + esc(draftState.username) + '" ' + (isEdit ? 'disabled' : 'required') + '></div>' +
+              '<div class="form-group"><label class="form-label" for="ef-username">اسم المستخدم</label><input class="input mono" id="ef-username" value="' + esc(draftState.username) + '" ' + ((isEdit && !isActorDevModal) ? 'disabled' : 'required') + '></div>' +
               '<div class="form-group"><label class="form-label" for="ef-phone">رقم الهاتف</label><input class="input mono" id="ef-phone" value="' + esc(draftState.phone) + '"></div>' +
               '<div class="form-group"><label class="form-label" for="ef-email">البريد الإلكتروني</label><input class="input mono" type="email" id="ef-email" value="' + esc(draftState.email) + '"></div>' +
               '<div class="form-group"><label class="form-label" for="ef-job">المسمى الوظيفي</label><input class="input" id="ef-job" value="' + esc(draftState.jobTitle) + '"></div>' +
-              '<div class="form-group"><label class="form-label" for="ef-role">الدور الأساسي</label><select class="select" id="ef-role">' +
+              '<div class="form-group"><label class="form-label" for="ef-role">الدور الأساسي</label><select class="select" id="ef-role"' + ((isEdit && existing && curEmpActor && existing.id === curEmpActor.id && existing.role === 'developer') ? ' disabled' : '') + '>' +
                 '<option value="agent"' + (draftState.role === 'agent' ? ' selected' : '') + '>موظف خدمة العملاء</option>' +
                 '<option value="supervisor"' + (draftState.role === 'supervisor' ? ' selected' : '') + '>المشرف</option>' +
                 '<option value="general_manager"' + (draftState.role === 'general_manager' ? ' selected' : '') + '>المدير العام</option>' +
+                ((isActorDevModal || draftState.role === 'developer') ? '<option value="developer"' + (draftState.role === 'developer' ? ' selected' : '') + '>المبرمج (صلاحيات النظام الكاملة)</option>' : '') +
               '</select></div>' +
             '</div>' +
 
@@ -1206,7 +1484,12 @@
             '<div class="form-group"><label class="form-label" for="ef-pass">' + (isEdit ? 'إعادة تعيين كلمة المرور (اختياري — اتركه فارغًا للإبقاء)' : 'كلمة المرور (6 أحرف على الأقل)') + '</label>' +
               '<input class="input" type="password" id="ef-pass" ' + (isEdit ? '' : 'required minlength="6"') + '></div>' +
             '<div id="emp-form-err" class="form-error hidden"></div>' +
-            '<div class="modal-footer"><button type="submit" class="btn btn-primary">' + (isEdit ? 'حفظ التعديلات والصلاحيات' : 'إنشاء الحساب') + '</button></div>' +
+            '<div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">' +
+              (canPreviewEmp
+                ? '<button type="button" class="btn rg-preview-inline-btn" id="ef-preview-role-btn">👁️ معاينة النظام بهذا الدور</button>'
+                : '<span></span>') +
+              '<button type="submit" class="btn btn-primary" id="ef-save-btn">' + (isEdit ? 'حفظ التعديلات والصلاحيات' : 'إنشاء الحساب') + '</button>' +
+            '</div>' +
           '</form>' +
         '</div>';
 
@@ -1237,12 +1520,41 @@
         delPresetBtn.disabled = isCustom;
       }
 
+      var efPreviewBtn = document.getElementById('ef-preview-role-btn');
+
       function syncApiLockForRole(roleVal) {
         var isAgent = roleVal === 'agent';
         modalRoot.querySelectorAll('.ef-perm-checkbox').forEach(function (cb) {
           if (cb.value === 'sync_data' || cb.value === 'manage_api_connection') {
             cb.disabled = isAgent;
             if (isAgent) cb.checked = false;
+          }
+        });
+        if (efPreviewBtn) {
+          var allowed = allowedPreviewRolesEmp.indexOf(roleVal) !== -1;
+          efPreviewBtn.disabled = !allowed;
+          efPreviewBtn.title = allowed ? 'معاينة النظام مباشرة بهذه الصلاحيات والدور' : 'لا يمكنك محاكاة هذا الدور';
+        }
+      }
+      syncApiLockForRole(roleSelect.value);
+
+      if (efPreviewBtn) {
+        efPreviewBtn.addEventListener('click', function () {
+          var selectedPerms = [];
+          modalRoot.querySelectorAll('.ef-perm-checkbox:checked').forEach(function (cb) {
+            if (!cb.disabled) selectedPerms.push(cb.value);
+          });
+          if (selectedPerms.indexOf('dash_perms_configured') === -1) selectedPerms.push('dash_perms_configured');
+          if (selectedPerms.indexOf('perms_sections_configured') === -1) selectedPerms.push('perms_sections_configured');
+          if (selectedPerms.indexOf('perms_subsections_configured') === -1) selectedPerms.push('perms_subsections_configured');
+          if (selectedPerms.indexOf('perms_actions_configured') === -1) selectedPerms.push('perms_actions_configured');
+          var lblName = (document.getElementById('ef-name') || {}).value || (jobInput ? jobInput.value : '');
+          if (root.RGApp && typeof root.RGApp.startPreviewSession === 'function') {
+            root.RGApp.startPreviewSession({
+              role: roleSelect.value,
+              customPermissions: selectedPerms,
+              customLabel: String(lblName || '').trim()
+            });
           }
         });
       }
@@ -1466,17 +1778,37 @@
         });
       });
 
-      document.getElementById('emp-cancel').addEventListener('click', function () {
-        modalRoot.innerHTML = '';
-        if (onSaved) onSaved();
-      });
+      function clearEmpGuard() {
+        if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+          root.RGApp.clearUnsavedGuard();
+        } else if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+          root.RGApp.setUnsavedGuard(null);
+        }
+      }
 
-      var empForm = document.getElementById('emp-form');
-      empForm.addEventListener('submit', function (ev) {
-        ev.preventDefault();
+      function snapshotCurrentEmpDom() {
+        var perms = [];
+        modalRoot.querySelectorAll('.ef-perm-checkbox:checked').forEach(function (cb) {
+          if (!cb.disabled && cb.value !== 'dash_perms_configured' && cb.value !== 'perms_sections_configured' && cb.value !== 'perms_subsections_configured' && cb.value !== 'perms_actions_configured') {
+            perms.push(cb.value);
+          }
+        });
+        perms.sort();
+        return JSON.stringify({
+          name: String((document.getElementById('ef-name') || {}).value || '').trim(),
+          username: String((document.getElementById('ef-username') || {}).value || '').trim(),
+          phone: String((document.getElementById('ef-phone') || {}).value || '').trim(),
+          email: String((document.getElementById('ef-email') || {}).value || '').trim(),
+          jobTitle: String((jobInput && jobInput.value) || '').trim(),
+          role: roleSelect ? roleSelect.value : 'agent',
+          presetId: presetSelect ? presetSelect.value : 'custom',
+          permissions: perms
+        });
+      }
+
+      async function executeSaveEmployee() {
         var errEl = document.getElementById('emp-form-err');
-        errEl.classList.add('hidden');
-        var submitBtn = empForm.querySelector('button[type="submit"]');
+        if (errEl) errEl.classList.add('hidden');
 
         var selectedPerms = [];
         modalRoot.querySelectorAll('.ef-perm-checkbox:checked').forEach(function (cb) {
@@ -1485,17 +1817,46 @@
         if (selectedPerms.indexOf('dash_perms_configured') === -1) {
           selectedPerms.push('dash_perms_configured');
         }
+        if (selectedPerms.indexOf('perms_sections_configured') === -1) {
+          selectedPerms.push('perms_sections_configured');
+        }
+        if (selectedPerms.indexOf('perms_subsections_configured') === -1) {
+          selectedPerms.push('perms_subsections_configured');
+        }
+        if (selectedPerms.indexOf('perms_actions_configured') === -1) {
+          selectedPerms.push('perms_actions_configured');
+        }
 
         var payload = {
-          name: document.getElementById('ef-name').value,
-          username: document.getElementById('ef-username').value,
-          phone: document.getElementById('ef-phone').value,
-          email: document.getElementById('ef-email').value,
-          jobTitle: document.getElementById('ef-job').value,
+          name: document.getElementById('ef-name').value.trim(),
+          username: document.getElementById('ef-username').value.trim(),
+          phone: document.getElementById('ef-phone').value.trim(),
+          email: document.getElementById('ef-email').value.trim(),
+          jobTitle: document.getElementById('ef-job').value.trim(),
           role: document.getElementById('ef-role').value,
           permissions: selectedPerms
         };
         var pwd = document.getElementById('ef-pass').value;
+        if (!payload.name) {
+          errEl.textContent = 'يرجى إدخال الاسم الكامل للموظف.';
+          errEl.classList.remove('hidden');
+          return false;
+        }
+        if (!payload.username) {
+          errEl.textContent = 'اسم المستخدم مطلوب.';
+          errEl.classList.remove('hidden');
+          return false;
+        }
+        if (!isEdit && (!pwd || pwd.length < 6)) {
+          errEl.textContent = 'اسم المستخدم وكلمة المرور (6 أحرف على الأقل) مطلوبان.';
+          errEl.classList.remove('hidden');
+          return false;
+        }
+        if (pwd && pwd.length < 6) {
+          errEl.textContent = 'كلمة المرور يجب أن تكون 6 أحرف على الأقل.';
+          errEl.classList.remove('hidden');
+          return false;
+        }
         if (isEdit) {
           payload.employeeId = existing.id;
           if (pwd) payload.newPassword = pwd;
@@ -1503,19 +1864,182 @@
           payload.password = pwd;
         }
 
-        runWithLock(submitBtn, isEdit ? ('updateEmployee:' + existing.id) : ('createEmployee:' + payload.username), async function () {
-          var res = await root.RGApi.callApi(isEdit ? 'updateEmployee' : 'createEmployee', payload);
-          if (!res.success) {
-            errEl.textContent = res.message;
-            errEl.classList.remove('hidden');
-            return;
+        if (root.RGApp && typeof root.RGApp.checkActionSpam === 'function') {
+          var empSpamSig = (isEdit ? 'updateEmployee:' : 'createEmployee:') +
+            [payload.employeeId || '', payload.username, payload.name, payload.role, selectedPerms.length, pwd ? 'pw' : ''].join('|');
+          var empSpamCheck = root.RGApp.checkActionSpam(isEdit ? 'updateEmployee' : 'createEmployee', empSpamSig);
+          if (!empSpamCheck.allowed) {
+            return false;
           }
-          if (res.data && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
-            ctx.appState.upsertEmployeeInState(res.data);
+          payload._spamChecked = true;
+        }
+
+        if (isEdit && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
+          var optEmp = Object.assign({}, existing, {
+            name: payload.name,
+            username: payload.username,
+            phone: payload.phone,
+            email: payload.email,
+            jobTitle: payload.jobTitle,
+            role: payload.role,
+            permissions: selectedPerms
+          });
+          ctx.appState.upsertEmployeeInState(optEmp);
+          var realActorNow = (root.RGAuth && typeof root.RGAuth.getRealUser === 'function')
+            ? root.RGAuth.getRealUser()
+            : (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
+          if (realActorNow && realActorNow.id === optEmp.id) {
+            if (root.RGAuth && typeof root.RGAuth.updateCurrentUser === 'function') {
+              var nextCur = root.RGAuth.updateCurrentUser({
+                name: optEmp.name,
+                username: optEmp.username,
+                phone: optEmp.phone,
+                email: optEmp.email,
+                jobTitle: optEmp.jobTitle,
+                role: optEmp.role,
+                permissions: optEmp.permissions
+              });
+              if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') {
+                root.RGApp.syncCurrentUserShell(nextCur || optEmp);
+              }
+            }
           }
-          ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
+          clearEmpGuard();
+          ctx.toast('تم تحديث بيانات وصلاحيات الموظف.');
+          modalRoot.innerHTML = '';
+          if (onSaved) onSaved(optEmp);
+          root.RGApi.callApi('updateEmployee', payload).then(function (bgRes) {
+            if (!bgRes || !bgRes.success) {
+              ctx.appState.upsertEmployeeInState(existing);
+              if (realActorNow && realActorNow.id === existing.id && root.RGAuth && typeof root.RGAuth.updateCurrentUser === 'function') {
+                var revUser = root.RGAuth.updateCurrentUser(existing);
+                if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') {
+                  root.RGApp.syncCurrentUserShell(revUser || existing);
+                }
+              }
+              ctx.toast((bgRes && bgRes.message) || 'تعذر حفظ تعديلات الموظف على الخادم.', true);
+              return;
+            }
+            if (bgRes.data) {
+              ctx.appState.upsertEmployeeInState(bgRes.data);
+              if (realActorNow && realActorNow.id === bgRes.data.id && root.RGAuth && typeof root.RGAuth.updateCurrentUser === 'function') {
+                var syncedUser = root.RGAuth.updateCurrentUser(bgRes.data);
+                if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') {
+                  root.RGApp.syncCurrentUserShell(syncedUser || bgRes.data);
+                }
+              }
+            }
+          }).catch(function () {
+            ctx.appState.upsertEmployeeInState(existing);
+            ctx.toast('تعذر حفظ تعديلات الموظف على الخادم.', true);
+          });
+          return true;
+        }
+
+        if (!isEdit && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
+          var createActor = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+          var newOptEmp = {
+            id: 'EMP_OPT_' + Date.now(),
+            name: payload.name,
+            username: payload.username,
+            phone: payload.phone,
+            email: payload.email,
+            jobTitle: payload.jobTitle || 'موظف خدمة العملاء',
+            role: payload.role,
+            permissions: selectedPerms,
+            status: 'active',
+            reservationsCount: 0,
+            followUpsCount: 0,
+            problemsCount: 0,
+            lastActivity: new Date().toISOString()
+          };
+          ctx.appState.upsertEmployeeInState(newOptEmp);
+          if (root.RGApi && root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('createEmployee', { _optimisticEmployee: newOptEmp }, createActor);
+          }
+          clearEmpGuard();
+          ctx.toast('تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
+          modalRoot.innerHTML = '';
+          if (onSaved) onSaved(newOptEmp);
+          root.RGApi.callApi('createEmployee', Object.assign({ _keepOptimisticCache: true }, payload)).then(function (bgCreateRes) {
+            if (!bgCreateRes || !bgCreateRes.success) {
+              if (typeof ctx.appState.removeEmployeeLocal === 'function') {
+                ctx.appState.removeEmployeeLocal(newOptEmp.id);
+              }
+              ctx.toast((bgCreateRes && bgCreateRes.message) || 'تعذر إنشاء حساب الموظف على الخادم.', true);
+              return;
+            }
+            if (bgCreateRes.data) {
+              if (typeof ctx.appState.removeEmployeeLocal === 'function') {
+                ctx.appState.removeEmployeeLocal(newOptEmp.id);
+              }
+              ctx.appState.upsertEmployeeInState(bgCreateRes.data);
+            }
+          }).catch(function () {
+            if (typeof ctx.appState.removeEmployeeLocal === 'function') {
+              ctx.appState.removeEmployeeLocal(newOptEmp.id);
+            }
+            ctx.toast('تعذر الاتصال بالخادم أثناء إنشاء حساب الموظف.', true);
+          });
+          return true;
+        }
+
+        var res = await root.RGApi.callApi(isEdit ? 'updateEmployee' : 'createEmployee', payload);
+        if (!res.success) {
+          errEl.textContent = res.message;
+          errEl.classList.remove('hidden');
+          return false;
+        }
+        clearEmpGuard();
+        if (res.data && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
+          ctx.appState.upsertEmployeeInState(res.data);
+        }
+        ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
+        modalRoot.innerHTML = '';
+        if (onSaved) onSaved(res.data);
+        return true;
+      }
+
+      if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+        root.RGApp.setUnsavedGuard({
+          label: isEdit ? ('تعديل بيانات ' + (existing.name || 'الموظف')) : 'إنشاء حساب موظف جديد',
+          isDirty: function () {
+            var f = document.getElementById('emp-form');
+            if (!f) return false;
+            var pwdEl = document.getElementById('ef-pass');
+            if (pwdEl && String(pwdEl.value || '').length > 0) return true;
+            return snapshotCurrentEmpDom() !== initialEmpSnapshot;
+          },
+          onSave: function () {
+            return executeSaveEmployee();
+          },
+          onDiscard: function () {
+            clearEmpGuard();
+            modalRoot.innerHTML = '';
+            if (onSaved) onSaved();
+          }
+        });
+      }
+
+      document.getElementById('emp-cancel').addEventListener('click', function () {
+        var proceedClose = function () {
+          clearEmpGuard();
           modalRoot.innerHTML = '';
           if (onSaved) onSaved();
+        };
+        if (root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+          root.RGApp.requestCloseWithGuard(proceedClose);
+        } else {
+          proceedClose();
+        }
+      });
+
+      var empForm = document.getElementById('emp-form');
+      empForm.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var submitBtn = document.getElementById('ef-save-btn') || empForm.querySelector('button[type="submit"]');
+        runWithLock(submitBtn, isEdit ? ('updateEmployee:' + existing.id) : ('createEmployee:' + (document.getElementById('ef-username').value || 'new')), function () {
+          return executeSaveEmployee();
         });
       });
     }
@@ -1532,7 +2056,7 @@
     var modalRoot = document.getElementById('modal-root');
     if (!modalRoot) return;
     var candidates = (Array.isArray(employees) ? employees : []).filter(function (e) {
-      return e && e.status === 'active' && e.role !== 'general_manager';
+      return e && e.status === 'active' && e.role !== 'general_manager' && e.role !== 'developer';
     });
     if (!candidates.length) {
       ctx.toast('لا يوجد موظفون نشطون متاحون لمنح التفويض المؤقت.', true);
@@ -1604,23 +2128,38 @@
       }
 
       var submitBtn = document.getElementById('del-grant-submit');
-      runWithLock(submitBtn, 'saveDelegation:' + empId, async function () {
-        var resp = await root.RGApi.callApi('saveDelegation', {
+      runWithLock(submitBtn, 'saveDelegation:' + empId, function () {
+        var delActor = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+        var targetCand = candidates.find(function (e) { return e.id === empId; });
+        var delPayload = {
           delegateEmployeeId: empId,
           delegatedRole: 'supervisor',
           startsAt: sDate.toISOString(),
           expiresAt: eDate.toISOString(),
           reason: reasonVal
-        });
-        if (!resp || !resp.success) {
-          errEl.textContent = (resp && resp.message) || 'تعذر حفظ التفويض المؤقت.';
-          errEl.classList.remove('hidden');
-          return;
+        };
+        var optDelegation = Object.assign({
+          id: 'DEL_OPT_' + Date.now(),
+          delegateEmployeeName: targetCand ? targetCand.name : empId,
+          status: 'active',
+          isActiveNow: true
+        }, delPayload);
+        if (root.RGApi && root.RGApi.applyOptimisticMutation) {
+          root.RGApi.applyOptimisticMutation('saveDelegation', { _optimisticDelegation: optDelegation }, delActor);
         }
-        ctx.toast(resp.message || 'تم منح تفويض المشرف المؤقت بنجاح.');
+        ctx.toast('تم منح تفويض المشرف المؤقت بنجاح.');
         closeDelModal();
-        if (onDone) onDone(resp.data);
-      });
+        if (onDone) onDone(optDelegation);
+        return root.RGApi.callApi('saveDelegation', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, delPayload)).then(function (resp) {
+          if (!resp || !resp.success) {
+            ctx.toast((resp && resp.message) || 'تعذر حفظ التفويض المؤقت على الخادم.', true);
+            if (onDone) onDone();
+          }
+        }).catch(function () {
+          ctx.toast('تعذر الاتصال بالخادم أثناء حفظ التفويض.', true);
+          if (onDone) onDone();
+        });
+      }, { spamAction: 'saveDelegation', spamSig: 'saveDelegation:' + empId });
     });
   }
 
@@ -1727,7 +2266,8 @@
         var resp = await root.RGApi.callApi('bulkReassignEmployeeReservations', {
           fromEmployeeId: fId,
           toEmployeeId: tId,
-          onlyActive: onlyActive
+          onlyActive: onlyActive,
+          _spamChecked: true
         });
         if (!resp || !resp.success) {
           errEl.textContent = (resp && resp.message) || 'تعذر تنفيذ التحويل الجماعي.';
@@ -1741,7 +2281,726 @@
         }
         closeBr();
         if (onDone) onDone(resp.data);
+      }, { spamAction: 'bulkReassignEmployeeReservations', spamSig: 'bulkReassign:' + fId + ':' + tId });
+    });
+  }
+
+  function openEditDeveloperModal(ctx, onSaved) {
+    var curUser = (root.RGAuth && typeof root.RGAuth.getRealUser === 'function')
+      ? root.RGAuth.getRealUser()
+      : (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
+    if (!curUser || curUser.role !== 'developer') {
+      if (ctx && ctx.toast) ctx.toast('هذه الميزة متاحة لحساب المبرمج فقط.', true);
+      return;
+    }
+    var empState = (root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState() : null;
+    var list = (empState && Array.isArray(empState.items)) ? empState.items : [];
+    var devRecord = list.find(function (e) { return e && (e.id === curUser.id || e.role === 'developer'); }) || curUser;
+    openEmployeeModal(devRecord, ctx, onSaved || function () {}, {
+      rolePresets: (empState && empState.rolePresets) || [],
+      customPermissions: (empState && empState.customPermissions) || []
+    });
+  }
+
+  function getStatsControlConfigFromApp(ctx) {
+    var raw = (ctx && typeof ctx.getStatsControlConfig === 'function')
+      ? ctx.getStatsControlConfig()
+      : (root.RGApp && typeof root.RGApp.getStatsControlConfig === 'function' ? root.RGApp.getStatsControlConfig() : null);
+    return (root.RGCrmCore && typeof root.RGCrmCore.normalizeStatsControlConfig === 'function')
+      ? root.RGCrmCore.normalizeStatsControlConfig(raw)
+      : { excludedFromStatsEmployeeIds: [], updatedAt: '', updatedBy: '' };
+  }
+
+  function getRealActorForDevFeatures() {
+    if (root.RGAuth && typeof root.RGAuth.getRealUser === 'function') {
+      return root.RGAuth.getRealUser() || root.RGAuth.getUser();
+    }
+    return (root.RGAuth && typeof root.RGAuth.getUser === 'function') ? root.RGAuth.getUser() : null;
+  }
+
+  function renderSwitchMarkup(idAttr, cls, dataAttrHtml, checked, disabled, labelText) {
+    return '<label class="rg-switch-label">' +
+      '<span class="rg-switch-control">' +
+        '<input type="checkbox"' +
+          (idAttr ? (' id="' + esc(idAttr) + '"') : '') +
+          (cls ? (' class="' + esc(cls) + '"') : '') +
+          (dataAttrHtml ? (' ' + dataAttrHtml) : '') +
+          (checked ? ' checked' : '') +
+          (disabled ? ' disabled' : '') +
+        '>' +
+        '<span class="rg-switch-track"></span>' +
+      '</span>' +
+      '<span>' + esc(labelText) + '</span>' +
+    '</label>';
+  }
+
+  async function openEmployeeSectionsModal(targetEmp, allEmployees, ctx, onSaved, opts) {
+    var realActor = getRealActorForDevFeatures();
+    if (!realActor || realActor.role !== 'developer') {
+      if (ctx && ctx.toast) ctx.toast('التحكم في إظهار وإخفاء الأقسام وأزرار الجداول متاح لحساب المبرمج فقط.', true);
+      return;
+    }
+    var focusGroupId = (opts && opts.focusGroup) ? String(opts.focusGroup) : '';
+
+    var employeesList = Array.isArray(allEmployees) && allEmployees.length
+      ? allEmployees.slice()
+      : (((root.RGApp && root.RGApp.getEmployeesState) ? root.RGApp.getEmployeesState().items : []) || []);
+
+    if (!employeesList.length && root.RGApi) {
+      var fetched = await root.RGApi.callApi('getEmployees', {});
+      if (fetched && fetched.success && fetched.data && Array.isArray(fetched.data.items)) {
+        employeesList = fetched.data.items;
+        if (root.RGApp && typeof root.RGApp.syncEmployeesStateFromPayload === 'function') {
+          root.RGApp.syncEmployeesStateFromPayload(fetched.data);
+        }
+      }
+    }
+
+    if (!employeesList.length) {
+      if (ctx && ctx.toast) ctx.toast('لا توجد حسابات موظفين متاحة للتحكم بها حالياً.', true);
+      return;
+    }
+
+    var modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+
+    var core = root.RGCrmCore;
+    var groups = (core && Array.isArray(core.EMPLOYEE_SECTION_GROUPS)) ? core.EMPLOYEE_SECTION_GROUPS : [];
+    var statsViewKeys = (core && Array.isArray(core.STATS_VIEW_PERMISSION_KEYS)) ? core.STATS_VIEW_PERMISSION_KEYS : [];
+    var roleLabels = (core && core.ROLE_LABELS && (core.ROLE_LABELS[ctx && ctx.lang] || core.ROLE_LABELS.ar)) || {};
+
+    var preferredEmp = targetEmp && employeesList.find(function (e) { return e.id === targetEmp.id; });
+    if (!preferredEmp) {
+      preferredEmp = employeesList.find(function (e) { return e && e.role !== 'developer'; }) || employeesList[0];
+    }
+
+    var activeEmpId = preferredEmp.id;
+    var searchTerm = '';
+    var draftPermsByEmpId = {};
+    var initialStatsConfig = getStatsControlConfigFromApp(ctx);
+    var excludedMap = {};
+    initialStatsConfig.excludedFromStatsEmployeeIds.forEach(function (id) { excludedMap[id] = true; });
+    var initialExcludedSnapshot = JSON.stringify(initialStatsConfig.excludedFromStatsEmployeeIds.slice().sort());
+
+    function getWorkingPerms(emp) {
+      if (!emp) return [];
+      if (!draftPermsByEmpId[emp.id]) {
+        draftPermsByEmpId[emp.id] = core && core.ensureSectionPermissionSentinels
+          ? core.ensureSectionPermissionSentinels(emp.role, emp.permissions)
+          : (Array.isArray(emp.permissions) ? emp.permissions.slice() : []);
+      }
+      return draftPermsByEmpId[emp.id];
+    }
+
+    function drawSectionsModal() {
+      var curEmp = employeesList.find(function (e) { return e.id === activeEmpId; }) || employeesList[0];
+      activeEmpId = curEmp.id;
+      var curPerms = getWorkingPerms(curEmp);
+      var tempUser = { role: curEmp.role, permissions: curPerms };
+      var isDevTarget = curEmp.role === 'developer';
+      var summary = core && core.getEmployeeSectionVisibilitySummary
+        ? core.getEmployeeSectionVisibilitySummary(tempUser)
+        : { totalVisible: 0, totalAvailable: 0 };
+      var appearInStats = !excludedMap[curEmp.id];
+      var canViewStats = core && core.canEmployeeViewStatistics
+        ? core.canEmployeeViewStatistics(tempUser)
+        : true;
+      var q = String(searchTerm || '').trim().toLowerCase();
+
+      var groupsHtml = groups.map(function (grp) {
+        var grpKeys = grp.items.map(function (it) { return it.key; });
+        var filteredItems = grp.items.filter(function (it) {
+          if (!q) return true;
+          return (String(it.labelAr || '') + ' ' + String(it.labelEn || '') + ' ' + String(it.key || '')).toLowerCase().indexOf(q) !== -1;
+        });
+        if (!filteredItems.length) return '';
+
+        var visibleInGrp = grp.items.filter(function (it) {
+          return isDevTarget ? true : curPerms.indexOf(it.key) !== -1;
+        }).length;
+
+        return '<div class="rg-esec-group-card" data-esec-group="' + esc(grp.id) + '">' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+              '<strong style="font-size:13.5px;color:var(--text-primary);">' + esc(grp.labelAr) + '</strong>' +
+              '<span class="status-tag status-info tabular-nums">' + visibleInGrp + ' / ' + grp.items.length + ' ظاهر</span>' +
+            '</div>' +
+            (!isDevTarget ? (
+              '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+                '<button type="button" class="btn btn-sm esec-group-toggle" data-group-id="' + esc(grp.id) + '" data-vis="1">إظهار الكل</button>' +
+                '<button type="button" class="btn btn-sm btn-danger esec-group-toggle" data-group-id="' + esc(grp.id) + '" data-vis="0">إخفاء الكل</button>' +
+              '</div>'
+            ) : '') +
+          '</div>' +
+          '<div class="rg-esec-items-grid">' +
+            filteredItems.map(function (it) {
+              var checked = isDevTarget ? true : (curPerms.indexOf(it.key) !== -1);
+              return '<div class="rg-esec-item-row">' +
+                '<div style="min-width:0;flex:1;">' +
+                  '<div style="font-size:12.5px;font-weight:600;color:var(--text-primary);line-height:1.35;">' + esc(it.labelAr) + '</div>' +
+                  '<div class="mono" style="font-size:10.5px;color:var(--text-muted);" dir="ltr">' + esc(it.key) + '</div>' +
+                '</div>' +
+                renderSwitchMarkup('', 'esec-item-cb', 'data-perm-key="' + esc(it.key) + '"', checked, isDevTarget, checked ? 'ظاهر' : 'مخفي') +
+              '</div>';
+            }).join('') +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      var canPreviewTarget = Boolean(
+        !isDevTarget &&
+        realActor && curEmp.id !== realActor.id &&
+        root.RGApp && typeof root.RGApp.startPreviewSession === 'function'
+      );
+
+      modalRoot.innerHTML =
+        '<div class="modal-backdrop" id="esec-modal" role="dialog" aria-modal="true" aria-labelledby="esec-modal-title">' +
+          '<div class="modal-panel" style="max-width:860px;">' +
+            '<div class="modal-header">' +
+              '<div>' +
+                '<h3 class="modal-title" id="esec-modal-title">' + (focusGroupId === 'table_actions' ? 'تحكم المبرمج: إظهار / إخفاء أزرار وإجراءات الجداول لكل موظف' : 'تحكم المبرمج: إظهار / إخفاء الأقسام والأزرار لكل موظف') + '</h3>' +
+                '<p class="section-subtitle">تحكم دقيق في الصفحات الرئيسية، التبويبات الفرعية، بطاقات لوحة التحكم، وأزرار الجداول والتصدير بشكل مستقل لكل حساب.</p>' +
+              '</div>' +
+              '<button type="button" class="btn btn-sm" id="esec-close-top" data-modal-close>إغلاق</button>' +
+            '</div>' +
+            '<div class="form-grid-2" style="align-items:end;margin-bottom:12px;">' +
+              '<div class="form-group" style="margin-bottom:0;">' +
+                '<label class="form-label" for="esec-emp-select">اختر الموظف</label>' +
+                '<select class="select" id="esec-emp-select">' +
+                  employeesList.map(function (e) {
+                    return '<option value="' + esc(e.id) + '"' + (e.id === curEmp.id ? ' selected' : '') + '>' +
+                      esc(e.name) + ' — ' + esc(roleLabels[e.role] || e.role) + (e.status === 'disabled' ? ' (متوقف)' : '') +
+                    '</option>';
+                  }).join('') +
+                '</select>' +
+              '</div>' +
+              '<div class="form-group" style="margin-bottom:0;">' +
+                '<label class="form-label" for="esec-search-input">بحث داخل الأقسام والأزرار</label>' +
+                '<input type="search" class="input" id="esec-search-input" value="' + esc(searchTerm) + '" placeholder="ابحث مثل: تصدير، سحب، حذف، الحجوزات، رادار...">' +
+              '</div>' +
+            '</div>' +
+            '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 12px;border-radius:var(--radius-sm);border:1px solid var(--border-hairline);background:var(--bg-surface-subtle);margin-bottom:12px;">' +
+              '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                '<span class="status-tag status-info tabular-nums" id="esec-summary-pill">العناصر الظاهرة: ' + summary.totalVisible + ' / ' + summary.totalAvailable + '</span>' +
+                '<span class="status-tag ' + (appearInStats ? 'status-success' : 'status-warning') + '">' + (appearInStats ? 'يظهر في الإحصائيات' : 'مخفي من الإحصائيات') + '</span>' +
+                '<button type="button" class="btn btn-sm" id="esec-jump-actions-btn">⚡ أزرار وإجراءات الجداول</button>' +
+              '</div>' +
+              '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                (canPreviewTarget ? '<button type="button" class="btn btn-sm" id="esec-preview-btn">👁️ معاينة بحساب هذا الموظف</button>' : '') +
+              '</div>' +
+            '</div>' +
+            (isDevTarget ? (
+              '<div class="rg-error-banner" style="margin-bottom:12px;border-color:rgba(245,158,11,0.4);background:rgba(245,158,11,0.08);">' +
+                '<div class="rg-error-banner-body">' +
+                  '<div class="rg-error-banner-title" style="color:var(--text-primary);">حساب المبرمج يحتفظ بكامل الأقسام والأزرار دائماً</div>' +
+                  '<div class="rg-error-banner-msg">يمكنك التحكم في ظهور المبرمج داخل تقارير وإحصائيات الفريق أدناه، كما يمكنك اختيار أي موظف آخر من القائمة أعلاه لتخصيص أقسامه وأزراره.</div>' +
+                '</div>' +
+              '</div>'
+            ) : '') +
+            '<div class="rg-esec-group-card" style="margin-bottom:12px;border-color:rgba(217,31,43,0.24);">' +
+              '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+                '<strong style="font-size:13.5px;color:var(--text-primary);">تحكم سريع في الإحصائيات لهذا الموظف</strong>' +
+                '<div class="rg-stats-ctrl-toggles">' +
+                  renderSwitchMarkup('esec-appear-in-stats', '', '', appearInStats, false, 'يظهر اسمه وأرقامه في الإحصائيات') +
+                  renderSwitchMarkup('esec-view-stats', '', '', isDevTarget ? true : canViewStats, isDevTarget, 'يشاهد صفحات وبطاقات الإحصائيات') +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div id="esec-groups-scroll" style="display:flex;flex-direction:column;gap:12px;max-height:46vh;overflow-y:auto;padding-inline-end:4px;">' +
+              (groupsHtml || '<div class="empty-state" style="padding:18px;">لا توجد أقسام أو أزرار مطابقة لعبارة البحث.</div>') +
+            '</div>' +
+            '<div id="esec-err" class="form-error hidden" style="margin-top:10px;"></div>' +
+            '<div class="modal-footer">' +
+              '<button type="button" class="btn" id="esec-cancel-btn" data-modal-close>إلغاء</button>' +
+              '<button type="button" class="btn btn-primary" id="esec-save-btn">حفظ الأقسام والأزرار للموظف</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+
+      if (focusGroupId) {
+        var targetGrpEl = modalRoot.querySelector('[data-esec-group="' + focusGroupId + '"]');
+        if (targetGrpEl && typeof targetGrpEl.scrollIntoView === 'function') {
+          setTimeout(function () {
+            targetGrpEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            targetGrpEl.style.borderColor = 'var(--brand-primary)';
+          }, 40);
+        }
+      }
+
+      var jumpActionsBtn = document.getElementById('esec-jump-actions-btn');
+      if (jumpActionsBtn) {
+        jumpActionsBtn.addEventListener('click', function () {
+          focusGroupId = 'table_actions';
+          var actGrp = modalRoot.querySelector('[data-esec-group="table_actions"]');
+          if (actGrp && typeof actGrp.scrollIntoView === 'function') {
+            actGrp.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            actGrp.style.borderColor = 'var(--brand-primary)';
+          }
+        });
+      }
+
+      var closeModal = function () { modalRoot.innerHTML = ''; };
+      document.getElementById('esec-close-top').addEventListener('click', closeModal);
+      document.getElementById('esec-cancel-btn').addEventListener('click', closeModal);
+
+      var empSel = document.getElementById('esec-emp-select');
+      if (empSel) {
+        empSel.addEventListener('change', function () {
+          activeEmpId = empSel.value;
+          drawSectionsModal();
+        });
+      }
+
+      var searchEl = document.getElementById('esec-search-input');
+      if (searchEl) {
+        searchEl.addEventListener('input', function () {
+          searchTerm = searchEl.value;
+          var cursorPos = searchEl.selectionStart || searchTerm.length;
+          drawSectionsModal();
+          var nextSearch = document.getElementById('esec-search-input');
+          if (nextSearch) {
+            nextSearch.focus();
+            try { nextSearch.setSelectionRange(cursorPos, cursorPos); } catch (_s) {}
+          }
+        });
+      }
+
+      var previewBtn = document.getElementById('esec-preview-btn');
+      if (previewBtn) {
+        previewBtn.addEventListener('click', function () {
+          if (root.RGApp && typeof root.RGApp.startPreviewSession === 'function') {
+            closeModal();
+            root.RGApp.startPreviewSession({ employeeId: curEmp.id });
+          }
+        });
+      }
+
+      var appearCb = document.getElementById('esec-appear-in-stats');
+      if (appearCb) {
+        appearCb.addEventListener('change', function () {
+          if (appearCb.checked) delete excludedMap[curEmp.id];
+          else excludedMap[curEmp.id] = true;
+          drawSectionsModal();
+        });
+      }
+
+      var viewStatsCb = document.getElementById('esec-view-stats');
+      if (viewStatsCb && !isDevTarget) {
+        viewStatsCb.addEventListener('change', function () {
+          if (core && typeof core.applyEmployeeStatsViewToggle === 'function') {
+            draftPermsByEmpId[curEmp.id] = core.applyEmployeeStatsViewToggle(curEmp.role, getWorkingPerms(curEmp), viewStatsCb.checked);
+          }
+          drawSectionsModal();
+        });
+      }
+
+      modalRoot.querySelectorAll('.esec-group-toggle').forEach(function (gBtn) {
+        gBtn.addEventListener('click', function () {
+          var grpId = gBtn.getAttribute('data-group-id');
+          var show = gBtn.getAttribute('data-vis') === '1';
+          var grpObj = groups.find(function (g) { return g.id === grpId; });
+          if (!grpObj || !core || typeof core.setEmployeeSectionGroupVisibility !== 'function') return;
+          var keys = grpObj.items.map(function (x) { return x.key; });
+          draftPermsByEmpId[curEmp.id] = core.setEmployeeSectionGroupVisibility(curEmp.role, getWorkingPerms(curEmp), keys, show);
+          drawSectionsModal();
+        });
       });
+
+      modalRoot.querySelectorAll('.esec-item-cb').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          var pKey = cb.getAttribute('data-perm-key');
+          if (core && typeof core.applyEmployeeSectionToggle === 'function') {
+            draftPermsByEmpId[curEmp.id] = core.applyEmployeeSectionToggle(curEmp.role, getWorkingPerms(curEmp), pKey, cb.checked);
+          }
+          drawSectionsModal();
+        });
+      });
+
+      var saveBtn = document.getElementById('esec-save-btn');
+      if (saveBtn) {
+        saveBtn.addEventListener('click', function () {
+          var errEl = document.getElementById('esec-err');
+          if (errEl) errEl.classList.add('hidden');
+          runWithLock(saveBtn, 'devSectionsSave:' + curEmp.id, async function () {
+            var nextExcludedIds = Object.keys(excludedMap).filter(function (id) { return excludedMap[id]; }).sort();
+            var statsChanged = JSON.stringify(nextExcludedIds) !== initialExcludedSnapshot;
+            var changedEmpIds = Object.keys(draftPermsByEmpId);
+
+            if (changedEmpIds.length === 0 && !statsChanged) {
+              ctx.toast('لم يتم تغيير أي أقسام عن الوضع الحالي.');
+              closeModal();
+              return;
+            }
+
+            for (var i = 0; i < changedEmpIds.length; i++) {
+              var empId = changedEmpIds[i];
+              var targetObj = employeesList.find(function (e) { return e.id === empId; });
+              if (!targetObj || targetObj.role === 'developer') continue;
+              var nextPerms = draftPermsByEmpId[empId];
+              var updRes = await root.RGApi.callApi('updateEmployee', {
+                employeeId: targetObj.id,
+                name: targetObj.name,
+                username: targetObj.username,
+                phone: targetObj.phone || '',
+                email: targetObj.email || '',
+                jobTitle: targetObj.jobTitle || '',
+                role: targetObj.role,
+                status: targetObj.status || 'active',
+                permissions: nextPerms,
+                _spamChecked: true
+              });
+              if (!updRes || !updRes.success) {
+                if (errEl) {
+                  errEl.textContent = (updRes && updRes.message) || 'تعذر حفظ صلاحيات الأقسام للموظف.';
+                  errEl.classList.remove('hidden');
+                }
+                return;
+              }
+              if (updRes.data && root.RGApp && typeof root.RGApp.upsertEmployeeInState === 'function') {
+                root.RGApp.upsertEmployeeInState(updRes.data);
+              }
+            }
+
+            if (statsChanged) {
+              var nextStatsCfg = {
+                excludedFromStatsEmployeeIds: nextExcludedIds,
+                updatedAt: new Date().toISOString(),
+                updatedBy: (realActor && realActor.name) || 'المبرمج'
+              };
+              var setRes = await root.RGApi.callApi('updateSettings', {
+                stats_control_config: nextStatsCfg,
+                _spamChecked: true
+              });
+              if (!setRes || !setRes.success) {
+                if (errEl) {
+                  errEl.textContent = (setRes && setRes.message) || 'تعذر حفظ إعدادات الظهور في الإحصائيات.';
+                  errEl.classList.remove('hidden');
+                }
+                return;
+              }
+              var savedCfg = (setRes.data && setRes.data.stats_control_config) || nextStatsCfg;
+              if (root.RGApp && typeof root.RGApp.setStatsControlConfig === 'function') {
+                root.RGApp.setStatsControlConfig(savedCfg);
+              }
+            }
+
+            if (root.RGApi && typeof root.RGApi.invalidateScopes === 'function') {
+              root.RGApi.invalidateScopes(['employees', 'dashboard', 'reports', 'settings']);
+            }
+            if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') {
+              var updatedCur = employeesList.find(function (e) { return e.id === (realActor && realActor.id); });
+              if (updatedCur && draftPermsByEmpId[updatedCur.id]) {
+                root.RGApp.syncCurrentUserShell(Object.assign({}, updatedCur, { permissions: draftPermsByEmpId[updatedCur.id] }));
+              }
+            }
+            ctx.toast('تم حفظ إعدادات إظهار وإخفاء الأقسام للموظف بنجاح.');
+            closeModal();
+            if (onSaved) onSaved();
+          }, { spamAction: 'updateEmployee', spamSig: 'devSections:' + curEmp.id + ':' + (draftPermsByEmpId[curEmp.id] ? draftPermsByEmpId[curEmp.id].join(',') : '') + ':' + Object.keys(excludedMap).sort().join(',') });
+        });
+      }
+    }
+
+    drawSectionsModal();
+  }
+
+  function mountStatsControlPanel(hostEl, employees, ctx, opts) {
+    if (!hostEl) return;
+    var options = opts || {};
+    var realActor = getRealActorForDevFeatures();
+    if (!realActor || realActor.role !== 'developer') {
+      hostEl.innerHTML = '';
+      return;
+    }
+
+    var core = root.RGCrmCore;
+    var roleLabels = (core && core.ROLE_LABELS && (core.ROLE_LABELS[ctx && ctx.lang] || core.ROLE_LABELS.ar)) || {};
+    var list = (Array.isArray(employees) ? employees : []).slice();
+    var curCfg = getStatsControlConfigFromApp(ctx);
+    var excludedMap = {};
+    curCfg.excludedFromStatsEmployeeIds.forEach(function (id) { excludedMap[id] = true; });
+    var initialExcludedSnap = JSON.stringify(curCfg.excludedFromStatsEmployeeIds.slice().sort());
+
+    var viewStatsMap = {};
+    var initialViewMap = {};
+    list.forEach(function (emp) {
+      var canView = emp.role === 'developer'
+        ? true
+        : (core && typeof core.canEmployeeViewStatistics === 'function' ? core.canEmployeeViewStatistics(emp) : true);
+      viewStatsMap[emp.id] = canView;
+      initialViewMap[emp.id] = canView;
+    });
+
+    var searchQuery = '';
+
+    function drawPanel() {
+      var q = String(searchQuery || '').trim().toLowerCase();
+      var activeList = list.filter(function (e) {
+        if (!e) return false;
+        if (!q) return true;
+        return (String(e.name || '') + ' ' + String(e.username || '') + ' ' + String(e.jobTitle || '')).toLowerCase().indexOf(q) !== -1;
+      });
+
+      var totalEligible = list.filter(function (e) { return e && e.status !== 'disabled'; }).length;
+      var appearCount = list.filter(function (e) { return e && e.status !== 'disabled' && !excludedMap[e.id]; }).length;
+      var viewCount = list.filter(function (e) { return e && e.status !== 'disabled' && (e.role === 'developer' || viewStatsMap[e.id]); }).length;
+
+      var rowsHtml = activeList.length === 0
+        ? '<div class="empty-state" style="padding:18px;">لا يوجد موظفون مطابقون للبحث.</div>'
+        : activeList.map(function (emp) {
+          var isDev = emp.role === 'developer';
+          var isExcluded = Boolean(excludedMap[emp.id]);
+          var canView = isDev ? true : Boolean(viewStatsMap[emp.id]);
+          var initialChar = String(emp.name || 'م').trim().charAt(0) || 'م';
+          return '<div class="rg-stats-ctrl-row' + (isExcluded ? ' is-excluded' : '') + '" data-stats-emp-id="' + esc(emp.id) + '">' +
+            '<div class="rg-stats-ctrl-person">' +
+              '<span class="rg-stats-ctrl-avatar">' + esc(initialChar) + '</span>' +
+              '<div style="min-width:0;">' +
+                '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+                  '<strong style="font-size:13px;color:var(--text-primary);">' + esc(emp.name) + '</strong>' +
+                  '<span class="status-tag ' + (isDev ? 'status-danger' : 'status-neutral') + '">' + esc(roleLabels[emp.role] || emp.role) + '</span>' +
+                  (emp.status === 'disabled' ? '<span class="status-tag status-warning">متوقف</span>' : '') +
+                '</div>' +
+                '<div style="font-size:11.5px;color:var(--text-muted);">' +
+                  (isExcluded ? 'مخفي من لوحة الصدارة والرسوم' : 'ظاهر في تقارير ولوحة الأداء') +
+                  (isDev ? ' · المبرمج يشاهد الإحصائيات دائماً' : '') +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="rg-stats-ctrl-toggles">' +
+              renderSwitchMarkup('', 'stats-ctrl-appear-cb', 'data-emp-id="' + esc(emp.id) + '"', !isExcluded, false, 'يظهر في الإحصائيات') +
+              renderSwitchMarkup('', 'stats-ctrl-view-cb', 'data-emp-id="' + esc(emp.id) + '"', canView, isDev, 'يشاهد الإحصائيات') +
+            '</div>' +
+          '</div>';
+        }).join('');
+
+      var saveBtnId = options.saveBtnId || 'btn-save-dev-stats-control';
+
+      hostEl.innerHTML =
+        '<div class="rg-stats-ctrl-toolbar">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:220px;">' +
+            '<input type="search" class="input" id="stats-ctrl-search" value="' + esc(searchQuery) + '" placeholder="بحث باسم الموظف أو الدور..." style="max-width:260px;">' +
+            '<span class="status-tag status-info tabular-nums" id="stats-ctrl-summary">ظاهر في الإحصائيات: ' + appearCount + ' / ' + totalEligible + ' · يشاهد الإحصائيات: ' + viewCount + ' / ' + totalEligible + '</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+            '<button type="button" class="btn btn-sm" id="stats-preset-all">إظهار الجميع</button>' +
+            '<button type="button" class="btn btn-sm" id="stats-preset-hide-admins">إخفاء المبرمج والمدير العام</button>' +
+            '<button type="button" class="btn btn-sm" id="stats-preset-agents-only">خدمة العملاء فقط</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="rg-stats-ctrl-list">' + rowsHtml + '</div>' +
+        '<div id="stats-ctrl-err" class="form-error hidden" style="margin-top:10px;"></div>' +
+        '<div style="margin-top:14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+          '<span style="font-size:12px;color:var(--text-muted);">ملاحظة: إخفاء موظف من الإحصائيات يخفي اسمه من لوحة الصدارة ومخططات الأداء دون التأثير على إجمالي حجوزات الفرع أو الإيرادات.</span>' +
+          '<div style="display:flex;gap:8px;align-items:center;">' +
+            (options.showCancel ? '<button type="button" class="btn" id="stats-ctrl-cancel-btn">إلغاء</button>' : '') +
+            '<button type="button" class="btn btn-primary" id="' + esc(saveBtnId) + '">حفظ تحكم الإحصائيات</button>' +
+          '</div>' +
+        '</div>';
+
+      var searchInput = hostEl.querySelector('#stats-ctrl-search');
+      if (searchInput) {
+        searchInput.addEventListener('input', function () {
+          searchQuery = searchInput.value;
+          var pos = searchInput.selectionStart || searchQuery.length;
+          drawPanel();
+          var nextIn = hostEl.querySelector('#stats-ctrl-search');
+          if (nextIn) {
+            nextIn.focus();
+            try { nextIn.setSelectionRange(pos, pos); } catch (_p) {}
+          }
+        });
+      }
+
+      var presetAll = hostEl.querySelector('#stats-preset-all');
+      if (presetAll) {
+        presetAll.addEventListener('click', function () {
+          excludedMap = {};
+          list.forEach(function (e) { viewStatsMap[e.id] = true; });
+          drawPanel();
+        });
+      }
+
+      var presetHideAdmins = hostEl.querySelector('#stats-preset-hide-admins');
+      if (presetHideAdmins) {
+        presetHideAdmins.addEventListener('click', function () {
+          excludedMap = {};
+          list.forEach(function (e) {
+            if (e.role === 'developer' || e.role === 'general_manager') {
+              excludedMap[e.id] = true;
+            }
+          });
+          drawPanel();
+        });
+      }
+
+      var presetAgentsOnly = hostEl.querySelector('#stats-preset-agents-only');
+      if (presetAgentsOnly) {
+        presetAgentsOnly.addEventListener('click', function () {
+          excludedMap = {};
+          list.forEach(function (e) {
+            if (e.role !== 'agent') excludedMap[e.id] = true;
+          });
+          drawPanel();
+        });
+      }
+
+      hostEl.querySelectorAll('.stats-ctrl-appear-cb').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          var eid = cb.getAttribute('data-emp-id');
+          if (cb.checked) delete excludedMap[eid];
+          else excludedMap[eid] = true;
+          drawPanel();
+        });
+      });
+
+      hostEl.querySelectorAll('.stats-ctrl-view-cb').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          var eid = cb.getAttribute('data-emp-id');
+          viewStatsMap[eid] = cb.checked;
+          drawPanel();
+        });
+      });
+
+      if (options.showCancel && typeof options.onCancel === 'function') {
+        var cBtn = hostEl.querySelector('#stats-ctrl-cancel-btn');
+        if (cBtn) cBtn.addEventListener('click', options.onCancel);
+      }
+
+      var saveBtn = hostEl.querySelector('#' + saveBtnId);
+      if (saveBtn) {
+        saveBtn.addEventListener('click', function () {
+          var errEl = hostEl.querySelector('#stats-ctrl-err');
+          if (errEl) errEl.classList.add('hidden');
+          runWithLock(saveBtn, 'devStatsControlSave', async function () {
+            var nextExcludedIds = Object.keys(excludedMap).filter(function (id) { return excludedMap[id]; }).sort();
+            var settingsChanged = JSON.stringify(nextExcludedIds) !== initialExcludedSnap;
+            var changedViewEmps = list.filter(function (e) {
+              return e && e.role !== 'developer' && Boolean(viewStatsMap[e.id]) !== Boolean(initialViewMap[e.id]);
+            });
+
+            if (!settingsChanged && changedViewEmps.length === 0) {
+              if (ctx && ctx.toast) ctx.toast('لم يتم إجراء أي تغييرات على إعدادات الإحصائيات.');
+              if (typeof options.onSaved === 'function') options.onSaved();
+              return;
+            }
+
+            if (settingsChanged) {
+              var nextCfg = {
+                excludedFromStatsEmployeeIds: nextExcludedIds,
+                updatedAt: new Date().toISOString(),
+                updatedBy: (realActor && realActor.name) || 'المبرمج'
+              };
+              var sRes = await root.RGApi.callApi('updateSettings', {
+                stats_control_config: nextCfg,
+                _spamChecked: true
+              });
+              if (!sRes || !sRes.success) {
+                if (errEl) {
+                  errEl.textContent = (sRes && sRes.message) || 'تعذر حفظ إعدادات الظهور في الإحصائيات.';
+                  errEl.classList.remove('hidden');
+                }
+                return;
+              }
+              var savedCfg = (sRes.data && sRes.data.stats_control_config) || nextCfg;
+              if (root.RGApp && typeof root.RGApp.setStatsControlConfig === 'function') {
+                root.RGApp.setStatsControlConfig(savedCfg);
+              }
+              initialExcludedSnap = JSON.stringify(nextExcludedIds);
+            }
+
+            for (var idx = 0; idx < changedViewEmps.length; idx++) {
+              var emp = changedViewEmps[idx];
+              var wantView = Boolean(viewStatsMap[emp.id]);
+              var nextPerms = (core && typeof core.applyEmployeeStatsViewToggle === 'function')
+                ? core.applyEmployeeStatsViewToggle(emp.role, emp.permissions, wantView)
+                : emp.permissions;
+              var eRes = await root.RGApi.callApi('updateEmployee', {
+                employeeId: emp.id,
+                name: emp.name,
+                username: emp.username,
+                phone: emp.phone || '',
+                email: emp.email || '',
+                jobTitle: emp.jobTitle || '',
+                role: emp.role,
+                status: emp.status || 'active',
+                permissions: nextPerms,
+                _spamChecked: true
+              });
+              if (!eRes || !eRes.success) {
+                if (errEl) {
+                  errEl.textContent = (eRes && eRes.message) || ('تعذر تحديث صلاحية مشاهدة الإحصائيات للموظف: ' + emp.name);
+                  errEl.classList.remove('hidden');
+                }
+                return;
+              }
+              emp.permissions = nextPerms;
+              initialViewMap[emp.id] = wantView;
+              if (eRes.data && root.RGApp && typeof root.RGApp.upsertEmployeeInState === 'function') {
+                root.RGApp.upsertEmployeeInState(eRes.data);
+              }
+            }
+
+            if (root.RGApi && typeof root.RGApi.invalidateScopes === 'function') {
+              root.RGApi.invalidateScopes(['settings', 'dashboard', 'reports', 'employees']);
+            }
+            if (ctx && ctx.toast) ctx.toast('تم حفظ تحكم المبرمج في الإحصائيات وتطبيق التغييرات فوراً.');
+            if (typeof options.onSaved === 'function') options.onSaved();
+          }, { spamAction: 'updateSettings', spamSig: 'devStatsControl:' + Date.now() });
+        });
+      }
+    }
+
+    drawPanel();
+  }
+
+  async function openDeveloperStatsControlModal(ctx, onSaved) {
+    var realActor = getRealActorForDevFeatures();
+    if (!realActor || realActor.role !== 'developer') {
+      if (ctx && ctx.toast) ctx.toast('قسم التحكم في الإحصائيات متاح لحساب المبرمج فقط.', true);
+      return;
+    }
+
+    var employees = (root.RGApp && typeof root.RGApp.getEmployeesState === 'function')
+      ? (root.RGApp.getEmployeesState().items || [])
+      : [];
+    if (!employees.length && root.RGApi) {
+      var res = await root.RGApi.callApi('getEmployees', {});
+      if (res && res.success && res.data && Array.isArray(res.data.items)) {
+        employees = res.data.items;
+        if (root.RGApp && typeof root.RGApp.syncEmployeesStateFromPayload === 'function') {
+          root.RGApp.syncEmployeesStateFromPayload(res.data);
+        }
+      }
+    }
+
+    var modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" id="stats-ctrl-modal" role="dialog" aria-modal="true" aria-labelledby="stats-ctrl-modal-title">' +
+        '<div class="modal-panel" style="max-width:780px;">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h3 class="modal-title" id="stats-ctrl-modal-title">تحكم المبرمج في الإحصائيات — من يظهر ومن يشاهد</h3>' +
+              '<p class="section-subtitle">حدّد أي الموظفين يظهر اسمه وأرقامه في لوحة الصدارة والتقارير، وأي الموظفين يحق له مشاهدة الإحصائيات.</p>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="stats-ctrl-modal-close" data-modal-close>إغلاق</button>' +
+          '</div>' +
+          '<div id="stats-ctrl-modal-body"></div>' +
+        '</div>' +
+      '</div>';
+
+    var closeModal = function () { modalRoot.innerHTML = ''; };
+    document.getElementById('stats-ctrl-modal-close').addEventListener('click', closeModal);
+
+    mountStatsControlPanel(document.getElementById('stats-ctrl-modal-body'), employees, ctx, {
+      saveBtnId: 'stats-ctrl-modal-save',
+      showCancel: true,
+      onCancel: closeModal,
+      onSaved: function () {
+        closeModal();
+        if (typeof onSaved === 'function') onSaved();
+      }
     });
   }
 
@@ -1749,7 +3008,12 @@
   root.RGEmployees = {
     render: render,
     EmployeeManager: EmployeeManager,
+    openEmployeeModal: openEmployeeModal,
+    openEditDeveloperModal: openEditDeveloperModal,
     openEmployeeDetailsDrawer: openEmployeeDetailsDrawer,
-    openBulkReassignModal: openBulkReassignModal
+    openBulkReassignModal: openBulkReassignModal,
+    openEmployeeSectionsModal: openEmployeeSectionsModal,
+    openDeveloperStatsControlModal: openDeveloperStatsControlModal,
+    mountStatsControlPanel: mountStatsControlPanel
   };
 })(window);

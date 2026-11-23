@@ -71,12 +71,19 @@
     var core = root.RGCrmCore || {};
     var currentUser = root.RGAuth.getUser() || {};
     var currentEmpId = currentUser.id || '';
+    var canViewMentionsTab = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_myfu_mentions');
+    var canViewFuHistory = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_myfu_history');
+    if (!canViewMentionsTab && fuState.tab === 'mentions') {
+      fuState.tab = 'assigned';
+    }
     var employees = (empRes.success && empRes.data.items) || [];
     var assigned = res.data.assignedReservations || [];
     var followUps = res.data.followUps || [];
-    var mentionFollowUps = Array.isArray(res.data.mentionFollowUps)
-      ? res.data.mentionFollowUps
-      : (core.filterMentionFollowUps ? core.filterMentionFollowUps(followUps, currentUser, employees) : []);
+    var mentionFollowUps = canViewMentionsTab
+      ? (Array.isArray(res.data.mentionFollowUps)
+        ? res.data.mentionFollowUps
+        : (core.filterMentionFollowUps ? core.filterMentionFollowUps(followUps, currentUser, employees) : []))
+      : [];
     var maxPins = core.MAX_PINNED_CRITICAL_RESERVATIONS || 3;
     var pinnedIds = Array.isArray(res.data.pinnedCriticalIds) ? res.data.pinnedCriticalIds.slice(0, maxPins) : [];
 
@@ -89,16 +96,16 @@
     function renderDirectCallBtn(r) {
       if (!r || typeof r !== 'object') return '';
       var phone = r.customerPhone;
-      var href = core.formatDirectCallTelHref ? core.formatDirectCallTelHref(phone, '90') : '';
+      var href = core.formatDirectCallTelHref ? core.formatDirectCallTelHref(phone, '9') : '';
       if (!href) return '';
-      var disp = core.formatDirectCallDisplayNumber ? core.formatDirectCallDisplayNumber(phone, '90') : href.replace(/^tel:/, '');
+      var disp = core.formatDirectCallDisplayNumber ? core.formatDirectCallDisplayNumber(phone, '9') : href.replace(/^tel:/, '');
       return '<a class="btn btn-sm rg-tel-btn" href="' + esc(href) + '" title="' + esc(disp) + '"' +
         ' data-call-res-id="' + esc(r.id || '') + '"' +
         ' data-call-res-num="' + esc(r.reservationNumber || '') + '"' +
         ' data-call-customer="' + esc(r.customerName || '') + '"' +
         ' data-call-phone="' + esc(phone || '') + '"' +
         ' data-call-status="' + esc(r.internalStatus || '') + '">' +
-        '<span aria-hidden="true">📞</span> ' + (isEn ? 'Call 90' : 'اتصال 90') +
+        '<span aria-hidden="true">📞</span> ' + (isEn ? 'Call 9' : 'اتصال 9') +
       '</a>';
     }
 
@@ -231,22 +238,24 @@
     container.innerHTML =
       '<div class="surface-card">' +
         '<div class="section-header">' +
-          '<div><h2 class="section-title">' + t('nav_my_followups') + '</h2><p class="section-subtitle">الحجوزات المستلمة والمسندة إليك (<strong class="tabular-nums">' + assigned.length + '</strong>) · إشارات @Mention الواردة (<strong class="tabular-nums">' + mentionFollowUps.length + '</strong>)</p></div>' +
+          '<div><h2 class="section-title">' + t('nav_my_followups') + '</h2><p class="section-subtitle">الحجوزات المستلمة والمسندة إليك (<strong class="tabular-nums">' + assigned.length + '</strong>)' + (canViewMentionsTab ? (' · إشارات @Mention الواردة (<strong class="tabular-nums">' + mentionFollowUps.length + '</strong>)') : '') + '</p></div>' +
           '<div class="toolbar-actions">' +
             (assigned.length > 0 ? '<button type="button" class="btn btn-sm" id="myfu-ics-btn">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' : '') +
             '<div class="segmented-control" id="myfu-tabs" role="tablist" aria-label="تبويبات متابعاتي">' +
               '<button type="button" class="segmented-btn' + (fuState.tab !== 'mentions' ? ' active' : '') + '" data-myfu-tab="assigned">' +
                 (isEn ? 'My Bookings' : 'حجوزاتي المستلمة') + ' (<span class="tabular-nums">' + assigned.length + '</span>)' +
               '</button>' +
-              '<button type="button" class="segmented-btn' + (fuState.tab === 'mentions' ? ' active' : '') + '" data-myfu-tab="mentions">' +
-                (isEn ? '@Mentions Received' : 'إشارات @Mention') + ' (<span class="tabular-nums">' + mentionFollowUps.length + '</span>)' +
-              '</button>' +
+              (canViewMentionsTab ? (
+                '<button type="button" class="segmented-btn' + (fuState.tab === 'mentions' ? ' active' : '') + '" data-myfu-tab="mentions">' +
+                  (isEn ? '@Mentions Received' : 'إشارات @Mention') + ' (<span class="tabular-nums">' + mentionFollowUps.length + '</span>)' +
+                '</button>'
+              ) : '') +
             '</div>' +
           '</div>' +
         '</div>' +
-        (fuState.tab === 'mentions' ? renderMentionsTabHtml() : renderAssignedTabHtml()) +
+        ((fuState.tab === 'mentions' && canViewMentionsTab) ? renderMentionsTabHtml() : renderAssignedTabHtml()) +
       '</div>' +
-      (fuState.tab !== 'mentions' ? (
+      ((fuState.tab !== 'mentions' && canViewFuHistory) ? (
         '<div class="surface-card" id="myfu-history-card">' +
           '<div class="section-header"><h3 class="section-title">سجل متابعاتي السابقة</h3></div>' +
           (followUps.length === 0
@@ -268,9 +277,9 @@
         '</div>'
       ) : '');
 
-    function runWithLock(btnEl, lockKey, fn) {
+    function runWithLock(btnEl, lockKey, fn, opts) {
       if (root.RGApp && root.RGApp.withActionLock) {
-        return root.RGApp.withActionLock(btnEl, lockKey, fn);
+        return root.RGApp.withActionLock(btnEl, lockKey, fn, opts);
       }
       return Promise.resolve().then(fn);
     }
@@ -333,7 +342,8 @@
           return root.RGApi.callApi('togglePinnedCriticalReservation', {
             reservationId: rid,
             pin: !isPinnedNow,
-            _keepOptimisticCache: true
+            _keepOptimisticCache: true,
+            _spamChecked: true
           }).then(function (resp) {
             if (!resp || !resp.success) {
               pinnedIds = prevPinnedIds;
@@ -345,7 +355,7 @@
             ctx.toast('تعذر الاتصال بالخادم أثناء تحديث التثبيت.', true);
             renderMyFollowUps(container, ctx);
           });
-        });
+        }, { spamAction: 'togglePinnedCriticalReservation', spamSig: rid + ':' + (!isPinnedNow) });
       });
     });
 
@@ -374,13 +384,14 @@
             if (lastEl) lastEl.textContent = nextActionTxt;
             var badgeEl = rowEl.querySelector('.rg-attempt-badge');
             if (badgeEl) {
-              badgeEl.textContent = (isEn ? 'Attempts: ' : 'محاولات: ') + nextCount;
+              badgeEl.textContent = String(nextCount);
             }
           }
           ctx.toast('تم تسجيل محاولة اتصال — لم يرد (المحاولة #' + nextCount + ')');
           return root.RGApi.callApi('recordNoAnswerFollowUp', {
             reservationId: rid,
-            _keepOptimisticCache: true
+            _keepOptimisticCache: true,
+            _spamChecked: true
           }).then(function (resp) {
             if (resp && resp.success) {
               ctx.refreshNotifications();
@@ -400,7 +411,7 @@
             ctx.toast('تعذر الاتصال بالخادم أثناء تسجيل المحاولة.', true);
             renderMyFollowUps(container, ctx);
           });
-        });
+        }, { spamAction: 'recordNoAnswerFollowUp', spamSig: rid });
       });
     });
 
@@ -413,6 +424,10 @@
         var prevLastText = (targetRes && targetRes.lastUpdateText) || '-';
         var expectedUpdatedAt = (targetRes && (targetRes.updatedAt || targetRes.lastUpdatedAt)) || '';
         runWithLock(sel, 'quickUpdateReservationStatus:' + rid, function () {
+          if (targetRes) {
+            targetRes.internalStatus = nextStatus;
+            targetRes.lastUpdateText = 'تحديث سريع للحالة إلى: ' + nextStatus;
+          }
           if (root.RGApi.applyOptimisticMutation) {
             root.RGApi.applyOptimisticMutation('quickUpdateReservationStatus', {
               reservationId: rid,
@@ -429,21 +444,34 @@
             reservationId: rid,
             status: nextStatus,
             expectedUpdatedAt: expectedUpdatedAt,
-            _keepOptimisticCache: true
+            _keepOptimisticCache: true,
+            _spamChecked: true
           }).then(function (resp) {
             if (resp && resp.success) {
               ctx.refreshNotifications();
             } else {
+              if (targetRes) {
+                targetRes.internalStatus = prevStatus;
+                targetRes.lastUpdateText = prevLastText;
+              }
               if (prevStatus) sel.value = prevStatus;
               if (lastEl) lastEl.textContent = prevLastText;
               ctx.toast((resp && resp.message) || 'تعذر تحديث الحالة.', true);
               renderMyFollowUps(container, ctx);
             }
           }).catch(function () {
+            if (targetRes) {
+              targetRes.internalStatus = prevStatus;
+              targetRes.lastUpdateText = prevLastText;
+            }
             if (prevStatus) sel.value = prevStatus;
             if (lastEl) lastEl.textContent = prevLastText;
             ctx.toast('تعذر الاتصال بالخادم أثناء تحديث الحالة.', true);
           });
+        }, { spamAction: 'quickUpdateReservationStatus', spamSig: rid + ':' + nextStatus }).then(function (lockRes) {
+          if (lockRes && lockRes.spamBlocked && prevStatus) {
+            sel.value = prevStatus;
+          }
         });
       });
     });
@@ -459,14 +487,18 @@
           if (rowEl && rowEl.parentNode) {
             rowEl.parentNode.removeChild(rowEl);
           }
+          var pinnedCard = container.querySelector('.rg-pinned-critical-card[data-res-id="' + rid + '"]');
+          if (pinnedCard && pinnedCard.parentNode) {
+            pinnedCard.parentNode.removeChild(pinnedCard);
+          }
           ctx.toast('تم إلغاء استلام الحجز.');
           return root.RGApi.callApi('unclaimReservation', {
             reservationId: rid,
-            _keepOptimisticCache: true
+            _keepOptimisticCache: true,
+            _spamChecked: true
           }).then(function (resp) {
             if (resp && resp.success) {
               ctx.refreshNotifications();
-              renderMyFollowUps(container, ctx);
             } else {
               ctx.toast((resp && resp.message) || 'تعذر إلغاء الاستلام.', true);
               renderMyFollowUps(container, ctx);
@@ -475,7 +507,7 @@
             ctx.toast('تعذر الاتصال بالخادم أثناء إلغاء الاستلام.', true);
             renderMyFollowUps(container, ctx);
           });
-        });
+        }, { spamAction: 'unclaimReservation', spamSig: rid });
       });
     });
 

@@ -11,7 +11,8 @@ var RG_DASHBOARD_PERMISSION_KEYS = [
   'dash_view_radar',
   'dash_view_heatmap',
   'dash_view_bottom_bento',
-  'dash_view_handover'
+  'dash_view_handover',
+  'dash_view_leaderboard'
 ];
 
 var RG_ROLE_PERMISSIONS = {
@@ -21,8 +22,9 @@ var RG_ROLE_PERMISSIONS = {
     'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
     'claim_reservation', 'unclaim_reservation', 'quick_update_status',
     'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
-    'create_problem', 'update_problem', 'view_employees', 'manage_employees',
-    'view_all_logs', 'sync_data', 'manage_settings', 'export_reports'
+    'create_problem', 'update_problem', 'delete_reservations', 'view_employees', 'manage_employees',
+    'view_all_logs', 'sync_data', 'manage_api_connection', 'manage_settings',
+    'manage_role_ui_defaults', 'manage_announcements', 'export_reports'
   ]),
   supervisor: [
     'view_dashboard', 'dash_perms_configured'
@@ -52,6 +54,7 @@ var RG_BUILTIN_PERMISSIONS_CATALOG = [
   { key: 'dash_view_heatmap', label: 'مصفوفة ساعات الذروة (تخطيط الورديات)', group: 'لوحة التحكم' },
   { key: 'dash_view_bottom_bento', label: 'أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة', group: 'لوحة التحكم' },
   { key: 'dash_view_handover', label: 'زر تسليم الوردية (PDF) داخل لوحة التحكم', group: 'لوحة التحكم' },
+  { key: 'dash_view_leaderboard', label: 'لوحة المتصدرين والأداء (Leaderboard)', group: 'لوحة التحكم' },
   { key: 'view_all_reservations', label: 'استعراض جميع الحجوزات', group: 'الحجوزات' },
   { key: 'pull_reservations', label: 'سحب واستيراد وتحديث الحجوزات من قائمة الحجوزات', group: 'الحجوزات' },
   { key: 'claim_reservation', label: 'استلام الحجوزات ذاتيًا', group: 'الحجوزات' },
@@ -70,7 +73,12 @@ var RG_BUILTIN_PERMISSIONS_CATALOG = [
   { key: 'view_all_logs', label: 'الاطلاع على سجل نشاطات الفريق', group: 'التقارير والرقابة' },
   { key: 'export_reports', label: 'تصدير تقارير Excel وPDF', group: 'التقارير والرقابة' },
   { key: 'sync_data', label: 'الوصول إلى Rental Gate API والمزامنة', group: 'الإدارة والربط (API)' },
-  { key: 'manage_settings', label: 'تعديل إعدادات النظام والتحديث التلقائي', group: 'الإدارة والربط (API)' }
+  { key: 'manage_api_connection', label: 'إدارة مفاتيح وربط API (RG_TOKEN / GAS)', group: 'الإدارة والربط (API)' },
+  { key: 'manage_settings', label: 'تعديل إعدادات النظام والتحديث التلقائي', group: 'الإدارة والربط (API)' },
+  { key: 'manage_role_ui_defaults', label: 'التحكم المركزي بإعدادات وأعمدة واجهة الأدوار والوظائف', group: 'الإدارة والربط (API)' },
+  { key: 'manage_announcements', label: 'إدارة تعميمات وإعلانات الوردية', group: 'الإدارة والربط (API)' },
+  { key: 'delete_reservations', label: 'حذف الحجوزات الجماعي والنسخ الاحتياطي', group: 'الإدارة والربط (API)' },
+  { key: 'manage_developer_tools', label: 'الصلاحيات البرمجية الكاملة وفحص الخادم وكاش الموقع', group: 'الإدارة والربط (API)' }
 ];
 
 var RG_DEFAULT_ROLE_PRESETS = [

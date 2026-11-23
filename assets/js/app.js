@@ -62,6 +62,14 @@
 
   root.RGLoadVendorScript = loadVendorScript;
 
+  function ensureChartLoaded() {
+    if (root.Chart) return Promise.resolve();
+    return loadVendorScript('assets/vendor/chart.umd.min.js').then(function () {
+      if (!root.Chart) throw new Error('تعذر تحميل مكتبة الرسوم البيانية (Chart.js).');
+    });
+  }
+  root.RGEnsureChartLoaded = ensureChartLoaded;
+
   function resolveInitialRoute() {
     var redirected = '';
     try {
@@ -119,12 +127,24 @@
     var normNavPos = (root.RGCrmCore && root.RGCrmCore.normalizeSidebarPosition)
       ? root.RGCrmCore.normalizeSidebarPosition(saved.sidebarPosition)
       : ((saved.sidebarPosition === 'top' || saved.sidebarPosition === 'bottom') ? saved.sidebarPosition : 'side');
+    var normTzMode = (root.RGCrmCore && root.RGCrmCore.normalizeTimezoneMode)
+      ? root.RGCrmCore.normalizeTimezoneMode(saved.timezoneMode)
+      : ((saved.timezoneMode === 'sa' || saved.timezoneMode === 'eg') ? saved.timezoneMode : 'both');
+    var normResView = (root.RGCrmCore && root.RGCrmCore.normalizeReservationsDisplayMode)
+      ? root.RGCrmCore.normalizeReservationsDisplayMode(saved.reservationsDisplayMode)
+      : (saved.reservationsDisplayMode === 'calendar' ? 'calendar' : 'table');
+    var normCalGran = (root.RGCrmCore && root.RGCrmCore.normalizeCalendarGranularity)
+      ? root.RGCrmCore.normalizeCalendarGranularity(saved.calendarGranularity)
+      : ((saved.calendarGranularity === 'day' || saved.calendarGranularity === 'month') ? saved.calendarGranularity : 'week');
     return {
       lang: saved.lang === 'en' ? 'en' : 'ar',
       theme: resolvedTheme,
       sidebarCollapsed: Boolean(saved.sidebarCollapsed),
       timeFormat: normTimeFmt,
-      sidebarPosition: normNavPos
+      sidebarPosition: normNavPos,
+      timezoneMode: normTzMode,
+      reservationsDisplayMode: normResView,
+      calendarGranularity: normCalGran
     };
   }
 
@@ -175,6 +195,9 @@
       dashHidden: Array.isArray(obj.dashHidden) ? obj.dashHidden.slice() : [],
       timeFormat: obj.timeFormat === '12h' ? '12h' : '24h',
       sidebarPosition: (obj.sidebarPosition === 'top' || obj.sidebarPosition === 'bottom') ? obj.sidebarPosition : 'side',
+      timezoneMode: (obj.timezoneMode === 'sa' || obj.timezoneMode === 'eg') ? obj.timezoneMode : 'both',
+      reservationsDisplayMode: obj.reservationsDisplayMode === 'calendar' ? 'calendar' : 'table',
+      calendarGranularity: (obj.calendarGranularity === 'day' || obj.calendarGranularity === 'month') ? obj.calendarGranularity : 'week',
       theme: (rt === 'dark' || rt === 'light') ? rt : '',
       lang: (rl === 'ar' || rl === 'en') ? rl : '',
       sidebarCollapsed: Boolean(obj.sidebarCollapsed === true || obj.sidebarCollapsed === 'true')
@@ -216,6 +239,8 @@
     route: resolveInitialRoute(),
     prefs: loadInitialPrefs(),
     uiSimplification: loadUiSimplification(),
+    roleUiDefaults: {},
+    previewSession: null,
     layoutPrefs: loadLayoutPrefs(null),
     notifications: { items: [], unreadCount: 0 },
     announcements: [],
@@ -235,6 +260,9 @@
       lastUpdatedAt: ''
     }
   };
+  var PREVIEW_SESSION_STORAGE_KEY = 'rg_crm_preview_role_v1';
+  var activeUnsavedGuard = null;
+  var authPreviewBridgeInstalled = false;
   var routeRenderSeq = 0;
   var activeActionLocks = {};
   var autoRefreshTimer = null;
@@ -470,6 +498,17 @@
     });
   }
 
+  function removeEmployeeLocal(empId) {
+    var targetId = String(empId || '').trim();
+    if (!targetId) return getEmployeesState();
+    var prevItems = (state.employees && Array.isArray(state.employees.items)) ? state.employees.items.slice() : [];
+    var nextItems = prevItems.filter(function (emp) { return emp && emp.id !== targetId; });
+    return setEmployeesState({
+      items: nextItems,
+      lastUpdatedAt: new Date().toISOString()
+    });
+  }
+
   function computeFingerprintSafe(data) {
     if (root.RGCrmCore && root.RGCrmCore.computeDataFingerprint) {
       return root.RGCrmCore.computeDataFingerprint(data);
@@ -477,10 +516,45 @@
     return '';
   }
 
-  function withActionLock(btnEl, lockKey, fn) {
+  var uiActionSpamState = { timestamps: [], signatures: {} };
+
+  function checkActionSpam(action, signature, opts) {
+    var act = String(action || '').trim();
+    if (!act || !root.RGCrmCore || typeof root.RGCrmCore.evaluateSpamGuard !== 'function') {
+      return { allowed: true, reason: '', waitMs: 0 };
+    }
+    var o = opts || {};
+    var sig = String(signature || act);
+    var res = root.RGCrmCore.evaluateSpamGuard(uiActionSpamState, act, sig, {
+      duplicateWindowMs: o.duplicateWindowMs || 1200,
+      burstWindowMs: o.burstWindowMs || 10000,
+      maxBurst: o.maxBurst || 25
+    });
+    if (!res.allowed && !o.silentToast) {
+      toast(res.message || 'تم إرسال نفس العملية قبل لحظات، تم منع التكرار التلقائي (مانع Spam).', true);
+    }
+    return res;
+  }
+
+  function withActionLock(btnEl, lockKey, fn, opts) {
+    var o = opts || {};
     var key = String(lockKey || '');
     if (key && activeActionLocks[key]) {
+      if (o.spamAction && !o.silentToast) {
+        toast('جاري تنفيذ العملية بالفعل، تم منع التكرار (مانع Spam).', true);
+      }
       return activeActionLocks[key];
+    }
+    if (o.spamAction) {
+      var spRes = checkActionSpam(o.spamAction, o.spamSig || key || o.spamAction, o.spamOpts);
+      if (!spRes.allowed) {
+        return Promise.resolve({
+          success: false,
+          spamBlocked: true,
+          waitMs: spRes.waitMs || 1200,
+          message: spRes.message || 'تم منع التكرار التلقائي (مانع Spam).'
+        });
+      }
     }
     var prevDisabled = btnEl ? Boolean(btnEl.disabled) : false;
     if (btnEl) {
@@ -498,9 +572,63 @@
     return p;
   }
 
+  function isActionLocked(lockKey) {
+    var key = String(lockKey || '');
+    return Boolean(key && activeActionLocks[key]);
+  }
+
+  function getRoleUiDefaults() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults) {
+      state.roleUiDefaults = root.RGCrmCore.normalizeRoleUiDefaults(state.roleUiDefaults);
+    }
+    return state.roleUiDefaults || {};
+  }
+
+  function setRoleUiDefaults(rawDefaults) {
+    state.roleUiDefaults = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+      ? root.RGCrmCore.normalizeRoleUiDefaults(rawDefaults)
+      : (rawDefaults && typeof rawDefaults === 'object' ? rawDefaults : {});
+    applyUiSimplification(state.uiSimplification, true);
+    return state.roleUiDefaults;
+  }
+
+  function getStatsControlConfig() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeStatsControlConfig) {
+      state.statsControlConfig = root.RGCrmCore.normalizeStatsControlConfig(state.statsControlConfig);
+    }
+    return state.statsControlConfig || { excludedFromStatsEmployeeIds: [] };
+  }
+
+  function setStatsControlConfig(rawCfg) {
+    state.statsControlConfig = (root.RGCrmCore && root.RGCrmCore.normalizeStatsControlConfig)
+      ? root.RGCrmCore.normalizeStatsControlConfig(rawCfg)
+      : (rawCfg && typeof rawCfg === 'object' ? rawCfg : { excludedFromStatsEmployeeIds: [] });
+    return state.statsControlConfig;
+  }
+
+  function getEffectiveRoleUiResolution(userOverride) {
+    var u = userOverride || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
+    var baseUi = normalizeUiSimpFallback(state.uiSimplification);
+    var activeDefaults = (state.previewSession && state.previewSession.draftRoleUiDefaults)
+      ? state.previewSession.draftRoleUiDefaults
+      : state.roleUiDefaults;
+    if (u && root.RGCrmCore && root.RGCrmCore.resolveRoleUiDefaultsForUser) {
+      return root.RGCrmCore.resolveRoleUiDefaultsForUser(u, activeDefaults, baseUi);
+    }
+    return {
+      role: (u && u.role) || 'agent',
+      hasRoleOverride: false,
+      forceForRole: false,
+      uiSimplification: baseUi,
+      visibleCols: (root.RGCrmCore && root.RGCrmCore.DEFAULT_RESERVATIONS_VISIBLE_COLS)
+        ? root.RGCrmCore.DEFAULT_RESERVATIONS_VISIBLE_COLS.slice()
+        : ['reservationNumber', 'customerName', 'carName', 'startDate', 'totalAmount', 'originalStatusAr', 'internalStatus']
+    };
+  }
+
   function getUiSimplification() {
-    state.uiSimplification = normalizeUiSimpFallback(state.uiSimplification);
-    return Object.assign({}, state.uiSimplification);
+    var resolved = getEffectiveRoleUiResolution();
+    return Object.assign({}, normalizeUiSimpFallback(resolved && resolved.uiSimplification ? resolved.uiSimplification : state.uiSimplification));
   }
 
   function applyUiSimplification(rawCfg, skipPersist) {
@@ -511,6 +639,8 @@
         localStorage.setItem(UI_SIMP_STORAGE_KEY, JSON.stringify(cfg));
       } catch (_e) {}
     }
+    var resolved = getEffectiveRoleUiResolution();
+    var effectiveCfg = normalizeUiSimpFallback(resolved && resolved.uiSimplification ? resolved.uiSimplification : cfg);
     var html = document.documentElement;
     if (html && html.classList) {
       var opts = (root.RGCrmCore && Array.isArray(root.RGCrmCore.UI_SIMPLIFICATION_OPTIONS))
@@ -525,11 +655,11 @@
           ];
       opts.forEach(function (item) {
         if (item && item.cssClass) {
-          html.classList.toggle(item.cssClass, Boolean(cfg[item.key]));
+          html.classList.toggle(item.cssClass, Boolean(effectiveCfg[item.key]));
         }
       });
     }
-    return cfg;
+    return effectiveCfg;
   }
 
   function getLayoutPrefs(user) {
@@ -559,6 +689,27 @@
       return root.RGCrmCore.normalizeSidebarPosition(state.prefs.sidebarPosition);
     }
     return (state.prefs.sidebarPosition === 'top' || state.prefs.sidebarPosition === 'bottom') ? state.prefs.sidebarPosition : 'side';
+  }
+
+  function getTimezoneMode() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeTimezoneMode) {
+      return root.RGCrmCore.normalizeTimezoneMode(state.prefs.timezoneMode);
+    }
+    return (state.prefs.timezoneMode === 'sa' || state.prefs.timezoneMode === 'eg') ? state.prefs.timezoneMode : 'both';
+  }
+
+  function getReservationsDisplayMode() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeReservationsDisplayMode) {
+      return root.RGCrmCore.normalizeReservationsDisplayMode(state.prefs.reservationsDisplayMode);
+    }
+    return state.prefs.reservationsDisplayMode === 'calendar' ? 'calendar' : 'table';
+  }
+
+  function getCalendarGranularity() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeCalendarGranularity) {
+      return root.RGCrmCore.normalizeCalendarGranularity(state.prefs.calendarGranularity);
+    }
+    return (state.prefs.calendarGranularity === 'day' || state.prefs.calendarGranularity === 'month') ? state.prefs.calendarGranularity : 'week';
   }
 
   function formatTimePref(val, langOverride) {
@@ -597,6 +748,9 @@
       var nextPos = (raw && (raw.sidebarPosition === 'side' || raw.sidebarPosition === 'top' || raw.sidebarPosition === 'bottom'))
         ? raw.sidebarPosition
         : ((localUserPrefs.sidebarPosition === 'side' || localUserPrefs.sidebarPosition === 'top' || localUserPrefs.sidebarPosition === 'bottom') ? localUserPrefs.sidebarPosition : norm.sidebarPosition);
+      var nextTz = (raw && (raw.timezoneMode === 'both' || raw.timezoneMode === 'sa' || raw.timezoneMode === 'eg'))
+        ? raw.timezoneMode
+        : ((localUserPrefs.timezoneMode === 'both' || localUserPrefs.timezoneMode === 'sa' || localUserPrefs.timezoneMode === 'eg') ? localUserPrefs.timezoneMode : norm.timezoneMode);
       var nextTheme = (raw && (raw.theme === 'dark' || raw.theme === 'light'))
         ? raw.theme
         : ((localUserPrefs.theme === 'dark' || localUserPrefs.theme === 'light') ? localUserPrefs.theme : getDefaultSystemTheme());
@@ -607,8 +761,18 @@
         ? Boolean(raw.sidebarCollapsed)
         : Boolean(localUserPrefs.sidebarCollapsed || localUserLayout.sidebarCollapsed);
 
+      var nextResView = (raw && (raw.reservationsDisplayMode === 'table' || raw.reservationsDisplayMode === 'calendar'))
+        ? raw.reservationsDisplayMode
+        : ((localUserPrefs.reservationsDisplayMode === 'table' || localUserPrefs.reservationsDisplayMode === 'calendar') ? localUserPrefs.reservationsDisplayMode : norm.reservationsDisplayMode);
+      var nextCalGran = (raw && (raw.calendarGranularity === 'week' || raw.calendarGranularity === 'day' || raw.calendarGranularity === 'month'))
+        ? raw.calendarGranularity
+        : ((localUserPrefs.calendarGranularity === 'week' || localUserPrefs.calendarGranularity === 'day' || localUserPrefs.calendarGranularity === 'month') ? localUserPrefs.calendarGranularity : norm.calendarGranularity);
+
       state.prefs.timeFormat = nextTime;
       state.prefs.sidebarPosition = nextPos;
+      state.prefs.timezoneMode = nextTz;
+      state.prefs.reservationsDisplayMode = nextResView;
+      state.prefs.calendarGranularity = nextCalGran;
       state.prefs.theme = nextTheme;
       state.prefs.lang = nextLang;
       state.prefs.sidebarCollapsed = nextCollapsed;
@@ -618,6 +782,9 @@
     } else if (raw && typeof raw === 'object') {
       if (raw.timeFormat === '12h' || raw.timeFormat === '24h') state.prefs.timeFormat = raw.timeFormat;
       if (raw.sidebarPosition === 'side' || raw.sidebarPosition === 'top' || raw.sidebarPosition === 'bottom') state.prefs.sidebarPosition = raw.sidebarPosition;
+      if (raw.timezoneMode === 'both' || raw.timezoneMode === 'sa' || raw.timezoneMode === 'eg') state.prefs.timezoneMode = raw.timezoneMode;
+      if (raw.reservationsDisplayMode === 'table' || raw.reservationsDisplayMode === 'calendar') state.prefs.reservationsDisplayMode = raw.reservationsDisplayMode;
+      if (raw.calendarGranularity === 'week' || raw.calendarGranularity === 'day' || raw.calendarGranularity === 'month') state.prefs.calendarGranularity = raw.calendarGranularity;
       if (raw.theme === 'dark' || raw.theme === 'light') state.prefs.theme = raw.theme;
       if (raw.lang === 'ar' || raw.lang === 'en') state.prefs.lang = raw.lang;
       if (raw.sidebarCollapsed !== undefined) state.prefs.sidebarCollapsed = Boolean(raw.sidebarCollapsed);
@@ -628,6 +795,9 @@
 
     norm.timeFormat = getTimeFormat();
     norm.sidebarPosition = getSidebarPosition();
+    norm.timezoneMode = getTimezoneMode();
+    norm.reservationsDisplayMode = getReservationsDisplayMode();
+    norm.calendarGranularity = getCalendarGranularity();
     norm.theme = state.prefs.theme === 'dark' ? 'dark' : 'light';
     norm.lang = state.prefs.lang === 'en' ? 'en' : 'ar';
     norm.sidebarCollapsed = Boolean(state.prefs.sidebarCollapsed);
@@ -638,6 +808,7 @@
     return norm;
   }
 
+  var saveLayoutPrefsTimer = null;
   async function saveLayoutPrefs(patch, opts) {
     var o = opts || {};
     var u = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
@@ -645,6 +816,9 @@
     var merged = Object.assign({}, cur, patch || {});
     if (merged.timeFormat === undefined) merged.timeFormat = getTimeFormat();
     if (merged.sidebarPosition === undefined) merged.sidebarPosition = getSidebarPosition();
+    if (merged.timezoneMode === undefined) merged.timezoneMode = getTimezoneMode();
+    if (merged.reservationsDisplayMode === undefined) merged.reservationsDisplayMode = getReservationsDisplayMode();
+    if (merged.calendarGranularity === undefined) merged.calendarGranularity = getCalendarGranularity();
     if (merged.theme === undefined) merged.theme = state.prefs.theme === 'dark' ? 'dark' : 'light';
     if (merged.lang === undefined) merged.lang = state.prefs.lang === 'en' ? 'en' : 'ar';
     if (merged.sidebarCollapsed === undefined) merged.sidebarCollapsed = Boolean(state.prefs.sidebarCollapsed);
@@ -661,9 +835,16 @@
       refreshSidebarNavDom(u);
     }
     if (o.persist !== false && root.RGApi && root.RGApi.callApi && u) {
-      try {
-        await root.RGApi.callApi('saveUserLayoutPrefs', next);
-      } catch (_err) {}
+      if (o.immediate) {
+        if (saveLayoutPrefsTimer) { clearTimeout(saveLayoutPrefsTimer); saveLayoutPrefsTimer = null; }
+        try { await root.RGApi.callApi('saveUserLayoutPrefs', next); } catch (_err) {}
+      } else {
+        if (saveLayoutPrefsTimer) clearTimeout(saveLayoutPrefsTimer);
+        saveLayoutPrefsTimer = setTimeout(function () {
+          saveLayoutPrefsTimer = null;
+          root.RGApi.callApi('saveUserLayoutPrefs', Object.assign({}, state.layoutPrefs || next, { _spamChecked: true })).catch(function () {});
+        }, 200);
+      }
     }
     return next;
   }
@@ -673,6 +854,9 @@
     var o = opts || {};
     var prevTime = getTimeFormat();
     var prevPos = getSidebarPosition();
+    var prevTz = getTimezoneMode();
+    var prevResView = getReservationsDisplayMode();
+    var prevCalGran = getCalendarGranularity();
     var prevLang = state.prefs.lang;
     var prevTheme = state.prefs.theme;
 
@@ -686,6 +870,21 @@
         ? root.RGCrmCore.normalizeSidebarPosition(p.sidebarPosition)
         : ((p.sidebarPosition === 'top' || p.sidebarPosition === 'bottom') ? p.sidebarPosition : 'side');
     }
+    if (p.timezoneMode !== undefined) {
+      state.prefs.timezoneMode = (root.RGCrmCore && root.RGCrmCore.normalizeTimezoneMode)
+        ? root.RGCrmCore.normalizeTimezoneMode(p.timezoneMode)
+        : ((p.timezoneMode === 'sa' || p.timezoneMode === 'eg') ? p.timezoneMode : 'both');
+    }
+    if (p.reservationsDisplayMode !== undefined) {
+      state.prefs.reservationsDisplayMode = (root.RGCrmCore && root.RGCrmCore.normalizeReservationsDisplayMode)
+        ? root.RGCrmCore.normalizeReservationsDisplayMode(p.reservationsDisplayMode)
+        : (p.reservationsDisplayMode === 'calendar' ? 'calendar' : 'table');
+    }
+    if (p.calendarGranularity !== undefined) {
+      state.prefs.calendarGranularity = (root.RGCrmCore && root.RGCrmCore.normalizeCalendarGranularity)
+        ? root.RGCrmCore.normalizeCalendarGranularity(p.calendarGranularity)
+        : ((p.calendarGranularity === 'day' || p.calendarGranularity === 'month') ? p.calendarGranularity : 'week');
+    }
     if (p.theme === 'dark' || p.theme === 'light') {
       state.prefs.theme = p.theme;
     }
@@ -698,6 +897,9 @@
 
     var nextTime = getTimeFormat();
     var nextPos = getSidebarPosition();
+    var nextTz = getTimezoneMode();
+    var nextResView = getReservationsDisplayMode();
+    var nextCalGran = getCalendarGranularity();
     var nextTheme = state.prefs.theme === 'dark' ? 'dark' : 'light';
     var nextLang = state.prefs.lang === 'en' ? 'en' : 'ar';
 
@@ -730,35 +932,60 @@
 
     try {
       document.dispatchEvent(new CustomEvent('rg:personalprefschange', {
-        detail: { timeFormat: nextTime, sidebarPosition: nextPos, theme: nextTheme, lang: nextLang }
+        detail: {
+          timeFormat: nextTime,
+          sidebarPosition: nextPos,
+          timezoneMode: nextTz,
+          reservationsDisplayMode: nextResView,
+          calendarGranularity: nextCalGran,
+          theme: nextTheme,
+          lang: nextLang
+        }
       }));
     } catch (_evErr) {}
 
     var curUser = root.RGAuth && root.RGAuth.getUser && root.RGAuth.getUser();
+    var wasPersonalModalOpen = Boolean(document.getElementById('personal-settings-modal'));
     if (o.reRender !== false && curUser) {
       if (prevLang !== nextLang) {
         renderAppShell(curUser);
-        await renderRoute();
-      } else if (prevTime !== nextTime) {
-        await renderRoute();
+        if (wasPersonalModalOpen) {
+          openPersonalAccountSettingsModal();
+        }
+        renderRoute().catch(function () {});
+      } else if (prevTime !== nextTime || prevTz !== nextTz || ((prevResView !== nextResView || prevCalGran !== nextCalGran) && state.route === 'reservations' && !o.skipRouteRerender)) {
+        renderRoute().catch(function () {});
       }
     }
 
     if (o.persist !== false) {
-      await saveLayoutPrefs({
+      saveLayoutPrefs({
         timeFormat: nextTime,
         sidebarPosition: nextPos,
+        timezoneMode: nextTz,
+        reservationsDisplayMode: nextResView,
+        calendarGranularity: nextCalGran,
         theme: nextTheme,
         lang: nextLang,
         sidebarCollapsed: Boolean(state.prefs.sidebarCollapsed)
-      }, { reRenderNav: false, persist: true });
+      }, { reRenderNav: false, persist: true }).catch(function () {});
     }
-    return { timeFormat: nextTime, sidebarPosition: nextPos, theme: nextTheme, lang: nextLang };
+    return {
+      timeFormat: nextTime,
+      sidebarPosition: nextPos,
+      timezoneMode: nextTz,
+      reservationsDisplayMode: nextResView,
+      calendarGranularity: nextCalGran,
+      theme: nextTheme,
+      lang: nextLang
+    };
   }
 
   function canManageAnnouncements(user) {
     var u = user || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null);
-    return Boolean(u && (u.role === 'supervisor' || u.role === 'general_manager'));
+    if (!u) return false;
+    if (root.RGCrmCore && root.RGCrmCore.isPrivilegedRole && root.RGCrmCore.isPrivilegedRole(u)) return true;
+    return u.role === 'supervisor' || u.role === 'general_manager' || u.role === 'developer';
   }
 
   function getHandoverSettings() {
@@ -1297,10 +1524,26 @@
       refreshNotifications: refreshNotifications,
       getUiSimplification: getUiSimplification,
       applyUiSimplification: applyUiSimplification,
+      getRoleUiDefaults: getRoleUiDefaults,
+      setRoleUiDefaults: setRoleUiDefaults,
+      getStatsControlConfig: getStatsControlConfig,
+      setStatsControlConfig: setStatsControlConfig,
+      getEffectiveRoleUiResolution: getEffectiveRoleUiResolution,
+      getRealUser: getRealUser,
+      getPreviewState: getPreviewState,
+      startPreviewSession: startPreviewSession,
+      stopPreviewSession: stopPreviewSession,
+      openPreviewRoleModal: openPreviewRoleModal,
+      setUnsavedGuard: setUnsavedGuard,
+      clearUnsavedGuard: clearUnsavedGuard,
+      requestCloseWithGuard: requestCloseWithGuard,
       getLayoutPrefs: getLayoutPrefs,
       saveLayoutPrefs: saveLayoutPrefs,
       getTimeFormat: getTimeFormat,
       getSidebarPosition: getSidebarPosition,
+      getTimezoneMode: getTimezoneMode,
+      getReservationsDisplayMode: getReservationsDisplayMode,
+      getCalendarGranularity: getCalendarGranularity,
       setPersonalPreferences: setPersonalPreferences,
       formatTime: formatTimePref,
       formatDateTime: formatDateTimePref,
@@ -1316,6 +1559,10 @@
       openCallWrapUpBar: openCallWrapUpBar,
       updateOfflineBanner: updateOfflineBanner,
       openPwaInstallFlow: openPwaInstallFlow,
+      toggleEmployeeStatusInState: toggleEmployeeStatusInState,
+      deleteEmployeeFromState: deleteEmployeeFromState,
+      upsertEmployeeInState: upsertEmployeeInState,
+      removeEmployeeLocal: removeEmployeeLocal,
       openPersonalAccountSettingsModal: function (onUpdated) {
         openPersonalAccountSettingsModal(onUpdated);
       },
@@ -1324,6 +1571,7 @@
         if (u) openScreenOrganizerModal(u);
       },
       withActionLock: withActionLock,
+      isActionLocked: isActionLocked,
       onAuthChanged: bootAuthenticatedApp
     };
   }
@@ -1514,6 +1762,8 @@
     html.setAttribute('data-theme', state.prefs.theme === 'dark' ? 'dark' : 'light');
     html.setAttribute('data-nav-pos', getSidebarPosition());
     html.setAttribute('data-time-format', getTimeFormat());
+    html.setAttribute('data-timezone-mode', getTimezoneMode());
+    html.setAttribute('data-reservations-view', getReservationsDisplayMode());
     if (state.prefs.theme === 'dark') html.classList.add('dark');
     else html.classList.remove('dark');
     applyUiSimplification(state.uiSimplification, true);
@@ -1722,18 +1972,28 @@
         '</div>' +
       '</div>' +
       '<div class="rg-profile-menu-items">' +
-        '<button type="button" class="rg-menu-item" role="menuitem" id="profile-personal-settings-btn">' +
+        '<button type="button" class="rg-menu-item rg-ui-profile-personal" role="menuitem" id="profile-personal-settings-btn">' +
           renderIcon('M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z') +
           '<span>' + (isEn ? 'Personal Account Settings' : 'إعدادات الحساب الشخصي') + '</span>' +
         '</button>' +
-        '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="my-followups">' +
-          renderIcon('M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11') +
-          '<span>' + t('nav_my_followups') + '</span>' +
-        '</button>' +
-        '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="settings">' +
-          renderIcon('M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z') +
-          '<span>' + t('nav_settings') + '</span>' +
-        '</button>' +
+        (((getRealUser() || user).role === 'developer')
+          ? '<button type="button" class="rg-menu-item rg-ui-edit-dev-btn" role="menuitem" id="profile-edit-developer-btn">' +
+              renderIcon('M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z') +
+              '<span>' + (isEn ? 'Edit Developer Data' : 'تعديل بيانات المبرمج') + '</span>' +
+            '</button>'
+          : '') +
+        (isNavRouteAllowedForUser({ id: 'my-followups' }, user)
+          ? '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="my-followups">' +
+              renderIcon('M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11') +
+              '<span>' + t('nav_my_followups') + '</span>' +
+            '</button>'
+          : '') +
+        (isNavRouteAllowedForUser({ id: 'settings' }, user)
+          ? '<button type="button" class="rg-menu-item" role="menuitem" data-profile-route="settings">' +
+              renderIcon('M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z') +
+              '<span>' + t('nav_settings') + '</span>' +
+            '</button>'
+          : '') +
         (showInstallBtn
           ? ('<button type="button" class="rg-menu-item" role="menuitem" id="profile-pwa-install-btn">' +
                renderIcon('M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3') +
@@ -1792,6 +2052,20 @@
       });
     }
 
+    var profEditDevBtn = document.getElementById('profile-edit-developer-btn');
+    if (profEditDevBtn) {
+      profEditDevBtn.addEventListener('click', function () {
+        closeProfileMenu();
+        var sb = document.getElementById('app-sidebar');
+        var ov = document.getElementById('sidebar-overlay');
+        if (sb) sb.classList.remove('mobile-open');
+        if (ov) ov.classList.remove('active');
+        if (root.RGEmployees && typeof root.RGEmployees.openEditDeveloperModal === 'function') {
+          root.RGEmployees.openEditDeveloperModal(buildAppCtx(), function () { renderRoute(); });
+        }
+      });
+    }
+
     var profPwaBtn = document.getElementById('profile-pwa-install-btn');
     if (profPwaBtn) {
       profPwaBtn.addEventListener('click', function () {
@@ -1808,8 +2082,10 @@
         var ov = document.getElementById('sidebar-overlay');
         if (sb) sb.classList.remove('mobile-open');
         if (ov) ov.classList.remove('active');
-        state.route = r;
-        renderRoute();
+        requestCloseWithGuard(function () {
+          state.route = r;
+          renderRoute();
+        });
       });
     });
 
@@ -2095,9 +2371,10 @@
               '<div id="login-conn-test-result" class="hidden" role="status" style="margin-top:8px;"></div>' +
               (!isLive ? (
                 '<div class="auth-demo-quick">' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">دخول كمدير (admin)</button>' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">دخول كمشرف (supervisor)</button>' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">دخول كموظف (agent1)</button>' +
+                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="developer" data-p="Dev@123">المبرمج (developer)</button>' +
+                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">المدير (admin)</button>' +
+                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">المشرف (supervisor)</button>' +
+                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">موظف (agent1)</button>' +
                 '</div>' +
                 '<div style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.6;">' +
                   'يتم ضبط الاتصال بقاعدة البيانات و<span class="mono" dir="ltr">Apps Script</span> من متغيرات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط.' +
@@ -2257,16 +2534,105 @@
     return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="' + pathData + '"/></svg>';
   }
 
-  function buildLoadingSkeletonHtml(title) {
-    return '<div class="surface-card rg-skeleton-card" aria-busy="true" aria-label="جاري تحميل ' + title + '">' +
-      '<div class="rg-skeleton-line lg"></div>' +
-      '<div class="rg-skeleton-line sm"></div>' +
-      '<div class="rg-skeleton-grid">' +
-        '<div class="rg-skeleton-box"></div>' +
-        '<div class="rg-skeleton-box"></div>' +
-        '<div class="rg-skeleton-box"></div>' +
-      '</div>' +
+  function buildLoadingSkeletonHtml(title, routeId) {
+    var rId = String(routeId || '');
+    var headerRow =
+      '<div class="rg-skeleton-interactive rg-skeleton-toolbar">' +
+        '<div style="display:flex;flex-direction:column;gap:8px;min-width:180px;flex:1;">' +
+          '<div class="rg-skeleton-line lg"></div>' +
+          '<div class="rg-skeleton-line sm"></div>' +
+        '</div>' +
+        '<div class="rg-skeleton-pills">' +
+          '<div class="rg-skeleton-pill"></div>' +
+          '<div class="rg-skeleton-pill"></div>' +
+          '<div class="rg-skeleton-pill"></div>' +
+        '</div>' +
+      '</div>';
+
+    var bodyHtml = '';
+    if (rId === 'dashboard') {
+      bodyHtml =
+        '<div class="rg-skeleton-kpis">' +
+          '<div class="rg-skeleton-interactive rg-skeleton-kpi"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line md"></div></div>' +
+          '<div class="rg-skeleton-interactive rg-skeleton-kpi"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line md"></div></div>' +
+          '<div class="rg-skeleton-interactive rg-skeleton-kpi"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line md"></div></div>' +
+          '<div class="rg-skeleton-interactive rg-skeleton-kpi"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-line lg"></div><div class="rg-skeleton-line md"></div></div>' +
+        '</div>' +
+        '<div class="rg-skeleton-split">' +
+          '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line md"></div><div class="rg-skeleton-box" style="height:175px;"></div></div>' +
+          '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
+        '</div>';
+    } else if (rId === 'reservations' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
+      var rows = '';
+      for (var i = 0; i < 5; i++) {
+        rows +=
+          '<div class="rg-skeleton-table-row">' +
+            '<div class="rg-skeleton-line md"></div>' +
+            '<div class="rg-skeleton-line lg" style="width:78%;"></div>' +
+            '<div class="rg-skeleton-line sm" style="width:70%;"></div>' +
+            '<div class="rg-skeleton-line sm" style="width:65%;"></div>' +
+            '<div class="rg-skeleton-line sm" style="width:55%;"></div>' +
+          '</div>';
+      }
+      bodyHtml =
+        '<div class="rg-skeleton-interactive rg-skeleton-table-rows">' +
+          rows +
+        '</div>';
+    } else if (rId === 'reports') {
+      bodyHtml =
+        '<div class="rg-skeleton-split">' +
+          '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line md"></div><div class="rg-skeleton-box" style="height:160px;"></div></div>' +
+          '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line md"></div><div class="rg-skeleton-box" style="height:160px;"></div></div>' +
+        '</div>' +
+        '<div class="rg-skeleton-interactive rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+    } else {
+      bodyHtml =
+        '<div class="rg-skeleton-interactive rg-skeleton-card">' +
+          '<div class="rg-skeleton-line lg"></div>' +
+          '<div class="rg-skeleton-line sm"></div>' +
+          '<div class="rg-skeleton-grid">' +
+            '<div class="rg-skeleton-box"></div>' +
+            '<div class="rg-skeleton-box"></div>' +
+            '<div class="rg-skeleton-box"></div>' +
+          '</div>' +
+        '</div>';
+    }
+
+    return '<div class="rg-skeleton-shell" aria-busy="true" aria-label="جاري تحميل ' + escapeHtml(title || '') + '">' +
+      headerRow +
+      bodyHtml +
     '</div>';
+  }
+
+  function bindSkeletonPointerGlow(containerEl) {
+    if (!containerEl) return;
+    var shell = containerEl.querySelector('.rg-skeleton-shell');
+    if (!shell || shell._rgGlowBound) return;
+    shell._rgGlowBound = true;
+    shell.addEventListener('pointermove', function (ev) {
+      var rect = shell.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      var xPct = Math.max(0, Math.min(100, Math.round(((ev.clientX - rect.left) / rect.width) * 100)));
+      var yPct = Math.max(0, Math.min(100, Math.round(((ev.clientY - rect.top) / rect.height) * 100)));
+      shell.style.setProperty('--rg-mx', xPct + '%');
+      shell.style.setProperty('--rg-my', yPct + '%');
+    }, { passive: true });
+  }
+
+  function animateProgressiveReveal(rootEl) {
+    if (!rootEl || !rootEl.querySelectorAll) return;
+    var reduced = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) return;
+    var targets = rootEl.querySelectorAll('.dash-sec-wrap, .kpi-hero-card, .kpi-strip-card, .surface-card, .chart-card, .glass-subcard, .rg-stats-ctrl-row');
+    var maxItems = Math.min(targets.length, 14);
+    for (var i = 0; i < maxItems; i++) {
+      var el = targets[i];
+      if (!el || el.classList.contains('hidden')) continue;
+      el.style.setProperty('--rg-idx', String(i));
+      el.classList.remove('rg-reveal-item');
+      void el.offsetWidth;
+      el.classList.add('rg-reveal-item');
+    }
   }
 
   function getRoutePrimaryRequest(routeId) {
@@ -2314,7 +2680,7 @@
         };
       }
       case 'employees':
-        if (u && root.RGCrmCore && root.RGCrmCore.canUserPerform(u, 'view_employees')) {
+        if (u && root.RGCrmCore && root.RGCrmCore.canUserViewRoute && root.RGCrmCore.canUserViewRoute(u, 'employees')) {
           return { action: 'getEmployees', payload: {} };
         }
         return null;
@@ -2328,6 +2694,17 @@
   async function renderActiveRouteView(slot, ctx, routeOpts) {
     var curUser = root.RGAuth.getUser();
     var rOpts = routeOpts || {};
+    if (!state.route) {
+      slot.innerHTML =
+        '<div class="surface-card">' +
+          '<div class="empty-state" style="padding:36px 18px;">' +
+            (state.prefs.lang === 'en'
+              ? 'No sections are currently enabled for this account. Please contact your manager or developer.'
+              : 'لا توجد أقسام مفعلة لهذا الحساب حالياً. يرجى مراجعة المدير أو المبرمج لتفعيل الأقسام المطلوبة.') +
+          '</div>' +
+        '</div>';
+      return;
+    }
     switch (state.route) {
       case 'dashboard':
         await root.RGDashboard.render(slot, ctx, { silent: Boolean(rOpts.silent) });
@@ -2411,6 +2788,9 @@
     closeProfileMenu();
     closeNotificationsPopover();
     root.RGDashboard.destroyCharts();
+    if (root.RGReports && typeof root.RGReports.destroyCharts === 'function') {
+      root.RGReports.destroyCharts();
+    }
     var navItem = NAV_ITEMS.find(function (n) { return n.id === state.route; }) || NAV_ITEMS[0];
     var routeTitle = t(navItem.key);
     if (heading) heading.textContent = routeTitle;
@@ -2435,13 +2815,15 @@
     }
 
     if (!isInstantlyReady) {
-      slot.innerHTML = buildLoadingSkeletonHtml(routeTitle);
+      slot.innerHTML = buildLoadingSkeletonHtml(routeTitle, state.route);
+      bindSkeletonPointerGlow(slot);
     }
 
     var ctx = buildAppCtx();
 
     try {
       await renderActiveRouteView(slot, ctx, { silent: false });
+      animateProgressiveReveal(slot);
     } catch (err) {
       slot.innerHTML =
         '<div class="surface-card">' +
@@ -2462,14 +2844,14 @@
 
   function isNavRouteAllowedForUser(item, user) {
     if (!item || !user) return false;
+    if (root.RGCrmCore && root.RGCrmCore.canUserViewRoute) {
+      return root.RGCrmCore.canUserViewRoute(user, item.id);
+    }
     if (item.id === 'dashboard' && !root.RGCrmCore.canUserPerform(user, 'view_dashboard')) {
       return false;
     }
-    if (item.id === 'employees' && !root.RGCrmCore.canUserPerform(user, 'view_employees') && user.role !== root.RGCrmCore.ROLES.GENERAL_MANAGER) {
+    if (item.id === 'employees' && !root.RGCrmCore.canUserPerform(user, 'view_employees') && !(root.RGCrmCore && root.RGCrmCore.isPrivilegedRole && root.RGCrmCore.isPrivilegedRole(user))) {
       return false;
-    }
-    if (item.id === 'settings') {
-      return true;
     }
     return true;
   }
@@ -2526,8 +2908,10 @@
         if (sidebar) sidebar.classList.remove('mobile-open');
         if (overlay) overlay.classList.remove('active');
         if (state.route === targetRoute) return;
-        state.route = targetRoute;
-        renderRoute();
+        requestCloseWithGuard(function () {
+          state.route = targetRoute;
+          renderRoute();
+        });
       });
     });
 
@@ -2555,6 +2939,7 @@
     var user = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
     var curTimeFmt = getTimeFormat();
     var curNavPos = getSidebarPosition();
+    var curTzMode = getTimezoneMode();
     var curTheme = state.prefs.theme === 'dark' ? 'dark' : 'light';
     var curLang = state.prefs.lang === 'en' ? 'en' : 'ar';
 
@@ -2568,15 +2953,37 @@
       return hhmm;
     }
 
+    function formatLiveTzSample(tzM, fmt) {
+      var now = new Date();
+      var riyadh = new Date(now.getTime() + 3 * 3600000);
+      var dStr = riyadh.toISOString().substring(0, 10);
+      var tStr = riyadh.toISOString().substring(11, 16);
+      if (root.RGCrmCore && root.RGCrmCore.buildBookingTimezoneDisplay) {
+        var disp = root.RGCrmCore.buildBookingTimezoneDisplay(dStr, tStr, {
+          lang: state.prefs.lang,
+          timeFormat: fmt,
+          timezoneMode: tzM,
+          compact: true,
+          timeOnly: true
+        });
+        if (disp && disp.entries && disp.entries.length) {
+          return disp.entries.map(function (e) {
+            return e.label + ': ' + e.valueText;
+          }).join(' | ');
+        }
+      }
+      return formatLiveSample(fmt);
+    }
+
     modalRoot.innerHTML =
       '<div class="modal-backdrop" id="personal-settings-modal" role="dialog" aria-modal="true" aria-labelledby="personal-settings-title">' +
-        '<div class="modal-panel rg-personal-modal" style="max-width:620px;">' +
+        '<div class="modal-panel rg-personal-modal" style="max-width:650px;">' +
           '<div class="modal-header">' +
             '<div>' +
               '<h3 class="modal-title" id="personal-settings-title">' + (isEn ? 'Personal Account Settings' : 'إعدادات الحساب الشخصي') + '</h3>' +
               '<p class="section-subtitle">' + (isEn
-                ? ('Customize theme, language, time display, and navigation for your account' + (user && user.name ? (' (' + user.name + ')') : '') + '. Saved automatically.')
-                : ('خصص المظهر واللغة وطريقة عرض الوقت وموضع شريط التنقل لحسابك' + (user && user.name ? (' (' + user.name + ')') : '') + ' مع الحفظ التلقائي لحسابك.')) + '</p>' +
+                ? ('Customize theme, language, booking timezone, time display, and navigation for your account' + (user && user.name ? (' (' + user.name + ')') : '') + '. Saved automatically.')
+                : ('خصص المظهر واللغة وتوقيت مواعيد الحجوزات وطريقة عرض الوقت وموضع شريط التنقل لحسابك' + (user && user.name ? (' (' + user.name + ')') : '') + ' مع الحفظ التلقائي.')) + '</p>' +
             '</div>' +
             '<button type="button" class="btn btn-sm" id="personal-settings-close" data-modal-close aria-label="' + (isEn ? 'Close' : 'إغلاق') + '">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
           '</div>' +
@@ -2635,6 +3042,39 @@
           '<div class="rg-personal-section">' +
             '<div class="rg-personal-sec-head">' +
               '<div>' +
+                '<div class="rg-personal-sec-title">' + (isEn ? 'Booking Timezone Display' : 'توقيت مواعيد الحجوزات') + '</div>' +
+                '<div class="rg-personal-sec-sub">' + (isEn ? 'Choose to show Original Saudi Time, Egypt Time, or Both together under each booking appointment.' : 'اختر إظهار التوقيت الأصلي السعودي أو التوقيت المصري أو كلاهما معاً تحت مواعيد الحجز.') + '</div>' +
+              '</div>' +
+              '<span class="status-tag status-info tabular-nums" id="personal-tz-preview">' + formatLiveTzSample(curTzMode, curTimeFmt) + '</span>' +
+            '</div>' +
+            '<div class="rg-choice-grid rg-choice-grid-3" role="radiogroup" aria-label="' + (isEn ? 'Booking Timezone Display' : 'توقيت مواعيد الحجوزات') + '">' +
+              '<button type="button" class="rg-choice-card' + (curTzMode === 'both' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTzMode === 'both' ? 'true' : 'false') + '" data-tz-choice="both">' +
+                '<div class="rg-choice-card-top">' +
+                  '<span class="rg-choice-title">' + (isEn ? 'Both Together' : 'كلاهما معاً') + '</span>' +
+                  '<span class="rg-choice-badge mono">SA + EG</span>' +
+                '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Original Saudi Time with Egypt Time below it' : 'إظهار التوقيت الأصلي السعودي وتحته التوقيت المصري') + '</div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curTzMode === 'eg' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTzMode === 'eg' ? 'true' : 'false') + '" data-tz-choice="eg">' +
+                '<div class="rg-choice-card-top">' +
+                  '<span class="rg-choice-title">' + (isEn ? 'Egypt Time Only' : 'التوقيت المصري فقط') + '</span>' +
+                  '<span class="rg-choice-badge mono">EG</span>' +
+                '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Show booking times converted to Egypt time' : 'إظهار مواعيد الحجوزات بالتوقيت المصري فقط') + '</div>' +
+              '</button>' +
+              '<button type="button" class="rg-choice-card' + (curTzMode === 'sa' ? ' is-selected' : '') + '" role="radio" aria-checked="' + (curTzMode === 'sa' ? 'true' : 'false') + '" data-tz-choice="sa">' +
+                '<div class="rg-choice-card-top">' +
+                  '<span class="rg-choice-title">' + (isEn ? 'Saudi Time Only' : 'التوقيت السعودي فقط') + '</span>' +
+                  '<span class="rg-choice-badge mono">SA</span>' +
+                '</div>' +
+                '<div class="rg-choice-desc">' + (isEn ? 'Show Original Saudi Time only' : 'إظهار التوقيت الأصلي السعودي فقط') + '</div>' +
+              '</button>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="rg-personal-section">' +
+            '<div class="rg-personal-sec-head">' +
+              '<div>' +
                 '<div class="rg-personal-sec-title">' + (isEn ? 'Navigation Bar Position' : 'موضع شريط التنقل (السيد بار)') + '</div>' +
                 '<div class="rg-personal-sec-sub">' + (isEn ? 'Top and Bottom modes display clean section icons without text labels.' : 'في وضعي الأعلى والأسفل يظهر الشريط كأيقونات فقط للانتقال السريع بين الأقسام بدون كتابة.') + '</div>' +
               '</div>' +
@@ -2668,12 +3108,15 @@
       '</div>';
 
     var previewEl = document.getElementById('personal-time-preview');
+    var tzPreviewEl = document.getElementById('personal-tz-preview');
     function syncModalSelections() {
       var tf = getTimeFormat();
       var np = getSidebarPosition();
+      var tz = getTimezoneMode();
       var th = state.prefs.theme === 'dark' ? 'dark' : 'light';
       var lg = state.prefs.lang === 'en' ? 'en' : 'ar';
       if (previewEl) previewEl.textContent = formatLiveSample(tf);
+      if (tzPreviewEl) tzPreviewEl.textContent = formatLiveTzSample(tz, tf);
       modalRoot.querySelectorAll('[data-theme-choice]').forEach(function (btn) {
         var active = btn.getAttribute('data-theme-choice') === th;
         btn.classList.toggle('is-selected', active);
@@ -2686,6 +3129,11 @@
       });
       modalRoot.querySelectorAll('[data-time-choice]').forEach(function (btn) {
         var active = btn.getAttribute('data-time-choice') === tf;
+        btn.classList.toggle('is-selected', active);
+        btn.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
+      modalRoot.querySelectorAll('[data-tz-choice]').forEach(function (btn) {
+        var active = btn.getAttribute('data-tz-choice') === tz;
         btn.classList.toggle('is-selected', active);
         btn.setAttribute('aria-checked', active ? 'true' : 'false');
       });
@@ -2703,6 +3151,9 @@
           onUpdated({
             timeFormat: getTimeFormat(),
             sidebarPosition: getSidebarPosition(),
+            timezoneMode: getTimezoneMode(),
+            reservationsDisplayMode: getReservationsDisplayMode(),
+            calendarGranularity: getCalendarGranularity(),
             theme: state.prefs.theme,
             lang: state.prefs.lang
           });
@@ -2729,6 +3180,12 @@
       });
     });
 
+    modalRoot.querySelectorAll('[data-tz-choice]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        applyInstantPref({ timezoneMode: btn.getAttribute('data-tz-choice') });
+      });
+    });
+
     modalRoot.querySelectorAll('[data-pos-choice]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         applyInstantPref({ sidebarPosition: btn.getAttribute('data-pos-choice') });
@@ -2738,16 +3195,14 @@
     var resetBtn = document.getElementById('personal-settings-reset');
     if (resetBtn) {
       resetBtn.addEventListener('click', function () {
-        applyInstantPref({ timeFormat: '24h', sidebarPosition: 'side', theme: 'light', lang: 'ar', sidebarCollapsed: false });
+        applyInstantPref({ timeFormat: '24h', sidebarPosition: 'side', timezoneMode: 'both', theme: 'light', lang: 'ar', sidebarCollapsed: false });
         toast(isEn ? 'Personal preferences reset to defaults.' : 'تمت استعادة الإعدادات الشخصية للافتراضي.');
       });
     }
 
     function closeAndAcknowledge() {
-      Promise.resolve(pendingSavePromise).finally(function () {
-        modalRoot.innerHTML = '';
-        toast(isEn ? 'Personal account preferences saved.' : 'تم حفظ إعدادات الحساب الشخصي.');
-      });
+      modalRoot.innerHTML = '';
+      toast(isEn ? 'Personal account preferences saved.' : 'تم حفظ إعدادات الحساب الشخصي.');
     }
 
     var closeBtn = document.getElementById('personal-settings-close');
@@ -2943,12 +3398,436 @@
     renderOrganizer();
   }
 
+  function getConfirmRoot() {
+    var el = document.getElementById('rg-confirm-root');
+    if (!el && document.body) {
+      el = document.createElement('div');
+      el.id = 'rg-confirm-root';
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+
+  function closeConfirmModal() {
+    var el = document.getElementById('rg-confirm-root');
+    if (el && el.firstElementChild) {
+      el.innerHTML = '';
+      return true;
+    }
+    return false;
+  }
+
+  function setUnsavedGuard(guard) {
+    if (!guard || typeof guard.isDirty !== 'function') {
+      activeUnsavedGuard = null;
+      return;
+    }
+    activeUnsavedGuard = guard;
+  }
+
+  function clearUnsavedGuard() {
+    activeUnsavedGuard = null;
+    closeConfirmModal();
+  }
+
+  function requestCloseWithGuard(proceedFn) {
+    var nextStep = typeof proceedFn === 'function' ? proceedFn : function () {};
+    var guard = activeUnsavedGuard;
+    var dirty = false;
+    try {
+      dirty = Boolean(guard && typeof guard.isDirty === 'function' && guard.isDirty());
+    } catch (_e) {
+      dirty = false;
+    }
+    if (!dirty) {
+      clearUnsavedGuard();
+      nextStep();
+      return;
+    }
+
+    var cRoot = getConfirmRoot();
+    if (!cRoot) {
+      clearUnsavedGuard();
+      nextStep();
+      return;
+    }
+    var isEn = state.prefs.lang === 'en';
+    var hasSave = typeof guard.onSave === 'function';
+    var areaLabel = guard.label ? String(guard.label) : '';
+    cRoot.innerHTML =
+      '<div class="modal-backdrop rg-confirm-backdrop" id="rg-unsaved-confirm-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="rg-unsaved-title">' +
+        '<div class="modal-panel rg-confirm-panel" style="max-width:460px;">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h3 class="modal-title" id="rg-unsaved-title">' + (isEn ? 'Unsaved Changes Detected' : 'تنبيه: توجد تعديلات أو ملاحظات غير محفوظة') + '</h3>' +
+              (areaLabel ? '<p class="section-subtitle">' + escapeHtml(areaLabel) + '</p>' : '') +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="rg-confirm-stay-x" aria-label="' + (isEn ? 'Stay' : 'متابعة التعديل') + '">✕</button>' +
+          '</div>' +
+          '<div class="rg-confirm-body">' +
+            (isEn
+              ? 'You have unsaved notes or edits that have not been submitted yet. Would you like to save them before closing, discard them, or continue editing?'
+              : 'هناك نص مكتوب أو تعديلات غير محفوظة لم يتم إرسالها بعد. هل تريد حفظها قبل الإغلاق أم تجاهل التغييرات؟') +
+          '</div>' +
+          '<div class="modal-footer rg-confirm-actions">' +
+            '<button type="button" class="btn" id="rg-confirm-stay-btn">' + (isEn ? 'Continue Editing' : 'متابعة التعديل') + '</button>' +
+            '<button type="button" class="btn btn-danger" id="rg-confirm-discard-btn">' + (isEn ? 'Discard & Close' : 'تجاهل التغييرات والمتابعة') + '</button>' +
+            (hasSave
+              ? '<button type="button" class="btn btn-primary" id="rg-confirm-save-btn">' + (isEn ? 'Save & Continue' : 'حفظ التعديلات والمتابعة') + '</button>'
+              : '') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    var stayBtn = document.getElementById('rg-confirm-stay-btn');
+    var stayX = document.getElementById('rg-confirm-stay-x');
+    var discardBtn = document.getElementById('rg-confirm-discard-btn');
+    var saveBtn = document.getElementById('rg-confirm-save-btn');
+
+    if (stayBtn) stayBtn.addEventListener('click', closeConfirmModal);
+    if (stayX) stayX.addEventListener('click', closeConfirmModal);
+    if (discardBtn) {
+      discardBtn.addEventListener('click', function () {
+        var onDisc = guard && guard.onDiscard;
+        clearUnsavedGuard();
+        if (typeof onDisc === 'function') {
+          try { onDisc(); } catch (_e) {}
+        }
+        nextStep();
+      });
+    }
+    if (saveBtn && hasSave) {
+      saveBtn.addEventListener('click', async function () {
+        saveBtn.disabled = true;
+        try {
+          var ok = await guard.onSave();
+          if (ok === false) {
+            saveBtn.disabled = false;
+            return;
+          }
+          clearUnsavedGuard();
+          nextStep();
+        } catch (err) {
+          saveBtn.disabled = false;
+          toast((err && err.message) || 'تعذر حفظ التعديلات.', true);
+        }
+      });
+    }
+  }
+
+  function installAuthPreviewBridge() {
+    if (authPreviewBridgeInstalled || !root.RGAuth) return;
+    authPreviewBridgeInstalled = true;
+    var origGetUser = root.RGAuth.getUser;
+    var origSetUser = root.RGAuth.setUser;
+    var origUpdateUser = root.RGAuth.updateCurrentUser;
+    var origLogout = root.RGAuth.logout;
+
+    root.RGAuth.getRealUser = function () {
+      return state.previewSession && state.previewSession.realUser
+        ? state.previewSession.realUser
+        : origGetUser();
+    };
+    root.RGAuth.getUser = function () {
+      if (state.previewSession && state.previewSession.previewUser) {
+        return state.previewSession.previewUser;
+      }
+      return origGetUser();
+    };
+    root.RGAuth.updateCurrentUser = function (patch) {
+      var updated = origUpdateUser ? origUpdateUser(patch) : origGetUser();
+      if (state.previewSession && updated && state.previewSession.realUser && state.previewSession.realUser.id === updated.id) {
+        state.previewSession.realUser = updated;
+      }
+      return updated;
+    };
+    root.RGAuth.setUser = function (u) {
+      origSetUser(u);
+      if (!u) {
+        state.previewSession = null;
+        try { sessionStorage.removeItem(PREVIEW_SESSION_STORAGE_KEY); } catch (_e) {}
+      } else if (state.previewSession) {
+        state.previewSession.realUser = u;
+        if (root.RGCrmCore && root.RGCrmCore.resolvePreviewUserSession) {
+          var refreshed = root.RGCrmCore.resolvePreviewUserSession(
+            u,
+            state.previewSession.spec,
+            (state.employees && state.employees.items) || [],
+            (state.employees && state.employees.rolePresets) || []
+          );
+          if (refreshed) state.previewSession.previewUser = refreshed;
+          else state.previewSession = null;
+        }
+      }
+    };
+    root.RGAuth.logout = async function () {
+      state.previewSession = null;
+      try { sessionStorage.removeItem(PREVIEW_SESSION_STORAGE_KEY); } catch (_e) {}
+      return origLogout();
+    };
+  }
+
+  function getRealUser() {
+    if (state.previewSession && state.previewSession.realUser) {
+      return state.previewSession.realUser;
+    }
+    if (root.RGAuth && typeof root.RGAuth.getRealUser === 'function') {
+      return root.RGAuth.getRealUser();
+    }
+    return root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+  }
+
+  function getPreviewState() {
+    if (!state.previewSession || !state.previewSession.previewUser) {
+      return { active: false, spec: null, previewUser: null, realUser: getRealUser() };
+    }
+    return {
+      active: true,
+      spec: Object.assign({}, state.previewSession.spec),
+      previewUser: Object.assign({}, state.previewSession.previewUser),
+      realUser: state.previewSession.realUser
+    };
+  }
+
+  function renderPreviewRoleBanner() {
+    var host = document.getElementById('rg-preview-role-banner');
+    if (!host) return;
+    if (!state.previewSession || !state.previewSession.previewUser) {
+      host.innerHTML = '';
+      host.classList.add('hidden');
+      document.documentElement.classList.remove('rg-preview-mode-active');
+      return;
+    }
+    var pu = state.previewSession.previewUser;
+    var isEn = state.prefs.lang === 'en';
+    var roleLabels = (root.RGCrmCore && root.RGCrmCore.ROLE_LABELS && (root.RGCrmCore.ROLE_LABELS[state.prefs.lang] || root.RGCrmCore.ROLE_LABELS.ar)) || {};
+    var targetDesc = pu.previewMode === 'employee'
+      ? (pu.name + ' (' + (roleLabels[pu.role] || pu.role) + ')')
+      : (roleLabels[pu.role] || pu.role);
+    document.documentElement.classList.add('rg-preview-mode-active');
+    host.classList.remove('hidden');
+    host.innerHTML =
+      '<div class="rg-preview-banner" role="status" aria-live="polite">' +
+        '<div class="rg-preview-banner-main">' +
+          '<span class="rg-preview-pill">' + (isEn ? 'PREVIEW MODE' : 'وضع المحاكاة') + '</span>' +
+          '<span class="rg-preview-banner-text">' +
+            (isEn
+              ? ('You are previewing the CRM as <strong>' + escapeHtml(targetDesc) + '</strong>. Navigation, widgets, and actions reflect this role.')
+              : ('وضع المحاكاة — أنت تعاين النظام الآن بصلاحيات <strong>' + escapeHtml(targetDesc) + '</strong>')) +
+          '</span>' +
+        '</div>' +
+        '<div class="rg-preview-banner-actions">' +
+          '<button type="button" class="btn btn-sm" id="rg-change-preview-btn">' + (isEn ? 'Switch Role' : 'تغيير المعاينة') + '</button>' +
+          '<button type="button" class="btn btn-sm btn-primary" id="rg-stop-preview-btn">' + (isEn ? 'Exit Preview' : 'إنهاء المحاكاة') + '</button>' +
+        '</div>' +
+      '</div>';
+
+    var changeBtn = document.getElementById('rg-change-preview-btn');
+    if (changeBtn) {
+      changeBtn.addEventListener('click', function () { openPreviewRoleModal(); });
+    }
+    var stopBtn = document.getElementById('rg-stop-preview-btn');
+    if (stopBtn) {
+      stopBtn.addEventListener('click', function () { stopPreviewSession(); });
+    }
+  }
+
+  async function startPreviewSession(spec) {
+    installAuthPreviewBridge();
+    var realUser = getRealUser();
+    if (!realUser || !root.RGCrmCore || !root.RGCrmCore.canUserImpersonate || !root.RGCrmCore.canUserImpersonate(realUser)) {
+      toast('وضع المحاكاة متاح للمشرف والمدير العام والمبرمج فقط.', true);
+      return false;
+    }
+    if (!state.employees || !state.employees.loaded) {
+      await loadEmployeesState({ silent: true }).catch(function () {});
+    }
+    var previewUser = root.RGCrmCore.resolvePreviewUserSession(
+      realUser,
+      spec,
+      (state.employees && state.employees.items) || [],
+      (state.employees && state.employees.rolePresets) || []
+    );
+    if (!previewUser) {
+      toast('تعذر تفعيل وضع المحاكاة للدور أو الحساب المحدد.', true);
+      return false;
+    }
+    var draftRoleUi = (spec && spec.draftRoleUiDefaults && root.RGCrmCore.normalizeRoleUiDefaults)
+      ? root.RGCrmCore.normalizeRoleUiDefaults(spec.draftRoleUiDefaults)
+      : null;
+    clearUnsavedGuard();
+    var mRoot = document.getElementById('modal-root');
+    if (mRoot) mRoot.innerHTML = '';
+    state.previewSession = {
+      spec: Object.assign({}, spec),
+      realUser: realUser,
+      previewUser: previewUser,
+      draftRoleUiDefaults: draftRoleUi
+    };
+    try {
+      sessionStorage.setItem(PREVIEW_SESSION_STORAGE_KEY, JSON.stringify(spec));
+    } catch (_e) {}
+    applyUiSimplification(state.uiSimplification, true);
+    var safeRoute = resolveSafeRouteForUser(state.route, previewUser, getLayoutPrefs(previewUser));
+    state.route = safeRoute;
+    renderAppShell(previewUser);
+    await renderRoute();
+    toast('تم تفعيل وضع المحاكاة: ' + (previewUser.name || previewUser.role));
+    return true;
+  }
+
+  async function stopPreviewSession(silent) {
+    var realUser = getRealUser();
+    state.previewSession = null;
+    try {
+      sessionStorage.removeItem(PREVIEW_SESSION_STORAGE_KEY);
+    } catch (_e) {}
+    applyUiSimplification(state.uiSimplification, true);
+    if (realUser) {
+      renderAppShell(realUser);
+      await renderRoute();
+    }
+    if (!silent) {
+      toast('تم إنهاء وضع المحاكاة والعودة إلى حسابك الفعلي.');
+    }
+  }
+
+  async function openPreviewRoleModal(preselectSpec) {
+    var realUser = getRealUser();
+    if (!realUser || !root.RGCrmCore || !root.RGCrmCore.canUserImpersonate || !root.RGCrmCore.canUserImpersonate(realUser)) {
+      toast('وضع المحاكاة متاح للمشرف والمدير العام والمبرمج فقط.', true);
+      return;
+    }
+    if (!state.employees || !state.employees.loaded) {
+      await loadEmployeesState({ silent: true }).catch(function () {});
+    }
+    var modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+    var isEn = state.prefs.lang === 'en';
+    var allowedRoles = root.RGCrmCore.getAllowedPreviewRoles ? root.RGCrmCore.getAllowedPreviewRoles(realUser) : ['agent', 'supervisor'];
+    var roleLabels = (root.RGCrmCore.ROLE_LABELS && (root.RGCrmCore.ROLE_LABELS[state.prefs.lang] || root.RGCrmCore.ROLE_LABELS.ar)) || {};
+    var presets = (state.employees && Array.isArray(state.employees.rolePresets) ? state.employees.rolePresets : []).filter(function (p) {
+      return p && allowedRoles.indexOf(p.role) !== -1;
+    });
+    var emps = (state.employees && Array.isArray(state.employees.items) ? state.employees.items : []).filter(function (e) {
+      return e && e.id !== realUser.id && allowedRoles.indexOf(e.role) !== -1;
+    });
+
+    var initMode = (preselectSpec && preselectSpec.employeeId) ? 'employee' : ((preselectSpec && preselectSpec.presetId) ? 'preset' : 'role');
+    var initRole = (preselectSpec && preselectSpec.role) || (allowedRoles[0] || 'agent');
+    var initPresetId = (preselectSpec && preselectSpec.presetId) || (presets[0] ? presets[0].id : '');
+    var initEmpId = (preselectSpec && preselectSpec.employeeId) || (emps[0] ? emps[0].id : '');
+
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" id="rg-preview-role-modal" role="dialog" aria-modal="true" aria-labelledby="rg-preview-modal-title">' +
+        '<form class="modal-panel" id="rg-preview-role-form" style="max-width:560px;">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h3 class="modal-title" id="rg-preview-modal-title">' + (isEn ? 'Impersonation / Role Preview Mode' : 'وضع المحاكاة (معاينة النظام بصلاحيات أخرى)') + '</h3>' +
+              '<p class="section-subtitle">' + (isEn ? 'Preview screens, buttons, and role UI defaults exactly as another employee sees them without changing your login token.' : 'عاين الواجهة والأقسام والأزرار وإعدادات الواجهة الافتراضية تماماً كما يراها الدور أو الموظف المحدد.') + '</p>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="rg-preview-modal-close" data-modal-close>' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
+          '</div>' +
+          '<div class="form-group">' +
+            '<label class="form-label">' + (isEn ? 'Preview Source' : 'نطاق المحاكاة') + '</label>' +
+            '<div class="segmented-control" id="rg-preview-mode-tabs">' +
+              '<button type="button" class="segmented-btn' + (initMode === 'role' ? ' active' : '') + '" data-p-mode="role">' + (isEn ? 'By Role' : 'حسب الدور') + '</button>' +
+              '<button type="button" class="segmented-btn' + (initMode === 'preset' ? ' active' : '') + '" data-p-mode="preset"' + (presets.length ? '' : ' disabled') + '>' + (isEn ? 'By Preset' : 'حسب القالب') + '</button>' +
+              '<button type="button" class="segmented-btn' + (initMode === 'employee' ? ' active' : '') + '" data-p-mode="employee"' + (emps.length ? '' : ' disabled') + '>' + (isEn ? 'Specific Employee' : 'موظف محدد') + '</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="form-group' + (initMode === 'role' ? '' : ' hidden') + '" id="rg-preview-role-wrap">' +
+            '<label class="form-label" for="rg-preview-role-select">' + (isEn ? 'Target Role' : 'اختر الدور المطلوب معاينته') + '</label>' +
+            '<select class="select" id="rg-preview-role-select">' +
+              allowedRoles.map(function (r) {
+                return '<option value="' + escapeHtml(r) + '"' + (r === initRole ? ' selected' : '') + '>' + escapeHtml(roleLabels[r] || r) + '</option>';
+              }).join('') +
+            '</select>' +
+          '</div>' +
+          '<div class="form-group' + (initMode === 'preset' ? '' : ' hidden') + '" id="rg-preview-preset-wrap">' +
+            '<label class="form-label" for="rg-preview-preset-select">' + (isEn ? 'Target Role Preset' : 'اختر قالب الصلاحيات') + '</label>' +
+            '<select class="select" id="rg-preview-preset-select">' +
+              presets.map(function (p) {
+                return '<option value="' + escapeHtml(p.id) + '" data-role="' + escapeHtml(p.role) + '"' + (p.id === initPresetId ? ' selected' : '') + '>' + escapeHtml(p.label) + ' (' + escapeHtml(roleLabels[p.role] || p.role) + ')</option>';
+              }).join('') +
+            '</select>' +
+          '</div>' +
+          '<div class="form-group' + (initMode === 'employee' ? '' : ' hidden') + '" id="rg-preview-emp-wrap">' +
+            '<label class="form-label" for="rg-preview-emp-select">' + (isEn ? 'Target Employee Account' : 'اختر حساب الموظف للمحاكاة') + '</label>' +
+            '<select class="select" id="rg-preview-emp-select">' +
+              emps.map(function (e) {
+                return '<option value="' + escapeHtml(e.id) + '"' + (e.id === initEmpId ? ' selected' : '') + '>' + escapeHtml(e.name) + ' — ' + escapeHtml(roleLabels[e.role] || e.role) + ' (@' + escapeHtml(e.username) + ')</option>';
+              }).join('') +
+            '</select>' +
+          '</div>' +
+          '<div class="modal-footer" style="justify-content:space-between;">' +
+            (state.previewSession
+              ? '<button type="button" class="btn btn-danger" id="rg-preview-exit-modal-btn">' + (isEn ? 'Exit Current Preview' : 'إنهاء المحاكاة الحالية') + '</button>'
+              : '<span></span>') +
+            '<div style="display:flex;gap:8px;">' +
+              '<button type="button" class="btn" id="rg-preview-cancel-btn" data-modal-close>' + (isEn ? 'Cancel' : 'إلغاء') + '</button>' +
+              '<button type="submit" class="btn btn-primary" id="rg-preview-start-btn">' + (isEn ? 'Start Preview' : 'بدء المحاكاة الآن') + '</button>' +
+            '</div>' +
+          '</div>' +
+        '</form>' +
+      '</div>';
+
+    var currentMode = initMode;
+    var roleWrap = document.getElementById('rg-preview-role-wrap');
+    var presetWrap = document.getElementById('rg-preview-preset-wrap');
+    var empWrap = document.getElementById('rg-preview-emp-wrap');
+
+    modalRoot.querySelectorAll('#rg-preview-mode-tabs [data-p-mode]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return;
+        currentMode = btn.getAttribute('data-p-mode') || 'role';
+        modalRoot.querySelectorAll('#rg-preview-mode-tabs [data-p-mode]').forEach(function (b) {
+          b.classList.toggle('active', b === btn);
+        });
+        if (roleWrap) roleWrap.classList.toggle('hidden', currentMode !== 'role');
+        if (presetWrap) presetWrap.classList.toggle('hidden', currentMode !== 'preset');
+        if (empWrap) empWrap.classList.toggle('hidden', currentMode !== 'employee');
+      });
+    });
+
+    var closeModal = function () { modalRoot.innerHTML = ''; };
+    document.getElementById('rg-preview-modal-close').addEventListener('click', closeModal);
+    document.getElementById('rg-preview-cancel-btn').addEventListener('click', closeModal);
+    var exitModalBtn = document.getElementById('rg-preview-exit-modal-btn');
+    if (exitModalBtn) {
+      exitModalBtn.addEventListener('click', function () {
+        closeModal();
+        stopPreviewSession();
+      });
+    }
+
+    document.getElementById('rg-preview-role-form').addEventListener('submit', async function (ev) {
+      ev.preventDefault();
+      var spec = {};
+      if (currentMode === 'employee') {
+        spec.employeeId = (document.getElementById('rg-preview-emp-select') || {}).value || '';
+      } else if (currentMode === 'preset') {
+        var pSel = document.getElementById('rg-preview-preset-select');
+        spec.presetId = pSel ? pSel.value : '';
+        var opt = pSel && pSel.options && pSel.selectedIndex >= 0 ? pSel.options[pSel.selectedIndex] : null;
+        spec.role = opt ? (opt.getAttribute('data-role') || 'agent') : 'agent';
+      } else {
+        spec.role = (document.getElementById('rg-preview-role-select') || {}).value || 'agent';
+      }
+      closeModal();
+      await startPreviewSession(spec);
+    });
+  }
+
   function renderAppShell(user) {
     var appRoot = document.getElementById('app-root');
     var roleLabels = root.RGCrmCore.ROLE_LABELS[state.prefs.lang] || root.RGCrmCore.ROLE_LABELS.ar;
     var collapsedClass = state.prefs.sidebarCollapsed ? ' collapsed' : '';
     var isEn = state.prefs.lang === 'en';
+    var realUser = getRealUser();
     var canAnnMgr = canManageAnnouncements(user);
+    var canPreview = Boolean(realUser && root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realUser));
+    var isPreviewActive = Boolean(state.previewSession && state.previewSession.previewUser);
     var delBadge = user.activeDelegation
       ? ('<div class="rg-delegation-pill">' + (isEn ? 'Delegated Supervisor' : 'تفويض مشرف مؤقت') + '</div>')
       : '';
@@ -2965,7 +3844,7 @@
                 '<div class="sidebar-brand-sub">ROYAL RED CRM</div>' +
               '</div>' +
             '</a>' +
-            '<button type="button" class="sidebar-collapse-btn" id="sidebar-collapse-btn" aria-label="طي القائمة" title="طي / توسيع القائمة">' +
+            '<button type="button" class="sidebar-collapse-btn rg-ui-sidebar-collapse" id="sidebar-collapse-btn" aria-label="طي القائمة" title="طي / توسيع القائمة">' +
               renderIcon('M4 6h16M4 12h16M4 18h16') +
             '</button>' +
           '</div>' +
@@ -2989,43 +3868,58 @@
             '<div class="topbar-start">' +
               '<button type="button" class="btn btn-icon mobile-menu-btn" id="mobile-menu-btn" aria-label="فتح القائمة">' + renderIcon('M4 6h16M4 12h16M4 18h16') + '</button>' +
               '<h1 class="page-heading" id="page-heading">' + t('nav_dashboard') + '</h1>' +
-              '<form class="topbar-search-form" id="topbar-search-form" role="search">' +
+              '<form class="topbar-search-form rg-ui-topbar-search" id="topbar-search-form" role="search">' +
                 '<span class="topbar-search-icon" aria-hidden="true">' + renderIcon('M21 21l-4.35-4.35M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16z') + '</span>' +
                 '<input type="search" class="topbar-search-input" id="topbar-quick-search" placeholder="' + t('topbar_search_placeholder') + '" aria-label="' + t('topbar_search_placeholder') + '">' +
                 '<span class="topbar-search-kbd" aria-hidden="true">Ctrl+K</span>' +
               '</form>' +
             '</div>' +
             '<div class="topbar-actions">' +
+              (canPreview
+                ? '<button type="button" class="btn btn-sm rg-ui-preview-role-btn' + (isPreviewActive ? ' btn-primary' : '') + '" id="topbar-preview-role-btn" aria-label="' + (isEn ? 'Preview Role' : 'وضع المحاكاة') + '" title="' + (isEn ? 'Preview system as another role or employee' : 'معاينة النظام بصلاحيات دور أو موظف آخر') + '">' +
+                    renderIcon('M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z') +
+                    '<span class="topbar-desktop-only">' + (isEn ? 'Preview Role' : 'وضع المحاكاة') + '</span>' +
+                  '</button>'
+                : '') +
               (canAnnMgr
-                ? '<button type="button" class="btn btn-icon" id="announcements-mgr-btn" aria-label="' + (isEn ? 'Shift Announcements' : 'تعميمات وإعلانات الوردية') + '" title="' + (isEn ? 'Shift Announcements' : 'تعميمات وإعلانات الوردية') + '">' +
+                ? '<button type="button" class="btn btn-icon rg-ui-topbar-ann-btn" id="announcements-mgr-btn" aria-label="' + (isEn ? 'Shift Announcements' : 'تعميمات وإعلانات الوردية') + '" title="' + (isEn ? 'Shift Announcements' : 'تعميمات وإعلانات الوردية') + '">' +
                     renderIcon('M3 11l18-5v12L3 14v-3zm8 4v5a2 2 0 0 1-4 0v-5') +
                   '</button>'
                 : '') +
-              '<button type="button" class="btn btn-icon" id="refresh-view-btn" aria-label="' + t('refresh') + '" title="' + t('refresh') + '">' +
+              '<button type="button" class="btn btn-icon rg-ui-topbar-refresh" id="refresh-view-btn" aria-label="' + t('refresh') + '" title="' + t('refresh') + '">' +
                 renderIcon('M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15') +
               '</button>' +
-              '<button type="button" class="btn btn-icon" id="notif-toggle-btn" aria-label="الإشعارات" aria-haspopup="dialog" aria-expanded="false">' +
+              '<button type="button" class="btn btn-icon rg-ui-topbar-notif" id="notif-toggle-btn" aria-label="الإشعارات" aria-haspopup="dialog" aria-expanded="false">' +
                 renderIcon('M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0') +
                 '<span class="notif-count hidden" id="notif-badge">0</span>' +
               '</button>' +
-              '<button type="button" class="btn btn-sm theme-toggle-btn" id="theme-toggle-btn" data-theme-state="' + (state.prefs.theme === 'dark' ? 'dark' : 'light') + '" aria-label="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '" title="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '">' +
+              '<button type="button" class="btn btn-sm theme-toggle-btn rg-ui-topbar-theme" id="theme-toggle-btn" data-theme-state="' + (state.prefs.theme === 'dark' ? 'dark' : 'light') + '" aria-label="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '" title="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '">' +
                 buildThemeToggleHtml(state.prefs.theme, false) +
               '</button>' +
-              '<button type="button" class="btn btn-sm" id="lang-toggle-btn">' + t('lang_toggle') + '</button>' +
-              '<button type="button" class="btn btn-sm btn-danger" id="logout-btn">' +
+              '<button type="button" class="btn btn-sm rg-ui-topbar-lang" id="lang-toggle-btn">' + t('lang_toggle') + '</button>' +
+              '<button type="button" class="btn btn-sm btn-danger rg-ui-logout-btn" id="logout-btn">' +
                 '<span class="topbar-mobile-only">' + (isEn ? 'Exit' : 'خروج') + '</span>' +
                 '<span class="topbar-desktop-only">' + t('logout') + '</span>' +
               '</button>' +
             '</div>' +
           '</header>' +
-          '<div id="rg-shift-announcement-banner" class="rg-shift-banner-host hidden"></div>' +
+          '<div id="rg-preview-role-banner" class="rg-preview-banner-host hidden"></div>' +
+          '<div id="rg-shift-announcement-banner" class="rg-shift-banner-host rg-ui-topbar-ann-host hidden"></div>' +
           '<div id="rg-offline-banner" class="rg-offline-banner-host hidden"></div>' +
           '<main class="page-content" id="page-content"></main>' +
         '</div>' +
       '</div>';
 
+    renderPreviewRoleBanner();
     renderShiftAnnouncementBanner();
     updateOfflineBanner();
+
+    var previewTopBtn = document.getElementById('topbar-preview-role-btn');
+    if (previewTopBtn) {
+      previewTopBtn.addEventListener('click', function () {
+        openPreviewRoleModal();
+      });
+    }
 
     var annMgrTopBtn = document.getElementById('announcements-mgr-btn');
     if (annMgrTopBtn) {
@@ -3065,6 +3959,29 @@
       sidebar.classList.remove('mobile-open');
       overlay.classList.remove('active');
     });
+
+    var brandHomeLink = document.getElementById('brand-home-link');
+    if (brandHomeLink) {
+      brandHomeLink.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        if (sidebar) sidebar.classList.remove('mobile-open');
+        if (overlay) overlay.classList.remove('active');
+        var curU = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : user;
+        var homeRoute = resolveSafeRouteForUser('dashboard', curU, getLayoutPrefs(curU));
+        if (!homeRoute) return;
+        if (state.route === homeRoute) {
+          var pc = document.getElementById('page-content');
+          if (pc && typeof pc.scrollTo === 'function') pc.scrollTo({ top: 0, behavior: 'smooth' });
+          if (typeof window.scrollTo === 'function') window.scrollTo({ top: 0, behavior: 'smooth' });
+          renderRoute();
+          return;
+        }
+        requestCloseWithGuard(function () {
+          state.route = homeRoute;
+          renderRoute();
+        });
+      });
+    }
 
     bindSidebarNavEvents(user);
 
@@ -3109,24 +4026,28 @@
       renderRoute();
     });
 
-    document.getElementById('logout-btn').addEventListener('click', async function () {
-      closeProfileMenu();
-      closeNotificationsPopover();
-      closeCallWrapUpBar();
-      stopAutoRefreshLoop();
-      state.route = 'dashboard';
-      state.layoutPrefs = normalizeLayoutPrefsFallback({});
-      state.announcements = [];
-      state.activeLocks = [];
-      state.lastDeltaSyncAt = '';
-      delete state.reservations;
-      delete state.reports;
-      delete state.problems;
-      delete state.followups;
-      state.notifications = { items: [], unreadCount: 0 };
-      resetEmployeesState();
-      await root.RGAuth.logout();
-      renderLoginScreen();
+    document.getElementById('logout-btn').addEventListener('click', function () {
+      requestCloseWithGuard(async function () {
+        clearUnsavedGuard();
+        closeProfileMenu();
+        closeNotificationsPopover();
+        closeCallWrapUpBar();
+        stopAutoRefreshLoop();
+        state.route = 'dashboard';
+        state.previewSession = null;
+        state.layoutPrefs = normalizeLayoutPrefsFallback({});
+        state.announcements = [];
+        state.activeLocks = [];
+        state.lastDeltaSyncAt = '';
+        delete state.reservations;
+        delete state.reports;
+        delete state.problems;
+        delete state.followups;
+        state.notifications = { items: [], unreadCount: 0 };
+        resetEmployeesState();
+        await root.RGAuth.logout();
+        renderLoginScreen();
+      });
     });
   }
 
@@ -3539,8 +4460,18 @@
 
   function hydrateRealtimeBootstrapState(bData) {
     if (!bData || typeof bData !== 'object') return;
+    if (bData.roleUiDefaults || (bData.settings && bData.settings.role_ui_defaults)) {
+      state.roleUiDefaults = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+        ? root.RGCrmCore.normalizeRoleUiDefaults(bData.roleUiDefaults || (bData.settings && bData.settings.role_ui_defaults))
+        : (bData.roleUiDefaults || (bData.settings && bData.settings.role_ui_defaults) || {});
+    }
+    if (bData.statsControlConfig || (bData.settings && bData.settings.stats_control_config)) {
+      setStatsControlConfig(bData.statsControlConfig || (bData.settings && bData.settings.stats_control_config));
+    }
     if (bData.uiSimplification) {
       applyUiSimplification(bData.uiSimplification);
+    } else {
+      applyUiSimplification(state.uiSimplification, true);
     }
     if (bData.handoverSettings) {
       setHandoverSettings(bData.handoverSettings);
@@ -3556,21 +4487,50 @@
     state.lastDeltaSyncAt = bData.serverTime || new Date().toISOString();
   }
 
+  function restorePersistedPreviewIfAllowed(realUser) {
+    if (!realUser || !root.RGCrmCore || !root.RGCrmCore.canUserImpersonate || !root.RGCrmCore.canUserImpersonate(realUser)) {
+      state.previewSession = null;
+      return realUser;
+    }
+    try {
+      var rawSpec = sessionStorage.getItem(PREVIEW_SESSION_STORAGE_KEY);
+      if (rawSpec) {
+        var parsedSpec = JSON.parse(rawSpec);
+        if (parsedSpec && root.RGCrmCore.resolvePreviewUserSession) {
+          var pu = root.RGCrmCore.resolvePreviewUserSession(
+            realUser,
+            parsedSpec,
+            (state.employees && state.employees.items) || [],
+            (state.employees && state.employees.rolePresets) || []
+          );
+          if (pu) {
+            state.previewSession = { spec: parsedSpec, realUser: realUser, previewUser: pu };
+            applyUiSimplification(state.uiSimplification, true);
+            return pu;
+          }
+        }
+      }
+    } catch (_e) {}
+    return realUser;
+  }
+
   async function bootAuthenticatedApp() {
+    installAuthPreviewBridge();
     if (root.RGApi && root.RGApi.ready) {
       await root.RGApi.ready();
     }
     var dashRange = (state.dashboard && state.dashboard.range) || '30d';
     var consumed = root.RGAuth.consumeBootstrap ? root.RGAuth.consumeBootstrap() : null;
-    var user = root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var user = getRealUser();
 
     if (user && consumed && consumed.data) {
       if (root.RGAuth.primeBootstrapCaches) {
         root.RGAuth.primeBootstrapCaches(consumed.data, consumed.range || dashRange);
       }
-      hydrateRealtimeBootstrapState(consumed.data);
-      hydrateLayoutPrefsFromServer(consumed.data.layoutPrefs, user);
       if (consumed.data.employees) syncEmployeesStateFromPayload(consumed.data.employees);
+      hydrateRealtimeBootstrapState(consumed.data);
+      user = restorePersistedPreviewIfAllowed(user);
+      hydrateLayoutPrefsFromServer(consumed.data.layoutPrefs, user);
       renderAppShell(user);
       if (consumed.data.notifications) applyNotificationsState(consumed.data.notifications);
       await renderRoute();
@@ -3596,9 +4556,10 @@
         if (root.RGAuth.primeBootstrapCaches) {
           root.RGAuth.primeBootstrapCaches(Object.assign({ user: bootUser }, bootRes.data), dashRange);
         }
-        hydrateRealtimeBootstrapState(bootRes.data);
-        hydrateLayoutPrefsFromServer(bootRes.data.layoutPrefs, user);
         if (bootRes.data.employees) syncEmployeesStateFromPayload(bootRes.data.employees);
+        hydrateRealtimeBootstrapState(bootRes.data);
+        user = restorePersistedPreviewIfAllowed(user);
+        hydrateLayoutPrefsFromServer(bootRes.data.layoutPrefs, user);
         renderAppShell(user);
         if (bootRes.data.notifications) applyNotificationsState(bootRes.data.notifications);
         await renderRoute();
@@ -3658,14 +4619,50 @@
 
   root.RGApp = {
     withActionLock: withActionLock,
+    isActionLocked: isActionLocked,
+    checkActionSpam: checkActionSpam,
     applyNotificationsState: applyNotificationsState,
     refreshNotifications: refreshNotifications,
+    refreshSidebarNavDom: refreshSidebarNavDom,
+    renderAppShell: renderAppShell,
+    syncCurrentUserShell: function (updatedUser) {
+      if (!updatedUser) return;
+      var activeUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : updatedUser;
+      var resolvedActive = (activeUser && activeUser.id === updatedUser.id && !activeUser.isPreviewSession) ? updatedUser : activeUser;
+      var nameEls = document.querySelectorAll('#user-profile-menu-btn .sidebar-user-name');
+      nameEls.forEach(function (el) { el.textContent = resolvedActive.name || ''; });
+      var avatarEls = document.querySelectorAll('#user-profile-menu-btn .sidebar-user-avatar');
+      avatarEls.forEach(function (el) { el.textContent = String(resolvedActive.name || 'U').charAt(0); });
+      refreshSidebarNavDom(resolvedActive);
+      var nextSafeRoute = resolveSafeRouteForUser(state.route, resolvedActive, getLayoutPrefs(resolvedActive));
+      if (nextSafeRoute !== state.route) {
+        state.route = nextSafeRoute;
+        renderRoute().catch(function () {});
+      }
+    },
     getUiSimplification: getUiSimplification,
     applyUiSimplification: applyUiSimplification,
+    getRoleUiDefaults: getRoleUiDefaults,
+    setRoleUiDefaults: setRoleUiDefaults,
+    getStatsControlConfig: getStatsControlConfig,
+    setStatsControlConfig: setStatsControlConfig,
+    animateProgressiveReveal: animateProgressiveReveal,
+    getEffectiveRoleUiResolution: getEffectiveRoleUiResolution,
+    getRealUser: getRealUser,
+    getPreviewState: getPreviewState,
+    startPreviewSession: startPreviewSession,
+    stopPreviewSession: stopPreviewSession,
+    openPreviewRoleModal: openPreviewRoleModal,
+    setUnsavedGuard: setUnsavedGuard,
+    clearUnsavedGuard: clearUnsavedGuard,
+    requestCloseWithGuard: requestCloseWithGuard,
     getLayoutPrefs: getLayoutPrefs,
     saveLayoutPrefs: saveLayoutPrefs,
     getTimeFormat: getTimeFormat,
     getSidebarPosition: getSidebarPosition,
+    getTimezoneMode: getTimezoneMode,
+    getReservationsDisplayMode: getReservationsDisplayMode,
+    getCalendarGranularity: getCalendarGranularity,
     setPersonalPreferences: setPersonalPreferences,
     formatTime: formatTimePref,
     formatDateTime: formatDateTimePref,
@@ -3708,12 +4705,28 @@
       : 'dashboard';
     nextRoute = resolveSafeRouteForUser(nextRoute, curU, getLayoutPrefs(curU));
     if (nextRoute !== state.route) {
-      state.route = nextRoute;
-      renderRoute();
+      requestCloseWithGuard(function () {
+        state.route = nextRoute;
+        renderRoute();
+      });
+    }
+  });
+
+  window.addEventListener('beforeunload', function (ev) {
+    if (activeUnsavedGuard && typeof activeUnsavedGuard.isDirty === 'function') {
+      try {
+        if (activeUnsavedGuard.isDirty()) {
+          ev.preventDefault();
+          ev.returnValue = '';
+        }
+      } catch (_e) {}
     }
   });
 
   function closeTopmostOverlay() {
+    if (closeConfirmModal()) {
+      return true;
+    }
     if (root.RGCrmDatePicker && root.RGCrmDatePicker.closeActive && root.RGCrmDatePicker.closeActive()) {
       return true;
     }
@@ -3732,11 +4745,23 @@
     }
     var modalRoot = document.getElementById('modal-root');
     if (modalRoot && modalRoot.firstElementChild) {
-      var closeBtn = modalRoot.querySelector('#drawer-close-btn, #res-drawer-close, #emp-drawer-close, #prb-upd-close, #res-edit-cancel, #fu-edit-cancel, #prb-loading-cancel, #emp-cancel, #exp-close, [data-modal-close]');
+      var closeBtn = modalRoot.querySelector('#drawer-close-btn, #res-drawer-close, #emp-drawer-close, #prb-upd-close, #res-edit-cancel, #fu-edit-cancel, #prb-loading-cancel, #emp-cancel, #preset-modal-cancel, #personal-settings-close, #del-all-res-close, #perms-cat-close, #ann-mgr-close, #rg-preview-modal-close, #exp-close, [data-modal-close]');
       if (closeBtn && typeof closeBtn.click === 'function') {
         closeBtn.click();
       } else {
-        modalRoot.innerHTML = '';
+        requestCloseWithGuard(function () {
+          modalRoot.innerHTML = '';
+        });
+      }
+      return true;
+    }
+    var hoRoot = document.getElementById('rg-handover-root');
+    if (hoRoot && hoRoot.firstElementChild) {
+      var hoCloseBtn = hoRoot.querySelector('#handover-close-btn');
+      if (hoCloseBtn && typeof hoCloseBtn.click === 'function') {
+        hoCloseBtn.click();
+      } else if (root.RGHandover && typeof root.RGHandover.closeModal === 'function') {
+        root.RGHandover.closeModal();
       }
       return true;
     }
@@ -3783,6 +4808,10 @@
       closeProfileMenu();
     }
     var target = ev.target;
+    if (target && target.id === 'rg-unsaved-confirm-backdrop') {
+      closeConfirmModal();
+      return;
+    }
     if (target && target.classList && (target.classList.contains('drawer-backdrop') || target.classList.contains('modal-backdrop'))) {
       if (ev.target === target) {
         closeTopmostOverlay();

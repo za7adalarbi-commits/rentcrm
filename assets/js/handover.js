@@ -76,6 +76,40 @@
     return String(val);
   }
 
+  function activeTimezoneMode() {
+    return (root.RGApp && typeof root.RGApp.getTimezoneMode === 'function') ? root.RGApp.getTimezoneMode() : 'both';
+  }
+
+  function renderBookingTimezoneHtml(dateStr, timeStr, lang, options) {
+    var opts = (options && typeof options === 'object') ? options : {};
+    var core = root.RGCrmCore;
+    if (core && typeof core.buildBookingTimezoneDisplay === 'function') {
+      var info = core.buildBookingTimezoneDisplay(dateStr, timeStr, {
+        lang: lang === 'en' ? 'en' : 'ar',
+        timeFormat: activeTimeFormat(),
+        timezoneMode: activeTimezoneMode(),
+        compact: Boolean(opts.compact),
+        timeOnly: Boolean(opts.timeOnly)
+      });
+      if (!info.hasTime) {
+        if (opts.timeOnly) return '';
+        return info.saDate ? '<span class="mono tabular-nums" dir="ltr">' + esc(info.saDate) + '</span>' : '-';
+      }
+      return '<span class="rg-tz-stack' + (opts.compact ? ' is-compact' : '') + '">' +
+        info.entries.map(function (entry) {
+          return '<span class="rg-tz-line is-' + esc(entry.zone) + '">' +
+            '<span class="rg-tz-val mono tabular-nums" dir="ltr">' + esc(entry.valueText) + '</span>' +
+            '<span class="rg-tz-tag">' + esc(entry.label) + '</span>' +
+          '</span>';
+        }).join('') +
+      '</span>';
+    }
+    var dTxt = dateStr ? formatDateOnly(dateStr) : '';
+    var tTxt = timeStr ? formatTimeOnly(timeStr, lang) : '';
+    if (opts.timeOnly) return tTxt ? '<span class="mono tabular-nums" dir="ltr">' + esc(tTxt) + '</span>' : '';
+    return '<span class="mono tabular-nums" dir="ltr">' + esc([dTxt, tTxt].filter(Boolean).join(' · ') || '-') + '</span>';
+  }
+
   function formatDateOnly(val) {
     if (!val) return '-';
     if (root.RGCrmCore && root.RGCrmCore.formatDisplayDate) {
@@ -84,13 +118,25 @@
     return String(val).substring(0, 10);
   }
 
-  function closeModal() {
-    var el = document.getElementById(ROOT_ID);
-    if (el) el.innerHTML = '';
-    if (activeInstance && activeInstance.restoreFocusEl && activeInstance.restoreFocusEl.isConnected) {
-      try { activeInstance.restoreFocusEl.focus({ preventScroll: true }); } catch (_e) {}
+  function closeModal(force) {
+    var performClose = function () {
+      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') {
+        root.RGApp.clearUnsavedGuard();
+      } else if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+        root.RGApp.setUnsavedGuard(null);
+      }
+      var el = document.getElementById(ROOT_ID);
+      if (el) el.innerHTML = '';
+      if (activeInstance && activeInstance.restoreFocusEl && activeInstance.restoreFocusEl.isConnected) {
+        try { activeInstance.restoreFocusEl.focus({ preventScroll: true }); } catch (_e) {}
+      }
+      activeInstance = null;
+    };
+    if (!force && activeInstance && root.RGApp && typeof root.RGApp.requestCloseWithGuard === 'function') {
+      root.RGApp.requestCloseWithGuard(performClose);
+      return;
     }
-    activeInstance = null;
+    performClose();
   }
 
   async function openHandoverModal(ctx, initialOpts) {
@@ -157,6 +203,7 @@
       handoverSettings: savedHo,
       pdfVisibility: loadSavedPdfVisibility(),
       staffName: (user && user.name) || (isEn ? 'Shift Supervisor' : 'مشرف الوردية'),
+      initialStaffName: (user && user.name) || (isEn ? 'Shift Supervisor' : 'مشرف الوردية'),
       notes: '',
       activeTab: opts.activeTab || 'today',
       loading: true,
@@ -174,6 +221,22 @@
       restoreFocusEl: document.activeElement
     };
     activeInstance = state;
+
+    if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
+      root.RGApp.setUnsavedGuard({
+        label: isEn ? 'Shift Handover Summary' : 'ملخص تسليم الوردية',
+        isDirty: function () {
+          if (activeInstance !== state) return false;
+          if (String(state.notes || '').trim().length > 0) return true;
+          if (String(state.staffName || '').trim() !== String(state.initialStaffName || '').trim()) return true;
+          return false;
+        },
+        onSave: null,
+        onDiscard: function () {
+          closeModal(true);
+        }
+      });
+    }
 
     var presets = (core && core.SHIFT_HANDOVER_PRESETS) || [
       { key: '8h', labelAr: 'آخر 8 ساعات', labelEn: 'Last 8 Hours' },
@@ -234,17 +297,21 @@
       var rowsCount = (visibleColsCount > 0)
         ? ((vis.includePending ? (c.pendingCount || 0) : 0) + (vis.includeClosed ? (c.closedCount || 0) : 0))
         : 0;
-      var todayLen = vis.includeTodayMovements ? ((s.todayMovements && s.todayMovements.length) || 0) : 0;
+      var todayMvs = Array.isArray(s.todayMovements) ? s.todayMovements : [];
+      var todayLen = vis.includeTodayMovements ? todayMvs.length : 0;
+      var splitToday = Boolean(vis.includeTodayMovements && vis.splitPickupsAndReturns && todayLen > 0);
       var prbLen = vis.includeOpenProblems ? ((s.openProblems && s.openProblems.length) || 0) : 0;
       var expLen = vis.includeExpiring24h ? ((s.expiring24h && s.expiring24h.length) || 0) : 0;
-      var extraCount = (todayLen ? 1 : 0) + (prbLen ? 1 : 0) + (expLen ? 1 : 0);
-      var extraLines = todayLen + prbLen + expLen;
+      var extraCount = (todayLen && !splitToday ? 1 : 0) + (prbLen ? 1 : 0) + (expLen ? 1 : 0);
+      var extraLines = (splitToday ? 0 : todayLen) + prbLen + expLen;
+      var splitRowsCount = splitToday ? todayLen : 0;
+      var splitColsCount = splitToday ? 6 : 0;
       return {
-        rowCount: rowsCount,
-        columnCount: visibleColsCount,
+        rowCount: rowsCount + splitRowsCount,
+        columnCount: Math.max(visibleColsCount, splitColsCount),
         kpiCount: vis.includeSummaryKpis ? 7 : 0,
         wideSummaryCount: (vis.autoIncludeNotes && state.notes && state.notes.trim().length > 26) ? 1 : 0,
-        extraSectionsCount: extraCount,
+        extraSectionsCount: extraCount + (splitToday ? 2 : 0),
         extraLinesCount: extraLines,
         chartCount: 0
       };
@@ -253,6 +320,7 @@
     var PDF_SECTION_TOGGLES = [
       { key: 'includeSummaryKpis', ar: 'بطاقة الملخص والأرقام', en: 'Summary KPIs' },
       { key: 'includeTodayMovements', ar: 'التسليم والاستلام اليوم', en: "Today's Movements" },
+      { key: 'splitPickupsAndReturns', ar: 'تقسيم الاستلام عن التسليم في PDF', en: 'Split Pickups & Returns' },
       { key: 'includePending', ar: 'قيد الانتظار / المتابعة', en: 'Pending Bookings' },
       { key: 'includeClosed', ar: 'الحجوزات المغلقة', en: 'Closed Bookings' },
       { key: 'includeOpenProblems', ar: 'المشكلات المفتوحة', en: 'Open Problems' },
@@ -311,6 +379,17 @@
         }
       }
 
+      var footerSplitBtn = rootEl.querySelector('#handover-pdf-split-btn');
+      if (footerSplitBtn) {
+        var splitActive = Boolean(vis.includeTodayMovements && vis.splitPickupsAndReturns);
+        footerSplitBtn.classList.toggle('btn-primary', splitActive);
+        footerSplitBtn.classList.toggle('is-split-active', splitActive);
+        footerSplitBtn.setAttribute('aria-pressed', splitActive ? 'true' : 'false');
+        footerSplitBtn.textContent = splitActive
+          ? (isEn ? '✓ Split Pickups & Returns in PDF: ON' : '✓ تقسيم الاستلام عن التسليم في PDF: مفعّل')
+          : (isEn ? '⇄ Split Pickups & Returns in PDF' : '⇄ تقسيم الاستلام عن التسليم في PDF');
+      }
+
       if (state.pdfCtrl) {
         state.pdfCtrl.setContentStats(getContentStatsForSummary(state.summary));
       }
@@ -325,10 +404,8 @@
 
       if (state.activeTab === 'today') {
         var mvs = s.todayMovements || [];
-        if (!mvs.length) {
-          return '<div class="empty-state" style="padding:20px;">' + (isEn ? 'No pickups or returns scheduled for today in this time range.' : 'لا توجد حركات تسليم أو استلام اليوم ضمن نطاق الوقت المحدد.') + '</div>';
-        }
-        return '<div class="handover-list">' + mvs.map(function (it) {
+        var isSplitView = Boolean(state.pdfVisibility && state.pdfVisibility.splitPickupsAndReturns);
+        var renderMovementRow = function (it) {
           var r = it.reservation || {};
           var isPickup = it.movementType === 'pickup';
           var kindLabel = isPickup ? (isEn ? 'Pickup' : 'تسليم') : (isEn ? 'Return' : 'استلام');
@@ -338,12 +415,15 @@
             : (it.isOverdue
               ? '<span class="status-tag status-danger">' + (isEn ? 'Overdue' : 'متأخر') + '</span>'
               : '<span class="status-tag status-neutral">' + (isEn ? 'Scheduled' : 'مجدول') + '</span>');
-          var telHref = (core && core.formatDirectCallTelHref) ? core.formatDirectCallTelHref(r.customerPhone, '90') : '';
+          var telHref = (core && core.formatDirectCallTelHref) ? core.formatDirectCallTelHref(r.customerPhone, '9') : '';
+          var schedTzHtml = it.scheduledTime
+            ? renderBookingTimezoneHtml(s.todayDate || '', it.scheduledTime, appCtx.lang, { timeOnly: true, compact: true })
+            : '<span class="mono" dir="ltr">-</span>';
           return '<div class="handover-row">' +
             '<button type="button" class="handover-row-main handover-open-res" data-res-id="' + esc(r.id) + '" style="background:transparent;border:0;padding:0;text-align:start;cursor:pointer;">' +
               '<div class="handover-row-top">' +
                 '<span class="status-tag ' + kindCls + '">' + esc(kindLabel) + '</span>' +
-                '<span class="today-time-slot tabular-nums" dir="ltr">' + esc(formatTimeOnly(it.scheduledTime, appCtx.lang)) + '</span>' +
+                '<span class="today-time-slot has-tz-stack">' + schedTzHtml + '</span>' +
                 '<strong class="mono" dir="ltr">' + esc(r.reservationNumber || r.id) + '</strong>' +
                 '<span class="handover-row-customer">' + esc(r.customerName || '-') + '</span>' +
               '</div>' +
@@ -354,10 +434,38 @@
             '</button>' +
             '<div class="handover-row-end">' +
               stateBadge +
-              (telHref ? '<a class="btn btn-sm rg-tel-btn" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || '') + '" data-call-customer="' + esc(r.customerName || '') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '">📞 ' + (isEn ? 'Call 90' : 'اتصال 90') + '</a>' : '') +
+              (telHref ? '<a class="btn btn-sm rg-tel-btn" href="' + esc(telHref) + '" data-call-res-id="' + esc(r.id) + '" data-call-res-num="' + esc(r.reservationNumber || '') + '" data-call-customer="' + esc(r.customerName || '') + '" data-call-phone="' + esc(r.customerPhone || '') + '" data-call-status="' + esc(r.internalStatus || '') + '">📞 ' + (isEn ? 'Call 9' : 'اتصال 9') + '</a>' : '') +
             '</div>' +
           '</div>';
-        }).join('') + '</div>';
+        };
+
+        var splitToolbarHtml = '<div class="ho-today-split-toolbar">' +
+          '<button type="button" class="btn btn-sm' + (isSplitView ? ' btn-primary' : '') + '" id="ho-btn-split-movements" aria-pressed="' + (isSplitView ? 'true' : 'false') + '">' +
+            (isSplitView
+              ? (isEn ? '✓ Split Active: Pickups vs Returns' : '✓ مقسّم: التسليم مفصول عن الاستلام (في العرض والـ PDF)')
+              : (isEn ? '⇄ Split Pickups & Returns' : '⇄ تقسيم الاستلام عن التسليم (في العرض والـ PDF)')) +
+          '</button>' +
+        '</div>';
+
+        if (!mvs.length) {
+          return splitToolbarHtml + '<div class="empty-state" style="padding:20px;">' + (isEn ? 'No pickups or returns scheduled for today in this time range.' : 'لا توجد حركات تسليم أو استلام اليوم ضمن نطاق الوقت المحدد.') + '</div>';
+        }
+        if (isSplitView) {
+          var pickups = mvs.filter(function (it) { return it.movementType !== 'return'; });
+          var returns = mvs.filter(function (it) { return it.movementType === 'return'; });
+          return splitToolbarHtml +
+            '<div class="ho-split-movements-grid">' +
+              '<div class="ho-split-col">' +
+                '<div class="ho-split-col-head is-pickup"><strong>' + (isEn ? 'Today\'s Pickups (Out)' : 'التسليم اليوم (تسليم السيارة للعميل)') + '</strong><span class="status-tag status-info tabular-nums">' + pickups.length + '</span></div>' +
+                (pickups.length ? '<div class="handover-list">' + pickups.map(renderMovementRow).join('') + '</div>' : '<div class="empty-state" style="padding:14px;">' + (isEn ? 'No pickups scheduled.' : 'لا توجد عمليات تسليم في هذا النطاق.') + '</div>') +
+              '</div>' +
+              '<div class="ho-split-col">' +
+                '<div class="ho-split-col-head is-return"><strong>' + (isEn ? 'Today\'s Returns (In)' : 'الاستلام / الإرجاع اليوم (استلام من العميل)') + '</strong><span class="status-tag status-warning tabular-nums">' + returns.length + '</span></div>' +
+                (returns.length ? '<div class="handover-list">' + returns.map(renderMovementRow).join('') + '</div>' : '<div class="empty-state" style="padding:14px;">' + (isEn ? 'No returns scheduled.' : 'لا توجد عمليات استلام في هذا النطاق.') + '</div>') +
+              '</div>' +
+            '</div>';
+        }
+        return splitToolbarHtml + '<div class="handover-list">' + mvs.map(renderMovementRow).join('') + '</div>';
       }
 
       if (state.activeTab === 'pending') {
@@ -452,7 +560,9 @@
             '</div>' +
             '<div class="handover-row-sub">' +
               esc(r.carName || '-') + ' · ' +
-              '<span class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(entry.effectiveEndDate)) + (entry.effectiveEndTime ? ' ' + esc(formatTimeOnly(entry.effectiveEndTime, appCtx.lang)) : '') + '</span>' +
+              (entry.effectiveEndTime
+                ? renderBookingTimezoneHtml(entry.effectiveEndDate, entry.effectiveEndTime, appCtx.lang, { compact: true })
+                : '<span class="mono tabular-nums" dir="ltr">' + esc(formatDateOnly(entry.effectiveEndDate)) + '</span>') +
             '</div>' +
           '</div>' +
           '<div class="handover-row-end">' +
@@ -499,6 +609,18 @@
 
     function bindRowHandlers(scopeEl) {
       if (!scopeEl) return;
+      var splitBtn = scopeEl.querySelector('#ho-btn-split-movements');
+      if (splitBtn) {
+        splitBtn.addEventListener('click', function () {
+          state.pdfVisibility.splitPickupsAndReturns = !state.pdfVisibility.splitPickupsAndReturns;
+          if (state.pdfVisibility.splitPickupsAndReturns && !state.pdfVisibility.includeTodayMovements) {
+            state.pdfVisibility.includeTodayMovements = true;
+          }
+          persistPdfVisibility(state.pdfVisibility);
+          syncVisibilityUi();
+          updateDynamicSections();
+        });
+      }
       scopeEl.querySelectorAll('.handover-open-res').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var rid = btn.getAttribute('data-res-id');
@@ -695,9 +817,16 @@
 
             pdfPanelHtml +
 
-            '<div class="modal-footer">' +
-              '<button type="button" class="btn" id="handover-pdf-download-btn">' + (isEn ? 'Download Handover PDF' : 'تحميل PDF مباشرة') + '</button>' +
-              '<button type="button" class="btn btn-primary" id="handover-pdf-preview-btn">' + (isEn ? 'Preview & Export PDF' : 'معاينة وتصدير PDF') + '</button>' +
+            '<div class="modal-footer ho-modal-footer-split">' +
+              '<button type="button" class="btn ho-footer-split-btn" id="handover-pdf-split-btn" aria-pressed="' + ((state.pdfVisibility.includeTodayMovements && state.pdfVisibility.splitPickupsAndReturns) ? 'true' : 'false') + '">' +
+                ((state.pdfVisibility.includeTodayMovements && state.pdfVisibility.splitPickupsAndReturns)
+                  ? (isEn ? '✓ Split Pickups & Returns in PDF: ON' : '✓ تقسيم الاستلام عن التسليم في PDF: مفعّل')
+                  : (isEn ? '⇄ Split Pickups & Returns in PDF' : '⇄ تقسيم الاستلام عن التسليم في PDF')) +
+              '</button>' +
+              '<div class="ho-modal-footer-actions">' +
+                '<button type="button" class="btn" id="handover-pdf-download-btn">' + (isEn ? 'Download Handover PDF' : 'تحميل PDF مباشرة') + '</button>' +
+                '<button type="button" class="btn btn-primary" id="handover-pdf-preview-btn">' + (isEn ? 'Preview & Export PDF' : 'معاينة وتصدير PDF') + '</button>' +
+              '</div>' +
             '</div>' +
           '</div>' +
         '</div>';
@@ -705,11 +834,29 @@
       var backdrop = document.getElementById('rg-handover-backdrop');
       if (backdrop) {
         backdrop.addEventListener('click', function (ev) {
-          if (ev.target === backdrop) closeModal();
+          if (ev.target === backdrop) {
+            ev.stopPropagation();
+            closeModal(false);
+          }
         });
       }
       var closeBtn = document.getElementById('handover-close-btn');
-      if (closeBtn) closeBtn.addEventListener('click', closeModal);
+      if (closeBtn) closeBtn.addEventListener('click', function () { closeModal(false); });
+
+      var footerSplitBtnEl = document.getElementById('handover-pdf-split-btn');
+      if (footerSplitBtnEl) {
+        footerSplitBtnEl.addEventListener('click', function () {
+          state.pdfVisibility.splitPickupsAndReturns = !state.pdfVisibility.splitPickupsAndReturns;
+          if (state.pdfVisibility.splitPickupsAndReturns && !state.pdfVisibility.includeTodayMovements) {
+            state.pdfVisibility.includeTodayMovements = true;
+          }
+          persistPdfVisibility(state.pdfVisibility);
+          syncVisibilityUi();
+          if (state.activeTab === 'today') {
+            updateDynamicSections();
+          }
+        });
+      }
 
       var refreshBtn = document.getElementById('handover-refresh-btn');
       if (refreshBtn) {
@@ -824,8 +971,14 @@
           var key = btn.getAttribute('data-vis-key');
           if (!key) return;
           state.pdfVisibility[key] = !state.pdfVisibility[key];
+          if (key === 'splitPickupsAndReturns' && state.pdfVisibility.splitPickupsAndReturns && !state.pdfVisibility.includeTodayMovements) {
+            state.pdfVisibility.includeTodayMovements = true;
+          }
           persistPdfVisibility(state.pdfVisibility);
           syncVisibilityUi();
+          if (key === 'splitPickupsAndReturns' && state.activeTab === 'today') {
+            updateDynamicSections();
+          }
         });
       });
 
@@ -1010,11 +1163,12 @@
 
   document.addEventListener('keydown', function (ev) {
     if (!activeInstance || ev.key !== 'Escape') return;
+    if (root.RGApp) return; // app.js closeTopmostOverlay handles Escape cleanly for #rg-handover-root
     if (root.RGPdfPreview && root.RGPdfPreview.isOpen && root.RGPdfPreview.isOpen()) return;
     var modalRoot = document.getElementById('modal-root');
     if (modalRoot && modalRoot.children.length > 0) return;
     ev.preventDefault();
-    closeModal();
+    closeModal(false);
   });
 
   root.RGHandover = {

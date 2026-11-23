@@ -225,6 +225,43 @@
   var localDetailsByNs = {};
   var localExtensionsByResNs = {};
   var localMetaByNs = {};
+  var optimisticRollbackStack = [];
+
+  function cloneForRollback(val) {
+    try { return JSON.parse(JSON.stringify(val)); } catch (_e) { return val; }
+  }
+
+  function captureOptimisticSnapshot(action) {
+    var ns = getCacheNamespace();
+    var snap = {
+      id: 'SNAP_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      action: String(action || ''),
+      ns: ns,
+      apiCache: cloneForRollback(apiResponseCache),
+      localRes: localReservationsByNs[ns] ? cloneForRollback(localReservationsByNs[ns]) : null,
+      localDet: localDetailsByNs[ns] ? cloneForRollback(localDetailsByNs[ns]) : null
+    };
+    optimisticRollbackStack.push(snap);
+    if (optimisticRollbackStack.length > 6) optimisticRollbackStack.shift();
+    return snap.id;
+  }
+
+  function restoreLatestOptimisticSnapshot(action) {
+    var targetAction = String(action || '');
+    for (var i = optimisticRollbackStack.length - 1; i >= 0; i--) {
+      if (!targetAction || optimisticRollbackStack[i].action === targetAction) {
+        var snap = optimisticRollbackStack.splice(i, 1)[0];
+        if (snap && snap.apiCache) apiResponseCache = snap.apiCache;
+        if (snap && snap.ns) {
+          if (snap.localRes) localReservationsByNs[snap.ns] = snap.localRes;
+          if (snap.localDet) localDetailsByNs[snap.ns] = snap.localDet;
+        }
+        schedulePersistApiCache(false);
+        return true;
+      }
+    }
+    return false;
+  }
 
   function getCacheNamespace() {
     var mode = getTransportUrl() || 'sandbox';
@@ -1209,6 +1246,7 @@
     var empCache = getCachedData('getEmployees', {}, true);
     var allEmployees = (empCache && Array.isArray(empCache.items)) ? empCache.items : [];
     var nowIso = new Date().toISOString();
+    captureOptimisticSnapshot(action);
 
     if (action === 'claimReservation' || action === 'unclaimReservation') {
       var resIdClaim = String(p.reservationId || '').trim();
@@ -1647,16 +1685,47 @@
       if (!resIdDet) return;
       var patchDet = function (rec) {
         if (!rec || rec.id !== resIdDet) return rec;
+        var nextStatusVal = (p.internalStatus !== undefined && p.internalStatus !== '') ? String(p.internalStatus) : rec.internalStatus;
+        var nextHist = rec.statusHistory || [];
+        if (nextStatusVal && nextStatusVal !== rec.internalStatus && core && core.appendStatusStageEntry) {
+          nextHist = core.appendStatusStageEntry(nextHist, {
+            source: 'supervisor_edit',
+            previousStatus: rec.internalStatus,
+            newStatus: nextStatusVal,
+            changedAt: nowIso,
+            changedById: actUser.id,
+            changedByName: actUser.name,
+            note: p.lastUpdateText !== undefined ? String(p.lastUpdateText) : 'تحديث الحالة'
+          });
+        }
         var out = Object.assign({}, rec, {
           lastUpdatedById: actUser.id || rec.lastUpdatedById,
           lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
           lastUpdatedAt: nowIso,
-          updatedAt: nowIso
+          updatedAt: nowIso,
+          statusHistory: nextHist
         });
-        if (p.internalStatus !== undefined && p.internalStatus !== '') out.internalStatus = String(p.internalStatus);
-        if (p.priority !== undefined && p.priority !== '') out.priority = String(p.priority);
-        if (p.notes !== undefined) out.notes = String(p.notes);
-        if (p.customerPhone !== undefined && p.customerPhone !== '') out.customerPhone = String(p.customerPhone);
+        var strFields = [
+          'customerName', 'customerPhone', 'customerEmail', 'customerIdNumber',
+          'companyName', 'branchName', 'deliverBranchName',
+          'carName', 'carCategory', 'plateNumber',
+          'startDate', 'startTime', 'endDate', 'endTime',
+          'extendedUntilDate', 'extendedUntilTime',
+          'pickupTypeAr', 'returnTypeAr',
+          'paymentMethod', 'paymentStatus',
+          'internalStatus', 'priority', 'notes', 'lastUpdateText'
+        ];
+        strFields.forEach(function (fk) {
+          if (p[fk] !== undefined) out[fk] = String(p[fk]);
+        });
+        var numFields = ['daysCount', 'extendedDaysCount', 'totalDaysCount', 'extensionsCount', 'baseAmount', 'extensionsAmount', 'totalAmount'];
+        numFields.forEach(function (nf) {
+          if (p[nf] !== undefined && p[nf] !== '') {
+            var parsedN = Number(p[nf]);
+            if (!isNaN(parsedN)) out[nf] = parsedN;
+          }
+        });
+        if (out.extensionsCount > 0 || out.extendedDaysCount > 0) out.hasExtensions = true;
         return out;
       };
       var nsDet = getCacheNamespace();
@@ -1685,16 +1754,86 @@
       return;
     }
 
+    if (action === 'updateFollowUp') {
+      var fuIdOpt = String(p.followUpId || '').trim();
+      var resIdFuEdit = String(p.reservationId || '').trim();
+      if (!fuIdOpt) return;
+      var patchFuItem = function (f) {
+        if (!f || f.id !== fuIdOpt) return f;
+        var outF = Object.assign({}, f);
+        if (p.status !== undefined && p.status !== '') outF.status = String(p.status);
+        if (p.action !== undefined) outF.action = String(p.action);
+        if (p.notes !== undefined) outF.notes = String(p.notes);
+        return outF;
+      };
+      var nsFuEdit = getCacheNamespace();
+      var patchResFromFu = function (rec) {
+        if (!rec || (resIdFuEdit && rec.id !== resIdFuEdit)) return rec;
+        var nextStF = p.status ? String(p.status) : rec.internalStatus;
+        var lastTxtF = String(p.action || '') + (p.notes ? (' — ' + String(p.notes)) : '');
+        return Object.assign({}, rec, {
+          internalStatus: nextStF,
+          lastUpdateText: lastTxtF || rec.lastUpdateText,
+          lastUpdatedById: actUser.id || rec.lastUpdatedById,
+          lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
+          lastUpdatedAt: nowIso,
+          updatedAt: nowIso
+        });
+      };
+      if (resIdFuEdit && localReservationsByNs[nsFuEdit] && localReservationsByNs[nsFuEdit].byId[resIdFuEdit]) {
+        setLocalReservationsState(nsFuEdit, [patchResFromFu(localReservationsByNs[nsFuEdit].byId[resIdFuEdit])], false);
+      }
+      if (resIdFuEdit && localDetailsByNs[nsFuEdit] && localDetailsByNs[nsFuEdit][resIdFuEdit]) {
+        var detFuCur = localDetailsByNs[nsFuEdit][resIdFuEdit];
+        setLocalDetailState(nsFuEdit, Object.assign({}, detFuCur, {
+          reservation: detFuCur.reservation ? patchResFromFu(detFuCur.reservation) : detFuCur.reservation,
+          followUps: Array.isArray(detFuCur.followUps) ? detFuCur.followUps.map(patchFuItem) : []
+        }));
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && resIdFuEdit && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchResFromFu) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && (!resIdFuEdit || data.reservation.id === resIdFuEdit)) {
+          return Object.assign({}, data, {
+            reservation: patchResFromFu(data.reservation),
+            followUps: Array.isArray(data.followUps) ? data.followUps.map(patchFuItem) : data.followUps
+          });
+        }
+        if (actName === 'getMyFollowUps') {
+          return Object.assign({}, data, {
+            followUps: Array.isArray(data.followUps) ? data.followUps.map(patchFuItem) : data.followUps,
+            assignedReservations: (resIdFuEdit && Array.isArray(data.assignedReservations)) ? data.assignedReservations.map(patchResFromFu) : data.assignedReservations
+          });
+        }
+        if (actName === 'getTeamFollowUps' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchFuItem) });
+        }
+        return undefined;
+      });
+      if (resIdFuEdit) patchTodayRadarCaches(patchResFromFu);
+      emitOptimisticMutationEvent(action, { followUpId: fuIdOpt, reservationId: resIdFuEdit });
+      return;
+    }
+
     if (action === 'assignEmployees' || action === 'removeAssignment') {
       var resIdAs = String(p.reservationId || '').trim();
       if (!resIdAs) return;
       var patchAs = function (rec) {
         if (!rec || rec.id !== resIdAs) return rec;
         if (action === 'assignEmployees' && Array.isArray(p.employeeIds)) {
-          var nextIds = p.employeeIds.map(String).filter(Boolean);
-          var nextNames = nextIds.map(function (eid) {
+          var existingIds = Array.isArray(rec.assignedEmployeeIds) ? rec.assignedEmployeeIds : [];
+          var addIds = p.employeeIds.map(String).filter(Boolean);
+          var nextIds = [];
+          var seenId = {};
+          (p._replaceAssignments ? addIds : existingIds.concat(addIds)).forEach(function (eid) {
+            if (eid && !seenId[eid]) { seenId[eid] = true; nextIds.push(eid); }
+          });
+          var nextNames = nextIds.map(function (eid, idx) {
             var foundEmp = allEmployees.find(function (e) { return e.id === eid; });
-            return (foundEmp && foundEmp.name) || eid;
+            if (foundEmp && foundEmp.name) return foundEmp.name;
+            var oldIdx = existingIds.indexOf(eid);
+            return (oldIdx !== -1 && Array.isArray(rec.assignedEmployeeNames) && rec.assignedEmployeeNames[oldIdx]) || eid;
           });
           return Object.assign({}, rec, {
             assignedEmployeeIds: nextIds,
@@ -1738,10 +1877,94 @@
         if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdAs) {
           return Object.assign({}, data, { reservation: patchAs(data.reservation) });
         }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          var nextMyAs = data.assignedReservations.map(patchAs).filter(function (r) {
+            return Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds.indexOf(actUser.id) !== -1;
+          });
+          return Object.assign({}, data, { assignedReservations: nextMyAs });
+        }
         return undefined;
       });
       patchTodayRadarCaches(patchAs);
       emitOptimisticMutationEvent(action, { reservationId: resIdAs });
+      return;
+    }
+
+    if (action === 'bulkReassignSelectedReservations') {
+      var bulkIds = Array.isArray(p.reservationIds) ? p.reservationIds.map(String).filter(Boolean) : [];
+      var targetEmpIdB = String(p.targetEmployeeId || p.toEmployeeId || p.employeeId || '').trim();
+      var bulkMode = String(p.mode || 'replace').toLowerCase() === 'add' ? 'add' : 'replace';
+      if (!bulkIds.length || !targetEmpIdB) return;
+      var targetEmpObjB = allEmployees.find(function (e) { return e.id === targetEmpIdB; });
+      var targetEmpNameB = (targetEmpObjB && targetEmpObjB.name) || String(p.targetEmployeeName || targetEmpIdB);
+      var bulkIdSet = {};
+      bulkIds.forEach(function (id) { bulkIdSet[id] = true; });
+      var patchBulkRec = function (rec) {
+        if (!rec || !bulkIdSet[rec.id]) return rec;
+        var nextIds = [];
+        var nextNames = [];
+        if (bulkMode === 'add') {
+          var curIds = Array.isArray(rec.assignedEmployeeIds) ? rec.assignedEmployeeIds : [];
+          var curNames = Array.isArray(rec.assignedEmployeeNames) ? rec.assignedEmployeeNames : [];
+          var seenB = {};
+          curIds.forEach(function (eid, idx) {
+            if (eid && !seenB[eid]) {
+              seenB[eid] = true;
+              nextIds.push(eid);
+              nextNames.push(curNames[idx] || eid);
+            }
+          });
+          if (!seenB[targetEmpIdB]) {
+            nextIds.push(targetEmpIdB);
+            nextNames.push(targetEmpNameB);
+          }
+        } else {
+          nextIds = [targetEmpIdB];
+          nextNames = [targetEmpNameB];
+        }
+        return Object.assign({}, rec, {
+          assignedEmployeeIds: nextIds,
+          assignedEmployeeNames: nextNames,
+          lastUpdateText: (bulkMode === 'add' ? 'إسناد جماعي إلى: ' : 'إعادة توزيع جماعي إلى: ') + targetEmpNameB,
+          lastUpdatedById: actUser.id || rec.lastUpdatedById,
+          lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
+          lastUpdatedAt: nowIso,
+          updatedAt: nowIso
+        });
+      };
+      var nsBulk = getCacheNamespace();
+      if (localReservationsByNs[nsBulk] && localReservationsByNs[nsBulk].byId) {
+        var bulkPatchedList = [];
+        bulkIds.forEach(function (id) {
+          if (localReservationsByNs[nsBulk].byId[id]) {
+            bulkPatchedList.push(patchBulkRec(localReservationsByNs[nsBulk].byId[id]));
+          }
+        });
+        if (bulkPatchedList.length) setLocalReservationsState(nsBulk, bulkPatchedList, false);
+      }
+      if (localDetailsByNs[nsBulk]) {
+        bulkIds.forEach(function (id) {
+          if (localDetailsByNs[nsBulk][id] && localDetailsByNs[nsBulk][id].reservation) {
+            setLocalDetailState(nsBulk, Object.assign({}, localDetailsByNs[nsBulk][id], {
+              reservation: patchBulkRec(localDetailsByNs[nsBulk][id].reservation)
+            }));
+          }
+        });
+      }
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName) {
+        if (actName === 'getReservations' && Array.isArray(data.items)) {
+          return Object.assign({}, data, { items: data.items.map(patchBulkRec) });
+        }
+        if (actName === 'getReservationDetails' && data.reservation && bulkIdSet[data.reservation.id]) {
+          return Object.assign({}, data, { reservation: patchBulkRec(data.reservation) });
+        }
+        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
+          return Object.assign({}, data, { assignedReservations: data.assignedReservations.map(patchBulkRec) });
+        }
+        return undefined;
+      });
+      patchTodayRadarCaches(patchBulkRec);
+      emitOptimisticMutationEvent(action, { reservationIds: bulkIds, targetEmployeeId: targetEmpIdB });
       return;
     }
 
@@ -1758,6 +1981,34 @@
         return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
       });
       emitOptimisticMutationEvent(action, {});
+      return;
+    }
+
+    if (action === 'updateEmployee') {
+      var updEmpId = String(p.employeeId || '').trim();
+      if (!updEmpId) return;
+      patchCachedScopes(['employees'], function (data, actName) {
+        if (actName === 'getEmployees' && Array.isArray(data.items)) {
+          return Object.assign({}, data, {
+            items: data.items.map(function (emp) {
+              if (emp.id !== updEmpId) return emp;
+              return Object.assign({}, emp, {
+                name: p.name !== undefined ? String(p.name) : emp.name,
+                username: p.username !== undefined ? String(p.username).trim().toLowerCase() : emp.username,
+                phone: p.phone !== undefined ? String(p.phone) : emp.phone,
+                email: p.email !== undefined ? String(p.email) : emp.email,
+                jobTitle: p.jobTitle !== undefined ? String(p.jobTitle) : emp.jobTitle,
+                role: p.role !== undefined ? String(p.role) : emp.role,
+                permissions: Array.isArray(p.permissions) ? p.permissions.slice() : emp.permissions,
+                status: p.status !== undefined ? String(p.status) : emp.status,
+                updatedAt: nowIso
+              });
+            })
+          });
+        }
+        return undefined;
+      });
+      emitOptimisticMutationEvent(action, { employeeId: updEmpId });
       return;
     }
 
@@ -1791,6 +2042,69 @@
         return undefined;
       });
       emitOptimisticMutationEvent(action, { employeeId: delEmpId });
+      return;
+    }
+
+    if (action === 'createEmployee') {
+      var newOptEmp = p._optimisticEmployee;
+      if (!newOptEmp || !newOptEmp.id) return;
+      patchCachedScopes(['employees'], function (data, actName) {
+        if (actName === 'getEmployees' && Array.isArray(data.items)) {
+          var exists = data.items.some(function (emp) { return emp && emp.id === newOptEmp.id; });
+          if (exists) return undefined;
+          return Object.assign({}, data, {
+            items: data.items.concat([newOptEmp]),
+            total: Number(data.total || data.items.length) + 1
+          });
+        }
+        return undefined;
+      });
+      emitOptimisticMutationEvent(action, { employeeId: newOptEmp.id });
+      return;
+    }
+
+    if (action === 'saveRolePreset' || action === 'deleteRolePreset' || action === 'resetRolePresets') {
+      patchCachedScopes(['employees'], function (data, actName) {
+        if (actName !== 'getEmployees') return undefined;
+        var nextPresets = Array.isArray(data.rolePresets) ? data.rolePresets.slice() : [];
+        if (action === 'resetRolePresets' && core && Array.isArray(core.JOB_ROLE_PRESETS)) {
+          nextPresets = core.JOB_ROLE_PRESETS.slice();
+        } else if (action === 'deleteRolePreset') {
+          var delPId = String(p.presetId || p.id || '').trim();
+          nextPresets = nextPresets.filter(function (pr) { return pr && pr.id !== delPId; });
+        } else if (action === 'saveRolePreset' && core && core.upsertRolePreset) {
+          try { nextPresets = core.upsertRolePreset(nextPresets, p).presets; } catch (_eUp) {}
+        }
+        return Object.assign({}, data, { rolePresets: nextPresets });
+      });
+      emitOptimisticMutationEvent(action, {});
+      return;
+    }
+
+    if (action === 'saveDelegation' || action === 'revokeDelegation') {
+      patchCachedScopes(['employees'], function (data, actName) {
+        if (actName !== 'getDelegations' || !Array.isArray(data.items)) return undefined;
+        if (action === 'revokeDelegation') {
+          var revIdOpt = String(p.id || p.delegationId || '').trim();
+          return Object.assign({}, data, {
+            items: data.items.map(function (del) {
+              return (del && del.id === revIdOpt)
+                ? Object.assign({}, del, { status: 'revoked', revokedAt: nowIso, isActiveNow: false })
+                : del;
+            })
+          });
+        }
+        if (action === 'saveDelegation' && p._optimisticDelegation) {
+          return Object.assign({}, data, { items: [p._optimisticDelegation].concat(data.items) });
+        }
+        return undefined;
+      });
+      emitOptimisticMutationEvent(action, {});
+      return;
+    }
+
+    if (action === 'updateSettings') {
+      emitOptimisticMutationEvent(action, {});
     }
   }
 
@@ -1877,6 +2191,22 @@
     var startMinus3d = localOffsetDateTime(-68);
 
     var employees = [
+      {
+        id: 'EMP_DEV',
+        name: 'المبرمج - مسؤول الموقع',
+        username: 'developer',
+        salt: 'S_DEV',
+        passwordHash: simpleHash('S_DEV:Dev@123'),
+        phone: '0500000009',
+        email: 'dev@rentalgate.net',
+        jobTitle: 'مبرمج ومسؤول إعدادات الموقع',
+        role: 'developer',
+        permissions: ['all'],
+        status: 'active',
+        lastActivity: new Date().toISOString(),
+        createdAt: '2026-10-01T08:00:00.000Z',
+        updatedAt: new Date().toISOString()
+      },
       {
         id: 'EMP_ADMIN',
         name: 'فهد الدوسري',
@@ -3188,6 +3518,12 @@
         var uiSimpBoot = core && core.normalizeUiSimplificationSettings
           ? core.normalizeUiSimplificationSettings(db.settings.ui_simplification)
           : (db.settings.ui_simplification || { preset: 'full' });
+        var roleUiDefaultsBoot = core && core.normalizeRoleUiDefaults
+          ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults)
+          : {};
+        var statsControlBoot = core && core.normalizeStatsControlConfig
+          ? core.normalizeStatsControlConfig(db.settings.stats_control_config)
+          : { excludedFromStatsEmployeeIds: [] };
         var rawPinnedBoot = db.settings['pinned_res_u_' + session.employeeId];
         var parsedPinnedBoot = Array.isArray(rawPinnedBoot) ? rawPinnedBoot : [];
         var rawLayoutBoot = db.settings['layout_prefs_u_' + session.employeeId];
@@ -3209,6 +3545,8 @@
             employees: bsEmp.success ? bsEmp.data : { items: [], total: 0 },
             problems: bsPrb.success ? bsPrb.data : { items: [], total: 0 },
             uiSimplification: uiSimpBoot,
+            roleUiDefaults: roleUiDefaultsBoot,
+            statsControlConfig: statsControlBoot,
             handoverSettings: handoverSettingsBoot,
             announcements: activeAnnsBoot,
             activeLocks: activeLocksBoot,
@@ -3220,7 +3558,7 @@
       }
 
       case 'getDashboard': {
-        var rangeKey = payload.range || '30d';
+        var rangeKey = payload.range || payload.datePreset || '30d';
         var todayStr = /^\d{4}-\d{2}-\d{2}$/.test(String(payload.todayDate || ''))
           ? String(payload.todayDate)
           : todayIso(0);
@@ -3234,10 +3572,40 @@
           start = payload.dateFrom || '';
           end = payload.dateTo || todayStr;
         }
-        var metrics = core.computeDashboardMetrics(db.reservations, db.followUps, db.problems, db.employees, { start: start, end: end }, todayStr);
+        var dashStatsCfg = core && core.normalizeStatsControlConfig
+          ? core.normalizeStatsControlConfig(db.settings.stats_control_config)
+          : { excludedFromStatsEmployeeIds: [] };
+        var metrics = core.computeDashboardMetrics(db.reservations, db.followUps, db.problems, db.employees, { start: start, end: end }, todayStr, { statsControlConfig: dashStatsCfg });
         var dashTodayRadar = sandboxExecute('getTodayAndRadar', token, { summaryOnly: true, todayDate: todayStr, nowMs: payload.nowMs });
         if (dashTodayRadar && dashTodayRadar.success && dashTodayRadar.data && dashTodayRadar.data.counts) {
           metrics.todayRadarCounts = dashTodayRadar.data.counts;
+        }
+        if (core && typeof core.computeEmployeeLeaderboard === 'function') {
+          var lbResList = (db.reservations || []).filter(function (r) {
+            if (!r) return false;
+            var dKey = String(r.startDate || r.createdAt || '').substring(0, 10);
+            if (!dKey) return true;
+            if (start && dKey < start) return false;
+            if (end && dKey > end) return false;
+            return true;
+          });
+          var lbFuList = (db.followUps || []).filter(function (f) {
+            if (!f) return false;
+            var dKey = String(f.followUpDate || f.createdAt || '').substring(0, 10);
+            if (!dKey) return true;
+            if (start && dKey < start) return false;
+            if (end && dKey > end) return false;
+            return true;
+          });
+          var lbPrbList = (db.problems || []).filter(function (p) {
+            if (!p) return false;
+            var dKey = String(p.createdAt || '').substring(0, 10);
+            if (!dKey) return true;
+            if (start && dKey < start) return false;
+            if (end && dKey > end) return false;
+            return true;
+          });
+          metrics.leaderboard = core.computeEmployeeLeaderboard(db.employees, lbResList, lbFuList, lbPrbList, { limit: 10, statsControlConfig: dashStatsCfg });
         }
         return { success: true, message: '', data: metrics, error: null };
       }
@@ -3679,8 +4047,8 @@
 
       case 'saveReservationPinnedNote': {
         if (!core.canUserPerform(session.user, 'pin_reservation_note') ||
-            (session.role !== 'general_manager' && session.role !== 'supervisor')) {
-          return { success: false, message: 'FORBIDDEN: إضافة الملاحظة المثبتة متاحة للمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
+            (!core.isPrivilegedRole(session.role) && session.role !== 'supervisor')) {
+          return { success: false, message: 'FORBIDDEN: إضافة الملاحظة المثبتة متاحة للمبرمج والمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
         }
         var rPinTarget = db.reservations.find(function (r) { return r.id === payload.reservationId; });
         if (!rPinTarget) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
@@ -4035,7 +4403,7 @@
 
         if (prio === 'مرتفع') {
           db.employees.forEach(function (emp) {
-            if (emp.status === 'active' && (emp.role === 'supervisor' || emp.role === 'general_manager')) {
+            if (emp.status === 'active' && (emp.role === 'supervisor' || emp.role === 'general_manager' || emp.role === 'developer')) {
               pushSandboxNotification(
                 db, emp.id, emp.role, 'high_priority_problem',
                 'تنبيه: مشكلة بأولوية مرتفعة',
@@ -4350,11 +4718,32 @@
         }
         var empEdit = db.employees.find(function (e) { return e.id === payload.employeeId; });
         if (!empEdit) return { success: false, message: 'الموظف غير موجود.', data: null, error: 'NOT_FOUND' };
+        if (empEdit.role === 'developer' && session.role !== 'developer') {
+          return { success: false, message: 'FORBIDDEN: تعديل حساب المبرمج متاح للمبرمج فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        if (payload.role === 'developer' && session.role !== 'developer') {
+          return { success: false, message: 'FORBIDDEN: ترقية حساب إلى دور المبرمج متاحة للمبرمج فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var nextUsernameSb = empEdit.username;
+        if (payload.username !== undefined) {
+          var reqUsernameSb = String(payload.username || '').trim().toLowerCase();
+          if (!reqUsernameSb) {
+            return { success: false, message: 'اسم المستخدم مطلوب.', data: null, error: 'VALIDATION' };
+          }
+          var dupEmpSb = db.employees.find(function (e) {
+            return e.id !== empEdit.id && String(e.username || '').toLowerCase() === reqUsernameSb;
+          });
+          if (dupEmpSb) {
+            return { success: false, message: 'اسم المستخدم مسجل بالفعل لموظف آخر.', data: null, error: 'CONFLICT' };
+          }
+          nextUsernameSb = reqUsernameSb;
+        }
         var beforeEmpSnap = Object.assign({}, empEdit);
+        empEdit.username = nextUsernameSb;
         if (payload.name) empEdit.name = String(payload.name).trim();
         if (payload.phone !== undefined) empEdit.phone = String(payload.phone).trim();
         if (payload.email !== undefined) empEdit.email = String(payload.email).trim();
-        if (payload.jobTitle) empEdit.jobTitle = String(payload.jobTitle).trim();
+        if (payload.jobTitle !== undefined) empEdit.jobTitle = String(payload.jobTitle).trim();
         if (payload.role) empEdit.role = payload.role;
         if (Array.isArray(payload.permissions)) {
           empEdit.permissions = payload.permissions.slice();
@@ -4369,11 +4758,16 @@
           var s2 = genId('SLT');
           empEdit.salt = s2;
           empEdit.passwordHash = simpleHash(s2 + ':' + payload.newPassword);
-          db.sessions.forEach(function (s) { if (s.employeeId === empEdit.id) s.isRevoked = true; });
+          db.sessions.forEach(function (s) {
+            if (s.employeeId === empEdit.id && (empEdit.id !== session.employeeId || s.token !== token)) {
+              s.isRevoked = true;
+            }
+          });
         }
         empEdit.updatedAt = new Date().toISOString();
         var empDiffs = (core && core.computeAuditFieldDiffs) ? core.computeAuditFieldDiffs(beforeEmpSnap, empEdit, [
           { field: 'name', label: 'الاسم' },
+          { field: 'username', label: 'اسم المستخدم' },
           { field: 'jobTitle', label: 'المسمى الوظيفي' },
           { field: 'role', label: 'الدور' },
           { field: 'status', label: 'الحالة' }
@@ -4415,6 +4809,9 @@
         }
         var empDel = db.employees.find(function (e) { return e.id === delEmpId; });
         if (!empDel) return { success: false, message: 'الموظف غير موجود.', data: null, error: 'NOT_FOUND' };
+        if (empDel.role === 'developer' && session.role !== 'developer') {
+          return { success: false, message: 'حذف حساب المبرمج متاح للمبرمج فقط.', data: null, error: 'FORBIDDEN' };
+        }
         if (empDel.role === 'general_manager' && empDel.status === 'active') {
           var remainingGms = db.employees.filter(function (e) {
             return e.id !== delEmpId && e.role === 'general_manager' && e.status === 'active';
@@ -4623,10 +5020,10 @@
         }
 
         var pullRange = core.resolvePullDateRange ? core.resolvePullDateRange(payload, todayIso(0)) : { preset: 'all', dateFrom: '', dateTo: '', hasCustomRange: false };
-        if (pullRange.hasCustomRange && session.role !== 'general_manager') {
+        if (pullRange.hasCustomRange && !core.isPrivilegedRole(session.role)) {
           return {
             success: false,
-            message: 'FORBIDDEN: تخصيص سحب البيانات بمدة أو من تاريخ معين متاح للمدير العام فقط.',
+            message: 'FORBIDDEN: تخصيص سحب البيانات بمدة أو من تاريخ معين متاح للمبرمج والمدير العام فقط.',
             data: null,
             error: 'FORBIDDEN'
           };
@@ -4931,8 +5328,12 @@
           return { success: true, message: '', data: { reportType: rType, rows: prioSorted, facets: repFacets }, error: null };
         }
         if (rType === 'employee_performance') {
-          var perf = db.employees.map(function (emp) {
+          var statsEmpsRep = (core && core.filterEmployeesForStats)
+            ? core.filterEmployeesForStats(db.employees, db.settings.stats_control_config)
+            : (db.employees || []).filter(function (e) { return e && e.status !== 'disabled'; });
+          var perf = statsEmpsRep.map(function (emp) {
             return {
+              employeeId: emp.id,
               employeeName: emp.name,
               jobTitle: emp.jobTitle,
               role: emp.role,
@@ -4964,7 +5365,7 @@
 
       case 'getSettings': {
         if (!core.canAccessApi(session.user)) {
-          return { success: false, message: 'FORBIDDEN: إعدادات النظام وAPI مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
+          return { success: false, message: 'FORBIDDEN: إعدادات النظام وAPI مخصصة للمبرمج والمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
         var getIv = core.normalizeAutoSyncInterval(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
         return {
@@ -4972,6 +5373,8 @@
           message: '',
           data: Object.assign({}, db.settings, {
             ui_simplification: core.normalizeUiSimplificationSettings(db.settings.ui_simplification),
+            role_ui_defaults: core.normalizeRoleUiDefaults ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults) : {},
+            stats_control_config: core.normalizeStatsControlConfig ? core.normalizeStatsControlConfig(db.settings.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
             handover_settings: core.normalizeHandoverSettings(db.settings.handover_settings),
             auto_sync_enabled: db.settings.auto_sync_enabled !== false,
             auto_sync_interval_hours: getIv.hours,
@@ -4991,12 +5394,17 @@
           payload.default_language !== undefined ||
           payload.auto_sync_enabled !== undefined ||
           payload.ui_simplification !== undefined ||
+          payload.role_ui_defaults !== undefined ||
+          payload.stats_control_config !== undefined ||
           payload.auto_sync_interval_hours !== undefined ||
           payload.auto_sync_interval_minutes !== undefined
         );
+        if (payload.stats_control_config !== undefined && session.role !== 'developer') {
+          return { success: false, message: 'FORBIDDEN: التحكم في ظهور الموظفين بالإحصائيات متاح للمبرمج فقط.', data: null, error: 'FORBIDDEN' };
+        }
         if (hasSysFields || payload.handover_settings === undefined) {
           if (!core.canUserPerform(session.user, 'manage_settings')) {
-            return { success: false, message: 'FORBIDDEN: صلاحية المدير العام فقط.', data: null, error: 'FORBIDDEN' };
+            return { success: false, message: 'FORBIDDEN: صلاحية المبرمج أو المدير العام فقط.', data: null, error: 'FORBIDDEN' };
           }
         } else if (!core.canAccessApi(session.user)) {
           return { success: false, message: 'FORBIDDEN: إعدادات تسليم الوردية مخصصة للمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
@@ -5013,6 +5421,15 @@
         if (typeof payload.auto_sync_enabled === 'boolean') db.settings.auto_sync_enabled = payload.auto_sync_enabled;
         if (payload.ui_simplification !== undefined) {
           db.settings.ui_simplification = core.normalizeUiSimplificationSettings(payload.ui_simplification);
+        }
+        if (payload.role_ui_defaults !== undefined && core.normalizeRoleUiDefaults) {
+          db.settings.role_ui_defaults = core.normalizeRoleUiDefaults(payload.role_ui_defaults);
+        }
+        if (payload.stats_control_config !== undefined && core.normalizeStatsControlConfig) {
+          var nextStatsCfg = core.normalizeStatsControlConfig(payload.stats_control_config);
+          nextStatsCfg.updatedAt = new Date().toISOString();
+          nextStatsCfg.updatedBy = session.user ? session.user.name : '';
+          db.settings.stats_control_config = nextStatsCfg;
         }
         if (payload.handover_settings !== undefined) {
           var prevHo = core.normalizeHandoverSettings(db.settings.handover_settings);
@@ -5052,6 +5469,8 @@
           message: 'تم حفظ الإعدادات.',
           data: Object.assign({}, db.settings, {
             ui_simplification: core.normalizeUiSimplificationSettings(db.settings.ui_simplification),
+            role_ui_defaults: core.normalizeRoleUiDefaults ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults) : {},
+            stats_control_config: core.normalizeStatsControlConfig ? core.normalizeStatsControlConfig(db.settings.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
             handover_settings: core.normalizeHandoverSettings(db.settings.handover_settings)
           }),
           error: null
@@ -5241,8 +5660,8 @@
       }
 
       case 'saveAnnouncement': {
-        if (session.role !== 'general_manager' && session.role !== 'supervisor') {
-          return { success: false, message: 'FORBIDDEN: إدارة تعميمات الوردية متاحة للمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        if (!core.isPrivilegedRole(session.role) && session.role !== 'supervisor') {
+          return { success: false, message: 'FORBIDDEN: إدارة تعميمات الوردية متاحة للمبرمج والمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
         }
         var annMsg = String(payload.message || '').trim();
         if (!annMsg) {
@@ -5286,8 +5705,8 @@
       }
 
       case 'deleteAnnouncement': {
-        if (session.role !== 'general_manager' && session.role !== 'supervisor') {
-          return { success: false, message: 'FORBIDDEN: حذف تعميمات الوردية متاح للمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        if (!core.isPrivilegedRole(session.role) && session.role !== 'supervisor') {
+          return { success: false, message: 'FORBIDDEN: حذف تعميمات الوردية متاح للمبرمج والمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
         }
         var delAnnId = String(payload.id || payload.announcementId || '').trim();
         if (!delAnnId) return { success: false, message: 'معرف التعميم مطلوب.', data: null, error: 'VALIDATION_ERROR' };
@@ -5307,7 +5726,7 @@
       }
 
       case 'getDelegations': {
-        var canManageDels = session.role === 'general_manager' || core.canUserPerform(session.user, 'manage_employees') || core.canUserPerform(session.user, 'view_employees');
+        var canManageDels = core.isPrivilegedRole(session.role) || core.canUserPerform(session.user, 'manage_employees') || core.canUserPerform(session.user, 'view_employees');
         var rawDels = Array.isArray(db.delegations) ? db.delegations : [];
         var visibleDels = canManageDels
           ? rawDels.slice()
@@ -5326,8 +5745,8 @@
       }
 
       case 'saveDelegation': {
-        if (session.role !== 'general_manager' && !core.canUserPerform(session.user, 'manage_employees')) {
-          return { success: false, message: 'FORBIDDEN: منح تفويض الصلاحيات المؤقت متاح للمدير العام أو مسؤول إدارة الموظفين فقط.', data: null, error: 'FORBIDDEN' };
+        if (!core.isPrivilegedRole(session.role) && !core.canUserPerform(session.user, 'manage_employees')) {
+          return { success: false, message: 'FORBIDDEN: منح تفويض الصلاحيات المؤقت متاح للمبرمج أو المدير العام أو مسؤول إدارة الموظفين فقط.', data: null, error: 'FORBIDDEN' };
         }
         var delEmpIdTarget = String(payload.delegateEmployeeId || '').trim();
         var delStartsAt = String(payload.startsAt || '').trim() || new Date().toISOString();
@@ -5395,8 +5814,8 @@
       }
 
       case 'revokeDelegation': {
-        if (session.role !== 'general_manager' && !core.canUserPerform(session.user, 'manage_employees')) {
-          return { success: false, message: 'FORBIDDEN: إلغاء التفويض المؤقت متاح للمدير العام أو مسؤول إدارة الموظفين فقط.', data: null, error: 'FORBIDDEN' };
+        if (!core.isPrivilegedRole(session.role) && !core.canUserPerform(session.user, 'manage_employees')) {
+          return { success: false, message: 'FORBIDDEN: إلغاء التفويض المؤقت متاح للمبرمج أو المدير العام أو مسؤول إدارة الموظفين فقط.', data: null, error: 'FORBIDDEN' };
         }
         var revId = String(payload.id || payload.delegationId || '').trim();
         var revTarget = (db.delegations || []).find(function (d) { return d && d.id === revId; });
@@ -5613,6 +6032,124 @@
         };
       }
 
+      case 'bulkReassignSelectedReservations': {
+        if (!core.canUserPerform(session.user, 'assign_employees')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إعادة توزيع الحجوزات.', data: null, error: 'FORBIDDEN' };
+        }
+        var selResIds = Array.isArray(payload.reservationIds)
+          ? Array.from(new Set(payload.reservationIds.map(function (x) { return String(x || '').trim(); }).filter(Boolean)))
+          : [];
+        var targetEmpIdSel = String(payload.targetEmployeeId || payload.toEmployeeId || payload.employeeId || '').trim();
+        var reassignMode = String(payload.mode || 'replace').toLowerCase() === 'add' ? 'add' : 'replace';
+        if (!selResIds.length) {
+          return { success: false, message: 'يرجى تحديد حجز واحد على الأقل لإعادة التوزيع.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        if (!targetEmpIdSel) {
+          return { success: false, message: 'يرجى اختيار الموظف المستلم.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var targetEmpSel = db.employees.find(function (e) { return e.id === targetEmpIdSel; });
+        if (!targetEmpSel) return { success: false, message: 'الموظف المستلم غير موجود.', data: null, error: 'NOT_FOUND' };
+        if (String(targetEmpSel.status || 'active') !== 'active') {
+          return { success: false, message: 'الموظف المستلم غير نشط.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var selIdLookup = {};
+        selResIds.forEach(function (id) { selIdLookup[id] = true; });
+        var bulkNowIso = new Date().toISOString();
+        var bulkUpdatedList = [];
+        var bulkUpdatedNums = [];
+        var bulkLastText = (reassignMode === 'add' ? 'إسناد جماعي إلى: ' : 'إعادة توزيع جماعي إلى: ') + targetEmpSel.name;
+
+        (db.reservations || []).forEach(function (resItem) {
+          if (!resItem || !selIdLookup[resItem.id]) return;
+          var curIds = Array.isArray(resItem.assignedEmployeeIds) ? resItem.assignedEmployeeIds : [];
+          var curNames = Array.isArray(resItem.assignedEmployeeNames) ? resItem.assignedEmployeeNames : [];
+          var nextIds = [];
+          var nextNames = [];
+          if (reassignMode === 'add') {
+            var seenB = {};
+            for (var i = 0; i < curIds.length; i++) {
+              var eid = String(curIds[i] || '').trim();
+              if (!eid || seenB[eid]) continue;
+              seenB[eid] = true;
+              nextIds.push(eid);
+              nextNames.push(String(curNames[i] || eid));
+            }
+            if (!seenB[targetEmpSel.id]) {
+              nextIds.push(targetEmpSel.id);
+              nextNames.push(targetEmpSel.name);
+            }
+          } else {
+            nextIds = [targetEmpSel.id];
+            nextNames = [targetEmpSel.name];
+            (db.assignments || []).forEach(function (a) {
+              if (a.reservationId === resItem.id && a.status === 'active') {
+                a.status = 'transferred';
+                a.updatedAt = bulkNowIso;
+              }
+            });
+          }
+          resItem.assignedEmployeeIds = nextIds;
+          resItem.assignedEmployeeNames = nextNames;
+          resItem.lastUpdateText = bulkLastText;
+          resItem.lastUpdatedById = session.employeeId;
+          resItem.lastUpdatedByName = session.user.name;
+          resItem.lastUpdatedAt = bulkNowIso;
+          resItem.updatedAt = bulkNowIso;
+          db.assignments.push({
+            id: genId('ASN'),
+            reservationId: resItem.id,
+            reservationNumber: resItem.reservationNumber,
+            employeeId: targetEmpSel.id,
+            employeeName: targetEmpSel.name,
+            assignedById: session.employeeId,
+            assignedByName: session.user.name,
+            roleType: 'bulk_reassign',
+            status: 'active',
+            assignedAt: bulkNowIso,
+            updatedAt: bulkNowIso
+          });
+          bulkUpdatedList.push(Object.assign({}, resItem));
+          bulkUpdatedNums.push(resItem.reservationNumber);
+        });
+
+        if (bulkUpdatedList.length > 0) {
+          pushSandboxNotification(
+            db,
+            targetEmpSel.id,
+            targetEmpSel.role,
+            'assignment',
+            'إسناد جماعي: ' + bulkUpdatedList.length + ' حجز',
+            'تم إسناد ' + bulkUpdatedList.length + ' حجزًا إليك بواسطة ' + session.user.name + ' (' + (reassignMode === 'add' ? 'إضافة للمشاركين' : 'استبدال الإسناد') + ').',
+            'Reservation',
+            bulkUpdatedNums[0] || ''
+          );
+          appendSandboxActivity(
+            db,
+            session.user,
+            'إعادة توزيع جماعي',
+            'Reservation',
+            bulkUpdatedNums.slice(0, 4).join(', '),
+            (reassignMode === 'add' ? 'إضافة إسناد ' : 'إعادة توزيع ') + bulkUpdatedList.length + ' حجز إلى ' + targetEmpSel.name
+          );
+          saveSandboxDb(db);
+        }
+
+        return {
+          success: true,
+          message: 'تم إعادة توزيع ' + bulkUpdatedList.length + ' حجز إلى ' + targetEmpSel.name + ' بنجاح.',
+          data: {
+            targetEmployeeId: targetEmpSel.id,
+            targetEmployeeName: targetEmpSel.name,
+            mode: reassignMode,
+            updatedCount: bulkUpdatedList.length,
+            reservationIds: bulkUpdatedList.map(function (r) { return r.id; }),
+            reservationNumbers: bulkUpdatedNums,
+            updatedReservations: bulkUpdatedList
+          },
+          error: null
+        };
+      }
+
       default:
         return { success: false, message: 'الإجراء غير مدعوم.', data: null, error: 'UNKNOWN_ACTION' };
     }
@@ -5783,6 +6320,7 @@
     return { changedScopes: Object.keys(touchedScopes) };
   }
 
+  var clientSpamStateByToken = {};
   var syncProgressSeq = 0;
   var FOREGROUND_SYNC_ACTIONS = {
     syncRentalGate: true,
@@ -5791,9 +6329,29 @@
     applyUnifiedConnectionSetup: true,
     importReservationsFromExcel: true,
     deleteAllReservations: true,
-    bulkReassignEmployeeReservations: true,
     syncOfflineQueue: true
   };
+
+  function getSpamStateForToken(token) {
+    var tKey = token ? ('tok_' + String(token).slice(-24)) : 'anon';
+    if (!clientSpamStateByToken[tKey]) {
+      clientSpamStateByToken[tKey] = { timestamps: [], signatures: {} };
+    }
+    return clientSpamStateByToken[tKey];
+  }
+
+  function buildClientSpamSignature(action, payload, token) {
+    var obj = (payload && typeof payload === 'object') ? payload : {};
+    var clone = {};
+    Object.keys(obj).sort().forEach(function (k) {
+      if (k === 'clientRequestId' || k === 'expectedUpdatedAt' || k === 'nowMs' || k === '_keepOptimisticCache' || k === '_replayingOfflineQueue') return;
+      clone[k] = obj[k];
+    });
+    var serialized = '';
+    try { serialized = JSON.stringify(clone); } catch (_e) { serialized = ''; }
+    var tokScope = token ? String(token).slice(-12) : 'anon';
+    return tokScope + ':' + String(action || '').trim() + ':' + serialized.slice(0, 320);
+  }
 
   function isTrackedSyncProcess(action, payload) {
     var clean = String(action || '').trim();
@@ -5824,7 +6382,34 @@
     var ns = getCacheNamespace();
 
     var reqPayload = payload && typeof payload === 'object' ? Object.assign({}, payload) : {};
-    if ((action === 'addFollowUp' || action === 'createProblem') && !reqPayload.clientRequestId) {
+    var isReplay = Boolean(reqPayload._replayingOfflineQueue);
+    var alreadySpamChecked = Boolean(reqPayload._spamChecked);
+    if (reqPayload._spamChecked !== undefined) delete reqPayload._spamChecked;
+    var spamState = null;
+    var spamSig = '';
+    if (core && typeof core.evaluateSpamGuard === 'function' && !isReplay && !alreadySpamChecked) {
+      var policyPre = (core.getApiCachePolicy) ? core.getApiCachePolicy(action) : { cacheable: false };
+      if (!policyPre.cacheable) {
+        spamState = getSpamStateForToken(token);
+        spamSig = buildClientSpamSignature(action, reqPayload, token);
+        var spamRes = core.evaluateSpamGuard(spamState, action, spamSig, {
+          duplicateWindowMs: 1200,
+          burstWindowMs: 10000,
+          maxBurst: 25
+        });
+        if (!spamRes.allowed) {
+          return {
+            success: false,
+            spamBlocked: true,
+            waitMs: spamRes.waitMs || 1200,
+            message: spamRes.message || 'تم إرسال نفس العملية قبل لحظات، تم منع التكرار التلقائي.',
+            data: null,
+            error: spamRes.reason || 'DUPLICATE_SUBMISSION'
+          };
+        }
+      }
+    }
+    if (!reqPayload.clientRequestId && !(core && core.SPAM_GUARD_EXEMPT_ACTIONS && core.SPAM_GUARD_EXEMPT_ACTIONS[action])) {
       reqPayload.clientRequestId = generateClientRequestId(action);
     }
     payload = reqPayload;
@@ -6355,13 +6940,20 @@
           if (localDetailsByNs[ns] && localDetailsByNs[ns][parsed.data.id]) {
             setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][parsed.data.id], { reservation: parsed.data }));
           }
+        } else if (action === 'bulkReassignSelectedReservations' && parsed.data && Array.isArray(parsed.data.updatedReservations) && parsed.data.updatedReservations.length > 0) {
+          pendingIdbOps.push(writeLocalReservationsState(ns, parsed.data.updatedReservations, false).idbPromise);
+          parsed.data.updatedReservations.forEach(function (ur) {
+            if (ur && ur.id && localDetailsByNs[ns] && localDetailsByNs[ns][ur.id]) {
+              setLocalDetailState(ns, Object.assign({}, localDetailsByNs[ns][ur.id], { reservation: ur }));
+            }
+          });
         } else if (action === 'deleteAllReservations' || action === 'importReservationsFromExcel') {
           pendingIdbOps.push(clearCache(['*']));
           if (root.RGIdbCache && typeof root.RGIdbCache.resetBootSyncState === 'function') {
             root.RGIdbCache.resetBootSyncState(ns);
           }
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
-        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'createProblem' || action === 'updateProblem')) {
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'bulkReassignSelectedReservations' || action === 'bulkReassignEmployeeReservations' || action === 'createProblem' || action === 'updateProblem')) {
           var dObj = (parsed && parsed.data) || {};
           var pObj = payload || {};
           var tResId = dObj.reservationId || (dObj.reservation && dObj.reservation.id) || pObj.reservationId || '';
@@ -6445,8 +7037,23 @@
             }
           } catch (_mEvErr) {}
         }
-      } else if (payload && payload._keepOptimisticCache && core && core.getCacheInvalidationScopes) {
-        await clearCache(core.getCacheInvalidationScopes(action));
+      } else {
+        if (spamState && spamSig && spamState.signatures && !(parsed && parsed.spamBlocked)) {
+          delete spamState.signatures[spamSig];
+        }
+        if (payload && payload._keepOptimisticCache) {
+          var rolledBack = restoreLatestOptimisticSnapshot(action);
+          try {
+            if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function') {
+              document.dispatchEvent(new CustomEvent('rg:optimisticrollback', {
+                detail: { action: action, rolledBack: rolledBack, at: Date.now() }
+              }));
+            }
+          } catch (_rbErr) {}
+          if (core && core.getCacheInvalidationScopes) {
+            await clearCache(core.getCacheInvalidationScopes(action));
+          }
+        }
       }
       return parsed;
     }
@@ -6943,6 +7550,7 @@
     prefetchReservationDetails: prefetchReservationDetails,
     getLocalCacheStats: getLocalCacheStats,
     applyOptimisticMutation: applyOptimisticMutation,
+    restoreLatestOptimisticSnapshot: restoreLatestOptimisticSnapshot,
     isOfflineQueueableAction: isOfflineQueueableAction,
     getOfflineQueueStatus: getOfflineQueueStatus,
     syncOfflineQueue: syncOfflineQueue,
