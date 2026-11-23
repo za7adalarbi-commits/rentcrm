@@ -1,5 +1,6 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
+import esbuild from 'esbuild';
 import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
@@ -11,17 +12,14 @@ function isGitHubPagesBuild(): boolean {
   return process.env.GITHUB_ACTIONS === 'true' || process.env.GITHUB_PAGES === 'true';
 }
 
-function resolveBasePath(command: 'build' | 'serve'): string {
+function resolveBasePath(_command: 'build' | 'serve'): string {
   if (process.env.VITE_BASE_PATH) {
     return process.env.VITE_BASE_PATH;
   }
   if (isGitHubPagesBuild()) {
     return GITHUB_PAGES_BASE;
   }
-  if (process.env.VERCEL === '1') {
-    return '/';
-  }
-  return command === 'build' ? './' : '/';
+  return '/';
 }
 
 function buildSpa404Html(basePath: string): string {
@@ -56,6 +54,44 @@ function buildSpa404Html(basePath: string): string {
 `;
 }
 
+function walkFilesRecursive(dirPath: string): string[] {
+  if (!fs.existsSync(dirPath)) return [];
+  const out: string[] = [];
+  for (const entry of fs.readdirSync(dirPath, {withFileTypes: true})) {
+    const full = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...walkFilesRecursive(full));
+    } else if (entry.isFile()) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+function minifyCopiedAssets(distAssetsDir: string): void {
+  const vendorDir = `${path.sep}vendor${path.sep}`;
+  for (const filePath of walkFilesRecursive(distAssetsDir)) {
+    if (filePath.includes(vendorDir)) continue;
+    const isJs = filePath.endsWith('.js');
+    const isCss = filePath.endsWith('.css');
+    if (!isJs && !isCss) continue;
+    try {
+      const source = fs.readFileSync(filePath, 'utf8');
+      const result = esbuild.transformSync(source, {
+        loader: isJs ? 'js' : 'css',
+        minify: true,
+        legalComments: 'none',
+        charset: 'utf8',
+      });
+      if (result && typeof result.code === 'string' && result.code.length > 0 && result.code.length < source.length) {
+        fs.writeFileSync(filePath, result.code, 'utf8');
+      }
+    } catch {
+      // Preserve unminified asset if transform fails
+    }
+  }
+}
+
 export default defineConfig(({command}) => {
   const base = resolveBasePath(command);
   const rootDir = import.meta.dirname;
@@ -66,6 +102,24 @@ export default defineConfig(({command}) => {
     plugins: [
       react(),
       tailwindcss(),
+      // Copies and minifies assets/ into dist/ in writeBundle so Workbox precaches minified sizes
+      {
+        name: 'copy-and-minify-assets',
+        apply: 'build',
+        writeBundle(): void {
+          const distDir = path.resolve(rootDir, 'dist');
+          const rootAssets = path.resolve(rootDir, 'assets');
+          const distRootAssets = path.resolve(distDir, 'assets');
+          if (fs.existsSync(distDir) && fs.existsSync(rootAssets)) {
+            fs.cpSync(rootAssets, distRootAssets, {recursive: true, force: true});
+            minifyCopiedAssets(distRootAssets);
+          }
+          if (fs.existsSync(distDir)) {
+            fs.writeFileSync(path.resolve(distDir, '.nojekyll'), '', 'utf8');
+            fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
+          }
+        },
+      },
       VitePWA({
         registerType: 'autoUpdate',
         includeAssets: [
@@ -108,6 +162,7 @@ export default defineConfig(({command}) => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
+          globIgnores: ['**/vendor/xlsx*.js', '**/vendor/jspdf*.js'],
           navigateFallback: 'index.html',
           navigateFallbackDenylist: [/^\/api(?:\/|$)/, /\/api\//],
           ignoreURLParametersMatching: [/^v$/],
@@ -126,7 +181,7 @@ export default defineConfig(({command}) => {
           ],
         },
         devOptions: {
-          enabled: true,
+          enabled: process.env.DISABLE_HMR !== 'true',
           type: 'module',
           navigateFallback: 'index.html',
           navigateFallbackAllowlist: [/^\/$/],
@@ -141,34 +196,9 @@ export default defineConfig(({command}) => {
           const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};window.__RG_DEFAULT_BACKEND_API_URL__ = ${JSON.stringify(defaultBackendUrl)};</script>\n`;
           let nextHtml = html.replace('</head>', `${baseInject}  </head>`);
           if (normalizedBase !== './') {
-            nextHtml = nextHtml.replace(/(src|href)="\.\/assets\//g, `$1="${normalizedBase}assets/`);
+            nextHtml = nextHtml.replace(/(src|href)="\.\/(assets\/|src\/|apple-touch-icon\.png)/g, `$1="${normalizedBase}$2`);
           }
           return nextHtml;
-        },
-      },
-      // Copies src/assets & assets into dist/ and generates GitHub Pages SPA 404.html + .nojekyll
-      {
-        name: 'copy-unbundled-src-assets',
-        apply: 'build',
-        closeBundle(error?: Error): void {
-          if (error) {
-            return;
-          }
-          const distDir = path.resolve(rootDir, 'dist');
-          const srcAssets = path.resolve(rootDir, 'src/assets');
-          const distAssets = path.resolve(rootDir, 'dist/src/assets');
-          if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
-            fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
-          }
-          const rootAssets = path.resolve(rootDir, 'assets');
-          const distRootAssets = path.resolve(distDir, 'assets');
-          if (fs.existsSync(distDir) && fs.existsSync(rootAssets)) {
-            fs.cpSync(rootAssets, distRootAssets, {recursive: true, force: true});
-          }
-          if (fs.existsSync(distDir)) {
-            fs.writeFileSync(path.resolve(distDir, '.nojekyll'), '', 'utf8');
-            fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
-          }
         },
       },
     ],

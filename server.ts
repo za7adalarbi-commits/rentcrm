@@ -10,6 +10,82 @@ import { requireAuth } from './backend/auth.js';
 import { createPgExecutor, isDatabaseConfigured } from './backend/db.js';
 import { subscribeCrmEvents } from './backend/realtime.js';
 
+const STATIC_GZIP_EXT_MAP: Record<string, string> = {
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.cjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.svg': 'image/svg+xml; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+};
+
+const staticGzipCache = new Map<string, { mtimeMs: number; gzip: Buffer; size: number }>();
+
+function sendCompressedTextAsset(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  baseDirs: string[],
+  reqPathOverride?: string
+) {
+  if (req.method !== 'GET' || req.headers.range) {
+    next();
+    return;
+  }
+  const acceptEnc = String(req.headers['accept-encoding'] || '');
+  if (!acceptEnc.includes('gzip')) {
+    next();
+    return;
+  }
+  const rawUrlPath = String(reqPathOverride ?? req.path ?? '').split('?')[0];
+  const cleanUrlPath = rawUrlPath === '/' ? '/index.html' : rawUrlPath;
+  const ext = path.extname(cleanUrlPath).toLowerCase();
+  const contentType = STATIC_GZIP_EXT_MAP[ext];
+  if (!contentType) {
+    next();
+    return;
+  }
+  const relPath = cleanUrlPath.replace(/^\/+/, '');
+  if (!relPath || relPath.includes('..')) {
+    next();
+    return;
+  }
+  for (const dir of baseDirs) {
+    const absPath = path.resolve(dir, relPath);
+    if (!absPath.startsWith(dir + path.sep) && absPath !== dir) continue;
+    try {
+      const stat = fs.statSync(absPath);
+      if (!stat.isFile() || stat.size <= 1024 || stat.size > 4 * 1024 * 1024) continue;
+      const cacheKey = absPath;
+      let cached = staticGzipCache.get(cacheKey);
+      if (!cached || cached.mtimeMs !== stat.mtimeMs) {
+        const rawBuf = fs.readFileSync(absPath);
+        const gzip = zlib.gzipSync(rawBuf, { level: 6 });
+        if (staticGzipCache.size > 160) staticGzipCache.clear();
+        cached = { mtimeMs: stat.mtimeMs, gzip, size: stat.size };
+        staticGzipCache.set(cacheKey, cached);
+      }
+      if (absPath.endsWith('index.html') || absPath.endsWith(`${path.sep}config.js`)) {
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+      } else if (absPath.includes(`${path.sep}vendor${path.sep}`) || /-[A-Za-z0-9_-]{8}\.(?:js|css)$/.test(absPath)) {
+        res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
+      } else {
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+      }
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.status(200).send(cached.gzip);
+      return;
+    } catch {
+      // File not in this dir, check next
+    }
+  }
+  next();
+}
+
 function gzipResponseMiddleware(req: Request, res: Response, next: NextFunction) {
   const acceptEnc = String(req.headers['accept-encoding'] || '');
   if (!acceptEnc.includes('gzip') || req.method === 'HEAD') {
@@ -137,18 +213,101 @@ async function startServer() {
     });
   });
 
+  const STATIC_ASSET_EXT_RE = /\.(?:js|mjs|cjs|ts|tsx|jsx|css|scss|map|json|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|webmanifest|txt|xml)$/i;
+
   if (process.env.NODE_ENV !== 'production') {
+    const isHmrDisabled = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true'
+        hmr: !isHmrDisabled,
+        ws: isHmrDisabled ? false : undefined
       },
-      appType: 'spa'
+      appType: 'custom'
     });
+
+    if (isHmrDisabled) {
+      app.get('/@vite/client', (_req: Request, res: Response) => {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send([
+          'const noop = () => {};',
+          'export function createHotContext() {',
+          '  return { data: {}, accept: noop, dispose: noop, prune: noop, decline: noop, invalidate: noop, on: noop, off: noop, send: noop };',
+          '}',
+          'export function injectQuery(url) { return url; }',
+          'export function updateStyle(id, content) {',
+          '  if (typeof document === "undefined") return;',
+          '  let style = document.querySelector("style[data-vite-dev-id=" + JSON.stringify(id) + "]");',
+          '  if (!style) {',
+          '    style = document.createElement("style");',
+          '    style.setAttribute("type", "text/css");',
+          '    style.setAttribute("data-vite-dev-id", id);',
+          '    document.head.appendChild(style);',
+          '  }',
+          '  style.textContent = content;',
+          '}',
+          'export function removeStyle(id) {',
+          '  if (typeof document === "undefined") return;',
+          '  const style = document.querySelector("style[data-vite-dev-id=" + JSON.stringify(id) + "]");',
+          '  if (style) style.remove();',
+          '}',
+          'export class ErrorOverlay {}'
+        ].join('\n'));
+      });
+    }
+
+    // Serve /assets directly in dev (compressed) so Vite does not inline 3x base64 source maps into static JS files
+    app.use('/assets', (req: Request, res: Response, next: NextFunction) => {
+      sendCompressedTextAsset(req, res, next, [rootDir], `/assets${req.path}`);
+    });
+    app.use('/assets', express.static(path.resolve(rootDir, 'assets'), {
+      setHeaders(res, filePath) {
+        if (filePath.includes(`${path.sep}vendor${path.sep}`) || /\.(png|jpg|jpeg|svg|webp|woff2?)$/i.test(filePath)) {
+          res.setHeader('Cache-Control', 'public, max-age=604800');
+        } else {
+          res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        }
+      }
+    }));
+
     app.use(vite.middlewares);
+
+    app.use(async (req: Request, res: Response, next: NextFunction) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        next();
+        return;
+      }
+      if (req.path.startsWith('/api/') || STATIC_ASSET_EXT_RE.test(req.path)) {
+        res.status(404).type('text/plain').send('Not Found');
+        return;
+      }
+      try {
+        const indexPath = path.resolve(rootDir, 'index.html');
+        const rawHtml = fs.readFileSync(indexPath, 'utf8');
+        const transformed = await vite.transformIndexHtml(req.originalUrl || '/', rawHtml);
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        const acceptEnc = String(req.headers['accept-encoding'] || '');
+        if (req.method === 'GET' && acceptEnc.includes('gzip') && transformed.length > 1024) {
+          const gz = zlib.gzipSync(Buffer.from(transformed, 'utf8'), { level: 6 });
+          res.setHeader('Content-Encoding', 'gzip');
+          res.setHeader('Vary', 'Accept-Encoding');
+          res.status(200).send(gz);
+          return;
+        }
+        res.status(200).send(transformed);
+      } catch (err) {
+        vite.ssrFixStacktrace(err as Error);
+        next(err);
+      }
+    });
   } else {
     const distDir = path.resolve(rootDir, 'dist');
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      sendCompressedTextAsset(req, res, next, [distDir]);
+    });
     app.use(express.static(distDir, {
       index: 'index.html',
       setHeaders(res, filePath) {
@@ -164,6 +323,10 @@ async function startServer() {
     app.use((req, res, next) => {
       if (req.path.startsWith('/api/')) {
         next();
+        return;
+      }
+      if (STATIC_ASSET_EXT_RE.test(req.path)) {
+        res.status(404).type('text/plain').send('Not Found');
         return;
       }
       const indexHtml = path.resolve(distDir, 'index.html');
