@@ -232,6 +232,13 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
              locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
              expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '2 minutes')
            );
+           CREATE TABLE IF NOT EXISTS sync_tombstones (
+             id TEXT PRIMARY KEY,
+             entity_type TEXT NOT NULL,
+             entity_id TEXT NOT NULL DEFAULT '',
+             meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+             deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+           );
            CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_reservations_company_updated ON reservations (company_name, updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_employee_id, is_read, created_at DESC);
@@ -244,7 +251,8 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
            CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_until_date) WHERE extended_until_date <> '';
            CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);
            CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);`
+           CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);
+           CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`
         ).catch(() => undefined);
       }
       schemaInitialized = true;

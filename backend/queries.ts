@@ -13,6 +13,7 @@ import {
   type AuthSession
 } from './auth.js';
 import {
+  ensureCacheSyncFreshness,
   getCachedOrLoad,
   getLocalCacheVersion,
   invalidateScopes,
@@ -44,6 +45,28 @@ import {
 function str(v: unknown, fallback = ''): string {
   if (v === null || v === undefined) return fallback;
   return String(v).trim();
+}
+
+async function recordSyncTombstone(
+  client: DbClient,
+  entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement',
+  entityIds: string[],
+  meta: Record<string, any> = {}
+): Promise<void> {
+  const cleanIds = Array.from(new Set(entityIds.map((x) => str(x)).filter(Boolean))).slice(0, 800);
+  if (!cleanIds.length) return;
+  const metaJson = JSON.stringify(meta || {});
+  try {
+    const ids = cleanIds.map(() => generateId('TMB'));
+    await client.query(
+      `INSERT INTO sync_tombstones (id, entity_type, entity_id, meta, deleted_at)
+       SELECT u.id, $2, u.entity_id, $3::jsonb, NOW()
+       FROM unnest($1::text[], $4::text[]) AS u(id, entity_id)`,
+      [ids, entityType, metaJson, cleanIds]
+    );
+  } catch {
+    // Graceful no-op on mock executors that don't support unnest tombstones
+  }
 }
 
 function num(v: unknown, fallback = 0): number {
@@ -3074,7 +3097,7 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
         }
       }
       await tx.query(
-        `UPDATE reservations SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb WHERE id = $1`,
+        `UPDATE reservations SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb, updated_at = NOW() WHERE id = $1`,
         [r.id, JSON.stringify(nextIds), JSON.stringify(nextNames)]
       );
     }
@@ -3095,13 +3118,14 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
         }
       }
       await tx.query(
-        `UPDATE problems SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb WHERE id = $1`,
+        `UPDATE problems SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb, updated_at = NOW() WHERE id = $1`,
         [p.id, JSON.stringify(nextIds), JSON.stringify(nextNames)]
       );
     }
 
     await tx.query(`DELETE FROM users WHERE id = $1`, [empId]);
     await tx.query(`DELETE FROM employees WHERE id = $1`, [empId]);
+    await recordSyncTombstone(tx, 'employee', [empId], { username: str(cur.username) });
 
     await logActivity(tx, session.user, 'حذف موظف', 'Employee', str(cur.username || empId), `حذف الموظف ${str(cur.name)} (${str(cur.username)})`);
     await enqueueSheetsMirror(tx, 'Employee', empId, 'deleteEmployee', {
@@ -3557,6 +3581,7 @@ export async function deleteAllReservations(
       await tx.query(
         `UPDATE sync_checkpoints SET last_cursor = '', last_batch_count = 0, last_status = 'cleared', meta = '{}'::jsonb, updated_at = NOW()`
       ).catch(() => undefined);
+      await recordSyncTombstone(tx, 'reservation_clear_all', ['ALL'], { scope: 'all', deletedCount });
     } else if (deletedCount > 0) {
       await tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]).catch(() => undefined);
       await tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]).catch(() => undefined);
@@ -3565,6 +3590,7 @@ export async function deleteAllReservations(
       await tx.query(`DELETE FROM assignments WHERE reservation_id = ANY($1::text[])`, [targetIds]);
       await tx.query(`DELETE FROM extensions WHERE reservation_id = ANY($1::text[])`, [targetIds]);
       await tx.query(`DELETE FROM reservations WHERE id = ANY($1::text[])`, [targetIds]);
+      await recordSyncTombstone(tx, 'reservation', targetIds, { scope: scopeInfo.scope });
     }
 
     const scopeEntityKey = scopeInfo.scope === 'all' ? 'ALL' : (scopeInfo.ym || String(scopeInfo.year || 'SCOPE'));
@@ -4381,6 +4407,7 @@ export async function deleteAnnouncement(executor: DbExecutor, session: AuthSess
   if (!annId) throw new Error('VALIDATION_ERROR: معرف التعميم مطلوب.');
 
   await executor.query(`DELETE FROM shift_announcements WHERE id = $1`, [annId]);
+  await recordSyncTombstone(executor, 'announcement', [annId]);
   await logActivity(executor, session.user, 'حذف تعميم وردية', 'Announcement', annId, 'تم حذف تعميم الوردية');
   invalidateScopes(executor, ['announcements', 'dashboard']);
   const data = await getAnnouncements(executor, session);
@@ -4598,7 +4625,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     ? new Date(Date.parse(rawSince) - 2000).toISOString()
     : new Date(Date.now() - 120000).toISOString();
 
-  const [resRows, fuRows, prbRows, empRows, notifData, annData, locksData, todayRadarSummary] = await Promise.all([
+  const [resRows, fuRows, prbRows, empRows, tombstoneRows, settingsUpdRes, delUpdRes, rolesActRes, freshSyncVer, notifData, annData, locksData, todayRadarSummary] = await Promise.all([
     executor.query(
       `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
@@ -4623,19 +4650,85 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
        LIMIT 50`,
       [sinceDate]
     ).catch(() => ({ rows: [] as any[] })),
+    executor.query<{ entity_type: string; entity_id: string; deleted_at: any }>(
+      `SELECT entity_type, entity_id, deleted_at
+       FROM sync_tombstones
+       WHERE deleted_at > $1::timestamptz
+       ORDER BY deleted_at DESC
+       LIMIT 800`,
+      [sinceDate]
+    ).catch(() => ({ rows: [] as any[] })),
+    executor.query<{ max_upd: any }>(
+      `SELECT MAX(updated_at) AS max_upd
+       FROM settings
+       WHERE key <> 'crm_sync_version' AND updated_at > $1::timestamptz`,
+      [sinceDate]
+    ).catch(() => ({ rows: [] as any[] })),
+    executor.query<{ max_upd: any }>(
+      `SELECT MAX(updated_at) AS max_upd
+       FROM employee_delegations
+       WHERE updated_at > $1::timestamptz`,
+      [sinceDate]
+    ).catch(() => ({ rows: [] as any[] })),
+    executor.query<{ max_upd: any }>(
+      `SELECT MAX(created_at) AS max_upd
+       FROM activity_log
+       WHERE entity_type IN ('Role','RolePreset','Permission') AND created_at > $1::timestamptz`,
+      [sinceDate]
+    ).catch(() => ({ rows: [] as any[] })),
+    ensureCacheSyncFreshness(executor, true).catch(() => getLocalCacheVersion(executor)),
     getNotifications(executor, session),
     getAnnouncements(executor, session).catch(() => ({ items: [], activeItems: [] })),
     getReservationLocks(executor, session).catch(() => ({ items: [] })),
     getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: str(payload.todayDate) }).catch(() => ({ counts: null }))
   ]);
 
+  const deletedReservationIds: string[] = [];
+  const deletedEmployeeIds: string[] = [];
+  const deletedAnnouncementIds: string[] = [];
+  let deletedAllReservationsBefore = '';
+
+  for (const row of tombstoneRows.rows || []) {
+    const et = str(row?.entity_type);
+    const eid = str(row?.entity_id);
+    if (et === 'reservation' && eid) {
+      deletedReservationIds.push(eid);
+    } else if (et === 'employee' && eid) {
+      deletedEmployeeIds.push(eid);
+    } else if (et === 'announcement' && eid) {
+      deletedAnnouncementIds.push(eid);
+    } else if (et === 'reservation_clear_all') {
+      const dIso = row?.deleted_at instanceof Date ? row.deleted_at.toISOString() : str(row?.deleted_at);
+      if (dIso && (!deletedAllReservationsBefore || dIso > deletedAllReservationsBefore)) {
+        deletedAllReservationsBefore = dIso;
+      }
+    }
+  }
+
+  const maxSetUpdRaw = settingsUpdRes.rows?.[0]?.max_upd;
+  const settingsUpdatedAt = maxSetUpdRaw instanceof Date ? maxSetUpdRaw.toISOString() : str(maxSetUpdRaw || '');
+  const maxDelUpdRaw = delUpdRes.rows?.[0]?.max_upd;
+  const maxRoleUpdRaw = rolesActRes.rows?.[0]?.max_upd;
+  const syncVersion = Math.max(getLocalCacheVersion(executor), Number(freshSyncVer || 0) || 0);
+
   return {
     serverTime: new Date().toISOString(),
-    syncVersion: getLocalCacheVersion(executor),
+    syncVersion,
     changedReservations: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
     changedFollowUps: fuRows.rows.map(formatFollowUpRow),
     changedProblems: prbRows.rows.map((p) => formatProblemRow(p)),
     changedEmployees: empRows.rows.map((e) => mapEmployeeRow(e)),
+    deletedReservationIds: Array.from(new Set(deletedReservationIds)),
+    deletedEmployeeIds: Array.from(new Set(deletedEmployeeIds)),
+    deletedAnnouncementIds: Array.from(new Set(deletedAnnouncementIds)),
+    deletedAllReservationsBefore,
+    changedSettings: Boolean(settingsUpdatedAt),
+    settingsUpdatedAt,
+    changedDelegations: Boolean(maxDelUpdRaw),
+    changedRoles: Boolean(maxRoleUpdRaw),
+    hasMoreReservations: resRows.rows.length >= 200,
+    hasMoreFollowUps: fuRows.rows.length >= 200,
+    hasMoreProblems: prbRows.rows.length >= 100,
     todayRadarCounts: (todayRadarSummary as any)?.counts || null,
     notifications: notifData,
     announcements: annData.activeItems || [],

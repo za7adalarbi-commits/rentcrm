@@ -2,7 +2,7 @@ import { handleLogin, handleLogout, hashToken, invalidateAuthSessionCache, requi
 import { checkMutationSpamLimit, getMutationSyncSpec, invalidateAndBumpVersion, runWithIdempotency } from './cache.js';
 import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
-import { broadcastCrmEvent } from './realtime.js';
+import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
 import * as queries from './queries.js';
 
 export interface CrmApiResponse<T = any> {
@@ -320,15 +320,19 @@ export async function dispatchCrmRequest(
       const entityIds: string[] = [];
       const candidateResId = String(payload?.reservationId || outResult?.reservation?.id || outResult?.id || '').trim();
       if (candidateResId) entityIds.push(candidateResId);
-      broadcastCrmEvent({
+      const originTabId = String(payload?.originTabId || '').trim() || undefined;
+      const rtEvent = {
         type: syncSpec.eventType,
         action,
         scopes: syncSpec.scopes,
         entityIds: entityIds.length ? entityIds : undefined,
         actorId: session.user.id,
+        originTabId,
         version: version || undefined,
         at: new Date().toISOString()
-      });
+      };
+      broadcastCrmEvent(rtEvent);
+      await publishPgNotify(executor, rtEvent).catch(() => undefined);
     }
 
     return outResult;

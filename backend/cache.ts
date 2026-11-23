@@ -334,7 +334,7 @@ export function buildSpamSignature(action: string, payload?: Record<string, any>
   const clone: Record<string, any> = {};
   const keys = Object.keys(obj).sort();
   for (const k of keys) {
-    if (k === 'clientRequestId' || k === 'expectedUpdatedAt' || k === 'siteOrigin' || k === 'nowMs') continue;
+    if (k === 'clientRequestId' || k === 'expectedUpdatedAt' || k === 'siteOrigin' || k === 'nowMs' || k === 'originTabId') continue;
     clone[k] = obj[k];
   }
   let serialized = '';

@@ -454,6 +454,15 @@ CREATE TABLE IF NOT EXISTS reservation_locks (
   expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '2 minutes')
 );
 
+-- 24. Cross-Client Deletion Tombstones for Real-Time Delta Sync
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL DEFAULT '',
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_employee_active ON sessions (employee_id, is_revoked, expires_at);
 CREATE INDEX IF NOT EXISTS idx_sync_log_started_at ON sync_log (started_at DESC);
@@ -468,3 +477,4 @@ CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_
 CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);
+CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);
