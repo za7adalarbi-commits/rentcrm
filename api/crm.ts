@@ -77,8 +77,9 @@ async function verifyGeneralManagerCredentials(
   if (!row || String(row.status || 'active') !== 'active') {
     throw new Error('FORBIDDEN: حساب المدير العام غير موجود أو غير نشط.');
   }
-  if (String(row.role || '') !== 'general_manager') {
-    throw new Error('FORBIDDEN: تحويل الوضع وإعدادات الربط الشامل متاح للمدير العام فقط.');
+  const empRole = String(row.role || '');
+  if (empRole !== 'general_manager' && empRole !== 'developer') {
+    throw new Error('FORBIDDEN: تحويل الوضع وإعدادات الربط الشامل متاح للمدير العام أو المبرمج فقط.');
   }
 
   const expectedHash = String(row.password_hash || '');
@@ -178,7 +179,7 @@ export default async function handler(req: any, res: any) {
         try {
           const isServerless = process.env.VERCEL === '1' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
           const actorRole = String(payload.actorRole || '').trim();
-          if (actorRole && actorRole !== 'general_manager') {
+          if (actorRole && actorRole !== 'general_manager' && actorRole !== 'developer') {
             res.status(403).json({
               success: false,
               message: 'FORBIDDEN: إعدادات الربط مخصصة للمدير العام فقط.',
