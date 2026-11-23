@@ -129,7 +129,8 @@ function formatFollowUpRow(row: any): Record<string, any> {
     notes: str(row.notes),
     followUpDate: str(row.follow_up_date),
     followUpTime: str(row.follow_up_time),
-    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at)
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at || row.created_at)
   };
 }
 
@@ -1136,7 +1137,7 @@ export async function getReservations(
     clauses.push(`r.start_date <= $${params.length}`);
   }
 
-  if (toBool(payload.hasProblem)) {
+  if (toBool(payload.hasProblem) || toBool(payload.hasProblemsOnly)) {
     clauses.push(`r.has_problem = TRUE`);
   }
 
@@ -1242,6 +1243,7 @@ export async function getReservations(
       timeField,
       timeFrom: str(payload.timeFrom),
       timeTo: str(payload.timeTo),
+      hasProblemsOnly: Boolean(toBool(payload.hasProblem) || toBool(payload.hasProblemsOnly)),
       overdueUnpaidOnly,
       extensionsByResId: extByResId,
       nowMs: Date.now(),
@@ -2078,12 +2080,13 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
         notes,
         followUpDate: nowIso.slice(0, 10),
         followUpTime: nowIso.slice(11, 19),
-        createdAt: nowIso
+        createdAt: nowIso,
+        updatedAt: nowIso
       };
 
       await tx.query(
-        `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
+        `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$12::timestamptz)`,
         [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
       );
 
@@ -2160,8 +2163,8 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     const nowIso = new Date().toISOString();
 
     await tx.query(
-      `UPDATE follow_ups SET status = $2, action = $3, notes = $4 WHERE id = $1`,
-      [followUpId, newStatus, newAction, newNotes]
+      `UPDATE follow_ups SET status = $2, action = $3, notes = $4, updated_at = $5::timestamptz WHERE id = $1`,
+      [followUpId, newStatus, newAction, newNotes, nowIso]
     );
 
     const hist = {
@@ -2220,7 +2223,7 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
       entityId: existing.reservationId,
       label: existing.reservationNumber
     });
-    return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes }, history: hist };
+    return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes, updatedAt: nowIso }, history: hist };
   });
 
   return out;
@@ -3278,8 +3281,9 @@ export async function markNotificationRead(executor: DbExecutor, session: AuthSe
     );
   } else if (payload.notificationId) {
     await executor.query(
-      `UPDATE notifications SET is_read = TRUE WHERE id = $1`,
-      [str(payload.notificationId)]
+      `UPDATE notifications SET is_read = TRUE
+       WHERE id = $1 AND (recipient_employee_id = $2 OR recipient_role = $3 OR recipient_role = 'all')`,
+      [str(payload.notificationId), session.user.id, session.user.role]
     );
   }
   return { updated: true };
@@ -4635,7 +4639,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       [sinceDate]
     ),
     executor.query(
-      `SELECT * FROM follow_ups WHERE created_at > $1::timestamptz ORDER BY created_at DESC LIMIT 200`,
+      `SELECT * FROM follow_ups WHERE COALESCE(updated_at, created_at) > $1::timestamptz ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 200`,
       [sinceDate]
     ),
     executor.query(

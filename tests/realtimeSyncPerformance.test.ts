@@ -219,9 +219,20 @@ function createRealtimeTestExecutor(): DbExecutor & {
         notes: params[8],
         follow_up_date: params[9],
         follow_up_time: params[10],
-        created_at: new Date(params[11])
+        created_at: new Date(params[11]),
+        updated_at: new Date(params[11])
       });
       return { rows: [], rowCount: 1 };
+    }
+    if (sql.startsWith('UPDATE follow_ups SET')) {
+      const f = state.follow_ups.find((x) => x.id === params[0]);
+      if (f) {
+        f.status = params[1];
+        f.action = params[2];
+        f.notes = params[3];
+        f.updated_at = new Date(params[4]);
+      }
+      return { rows: f ? [f] as any[] : [], rowCount: f ? 1 : 0 };
     }
     if (sql.startsWith('INSERT INTO activity_log')) {
       state.activity_log.push({
@@ -260,9 +271,12 @@ function createRealtimeTestExecutor(): DbExecutor & {
         .map((r) => ({ ...r, is_followed: state.follow_ups.some((f) => f.reservation_id === r.id) }));
       return { rows: rows as any[], rowCount: rows.length };
     }
-    if (sql.startsWith('SELECT * FROM follow_ups WHERE created_at >')) {
+    if (sql.startsWith('SELECT * FROM follow_ups WHERE COALESCE(updated_at, created_at) >') || sql.startsWith('SELECT * FROM follow_ups WHERE created_at >')) {
       const sinceMs = Date.parse(String(params[0] || ''));
-      const rows = state.follow_ups.filter((f) => Date.parse(f.created_at instanceof Date ? f.created_at.toISOString() : String(f.created_at)) > sinceMs);
+      const rows = state.follow_ups.filter((f) => {
+        const ts = f.updated_at || f.created_at;
+        return Date.parse(ts instanceof Date ? ts.toISOString() : String(ts)) > sinceMs;
+      });
       return { rows: rows as any[], rowCount: rows.length };
     }
     if (sql.startsWith('SELECT * FROM problems WHERE updated_at >')) {

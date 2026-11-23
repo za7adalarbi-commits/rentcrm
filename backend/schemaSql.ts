@@ -158,7 +158,8 @@ CREATE TABLE IF NOT EXISTS follow_ups (
   notes TEXT NOT NULL DEFAULT '',
   follow_up_date TEXT NOT NULL DEFAULT '',
   follow_up_time TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 7. FollowUpHistory (mirrors RG_SHEETS.FOLLOWUP_HISTORY)
@@ -476,6 +477,7 @@ CREATE INDEX IF NOT EXISTS idx_reservations_start_status ON reservations (start_
 CREATE INDEX IF NOT EXISTS idx_reservations_end_status ON reservations (end_date, internal_status);
 CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_until_date) WHERE extended_until_date <> '';
 CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_follow_ups_updated_desc ON follow_ups (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);
 CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);

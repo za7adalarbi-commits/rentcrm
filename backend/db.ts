@@ -191,6 +191,7 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
            ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_name TEXT NOT NULL DEFAULT '';
            ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_updated_at TEXT NOT NULL DEFAULT '';
            ALTER TABLE reservations ADD COLUMN IF NOT EXISTS no_answer_count INTEGER NOT NULL DEFAULT 0;
+           ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
            ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '[]'::jsonb;
            CREATE TABLE IF NOT EXISTS shift_announcements (
              id TEXT PRIMARY KEY,
@@ -250,6 +251,7 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
            CREATE INDEX IF NOT EXISTS idx_reservations_end_status ON reservations (end_date, internal_status);
            CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_until_date) WHERE extended_until_date <> '';
            CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);
+           CREATE INDEX IF NOT EXISTS idx_follow_ups_updated_desc ON follow_ups (updated_at DESC);
            CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
            CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);
            CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`
