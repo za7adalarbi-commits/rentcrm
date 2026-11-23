@@ -1,12 +1,32 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import esbuild from 'esbuild';
-import fs from 'fs';
-import path from 'path';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
 const GITHUB_PAGES_BASE = '/RENT-CRM/';
+
+function resolveBuildVersion(command: 'build' | 'serve'): string {
+  if (command === 'serve') {
+    return 'dev';
+  }
+  const explicit = String(
+    process.env.VITE_BUILD_VERSION ||
+    process.env.VERCEL_GIT_COMMIT_SHA ||
+    process.env.GITHUB_SHA ||
+    process.env.VERCEL_DEPLOYMENT_ID ||
+    ''
+  ).trim();
+  if (explicit) {
+    return explicit.slice(0, 14);
+  }
+  const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 12);
+  const rand = crypto.randomBytes(3).toString('hex');
+  return `${ts}-${rand}`;
+}
 
 function isGitHubPagesBuild(): boolean {
   return process.env.GITHUB_ACTIONS === 'true' || process.env.GITHUB_PAGES === 'true';
@@ -96,13 +116,15 @@ export default defineConfig(({command}) => {
   const base = resolveBasePath(command);
   const rootDir = import.meta.dirname;
   const pwaScope = base === './' ? '/' : base;
+  const buildVersion = resolveBuildVersion(command);
+  const builtAtIso = new Date().toISOString();
 
   return {
     base,
     plugins: [
       react(),
       tailwindcss(),
-      // Copies and minifies assets/ into dist/ in writeBundle so Workbox precaches minified sizes
+      // Copies and minifies assets/, stamps dist/version.json before Workbox manifest generation
       {
         name: 'copy-and-minify-assets',
         apply: 'build',
@@ -117,6 +139,16 @@ export default defineConfig(({command}) => {
           if (fs.existsSync(distDir)) {
             fs.writeFileSync(path.resolve(distDir, '.nojekyll'), '', 'utf8');
             fs.writeFileSync(path.resolve(distDir, '404.html'), buildSpa404Html(base), 'utf8');
+            fs.writeFileSync(
+              path.resolve(distDir, 'version.json'),
+              JSON.stringify({
+                version: buildVersion,
+                buildId: buildVersion,
+                builtAt: builtAtIso,
+                env: 'production',
+              }, null, 2),
+              'utf8'
+            );
           }
         },
       },
@@ -161,14 +193,41 @@ export default defineConfig(({command}) => {
           ],
         },
         workbox: {
+          skipWaiting: true,
+          clientsClaim: true,
+          cleanupOutdatedCaches: true,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
-          globIgnores: ['**/vendor/xlsx*.js', '**/vendor/jspdf*.js'],
+          globIgnores: ['**/vendor/xlsx*.js', '**/vendor/jspdf*.js', '**/version.json'],
           navigateFallback: 'index.html',
-          navigateFallbackDenylist: [/^\/api(?:\/|$)/, /\/api\//],
+          navigateFallbackDenylist: [/^\/api(?:\/|$)/, /\/api\//, /\/version\.json$/],
           ignoreURLParametersMatching: [/^v$/],
           runtimeCaching: [
             {
-              urlPattern: /\/assets\/.*\.(?:js|css|png|jpg|svg|woff2)(?:\?.*)?$/i,
+              urlPattern: /\/version\.json(?:\?.*)?$/i,
+              handler: 'NetworkOnly',
+            },
+            {
+              urlPattern: /\/api\/.*/i,
+              handler: 'NetworkOnly',
+            },
+            {
+              urlPattern: /\/assets\/js\/config\.js(?:\?.*)?$/i,
+              handler: 'NetworkOnly',
+            },
+            {
+              urlPattern: /\/assets\/.*\.(?:js|css)(?:\?.*)?$/i,
+              handler: 'NetworkFirst',
+              options: {
+                cacheName: 'rg-crm-code-cache',
+                networkTimeoutSeconds: 4,
+                expiration: {
+                  maxEntries: 60,
+                  maxAgeSeconds: 60 * 60 * 24 * 7,
+                },
+              },
+            },
+            {
+              urlPattern: /\/assets\/.*\.(?:png|jpg|jpeg|gif|svg|webp|woff2?)(?:\?.*)?$/i,
               handler: 'StaleWhileRevalidate',
               options: {
                 cacheName: 'rg-crm-assets-cache',
@@ -181,10 +240,7 @@ export default defineConfig(({command}) => {
           ],
         },
         devOptions: {
-          enabled: process.env.DISABLE_HMR !== 'true',
-          type: 'module',
-          navigateFallback: 'index.html',
-          navigateFallbackAllowlist: [/^\/$/],
+          enabled: false,
         },
       }),
       {
@@ -193,8 +249,10 @@ export default defineConfig(({command}) => {
           const normalizedBase = base === './' ? './' : (base.endsWith('/') ? base : `${base}/`);
           const defaultGasUrl = String(process.env.VITE_GAS_WEBAPP_URL || '').trim();
           const defaultBackendUrl = String(process.env.VITE_BACKEND_API_URL || '').trim();
-          const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};window.__RG_DEFAULT_BACKEND_API_URL__ = ${JSON.stringify(defaultBackendUrl)};</script>\n`;
+          const baseInject = `    <script>window.__RG_BASE_URL__ = ${JSON.stringify(normalizedBase)};window.__RG_BUILD_VERSION__ = ${JSON.stringify(buildVersion)};window.__RG_BUILD_AT__ = ${JSON.stringify(builtAtIso)};window.__RG_DEFAULT_GAS_URL__ = ${JSON.stringify(defaultGasUrl)};window.__RG_DEFAULT_BACKEND_API_URL__ = ${JSON.stringify(defaultBackendUrl)};</script>\n`;
           let nextHtml = html.replace('</head>', `${baseInject}  </head>`);
+          nextHtml = nextHtml.replace(/var BUILD_VER = '[^']*';/, `var BUILD_VER = ${JSON.stringify(buildVersion)};`);
+          nextHtml = nextHtml.replace(/((?:\.|\/)?(?:assets|src)\/[^"']+\.(?:js|css))\?v=[A-Za-z0-9._-]+/g, `$1?v=${buildVersion}`);
           if (normalizedBase !== './') {
             nextHtml = nextHtml.replace(/(src|href)="\.\/(assets\/|src\/|apple-touch-icon\.png)/g, `$1="${normalizedBase}$2`);
           }

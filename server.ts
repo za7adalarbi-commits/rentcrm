@@ -6,9 +6,11 @@ import zlib from 'node:zlib';
 import crmHandler from './api/crm.js';
 import healthHandler from './api/health.js';
 import syncHandler from './api/sync.js';
+import versionHandler from './api/version.js';
 import { requireAuth } from './backend/auth.js';
-import { createPgExecutor, isDatabaseConfigured } from './backend/db.js';
-import { subscribeCrmEvents } from './backend/realtime.js';
+import { createPgExecutor, getDatabaseUrl, isDatabaseConfigured } from './backend/db.js';
+import { ensurePgRealtimeListener, subscribeCrmEvents } from './backend/realtime.js';
+import { attachAppVersionHeaders } from './backend/versionManifest.js';
 
 const STATIC_GZIP_EXT_MAP: Record<string, string> = {
   '.js': 'application/javascript; charset=utf-8',
@@ -67,8 +69,15 @@ function sendCompressedTextAsset(
         cached = { mtimeMs: stat.mtimeMs, gzip, size: stat.size };
         staticGzipCache.set(cacheKey, cached);
       }
-      if (absPath.endsWith('index.html') || absPath.endsWith(`${path.sep}config.js`)) {
-        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+      if (
+        absPath.endsWith('index.html') ||
+        absPath.endsWith(`${path.sep}config.js`) ||
+        absPath.endsWith(`${path.sep}version.json`) ||
+        absPath.endsWith(`${path.sep}sw.js`) ||
+        absPath.endsWith(`${path.sep}registerSW.js`) ||
+        absPath.endsWith(`${path.sep}manifest.webmanifest`)
+      ) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
       } else if (absPath.includes(`${path.sep}vendor${path.sep}`) || /-[A-Za-z0-9_-]{8}\.(?:js|css)$/.test(absPath)) {
         res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
       } else {
@@ -126,6 +135,7 @@ async function startServer() {
   const runApiRoute = (handlerFn: (req: Request, res: Response) => Promise<void>) => {
     return (req: Request, res: Response) => {
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      attachAppVersionHeaders(res);
       Promise.resolve(handlerFn(req, res)).catch((err: any) => {
         console.error('Express API route error:', err);
         if (!res.headersSent) {
@@ -141,6 +151,8 @@ async function startServer() {
   };
 
   app.all('/api/health', runApiRoute(healthHandler));
+  app.all('/api/version', runApiRoute(versionHandler));
+  app.get('/version.json', runApiRoute(versionHandler));
   app.all('/api/crm', runApiRoute(crmHandler));
   app.all('/api/sync', runApiRoute(syncHandler));
 
@@ -176,6 +188,7 @@ async function startServer() {
       }
     }
 
+    const sseManifest = attachAppVersionHeaders(res);
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -183,7 +196,7 @@ async function startServer() {
     if (typeof (res as any).flushHeaders === 'function') {
       (res as any).flushHeaders();
     }
-    res.write(`retry: 3000\nevent: ready\ndata: ${JSON.stringify({ ok: true, userId, at: new Date().toISOString() })}\n\n`);
+    res.write(`retry: 3000\nevent: ready\ndata: ${JSON.stringify({ ok: true, userId, appVersion: sseManifest.version, at: new Date().toISOString() })}\n\n`);
 
     const unsubscribe = subscribeCrmEvents((ev) => {
       if (res.writableEnded) return;
@@ -288,7 +301,8 @@ async function startServer() {
         const rawHtml = fs.readFileSync(indexPath, 'utf8');
         const transformed = await vite.transformIndexHtml(req.originalUrl || '/', rawHtml);
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        res.setHeader('Pragma', 'no-cache');
         const acceptEnc = String(req.headers['accept-encoding'] || '');
         if (req.method === 'GET' && acceptEnc.includes('gzip') && transformed.length > 1024) {
           const gz = zlib.gzipSync(Buffer.from(transformed, 'utf8'), { level: 6 });
@@ -311,8 +325,15 @@ async function startServer() {
     app.use(express.static(distDir, {
       index: 'index.html',
       setHeaders(res, filePath) {
-        if (filePath.endsWith('index.html') || filePath.endsWith(`${path.sep}config.js`)) {
-          res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        if (
+          filePath.endsWith('index.html') ||
+          filePath.endsWith(`${path.sep}config.js`) ||
+          filePath.endsWith(`${path.sep}version.json`) ||
+          filePath.endsWith(`${path.sep}sw.js`) ||
+          filePath.endsWith(`${path.sep}registerSW.js`) ||
+          filePath.endsWith(`${path.sep}manifest.webmanifest`)
+        ) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
         } else if (/\.(png|jpg|jpeg|svg|webp|woff2?)$/i.test(filePath) || filePath.includes(`${path.sep}vendor${path.sep}`)) {
           res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
         } else if (/\.(js|css)$/i.test(filePath)) {
@@ -331,12 +352,16 @@ async function startServer() {
       }
       const indexHtml = path.resolve(distDir, 'index.html');
       if (fs.existsSync(indexHtml)) {
-        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
         res.sendFile(indexHtml);
       } else {
         res.status(404).send('Build output not found. Run npm run build first.');
       }
     });
+  }
+
+  if (isDatabaseConfigured()) {
+    ensurePgRealtimeListener(getDatabaseUrl());
   }
 
   app.listen(port, '0.0.0.0', () => {
