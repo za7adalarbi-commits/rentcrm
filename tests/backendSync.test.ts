@@ -171,21 +171,39 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
   }
 
   function sortMockReservations(sql: string, list: any[]): any[] {
-    const orderMatch = sql.match(/ORDER BY\s+r\.(\w+)\s+(ASC|DESC)/i);
+    const orderMatch = sql.match(/ORDER BY\s+r\.(\w+)\s+(ASC|DESC)(?:\s+NULLS\s+(FIRST|LAST))?/i);
     if (!orderMatch) return list;
     const col = orderMatch[1];
     const dir = orderMatch[2].toUpperCase() === 'ASC' ? 1 : -1;
-    return list.slice().sort((a, b) => {
-      const va = a[col];
-      const vb = b[col];
-      if (va instanceof Date || vb instanceof Date) {
-        return ((va ? new Date(va).getTime() : 0) - (vb ? new Date(vb).getTime() : 0)) * dir;
-      }
-      if (typeof va === 'number' || typeof vb === 'number') {
-        return (Number(va || 0) - Number(vb || 0)) * dir;
-      }
-      return String(va || '').localeCompare(String(vb || '')) * dir;
-    });
+    const nullsPos = orderMatch[3] ? orderMatch[3].toUpperCase() : '';
+    return list
+      .map((item, idx) => ({ item, idx }))
+      .sort((a, b) => {
+        const va = a.item[col];
+        const vb = b.item[col];
+        const aNull = va === null || va === undefined || va === '';
+        const bNull = vb === null || vb === undefined || vb === '';
+        if (nullsPos === 'LAST') {
+          if (aNull && !bNull) return 1;
+          if (!aNull && bNull) return -1;
+          if (aNull && bNull) return a.idx - b.idx;
+        } else if (nullsPos === 'FIRST') {
+          if (aNull && !bNull) return -1;
+          if (!aNull && bNull) return 1;
+          if (aNull && bNull) return a.idx - b.idx;
+        }
+        if (va instanceof Date || vb instanceof Date) {
+          const diff = ((va ? new Date(va).getTime() : 0) - (vb ? new Date(vb).getTime() : 0)) * dir;
+          return diff !== 0 ? diff : (a.idx - b.idx);
+        }
+        if (typeof va === 'number' || typeof vb === 'number') {
+          const diff = (Number(va || 0) - Number(vb || 0)) * dir;
+          return diff !== 0 ? diff : (a.idx - b.idx);
+        }
+        const cmp = String(va || '').localeCompare(String(vb || '')) * dir;
+        return cmp !== 0 ? cmp : (a.idx - b.idx);
+      })
+      .map((x) => x.item);
   }
 
   async function runQuery<T extends Record<string, any> = any>(sqlRaw: string, params: any[] = []): Promise<QueryResult<T>> {
@@ -518,18 +536,36 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
           created_at: new Date(params[48][i]),
           updated_at: new Date(params[49][i]),
           status_history: JSON.parse(params[50][i]),
-          raw_json: params[51][i]
+          raw_json: params[51][i],
+          source_order: Array.isArray(params[52]) ? (params[52][i] ?? null) : null
         };
         const idx = state.reservations.findIndex((r) => r.reservation_number === rec.reservation_number);
         if (idx === -1) {
           state.reservations.push(rec);
           outRows.push({ inserted: true });
         } else {
-          state.reservations[idx] = { ...rec, id: state.reservations[idx].id, created_at: state.reservations[idx].created_at };
+          state.reservations[idx] = {
+            ...rec,
+            id: state.reservations[idx].id,
+            created_at: state.reservations[idx].created_at,
+            source_order: rec.source_order ?? state.reservations[idx].source_order ?? null
+          };
           outRows.push({ inserted: false });
         }
       }
       return { rows: outRows as any[], rowCount: outRows.length };
+    }
+
+    if (sql.startsWith('UPDATE reservations SET source_order = NULL')) {
+      const liveNums: string[] = Array.isArray(params[0]) ? params[0] : [];
+      let cleared = 0;
+      for (const r of state.reservations) {
+        if (r.source_order !== null && r.source_order !== undefined && !liveNums.includes(r.reservation_number)) {
+          r.source_order = null;
+          cleared++;
+        }
+      }
+      return { rows: [], rowCount: cleared };
     }
 
     if (sql.startsWith('UPDATE extensions e SET reservation_id = r.id')) {
@@ -746,6 +782,15 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return {
         rows: paged.map((r) => ({ ...r, is_followed: state.follow_ups.some((f) => f.reservation_id === r.id) })) as any[],
         rowCount: paged.length
+      };
+    }
+
+    if (sql.startsWith('SELECT r.id, r.source_reservation_id, r.reservation_number')) {
+      const maxItems = Number(params[0] || 2500);
+      const list = sortMockReservations(sql, filterMockReservations(sql, params)).slice(0, maxItems);
+      return {
+        rows: list.map((r) => ({ ...r, is_followed: state.follow_ups.some((f) => f.reservation_id === r.id) })) as any[],
+        rowCount: list.length
       };
     }
 
@@ -3562,6 +3607,176 @@ test('dedicated reservationNumber search filter works in core.js, reservations.j
   assert.equal(backendRes.success, true);
   assert.deepEqual(backendRes.data.items.map((x: any) => x.id), ['RES_NUM_1']);
 });
+
+test('Booking order matches Rental Gate source sequence across pull, pagination, updates, re-pull, core, and IDB hydration', async () => {
+  // Exact reference sequence from Screenshot 1 (non-monotonic IDs and startDates)
+  const expectedSequence = ['1159', '1156', '1139', '1138', '1133', '1131', '1128', '1123', '1117', '1116'];
+  const startDates: Record<string, string> = {
+    '1159': '2026-11-24T17:30:00',
+    '1156': '2026-11-23T23:00:00',
+    '1139': '2026-11-23T17:59:00',
+    '1138': '2026-11-23T17:40:00',
+    '1133': '2026-11-23T16:15:00',
+    '1131': '2026-11-23T13:30:00',
+    '1128': '2026-11-24T09:30:00',
+    '1123': '2026-11-23T13:00:00',
+    '1117': '2026-11-22T21:33:00',
+    '1116': '2026-11-26T11:00:00'
+  };
+
+  const makeSourcePageItem = (num: string) => ({
+    id: Number(num),
+    reservationNumber: num,
+    clientName: `Customer ${num}`,
+    clientMobile: `+96650000${num}`,
+    companyArName: 'AlRehab',
+    receiveBranchArName: 'الرياض',
+    carNameAr: 'تويوتا يارس 2024',
+    startDate: startDates[num] || '2026-11-23T10:00:00',
+    endDate: '2026-11-27T10:00:00',
+    reservationDays: 2,
+    reservationStatus: 2,
+    total: 350
+  });
+
+  const db = createInMemoryMockExecutor();
+  await dispatchCrmRequest(db, { action: 'ping' });
+  const loginRes = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'Admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' }
+  });
+  assert.equal(loginRes.success, true);
+  const token = loginRes.data.token;
+
+  const prevRgToken = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_test_token_order_12345';
+
+  let activeSnapshotNums = expectedSequence.slice();
+  const mockFetch = (async (url: any) => {
+    const u = new URL(String(url));
+    if (u.pathname.includes('/reservations/filter')) {
+      const page = Number(u.searchParams.get('page') || '0');
+      const chunkSize = 5;
+      const start = page * chunkSize;
+      const items = activeSnapshotNums.slice(start, start + chunkSize).map(makeSourcePageItem);
+      const totalPages = Math.ceil(activeSnapshotNums.length / chunkSize);
+      const bodyObj = {
+        data: {
+          items,
+          totalItems: activeSnapshotNums.length,
+          totalPages,
+          last: page + 1 >= totalPages
+        }
+      };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => bodyObj,
+        text: async () => JSON.stringify(bodyObj)
+      } as any;
+    }
+    const emptyObj = { data: { items: [], totalItems: 0, totalPages: 1, last: true } };
+    return {
+      ok: true,
+      status: 200,
+      json: async () => emptyObj,
+      text: async () => JSON.stringify(emptyObj)
+    } as any;
+  }) as any;
+
+  try {
+    // 1) Multi-page pull preserves exact source sequence
+    const pullRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { maxPages: 5 },
+      mockFetch
+    );
+    assert.equal(pullRes.fetchedCount, 10);
+    assert.equal(pullRes.pagesFetched, 3);
+    assert.equal(pullRes.importedCount, 10);
+
+    const p1 = await dispatchCrmRequest(db, { action: 'getReservations', token, payload: { page: 1, pageSize: 5 } });
+    const p2 = await dispatchCrmRequest(db, { action: 'getReservations', token, payload: { page: 2, pageSize: 5 } });
+    assert.deepEqual(p1.data.items.map((x: any) => x.reservationNumber), expectedSequence.slice(0, 5));
+    assert.deepEqual(p2.data.items.map((x: any) => x.reservationNumber), expectedSequence.slice(5, 10));
+
+    // 2) Mutating a row later in the list (1116) bumps updated_at, yet source order remains unchanged
+    const res1116 = db.state.reservations.find((r) => r.reservation_number === '1116');
+    assert.ok(res1116);
+    const mutRes = await dispatchCrmRequest(db, {
+      action: 'quickUpdateReservationStatus',
+      token,
+      payload: { reservationId: res1116.id, status: 'تم التسليم' }
+    });
+    assert.equal(mutRes.success, true);
+
+    const afterMutAll = await dispatchCrmRequest(db, { action: 'getReservations', token, payload: { page: 1, pageSize: 20 } });
+    assert.deepEqual(afterMutAll.data.items.map((x: any) => x.reservationNumber), expectedSequence);
+
+    // 3) syncLocalCache also returns exact source sequence
+    const syncCacheRes = await dispatchCrmRequest(db, { action: 'syncLocalCache', token, payload: {} });
+    assert.equal(syncCacheRes.success, true);
+    assert.deepEqual(syncCacheRes.data.reservations.map((x: any) => x.reservationNumber), expectedSequence);
+
+    // 4) Full re-pull when a new booking (1160) arrives at source top & an old one (1117) leaves
+    activeSnapshotNums = ['1160', '1159', '1156', '1139', '1138', '1133', '1131', '1128', '1123', '1116'];
+    const repullRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { maxPages: 5 },
+      mockFetch
+    );
+    assert.equal(repullRes.fetchedCount, 10);
+    const afterRepull = await dispatchCrmRequest(db, { action: 'getReservations', token, payload: { page: 1, pageSize: 20 } });
+    assert.deepEqual(
+      afterRepull.data.items.map((x: any) => x.reservationNumber),
+      ['1160', '1159', '1156', '1139', '1138', '1133', '1131', '1128', '1123', '1116', '1117']
+    );
+    const removedRow = db.state.reservations.find((r) => r.reservation_number === '1117');
+    assert.equal(removedRow?.source_order, null);
+  } finally {
+    if (prevRgToken === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRgToken;
+  }
+
+  // 5) Frontend core.js & idb.js preserve exact sourceOrder even when IDB key order scrambles keys lexicographically
+  const coreSrc = fs.readFileSync(path.join(process.cwd(), 'assets/js/core.js'), 'utf8');
+  const idbSrc = fs.readFileSync(path.join(process.cwd(), 'assets/js/idb.js'), 'utf8');
+  const winCtx: any = { window: {} as any, Date, Math, JSON, Array, Object, Number, String, Boolean, isFinite };
+  winCtx.window = winCtx;
+  vm.runInNewContext(coreSrc, winCtx);
+  vm.runInNewContext(idbSrc, winCtx);
+
+  const clientOrdered = expectedSequence.map((num, idx) => ({
+    id: `RES_${num}`,
+    reservationNumber: num,
+    sourceOrder: idx + 1,
+    customerName: `Customer ${num}`,
+    startDate: startDates[num],
+    lastUpdatedAt: num === '1116' ? '2026-11-30T23:59:59Z' : '2026-11-23T00:00:00Z'
+  }));
+
+  // Shuffle into lexicographic nsId order and verify core.filterReservations restores sourceOrder
+  const scrambled = clientOrdered.slice().sort((a, b) => a.id.localeCompare(b.id));
+  const filteredDefault = winCtx.RGCrmCore.filterReservations(scrambled, [], {});
+  assert.deepEqual(Array.from(filteredDefault, (x: any) => x.reservationNumber), expectedSequence);
+
+  // Delta update on 1116 without sourceOrder preserves 1116 at position 10 (end)
+  const deltaUpdated = winCtx.RGCrmCore.reapplyReservationDeltaToFilteredList(
+    filteredDefault,
+    [{ id: 'RES_1116', internalStatus: 'تم التسليم', lastUpdatedAt: '2026-12-01T00:00:00Z' }],
+    [],
+    {}
+  );
+  assert.deepEqual(Array.from(deltaUpdated.items, (x: any) => x.reservationNumber), expectedSequence);
+
+  // IDB snapshot stores and loads back in sourceOrder
+  await winCtx.RGIdbCache.replaceReservationsSnapshot('test_ns', scrambled.slice().reverse(), [], {});
+  const loadedSnap = await winCtx.RGIdbCache.loadNamespaceSnapshot('test_ns');
+  assert.deepEqual(Array.from(loadedSnap.reservations, (x: any) => x.reservationNumber), expectedSequence);
+});
+
 
 
 

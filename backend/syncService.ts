@@ -22,6 +22,7 @@ export interface SyncBatchPayload {
   extensions?: any[];
   deletedReservationNumbers?: string[];
   appliedRange?: Record<string, any>;
+  isFullSnapshot?: boolean;
 }
 
 export interface SyncIngestResult {
@@ -118,6 +119,11 @@ export function mapReservationRowToClient(row: any, includeRaw = false): Record<
     isFollowed: row.is_followed !== undefined ? Boolean(row.is_followed) : Boolean(row.isFollowed),
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at ?? row.createdAt),
     updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at ?? row.updatedAt),
+    sourceOrder: (row.source_order !== null && row.source_order !== undefined && Number(row.source_order) > 0)
+      ? Math.floor(Number(row.source_order))
+      : ((row.sourceOrder !== null && row.sourceOrder !== undefined && Number(row.sourceOrder) > 0)
+          ? Math.floor(Number(row.sourceOrder))
+          : null),
     statusHistory: crmCore.normalizeStatusHistory(row.status_history ?? row.statusHistory ?? [])
   };
   if (includeRaw) {
@@ -205,7 +211,8 @@ function normalizeIncomingReservation(
   existingClient: Record<string, any> | null,
   relatedExts: any[],
   actor: SyncActor,
-  nowIso: string
+  nowIso: string,
+  seqFallback = 0
 ): { record: Record<string, any>; followUpHistoryEntry: Record<string, any> | null } {
   const isNormalizedCrmShape = Boolean(raw.reservationNumber && raw.customerName !== undefined && raw.originalStatusCode !== undefined);
   const srcResId = str(crmCore.extractSourceReservationId(raw));
@@ -345,6 +352,13 @@ function normalizeIncomingReservation(
   const extCount = extSummary ? num(extSummary.extensionsCount, 0) : num(merged.extensionsCount, 0);
   const totalAmt = num(merged.totalAmount, Number((baseAmt + extAmt).toFixed(2))) || Number((baseAmt + extAmt).toFixed(2));
 
+  const explicitOrder = num(raw.sourceOrder ?? raw.__sourceOrder ?? raw.source_order, 0);
+  const prevOrder = existingClient ? num(existingClient.sourceOrder, 0) : 0;
+  const resolvedSourceOrder: number | null =
+    explicitOrder > 0
+      ? Math.floor(explicitOrder)
+      : (prevOrder > 0 ? Math.floor(prevOrder) : (seqFallback > 0 ? Math.floor(seqFallback) : null));
+
   const record: Record<string, any> = {
     id: resId,
     sourceReservationId: srcResId,
@@ -400,6 +414,7 @@ function normalizeIncomingReservation(
     hasProblem: existingClient ? boolVal(existingClient.hasProblem) : boolVal(merged.hasProblem),
     createdAt: existingClient?.createdAt || str(merged.createdAt) || nowIso,
     updatedAt: nowIso,
+    sourceOrder: resolvedSourceOrder,
     statusHistory: nextStatusHistory,
     rawJson: str(merged.rawJson) || JSON.stringify(raw).slice(0, 8000)
   };
@@ -524,7 +539,9 @@ export async function ingestIncrementalSyncBatch(
       const resDedupMap = new Map<string, Record<string, any>>();
       const historyBatch: Record<string, any>[] = [];
 
+      let seqIdx = 0;
       for (const raw of incomingRes) {
+        seqIdx++;
         const resNum = str(crmCore.extractReservationNumber(raw));
         if (!resNum) continue;
         const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
@@ -547,7 +564,7 @@ export async function ingestIncrementalSyncBatch(
           }
         }
 
-        const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt);
+        const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt, seqIdx);
         resDedupMap.set(record.reservationNumber, record);
         if (followUpHistoryEntry) historyBatch.push(followUpHistoryEntry);
       }
@@ -568,7 +585,7 @@ export async function ingestIncrementalSyncBatch(
              base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
              internal_status, priority, assigned_employee_ids, assigned_employee_names,
              last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
-             has_problem, created_at, updated_at, status_history, raw_json
+             has_problem, created_at, updated_at, status_history, raw_json, source_order
            )
            SELECT * FROM unnest(
              $1::text[], $2::text[], $3::text[], $4::text[],
@@ -581,7 +598,7 @@ export async function ingestIncrementalSyncBatch(
              $35::numeric[], $36::int4[], $37::numeric[], $38::numeric[], $39::boolean[],
              $40::text[], $41::text[], $42::jsonb[], $43::jsonb[],
              $44::text[], $45::text[], $46::text[], $47::text[],
-             $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[]
+             $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[], $53::int4[]
            )
            ON CONFLICT (reservation_number) DO UPDATE SET
              source_reservation_id = EXCLUDED.source_reservation_id,
@@ -632,7 +649,8 @@ export async function ingestIncrementalSyncBatch(
              has_problem = EXCLUDED.has_problem,
              updated_at = EXCLUDED.updated_at,
              status_history = EXCLUDED.status_history,
-             raw_json = EXCLUDED.raw_json
+             raw_json = EXCLUDED.raw_json,
+             source_order = COALESCE(EXCLUDED.source_order, reservations.source_order)
            RETURNING (xmax = 0) AS inserted`,
           [
             chunk.map((r) => r.id),
@@ -686,7 +704,8 @@ export async function ingestIncrementalSyncBatch(
             chunk.map((r) => r.createdAt),
             chunk.map((r) => r.updatedAt),
             chunk.map((r) => JSON.stringify(r.statusHistory)),
-            chunk.map((r) => r.rawJson)
+            chunk.map((r) => r.rawJson),
+            chunk.map((r) => (r.sourceOrder && Number(r.sourceOrder) > 0 ? Math.floor(Number(r.sourceOrder)) : null))
           ]
         );
 
@@ -708,6 +727,17 @@ export async function ingestIncrementalSyncBatch(
           if (genuinelyChanged) {
             mutatedReservations.push(clientRes);
           }
+        }
+      }
+
+      if (payload?.isFullSnapshot === true && reservationBatch.length > 0) {
+        const liveResNums = reservationBatch.map((r) => str(r.reservationNumber)).filter(Boolean);
+        if (liveResNums.length > 0) {
+          await tx.query(
+            `UPDATE reservations SET source_order = NULL
+             WHERE source_order IS NOT NULL AND reservation_number <> ALL($1::text[])`,
+            [liveResNums]
+          );
         }
       }
 
@@ -1289,7 +1319,10 @@ export async function pullFromRentalGateDirect(
   }
   const excludedSet = new Set(excludedStatuses.map((s) => str(s).toLowerCase()));
 
-  const dedupedAllRes = crmCore.dedupeReservationsByNumber(resPaged.items);
+  const dedupedAllRes = crmCore.dedupeReservationsByNumber(resPaged.items).map((item: any, idx: number) => ({
+    ...item,
+    __sourceOrder: idx + 1
+  }));
   const afterExcludedRes = dedupedAllRes.filter((item: any) => {
     const code = str(item.reservationStatus || item.status || item.status_code).toLowerCase();
     return !excludedSet.has(code);
@@ -1308,6 +1341,7 @@ export async function pullFromRentalGateDirect(
     actor,
     pagesFetched: resPaged.pages + extPaged.pages,
     appliedRange,
+    isFullSnapshot: !appliedRange?.hasCustomRange,
     reservations: filteredRes,
     extensions: dedupedExt
   });

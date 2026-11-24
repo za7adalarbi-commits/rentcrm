@@ -152,6 +152,31 @@
     });
   }
 
+  function sortCachedReservationsBySourceOrder(list) {
+    if (!Array.isArray(list) || list.length <= 1) return Array.isArray(list) ? list : [];
+    return list.map(function (item, idx) {
+      return { item: item, idx: idx };
+    }).sort(function (a, b) {
+      var ra = a.item || {};
+      var rb = b.item || {};
+      var sa = (ra.sourceOrder !== undefined && ra.sourceOrder !== null && ra.sourceOrder !== '') ? Number(ra.sourceOrder) : NaN;
+      var sb = (rb.sourceOrder !== undefined && rb.sourceOrder !== null && rb.sourceOrder !== '') ? Number(rb.sourceOrder) : NaN;
+      var validA = isFinite(sa) && sa > 0;
+      var validB = isFinite(sb) && sb > 0;
+      if (validA && validB) return sa !== sb ? (sa - sb) : (a.idx - b.idx);
+      if (validA && !validB) return -1;
+      if (!validA && validB) return 1;
+      var ca = (ra._cacheSeq !== undefined && ra._cacheSeq !== null) ? Number(ra._cacheSeq) : NaN;
+      var cb = (rb._cacheSeq !== undefined && rb._cacheSeq !== null) ? Number(rb._cacheSeq) : NaN;
+      var hasCa = isFinite(ca) && ca >= 0;
+      var hasCb = isFinite(cb) && cb >= 0;
+      if (hasCa && hasCb) return ca !== cb ? (ca - cb) : (a.idx - b.idx);
+      if (hasCa && !hasCb) return -1;
+      if (!hasCa && hasCb) return 1;
+      return a.idx - b.idx;
+    }).map(function (entry) { return entry.item; });
+  }
+
   async function loadMeta(ns) {
     var cleanNs = String(ns || 'default');
     var db = await open();
@@ -176,7 +201,7 @@
     if (!db) {
       return {
         kvEntries: Object.values(_memFallback.kv_cache).filter(function (x) { return x && x.ns === cleanNs; }),
-        reservations: Object.values(_memFallback.reservations).filter(function (x) { return x && x.ns === cleanNs; }),
+        reservations: sortCachedReservationsBySourceOrder(Object.values(_memFallback.reservations).filter(function (x) { return x && x.ns === cleanNs; })),
         customers: Object.values(_memFallback.customers).filter(function (x) { return x && x.ns === cleanNs; }),
         details: Object.values(_memFallback.reservation_details).filter(function (x) { return x && x.ns === cleanNs; }),
         meta: _memFallback.meta[cleanNs] || null
@@ -203,7 +228,7 @@
           if (arr[4]) _memFallback.meta[cleanNs] = arr[4];
           resolve({
             kvEntries: arr[0],
-            reservations: arr[1],
+            reservations: sortCachedReservationsBySourceOrder(arr[1]),
             customers: arr[2],
             details: arr[3],
             meta: arr[4]
@@ -291,9 +316,17 @@
     var list = Array.isArray(reservations) ? reservations : [];
     if (!list.length) return true;
     var records = list.filter(function (r) { return r && r.id; }).map(function (r) {
-      var rec = Object.assign({}, r, { ns: cleanNs, nsId: makeNsId(cleanNs, r.id) });
-      _memFallback.reservations[rec.nsId] = rec;
-      return rec;
+      var nsId = makeNsId(cleanNs, r.id);
+      var prev = _memFallback.reservations[nsId];
+      var base = Object.assign({}, prev || {}, r, { ns: cleanNs, nsId: nsId });
+      if (r.sourceOrder === undefined && prev && prev.sourceOrder !== undefined) {
+        base.sourceOrder = prev.sourceOrder;
+      }
+      if (r._cacheSeq === undefined && prev && prev._cacheSeq !== undefined) {
+        base._cacheSeq = prev._cacheSeq;
+      }
+      _memFallback.reservations[nsId] = base;
+      return base;
     });
     return runWriteBatch([STORES.RESERVATIONS], function (tx) {
       if (!tx) return;
@@ -306,8 +339,8 @@
     var cleanNs = String(ns || 'default');
     var resList = Array.isArray(reservations) ? reservations : [];
     var custList = Array.isArray(customers) ? customers : [];
-    var resRecords = resList.filter(function (r) { return r && r.id; }).map(function (r) {
-      return Object.assign({}, r, { ns: cleanNs, nsId: makeNsId(cleanNs, r.id) });
+    var resRecords = resList.filter(function (r) { return r && r.id; }).map(function (r, idx) {
+      return Object.assign({}, r, { ns: cleanNs, nsId: makeNsId(cleanNs, r.id), _cacheSeq: idx });
     });
     var custRecords = custList.filter(function (c) { return c && c.id; }).map(function (c) {
       return Object.assign({}, c, { ns: cleanNs, nsId: makeNsId(cleanNs, c.id) });

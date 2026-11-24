@@ -24,15 +24,16 @@ function getReservations(session, params) {
   var timeFrom = normalizeStr(p.timeFrom);
   var timeTo = normalizeStr(p.timeTo);
   var overdueUnpaidOnly = toBool(p.overdueUnpaidOnly);
-  var sortBy = normalizeStr(p.sortBy) || 'lastUpdatedAt';
-  var sortDir = normalizeStr(p.sortDir) === 'asc' ? 1 : -1;
+  var sortBy = normalizeStr(p.sortBy) || 'sourceOrder';
+  var sortDirStr = normalizeStr(p.sortDir);
+  var sortDir = sortDirStr ? (sortDirStr === 'asc' ? 1 : -1) : (sortBy === 'sourceOrder' ? 1 : -1);
   var page = Math.max(1, toNumber(p.page, 1));
   var pageSize = Math.min(200, Math.max(1, toNumber(p.pageSize, 25)));
 
   var isDefaultQuery = !search && !reservationNumberQuery && !company && !branch && !status && !employeeId && !priority &&
     !dateFrom && !dateTo && !unfollowedOnly && !hasProblemsOnly && !hasExtensions &&
     !timeFrom && !timeTo && !overdueUnpaidOnly &&
-    page === 1 && sortBy === 'lastUpdatedAt' && sortDir === -1;
+    page === 1 && sortBy === 'sourceOrder' && sortDir === 1;
 
   var resVer = getCacheVersion_('RES');
   var fuVer = getCacheVersion_('FU');
@@ -170,16 +171,39 @@ function getReservations(session, params) {
     putCompressedJsonCache_(facetsKey, cachedFacets, 600);
   }
 
-  var numericSort = (sortBy === 'daysCount' || sortBy === 'extendedDaysCount' || sortBy === 'totalDaysCount' || sortBy === 'extensionsCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
-  matched.sort(function (a, b) {
-    if (numericSort) {
-      return (toNumber(a[sortBy], 0) - toNumber(b[sortBy], 0)) * sortDir;
+  if (sortBy === 'sourceOrder') {
+    var hasAnySrcOrd = matched.some(function (x) {
+      return x && x.sourceOrder !== undefined && x.sourceOrder !== null && x.sourceOrder !== '' && Number(x.sourceOrder) > 0;
+    });
+    if (hasAnySrcOrd) {
+      var wrappedSrc = matched.map(function (item, idx) { return { item: item, idx: idx }; });
+      wrappedSrc.sort(function (a, b) {
+        var oa = Number(a.item.sourceOrder);
+        var ob = Number(b.item.sourceOrder);
+        var va = (!isNaN(oa) && oa > 0) ? oa : null;
+        var vb = (!isNaN(ob) && ob > 0) ? ob : null;
+        if (va !== null && vb !== null) {
+          if (va !== vb) return (va - vb) * sortDir;
+          return a.idx - b.idx;
+        }
+        if (va !== null) return -1;
+        if (vb !== null) return 1;
+        return a.idx - b.idx;
+      });
+      matched = wrappedSrc.map(function (w) { return w.item; });
     }
-    var sa = String(a[sortBy] || '');
-    var sb = String(b[sortBy] || '');
-    if (sa === sb) return 0;
-    return (sa < sb ? -1 : 1) * sortDir;
-  });
+  } else {
+    var numericSort = (sortBy === 'daysCount' || sortBy === 'extendedDaysCount' || sortBy === 'totalDaysCount' || sortBy === 'extensionsCount' || sortBy === 'baseAmount' || sortBy === 'extensionsAmount' || sortBy === 'totalAmount');
+    matched.sort(function (a, b) {
+      if (numericSort) {
+        return (toNumber(a[sortBy], 0) - toNumber(b[sortBy], 0)) * sortDir;
+      }
+      var sa = String(a[sortBy] || '');
+      var sb = String(b[sortBy] || '');
+      if (sa === sb) return 0;
+      return (sa < sb ? -1 : 1) * sortDir;
+    });
+  }
 
   var total = matched.length;
   var startIdx = (page - 1) * pageSize;

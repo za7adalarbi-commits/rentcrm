@@ -1225,23 +1225,27 @@ export async function getReservations(
     originalStatusAr: 'r.original_status_ar',
     internalStatus: 'r.internal_status',
     priority: 'r.priority',
-    lastUpdatedByName: 'r.last_updated_by_name'
+    lastUpdatedByName: 'r.last_updated_by_name',
+    sourceOrder: 'r.source_order'
   };
 
-  let orderSql = 'r.updated_at DESC, r.start_date DESC, r.id DESC';
+  let orderSql = 'r.source_order ASC NULLS LAST';
   const rawSortBy = str(payload.sortBy);
+  const hasExplicitSortDir = str(payload.sortDir).length > 0;
   const rawSortDir = str(payload.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
-  if (rawSortBy === 'startDate_desc') {
-    orderSql = 'r.start_date DESC, r.updated_at DESC, r.id DESC';
+  if (!rawSortBy || rawSortBy === 'sourceOrder') {
+    orderSql = (rawSortBy === 'sourceOrder' && hasExplicitSortDir && rawSortDir === 'DESC')
+      ? 'r.source_order DESC NULLS LAST'
+      : 'r.source_order ASC NULLS LAST';
+  } else if (rawSortBy === 'startDate_desc') {
+    orderSql = 'r.start_date DESC, r.source_order ASC NULLS LAST, r.id DESC';
   } else if (rawSortBy === 'startDate_asc') {
-    orderSql = 'r.start_date ASC, r.updated_at DESC, r.id DESC';
+    orderSql = 'r.start_date ASC, r.source_order ASC NULLS LAST, r.id DESC';
   } else if (rawSortBy === 'totalAmount_desc') {
-    orderSql = 'r.total_amount DESC, r.updated_at DESC, r.id DESC';
-  } else if (rawSortBy && RESERVATION_SORT_COLUMNS[rawSortBy]) {
+    orderSql = 'r.total_amount DESC, r.source_order ASC NULLS LAST, r.id DESC';
+  } else if (RESERVATION_SORT_COLUMNS[rawSortBy]) {
     const col = RESERVATION_SORT_COLUMNS[rawSortBy];
-    orderSql = col === 'r.updated_at'
-      ? `${col} ${rawSortDir}, r.start_date DESC, r.id DESC`
-      : `${col} ${rawSortDir}, r.updated_at DESC, r.id DESC`;
+    orderSql = `${col} ${rawSortDir}, r.source_order ASC NULLS LAST, r.id DESC`;
   }
 
   const page = Math.max(1, num(payload.page, 1));
@@ -1289,8 +1293,10 @@ export async function getReservations(
       overdueUnpaidOnly,
       extensionsByResId: extByResId,
       nowMs: Date.now(),
-      sortBy: rawSortBy || 'lastUpdatedAt',
-      sortDir: rawSortDir === 'ASC' ? 'asc' : 'desc'
+      sortBy: rawSortBy || 'sourceOrder',
+      sortDir: (!rawSortBy || rawSortBy === 'sourceOrder')
+        ? ((rawSortBy === 'sourceOrder' && hasExplicitSortDir && rawSortDir === 'DESC') ? 'desc' : 'asc')
+        : (rawSortDir === 'ASC' ? 'asc' : 'desc')
     }, { role: session.user.role, employeeId: session.user.id, allowAgentViewAll: true, user: session.user });
 
     const total = filtered.length;
@@ -1366,11 +1372,11 @@ export async function syncLocalCache(
               r.internal_status, r.priority, r.assigned_employee_ids, r.assigned_employee_names,
               r.last_update_text, r.last_updated_by_id, r.last_updated_by_name, r.last_updated_at,
               r.has_problem, r.pinned_note, r.pinned_note_by_id, r.pinned_note_by_name, r.pinned_note_updated_at, r.no_answer_count,
-              r.created_at, r.updated_at, r.status_history,
+              r.created_at, r.updated_at, r.source_order, r.status_history,
               EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
        ${resWhere}
-       ORDER BY r.updated_at DESC
+       ORDER BY r.source_order ASC NULLS LAST
        LIMIT $1`,
       resParams
     ),
@@ -2397,7 +2403,7 @@ export async function getMyFollowUps(executor: DbExecutor, session: AuthSession,
       `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
        WHERE r.assigned_employee_ids @> $1::jsonb
-       ORDER BY r.updated_at DESC
+       ORDER BY r.source_order ASC NULLS LAST, r.updated_at DESC
        LIMIT 500`,
       [JSON.stringify([session.user.id])]
     ),
@@ -2863,7 +2869,7 @@ export async function getEmployeeDetails(executor: DbExecutor, session: AuthSess
        FROM reservations r
        WHERE r.assigned_employee_ids @> $1::jsonb
           OR EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id AND fu.employee_id = $2)
-       ORDER BY r.updated_at DESC
+       ORDER BY r.source_order ASC NULLS LAST, r.updated_at DESC
        LIMIT 250`,
       [empIdJson, empId]
     ),
@@ -4081,7 +4087,7 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
       }
 
       const resRows = await executor.query(
-        `SELECT * FROM reservations r ${where} ORDER BY r.updated_at DESC LIMIT 2000`,
+        `SELECT * FROM reservations r ${where} ORDER BY r.source_order ASC NULLS LAST LIMIT 2000`,
         params
       );
       return {

@@ -43,12 +43,13 @@
               unfollowedOnly: Boolean(r.unfollowedOnly),
               hasProblemsOnly: Boolean(r.hasProblemsOnly),
               overdueUnpaidOnly: Boolean(r.overdueUnpaidOnly),
-              sortBy: r.sortBy || 'lastUpdatedAt',
-              sortDir: r.sortDir === 'asc' ? 'asc' : 'desc',
+              sortBy: r.sortBy || 'sourceOrder',
+              sortDir: (!r.sortBy || r.sortBy === 'sourceOrder') ? (r.sortDir === 'desc' ? 'desc' : 'asc') : (r.sortDir === 'asc' ? 'asc' : 'desc'),
               page: Math.max(1, Number(r.page || 1)),
               pageSize: Math.max(1, Number(r.pageSize || 20))
             };
         payload.filters.reservations = Object.assign(resFilters, {
+          explicitSort: Boolean(r.explicitSort),
           viewMode: r.viewMode || 'all',
           radarFilter: r.radarFilter || 'all',
           radarSearch: r.radarSearch || '',
@@ -112,7 +113,12 @@
         state.dashboard = Object.assign({ range: '30d', dateFrom: '', dateTo: '' }, f.dashboard);
       }
       if (f.reservations && typeof f.reservations === 'object' && !state.reservations) {
-        state.reservations = Object.assign({}, f.reservations);
+        var restoredResFilters = Object.assign({}, f.reservations);
+        if (!restoredResFilters.sortBy || (restoredResFilters.sortBy === 'lastUpdatedAt' && !restoredResFilters.explicitSort)) {
+          restoredResFilters.sortBy = 'sourceOrder';
+          restoredResFilters.sortDir = 'asc';
+        }
+        state.reservations = restoredResFilters;
       }
       if (f.problems && typeof f.problems === 'object' && !state.problems) {
         state.problems = Object.assign({ status: '', priority: '', employeeId: '', search: '' }, f.problems);

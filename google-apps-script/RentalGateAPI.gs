@@ -423,6 +423,7 @@ function serializeReservationForClient_(sr, isFollowedFlag) {
     noAnswerCount: Math.max(0, Math.floor(toNumber(sr.noAnswerCount, 0))),
     createdAt: sr.createdAt || '',
     updatedAt: sr.updatedAt || '',
+    sourceOrder: (sr.sourceOrder !== undefined && sr.sourceOrder !== null && sr.sourceOrder !== '' && Number(sr.sourceOrder) > 0) ? Math.floor(Number(sr.sourceOrder)) : null,
     statusHistory: normalizeStatusHistory_(sr.statusHistory),
     isFollowed: Boolean(isFollowedFlag)
   };
@@ -604,9 +605,15 @@ function runRentalGateSyncInternal(actor, options) {
         }
       }
 
-      // 2. Apply Manager custom pull date filter (if requested), deduplicate, preserve & advance statusHistory
-      var rawFetchedCount = parallelFetch.reservations.length;
-      var resItems = filterSourceReservationsByPullRange_(parallelFetch.reservations, appliedRange);
+      // 2. Preserve authoritative Rental Gate source sequence (1-based) BEFORE any range filtering
+      var rawFetchedList = Array.isArray(parallelFetch.reservations) ? parallelFetch.reservations : [];
+      var rawFetchedCount = rawFetchedList.length;
+      for (var seqI = 0; seqI < rawFetchedList.length; seqI++) {
+        if (rawFetchedList[seqI] && typeof rawFetchedList[seqI] === 'object') {
+          rawFetchedList[seqI].__sourceOrder = seqI + 1;
+        }
+      }
+      var resItems = filterSourceReservationsByPullRange_(rawFetchedList, appliedRange);
       var rangeFilteredCount = Math.max(0, rawFetchedCount - resItems.length);
       var excludedFilteredCount = 0;
 
@@ -865,7 +872,10 @@ function runRentalGateSyncInternal(actor, options) {
           createdAt: existing ? existing.createdAt : nowStr,
           updatedAt: nowStr,
           statusHistory: JSON.stringify(nextStatusHistory),
-          rawJson: JSON.stringify(item).substring(0, 4000)
+          rawJson: JSON.stringify(item).substring(0, 4000),
+          sourceOrder: (item.__sourceOrder && Number(item.__sourceOrder) > 0)
+            ? Math.floor(Number(item.__sourceOrder))
+            : ((existing && existing.sourceOrder && Number(existing.sourceOrder) > 0) ? Math.floor(Number(existing.sourceOrder)) : (i + 1))
         };
 
         resRecordsToUpsert.push(resPayload);

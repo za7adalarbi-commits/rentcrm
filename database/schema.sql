@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS reservations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
-  raw_json TEXT NOT NULL DEFAULT ''
+  raw_json TEXT NOT NULL DEFAULT '',
+  source_order INTEGER
 );
 
 -- 4. Extensions (mirrors RG_SHEETS.EXTENSIONS — 23 columns)
@@ -364,6 +365,7 @@ CREATE TABLE IF NOT EXISTS error_logs (
 -- Performance Indexes for 100,000+ Reservations & Fast Faceted Queries
 -- ============================================================================
 
+CREATE INDEX IF NOT EXISTS idx_reservations_source_order ON reservations (source_order ASC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_reservations_updated_at_desc ON reservations (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reservations_created_at_desc ON reservations (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reservations_start_date ON reservations (start_date DESC);

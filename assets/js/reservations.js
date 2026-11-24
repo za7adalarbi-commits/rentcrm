@@ -214,7 +214,7 @@
       search: '', reservationNumber: '', company: '', branch: '', status: '', employeeId: '', priority: '',
       dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '',
       unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false,
-      sortBy: 'lastUpdatedAt', sortDir: 'desc', page: 1, pageSize: 20,
+      sortBy: 'sourceOrder', sortDir: 'asc', explicitSort: false, page: 1, pageSize: 20,
       visibleCols: defaultCols,
       selectedResIds: {},
       viewMode: 'all',
@@ -865,6 +865,7 @@
           var col = th.getAttribute('data-sort');
           if (state.sortBy === col) state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
           else { state.sortBy = col; state.sortDir = 'desc'; }
+          state.explicitSort = true;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           refreshTableRegion();
         });
@@ -1476,7 +1477,7 @@
     });
 
     document.getElementById('res-reset-filters').addEventListener('click', function () {
-      Object.assign(state, { search: '', reservationNumber: '', company: '', branch: '', status: '', employeeId: '', priority: '', dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '', unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false, page: 1 });
+      Object.assign(state, { search: '', reservationNumber: '', company: '', branch: '', status: '', employeeId: '', priority: '', dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '', unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false, sortBy: 'sourceOrder', sortDir: 'asc', explicitSort: false, page: 1 });
       document.getElementById('res-search').value = '';
       var resNumResetEl = document.getElementById('res-number-search');
       if (resNumResetEl) resNumResetEl.value = '';

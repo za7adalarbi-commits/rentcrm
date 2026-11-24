@@ -651,15 +651,36 @@
             }
           });
           if (Array.isArray(snap.reservations) && snap.reservations.length > 0) {
+            var orderedSnapRes = snap.reservations.map(function (item, idx) {
+              return { item: item, idx: idx };
+            }).sort(function (a, b) {
+              var ra = a.item || {};
+              var rb = b.item || {};
+              var sa = (ra.sourceOrder !== undefined && ra.sourceOrder !== null && ra.sourceOrder !== '') ? Number(ra.sourceOrder) : NaN;
+              var sb = (rb.sourceOrder !== undefined && rb.sourceOrder !== null && rb.sourceOrder !== '') ? Number(rb.sourceOrder) : NaN;
+              var validA = isFinite(sa) && sa > 0;
+              var validB = isFinite(sb) && sb > 0;
+              if (validA && validB) return sa !== sb ? (sa - sb) : (a.idx - b.idx);
+              if (validA && !validB) return -1;
+              if (!validA && validB) return 1;
+              var ca = (ra._cacheSeq !== undefined && ra._cacheSeq !== null) ? Number(ra._cacheSeq) : NaN;
+              var cb = (rb._cacheSeq !== undefined && rb._cacheSeq !== null) ? Number(rb._cacheSeq) : NaN;
+              var hasCa = isFinite(ca) && ca >= 0;
+              var hasCb = isFinite(cb) && cb >= 0;
+              if (hasCa && hasCb) return ca !== cb ? (ca - cb) : (a.idx - b.idx);
+              if (hasCa && !hasCb) return -1;
+              if (!hasCa && hasCb) return 1;
+              return a.idx - b.idx;
+            }).map(function (entry) { return entry.item; });
             var byId = {};
             var byNum = {};
-            snap.reservations.forEach(function (r) {
+            orderedSnapRes.forEach(function (r) {
               if (!r || !r.id) return;
               byId[r.id] = r;
               if (r.reservationNumber) byNum[r.reservationNumber] = r;
             });
             var snapUpdatedAt = Number((snap.meta && snap.meta.updatedAt) || 0);
-            localReservationsByNs[ns] = { list: snap.reservations, byId: byId, byNumber: byNum, updatedAt: snapUpdatedAt };
+            localReservationsByNs[ns] = { list: orderedSnapRes, byId: byId, byNumber: byNum, updatedAt: snapUpdatedAt };
           }
           if (Array.isArray(snap.customers) && snap.customers.length > 0) {
             localCustomersByNs[ns] = snap.customers;

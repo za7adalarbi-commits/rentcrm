@@ -1117,7 +1117,7 @@ test('filterReservations and resolvePullDateRange support end-date-only filterin
   ];
   // Standalone dateTo without dateFrom returns only reservations ending on that exact date
   const endOnlyFiltered = core.filterReservations(reservations, [], { dateFrom: '', dateTo: '2026-11-18' });
-  assert.deepEqual(endOnlyFiltered.map((r: any) => r.id), ['R3', 'R1']);
+  assert.deepEqual(endOnlyFiltered.map((r: any) => r.id), ['R1', 'R3']);
 
   // Extended reservation matches its effective extended end date
   const extEndFiltered = core.filterReservations(reservations, [], { dateFrom: '', dateTo: '2026-11-22' });
@@ -1125,7 +1125,7 @@ test('filterReservations and resolvePullDateRange support end-date-only filterin
 
   // Range with both dateFrom and dateTo still filters startDate within [dateFrom, dateTo]
   const rangeFiltered = core.filterReservations(reservations, [], { dateFrom: '2026-11-12', dateTo: '2026-11-18' });
-  assert.deepEqual(rangeFiltered.map((r: any) => r.id), ['R4', 'R3', 'R2']);
+  assert.deepEqual(rangeFiltered.map((r: any) => r.id), ['R2', 'R3', 'R4']);
 
   const endOnlyPull = core.resolvePullDateRange({ preset: 'custom', dateFrom: '', dateTo: '2026-11-18' }, '2026-11-22');
   assert.equal(endOnlyPull.hasCustomRange, true);

@@ -191,6 +191,8 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
            ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_name TEXT NOT NULL DEFAULT '';
            ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_updated_at TEXT NOT NULL DEFAULT '';
            ALTER TABLE reservations ADD COLUMN IF NOT EXISTS no_answer_count INTEGER NOT NULL DEFAULT 0;
+           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS source_order INTEGER;
+           CREATE INDEX IF NOT EXISTS idx_reservations_source_order ON reservations (source_order ASC NULLS LAST);
            ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
            ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '[]'::jsonb;
            CREATE TABLE IF NOT EXISTS shift_announcements (

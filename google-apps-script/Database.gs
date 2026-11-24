@@ -28,7 +28,7 @@ var RG_SHEETS_SCHEMA = {
     'internalStatus', 'priority', 'assignedEmployeeIds', 'assignedEmployeeNames',
     'lastUpdateText', 'lastUpdatedById', 'lastUpdatedByName', 'lastUpdatedAt',
     'hasProblem', 'pinnedNote', 'pinnedNoteById', 'pinnedNoteByName', 'pinnedNoteUpdatedAt', 'noAnswerCount',
-    'createdAt', 'updatedAt', 'statusHistory', 'rawJson'
+    'createdAt', 'updatedAt', 'statusHistory', 'rawJson', 'sourceOrder'
   ],
   Extensions: [
     'id', 'extensionNumber', 'sequenceNumber', 'reservationId', 'reservationNumber',

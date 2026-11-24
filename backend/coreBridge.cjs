@@ -1083,11 +1083,18 @@
     var receiveBranch = normalizeStr(apiItem.receiveBranchArName || apiItem.receiveBranchEnName || apiItem.branch_name || (apiItem.branch && apiItem.branch.name) || '');
     var deliverBranch = normalizeStr(apiItem.deliverBranchArName || apiItem.deliverBranchEnName || apiItem.returnBranchName || receiveBranch);
     var sourceCreatedRaw = apiItem.reservationDate || apiItem.createdAt || apiItem.created_at || '';
+    var rawSeq = apiItem.sourceOrder !== undefined ? apiItem.sourceOrder : (apiItem.__sourceOrder !== undefined ? apiItem.__sourceOrder : apiItem.source_order);
+    var parsedSeq = (rawSeq !== undefined && rawSeq !== null && rawSeq !== '') ? Number(rawSeq) : NaN;
+    var existingSeq = (existing && existing.sourceOrder !== undefined && existing.sourceOrder !== null && existing.sourceOrder !== '') ? Number(existing.sourceOrder) : NaN;
+    var resolvedSourceOrder = (isFinite(parsedSeq) && parsedSeq > 0)
+      ? Math.floor(parsedSeq)
+      : ((isFinite(existingSeq) && existingSeq > 0) ? Math.floor(existingSeq) : null);
 
     return {
       id: existing ? existing.id : ('RES_' + resNumber),
       sourceReservationId: resApiId || resNumber,
       reservationNumber: resNumber,
+      sourceOrder: resolvedSourceOrder,
       sourceCreatedAt: formatDisplayDateTime(sourceCreatedRaw) || normalizeStr(sourceCreatedRaw),
       customerName: normalizeStr(apiItem.clientName || apiItem.customer_name || (apiItem.customer && apiItem.customer.name) || 'عميل'),
       customerPhone: normalizeStr(apiItem.clientMobile || apiItem.customer_phone || (apiItem.customer && (apiItem.customer.phone || apiItem.customer.mobile)) || ''),
@@ -1210,12 +1217,42 @@
     for (var j = 0; j < inc.length; j++) {
       var item = inc[j];
       if (!item || !item.id) continue;
-      if (!Object.prototype.hasOwnProperty.call(map, item.id)) {
+      var hadExisting = Object.prototype.hasOwnProperty.call(map, item.id);
+      if (!hadExisting) {
         order.push(item.id);
       }
-      map[item.id] = Object.assign({}, map[item.id] || {}, item);
+      var merged = Object.assign({}, map[item.id] || {}, item);
+      var rawIncSeq = item.sourceOrder !== undefined ? item.sourceOrder : item.source_order;
+      var incSeq = (rawIncSeq !== undefined && rawIncSeq !== null && rawIncSeq !== '') ? Number(rawIncSeq) : NaN;
+      var rawPrevSeq = hadExisting ? map[item.id].sourceOrder : undefined;
+      var prevSeq = (rawPrevSeq !== undefined && rawPrevSeq !== null && rawPrevSeq !== '') ? Number(rawPrevSeq) : NaN;
+      if (isFinite(incSeq) && incSeq > 0) {
+        merged.sourceOrder = Math.floor(incSeq);
+      } else if (isFinite(prevSeq) && prevSeq > 0) {
+        merged.sourceOrder = Math.floor(prevSeq);
+      }
+      map[item.id] = merged;
     }
-    return order.map(function (id) { return map[id]; });
+    var result = order.map(function (id, idx) {
+      return { rec: map[id], idx: idx };
+    });
+    var hasSourceOrder = result.some(function (entry) {
+      var seq = Number(entry.rec && entry.rec.sourceOrder);
+      return isFinite(seq) && seq > 0;
+    });
+    if (hasSourceOrder) {
+      result.sort(function (a, b) {
+        var sa = Number(a.rec && a.rec.sourceOrder);
+        var sb = Number(b.rec && b.rec.sourceOrder);
+        var validA = isFinite(sa) && sa > 0;
+        var validB = isFinite(sb) && sb > 0;
+        if (validA && validB) return sa !== sb ? (sa - sb) : (a.idx - b.idx);
+        if (validA && !validB) return -1;
+        if (!validA && validB) return 1;
+        return a.idx - b.idx;
+      });
+    }
+    return result.map(function (entry) { return entry.rec; });
   }
 
   var DASHBOARD_PERMISSION_KEYS = [
@@ -2020,8 +2057,32 @@
       out.push(Object.assign({}, r, { isFollowed: resolvedFollowed }));
     }
 
-    var sortBy = f.sortBy || 'lastUpdatedAt';
-    var sortDir = f.sortDir === 'asc' ? 1 : -1;
+    var rawSortBy = normalizeStr(f.sortBy);
+    if (!rawSortBy || rawSortBy === 'sourceOrder') {
+      var hasSourceOrder = out.some(function (item) {
+        var seq = Number(item && item.sourceOrder);
+        return isFinite(seq) && seq > 0;
+      });
+      if (hasSourceOrder) {
+        var seqDir = (rawSortBy === 'sourceOrder' && normalizeStr(f.sortDir).toLowerCase() === 'desc') ? -1 : 1;
+        out = out.map(function (item, idx) {
+          return { item: item, idx: idx };
+        }).sort(function (a, b) {
+          var sa = Number(a.item && a.item.sourceOrder);
+          var sb = Number(b.item && b.item.sourceOrder);
+          var validA = isFinite(sa) && sa > 0;
+          var validB = isFinite(sb) && sb > 0;
+          if (validA && validB) return sa !== sb ? ((sa - sb) * seqDir) : (a.idx - b.idx);
+          if (validA && !validB) return -1;
+          if (!validA && validB) return 1;
+          return a.idx - b.idx;
+        }).map(function (entry) { return entry.item; });
+      }
+      return out;
+    }
+
+    var sortBy = rawSortBy;
+    var sortDir = normalizeStr(f.sortDir).toLowerCase() === 'asc' ? 1 : -1;
     out.sort(function (a, b) {
       var va = a[sortBy];
       var vb = b[sortBy];
@@ -2036,6 +2097,10 @@
     var s = (resState && typeof resState === 'object') ? resState : {};
     var pageNum = Number(s.page || 1);
     var pageSizeNum = Number(s.pageSize || 20);
+    var resolvedSortBy = normalizeStr(s.sortBy) || 'sourceOrder';
+    var resolvedSortDir = resolvedSortBy === 'sourceOrder'
+      ? (normalizeStr(s.sortDir).toLowerCase() === 'desc' ? 'desc' : 'asc')
+      : (normalizeStr(s.sortDir).toLowerCase() === 'asc' ? 'asc' : 'desc');
     return {
       search: normalizeStr(s.search),
       reservationNumber: normalizeStr(s.reservationNumber),
@@ -2052,8 +2117,8 @@
       unfollowedOnly: Boolean(s.unfollowedOnly),
       hasProblemsOnly: Boolean(s.hasProblemsOnly || s.hasProblem),
       overdueUnpaidOnly: Boolean(s.overdueUnpaidOnly),
-      sortBy: normalizeStr(s.sortBy || 'lastUpdatedAt') || 'lastUpdatedAt',
-      sortDir: normalizeStr(s.sortDir) === 'asc' ? 'asc' : 'desc',
+      sortBy: resolvedSortBy,
+      sortDir: resolvedSortDir,
       page: isFinite(pageNum) && pageNum >= 1 ? Math.floor(pageNum) : 1,
       pageSize: isFinite(pageSizeNum) && pageSizeNum >= 1 ? Math.floor(pageSizeNum) : 20
     };
@@ -2105,7 +2170,8 @@
       }
     }
 
-    var mergedPool = [];
+    var updatedBase = [];
+    var newMatching = [];
     var seen = {};
     var removedCount = 0;
     var updatedCount = 0;
@@ -2122,16 +2188,23 @@
       if (seen[cid]) continue;
       seen[cid] = true;
       if (Object.prototype.hasOwnProperty.call(changedById, cid)) {
-        var nextRec = Object.assign({}, cur, changedById[cid]);
+        var chRec = changedById[cid];
+        var nextRec = Object.assign({}, cur, chRec);
+        var rawChSeq = chRec && (chRec.sourceOrder !== undefined ? chRec.sourceOrder : chRec.source_order);
+        var chSeq = (rawChSeq !== undefined && rawChSeq !== null && rawChSeq !== '') ? Number(rawChSeq) : NaN;
+        var curSeq = (cur.sourceOrder !== undefined && cur.sourceOrder !== null && cur.sourceOrder !== '') ? Number(cur.sourceOrder) : NaN;
+        if (!(isFinite(chSeq) && chSeq > 0) && isFinite(curSeq) && curSeq > 0) {
+          nextRec.sourceOrder = Math.floor(curSeq);
+        }
         if (doesReservationMatchFilters(nextRec, followUps, f, userContext)) {
-          mergedPool.push(nextRec);
+          updatedBase.push(nextRec);
           updatedCount++;
         } else {
           removedCount++;
         }
       } else {
         if (doesReservationMatchFilters(cur, followUps, f, userContext)) {
-          mergedPool.push(cur);
+          updatedBase.push(cur);
         } else {
           removedCount++;
         }
@@ -2145,11 +2218,12 @@
       if (delMap[nid] || seen[nid]) continue;
       seen[nid] = true;
       if (doesReservationMatchFilters(chNew, followUps, f, userContext)) {
-        mergedPool.push(chNew);
+        newMatching.push(chNew);
         addedCount++;
       }
     }
 
+    var mergedPool = newMatching.concat(updatedBase);
     var sortedItems = filterReservations(mergedPool, followUps, f, userContext);
     return {
       items: sortedItems,
