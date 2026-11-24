@@ -3012,7 +3012,7 @@
         submitBtn.textContent = isEn ? 'Sign In to System' : 'دخول إلى النظام';
         var rawMsg = (res && res.message) || (isEn ? 'Unable to sign in. Please verify your credentials.' : 'تعذر تسجيل الدخول، يرجى التحقق من البيانات.');
         if (isLive && rawMsg.indexOf('اسم المستخدم أو كلمة المرور غير صحيحة') !== -1) {
-          errEl.textContent = rawMsg + ' تأكد من صحة بيانات الحساب الوظيفي المسجل في صفحة الموظفين (الحساب المبدئي للتهيئة الأولى هو admin / Admin@123).';
+          errEl.textContent = rawMsg + ' لا يوجد حساب مسجّل بهذه البيانات، يرجى التأكد من صحة بيانات الدخول أو التواصل مع المبرمج للتحقق من المشكلة.';
         } else {
           errEl.textContent = rawMsg;
         }
