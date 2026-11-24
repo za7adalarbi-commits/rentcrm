@@ -2912,11 +2912,7 @@
               '</div>' +
             '</div>' +
             '<div class="auth-visual-pillars" aria-label="System Capabilities">' +
-              '<span>' + (isEn ? 'Live Reservations' : 'حجوزات فورية') + '</span>' +
-              '<span class="auth-pillar-sep" aria-hidden="true"></span>' +
-              '<span>' + (isEn ? 'Team Follow-Ups' : 'متابعات الفريق') + '</span>' +
-              '<span class="auth-pillar-sep" aria-hidden="true"></span>' +
-              '<span>' + (isEn ? 'Executive Reports' : 'تقارير تنفيذية') + '</span>' +
+              '<span>' + (isEn ? 'Live Reservations' : 'من أول حجز لآخر مشوار.. بوابة التأجير معك في كل دار') + '</span>' +
             '</div>' +
           '</div>' +
         '</section>' +
