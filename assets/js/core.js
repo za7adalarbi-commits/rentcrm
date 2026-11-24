@@ -182,6 +182,50 @@
     return String(v).trim();
   }
 
+  function normalizeSearchText(v) {
+    if (v === null || v === undefined) return '';
+    return String(v)
+      .replace(/[٠-٩]/g, function (d) { return String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)); })
+      .replace(/[۰-۹]/g, function (d) { return String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)); })
+      .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+      .replace(/[\u0622\u0623\u0625\u0671]/g, '\u0627')
+      .replace(/\u0649/g, '\u064A')
+      .replace(/\u0629/g, '\u0647')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+  }
+
+  function tokenizeSearchQuery(query) {
+    var norm = normalizeSearchText(query);
+    if (!norm) return [];
+    return norm.split(' ').filter(Boolean);
+  }
+
+  function matchesSearchFields(fields, query) {
+    var tokens = tokenizeSearchQuery(query);
+    if (tokens.length === 0) return true;
+    var list = Array.isArray(fields) ? fields : [fields];
+    var normFields = [];
+    for (var i = 0; i < list.length; i++) {
+      var nf = normalizeSearchText(list[i]);
+      if (nf) normFields.push(nf);
+    }
+    if (normFields.length === 0) return false;
+    for (var t = 0; t < tokens.length; t++) {
+      var tok = tokens[t];
+      var hit = false;
+      for (var f = 0; f < normFields.length; f++) {
+        if (normFields[f].indexOf(tok) !== -1) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) return false;
+    }
+    return true;
+  }
+
   function toNum(v, fallback) {
     var n = Number(v);
     return isNaN(n) ? (fallback || 0) : n;
@@ -1896,7 +1940,7 @@
 
   function filterReservations(reservations, followUps, filters, userContext) {
     var f = filters || {};
-    var search = normalizeStr(f.search).toLowerCase();
+    var search = normalizeStr(f.search);
     var followedSet = {};
     if (Array.isArray(followUps)) {
       for (var i = 0; i < followUps.length; i++) {
@@ -1915,17 +1959,16 @@
         if (assignedIds.indexOf(userContext.employeeId) === -1) continue;
       }
 
-      if (search) {
-        var hay = (
-          normalizeStr(r.reservationNumber) + ' ' +
-          normalizeStr(r.customerName) + ' ' +
-          normalizeStr(r.customerPhone) + ' ' +
-          normalizeStr(r.carName) + ' ' +
-          normalizeStr(r.plateNumber) + ' ' +
-          normalizeStr(r.companyName) + ' ' +
-          normalizeStr(r.branchName)
-        ).toLowerCase();
-        if (hay.indexOf(search) === -1) continue;
+      if (search && !matchesSearchFields([
+        r.reservationNumber,
+        r.customerName,
+        r.customerPhone,
+        r.carName,
+        r.plateNumber,
+        r.companyName,
+        r.branchName
+      ], search)) {
+        continue;
       }
 
       if (f.company && r.companyName !== f.company) continue;
@@ -1933,8 +1976,17 @@
       if (f.status && r.internalStatus !== f.status && r.originalStatusAr !== f.status) continue;
       if (f.priority && r.priority !== f.priority) continue;
       if (f.employeeId && assignedIds.indexOf(f.employeeId) === -1) continue;
-      if (f.dateFrom && r.startDate < f.dateFrom) continue;
-      if (f.dateTo && r.startDate > f.dateTo) continue;
+      var fDateFrom = normalizeStr(f.dateFrom).substring(0, 10);
+      var fDateTo = normalizeStr(f.dateTo).substring(0, 10);
+      if (fDateFrom && fDateTo) {
+        var rStartBoth = normalizeStr(r.startDate).substring(0, 10);
+        if (rStartBoth < fDateFrom || rStartBoth > fDateTo) continue;
+      } else if (fDateFrom) {
+        if (normalizeStr(r.startDate).substring(0, 10) < fDateFrom) continue;
+      } else if (fDateTo) {
+        var effEndDay = resolveReservationEffectiveEnd(r).date;
+        if (!effEndDay || effEndDay !== fDateTo) continue;
+      }
       if (f.timeFrom || f.timeTo) {
         var tField = normalizeStr(f.timeField || 'both').toLowerCase();
         var sTime = normalizeStr(r.startTime) || extractTimeOnly(r.startDate);
@@ -2104,7 +2156,7 @@
     var st = normalizeStr(f.status);
     var pr = normalizeStr(f.priority);
     var empId = normalizeStr(f.employeeId);
-    var search = normalizeStr(f.search).toLowerCase();
+    var search = normalizeStr(f.search);
 
     return list.filter(function (p) {
       if (!p || typeof p !== 'object') return false;
@@ -2114,14 +2166,13 @@
         var ids = Array.isArray(p.assignedEmployeeIds) ? p.assignedEmployeeIds : [];
         if (ids.indexOf(empId) === -1) return false;
       }
-      if (search) {
-        var hay = (
-          normalizeStr(p.problemNumber) + ' ' +
-          normalizeStr(p.reservationNumber) + ' ' +
-          normalizeStr(p.customerName) + ' ' +
-          normalizeStr(p.description)
-        ).toLowerCase();
-        if (hay.indexOf(search) === -1) return false;
+      if (search && !matchesSearchFields([
+        p.problemNumber,
+        p.reservationNumber,
+        p.customerName,
+        p.description
+      ], search)) {
+        return false;
       }
       return true;
     });
@@ -2189,22 +2240,21 @@
     var empId = normalizeStr(f.employeeId);
     var st = normalizeStr(f.status);
     var date = normalizeStr(f.date);
-    var search = normalizeStr(f.search).toLowerCase();
+    var search = normalizeStr(f.search);
 
     return list.filter(function (item) {
       if (!item || typeof item !== 'object') return false;
       if (empId && normalizeStr(item.employeeId) !== empId) return false;
       if (st && normalizeStr(item.status) !== st) return false;
       if (date && normalizeStr(item.followUpDate) !== date) return false;
-      if (search) {
-        var hay = (
-          normalizeStr(item.reservationNumber) + ' ' +
-          normalizeStr(item.customerName) + ' ' +
-          normalizeStr(item.employeeName) + ' ' +
-          normalizeStr(item.action) + ' ' +
-          normalizeStr(item.notes)
-        ).toLowerCase();
-        if (hay.indexOf(search) === -1) return false;
+      if (search && !matchesSearchFields([
+        item.reservationNumber,
+        item.customerName,
+        item.employeeName,
+        item.action,
+        item.notes
+      ], search)) {
+        return false;
       }
       return true;
     });
@@ -4618,7 +4668,7 @@
     var list = Array.isArray(reservations) ? reservations : [];
     var opts = options || {};
     var subFilter = normalizeStr(opts.subFilter || 'all').toLowerCase();
-    var search = normalizeStr(opts.search).toLowerCase();
+    var search = normalizeStr(opts.search);
 
     var allMatches = [];
     var critical6hCount = 0;
@@ -4646,16 +4696,18 @@
       if (subFilter === 'soon_24h' && entry.bucket === 'expired_unclosed') return false;
       if (subFilter === 'expired_unclosed' && entry.bucket !== 'expired_unclosed') return false;
       if (search) {
-        var r = entry.reservation;
-        var hay = (
-          normalizeStr(r.reservationNumber) + ' ' +
-          normalizeStr(r.customerName) + ' ' +
-          normalizeStr(r.customerPhone) + ' ' +
-          normalizeStr(r.carName) + ' ' +
-          normalizeStr(r.companyName) + ' ' +
-          normalizeStr(r.branchName)
-        ).toLowerCase();
-        if (hay.indexOf(search) === -1) return false;
+        var r = entry.reservation || {};
+        if (!matchesSearchFields([
+          r.reservationNumber,
+          r.customerName,
+          r.customerPhone,
+          r.carName,
+          r.plateNumber,
+          r.companyName,
+          r.branchName
+        ], search)) {
+          return false;
+        }
       }
       return true;
     });
@@ -5329,7 +5381,7 @@
     var nowDt = new Date(now);
     var todayDate = formatDisplayDate(opts.todayDate) || formatIsoDateParts(nowDt.getFullYear(), nowDt.getMonth() + 1, nowDt.getDate());
     var subFilter = normalizeStr(opts.subFilter || 'all').toLowerCase();
-    var search = normalizeStr(opts.search).toLowerCase();
+    var search = normalizeStr(opts.search);
 
     var allItems = [];
     var pickupCount = 0;
@@ -5405,16 +5457,17 @@
       if ((opts.timeFrom || opts.timeTo) && !isTimeInRange(item.scheduledTime, opts.timeFrom, opts.timeTo)) return false;
       if (search) {
         var r = item.reservation || {};
-        var hay = (
-          normalizeStr(r.reservationNumber) + ' ' +
-          normalizeStr(r.customerName) + ' ' +
-          normalizeStr(r.customerPhone) + ' ' +
-          normalizeStr(r.carName) + ' ' +
-          normalizeStr(r.plateNumber) + ' ' +
-          normalizeStr(r.companyName) + ' ' +
-          normalizeStr(r.branchName)
-        ).toLowerCase();
-        if (hay.indexOf(search) === -1) return false;
+        if (!matchesSearchFields([
+          r.reservationNumber,
+          r.customerName,
+          r.customerPhone,
+          r.carName,
+          r.plateNumber,
+          r.companyName,
+          r.branchName
+        ], search)) {
+          return false;
+        }
       }
       return true;
     });
@@ -7598,14 +7651,15 @@
     });
   }
 
-  var CALL_WRAPUP_OUTCOMES = [
+  var DEFAULT_CALL_WRAPUP_OUTCOMES = [
     {
       key: 'confirmed',
       labelAr: 'تم الرد وتأكيد الحجز',
       labelEn: 'Answered & Confirmed',
       suggestedStatus: 'تم الحجز',
       actionTextAr: 'نتيجة المكالمة: تم الرد وتأكيد الحجز',
-      isNoAnswer: false
+      isNoAnswer: false,
+      variant: 'primary'
     },
     {
       key: 'no_answer',
@@ -7613,7 +7667,8 @@
       labelEn: 'No Answer',
       suggestedStatus: '',
       actionTextAr: 'محاولة اتصال — لم يرد',
-      isNoAnswer: true
+      isNoAnswer: true,
+      variant: 'danger'
     },
     {
       key: 'extending_24h',
@@ -7621,7 +7676,8 @@
       labelEn: 'Extending Within 24 Hours',
       suggestedStatus: 'تم التمديد',
       actionTextAr: 'نتيجة المكالمة: العميل بيمدد خلال 24 ساعة القادمة',
-      isNoAnswer: false
+      isNoAnswer: false,
+      variant: 'primary'
     },
     {
       key: 'returning_on_time',
@@ -7629,7 +7685,8 @@
       labelEn: 'Not Extending — Returning On Time',
       suggestedStatus: 'نشط الآن',
       actionTextAr: 'نتيجة المكالمة: العميل ما بيمدد وبيسلم في الموعد',
-      isNoAnswer: false
+      isNoAnswer: false,
+      variant: 'neutral'
     },
     {
       key: 'callback_later',
@@ -7637,9 +7694,180 @@
       labelEn: 'Call Back Later',
       suggestedStatus: '',
       actionTextAr: 'نتيجة المكالمة: طلب إعادة الاتصال لاحقاً',
-      isNoAnswer: false
+      isNoAnswer: false,
+      variant: 'neutral'
     }
   ];
+
+  var CALL_WRAPUP_OUTCOMES = DEFAULT_CALL_WRAPUP_OUTCOMES.slice();
+
+  function cloneCallWrapupOutcomeItem(item) {
+    var src = (item && typeof item === 'object') ? item : {};
+    var labelAr = normalizeStr(src.labelAr).slice(0, 80);
+    var labelEn = normalizeStr(src.labelEn).slice(0, 80) || labelAr;
+    var rawStatus = normalizeStr(src.suggestedStatus);
+    var suggestedStatus = rawStatus && isValidWorkflowStatus(rawStatus) ? rawStatus : '';
+    var isNoAnswer = Boolean(src.isNoAnswer);
+    var variant = normalizeStr(src.variant).toLowerCase();
+    if (variant !== 'primary' && variant !== 'danger' && variant !== 'neutral') {
+      variant = isNoAnswer ? 'danger' : 'neutral';
+    }
+    var rawKey = normalizeStr(src.key)
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 40);
+    if (!rawKey) {
+      rawKey = 'sc_' + Math.random().toString(36).slice(2, 8);
+    }
+    var actionTextAr = normalizeStr(src.actionTextAr).slice(0, 140) || ('نتيجة المكالمة: ' + labelAr);
+    return {
+      key: rawKey,
+      labelAr: labelAr,
+      labelEn: labelEn,
+      suggestedStatus: isNoAnswer ? '' : suggestedStatus,
+      actionTextAr: actionTextAr,
+      isNoAnswer: isNoAnswer,
+      variant: variant
+    };
+  }
+
+  function normalizeCallWrapupShortcutsConfig(raw) {
+    var input = raw;
+    if (typeof input === 'string') {
+      var trimmed = input.trim();
+      if (!trimmed) {
+        input = null;
+      } else {
+        try {
+          input = JSON.parse(trimmed);
+        } catch (_eParse) {
+          input = null;
+        }
+      }
+    }
+
+    var defaultItems = DEFAULT_CALL_WRAPUP_OUTCOMES.map(cloneCallWrapupOutcomeItem);
+    if (!input || typeof input !== 'object') {
+      return {
+        items: defaultItems,
+        customized: false,
+        updatedAt: '',
+        updatedBy: ''
+      };
+    }
+
+    var rawItems = null;
+    var customized = false;
+    var updatedAt = '';
+    var updatedBy = '';
+
+    if (Array.isArray(input)) {
+      rawItems = input;
+      customized = true;
+    } else {
+      updatedAt = normalizeStr(input.updatedAt);
+      updatedBy = normalizeStr(input.updatedBy);
+      if (input.customized === true) {
+        customized = true;
+        rawItems = Array.isArray(input.items) ? input.items : [];
+      } else if (Array.isArray(input.items) && input.customized !== false) {
+        customized = true;
+        rawItems = input.items;
+      } else {
+        return {
+          items: defaultItems,
+          customized: false,
+          updatedAt: updatedAt,
+          updatedBy: updatedBy
+        };
+      }
+    }
+
+    var seenKeys = {};
+    var cleanItems = [];
+    for (var i = 0; i < rawItems.length && cleanItems.length < 20; i++) {
+      var row = rawItems[i];
+      if (!row || typeof row !== 'object') continue;
+      if (!normalizeStr(row.labelAr)) continue;
+      var normItem = cloneCallWrapupOutcomeItem(row);
+      if (seenKeys[normItem.key]) {
+        normItem.key = normItem.key.slice(0, 32) + '_' + (cleanItems.length + 1);
+      }
+      seenKeys[normItem.key] = true;
+      cleanItems.push(normItem);
+    }
+
+    return {
+      items: cleanItems,
+      customized: customized,
+      updatedAt: updatedAt,
+      updatedBy: updatedBy
+    };
+  }
+
+  function getActiveCallWrapupShortcuts(rawConfig) {
+    return normalizeCallWrapupShortcutsConfig(rawConfig).items;
+  }
+
+  function upsertCallWrapupShortcut(rawConfig, shortcutInput) {
+    var cfg = normalizeCallWrapupShortcutsConfig(rawConfig);
+    var src = (shortcutInput && typeof shortcutInput === 'object') ? shortcutInput : {};
+    var labelAr = normalizeStr(src.labelAr).slice(0, 80);
+    if (!labelAr) {
+      throw new Error('VALIDATION_ERROR: اسم الاختصار بالعربية مطلوب.');
+    }
+    var baseList = cfg.items.slice();
+    var targetKey = normalizeStr(src.key);
+    var existingIdx = -1;
+    if (targetKey) {
+      for (var i = 0; i < baseList.length; i++) {
+        if (baseList[i].key === targetKey) {
+          existingIdx = i;
+          break;
+        }
+      }
+    }
+    var nextItem = cloneCallWrapupOutcomeItem(Object.assign({}, src, {
+      key: existingIdx !== -1 ? targetKey : (src.key || ('custom_' + Date.now().toString(36)))
+    }));
+    if (existingIdx !== -1) {
+      baseList[existingIdx] = nextItem;
+    } else {
+      if (baseList.some(function (x) { return x.key === nextItem.key; })) {
+        nextItem.key = nextItem.key.slice(0, 32) + '_' + Math.random().toString(36).slice(2, 6);
+      }
+      baseList.push(nextItem);
+    }
+    return normalizeCallWrapupShortcutsConfig({
+      items: baseList,
+      customized: true,
+      updatedAt: new Date().toISOString(),
+      updatedBy: cfg.updatedBy
+    });
+  }
+
+  function removeCallWrapupShortcut(rawConfig, key) {
+    var cfg = normalizeCallWrapupShortcutsConfig(rawConfig);
+    var targetKey = normalizeStr(key);
+    var nextItems = cfg.items.filter(function (x) { return x && x.key !== targetKey; });
+    return normalizeCallWrapupShortcutsConfig({
+      items: nextItems,
+      customized: true,
+      updatedAt: new Date().toISOString(),
+      updatedBy: cfg.updatedBy
+    });
+  }
+
+  function resetCallWrapupShortcutsConfig() {
+    return normalizeCallWrapupShortcutsConfig({
+      items: DEFAULT_CALL_WRAPUP_OUTCOMES.map(cloneCallWrapupOutcomeItem),
+      customized: false,
+      updatedAt: new Date().toISOString(),
+      updatedBy: ''
+    });
+  }
 
   function parseDeltaRecordTimestampMs(rec) {
     if (!rec || typeof rec !== 'object') return NaN;
@@ -7929,7 +8157,7 @@
     var sIso = formatDisplayDate(startIso) || '0000-01-01';
     var eIso = formatDisplayDate(endIso) || '9999-12-31';
     var typeFilter = normalizeStr(opts.eventType || opts.typeFilter || 'all').toLowerCase();
-    var searchTerm = normalizeStr(opts.search).toLowerCase();
+    var searchTerm = normalizeStr(opts.search);
     var includeCancelled = Boolean(opts.includeCancelled);
 
     var events = [];
@@ -7940,18 +8168,17 @@
       if (!ev || !ev.dateIso) return;
       if (ev.dateIso < sIso || ev.dateIso > eIso) return;
       if (seenKeys[ev.eventKey]) return;
-      if (searchTerm) {
-        var hay = [
-          ev.reservationNumber,
-          ev.customerName,
-          ev.customerPhone,
-          ev.carName,
-          ev.plateNumber,
-          ev.companyName,
-          ev.branchName,
-          ev.extensionNumber
-        ].join(' ').toLowerCase();
-        if (hay.indexOf(searchTerm) === -1) return;
+      if (searchTerm && !matchesSearchFields([
+        ev.reservationNumber,
+        ev.customerName,
+        ev.customerPhone,
+        ev.carName,
+        ev.plateNumber,
+        ev.companyName,
+        ev.branchName,
+        ev.extensionNumber
+      ], searchTerm)) {
+        return;
       }
       seenKeys[ev.eventKey] = true;
       counts.total += 1;
@@ -8361,6 +8588,12 @@
     buildReservationIcsEvents: buildReservationIcsEvents,
     buildTodayScheduleIcsEvents: buildTodayScheduleIcsEvents,
     CALL_WRAPUP_OUTCOMES: CALL_WRAPUP_OUTCOMES,
+    DEFAULT_CALL_WRAPUP_OUTCOMES: DEFAULT_CALL_WRAPUP_OUTCOMES,
+    normalizeCallWrapupShortcutsConfig: normalizeCallWrapupShortcutsConfig,
+    getActiveCallWrapupShortcuts: getActiveCallWrapupShortcuts,
+    upsertCallWrapupShortcut: upsertCallWrapupShortcut,
+    removeCallWrapupShortcut: removeCallWrapupShortcut,
+    resetCallWrapupShortcutsConfig: resetCallWrapupShortcutsConfig,
     computeExtensionComparisonSummary: computeExtensionComparisonSummary,
     HEATMAP_DAY_ORDER: HEATMAP_DAY_ORDER,
     computePeakHoursHeatmap: computePeakHoursHeatmap,
@@ -8432,6 +8665,9 @@
     compareAppVersions: compareAppVersions,
     shouldTriggerAutoUpdateReload: shouldTriggerAutoUpdateReload,
     computeAdaptiveSyncDelay: computeAdaptiveSyncDelay,
-    appendSyncDiagnosticLog: appendSyncDiagnosticLog
+    appendSyncDiagnosticLog: appendSyncDiagnosticLog,
+    normalizeSearchText: normalizeSearchText,
+    tokenizeSearchQuery: tokenizeSearchQuery,
+    matchesSearchFields: matchesSearchFields
   };
 }));

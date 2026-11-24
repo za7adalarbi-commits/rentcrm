@@ -360,6 +360,16 @@
           '<div id="dev-stats-control-host">' +
             '<div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
           '</div>' +
+        '</div>' +
+        '<div class="surface-card rg-dev-shortcuts-card" id="dev-call-shortcuts-card">' +
+          '<div class="section-header">' +
+            '<div>' +
+              '<h2 class="section-title">تحكم المبرمج في اختصارات نافذة ما بعد الاتصال</h2>' +
+              '<p class="section-subtitle">أضف اختصارات جديدة، عدّل التسميات أو الحالة المرتبطة، رتب الأزرار، أو احذف أي اختصار يظهر للفريق بعد الضغط على زر الاتصال.</p>' +
+            '</div>' +
+            '<span class="status-tag status-info">CALL SHORTCUTS</span>' +
+          '</div>' +
+          '<div id="dev-call-shortcuts-host"></div>' +
         '</div>'
       ) : '') +
       '<div class="surface-card" id="connection-diagnostics-card">' +
@@ -716,6 +726,11 @@
           }
         }
       })();
+    }
+
+    var devShortcutsHost = document.getElementById('dev-call-shortcuts-host');
+    if (isDeveloperUser && devShortcutsHost && root.RGApp && typeof root.RGApp.mountCallShortcutsControlPanel === 'function') {
+      root.RGApp.mountCallShortcutsControlPanel(devShortcutsHost, ctx, {});
     }
 
     if (root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {

@@ -508,6 +508,7 @@
       : '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>';
 
     var rangeBarHtml = '';
+    var rangeHintHtml = '';
     if (activeSession.isRange) {
       var fromLbl = lang === 'en' ? 'From' : 'من';
       var toLbl = lang === 'en' ? 'To' : 'إلى';
@@ -528,6 +529,20 @@
             '<span class="rg-dp-range-v mono" dir="ltr">' + (endVal || unsetLbl) + '</span>' +
           '</button>' +
         '</div>';
+      var isStandaloneResEnd = Boolean(
+        activeSession.endInput &&
+        activeSession.endInput.id === 'res-to' &&
+        activeSession.activeRole === 'end' &&
+        !startVal
+      );
+      if (isStandaloneResEnd) {
+        rangeHintHtml =
+          '<div class="rg-dp-range-hint">' +
+            (lang === 'en'
+              ? 'Standalone End Date: shows reservations ending on this exact date without a Start Date.'
+              : 'تاريخ النهاية يعمل بمفرده: يعرض الحجوزات المنتهية في هذا التاريخ دون الحاجة لتاريخ البداية.') +
+          '</div>';
+      }
     }
 
     var bodyHtml = '';
@@ -608,6 +623,7 @@
 
     pop.innerHTML =
       rangeBarHtml +
+      rangeHintHtml +
       '<div class="rg-dp-header">' +
         '<button type="button" class="rg-dp-nav-btn" data-dp-nav="-1" aria-label="' + (lang === 'en' ? 'Previous' : 'السابق') + '">' + prevArrow + '</button>' +
         '<div class="rg-dp-header-title">' + headerTitleHtml + '</div>' +

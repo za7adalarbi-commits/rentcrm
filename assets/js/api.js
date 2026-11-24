@@ -3718,6 +3718,9 @@
         var statsControlBoot = core && core.normalizeStatsControlConfig
           ? core.normalizeStatsControlConfig(db.settings.stats_control_config)
           : { excludedFromStatsEmployeeIds: [] };
+        var callShortcutsBoot = core && core.normalizeCallWrapupShortcutsConfig
+          ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts)
+          : { items: (core && core.CALL_WRAPUP_OUTCOMES) || [], customized: false, updatedAt: '', updatedBy: '' };
         var rawPinnedBoot = db.settings['pinned_res_u_' + session.employeeId];
         var parsedPinnedBoot = Array.isArray(rawPinnedBoot) ? rawPinnedBoot : [];
         var rawLayoutBoot = db.settings['layout_prefs_u_' + session.employeeId];
@@ -3741,6 +3744,7 @@
             uiSimplification: uiSimpBoot,
             roleUiDefaults: roleUiDefaultsBoot,
             statsControlConfig: statsControlBoot,
+            callWrapupShortcuts: callShortcutsBoot,
             handoverSettings: handoverSettingsBoot,
             announcements: activeAnnsBoot,
             activeLocks: activeLocksBoot,
@@ -4530,12 +4534,14 @@
       }
 
       case 'getTeamFollowUps': {
-        var teamFus = db.followUps.filter(function (f) {
-          if (payload.employeeId && f.employeeId !== payload.employeeId) return false;
-          if (payload.status && f.status !== payload.status) return false;
-          if (payload.date && f.followUpDate !== payload.date) return false;
-          return true;
-        });
+        var teamFus = (core && core.filterTeamFollowUpsList)
+          ? core.filterTeamFollowUpsList(db.followUps, payload)
+          : db.followUps.filter(function (f) {
+              if (payload.employeeId && f.employeeId !== payload.employeeId) return false;
+              if (payload.status && f.status !== payload.status) return false;
+              if (payload.date && f.followUpDate !== payload.date) return false;
+              return true;
+            });
         return { success: true, message: '', data: { items: teamFus, total: teamFus.length }, error: null };
       }
 
@@ -4704,16 +4710,15 @@
       }
 
       case 'getProblems': {
-        var prbList = db.problems.filter(function (p) {
-          if (payload.status && p.status !== payload.status) return false;
-          if (payload.priority && p.priority !== payload.priority) return false;
-          if (payload.employeeId && (p.assignedEmployeeIds || []).indexOf(payload.employeeId) === -1) return false;
-          if (payload.search) {
-            var h = (p.problemNumber + ' ' + p.reservationNumber + ' ' + p.customerName + ' ' + p.description).toLowerCase();
-            if (h.indexOf(String(payload.search).toLowerCase()) === -1) return false;
-          }
-          return true;
-        }).map(function (p) {
+        var filteredPrbs = (core && core.filterProblemsList)
+          ? core.filterProblemsList(db.problems, payload)
+          : db.problems.filter(function (p) {
+              if (payload.status && p.status !== payload.status) return false;
+              if (payload.priority && p.priority !== payload.priority) return false;
+              if (payload.employeeId && (p.assignedEmployeeIds || []).indexOf(payload.employeeId) === -1) return false;
+              return true;
+            });
+        var prbList = filteredPrbs.map(function (p) {
           return Object.assign({}, p, {
             updates: db.problemUpdates.filter(function (u) { return u.problemId === p.id; })
           });
@@ -5569,6 +5574,7 @@
             ui_simplification: core.normalizeUiSimplificationSettings(db.settings.ui_simplification),
             role_ui_defaults: core.normalizeRoleUiDefaults ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults) : {},
             stats_control_config: core.normalizeStatsControlConfig ? core.normalizeStatsControlConfig(db.settings.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
+            call_wrapup_shortcuts: core.normalizeCallWrapupShortcutsConfig ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts) : { items: core.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
             handover_settings: core.normalizeHandoverSettings(db.settings.handover_settings),
             auto_sync_enabled: db.settings.auto_sync_enabled !== false,
             auto_sync_interval_hours: getIv.hours,
@@ -5590,11 +5596,15 @@
           payload.ui_simplification !== undefined ||
           payload.role_ui_defaults !== undefined ||
           payload.stats_control_config !== undefined ||
+          payload.call_wrapup_shortcuts !== undefined ||
           payload.auto_sync_interval_hours !== undefined ||
           payload.auto_sync_interval_minutes !== undefined
         );
         if (payload.stats_control_config !== undefined && session.role !== 'developer') {
           return { success: false, message: 'FORBIDDEN: التحكم في ظهور الموظفين بالإحصائيات متاح للمبرمج فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        if (payload.call_wrapup_shortcuts !== undefined && session.role !== 'developer') {
+          return { success: false, message: 'FORBIDDEN: التحكم في اختصارات نافذة الاتصال متاح للمبرمج فقط.', data: null, error: 'FORBIDDEN' };
         }
         if (hasSysFields || payload.handover_settings === undefined) {
           if (!core.canUserPerform(session.user, 'manage_settings')) {
@@ -5625,6 +5635,21 @@
           nextStatsCfg.updatedBy = session.user ? session.user.name : '';
           db.settings.stats_control_config = nextStatsCfg;
         }
+        if (payload.call_wrapup_shortcuts !== undefined && core.normalizeCallWrapupShortcutsConfig) {
+          var prevSc = core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts);
+          var nextSc = core.normalizeCallWrapupShortcutsConfig(payload.call_wrapup_shortcuts);
+          nextSc.updatedAt = new Date().toISOString();
+          nextSc.updatedBy = session.user ? session.user.name : '';
+          db.settings.call_wrapup_shortcuts = nextSc;
+          if (JSON.stringify(prevSc.items) !== JSON.stringify(nextSc.items) || prevSc.customized !== nextSc.customized) {
+            settingDiffs.push({
+              field: 'call_wrapup_shortcuts',
+              label: 'اختصارات نافذة الاتصال',
+              before: String(prevSc.items.length) + ' اختصار',
+              after: String(nextSc.items.length) + ' اختصار'
+            });
+          }
+        }
         if (payload.handover_settings !== undefined) {
           var prevHo = core.normalizeHandoverSettings(db.settings.handover_settings);
           var nextHo = core.normalizeHandoverSettings(payload.handover_settings);
@@ -5646,6 +5671,7 @@
           db.settings.auto_sync_interval_hours = nextIv.hours;
           db.settings.auto_sync_interval_minutes = nextIv.minutes;
         }
+        db.settings._settings_updated_at = new Date().toISOString();
         appendSandboxActivity(
           db,
           session.user,
@@ -5665,6 +5691,7 @@
             ui_simplification: core.normalizeUiSimplificationSettings(db.settings.ui_simplification),
             role_ui_defaults: core.normalizeRoleUiDefaults ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults) : {},
             stats_control_config: core.normalizeStatsControlConfig ? core.normalizeStatsControlConfig(db.settings.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
+            call_wrapup_shortcuts: core.normalizeCallWrapupShortcutsConfig ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts) : { items: core.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
             handover_settings: core.normalizeHandoverSettings(db.settings.handover_settings)
           }),
           error: null
@@ -6098,22 +6125,29 @@
         var activeAnnsDelta = (db.announcements || []).filter(function (a) { return isSandboxAnnouncementActive(a); });
         var activeLocksDelta = pruneSandboxLocks(db);
         var deltaTodayRadar = sandboxExecute('getTodayAndRadar', token, { summaryOnly: true, todayDate: todayIso(0) });
+        var setUpdAt = String(db.settings._settings_updated_at || '');
+        var settingsChangedDelta = Boolean(setUpdAt && Date.parse(setUpdAt) > sinceMs);
+        var callShortcutsDelta = (settingsChangedDelta && core && core.normalizeCallWrapupShortcutsConfig)
+          ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts)
+          : undefined;
         return {
           success: true,
           message: '',
-          data: {
+          data: Object.assign({
             serverTime: new Date().toISOString(),
             syncVersion: Number(db.settings._sync_version || 1),
             changedReservations: changedRes,
             changedFollowUps: changedFu,
             changedProblems: changedPrb,
             changedEmployees: changedEmps,
+            changedSettings: settingsChangedDelta,
+            settingsUpdatedAt: settingsChangedDelta ? setUpdAt : '',
             todayRadarCounts: (deltaTodayRadar && deltaTodayRadar.success && deltaTodayRadar.data) ? deltaTodayRadar.data.counts : null,
             notifications: myNotifDelta.success ? myNotifDelta.data : { items: [], unreadCount: 0 },
             announcements: activeAnnsDelta,
             locks: activeLocksDelta,
             user: session.user
-          },
+          }, callShortcutsDelta !== undefined ? { callWrapupShortcuts: callShortcutsDelta } : {}),
           error: null
         };
       }

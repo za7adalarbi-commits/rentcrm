@@ -155,6 +155,23 @@
       '</div>';
 
     var activePrbSeq = 0;
+    var lastPaintedPrbSearch = String(state.search || '');
+
+    function preFilterVisibleProblemsForSearch(queryStr) {
+      var trimmed = String(queryStr || '').trim();
+      var region = container.querySelector('#prb-table-region');
+      if (!trimmed) return;
+      if (core && core.filterProblemsList && items.length > 0) {
+        var matching = core.filterProblemsList(items, Object.assign({}, state, { search: trimmed }));
+        if (matching.length > 0) {
+          paintProblemsRegion(matching, { keepPaintedSearch: true });
+          return;
+        }
+      }
+      if (region) {
+        region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+      }
+    }
 
     async function ensureRatesLoadedAndPaint() {
       if (ratesLoaded) {
@@ -306,14 +323,21 @@
       if (pRetry) pRetry.addEventListener('click', function () { refreshProblemsRegion({ forceRefresh: true }); });
     }
 
-    function paintProblemsRegion(list) {
+    function paintProblemsRegion(list, paintOpts) {
+      var pOpts = paintOpts || {};
       items = list || [];
+      if (!pOpts.keepPaintedSearch) {
+        lastPaintedPrbSearch = String(state.search || '');
+      }
       var countEl = container.querySelector('#prb-total-count');
       if (countEl) countEl.textContent = String(items.length);
       var region = container.querySelector('#prb-table-region');
       if (!region) return;
+      var activeSearchTrim = String(state.search || '').trim();
       region.innerHTML = items.length === 0
-        ? '<div class="empty-state">لا توجد مشكلات مطابقة للفلاتر الحالية.</div>'
+        ? (activeSearchTrim
+            ? '<div class="empty-state">لا توجد مشكلات مطابقة للبحث "<span class="mono" dir="auto">' + esc(activeSearchTrim) + '</span>". <button type="button" class="btn btn-sm" id="prb-empty-clear-search" style="margin-inline-start:8px;">مسح البحث</button></div>'
+            : '<div class="empty-state">لا توجد مشكلات مطابقة للفلاتر الحالية.</div>')
         : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
             '<th>رقم المشكلة</th><th>رقم الحجز</th><th>العميل</th><th>الوصف</th><th>الأولوية</th><th>الحالة</th><th>المنشئ</th><th>المسؤولون</th><th>آخر تحديث</th><th>إدارة</th>' +
           '</tr></thead><tbody>' +
@@ -336,6 +360,17 @@
               '</tr>';
             }).join('') +
           '</tbody></table></div>';
+
+      var clearEmptySearchBtn = region.querySelector('#prb-empty-clear-search');
+      if (clearEmptySearchBtn) {
+        clearEmptySearchBtn.addEventListener('click', function () {
+          state.search = '';
+          var searchInp = document.getElementById('prb-search');
+          if (searchInp) searchInp.value = '';
+          if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
+          refreshProblemsRegion({ forceRefresh: true });
+        });
+      }
 
       region.querySelectorAll('.prb-open-res').forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -396,11 +431,23 @@
     async function refreshProblemsRegion(opts) {
       var seq = ++activePrbSeq;
       var region = container.querySelector('#prb-table-region');
-      if (region && !(opts && opts.silentRefresh) && items.length === 0) {
+      var curSearch = String(state.search || '');
+      var searchChanged = curSearch !== lastPaintedPrbSearch;
+      if (searchChanged) {
+        if (curSearch.trim() && core && core.filterProblemsList && items.length > 0) {
+          items = core.filterProblemsList(items, state);
+          if (items.length > 0) {
+            paintProblemsRegion(items, { keepPaintedSearch: true });
+          }
+        } else {
+          items = [];
+        }
+      }
+      if (region && (!(opts && opts.silentRefresh) || searchChanged) && items.length === 0) {
         region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       }
       var resp = await root.RGApi.callApi('getProblems', Object.assign({}, state, {
-        forceRefresh: Boolean(opts && opts.forceRefresh),
+        forceRefresh: Boolean((opts && opts.forceRefresh) || searchChanged),
         silentRefresh: Boolean(opts && opts.silentRefresh),
         abortKey: 'prb:list'
       }));
@@ -413,7 +460,8 @@
           if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
         }
       } else if (!(opts && opts.silentRefresh)) {
-        if (items.length === 0) {
+        if (searchChanged || items.length === 0) {
+          items = [];
           paintProblemsError((resp && resp.message) || 'تعذر تحميل المشكلات.');
         } else if (ctx && ctx.toast) {
           ctx.toast((resp && resp.message) || 'تعذر تحديث قائمة المشكلات.', true);
@@ -429,14 +477,34 @@
     }
 
     var searchTimer = null;
-    document.getElementById('prb-search').addEventListener('input', function (ev) {
-      state.search = ev.target.value;
-      if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(function () {
-        refreshProblemsRegion();
-      }, 220);
-    });
+    var prbSearchInput = document.getElementById('prb-search');
+    if (prbSearchInput) {
+      var triggerPrbSearch = function (immediate) {
+        state.search = prbSearchInput.value;
+        if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
+        clearTimeout(searchTimer);
+        preFilterVisibleProblemsForSearch(state.search);
+        if (immediate) {
+          refreshProblemsRegion({ forceRefresh: true });
+          return;
+        }
+        searchTimer = setTimeout(function () {
+          refreshProblemsRegion({ forceRefresh: true });
+        }, 200);
+      };
+      prbSearchInput.addEventListener('input', function () {
+        triggerPrbSearch(false);
+      });
+      prbSearchInput.addEventListener('search', function () {
+        triggerPrbSearch(true);
+      });
+      prbSearchInput.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          triggerPrbSearch(true);
+        }
+      });
+    }
 
     ['prb-status', 'prb-prio', 'prb-emp'].forEach(function (id) {
       document.getElementById(id).addEventListener('change', function () {

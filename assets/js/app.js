@@ -377,6 +377,7 @@
     announcements: [],
     activeLocks: [],
     handoverSettings: normalizeHandoverSettingsSafe({}),
+    callWrapupShortcutsConfig: null,
     lastDeltaSyncAt: '',
     offlineQueue: { count: 0, items: [] },
     deferredInstallPrompt: null,
@@ -391,6 +392,7 @@
       lastUpdatedAt: ''
     }
   };
+  var lastOpenCallInfo = null;
   var PREVIEW_SESSION_STORAGE_KEY = 'rg_crm_preview_role_v1';
   var activeUnsavedGuard = null;
   var authPreviewBridgeInstalled = false;
@@ -751,6 +753,29 @@
       ? root.RGCrmCore.normalizeStatsControlConfig(rawCfg)
       : (rawCfg && typeof rawCfg === 'object' ? rawCfg : { excludedFromStatsEmployeeIds: [] });
     return state.statsControlConfig;
+  }
+
+  function getCallWrapupShortcutsConfig() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeCallWrapupShortcutsConfig) {
+      state.callWrapupShortcutsConfig = root.RGCrmCore.normalizeCallWrapupShortcutsConfig(state.callWrapupShortcutsConfig);
+      return state.callWrapupShortcutsConfig;
+    }
+    return state.callWrapupShortcutsConfig || { items: [], customized: false, updatedAt: '', updatedBy: '' };
+  }
+
+  function getActiveCallWrapupShortcuts() {
+    var cfg = getCallWrapupShortcutsConfig();
+    return Array.isArray(cfg.items) ? cfg.items : [];
+  }
+
+  function setCallWrapupShortcutsConfig(rawCfg) {
+    state.callWrapupShortcutsConfig = (root.RGCrmCore && root.RGCrmCore.normalizeCallWrapupShortcutsConfig)
+      ? root.RGCrmCore.normalizeCallWrapupShortcutsConfig(rawCfg)
+      : (rawCfg && typeof rawCfg === 'object' ? rawCfg : { items: [], customized: false, updatedAt: '', updatedBy: '' });
+    if (document.getElementById('rg-call-wrapup-bar') && lastOpenCallInfo) {
+      openCallWrapUpBar(lastOpenCallInfo);
+    }
+    return state.callWrapupShortcutsConfig;
   }
 
   function getEffectiveRoleUiResolution(userOverride) {
@@ -1562,25 +1587,335 @@
   }
 
   function closeCallWrapUpBar() {
+    lastOpenCallInfo = null;
     var existing = document.getElementById('rg-call-wrapup-bar');
     if (existing) existing.remove();
+  }
+
+  function mountCallShortcutsControlPanel(hostEl, ctxArg, opts) {
+    if (!hostEl) return;
+    var options = opts || {};
+    var realU = getRealUser();
+    if (!realU || realU.role !== 'developer') {
+      hostEl.innerHTML = '<div class="empty-state" style="padding:14px;">التحكم في اختصارات نافذة الاتصال متاح لحساب المبرمج فقط.</div>';
+      return;
+    }
+
+    var core = root.RGCrmCore;
+    var isEn = state.prefs.lang === 'en';
+    var editingKey = '';
+    var workingCfg = core && core.normalizeCallWrapupShortcutsConfig
+      ? core.normalizeCallWrapupShortcutsConfig(getCallWrapupShortcutsConfig())
+      : { items: [], customized: false, updatedAt: '', updatedBy: '' };
+    var workflowOpts = (core && Array.isArray(core.WORKFLOW_STATUS_OPTIONS))
+      ? core.WORKFLOW_STATUS_OPTIONS
+      : ['تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم الإنشاء', 'تم الإلغاء', 'تم التمديد', 'لم يتم الحجز'];
+
+    async function persistShortcutsConfig(nextCfg, triggerBtn, successMsg) {
+      return withActionLock(triggerBtn, 'saveCallWrapupShortcuts', async function () {
+        var res = await root.RGApi.callApi('updateSettings', {
+          call_wrapup_shortcuts: nextCfg
+        });
+        if (!res || !res.success) {
+          toast((res && res.message) || (isEn ? 'Failed to save shortcuts.' : 'تعذر حفظ اختصارات الاتصال.'), true);
+          return false;
+        }
+        var savedCfg = (res.data && res.data.call_wrapup_shortcuts) ? res.data.call_wrapup_shortcuts : nextCfg;
+        workingCfg = (core && core.normalizeCallWrapupShortcutsConfig)
+          ? core.normalizeCallWrapupShortcutsConfig(savedCfg)
+          : savedCfg;
+        setCallWrapupShortcutsConfig(workingCfg);
+        if (root.RGApi && root.RGApi.invalidateScopes) {
+          root.RGApi.invalidateScopes(['settings', 'dashboard']);
+        }
+        document.dispatchEvent(new CustomEvent('rg:deltasync', {
+          detail: { localMutation: true, changedSettings: true, callWrapupShortcuts: workingCfg }
+        }));
+        document.dispatchEvent(new CustomEvent('rg:mutationcomplete', {
+          detail: { action: 'updateSettings', scopes: ['settings'] }
+        }));
+        toast(successMsg || (isEn ? 'Call shortcuts saved & synced.' : 'تم حفظ اختصارات الاتصال ومزامنتها فوراً.'));
+        if (typeof options.onSaved === 'function') {
+          options.onSaved(workingCfg);
+        }
+        renderPanel();
+        return true;
+      });
+    }
+
+    function renderPanel() {
+      var list = Array.isArray(workingCfg.items) ? workingCfg.items : [];
+      var editItem = editingKey ? list.find(function (x) { return x && x.key === editingKey; }) : null;
+      if (editingKey && !editItem) editingKey = '';
+
+      var rowsHtml = list.length === 0
+        ? '<div class="rg-dev-shortcuts-empty">' +
+            (isEn
+              ? 'No shortcuts currently active. Add a custom shortcut below or restore defaults.'
+              : 'لا توجد اختصارات مفعّلة حالياً. يمكنك إضافة اختصار جديد أدناه أو استعادة الافتراضية.') +
+          '</div>'
+        : '<div class="rg-dev-shortcuts-list">' +
+            list.map(function (item, idx) {
+              var badgeTxt = item.isNoAnswer
+                ? (isEn ? 'No Answer Log' : 'تسجيل لم يرد')
+                : (item.suggestedStatus
+                    ? ((isEn ? 'Status: ' : 'الحالة: ') + item.suggestedStatus)
+                    : (isEn ? 'Keep Current Status' : 'إبقاء الحالة الحالية'));
+              var toneCls = item.variant === 'danger'
+                ? 'status-danger'
+                : (item.variant === 'primary' ? 'status-info' : 'status-neutral');
+              return '<div class="rg-dev-shortcut-row' + (editingKey === item.key ? ' is-editing' : '') + '" data-sc-key="' + escapeHtml(item.key) + '">' +
+                '<div class="rg-dev-shortcut-main">' +
+                  '<div class="rg-dev-shortcut-title">' +
+                    '<span class="mono rg-dev-shortcut-idx">' + (idx + 1) + '.</span>' +
+                    '<strong>' + escapeHtml(item.labelAr) + '</strong>' +
+                    (item.labelEn && item.labelEn !== item.labelAr ? '<span class="rg-dev-shortcut-en" dir="ltr">(' + escapeHtml(item.labelEn) + ')</span>' : '') +
+                    '<span class="status-tag ' + toneCls + '">' + escapeHtml(badgeTxt) + '</span>' +
+                  '</div>' +
+                  '<div class="rg-dev-shortcut-sub">' + escapeHtml(item.actionTextAr || '') + '</div>' +
+                '</div>' +
+                '<div class="rg-dev-shortcut-actions">' +
+                  '<button type="button" class="btn btn-sm rg-sc-move-up" data-sc-key="' + escapeHtml(item.key) + '"' + (idx === 0 ? ' disabled' : '') + ' title="' + (isEn ? 'Move Up' : 'تحريك لأعلى') + '">↑</button>' +
+                  '<button type="button" class="btn btn-sm rg-sc-move-down" data-sc-key="' + escapeHtml(item.key) + '"' + (idx === list.length - 1 ? ' disabled' : '') + ' title="' + (isEn ? 'Move Down' : 'تحريك لأسفل') + '">↓</button>' +
+                  '<button type="button" class="btn btn-sm rg-sc-edit" data-sc-key="' + escapeHtml(item.key) + '">' + (isEn ? 'Edit' : 'تعديل') + '</button>' +
+                  '<button type="button" class="btn btn-sm btn-danger rg-sc-delete" data-sc-key="' + escapeHtml(item.key) + '">' + (isEn ? 'Remove' : 'إزالة') + '</button>' +
+                '</div>' +
+              '</div>';
+            }).join('') +
+          '</div>';
+
+      hostEl.innerHTML =
+        '<div class="rg-dev-shortcuts-panel">' +
+          '<div class="rg-dev-shortcuts-top">' +
+            '<div class="rg-dev-shortcuts-meta">' +
+              '<span class="status-tag ' + (workingCfg.customized ? 'status-info' : 'status-neutral') + '">' +
+                (workingCfg.customized
+                  ? (isEn ? 'Custom List' : 'قائمة مخصصة')
+                  : (isEn ? 'Default List' : 'القائمة الافتراضية')) +
+              '</span>' +
+              '<span class="rg-dev-shortcuts-count tabular-nums">' +
+                (isEn ? (list.length + ' active shortcut(s)') : (list.length + ' اختصار مفعل')) +
+              '</span>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm rg-sc-reset-defaults">' +
+              (isEn ? 'Restore Defaults' : 'استعادة الافتراضية') +
+            '</button>' +
+          '</div>' +
+          rowsHtml +
+          '<form class="rg-dev-shortcut-form" autocomplete="off">' +
+            '<div class="rg-dev-shortcut-form-head">' +
+              '<strong>' + (editItem
+                ? (isEn ? 'Edit Shortcut' : 'تعديل الاختصار المحدد')
+                : (isEn ? 'Add New Post-Call Shortcut' : 'إضافة اختصار جديد لنافذة الاتصال')) + '</strong>' +
+              (editItem
+                ? '<button type="button" class="btn btn-sm rg-sc-cancel-edit">' + (isEn ? 'Cancel Edit' : 'إلغاء التعديل') + '</button>'
+                : '') +
+            '</div>' +
+            '<div class="rg-dev-shortcut-form-grid">' +
+              '<label class="form-field">' +
+                '<span>' + (isEn ? 'Button Label (Arabic) *' : 'اسم الزر (عربي) *') + '</span>' +
+                '<input type="text" class="input rg-sc-inp-ar" maxlength="80" required placeholder="' + (isEn ? 'e.g. Sent Payment Link' : 'مثال: تم إرسال رابط الدفع') + '" value="' + escapeHtml(editItem ? editItem.labelAr : '') + '">' +
+              '</label>' +
+              '<label class="form-field">' +
+                '<span>' + (isEn ? 'Button Label (English)' : 'اسم الزر (إنجليزي - اختياري)') + '</span>' +
+                '<input type="text" class="input rg-sc-inp-en" dir="ltr" maxlength="80" placeholder="Payment Link Sent" value="' + escapeHtml(editItem && editItem.labelEn !== editItem.labelAr ? editItem.labelEn : '') + '">' +
+              '</label>' +
+              '<label class="form-field">' +
+                '<span>' + (isEn ? 'Target Booking Status' : 'حالة الحجز المرتبطة (اختياري)') + '</span>' +
+                '<select class="select rg-sc-inp-status"' + (editItem && editItem.isNoAnswer ? ' disabled' : '') + '>' +
+                  '<option value="">' + (isEn ? 'Keep current status' : 'بدون تغيير حالة الحجز') + '</option>' +
+                  workflowOpts.map(function (st) {
+                    return '<option value="' + escapeHtml(st) + '"' + (editItem && editItem.suggestedStatus === st ? ' selected' : '') + '>' + escapeHtml(st) + '</option>';
+                  }).join('') +
+                '</select>' +
+              '</label>' +
+              '<label class="form-field">' +
+                '<span>' + (isEn ? 'Button Style' : 'لون / نمط الزر') + '</span>' +
+                '<select class="select rg-sc-inp-variant">' +
+                  '<option value="neutral"' + (!editItem || editItem.variant === 'neutral' ? ' selected' : '') + '>' + (isEn ? 'Standard' : 'قياسي (محايد)') + '</option>' +
+                  '<option value="primary"' + (editItem && editItem.variant === 'primary' ? ' selected' : '') + '>' + (isEn ? 'Primary (Highlighted)' : 'رئيسي (مميز)') + '</option>' +
+                  '<option value="danger"' + (editItem && editItem.variant === 'danger' ? ' selected' : '') + '>' + (isEn ? 'Alert / No Answer' : 'تنبيه / لم يرد') + '</option>' +
+                '</select>' +
+              '</label>' +
+              '<label class="form-field rg-dev-shortcut-wide">' +
+                '<span>' + (isEn ? 'Logged Follow-up Action Text' : 'نص الإجراء المسجل في سجل المتابعة (اختياري)') + '</span>' +
+                '<input type="text" class="input rg-sc-inp-action" maxlength="140" placeholder="' + (isEn ? 'Auto-generated if left blank' : 'يُنشأ تلقائياً إذا تُرك فارغاً') + '" value="' + escapeHtml(editItem ? editItem.actionTextAr : '') + '">' +
+              '</label>' +
+            '</div>' +
+            '<div class="rg-dev-shortcut-form-foot">' +
+              '<label class="checkbox-item">' +
+                '<input type="checkbox" class="rg-sc-inp-noanswer"' + (editItem && editItem.isNoAnswer ? ' checked' : '') + '> ' +
+                (isEn ? 'Treat as "No Answer" attempt counter' : 'احتساب كمحاولة اتصال "لم يرد" في العداد') +
+              '</label>' +
+              '<button type="submit" class="btn btn-primary rg-sc-submit-btn">' +
+                (editItem ? (isEn ? 'Save Shortcut Changes' : 'حفظ التعديلات') : (isEn ? 'Add Shortcut' : '+ إضافة اختصار')) +
+              '</button>' +
+            '</div>' +
+          '</form>' +
+        '</div>';
+
+      var statusSel = hostEl.querySelector('.rg-sc-inp-status');
+      var noAnsChk = hostEl.querySelector('.rg-sc-inp-noanswer');
+      if (noAnsChk && statusSel) {
+        noAnsChk.addEventListener('change', function () {
+          statusSel.disabled = noAnsChk.checked;
+          if (noAnsChk.checked) statusSel.value = '';
+        });
+      }
+
+      var cancelEditBtn = hostEl.querySelector('.rg-sc-cancel-edit');
+      if (cancelEditBtn) {
+        cancelEditBtn.addEventListener('click', function () {
+          editingKey = '';
+          renderPanel();
+        });
+      }
+
+      hostEl.querySelectorAll('.rg-sc-edit').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          editingKey = btn.getAttribute('data-sc-key') || '';
+          renderPanel();
+          var arInp = hostEl.querySelector('.rg-sc-inp-ar');
+          if (arInp) arInp.focus();
+        });
+      });
+
+      hostEl.querySelectorAll('.rg-sc-delete').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var delKey = btn.getAttribute('data-sc-key') || '';
+          if (!delKey || !core || !core.removeCallWrapupShortcut) return;
+          var nextCfg = core.removeCallWrapupShortcut(workingCfg, delKey);
+          if (editingKey === delKey) editingKey = '';
+          persistShortcutsConfig(nextCfg, btn, isEn ? 'Shortcut removed.' : 'تمت إزالة الاختصار وحفظ التغيير.');
+        });
+      });
+
+      hostEl.querySelectorAll('.rg-sc-move-up, .rg-sc-move-down').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var moveKey = btn.getAttribute('data-sc-key') || '';
+          var dir = btn.classList.contains('rg-sc-move-up') ? -1 : 1;
+          var curItems = (workingCfg.items || []).slice();
+          var curIdx = curItems.findIndex(function (x) { return x && x.key === moveKey; });
+          var nextIdx = curIdx + dir;
+          if (curIdx === -1 || nextIdx < 0 || nextIdx >= curItems.length) return;
+          var tmp = curItems[curIdx];
+          curItems[curIdx] = curItems[nextIdx];
+          curItems[nextIdx] = tmp;
+          var nextCfg = core && core.normalizeCallWrapupShortcutsConfig
+            ? core.normalizeCallWrapupShortcutsConfig({ items: curItems, customized: true })
+            : { items: curItems, customized: true };
+          persistShortcutsConfig(nextCfg, btn, isEn ? 'Shortcut order updated.' : 'تم تحديث ترتيب الاختصارات.');
+        });
+      });
+
+      var resetBtn = hostEl.querySelector('.rg-sc-reset-defaults');
+      if (resetBtn) {
+        resetBtn.addEventListener('click', function () {
+          if (!core || !core.resetCallWrapupShortcutsConfig) return;
+          editingKey = '';
+          var nextCfg = core.resetCallWrapupShortcutsConfig();
+          persistShortcutsConfig(nextCfg, resetBtn, isEn ? 'Default shortcuts restored.' : 'تمت استعادة الاختصارات الافتراضية.');
+        });
+      }
+
+      var formEl = hostEl.querySelector('.rg-dev-shortcut-form');
+      if (formEl) {
+        formEl.addEventListener('submit', function (ev) {
+          ev.preventDefault();
+          var arVal = String((hostEl.querySelector('.rg-sc-inp-ar') && hostEl.querySelector('.rg-sc-inp-ar').value) || '').trim();
+          var enVal = String((hostEl.querySelector('.rg-sc-inp-en') && hostEl.querySelector('.rg-sc-inp-en').value) || '').trim();
+          var stVal = String((hostEl.querySelector('.rg-sc-inp-status') && hostEl.querySelector('.rg-sc-inp-status').value) || '').trim();
+          var varVal = String((hostEl.querySelector('.rg-sc-inp-variant') && hostEl.querySelector('.rg-sc-inp-variant').value) || 'neutral').trim();
+          var actVal = String((hostEl.querySelector('.rg-sc-inp-action') && hostEl.querySelector('.rg-sc-inp-action').value) || '').trim();
+          var isNoAns = Boolean(hostEl.querySelector('.rg-sc-inp-noanswer') && hostEl.querySelector('.rg-sc-inp-noanswer').checked);
+          if (!arVal) {
+            toast(isEn ? 'Arabic button label is required.' : 'يرجى كتابة اسم الاختصار بالعربية.', true);
+            return;
+          }
+          var submitBtn = hostEl.querySelector('.rg-sc-submit-btn');
+          try {
+            var nextCfg = core.upsertCallWrapupShortcut(workingCfg, {
+              key: editingKey || undefined,
+              labelAr: arVal,
+              labelEn: enVal || arVal,
+              suggestedStatus: isNoAns ? '' : stVal,
+              variant: varVal,
+              actionTextAr: actVal || ('نتيجة المكالمة: ' + arVal),
+              isNoAnswer: isNoAns
+            });
+            var wasEditing = Boolean(editingKey);
+            editingKey = '';
+            persistShortcutsConfig(
+              nextCfg,
+              submitBtn,
+              wasEditing
+                ? (isEn ? 'Shortcut updated.' : 'تم تعديل الاختصار وحفظه.')
+                : (isEn ? 'Shortcut added.' : 'تمت إضافة الاختصار الجديد.')
+            );
+          } catch (err) {
+            toast((err && err.message) || 'تعذر حفظ الاختصار.', true);
+          }
+        });
+      }
+    }
+
+    renderPanel();
+  }
+
+  function openDeveloperCallShortcutsModal(ctxArg, onSaved) {
+    var realU = getRealUser();
+    if (!realU || realU.role !== 'developer') {
+      toast('التحكم في اختصارات نافذة الاتصال متاح للمبرمج فقط.', true);
+      return;
+    }
+    var modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) return;
+    var isEn = state.prefs.lang === 'en';
+    modalRoot.innerHTML =
+      '<div class="modal-backdrop" id="sc-mgr-backdrop">' +
+        '<div class="modal-panel rg-dev-shortcuts-modal" role="dialog" aria-modal="true" aria-label="' + (isEn ? 'Manage Post-Call Shortcuts' : 'إدارة اختصارات نافذة الاتصال') + '">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h2 class="modal-title">' + (isEn ? 'Post-Call Shortcuts Control (Developer)' : 'إدارة اختصارات نافذة الاتصال (المبرمج)') + '</h2>' +
+              '<p class="section-subtitle">' + (isEn ? 'Add, edit, remove, or reorder the quick outcome buttons shown after clicking Call.' : 'إضافة أو تعديل أو إزالة أو ترتيب أزرار الاختصارات السريعة التي تظهر بعد ضغط زر الاتصال لجميع الموظفين.') + '</p>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="sc-mgr-close" aria-label="' + (isEn ? 'Close' : 'إغلاق') + '">✕</button>' +
+          '</div>' +
+          '<div class="modal-body" id="sc-mgr-body"></div>' +
+        '</div>' +
+      '</div>';
+
+    var closeModal = function () {
+      modalRoot.innerHTML = '';
+    };
+    var scBackdrop = document.getElementById('sc-mgr-backdrop');
+    if (scBackdrop) {
+      scBackdrop.addEventListener('click', function (ev) {
+        if (ev.target === scBackdrop) closeModal();
+      });
+    }
+    var closeBtn = document.getElementById('sc-mgr-close');
+    if (closeBtn) closeBtn.addEventListener('click', closeModal);
+    var host = document.getElementById('sc-mgr-body');
+    if (host) {
+      mountCallShortcutsControlPanel(host, ctxArg || buildAppCtx(), {
+        onSaved: function (cfg) {
+          if (typeof onSaved === 'function') onSaved(cfg);
+        }
+      });
+    }
   }
 
   function openCallWrapUpBar(callInfo) {
     var curUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     if (!curUser || !callInfo || !callInfo.reservationId) return;
-    closeCallWrapUpBar();
+    lastOpenCallInfo = Object.assign({}, callInfo);
+    var existing = document.getElementById('rg-call-wrapup-bar');
+    if (existing) existing.remove();
 
     var isEn = state.prefs.lang === 'en';
-    var outcomes = (root.RGCrmCore && Array.isArray(root.RGCrmCore.CALL_WRAPUP_OUTCOMES))
-      ? root.RGCrmCore.CALL_WRAPUP_OUTCOMES
-      : [
-          { key: 'confirmed', labelAr: 'تم الرد وتأكيد الحجز', labelEn: 'Answered & Confirmed', suggestedStatus: 'تم الحجز', actionTextAr: 'نتيجة المكالمة: تم الرد وتأكيد الحجز', isNoAnswer: false },
-          { key: 'no_answer', labelAr: 'لم يرد', labelEn: 'No Answer', suggestedStatus: '', actionTextAr: 'محاولة اتصال — لم يرد', isNoAnswer: true },
-          { key: 'extending_24h', labelAr: 'بيمدد خلال 24 ساعة القادمة', labelEn: 'Extending Within 24 Hours', suggestedStatus: 'تم التمديد', actionTextAr: 'نتيجة المكالمة: العميل بيمدد خلال 24 ساعة القادمة', isNoAnswer: false },
-          { key: 'returning_on_time', labelAr: 'ما بيمدد وبيسلم في الموعد', labelEn: 'Not Extending — Returning On Time', suggestedStatus: 'نشط الآن', actionTextAr: 'نتيجة المكالمة: العميل ما بيمدد وبيسلم في الموعد', isNoAnswer: false },
-          { key: 'callback_later', labelAr: 'إعادة الاتصال لاحقاً', labelEn: 'Call Back Later', suggestedStatus: '', actionTextAr: 'نتيجة المكالمة: طلب إعادة الاتصال لاحقاً', isNoAnswer: false }
-        ];
+    var isDeveloper = Boolean(getRealUser() && getRealUser().role === 'developer' && curUser.role === 'developer');
+    var outcomes = getActiveCallWrapupShortcuts();
 
     var bar = document.createElement('div');
     bar.id = 'rg-call-wrapup-bar';
@@ -1595,24 +1930,42 @@
           '<span class="mono">#' + escapeHtml(callInfo.reservationNumber || callInfo.reservationId) + '</span>' +
           (callInfo.phone ? ('<span class="mono" dir="ltr">' + escapeHtml(callInfo.phone) + '</span>') : '') +
         '</div>' +
-        '<button type="button" class="btn btn-sm" id="rg-wrapup-close" aria-label="' + (isEn ? 'Close' : 'إغلاق') + '">✕</button>' +
+        '<div class="rg-call-wrapup-head-actions">' +
+          (isDeveloper
+            ? ('<button type="button" class="btn btn-sm rg-wrapup-manage-btn" id="rg-wrapup-manage-btn">' + (isEn ? 'Manage Shortcuts' : 'إدارة الاختصارات') + '</button>')
+            : '') +
+          '<button type="button" class="btn btn-sm" id="rg-wrapup-close" aria-label="' + (isEn ? 'Close' : 'إغلاق') + '">✕</button>' +
+        '</div>' +
       '</div>' +
       '<div class="rg-call-wrapup-note-row">' +
         '<input type="text" class="input" id="rg-wrapup-note" placeholder="' + (isEn ? 'Optional quick call note...' : 'ملاحظة سريعة اختيارية عن المكالمة...') + '">' +
       '</div>' +
       '<div class="rg-call-wrapup-actions">' +
-        outcomes.map(function (out) {
-          var cls = out.isNoAnswer ? 'btn-danger' : (out.key === 'confirmed' || out.key === 'extending_24h' ? 'btn-primary' : '');
-          return '<button type="button" class="btn btn-sm ' + cls + ' rg-wrapup-outcome-btn" data-outcome-key="' + escapeHtml(out.key) + '">' +
-            escapeHtml(isEn ? out.labelEn : out.labelAr) +
-          '</button>';
-        }).join('') +
+        (outcomes.length > 0
+          ? outcomes.map(function (out) {
+              var cls = out.variant === 'danger' || out.isNoAnswer
+                ? 'btn-danger'
+                : (out.variant === 'primary' || out.key === 'confirmed' || out.key === 'extending_24h' ? 'btn-primary' : '');
+              return '<button type="button" class="btn btn-sm ' + cls + ' rg-wrapup-outcome-btn" data-outcome-key="' + escapeHtml(out.key) + '">' +
+                escapeHtml(isEn ? (out.labelEn || out.labelAr) : out.labelAr) +
+              '</button>';
+            }).join('')
+          : '<div class="rg-call-wrapup-empty">' + (isEn ? 'No quick shortcuts configured.' : 'لا توجد اختصارات سريعة مفعّلة حالياً.') + '</div>') +
       '</div>';
 
     document.body.appendChild(bar);
 
     var closeBtn = document.getElementById('rg-wrapup-close');
     if (closeBtn) closeBtn.addEventListener('click', closeCallWrapUpBar);
+
+    var manageBtn = document.getElementById('rg-wrapup-manage-btn');
+    if (manageBtn && isDeveloper) {
+      manageBtn.addEventListener('click', function () {
+        openDeveloperCallShortcutsModal(buildAppCtx(), function () {
+          if (lastOpenCallInfo) openCallWrapUpBar(lastOpenCallInfo);
+        });
+      });
+    }
 
     bar.querySelectorAll('.rg-wrapup-outcome-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -1675,6 +2028,11 @@
       setRoleUiDefaults: setRoleUiDefaults,
       getStatsControlConfig: getStatsControlConfig,
       setStatsControlConfig: setStatsControlConfig,
+      getCallWrapupShortcutsConfig: getCallWrapupShortcutsConfig,
+      setCallWrapupShortcutsConfig: setCallWrapupShortcutsConfig,
+      getActiveCallWrapupShortcuts: getActiveCallWrapupShortcuts,
+      mountCallShortcutsControlPanel: mountCallShortcutsControlPanel,
+      openDeveloperCallShortcutsModal: openDeveloperCallShortcutsModal,
       getEffectiveRoleUiResolution: getEffectiveRoleUiResolution,
       getRealUser: getRealUser,
       getPreviewState: getPreviewState,
@@ -2471,67 +2829,105 @@
     var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
     var isBackendLive = Boolean(root.RGApi.isBackendConnected && root.RGApi.isBackendConnected());
     var isLive = Boolean(isBackendLive || connInfo.url);
+    var isEn = state.prefs.lang === 'en';
     cleanAutoBindQueryFromAddressBar();
     if (isLive && root.RGApi.warmUpGas) {
       root.RGApi.warmUpGas();
     }
 
+    var eyeIconSvg = '<svg class="auth-eye-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+    var serverStatusLabel = isBackendLive
+      ? (isEn ? 'Auto-connected to Cloud Database' : 'متصل تلقائيًا بقاعدة البيانات السحابية')
+      : (isLive
+        ? (isEn ? 'Auto-connected to Google Apps Script' : 'متصل تلقائيًا بـ Google Apps Script')
+        : (isEn ? 'Local Preview (Sandbox)' : 'معاينة محلية (Sandbox)'));
+
     appRoot.innerHTML =
       '<main class="auth-screen">' +
         '<section class="auth-shell">' +
-          '<div class="auth-brand-panel">' +
-            '<div class="auth-brand-top">' +
-              '<img src="' + assetUrl('assets/images/logo.png') + '" alt="Rental Gate Logo" class="auth-logo">' +
-              '<div><h1 class="auth-brand-title">RENTAL GATE CRM</h1><p class="auth-brand-sub">نظام إدارة خدمة العملاء والحجوزات</p></div>' +
-            '</div>' +
-            '<p class="auth-summary">منصة متكاملة لإدارة حجوزات Rental Gate، متابعات الموظفين المتعددة، المشكلات ذات الأولوية، والتقارير الاحترافية عبر Google Sheets وGoogle Apps Script.</p>' +
-            '<ul class="auth-highlights">' +
-              '<li>سحب الحجوزات والتمديدات المعتمدة من Rental Gate API بأمان</li>' +
-              '<li>متابعات مستقلة لكل موظف دون استبدال أو تعارض كتابة</li>' +
-              '<li>إشعارات فورية للمشكلات مرتفعة الأولوية وسجل نشاطات موثق</li>' +
-            '</ul>' +
-          '</div>' +
           '<div class="auth-form-panel">' +
-            '<div class="auth-form-header">' +
-              '<div><h2>تسجيل الدخول</h2><p>أدخل بيانات حسابك الوظيفي للمتابعة</p></div>' +
-              '<div class="auth-toolbar-mini">' +
-                '<button type="button" class="btn btn-sm theme-toggle-btn" id="login-theme-btn" data-theme-state="' + (state.prefs.theme === 'dark' ? 'dark' : 'light') + '" aria-label="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '" title="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '">' + buildThemeToggleHtml(state.prefs.theme, true) + '</button>' +
-                '<button type="button" class="btn btn-sm" id="login-lang-btn">' + t('lang_toggle') + '</button>' +
+            '<div class="auth-form-container">' +
+              '<header class="auth-panel-topbar">' +
+                '<div class="auth-panel-brand">' +
+                  '<div class="auth-panel-logo-wrap"><img src="' + assetUrl('assets/images/logo.png') + '" alt="RENTAL GATE" class="auth-panel-logo"></div>' +
+                  '<div class="auth-panel-brand-copy">' +
+                    '<span class="auth-panel-brand-name" dir="ltr">RENTAL GATE</span>' +
+                    '<span class="auth-panel-brand-sub" dir="ltr">Rental Gate CRM</span>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="auth-toolbar-mini">' +
+                  '<button type="button" class="btn btn-sm theme-toggle-btn" id="login-theme-btn" data-theme-state="' + (state.prefs.theme === 'dark' ? 'dark' : 'light') + '" aria-label="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '" title="' + (state.prefs.theme === 'dark' ? t('theme_light') : t('theme_dark')) + '">' + buildThemeToggleHtml(state.prefs.theme, true) + '</button>' +
+                  '<button type="button" class="btn btn-sm" id="login-lang-btn">' + t('lang_toggle') + '</button>' +
+                '</div>' +
+              '</header>' +
+              '<div class="auth-form-core">' +
+                '<div class="auth-form-header">' +
+                  '<h1>' + (isEn ? 'Sign In' : 'تسجيل الدخول') + '</h1>' +
+                  '<p>' + (isEn ? 'Enter your work account credentials to continue' : 'أدخل بيانات حسابك الوظيفي للمتابعة') + '</p>' +
+                '</div>' +
+                '<form id="login-form" novalidate class="auth-login-form">' +
+                  '<div class="form-group">' +
+                    '<label class="form-label" for="login-username">' + (isEn ? 'Username' : 'اسم المستخدم') + '</label>' +
+                    '<input class="input mono auth-input" id="login-username" dir="ltr" lang="en" autocapitalize="none" spellcheck="false" autocomplete="username" placeholder="admin" required>' +
+                  '</div>' +
+                  '<div class="form-group">' +
+                    '<label class="form-label" for="login-password">' + (isEn ? 'Password' : 'كلمة المرور') + '</label>' +
+                    '<div class="password-field-wrap">' +
+                      '<input class="input auth-input" type="password" id="login-password" dir="ltr" lang="en" autocomplete="current-password" placeholder="••••••••" required>' +
+                      '<button type="button" class="password-toggle-btn" id="toggle-login-password" aria-label="' + (isEn ? 'Show password' : 'إظهار كلمة المرور') + '">' + eyeIconSvg + '<span class="auth-pwd-toggle-text">' + (isEn ? 'Show' : 'إظهار') + '</span></button>' +
+                    '</div>' +
+                  '</div>' +
+                  '<div id="login-error" class="form-error hidden" role="alert"></div>' +
+                  '<button type="submit" class="btn btn-primary auth-submit-btn" id="login-submit-btn">' + (isEn ? 'Sign In to System' : 'دخول إلى النظام') + '</button>' +
+                '</form>' +
+                '<div class="auth-mode-box">' +
+                  '<div class="auth-mode-row">' +
+                    '<div class="auth-mode-status"><strong>' + (isEn ? 'Server Status:' : 'حالة الخادم:') + '</strong> <span>' + serverStatusLabel + '</span></div>' +
+                    '<button type="button" class="btn btn-sm auth-health-btn" id="login-test-connection-btn">' + (isEn ? 'Test Connection' : 'اختبار اتصال الخادم') + '</button>' +
+                  '</div>' +
+                  '<div id="login-conn-test-result" class="hidden" role="status" style="margin-top:8px;"></div>' +
+                  (!isLive ? (
+                    '<div class="auth-demo-quick">' +
+                      '<button type="button" class="btn btn-sm demo-fill-btn" data-u="developer" data-p="Dev@123">' + (isEn ? 'Developer' : 'المبرمج (developer)') + '</button>' +
+                      '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">' + (isEn ? 'Admin' : 'المدير (admin)') + '</button>' +
+                      '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">' + (isEn ? 'Supervisor' : 'المشرف (supervisor)') + '</button>' +
+                      '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">' + (isEn ? 'Agent' : 'موظف (agent1)') + '</button>' +
+                    '</div>' +
+                    '<div class="auth-mode-note">' +
+                      (isEn
+                        ? 'Database and <span class="mono" dir="ltr">Apps Script</span> connections are configured via server environment variables (<span class="mono" dir="ltr">Vercel / .env</span>).'
+                        : 'يتم ضبط الاتصال بقاعدة البيانات و<span class="mono" dir="ltr">Apps Script</span> من متغيرات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط.') +
+                    '</div>'
+                  ) : (
+                    '<div class="auth-mode-note auth-mode-note-live">' +
+                      (isEn
+                        ? 'System is connected to the server. Enter your staff account credentials from <strong>Employees</strong> to sign in.'
+                        : 'النظام مربوط تلقائيًا بالخادم. أدخل حسابك الوظيفي المسجل في <strong>الموظفين</strong> للدخول مباشرة.') +
+                    '</div>'
+                  )) +
+                '</div>' +
+              '</div>' +
+              '<footer class="auth-panel-footer">' +
+                '<div class="rg-powered-by rg-powered-by-auth" dir="ltr">powerd by zeyad</div>' +
+              '</footer>' +
+            '</div>' +
+          '</div>' +
+          '<div class="auth-brand-panel">' +
+            '<img src="' + assetUrl('assets/images/login-bg.jpg') + '" alt="" class="auth-brand-bg-img" aria-hidden="true">' +
+            '<div class="auth-visual-stage">' +
+              '<div class="auth-visual-wordmark">' +
+                '<div class="auth-visual-brand-title" dir="ltr">RENTAL GATE</div>' +
+                '<div class="auth-visual-brand-rule" aria-hidden="true"></div>' +
+                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'نظام إدارة الحجوزات وخدمة العملاء') + '</p>' +
               '</div>' +
             '</div>' +
-            '<form id="login-form" novalidate style="display:flex;flex-direction:column;gap:14px;">' +
-              '<div class="form-group"><label class="form-label" for="login-username">اسم المستخدم</label><input class="input mono" id="login-username" dir="ltr" lang="en" autocapitalize="none" spellcheck="false" autocomplete="username" placeholder="admin" required></div>' +
-              '<div class="form-group">' +
-                '<label class="form-label" for="login-password">كلمة المرور</label>' +
-                '<div class="password-field-wrap">' +
-                  '<input class="input" type="password" id="login-password" dir="ltr" lang="en" autocomplete="current-password" placeholder="••••••••" required>' +
-                  '<button type="button" class="password-toggle-btn" id="toggle-login-password" aria-label="إظهار كلمة المرور">إظهار</button>' +
-                '</div>' +
-              '</div>' +
-              '<div id="login-error" class="form-error hidden" role="alert"></div>' +
-              '<button type="submit" class="btn btn-primary" id="login-submit-btn">دخول إلى النظام</button>' +
-            '</form>' +
-            '<div class="auth-mode-box">' +
-              '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
-                '<div><strong>حالة الخادم:</strong> ' + (isBackendLive ? 'متصل تلقائيًا بقاعدة البيانات السحابية' : (isLive ? 'متصل تلقائيًا بـ Google Apps Script' : 'معاينة محلية (Sandbox)')) + '</div>' +
-                '<button type="button" class="btn btn-sm" id="login-test-connection-btn">اختبار اتصال الخادم</button>' +
-              '</div>' +
-              '<div id="login-conn-test-result" class="hidden" role="status" style="margin-top:8px;"></div>' +
-              (!isLive ? (
-                '<div class="auth-demo-quick">' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="developer" data-p="Dev@123">المبرمج (developer)</button>' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">المدير (admin)</button>' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">المشرف (supervisor)</button>' +
-                  '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">موظف (agent1)</button>' +
-                '</div>' +
-                '<div style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.6;">' +
-                  'يتم ضبط الاتصال بقاعدة البيانات و<span class="mono" dir="ltr">Apps Script</span> من متغيرات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط.' +
-                '</div>'
-              ) : (
-                '<div class="glass-subcard" style="margin-top:8px;padding:10px 12px;font-size:12px;line-height:1.6;color:var(--text-secondary);">' +
-                  'النظام مربوط تلقائيًا بالخادم. أدخل حسابك الوظيفي المسجل في <strong>الموظفين</strong> للدخول مباشرة.' +
-                '</div>'
-              )) +
+            '<div class="auth-visual-pillars" aria-label="System Capabilities">' +
+              '<span>' + (isEn ? 'Live Reservations' : 'حجوزات فورية') + '</span>' +
+              '<span class="auth-pillar-sep" aria-hidden="true"></span>' +
+              '<span>' + (isEn ? 'Team Follow-Ups' : 'متابعات الفريق') + '</span>' +
+              '<span class="auth-pillar-sep" aria-hidden="true"></span>' +
+              '<span>' + (isEn ? 'Executive Reports' : 'تقارير تنفيذية') + '</span>' +
             '</div>' +
           '</div>' +
         '</section>' +
@@ -2557,7 +2953,14 @@
       pwdToggleBtn.addEventListener('click', function () {
         var nextType = pwdInput.type === 'password' ? 'text' : 'password';
         pwdInput.type = nextType;
-        pwdToggleBtn.textContent = nextType === 'text' ? 'إخفاء' : 'إظهار';
+        var lblEl = pwdToggleBtn.querySelector('.auth-pwd-toggle-text');
+        var nextText = nextType === 'text' ? (isEn ? 'Hide' : 'إخفاء') : (isEn ? 'Show' : 'إظهار');
+        if (lblEl) {
+          lblEl.textContent = nextText;
+        } else {
+          pwdToggleBtn.textContent = nextText;
+        }
+        pwdToggleBtn.setAttribute('aria-label', nextType === 'text' ? (isEn ? 'Hide password' : 'إخفاء كلمة المرور') : (isEn ? 'Show password' : 'إظهار كلمة المرور'));
       });
     }
 
@@ -2576,7 +2979,7 @@
         : String(uEl.value || '').trim();
       var p = String(pEl.value || '');
       if (!u || !p) {
-        errEl.textContent = 'يرجى إدخال اسم المستخدم وكلمة المرور.';
+        errEl.textContent = isEn ? 'Please enter your username and password.' : 'يرجى إدخال اسم المستخدم وكلمة المرور.';
         errEl.classList.remove('hidden');
         if (!u) uEl.focus();
         else pEl.focus();
@@ -2584,14 +2987,14 @@
       }
 
       submitBtn.disabled = true;
-      submitBtn.textContent = 'جاري الدخول...';
+      submitBtn.textContent = isEn ? 'Signing in...' : 'جاري الدخول...';
       var dashRange = (state.dashboard && state.dashboard.range) || '30d';
       var res = await root.RGAuth.login(u, p, { range: dashRange });
 
       if (!res || !res.success) {
         submitBtn.disabled = false;
-        submitBtn.textContent = 'دخول إلى النظام';
-        var rawMsg = (res && res.message) || 'تعذر تسجيل الدخول، يرجى التحقق من البيانات.';
+        submitBtn.textContent = isEn ? 'Sign In to System' : 'دخول إلى النظام';
+        var rawMsg = (res && res.message) || (isEn ? 'Unable to sign in. Please verify your credentials.' : 'تعذر تسجيل الدخول، يرجى التحقق من البيانات.');
         if (isLive && rawMsg.indexOf('اسم المستخدم أو كلمة المرور غير صحيحة') !== -1) {
           errEl.textContent = rawMsg + ' تأكد من صحة بيانات الحساب الوظيفي المسجل في صفحة الموظفين (الحساب المبدئي للتهيئة الأولى هو admin / Admin@123).';
         } else {
@@ -2617,19 +3020,19 @@
       testConnBtn.addEventListener('click', async function () {
         testConnBtn.disabled = true;
         var origText = testConnBtn.textContent;
-        testConnBtn.textContent = 'جاري الاختبار...';
+        testConnBtn.textContent = isEn ? 'Testing...' : 'جاري الاختبار...';
         testConnOut.classList.remove('hidden');
-        testConnOut.innerHTML = '<div class="glass-subcard" style="padding:8px 10px;font-size:12px;color:var(--text-secondary);">جاري فحص اتصال الخادم...</div>';
+        testConnOut.innerHTML = '<div class="glass-subcard" style="padding:8px 10px;font-size:12px;color:var(--text-secondary);">' + (isEn ? 'Checking server connection...' : 'جاري فحص اتصال الخادم...') + '</div>';
         try {
           var healthRes = root.RGApi.testServerHealth
             ? await root.RGApi.testServerHealth()
-            : { success: false, message: 'دالة اختبار الخادم غير متاحة.' };
+            : { success: false, message: isEn ? 'Server health check is unavailable.' : 'دالة اختبار الخادم غير متاحة.' };
           var parts = [];
           var okHealth = Boolean(healthRes && healthRes.success);
           var hd = (healthRes && healthRes.data) || {};
           parts.push(
             '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
-              '<span><strong>الخادم (/api/health):</strong> ' + escapeHtml((healthRes && healthRes.message) || (okHealth ? 'متصل' : 'غير متصل')) + '</span>' +
+              '<span><strong>' + (isEn ? 'Server (/api/health):' : 'الخادم (/api/health):') + '</strong> ' + escapeHtml((healthRes && healthRes.message) || (okHealth ? (isEn ? 'Connected' : 'متصل') : (isEn ? 'Disconnected' : 'غير متصل'))) + '</span>' +
               (hd.latencyMs ? '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + hd.latencyMs + 'ms</span>' : '') +
             '</div>'
           );
@@ -2639,7 +3042,7 @@
             var gd = (gasRes && gasRes.data) || {};
             parts.push(
               '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;padding-top:4px;border-top:1px solid var(--border-hairline);">' +
-                '<span><strong>Apps Script:</strong> ' + escapeHtml((gasRes && gasRes.message) || (gasRes && gasRes.success ? 'متصل' : 'فشل الاتصال')) + '</span>' +
+                '<span><strong>Apps Script:</strong> ' + escapeHtml((gasRes && gasRes.message) || (gasRes && gasRes.success ? (isEn ? 'Connected' : 'متصل') : (isEn ? 'Connection Failed' : 'فشل الاتصال'))) + '</span>' +
                 (gd.latencyMs ? '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + gd.latencyMs + 'ms</span>' : '') +
               '</div>'
             );
@@ -2651,7 +3054,7 @@
         } catch (err) {
           testConnOut.innerHTML =
             '<div class="form-error" style="padding:8px 10px;border-radius:var(--radius-sm);font-size:12px;">' +
-              escapeHtml((err && err.message) || 'تعذر فحص اتصال الخادم.') +
+              escapeHtml((err && err.message) || (isEn ? 'Unable to check server connection.' : 'تعذر فحص اتصال الخادم.')) +
             '</div>';
         } finally {
           testConnBtn.disabled = false;
@@ -4018,6 +4421,7 @@
               '</div>' +
               '<span class="sidebar-user-chevron" aria-hidden="true">' + renderIcon('M6 9l6 6 6-6') + '</span>' +
             '</button>' +
+            '<div class="rg-powered-by rg-powered-by-sidebar" dir="ltr">powerd by zeyad</div>' +
           '</div>' +
         '</aside>' +
         '<div class="main-column">' +
@@ -4064,6 +4468,7 @@
           '<div id="rg-shift-announcement-banner" class="rg-shift-banner-host rg-ui-topbar-ann-host hidden"></div>' +
           '<div id="rg-offline-banner" class="rg-offline-banner-host hidden"></div>' +
           '<main class="page-content" id="page-content"></main>' +
+          '<footer class="rg-shell-attribution"><span class="rg-powered-by" dir="ltr">powerd by zeyad</span></footer>' +
         '</div>' +
       '</div>';
 
@@ -4091,7 +4496,24 @@
       quickSearchForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
         var q = String(quickSearchInput.value || '').trim();
-        state.reservations = Object.assign({}, state.reservations || {}, { search: q, page: 1, viewMode: 'all' });
+        state.reservations = Object.assign({}, state.reservations || {}, {
+          search: q,
+          company: '',
+          branch: '',
+          status: '',
+          employeeId: '',
+          priority: '',
+          dateFrom: '',
+          dateTo: '',
+          timeField: 'both',
+          timeFrom: '',
+          timeTo: '',
+          unfollowedOnly: false,
+          hasProblemsOnly: false,
+          overdueUnpaidOnly: false,
+          page: 1,
+          viewMode: 'all'
+        });
         saveRouteFilters();
         state.route = 'reservations';
         quickSearchInput.blur();
@@ -4625,6 +5047,9 @@
       if (sData.stats_control_config) {
         setStatsControlConfig(sData.stats_control_config);
       }
+      if (sData.call_wrapup_shortcuts) {
+        setCallWrapupShortcutsConfig(sData.call_wrapup_shortcuts);
+      }
       if (sData.ui_simplification) {
         applyUiSimplification(sData.ui_simplification, true);
       }
@@ -4696,6 +5121,9 @@
         }
       }
 
+      if (d.callWrapupShortcuts) {
+        setCallWrapupShortcutsConfig(d.callWrapupShortcuts);
+      }
       if (d.changedSettings) {
         syncSettingsChangesSilently(d.user || curUser).catch(function () {});
       }
@@ -5081,6 +5509,9 @@
     if (bData.statsControlConfig || (bData.settings && bData.settings.stats_control_config)) {
       setStatsControlConfig(bData.statsControlConfig || (bData.settings && bData.settings.stats_control_config));
     }
+    if (bData.callWrapupShortcuts || (bData.settings && bData.settings.call_wrapup_shortcuts)) {
+      setCallWrapupShortcutsConfig(bData.callWrapupShortcuts || (bData.settings && bData.settings.call_wrapup_shortcuts));
+    }
     if (bData.uiSimplification) {
       applyUiSimplification(bData.uiSimplification);
     } else {
@@ -5308,7 +5739,12 @@
     loadEmployeesState: loadEmployeesState,
     deleteEmployeeFromState: deleteEmployeeFromState,
     toggleEmployeeStatusInState: toggleEmployeeStatusInState,
-    upsertEmployeeInState: upsertEmployeeInState
+    upsertEmployeeInState: upsertEmployeeInState,
+    getCallWrapupShortcutsConfig: getCallWrapupShortcutsConfig,
+    setCallWrapupShortcutsConfig: setCallWrapupShortcutsConfig,
+    getActiveCallWrapupShortcuts: getActiveCallWrapupShortcuts,
+    mountCallShortcutsControlPanel: mountCallShortcutsControlPanel,
+    openDeveloperCallShortcutsModal: openDeveloperCallShortcutsModal
   };
 
   document.addEventListener('rg:unauthorized', function () {
@@ -5366,7 +5802,7 @@
     }
     var modalRoot = document.getElementById('modal-root');
     if (modalRoot && modalRoot.firstElementChild) {
-      var closeBtn = modalRoot.querySelector('#drawer-close-btn, #res-drawer-close, #emp-drawer-close, #prb-upd-close, #res-edit-cancel, #fu-edit-cancel, #prb-loading-cancel, #emp-cancel, #preset-modal-cancel, #personal-settings-close, #del-all-res-close, #perms-cat-close, #ann-mgr-close, #rg-preview-modal-close, #exp-close, [data-modal-close]');
+      var closeBtn = modalRoot.querySelector('#drawer-close-btn, #res-drawer-close, #emp-drawer-close, #prb-upd-close, #res-edit-cancel, #fu-edit-cancel, #prb-loading-cancel, #emp-cancel, #preset-modal-cancel, #personal-settings-close, #del-all-res-close, #perms-cat-close, #ann-mgr-close, #rg-preview-modal-close, #exp-close, #sc-mgr-close, [data-modal-close]');
       if (closeBtn && typeof closeBtn.click === 'function') {
         closeBtn.click();
       } else {

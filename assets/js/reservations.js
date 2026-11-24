@@ -402,9 +402,19 @@
             '<select class="select rg-ui-res-extra-filter" id="res-prio" aria-label="' + t('priority') + '"><option value="">' + t('all_priorities') + '</option>' +
               root.RGCrmCore.PROBLEM_PRIORITIES.map(function (p) { return '<option value="' + esc(p) + '"' + (state.priority === p ? ' selected' : '') + '>' + esc(p) + '</option>'; }).join('') +
             '</select>' +
-            '<input type="date" class="input rg-ui-res-extra-filter" id="res-from" data-rg-range-pair="res-filter-range" data-rg-range-role="start" value="' + esc(state.dateFrom || '') + '" aria-label="' + t('from_date') + '">' +
-            '<input type="date" class="input rg-ui-res-extra-filter" id="res-to" data-rg-range-pair="res-filter-range" data-rg-range-role="end" value="' + esc(state.dateTo || '') + '" aria-label="' + t('to_date') + '">' +
+            '<div class="rg-res-date-field rg-ui-res-extra-filter" id="res-from-wrap">' +
+              '<label class="rg-res-date-label" for="res-from"><span>' + (isEn ? 'Start Date (Optional)' : 'من تاريخ (البداية · اختياري)') + '</span></label>' +
+              '<input type="date" class="input" id="res-from" data-rg-range-pair="res-filter-range" data-rg-range-role="start" value="' + esc(state.dateFrom || '') + '" aria-label="' + t('from_date') + '">' +
+            '</div>' +
+            '<div class="rg-res-date-field rg-ui-res-extra-filter" id="res-to-wrap">' +
+              '<label class="rg-res-date-label" for="res-to">' +
+                '<span>' + (isEn ? 'End Date (Works Standalone)' : 'تاريخ النهاية (يعمل بمفرده)') + '</span>' +
+                '<span class="rg-res-standalone-tag" id="res-to-standalone-tag">' + (isEn ? 'Standalone ✓' : 'مستقل ✓') + '</span>' +
+              '</label>' +
+              '<input type="date" class="input" id="res-to" data-rg-range-pair="res-filter-range" data-rg-range-role="end" value="' + esc(state.dateTo || '') + '" aria-label="' + t('to_date') + '">' +
+            '</div>' +
           '</div>' +
+          '<div class="rg-date-filter-hint rg-ui-res-extra-filter" id="res-date-filter-hint" role="status" aria-live="polite"></div>' +
           '<div class="toolbar-row rg-ui-res-extra-filter" style="flex-wrap:wrap;">' +
             '<select class="select" id="res-time-field" aria-label="' + (isEn ? 'Time Filter Field' : 'نوع وقت الحركة') + '" style="width:auto;min-width:170px;">' +
               '<option value="both"' + (state.timeField === 'both' ? ' selected' : '') + '>' + (isEn ? 'Pickup or Return Time' : 'وقت التسليم أو الاستلام') + '</option>' +
@@ -474,8 +484,15 @@
         '</div>'
       ) : '';
 
+      var cleanSearchEmpty = String(state.search || '').trim();
       return bulkBarHtml + (list.length === 0
-        ? '<div class="empty-state">لا توجد حجوزات مطابقة للفلاتر الحالية.</div>'
+        ? '<div class="empty-state">' +
+            (cleanSearchEmpty
+              ? (isEn
+                  ? ('No bookings matched search «' + esc(cleanSearchEmpty) + '». <button type="button" class="btn btn-sm" id="res-empty-clear-search">Clear Search</button>')
+                  : ('لا توجد نتائج مطابقة للبحث «' + esc(cleanSearchEmpty) + '». <button type="button" class="btn btn-sm" id="res-empty-clear-search">مسح البحث</button>'))
+              : (isEn ? 'No bookings match the current filters.' : 'لا توجد حجوزات مطابقة للفلاتر الحالية.')) +
+          '</div>'
         : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
             (canBulkReassign ? '<th class="res-bulk-th rg-ui-res-bulk"><input type="checkbox" id="res-bulk-select-all" aria-label="' + (isEn ? 'Select all on page' : 'تحديد كل الحجوزات في الصفحة') + '"' + (allPageSelected ? ' checked' : '') + '></th>' : '') +
             visibleCols.map(function (c) {
@@ -1069,6 +1086,82 @@
           });
         });
       });
+
+      var clearSearchEmptyBtn = region.querySelector('#res-empty-clear-search');
+      if (clearSearchEmptyBtn) {
+        clearSearchEmptyBtn.addEventListener('click', function () {
+          var sEl = document.getElementById('res-search');
+          if (sEl) sEl.value = '';
+          state.search = '';
+          state.page = 1;
+          if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+          refreshTableRegion({ forceRefresh: true });
+        });
+      }
+    }
+
+    var lastPaintedSearch = String(state.search || '').trim();
+
+    function updateDateFilterHint() {
+      var hintEl = container.querySelector('#res-date-filter-hint');
+      var toWrap = container.querySelector('#res-to-wrap');
+      var fromWrap = container.querySelector('#res-from-wrap');
+      var fromEl = document.getElementById('res-from');
+      var toEl = document.getElementById('res-to');
+      var dFrom = String((fromEl ? fromEl.value : state.dateFrom) || '').trim();
+      var dTo = String((toEl ? toEl.value : state.dateTo) || '').trim();
+      var isStandaloneEnd = Boolean(dTo && !dFrom);
+      if (toWrap) toWrap.classList.toggle('is-standalone-end-active', isStandaloneEnd);
+      if (fromWrap) fromWrap.classList.toggle('is-range-start-active', Boolean(dFrom));
+      if (!hintEl) return;
+      hintEl.classList.toggle('is-standalone-end-active', isStandaloneEnd);
+      hintEl.classList.toggle('is-range-active', Boolean(dFrom && dTo));
+
+      if (isStandaloneEnd) {
+        hintEl.innerHTML =
+          '<span class="rg-date-filter-dot" aria-hidden="true"></span>' +
+          '<span class="rg-date-filter-text">' +
+            (isEn
+              ? ('<strong>Standalone End Date Active:</strong> Showing only bookings ending on <span class="mono" dir="ltr">' + esc(dTo) + '</span> (no Start Date needed).')
+              : ('<strong>وضع تاريخ النهاية المستقل مفعّل:</strong> يعرض النظام الحجوزات المنتهية تحديداً بتاريخ <span class="mono" dir="ltr">' + esc(dTo) + '</span> بدون الحاجة لتاريخ بداية.')) +
+          '</span>' +
+          '<button type="button" class="btn btn-sm rg-date-hint-clear" id="res-clear-to-only">' + (isEn ? 'Clear End Date' : 'مسح تاريخ النهاية') + '</button>';
+        var clrToBtn = hintEl.querySelector('#res-clear-to-only');
+        if (clrToBtn) {
+          clrToBtn.addEventListener('click', function () {
+            if (toEl) toEl.value = '';
+            state.dateTo = '';
+            if (root.RGCrmDatePicker && root.RGCrmDatePicker.enhanceAll) {
+              root.RGCrmDatePicker.enhanceAll(container);
+            }
+            applyFilterChange();
+          });
+        }
+      } else if (dFrom && dTo) {
+        hintEl.innerHTML =
+          '<span class="rg-date-filter-dot" aria-hidden="true"></span>' +
+          '<span class="rg-date-filter-text">' +
+            (isEn
+              ? ('<strong>Start Date Range:</strong> Showing bookings starting from <span class="mono" dir="ltr">' + esc(dFrom) + '</span> to <span class="mono" dir="ltr">' + esc(dTo) + '</span>.')
+              : ('<strong>نطاق تاريخ البداية:</strong> عرض الحجوزات التي تبدأ من <span class="mono" dir="ltr">' + esc(dFrom) + '</span> إلى <span class="mono" dir="ltr">' + esc(dTo) + '</span>.')) +
+          '</span>';
+      } else if (dFrom) {
+        hintEl.innerHTML =
+          '<span class="rg-date-filter-dot" aria-hidden="true"></span>' +
+          '<span class="rg-date-filter-text">' +
+            (isEn
+              ? ('<strong>Start Date Filter:</strong> Showing bookings starting from <span class="mono" dir="ltr">' + esc(dFrom) + '</span> onwards.')
+              : ('<strong>فلتر البداية فقط:</strong> عرض الحجوزات التي تبدأ من تاريخ <span class="mono" dir="ltr">' + esc(dFrom) + '</span> فأعلى.')) +
+          '</span>';
+      } else {
+        hintEl.innerHTML =
+          '<span class="rg-date-filter-dot" aria-hidden="true"></span>' +
+          '<span class="rg-date-filter-text">' +
+            (isEn
+              ? 'Tip: <strong>End Date</strong> works independently — select it alone without a Start Date to list bookings ending on that exact date.'
+              : 'معلومة: يمكنك اختيار <strong>تاريخ النهاية</strong> بمفرده (بدون تاريخ بداية) للبحث عن الحجوزات المنتهية في هذا التاريخ المحدد.') +
+          '</span>';
+      }
     }
 
     function paintTableError(msg) {
@@ -1093,6 +1186,7 @@
     function paintTableRegion(data) {
       var region = container.querySelector('#res-table-region');
       if (!region) return;
+      lastPaintedSearch = String(state.search || '').trim();
       currentItems = data.items || [];
       currentTotalPages = data.totalPages || 1;
       if (data.page && Number(data.page) > 0) {
@@ -1206,15 +1300,48 @@
       }
     }
 
+    function preFilterVisibleItemsForSearch() {
+      var core = root.RGCrmCore;
+      var curSearchClean = String(state.search || '').trim();
+      var region = container.querySelector('#res-table-region');
+      if (!region) return;
+      if (curSearchClean && core && core.filterReservations && currentItems.length > 0) {
+        var userCtx = {
+          role: (currentUser && currentUser.role) || 'agent',
+          employeeId: currentEmpId,
+          allowAgentViewAll: true,
+          user: currentUser
+        };
+        var strictMatches = core.filterReservations(currentItems, [], getQueryPayload(), userCtx);
+        if (strictMatches.length > 0) {
+          currentItems = strictMatches;
+          region.innerHTML = buildTableRegionHtml({
+            items: strictMatches,
+            total: strictMatches.length,
+            page: 1,
+            totalPages: 1
+          });
+          bindTableRegionEvents(region);
+          return;
+        }
+      }
+      currentItems = [];
+      region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+    }
+
     async function refreshTableRegion(opts) {
       var o = opts || {};
       var seq = ++activeFetchSeq;
       var region = container.querySelector('#res-table-region');
-      if (region && !o.silentRefresh && currentItems.length === 0) {
+      var curSearchClean = String(state.search || '').trim();
+      var searchChanged = curSearchClean !== lastPaintedSearch;
+      if (searchChanged && !o.silentRefresh) {
+        preFilterVisibleItemsForSearch();
+      } else if (region && !o.silentRefresh && currentItems.length === 0) {
         region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       }
       var queryPayload = getQueryPayload({
-        forceRefresh: Boolean(o.forceRefresh),
+        forceRefresh: Boolean(o.forceRefresh || searchChanged),
         silentRefresh: Boolean(o.silentRefresh),
         abortKey: 'res:list'
       });
@@ -1229,13 +1356,15 @@
           return refreshTableRegion(Object.assign({}, o, { _clampRetried: true, forceRefresh: true }));
         }
         paintTableRegion(resp.data);
-      } else if (!o.silentRefresh && currentItems.length === 0) {
+      } else if (searchChanged || (!o.silentRefresh && currentItems.length === 0)) {
+        currentItems = [];
         paintTableError((resp && resp.message) || 'تعذر تحميل الحجوزات.');
       } else if (!o.silentRefresh && ctx && ctx.toast) {
         ctx.toast((resp && resp.message) || 'تعذر تحديث الحجوزات.', true);
       }
     }
 
+    updateDateFilterHint();
     if (initialLoadError) {
       paintTableError(initialLoadError);
     } else {
@@ -1262,17 +1391,38 @@
       state.hasProblemsOnly = document.getElementById('res-problems').checked;
       state.overdueUnpaidOnly = Boolean(ovEl && ovEl.checked);
       state.page = 1;
+      updateDateFilterHint();
       if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       refreshTableRegion();
     }
 
     var searchTimer = null;
-    document.getElementById('res-search').addEventListener('input', function () {
+    var resSearchEl = document.getElementById('res-search');
+    resSearchEl.addEventListener('input', function () {
       state.search = this.value;
       state.page = 1;
       if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+      preFilterVisibleItemsForSearch();
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(applyFilterChange, 220);
+      searchTimer = setTimeout(applyFilterChange, 180);
+    });
+    resSearchEl.addEventListener('search', function () {
+      clearTimeout(searchTimer);
+      applyFilterChange();
+    });
+    resSearchEl.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        clearTimeout(searchTimer);
+        applyFilterChange();
+      }
+    });
+
+    ['res-from', 'res-to'].forEach(function (id) {
+      var dEl = document.getElementById(id);
+      if (dEl) {
+        dEl.addEventListener('input', updateDateFilterHint);
+      }
     });
 
     ['res-company', 'res-branch', 'res-status', 'res-emp', 'res-prio', 'res-from', 'res-to', 'res-time-field', 'res-time-from', 'res-time-to', 'res-unfollowed', 'res-problems', 'res-overdue-unpaid'].forEach(function (id) {
@@ -1303,8 +1453,9 @@
       document.getElementById('res-unfollowed').checked = false;
       document.getElementById('res-problems').checked = false;
       if (ovEl) ovEl.checked = false;
+      updateDateFilterHint();
       if (ctx.saveRouteFilters) ctx.saveRouteFilters();
-      refreshTableRegion();
+      refreshTableRegion({ forceRefresh: true });
       ctx.toast(ctx.lang === 'en' ? 'Filters reset.' : 'تمت إعادة ضبط جميع الفلاتر.');
     });
 
@@ -1867,11 +2018,13 @@
 
       var calSearchEl = calShell.querySelector('#today-cal-search');
       if (calSearchEl) {
-        calSearchEl.addEventListener('input', function () {
+        var syncCalSearch = function () {
           state.todayCalendarSearch = calSearchEl.value;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
-        });
+        };
+        calSearchEl.addEventListener('input', syncCalSearch);
+        calSearchEl.addEventListener('search', syncCalSearch);
       }
 
       var calIcsBtn = calShell.querySelector('#today-cal-ics-btn');
@@ -1985,11 +2138,13 @@
 
       var radarSearchEl = radarWrap.querySelector('#radar-search-input');
       if (radarSearchEl) {
-        radarSearchEl.addEventListener('input', function () {
+        var onRadarSearchChange = function () {
           state.radarSearch = radarSearchEl.value;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintRadarView();
-        });
+        };
+        radarSearchEl.addEventListener('input', onRadarSearchChange);
+        radarSearchEl.addEventListener('search', onRadarSearchChange);
       }
 
       var radarRefreshBtn = radarWrap.querySelector('#radar-refresh-btn');
@@ -2273,11 +2428,13 @@
 
       var todaySearchEl = contentHost.querySelector('#today-search-input');
       if (todaySearchEl) {
-        todaySearchEl.addEventListener('input', function () {
+        var syncTodaySearch = function () {
           state.todaySearch = todaySearchEl.value;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
-        });
+        };
+        todaySearchEl.addEventListener('input', syncTodaySearch);
+        todaySearchEl.addEventListener('search', syncTodaySearch);
       }
 
       var todayRefreshBtn = contentHost.querySelector('#today-refresh-btn');
