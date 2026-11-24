@@ -1110,12 +1110,22 @@ test('developer statistics visibility control filters leaderboard and performanc
 
 test('filterReservations and resolvePullDateRange support end-date-only filtering without startDate', () => {
   const reservations = [
-    { id: 'R1', startDate: '2026-11-10', lastUpdatedAt: '2026-11-10T10:00:00Z' },
-    { id: 'R2', startDate: '2026-11-18', lastUpdatedAt: '2026-11-18T10:00:00Z' },
-    { id: 'R3', startDate: '2026-11-25', lastUpdatedAt: '2026-11-25T10:00:00Z' }
+    { id: 'R1', startDate: '2026-11-10', endDate: '2026-11-18', lastUpdatedAt: '2026-11-10T10:00:00Z' },
+    { id: 'R2', startDate: '2026-11-12', endDate: '2026-11-18', extendedUntilDate: '2026-11-22', lastUpdatedAt: '2026-11-18T10:00:00Z' },
+    { id: 'R3', startDate: '2026-11-15', endDate: '2026-11-18T14:30:00', lastUpdatedAt: '2026-11-19T10:00:00Z' },
+    { id: 'R4', startDate: '2026-11-18', endDate: '2026-11-25', lastUpdatedAt: '2026-11-25T10:00:00Z' }
   ];
+  // Standalone dateTo without dateFrom returns only reservations ending on that exact date
   const endOnlyFiltered = core.filterReservations(reservations, [], { dateFrom: '', dateTo: '2026-11-18' });
-  assert.deepEqual(endOnlyFiltered.map((r: any) => r.id), ['R2', 'R1']);
+  assert.deepEqual(endOnlyFiltered.map((r: any) => r.id), ['R3', 'R1']);
+
+  // Extended reservation matches its effective extended end date
+  const extEndFiltered = core.filterReservations(reservations, [], { dateFrom: '', dateTo: '2026-11-22' });
+  assert.deepEqual(extEndFiltered.map((r: any) => r.id), ['R2']);
+
+  // Range with both dateFrom and dateTo still filters startDate within [dateFrom, dateTo]
+  const rangeFiltered = core.filterReservations(reservations, [], { dateFrom: '2026-11-12', dateTo: '2026-11-18' });
+  assert.deepEqual(rangeFiltered.map((r: any) => r.id), ['R4', 'R3', 'R2']);
 
   const endOnlyPull = core.resolvePullDateRange({ preset: 'custom', dateFrom: '', dateTo: '2026-11-18' }, '2026-11-22');
   assert.equal(endOnlyPull.hasCustomRange, true);

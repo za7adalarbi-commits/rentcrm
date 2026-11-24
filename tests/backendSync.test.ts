@@ -101,6 +101,17 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       }
     }
 
+    const exactEndMatch = whereSegment.match(/LEFT\(COALESCE\(NULLIF\(r\.extended_until_date[\s\S]*?\)\s*,\s*10\)\s*=\s*\$(\d+)/);
+    if (exactEndMatch) {
+      const targetEnd = String(params[Number(exactEndMatch[1]) - 1] || '').slice(0, 10);
+      if (targetEnd) {
+        list = list.filter((r) => {
+          const effEnd = String(r.extended_until_date || r.end_date || r.original_end_date || '').slice(0, 10);
+          return Boolean(effEnd) && effEnd === targetEnd;
+        });
+      }
+    }
+
     const statusMatch = whereSegment.match(/r\.internal_status\s*=\s*\$(\d+)/);
     if (statusMatch) {
       const st = String(params[Number(statusMatch[1]) - 1] || '');
@@ -3370,5 +3381,92 @@ test('API routing guards: vercel.json never rewrites /api/* to index.html or sel
   assert.equal(noDbHealth.success, true);
   assert.ok(noDbHealth.message.includes('DATABASE_URL'));
 });
+
+test('backend getReservations filters by exact effective end date when dateTo is provided without dateFrom', async () => {
+  const executor = createInMemoryMockExecutor();
+  await dispatchCrmRequest(executor, { action: 'ping' });
+  const loginRes = await dispatchCrmRequest(executor, {
+    action: 'login',
+    payload: { username: 'Admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' }
+  });
+  assert.equal(loginRes.success, true);
+  const token = loginRes.data.token;
+
+  const now = new Date();
+  executor.state.reservations.push(
+    {
+      id: 'RES_END_1',
+      reservation_number: '1001',
+      customer_name: 'عميل 1',
+      start_date: '2026-11-10',
+      end_date: '2026-11-20',
+      original_end_date: '2026-11-20',
+      extended_until_date: '',
+      internal_status: 'مؤكد',
+      priority: 'عادي',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: 'RES_END_2',
+      reservation_number: '1002',
+      customer_name: 'عميل 2',
+      start_date: '2026-11-12',
+      end_date: '2026-11-20',
+      original_end_date: '2026-11-20',
+      extended_until_date: '2026-11-24',
+      internal_status: 'مؤكد',
+      priority: 'عادي',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: 'RES_END_3',
+      reservation_number: '1003',
+      customer_name: 'عميل 3',
+      start_date: '2026-11-15',
+      end_date: '2026-11-19',
+      original_end_date: '2026-11-19',
+      extended_until_date: '',
+      internal_status: 'مؤكد',
+      priority: 'عادي',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      created_at: now,
+      updated_at: now
+    }
+  );
+
+  const endOnly20 = await dispatchCrmRequest(executor, {
+    action: 'getReservations',
+    token,
+    payload: { dateFrom: '', dateTo: '2026-11-20' }
+  });
+  assert.equal(endOnly20.success, true);
+  assert.deepEqual(endOnly20.data.items.map((x: any) => x.id), ['RES_END_1']);
+  assert.equal(endOnly20.data.total, 1);
+
+  const endOnly24 = await dispatchCrmRequest(executor, {
+    action: 'getReservations',
+    token,
+    payload: { dateFrom: '', dateTo: '2026-11-24' }
+  });
+  assert.equal(endOnly24.success, true);
+  assert.deepEqual(endOnly24.data.items.map((x: any) => x.id), ['RES_END_2']);
+
+  const rangeRes = await dispatchCrmRequest(executor, {
+    action: 'getReservations',
+    token,
+    payload: { dateFrom: '2026-11-10', dateTo: '2026-11-14' }
+  });
+  assert.equal(rangeRes.success, true);
+  assert.deepEqual(rangeRes.data.items.map((x: any) => x.id).sort(), ['RES_END_1', 'RES_END_2']);
+});
+
+
 
 

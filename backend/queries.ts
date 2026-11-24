@@ -47,6 +47,29 @@ function str(v: unknown, fallback = ''): string {
   return String(v).trim();
 }
 
+const PG_SEARCH_NORM_FROM = '٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹أإآٱىةـًٌٍَُِّْ';
+const PG_SEARCH_NORM_TO   = '01234567890123456789اااايه';
+
+export function buildPgSearchCondition(columns: string[], rawQuery: unknown, params: any[]): string {
+  const qStr = str(rawQuery);
+  if (!qStr || !Array.isArray(columns) || columns.length === 0) return '';
+  const tokens: string[] = typeof crmCore.tokenizeSearchQuery === 'function'
+    ? crmCore.tokenizeSearchQuery(qStr)
+    : qStr.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return '';
+  const tokenClauses: string[] = [];
+  for (const tok of tokens) {
+    const safeTok = String(tok).replace(/[!%_]/g, (m) => '!' + m);
+    params.push(`%${safeTok}%`);
+    const pIdx = params.length;
+    const perCol = columns.map(
+      (col) => `TRANSLATE(COALESCE(${col}, ''), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') ILIKE $${pIdx} ESCAPE '!'`
+    );
+    tokenClauses.push(`(${perCol.join(' OR ')})`);
+  }
+  return tokenClauses.length === 1 ? tokenClauses[0] : `(${tokenClauses.join(' AND ')})`;
+}
+
 async function recordSyncTombstone(
   client: DbClient,
   entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement',
@@ -1031,6 +1054,9 @@ export async function getAppBootstrap(
   const statsControlConfig = typeof crmCore.normalizeStatsControlConfig === 'function'
     ? crmCore.normalizeStatsControlConfig(settings.stats_control_config)
     : { excludedFromStatsEmployeeIds: [] };
+  const callWrapupShortcuts = typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function'
+    ? crmCore.normalizeCallWrapupShortcutsConfig(settings.call_wrapup_shortcuts)
+    : { items: crmCore.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' };
   const handoverSettings = crmCore.normalizeHandoverSettings(settings.handover_settings);
   const layoutPrefs = crmCore.normalizeUserLayoutPrefs(parseJsonValue(settings[`layout_prefs_u_${session.user.id}`], {}));
   const rawPinnedCritical = parseJsonValue<any[]>(settings[`pinned_res_u_${session.user.id}`], []);
@@ -1053,6 +1079,7 @@ export async function getAppBootstrap(
       ui_simplification: uiSimplification,
       role_ui_defaults: roleUiDefaults,
       stats_control_config: statsControlConfig,
+      call_wrapup_shortcuts: callWrapupShortcuts,
       handover_settings: handoverSettings,
       gas_webapp_url: serverCfg.gasWebAppUrl,
       auto_sync_enabled: settings.auto_sync_enabled !== false,
@@ -1075,6 +1102,7 @@ export async function getAppBootstrap(
     uiSimplification,
     roleUiDefaults,
     statsControlConfig,
+    callWrapupShortcuts,
     handoverSettings,
     announcements: announcementsData.activeItems || [],
     activeLocks: locksData.items || [],
@@ -1127,14 +1155,21 @@ export async function getReservations(
     clauses.push(`r.branch_name = $${params.length}`);
   }
 
-  if (payload.dateFrom) {
-    params.push(str(payload.dateFrom));
+  const dateFrom = str(payload.dateFrom).slice(0, 10);
+  const dateTo = str(payload.dateTo).slice(0, 10);
+  if (dateFrom && dateTo) {
+    params.push(dateFrom);
     clauses.push(`r.start_date >= $${params.length}`);
-  }
-
-  if (payload.dateTo) {
-    params.push(str(payload.dateTo));
+    params.push(dateTo);
     clauses.push(`r.start_date <= $${params.length}`);
+  } else if (dateFrom) {
+    params.push(dateFrom);
+    clauses.push(`r.start_date >= $${params.length}`);
+  } else if (dateTo) {
+    params.push(dateTo);
+    clauses.push(
+      `LEFT(COALESCE(NULLIF(r.extended_until_date, ''), NULLIF(r.end_date, ''), NULLIF(r.original_end_date, '')), 10) = $${params.length}`
+    );
   }
 
   if (toBool(payload.hasProblem) || toBool(payload.hasProblemsOnly)) {
@@ -1150,17 +1185,16 @@ export async function getReservations(
   }
 
   if (payload.search) {
-    params.push(`%${str(payload.search)}%`);
-    const pIdx = params.length;
-    clauses.push(`(
-      r.reservation_number ILIKE $${pIdx} OR
-      r.customer_name ILIKE $${pIdx} OR
-      r.customer_phone ILIKE $${pIdx} OR
-      r.car_name ILIKE $${pIdx} OR
-      r.plate_number ILIKE $${pIdx} OR
-      r.branch_name ILIKE $${pIdx} OR
-      r.company_name ILIKE $${pIdx}
-    )`);
+    const searchCond = buildPgSearchCondition([
+      'r.reservation_number',
+      'r.customer_name',
+      'r.customer_phone',
+      'r.car_name',
+      'r.plate_number',
+      'r.branch_name',
+      'r.company_name'
+    ], payload.search, params);
+    if (searchCond) clauses.push(searchCond);
   }
 
   const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1240,6 +1274,7 @@ export async function getReservations(
 
     const timeField = str(payload.timeField || 'both').toLowerCase();
     const filtered = crmCore.filterReservations(mappedItems, [], {
+      search: str(payload.search),
       timeField,
       timeFrom: str(payload.timeFrom),
       timeTo: str(payload.timeTo),
@@ -2417,9 +2452,14 @@ export async function getTeamFollowUps(executor: DbExecutor, _session: AuthSessi
     clauses.push(`follow_up_date <= $${params.length}`);
   }
   if (payload.search) {
-    params.push(`%${str(payload.search)}%`);
-    const pIdx = params.length;
-    clauses.push(`(reservation_number ILIKE $${pIdx} OR customer_name ILIKE $${pIdx} OR action ILIKE $${pIdx} OR notes ILIKE $${pIdx} OR employee_name ILIKE $${pIdx})`);
+    const searchCondFu = buildPgSearchCondition([
+      'reservation_number',
+      'customer_name',
+      'action',
+      'notes',
+      'employee_name'
+    ], payload.search, params);
+    if (searchCondFu) clauses.push(searchCondFu);
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const fuRes = await executor.query(`SELECT * FROM follow_ups ${where} ORDER BY created_at DESC LIMIT 500`, params);
@@ -2678,9 +2718,13 @@ export async function getProblems(executor: DbExecutor, _session: AuthSession, p
     clauses.push(`assigned_employee_ids @> $${params.length}::jsonb`);
   }
   if (payload.search) {
-    params.push(`%${str(payload.search)}%`);
-    const pIdx = params.length;
-    clauses.push(`(problem_number ILIKE $${pIdx} OR reservation_number ILIKE $${pIdx} OR customer_name ILIKE $${pIdx} OR description ILIKE $${pIdx})`);
+    const searchCondPrb = buildPgSearchCondition([
+      'problem_number',
+      'reservation_number',
+      'customer_name',
+      'description'
+    ], payload.search, params);
+    if (searchCondPrb) clauses.push(searchCondPrb);
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const prbRes = await executor.query(`SELECT * FROM problems ${where} ORDER BY updated_at DESC LIMIT 400`, params);
@@ -3305,6 +3349,7 @@ export async function getSettings(executor: DbExecutor, session: AuthSession) {
     ui_simplification: crmCore.normalizeUiSimplificationSettings(map.ui_simplification),
     role_ui_defaults: typeof crmCore.normalizeRoleUiDefaults === 'function' ? crmCore.normalizeRoleUiDefaults(map.role_ui_defaults) : {},
     stats_control_config: typeof crmCore.normalizeStatsControlConfig === 'function' ? crmCore.normalizeStatsControlConfig(map.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
+    call_wrapup_shortcuts: typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function' ? crmCore.normalizeCallWrapupShortcutsConfig(map.call_wrapup_shortcuts) : { items: crmCore.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
     handover_settings: crmCore.normalizeHandoverSettings(map.handover_settings),
     connection_mode: serverCfg.mode || 'neon',
     gas_webapp_url: serverCfg.gasWebAppUrl,
@@ -3357,11 +3402,15 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     payload.ui_simplification !== undefined ||
     payload.role_ui_defaults !== undefined ||
     payload.stats_control_config !== undefined ||
+    payload.call_wrapup_shortcuts !== undefined ||
     payload.auto_sync_interval_hours !== undefined ||
     payload.auto_sync_interval_minutes !== undefined
   );
   if (payload.stats_control_config !== undefined && session.user.role !== 'developer') {
     throw new Error('FORBIDDEN: التحكم في ظهور الموظفين بالإحصائيات متاح للمبرمج فقط.');
+  }
+  if (payload.call_wrapup_shortcuts !== undefined && session.user.role !== 'developer') {
+    throw new Error('FORBIDDEN: التحكم في اختصارات نافذة الاتصال متاح للمبرمج فقط.');
   }
   if (hasSystemSettingFields || payload.handover_settings === undefined) {
     requirePermission(session, 'manage_settings');
@@ -3390,6 +3439,22 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     normStatsCfg.updatedBy = session.user.name;
     updates.push(['stats_control_config', JSON.stringify(normStatsCfg)]);
   }
+  let shortcutsChangedDiff: { field: string; label: string; before: string; after: string } | null = null;
+  if (payload.call_wrapup_shortcuts !== undefined && typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function') {
+    const prevSc = crmCore.normalizeCallWrapupShortcutsConfig(prevMap.call_wrapup_shortcuts);
+    const normSc = crmCore.normalizeCallWrapupShortcutsConfig(payload.call_wrapup_shortcuts);
+    normSc.updatedAt = new Date().toISOString();
+    normSc.updatedBy = session.user.name;
+    updates.push(['call_wrapup_shortcuts', JSON.stringify(normSc)]);
+    if (JSON.stringify(prevSc.items) !== JSON.stringify(normSc.items) || prevSc.customized !== normSc.customized) {
+      shortcutsChangedDiff = {
+        field: 'call_wrapup_shortcuts',
+        label: 'اختصارات نافذة الاتصال',
+        before: String(prevSc.items.length) + ' اختصار',
+        after: String(normSc.items.length) + ' اختصار'
+      };
+    }
+  }
   let handoverChangedDiff: { field: string; label: string; before: string; after: string } | null = null;
   if (payload.handover_settings !== undefined) {
     const prevHandover = crmCore.normalizeHandoverSettings(prevMap.handover_settings);
@@ -3411,7 +3476,7 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   }
 
   const settingDiffs = updates
-    .filter(([k]) => k !== 'ui_simplification' && k !== 'role_ui_defaults' && k !== 'handover_settings' && k !== 'stats_control_config')
+    .filter(([k]) => k !== 'ui_simplification' && k !== 'role_ui_defaults' && k !== 'handover_settings' && k !== 'stats_control_config' && k !== 'call_wrapup_shortcuts')
     .map(([k, nextVal]) => ({
       field: k,
       label: k,
@@ -3420,6 +3485,7 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     }))
     .filter((d) => d.before !== d.after);
   if (handoverChangedDiff) settingDiffs.push(handoverChangedDiff);
+  if (shortcutsChangedDiff) settingDiffs.push(shortcutsChangedDiff);
 
   await executor.withTransaction(async (tx) => {
     for (const [key, value] of updates) {
@@ -4715,6 +4781,12 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
   const maxRoleUpdRaw = rolesActRes.rows?.[0]?.max_upd;
   const syncVersion = Math.max(getLocalCacheVersion(executor), Number(freshSyncVer || 0) || 0);
 
+  let callWrapupShortcuts: any = undefined;
+  if (settingsUpdatedAt && typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function') {
+    const setMap = await getSettingsMap(executor).catch(() => ({} as Record<string, any>));
+    callWrapupShortcuts = crmCore.normalizeCallWrapupShortcutsConfig(setMap.call_wrapup_shortcuts);
+  }
+
   return {
     serverTime: new Date().toISOString(),
     syncVersion,
@@ -4728,6 +4800,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     deletedAllReservationsBefore,
     changedSettings: Boolean(settingsUpdatedAt),
     settingsUpdatedAt,
+    ...(callWrapupShortcuts !== undefined ? { callWrapupShortcuts } : {}),
     changedDelegations: Boolean(maxDelUpdRaw),
     changedRoles: Boolean(maxRoleUpdRaw),
     hasMoreReservations: resRows.rows.length >= 200,
