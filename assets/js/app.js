@@ -2848,12 +2848,6 @@
 
     var eyeIconSvg = '<svg class="auth-eye-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
 
-    var serverStatusLabel = isBackendLive
-      ? (isEn ? 'Auto-connected to Cloud Database' : 'متصل تلقائيًا بقاعدة البيانات السحابية')
-      : (isLive
-        ? (isEn ? 'Auto-connected to Google Apps Script' : 'متصل تلقائيًا بـ Google Apps Script')
-        : (isEn ? 'Local Preview (Sandbox)' : 'معاينة محلية (Sandbox)'));
-
     appRoot.innerHTML =
       '<main class="auth-screen">' +
         '<section class="auth-shell">' +
@@ -2892,32 +2886,16 @@
                   '<div id="login-error" class="form-error hidden" role="alert"></div>' +
                   '<button type="submit" class="btn btn-primary auth-submit-btn" id="login-submit-btn">' + (isEn ? 'Sign In to System' : 'دخول إلى النظام') + '</button>' +
                 '</form>' +
-                '<div class="auth-mode-box">' +
-                  '<div class="auth-mode-row">' +
-                    '<div class="auth-mode-status"><strong>' + (isEn ? 'Server Status:' : 'حالة الخادم:') + '</strong> <span>' + serverStatusLabel + '</span></div>' +
-                    '<button type="button" class="btn btn-sm auth-health-btn" id="login-test-connection-btn">' + (isEn ? 'Test Connection' : 'اختبار اتصال الخادم') + '</button>' +
-                  '</div>' +
-                  '<div id="login-conn-test-result" class="hidden" role="status" style="margin-top:8px;"></div>' +
-                  (!isLive ? (
+                (!isLive ? (
+                  '<div class="auth-mode-box">' +
                     '<div class="auth-demo-quick">' +
                       '<button type="button" class="btn btn-sm demo-fill-btn" data-u="developer" data-p="Dev@123">' + (isEn ? 'Developer' : 'المبرمج (developer)') + '</button>' +
                       '<button type="button" class="btn btn-sm demo-fill-btn" data-u="admin" data-p="Admin@123">' + (isEn ? 'Admin' : 'المدير (admin)') + '</button>' +
                       '<button type="button" class="btn btn-sm demo-fill-btn" data-u="supervisor" data-p="Super@123">' + (isEn ? 'Supervisor' : 'المشرف (supervisor)') + '</button>' +
                       '<button type="button" class="btn btn-sm demo-fill-btn" data-u="agent1" data-p="Agent@123">' + (isEn ? 'Agent' : 'موظف (agent1)') + '</button>' +
                     '</div>' +
-                    '<div class="auth-mode-note">' +
-                      (isEn
-                        ? 'Database and <span class="mono" dir="ltr">Apps Script</span> connections are configured via server environment variables (<span class="mono" dir="ltr">Vercel / .env</span>).'
-                        : 'يتم ضبط الاتصال بقاعدة البيانات و<span class="mono" dir="ltr">Apps Script</span> من متغيرات بيئة الخادم (<span class="mono" dir="ltr">Vercel / .env</span>) فقط.') +
-                    '</div>'
-                  ) : (
-                    '<div class="auth-mode-note auth-mode-note-live">' +
-                      (isEn
-                        ? 'System is connected to the server. Enter your staff account credentials from <strong>Employees</strong> to sign in.'
-                        : 'النظام مربوط تلقائيًا بالخادم. أدخل حسابك الوظيفي المسجل في <strong>الموظفين</strong> للدخول مباشرة.') +
-                    '</div>'
-                  )) +
-                '</div>' +
+                  '</div>'
+                ) : '') +
               '</div>' +
               '<footer class="auth-panel-footer">' +
                 '<div class="rg-powered-by rg-powered-by-auth" dir="ltr">powerd by zeyad</div>' +
@@ -3035,55 +3013,6 @@
         performLoginSubmit();
       });
     });
-
-    var testConnBtn = document.getElementById('login-test-connection-btn');
-    var testConnOut = document.getElementById('login-conn-test-result');
-    if (testConnBtn && testConnOut) {
-      testConnBtn.addEventListener('click', async function () {
-        testConnBtn.disabled = true;
-        var origText = testConnBtn.textContent;
-        testConnBtn.textContent = isEn ? 'Testing...' : 'جاري الاختبار...';
-        testConnOut.classList.remove('hidden');
-        testConnOut.innerHTML = '<div class="glass-subcard" style="padding:8px 10px;font-size:12px;color:var(--text-secondary);">' + (isEn ? 'Checking server connection...' : 'جاري فحص اتصال الخادم...') + '</div>';
-        try {
-          var healthRes = root.RGApi.testServerHealth
-            ? await root.RGApi.testServerHealth()
-            : { success: false, message: isEn ? 'Server health check is unavailable.' : 'دالة اختبار الخادم غير متاحة.' };
-          var parts = [];
-          var okHealth = Boolean(healthRes && healthRes.success);
-          var hd = (healthRes && healthRes.data) || {};
-          parts.push(
-            '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
-              '<span><strong>' + (isEn ? 'Server (/api/health):' : 'الخادم (/api/health):') + '</strong> ' + escapeHtml((healthRes && healthRes.message) || (okHealth ? (isEn ? 'Connected' : 'متصل') : (isEn ? 'Disconnected' : 'غير متصل'))) + '</span>' +
-              (hd.latencyMs ? '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + hd.latencyMs + 'ms</span>' : '') +
-            '</div>'
-          );
-          var shouldPingGas = Boolean((okHealth && (hd.envGasConfigured || hd.mode === 'gas')) || connInfo.url);
-          if (shouldPingGas && root.RGApi.pingGasUrl) {
-            var gasRes = await root.RGApi.pingGasUrl('');
-            var gd = (gasRes && gasRes.data) || {};
-            parts.push(
-              '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;padding-top:4px;border-top:1px solid var(--border-hairline);">' +
-                '<span><strong>Apps Script:</strong> ' + escapeHtml((gasRes && gasRes.message) || (gasRes && gasRes.success ? (isEn ? 'Connected' : 'متصل') : (isEn ? 'Connection Failed' : 'فشل الاتصال'))) + '</span>' +
-                (gd.latencyMs ? '<span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + gd.latencyMs + 'ms</span>' : '') +
-              '</div>'
-            );
-          }
-          testConnOut.innerHTML =
-            '<div class="' + (okHealth ? 'form-success' : 'form-error') + '" style="padding:8px 10px;border-radius:var(--radius-sm);font-size:12px;line-height:1.55;">' +
-              parts.join('') +
-            '</div>';
-        } catch (err) {
-          testConnOut.innerHTML =
-            '<div class="form-error" style="padding:8px 10px;border-radius:var(--radius-sm);font-size:12px;">' +
-              escapeHtml((err && err.message) || (isEn ? 'Unable to check server connection.' : 'تعذر فحص اتصال الخادم.')) +
-            '</div>';
-        } finally {
-          testConnBtn.disabled = false;
-          testConnBtn.textContent = origText;
-        }
-      });
-    }
 
     document.getElementById('login-form').addEventListener('submit', function (ev) {
       ev.preventDefault();

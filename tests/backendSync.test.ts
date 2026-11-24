@@ -3119,7 +3119,8 @@ test('testDatabaseHealth diagnostics, disabled client-side web binding, and UI t
   ]) {
     assert.ok(settingsSrc.includes(id), `settings.js missing required control ${id}`);
   }
-  assert.ok(appSrc.includes('login-test-connection-btn'), 'app.js missing login-test-connection-btn');
+  assert.equal(appSrc.includes('login-test-connection-btn'), false, 'app.js still contains login-test-connection-btn');
+  assert.equal(appSrc.includes('login-conn-test-result'), false, 'app.js still contains login-conn-test-result');
 
   for (const removedId of [
     'btn-save-gas-url',
