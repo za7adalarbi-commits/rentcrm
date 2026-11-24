@@ -72,6 +72,8 @@ export function mapReservationRowToClient(row: any, includeRaw = false): Record<
     customerEmail: str(row.customer_email ?? row.customerEmail),
     customerIdNumber: str(row.customer_id_number ?? row.customerIdNumber),
     companyName: str(row.company_name ?? row.companyName),
+    companyNumber: str(row.company_number ?? row.companyNumber),
+    newCompanyName: str(row.new_company_name ?? row.newCompanyName),
     branchName: str(row.branch_name ?? row.branchName),
     deliverBranchName: str(row.deliver_branch_name ?? row.deliverBranchName),
     carName: str(row.car_name ?? row.carName),
@@ -111,6 +113,16 @@ export function mapReservationRowToClient(row: any, includeRaw = false): Record<
     lastUpdatedByName: str(row.last_updated_by_name ?? row.lastUpdatedByName),
     lastUpdatedAt: str(row.last_updated_at ?? row.lastUpdatedAt),
     hasProblem: boolVal(row.has_problem ?? row.hasProblem),
+    rejectionReason: str(row.rejection_reason ?? row.rejectionReason),
+    carStatusAtRequest: str(row.car_status_at_request ?? row.carStatusAtRequest),
+    refundAmount: num(row.refund_amount ?? row.refundAmount, 0),
+    rejectedById: str(row.rejected_by_id ?? row.rejectedById),
+    rejectedByName: str(row.rejected_by_name ?? row.rejectedByName),
+    rejectedAt: str(row.rejected_at ?? row.rejectedAt),
+    cancellationReason: str(row.cancellation_reason ?? row.cancellationReason),
+    cancelledById: str(row.cancelled_by_id ?? row.cancelledById),
+    cancelledByName: str(row.cancelled_by_name ?? row.cancelledByName),
+    cancelledAt: str(row.cancelled_at ?? row.cancelledAt),
     pinnedNote: str(row.pinned_note ?? row.pinnedNote),
     pinnedNoteById: str(row.pinned_note_by_id ?? row.pinnedNoteById),
     pinnedNoteByName: str(row.pinned_note_by_name ?? row.pinnedNoteByName),
@@ -273,6 +285,13 @@ function normalizeIncomingReservation(
     const prevInternal = str(existingClient.internalStatus);
     const prevHist = crmCore.normalizeStatusHistory(existingClient.statusHistory || []);
 
+    const existingInactive = crmCore.isInactiveReservation(existingClient);
+    const incomingInactive = crmCore.isInactiveReservation({
+      internalStatus: sourceStatusAr,
+      originalStatusCode: rawCode,
+      originalStatusAr: sourceStatusAr
+    });
+
     const sourceChanged = Boolean(
       rawCode && (
         (prevCode && rawCode !== prevCode) ||
@@ -280,7 +299,14 @@ function normalizeIncomingReservation(
       )
     );
 
-    if (sourceChanged) {
+    if (existingInactive && !incomingInactive) {
+      nextInternalStatus = prevInternal || sourceStatusAr;
+      nextLastUpdateText = existingClient.lastUpdateText || nextLastUpdateText;
+      nextLastUpdatedById = existingClient.lastUpdatedById || actor.id;
+      nextLastUpdatedByName = existingClient.lastUpdatedByName || actor.name;
+      nextLastUpdatedAt = existingClient.lastUpdatedAt || nowIso;
+      nextStatusHistory = prevHist.length > 0 ? prevHist : nextStatusHistory;
+    } else if (sourceChanged) {
       nextInternalStatus = sourceStatusAr;
       nextLastUpdateText = `تحديث الحالة من Rental Gate: ${prevInternal || prevOrigAr || '-'} ← ${sourceStatusAr}`;
       nextLastUpdatedById = actor.id;
@@ -359,6 +385,19 @@ function normalizeIncomingReservation(
       ? Math.floor(explicitOrder)
       : (prevOrder > 0 ? Math.floor(prevOrder) : (seqFallback > 0 ? Math.floor(seqFallback) : null));
 
+  const isRejectedRes = crmCore.isRejectedStatus({
+    internalStatus: nextInternalStatus,
+    originalStatusCode: rawCode,
+    originalStatusAr: sourceStatusAr,
+    rejectedAt: existingClient?.rejectedAt || merged.rejectedAt
+  });
+  const isCancelledRes = !isRejectedRes && crmCore.isCancelledStatus({
+    internalStatus: nextInternalStatus,
+    originalStatusCode: rawCode,
+    originalStatusAr: sourceStatusAr,
+    cancelledAt: existingClient?.cancelledAt || merged.cancelledAt
+  });
+
   const record: Record<string, any> = {
     id: resId,
     sourceReservationId: srcResId,
@@ -366,9 +405,11 @@ function normalizeIncomingReservation(
     sourceCreatedAt: str(merged.sourceCreatedAt),
     customerName: str(merged.customerName || 'عميل'),
     customerPhone: str(merged.customerPhone),
-    customerEmail: str(merged.customerEmail),
-    customerIdNumber: str(merged.customerIdNumber),
+    customerEmail: str(merged.customerEmail || existingClient?.customerEmail),
+    customerIdNumber: (typeof crmCore.extractCustomerNationalId === 'function' ? crmCore.extractCustomerNationalId(raw, existingClient) : '') || str(merged.customerIdNumber || existingClient?.customerIdNumber),
     companyName: str(merged.companyName),
+    companyNumber: str(existingClient?.companyNumber || merged.companyNumber || raw.companyNumber || raw.company_number || raw.companyCode || ''),
+    newCompanyName: str(existingClient?.newCompanyName || merged.newCompanyName || raw.newCompanyName || ''),
     branchName: str(merged.branchName),
     deliverBranchName: str(merged.deliverBranchName || merged.branchName),
     carName: str(merged.carName),
@@ -412,6 +453,18 @@ function normalizeIncomingReservation(
     lastUpdatedByName: nextLastUpdatedByName,
     lastUpdatedAt: nextLastUpdatedAt,
     hasProblem: existingClient ? boolVal(existingClient.hasProblem) : boolVal(merged.hasProblem),
+    rejectionReason: str(existingClient?.rejectionReason || merged.rejectionReason || raw.rejectionReason || ''),
+    carStatusAtRequest: str(existingClient?.carStatusAtRequest || merged.carStatusAtRequest || raw.carStatusAtRequest || ''),
+    refundAmount: existingClient && existingClient.refundAmount !== undefined && Number(existingClient.refundAmount) > 0
+      ? num(existingClient.refundAmount, 0)
+      : num(merged.refundAmount ?? raw.refundAmount, 0),
+    rejectedById: str(existingClient?.rejectedById || merged.rejectedById || (isRejectedRes ? actor.id : '')),
+    rejectedByName: str(existingClient?.rejectedByName || merged.rejectedByName || (isRejectedRes ? actor.name : '')),
+    rejectedAt: str(existingClient?.rejectedAt || merged.rejectedAt || (isRejectedRes ? nowIso : '')),
+    cancellationReason: str(existingClient?.cancellationReason || merged.cancellationReason || raw.cancellationReason || ''),
+    cancelledById: str(existingClient?.cancelledById || merged.cancelledById || (isCancelledRes ? actor.id : '')),
+    cancelledByName: str(existingClient?.cancelledByName || merged.cancelledByName || (isCancelledRes ? actor.name : '')),
+    cancelledAt: str(existingClient?.cancelledAt || merged.cancelledAt || (isCancelledRes ? nowIso : '')),
     createdAt: existingClient?.createdAt || str(merged.createdAt) || nowIso,
     updatedAt: nowIso,
     sourceOrder: resolvedSourceOrder,
@@ -585,7 +638,10 @@ export async function ingestIncrementalSyncBatch(
              base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
              internal_status, priority, assigned_employee_ids, assigned_employee_names,
              last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
-             has_problem, created_at, updated_at, status_history, raw_json, source_order
+             has_problem, created_at, updated_at, status_history, raw_json, source_order,
+             company_number, new_company_name, rejection_reason, car_status_at_request, refund_amount,
+             rejected_by_id, rejected_by_name, rejected_at,
+             cancellation_reason, cancelled_by_id, cancelled_by_name, cancelled_at
            )
            SELECT * FROM unnest(
              $1::text[], $2::text[], $3::text[], $4::text[],
@@ -598,15 +654,18 @@ export async function ingestIncrementalSyncBatch(
              $35::numeric[], $36::int4[], $37::numeric[], $38::numeric[], $39::boolean[],
              $40::text[], $41::text[], $42::jsonb[], $43::jsonb[],
              $44::text[], $45::text[], $46::text[], $47::text[],
-             $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[], $53::int4[]
+             $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[], $53::int4[],
+             $54::text[], $55::text[], $56::text[], $57::text[], $58::numeric[],
+             $59::text[], $60::text[], $61::text[],
+             $62::text[], $63::text[], $64::text[], $65::text[]
            )
            ON CONFLICT (reservation_number) DO UPDATE SET
              source_reservation_id = EXCLUDED.source_reservation_id,
              source_created_at = EXCLUDED.source_created_at,
              customer_name = EXCLUDED.customer_name,
              customer_phone = EXCLUDED.customer_phone,
-             customer_email = EXCLUDED.customer_email,
-             customer_id_number = EXCLUDED.customer_id_number,
+             customer_email = COALESCE(NULLIF(EXCLUDED.customer_email, ''), reservations.customer_email),
+             customer_id_number = COALESCE(NULLIF(EXCLUDED.customer_id_number, ''), reservations.customer_id_number),
              company_name = EXCLUDED.company_name,
              branch_name = EXCLUDED.branch_name,
              deliver_branch_name = EXCLUDED.deliver_branch_name,
@@ -650,7 +709,19 @@ export async function ingestIncrementalSyncBatch(
              updated_at = EXCLUDED.updated_at,
              status_history = EXCLUDED.status_history,
              raw_json = EXCLUDED.raw_json,
-             source_order = COALESCE(EXCLUDED.source_order, reservations.source_order)
+             source_order = COALESCE(EXCLUDED.source_order, reservations.source_order),
+             company_number = COALESCE(NULLIF(EXCLUDED.company_number, ''), reservations.company_number),
+             new_company_name = COALESCE(NULLIF(EXCLUDED.new_company_name, ''), reservations.new_company_name),
+             rejection_reason = COALESCE(NULLIF(EXCLUDED.rejection_reason, ''), reservations.rejection_reason),
+             car_status_at_request = COALESCE(NULLIF(EXCLUDED.car_status_at_request, ''), reservations.car_status_at_request),
+             refund_amount = CASE WHEN EXCLUDED.refund_amount > 0 THEN EXCLUDED.refund_amount ELSE reservations.refund_amount END,
+             rejected_by_id = COALESCE(NULLIF(EXCLUDED.rejected_by_id, ''), reservations.rejected_by_id),
+             rejected_by_name = COALESCE(NULLIF(EXCLUDED.rejected_by_name, ''), reservations.rejected_by_name),
+             rejected_at = COALESCE(NULLIF(EXCLUDED.rejected_at, ''), reservations.rejected_at),
+             cancellation_reason = COALESCE(NULLIF(EXCLUDED.cancellation_reason, ''), reservations.cancellation_reason),
+             cancelled_by_id = COALESCE(NULLIF(EXCLUDED.cancelled_by_id, ''), reservations.cancelled_by_id),
+             cancelled_by_name = COALESCE(NULLIF(EXCLUDED.cancelled_by_name, ''), reservations.cancelled_by_name),
+             cancelled_at = COALESCE(NULLIF(EXCLUDED.cancelled_at, ''), reservations.cancelled_at)
            RETURNING (xmax = 0) AS inserted`,
           [
             chunk.map((r) => r.id),
@@ -705,7 +776,19 @@ export async function ingestIncrementalSyncBatch(
             chunk.map((r) => r.updatedAt),
             chunk.map((r) => JSON.stringify(r.statusHistory)),
             chunk.map((r) => r.rawJson),
-            chunk.map((r) => (r.sourceOrder && Number(r.sourceOrder) > 0 ? Math.floor(Number(r.sourceOrder)) : null))
+            chunk.map((r) => (r.sourceOrder && Number(r.sourceOrder) > 0 ? Math.floor(Number(r.sourceOrder)) : null)),
+            chunk.map((r) => r.companyNumber || ''),
+            chunk.map((r) => r.newCompanyName || ''),
+            chunk.map((r) => r.rejectionReason || ''),
+            chunk.map((r) => r.carStatusAtRequest || ''),
+            chunk.map((r) => num(r.refundAmount, 0)),
+            chunk.map((r) => r.rejectedById || ''),
+            chunk.map((r) => r.rejectedByName || ''),
+            chunk.map((r) => r.rejectedAt || ''),
+            chunk.map((r) => r.cancellationReason || ''),
+            chunk.map((r) => r.cancelledById || ''),
+            chunk.map((r) => r.cancelledByName || ''),
+            chunk.map((r) => r.cancelledAt || '')
           ]
         );
 
@@ -1323,9 +1406,23 @@ export async function pullFromRentalGateDirect(
     ...item,
     __sourceOrder: idx + 1
   }));
+  const existingCheckNums = dedupedAllRes
+    .filter((item: any) => excludedSet.has(str(item.reservationStatus || item.status || item.status_code).toLowerCase()))
+    .map((item: any) => str(crmCore.extractReservationNumber(item)))
+    .filter(Boolean);
+  let existingNumsSet = new Set<string>();
+  if (existingCheckNums.length > 0) {
+    const existRows = await executor.query<{ reservation_number: string }>(
+      `SELECT reservation_number FROM reservations WHERE reservation_number = ANY($1::text[])`,
+      [existingCheckNums]
+    ).catch(() => ({ rows: [] }));
+    existingNumsSet = new Set((existRows.rows || []).map((r: any) => str(r.reservation_number)).filter(Boolean));
+  }
   const afterExcludedRes = dedupedAllRes.filter((item: any) => {
     const code = str(item.reservationStatus || item.status || item.status_code).toLowerCase();
-    return !excludedSet.has(code);
+    if (!excludedSet.has(code)) return true;
+    const numKey = str(crmCore.extractReservationNumber(item));
+    return existingNumsSet.has(numKey);
   });
   const excludedFilteredCount = dedupedAllRes.length - afterExcludedRes.length;
 

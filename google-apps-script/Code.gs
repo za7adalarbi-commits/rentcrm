@@ -163,6 +163,9 @@ function handleApiRequest(e, method) {
       case 'updateProblem':
         result = updateProblem(session, payload);
         break;
+      case 'deleteProblem':
+        result = deleteProblem(session, payload);
+        break;
       case 'getProblems':
         result = getProblems(session, payload);
         break;

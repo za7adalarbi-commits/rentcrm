@@ -393,6 +393,17 @@ function handleNeonMirrorSync_(payload) {
         assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
         assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
       }));
+    } else if (action === 'deleteProblem' && data.id) {
+      if (typeof deleteRecordsWhere_ === 'function') {
+        deleteRecordsWhere_(RG_SHEETS.PROBLEM_UPDATES, function (u) { return u && u.problemId === data.id; });
+      }
+      if (typeof deleteRecordByKey === 'function') {
+        deleteRecordByKey(RG_SHEETS.PROBLEMS, 'id', data.id);
+        if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
+          deleteRecordByKey(RG_SHEETS.ISSUES, 'id', data.id);
+        }
+      }
+      applied++;
     } else if (action === 'upsertEmployee' && data.id) {
       var empRec = Object.assign({}, data, {
         permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])

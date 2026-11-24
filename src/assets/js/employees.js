@@ -93,6 +93,11 @@
     var canManage = Boolean(user && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'manage_employees'));
     var canReassign = Boolean(user && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'assign_employees'));
     var isActorDeveloper = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.DEVELOPER);
+    var canCustomizeUi = Boolean(
+      isActorDeveloper ||
+      (user && user.role === 'general_manager') ||
+      (root.RGCrmCore && root.RGCrmCore.canUserPerform && root.RGCrmCore.canUserPerform(user, 'customize_ui'))
+    );
     var canActorImpersonate = Boolean(root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realOrCurUser));
     var allowedPreviewRoles = (canActorImpersonate && root.RGCrmCore.getAllowedPreviewRoles)
       ? root.RGCrmCore.getAllowedPreviewRoles(realOrCurUser)
@@ -232,6 +237,7 @@
           var canUseDeleteEmpAction = !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_delete_employee');
           var canMutateTarget = canManage && !isSelf && (!isTargetDev || isActorDeveloper);
           var canEditTarget = canManage && (canMutateTarget || (isSelf && isTargetDev && isActorDeveloper));
+          var canCustomizeTargetSections = Boolean(canCustomizeUi && (!isTargetDev || isActorDeveloper));
           var canImpersonateRow = Boolean(
             canActorImpersonate &&
             !isSelf &&
@@ -293,13 +299,13 @@
                 ((!canManage && canImpersonateRow) ? '<button type="button" class="btn btn-sm emp-impersonate-btn" data-id="' + esc(e.id) + '" title="معاينة النظام بصلاحيات هذا الموظف">محاكاة</button>' : '') +
               '</div>' +
             '</td>' +
-            (canManage ? (
+            ((canManage || canCustomizeUi) ? (
               '<td class="whitespace-nowrap">' +
                 '<div class="flex items-center gap-1.5">' +
                   (canEditTarget ? '<button type="button" class="btn btn-sm ' + (isTargetDev ? 'btn-primary emp-edit-dev-btn rg-ui-edit-dev-btn ' : '') + 'emp-edit-btn" data-id="' + esc(e.id) + '" aria-label="تعديل بيانات ' + esc(e.name) + '">' + (isTargetDev ? 'تعديل بيانات المبرمج' : 'تعديل') + '</button>' : '') +
-                  ((isActorDeveloper && canManage) ? '<button type="button" class="btn btn-sm emp-sections-btn" data-id="' + esc(e.id) + '" title="إظهار أو إخفاء الأقسام لهذا الموظف">الأقسام</button>' : '') +
+                  (canCustomizeTargetSections ? '<button type="button" class="btn btn-sm emp-sections-btn" data-id="' + esc(e.id) + '" title="إظهار أو إخفاء الأقسام وعناصر الواجهة لهذا الموظف">الأقسام</button>' : '') +
                   (canImpersonateRow ? '<button type="button" class="btn btn-sm emp-impersonate-btn" data-id="' + esc(e.id) + '" title="معاينة النظام بصلاحيات هذا الموظف">محاكاة</button>' : '') +
-                  ((!canEditTarget && !canImpersonateRow && !(isActorDeveloper && canManage)) ? '<span class="text-xs" style="color:var(--text-muted);">—</span>' : '') +
+                  ((!canEditTarget && !canImpersonateRow && !canCustomizeTargetSections) ? '<span class="text-xs" style="color:var(--text-muted);">—</span>' : '') +
                 '</div>' +
               '</td>'
             ) : '') +
@@ -314,12 +320,12 @@
               '<h2 class="section-title">' + t('nav_employees') + '</h2>' +
               '<p class="section-subtitle">إجمالي الموظفين الحاليين: <strong class="tabular-nums" style="color:var(--text-primary);" id="emp-total-count">' + items.length + '</strong> · تحديث لحظي مباشر مع نظام الحالة</p>' +
             '</div>' +
-            ((canManage || canReassign) ? (
+            ((canManage || canReassign || canCustomizeUi) ? (
               '<div class="toolbar-actions">' +
                 ((canReassign && (!root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_bulk_reassign'))) ? '<button type="button" class="btn rg-ui-emp-transfer" id="emp-bulk-reassign-btn">🔄 تحويل حجوزات نهاية الوردية</button>' : '') +
                 ((canManage && canViewPresetsSub) ? '<button type="button" class="btn rg-ui-role-presets" id="emp-scroll-presets-btn">الصلاحيات الجاهزة (' + rolePresets.length + ')</button>' : '') +
-                ((isActorDeveloper && canManage) ? '<button type="button" class="btn" id="emp-dev-sections-btn">إظهار / إخفاء الأقسام لكل موظف</button>' : '') +
-                ((isActorDeveloper && canManage) ? '<button type="button" class="btn" id="emp-dev-actions-btn">أزرار وإجراءات الجداول</button>' : '') +
+                (canCustomizeUi ? '<button type="button" class="btn" id="emp-dev-sections-btn">' + (isActorDeveloper ? 'إظهار / إخفاء الأقسام لكل موظف' : 'إظهار / إخفاء الأقسام والواجهة للموظفين') + '</button>' : '') +
+                (canCustomizeUi ? '<button type="button" class="btn" id="emp-dev-actions-btn">أزرار وإجراءات الجداول</button>' : '') +
                 ((isActorDeveloper && canManage) ? '<button type="button" class="btn" id="emp-dev-stats-btn">تحكم المبرمج في الإحصائيات</button>' : '') +
                 ((isActorDeveloper && canManage) ? '<button type="button" class="btn btn-charcoal rg-ui-edit-dev-btn" id="emp-edit-dev-btn">تعديل بيانات المبرمج</button>' : '') +
                 (canManage ? '<button type="button" class="btn btn-primary rg-ui-emp-add" id="emp-add-btn">إضافة موظف جديد</button>' : '') +
@@ -2356,8 +2362,14 @@
 
   async function openEmployeeSectionsModal(targetEmp, allEmployees, ctx, onSaved, opts) {
     var realActor = getRealActorForDevFeatures();
-    if (!realActor || realActor.role !== 'developer') {
-      if (ctx && ctx.toast) ctx.toast('التحكم في إظهار وإخفاء الأقسام وأزرار الجداول متاح لحساب المبرمج فقط.', true);
+    var coreRef = root.RGCrmCore;
+    var isActorDev = Boolean(realActor && realActor.role === 'developer');
+    var canOpenSections = Boolean(
+      isActorDev ||
+      (realActor && (realActor.role === 'general_manager' || (coreRef && coreRef.canUserPerform && coreRef.canUserPerform(realActor, 'customize_ui'))))
+    );
+    if (!canOpenSections) {
+      if (ctx && ctx.toast) ctx.toast('التحكم في إظهار وإخفاء الأقسام وعناصر الواجهة متاح للمبرمج أو المدير العام فقط.', true);
       return;
     }
     var focusGroupId = (opts && opts.focusGroup) ? String(opts.focusGroup) : '';
@@ -2397,6 +2409,8 @@
     var activeEmpId = preferredEmp.id;
     var searchTerm = '';
     var draftPermsByEmpId = {};
+    var draftUiOverridesByEmpId = {};
+    var uiOptsList = (core && Array.isArray(core.UI_SIMPLIFICATION_OPTIONS)) ? core.UI_SIMPLIFICATION_OPTIONS : [];
     var initialStatsConfig = getStatsControlConfigFromApp(ctx);
     var excludedMap = {};
     initialStatsConfig.excludedFromStatsEmployeeIds.forEach(function (id) { excludedMap[id] = true; });
@@ -2412,12 +2426,24 @@
       return draftPermsByEmpId[emp.id];
     }
 
+    function getWorkingUiOverrides(emp) {
+      if (!emp) return {};
+      if (!draftUiOverridesByEmpId[emp.id]) {
+        draftUiOverridesByEmpId[emp.id] = (core && typeof core.normalizeUiOverrides === 'function')
+          ? core.normalizeUiOverrides(emp.uiOverrides || {})
+          : Object.assign({}, emp.uiOverrides || {});
+      }
+      return draftUiOverridesByEmpId[emp.id];
+    }
+
     function drawSectionsModal() {
       var curEmp = employeesList.find(function (e) { return e.id === activeEmpId; }) || employeesList[0];
       activeEmpId = curEmp.id;
       var curPerms = getWorkingPerms(curEmp);
-      var tempUser = { role: curEmp.role, permissions: curPerms };
+      var curUiOv = getWorkingUiOverrides(curEmp);
+      var tempUser = { role: curEmp.role, permissions: curPerms, uiOverrides: curUiOv };
       var isDevTarget = curEmp.role === 'developer';
+      var isLockedTarget = isDevTarget;
       var summary = core && core.getEmployeeSectionVisibilitySummary
         ? core.getEmployeeSectionVisibilitySummary(tempUser)
         : { totalVisible: 0, totalAvailable: 0 };
@@ -2427,8 +2453,41 @@
         : true;
       var q = String(searchTerm || '').trim().toLowerCase();
 
+      var filteredUiOpts = uiOptsList.filter(function (opt) {
+        if (!q) return true;
+        return (String(opt.labelAr || '') + ' ' + String(opt.labelEn || '') + ' ' + String(opt.key || '')).toLowerCase().indexOf(q) !== -1;
+      });
+      var ovActiveCount = uiOptsList.filter(function (opt) { return curUiOv[opt.key] !== undefined; }).length;
+      var uiOverridesCardHtml =
+        '<div class="rg-esec-group-card" data-esec-group="ui_overrides">' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;">' +
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
+              '<strong style="font-size:13.5px;color:var(--text-primary);">تخصيص واجهة الموظف الفردية (إظهار / إخفاء العناصر)</strong>' +
+              '<span class="status-tag status-info tabular-nums">' + ovActiveCount + ' تخصيص فردي</span>' +
+            '</div>' +
+            (!isLockedTarget ? '<button type="button" class="btn btn-sm" id="esec-restore-ui-btn">استعادة الافتراضي للموظف</button>' : '') +
+          '</div>' +
+          (filteredUiOpts.length === 0
+            ? '<div style="font-size:12px;color:var(--text-muted);">لا توجد عناصر واجهة مطابقة للبحث.</div>'
+            : '<div class="rg-esec-items-grid">' +
+                filteredUiOpts.map(function (opt) {
+                  var ovVal = curUiOv[opt.key] === true ? 'hide' : (curUiOv[opt.key] === false ? 'show' : 'inherit');
+                  return '<div class="rg-esec-item-row">' +
+                    '<div style="min-width:0;flex:1;">' +
+                      '<div style="font-size:12.5px;font-weight:600;color:var(--text-primary);line-height:1.35;">' + esc(opt.labelAr) + '</div>' +
+                      '<div class="mono" style="font-size:10.5px;color:var(--text-muted);" dir="ltr">' + esc(opt.key) + '</div>' +
+                    '</div>' +
+                    '<select class="select esec-ui-ov-sel" data-ui-key="' + esc(opt.key) + '"' + (isLockedTarget ? ' disabled' : '') + ' style="width:auto;min-width:130px;padding:4px 8px;min-height:32px;font-size:12px;">' +
+                      '<option value="inherit"' + (ovVal === 'inherit' ? ' selected' : '') + '>افتراضي الدور</option>' +
+                      '<option value="hide"' + (ovVal === 'hide' ? ' selected' : '') + '>إخفاء قسري</option>' +
+                      '<option value="show"' + (ovVal === 'show' ? ' selected' : '') + '>إظهار قسري</option>' +
+                    '</select>' +
+                  '</div>';
+                }).join('') +
+              '</div>') +
+        '</div>';
+
       var groupsHtml = groups.map(function (grp) {
-        var grpKeys = grp.items.map(function (it) { return it.key; });
         var filteredItems = grp.items.filter(function (it) {
           if (!q) return true;
           return (String(it.labelAr || '') + ' ' + String(it.labelEn || '') + ' ' + String(it.key || '')).toLowerCase().indexOf(q) !== -1;
@@ -2478,8 +2537,8 @@
           '<div class="modal-panel" style="max-width:860px;">' +
             '<div class="modal-header">' +
               '<div>' +
-                '<h3 class="modal-title" id="esec-modal-title">' + (focusGroupId === 'table_actions' ? 'تحكم المبرمج: إظهار / إخفاء أزرار وإجراءات الجداول لكل موظف' : 'تحكم المبرمج: إظهار / إخفاء الأقسام والأزرار لكل موظف') + '</h3>' +
-                '<p class="section-subtitle">تحكم دقيق في الصفحات الرئيسية، التبويبات الفرعية، بطاقات لوحة التحكم، وأزرار الجداول والتصدير بشكل مستقل لكل حساب.</p>' +
+                '<h3 class="modal-title" id="esec-modal-title">' + (focusGroupId === 'table_actions' ? 'إظهار / إخفاء أزرار وإجراءات الجداول لكل موظف' : 'إظهار / إخفاء الأقسام وعناصر الواجهة لكل موظف') + '</h3>' +
+                '<p class="section-subtitle">تحكم دقيق في الصفحات الرئيسية، التبويبات الفرعية، تخصيصات الواجهة الفردية، وأزرار الجداول والتصدير بشكل مستقل لكل حساب.</p>' +
               '</div>' +
               '<button type="button" class="btn btn-sm" id="esec-close-top" data-modal-close>إغلاق</button>' +
             '</div>' +
@@ -2496,13 +2555,13 @@
               '</div>' +
               '<div class="form-group" style="margin-bottom:0;">' +
                 '<label class="form-label" for="esec-search-input">بحث داخل الأقسام والأزرار</label>' +
-                '<input type="search" class="input" id="esec-search-input" value="' + esc(searchTerm) + '" placeholder="ابحث مثل: تصدير، سحب، حذف، الحجوزات، رادار...">' +
+                '<input type="search" class="input" id="esec-search-input" value="' + esc(searchTerm) + '" placeholder="ابحث مثل: تصدير، رفض، إلغاء، غير فعالة، الهوية...">' +
               '</div>' +
             '</div>' +
             '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 12px;border-radius:var(--radius-sm);border:1px solid var(--border-hairline);background:var(--bg-surface-subtle);margin-bottom:12px;">' +
               '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                 '<span class="status-tag status-info tabular-nums" id="esec-summary-pill">العناصر الظاهرة: ' + summary.totalVisible + ' / ' + summary.totalAvailable + '</span>' +
-                '<span class="status-tag ' + (appearInStats ? 'status-success' : 'status-warning') + '">' + (appearInStats ? 'يظهر في الإحصائيات' : 'مخفي من الإحصائيات') + '</span>' +
+                (isActorDev ? ('<span class="status-tag ' + (appearInStats ? 'status-success' : 'status-warning') + '">' + (appearInStats ? 'يظهر في الإحصائيات' : 'مخفي من الإحصائيات') + '</span>') : '') +
                 '<button type="button" class="btn btn-sm" id="esec-jump-actions-btn">⚡ أزرار وإجراءات الجداول</button>' +
               '</div>' +
               '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
@@ -2512,27 +2571,30 @@
             (isDevTarget ? (
               '<div class="rg-error-banner" style="margin-bottom:12px;border-color:rgba(245,158,11,0.4);background:rgba(245,158,11,0.08);">' +
                 '<div class="rg-error-banner-body">' +
-                  '<div class="rg-error-banner-title" style="color:var(--text-primary);">حساب المبرمج يحتفظ بكامل الأقسام والأزرار دائماً</div>' +
-                  '<div class="rg-error-banner-msg">يمكنك التحكم في ظهور المبرمج داخل تقارير وإحصائيات الفريق أدناه، كما يمكنك اختيار أي موظف آخر من القائمة أعلاه لتخصيص أقسامه وأزراره.</div>' +
+                  '<div class="rg-error-banner-title" style="color:var(--text-primary);">حساب المبرمج محمي ويحتفظ بكامل الأقسام والأزرار دائماً</div>' +
+                  '<div class="rg-error-banner-msg">يمكنك اختيار أي موظف آخر من القائمة أعلاه لتخصيص أقسامه وأزراره وإعدادات الواجهة الخاصة به.</div>' +
                 '</div>' +
               '</div>'
             ) : '') +
-            '<div class="rg-esec-group-card" style="margin-bottom:12px;border-color:rgba(217,31,43,0.24);">' +
-              '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
-                '<strong style="font-size:13.5px;color:var(--text-primary);">تحكم سريع في الإحصائيات لهذا الموظف</strong>' +
-                '<div class="rg-stats-ctrl-toggles">' +
-                  renderSwitchMarkup('esec-appear-in-stats', '', '', appearInStats, false, 'يظهر اسمه وأرقامه في الإحصائيات') +
-                  renderSwitchMarkup('esec-view-stats', '', '', isDevTarget ? true : canViewStats, isDevTarget, 'يشاهد صفحات وبطاقات الإحصائيات') +
+            (isActorDev ? (
+              '<div class="rg-esec-group-card" style="margin-bottom:12px;border-color:rgba(217,31,43,0.24);">' +
+                '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+                  '<strong style="font-size:13.5px;color:var(--text-primary);">تحكم سريع في الإحصائيات لهذا الموظف</strong>' +
+                  '<div class="rg-stats-ctrl-toggles">' +
+                    renderSwitchMarkup('esec-appear-in-stats', '', '', appearInStats, false, 'يظهر اسمه وأرقامه في الإحصائيات') +
+                    renderSwitchMarkup('esec-view-stats', '', '', isDevTarget ? true : canViewStats, isDevTarget, 'يشاهد صفحات وبطاقات الإحصائيات') +
+                  '</div>' +
                 '</div>' +
-              '</div>' +
-            '</div>' +
+              '</div>'
+            ) : '') +
             '<div id="esec-groups-scroll" style="display:flex;flex-direction:column;gap:12px;max-height:46vh;overflow-y:auto;padding-inline-end:4px;">' +
+              uiOverridesCardHtml +
               (groupsHtml || '<div class="empty-state" style="padding:18px;">لا توجد أقسام أو أزرار مطابقة لعبارة البحث.</div>') +
             '</div>' +
             '<div id="esec-err" class="form-error hidden" style="margin-top:10px;"></div>' +
             '<div class="modal-footer">' +
               '<button type="button" class="btn" id="esec-cancel-btn" data-modal-close>إلغاء</button>' +
-              '<button type="button" class="btn btn-primary" id="esec-save-btn">حفظ الأقسام والأزرار للموظف</button>' +
+              '<button type="button" class="btn btn-primary" id="esec-save-btn">حفظ الأقسام والواجهة للموظف</button>' +
             '</div>' +
           '</div>' +
         '</div>';
@@ -2636,6 +2698,50 @@
         });
       });
 
+      modalRoot.querySelectorAll('.esec-ui-ov-sel').forEach(function (sel) {
+        sel.addEventListener('change', function () {
+          if (isLockedTarget) return;
+          var uiKey = sel.getAttribute('data-ui-key');
+          var val = sel.value;
+          var workingOv = Object.assign({}, getWorkingUiOverrides(curEmp));
+          if (val === 'hide') workingOv[uiKey] = true;
+          else if (val === 'show') workingOv[uiKey] = false;
+          else delete workingOv[uiKey];
+          draftUiOverridesByEmpId[curEmp.id] = workingOv;
+          drawSectionsModal();
+        });
+      });
+
+      var restoreUiBtn = document.getElementById('esec-restore-ui-btn');
+      if (restoreUiBtn && !isLockedTarget) {
+        restoreUiBtn.addEventListener('click', function () {
+          runWithLock(restoreUiBtn, 'restoreEmpUi:' + curEmp.id, async function () {
+            var rRes = await root.RGApi.callApi('restoreUiDefaults', {
+              scope: 'employee',
+              employeeId: curEmp.id,
+              _spamChecked: true
+            });
+            if (!rRes || !rRes.success) {
+              if (ctx && ctx.toast) ctx.toast((rRes && rRes.message) || 'تعذر استعادة الافتراضي للموظف.', true);
+              return;
+            }
+            curEmp.uiOverrides = {};
+            draftUiOverridesByEmpId[curEmp.id] = {};
+            if (root.RGApp && typeof root.RGApp.upsertEmployeeInState === 'function') {
+              root.RGApp.upsertEmployeeInState(curEmp);
+            }
+            if (realActor && curEmp.id === realActor.id) {
+              var nextCur = Object.assign({}, realActor, { uiOverrides: {} });
+              if (root.RGAuth && typeof root.RGAuth.setUser === 'function') root.RGAuth.setUser(nextCur);
+              if (root.RGApp && typeof root.RGApp.applyUiSimplification === 'function') root.RGApp.applyUiSimplification(null, true);
+              if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') root.RGApp.syncCurrentUserShell(nextCur);
+            }
+            if (ctx && ctx.toast) ctx.toast('تمت استعادة الإعدادات الافتراضية للواجهة لهذا الموظف.');
+            drawSectionsModal();
+          });
+        });
+      }
+
       var saveBtn = document.getElementById('esec-save-btn');
       if (saveBtn) {
         saveBtn.addEventListener('click', function () {
@@ -2643,11 +2749,24 @@
           if (errEl) errEl.classList.add('hidden');
           runWithLock(saveBtn, 'devSectionsSave:' + curEmp.id, async function () {
             var nextExcludedIds = Object.keys(excludedMap).filter(function (id) { return excludedMap[id]; }).sort();
-            var statsChanged = JSON.stringify(nextExcludedIds) !== initialExcludedSnapshot;
-            var changedEmpIds = Object.keys(draftPermsByEmpId);
+            var statsChanged = isActorDev && (JSON.stringify(nextExcludedIds) !== initialExcludedSnapshot);
+            var changedEmpIds = Object.keys(draftPermsByEmpId).filter(function (id) {
+              var tObj = employeesList.find(function (e) { return e.id === id; });
+              if (!tObj || tObj.role === 'developer') return false;
+              var origPerms = (core && core.ensureSectionPermissionSentinels)
+                ? core.ensureSectionPermissionSentinels(tObj.role, tObj.permissions)
+                : (Array.isArray(tObj.permissions) ? tObj.permissions : []);
+              return JSON.stringify(draftPermsByEmpId[id].slice().sort()) !== JSON.stringify(origPerms.slice().sort());
+            });
+            var changedUiEmpIds = Object.keys(draftUiOverridesByEmpId).filter(function (id) {
+              var tObj = employeesList.find(function (e) { return e.id === id; });
+              if (!tObj || tObj.role === 'developer') return false;
+              var origOv = (core && typeof core.normalizeUiOverrides === 'function') ? core.normalizeUiOverrides(tObj.uiOverrides || {}) : (tObj.uiOverrides || {});
+              return JSON.stringify(draftUiOverridesByEmpId[id] || {}) !== JSON.stringify(origOv || {});
+            });
 
-            if (changedEmpIds.length === 0 && !statsChanged) {
-              ctx.toast('لم يتم تغيير أي أقسام عن الوضع الحالي.');
+            if (changedEmpIds.length === 0 && changedUiEmpIds.length === 0 && !statsChanged) {
+              ctx.toast('لم يتم تغيير أي أقسام أو إعدادات عن الوضع الحالي.');
               closeModal();
               return;
             }
@@ -2681,6 +2800,29 @@
               }
             }
 
+            for (var uIdx = 0; uIdx < changedUiEmpIds.length; uIdx++) {
+              var uiEmpId = changedUiEmpIds[uIdx];
+              var uiTarget = employeesList.find(function (e) { return e.id === uiEmpId; });
+              if (!uiTarget || uiTarget.role === 'developer') continue;
+              var nextOv = draftUiOverridesByEmpId[uiEmpId] || {};
+              var ovRes = await root.RGApi.callApi('saveEmployeeUiOverrides', {
+                employeeId: uiTarget.id,
+                uiOverrides: nextOv,
+                _spamChecked: true
+              });
+              if (!ovRes || !ovRes.success) {
+                if (errEl) {
+                  errEl.textContent = (ovRes && ovRes.message) || 'تعذر حفظ تخصيصات الواجهة للموظف.';
+                  errEl.classList.remove('hidden');
+                }
+                return;
+              }
+              uiTarget.uiOverrides = nextOv;
+              if (root.RGApp && typeof root.RGApp.upsertEmployeeInState === 'function') {
+                root.RGApp.upsertEmployeeInState(Object.assign({}, uiTarget, { uiOverrides: nextOv }));
+              }
+            }
+
             if (statsChanged) {
               var nextStatsCfg = {
                 excludedFromStatsEmployeeIds: nextExcludedIds,
@@ -2707,16 +2849,21 @@
             if (root.RGApi && typeof root.RGApi.invalidateScopes === 'function') {
               root.RGApi.invalidateScopes(['employees', 'dashboard', 'reports', 'settings']);
             }
-            if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') {
-              var updatedCur = employeesList.find(function (e) { return e.id === (realActor && realActor.id); });
-              if (updatedCur && draftPermsByEmpId[updatedCur.id]) {
-                root.RGApp.syncCurrentUserShell(Object.assign({}, updatedCur, { permissions: draftPermsByEmpId[updatedCur.id] }));
+            if (root.RGApp && realActor) {
+              var updatedCur = employeesList.find(function (e) { return e.id === realActor.id; });
+              if (updatedCur && (draftPermsByEmpId[updatedCur.id] || draftUiOverridesByEmpId[updatedCur.id])) {
+                var syncedUser = Object.assign({}, updatedCur, {
+                  permissions: draftPermsByEmpId[updatedCur.id] || updatedCur.permissions,
+                  uiOverrides: draftUiOverridesByEmpId[updatedCur.id] || updatedCur.uiOverrides
+                });
+                if (typeof root.RGApp.syncCurrentUserShell === 'function') root.RGApp.syncCurrentUserShell(syncedUser);
+                if (typeof root.RGApp.applyUiSimplification === 'function') root.RGApp.applyUiSimplification(null, true);
               }
             }
-            ctx.toast('تم حفظ إعدادات إظهار وإخفاء الأقسام للموظف بنجاح.');
+            ctx.toast('تم حفظ إعدادات إظهار وإخفاء الأقسام والواجهة بنجاح.');
             closeModal();
             if (onSaved) onSaved();
-          }, { spamAction: 'updateEmployee', spamSig: 'devSections:' + curEmp.id + ':' + (draftPermsByEmpId[curEmp.id] ? draftPermsByEmpId[curEmp.id].join(',') : '') + ':' + Object.keys(excludedMap).sort().join(',') });
+          }, { spamAction: 'updateEmployee', spamSig: 'devSections:' + curEmp.id + ':' + (draftPermsByEmpId[curEmp.id] ? draftPermsByEmpId[curEmp.id].join(',') : '') + ':' + JSON.stringify(draftUiOverridesByEmpId[curEmp.id] || {}) });
         });
       }
     }

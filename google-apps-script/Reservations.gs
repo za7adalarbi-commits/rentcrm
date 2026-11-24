@@ -24,6 +24,7 @@ function getReservations(session, params) {
   var timeFrom = normalizeStr(p.timeFrom);
   var timeTo = normalizeStr(p.timeTo);
   var overdueUnpaidOnly = toBool(p.overdueUnpaidOnly);
+  var lifecycle = normalizeStr(p.lifecycle || 'active').toLowerCase();
   var sortBy = normalizeStr(p.sortBy) || 'sourceOrder';
   var sortDirStr = normalizeStr(p.sortDir);
   var sortDir = sortDirStr ? (sortDirStr === 'asc' ? 1 : -1) : (sortBy === 'sourceOrder' ? 1 : -1);
@@ -32,7 +33,7 @@ function getReservations(session, params) {
 
   var isDefaultQuery = !search && !reservationNumberQuery && !company && !branch && !status && !employeeId && !priority &&
     !dateFrom && !dateTo && !unfollowedOnly && !hasProblemsOnly && !hasExtensions &&
-    !timeFrom && !timeTo && !overdueUnpaidOnly &&
+    !timeFrom && !timeTo && !overdueUnpaidOnly && lifecycle === 'active' &&
     page === 1 && sortBy === 'sourceOrder' && sortDir === 1;
 
   var resVer = getCacheVersion_('RES');
@@ -105,6 +106,14 @@ function getReservations(session, params) {
       if (safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
     }
 
+    var isRejRow = Boolean(r.rejectedAt) || gsMatchStatusList_(r, ['rejected', 'declined', 'مرفوض', 'مرفوضة', 'تم الرفض']);
+    var isCanRow = !isRejRow && (Boolean(r.cancelledAt) || gsMatchStatusList_(r, ['cancelled', 'canceled', 'ملغي', 'تم الإلغاء', 'ملغى']));
+    var isInactRow = isRejRow || isCanRow;
+    if (lifecycle === 'rejected' && !isRejRow) continue;
+    if (lifecycle === 'cancelled' && !isCanRow) continue;
+    if (lifecycle === 'inactive' && !isInactRow) continue;
+    if (lifecycle !== 'all' && lifecycle !== 'rejected' && lifecycle !== 'cancelled' && lifecycle !== 'inactive' && isInactRow) continue;
+
     if (company && r.companyName !== company) continue;
     if (branch && r.branchName !== branch) continue;
     if (status && r.internalStatus !== status && r.originalStatusAr !== status) continue;
@@ -148,16 +157,21 @@ function getReservations(session, params) {
     }
 
     if (search) {
-      var hay = (
+      var normSearch = convertEasternDigitsGs_(search).toLowerCase();
+      var allowCidSearch = (session.role === 'developer' || session.role === RG_ROLES.GENERAL_MANAGER || hasPermission(session, 'view_customer_id'));
+      var hay = convertEasternDigitsGs_(
         normalizeStr(r.reservationNumber) + ' ' +
+        (allowCidSearch ? normalizeStr(r.customerIdNumber) + ' ' : '') +
         normalizeStr(r.customerName) + ' ' +
         normalizeStr(r.customerPhone) + ' ' +
         normalizeStr(r.carName) + ' ' +
         normalizeStr(r.plateNumber) + ' ' +
         normalizeStr(r.branchName) + ' ' +
-        normalizeStr(r.companyName)
+        normalizeStr(r.companyName) + ' ' +
+        normalizeStr(r.companyNumber) + ' ' +
+        normalizeStr(r.newCompanyName)
       ).toLowerCase();
-      if (hay.indexOf(search) === -1) continue;
+      if (hay.indexOf(normSearch) === -1) continue;
     }
 
     matched.push(r);

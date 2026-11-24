@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
   job_title TEXT NOT NULL DEFAULT '',
   role TEXT NOT NULL DEFAULT 'agent',
   permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+  ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
   status TEXT NOT NULL DEFAULT 'active',
   last_activity TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS employees (
   job_title TEXT NOT NULL DEFAULT '',
   role TEXT NOT NULL DEFAULT 'agent',
   permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+  ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
   status TEXT NOT NULL DEFAULT 'active',
   last_activity TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -97,6 +99,18 @@ CREATE TABLE IF NOT EXISTS reservations (
   pinned_note_by_name TEXT NOT NULL DEFAULT '',
   pinned_note_updated_at TEXT NOT NULL DEFAULT '',
   no_answer_count INTEGER NOT NULL DEFAULT 0,
+  company_number TEXT NOT NULL DEFAULT '',
+  new_company_name TEXT NOT NULL DEFAULT '',
+  rejection_reason TEXT NOT NULL DEFAULT '',
+  car_status_at_request TEXT NOT NULL DEFAULT '',
+  refund_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+  rejected_by_id TEXT NOT NULL DEFAULT '',
+  rejected_by_name TEXT NOT NULL DEFAULT '',
+  rejected_at TEXT NOT NULL DEFAULT '',
+  cancellation_reason TEXT NOT NULL DEFAULT '',
+  cancelled_by_id TEXT NOT NULL DEFAULT '',
+  cancelled_by_name TEXT NOT NULL DEFAULT '',
+  cancelled_at TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -483,4 +497,26 @@ CREATE INDEX IF NOT EXISTS idx_follow_ups_updated_desc ON follow_ups (updated_at
 CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);
 CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);
+
+-- Idempotent column migrations for existing deployments
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS company_number TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS new_company_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejection_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS car_status_at_request TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refund_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejected_by_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejected_by_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejected_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_at TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_new_company_name ON reservations (new_company_name) WHERE new_company_name <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_rejected_at ON reservations (rejected_at DESC) WHERE rejected_at <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancelled_at DESC) WHERE cancelled_at <> '';
 `;

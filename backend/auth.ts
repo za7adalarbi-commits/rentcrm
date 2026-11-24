@@ -14,6 +14,7 @@ export interface AuthEmployee {
   role: string;
   baseRole?: string;
   permissions: string[];
+  uiOverrides?: Record<string, boolean>;
   activeDelegation?: any;
   status: string;
   lastActivity: string;
@@ -74,12 +75,29 @@ export function parseJsonArray<T = string>(val: any): T[] {
   return [];
 }
 
+export function parseJsonObject<T extends Record<string, any> = Record<string, any>>(val: any): T {
+  if (val && typeof val === 'object' && !Array.isArray(val)) return val as T;
+  if (typeof val === 'string' && val.trim()) {
+    try {
+      const parsed = JSON.parse(val);
+      return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed as T : ({} as T);
+    } catch {
+      return {} as T;
+    }
+  }
+  return {} as T;
+}
+
 export function mapEmployeeRow(row: any): AuthEmployee {
   const role = String(row.role || 'agent');
   const rawPerms = parseJsonArray<string>(row.permissions);
   const resolvedPerms = crmCore && typeof crmCore.resolveEffectivePermissions === 'function'
     ? crmCore.resolveEffectivePermissions(role, rawPerms)
     : rawPerms;
+  const rawUiOverrides = parseJsonObject<Record<string, any>>(row.ui_overrides ?? row.uiOverrides);
+  const uiOverrides = crmCore && typeof crmCore.normalizeUiOverrides === 'function'
+    ? crmCore.normalizeUiOverrides(rawUiOverrides)
+    : rawUiOverrides;
 
   return {
     id: String(row.id || ''),
@@ -91,6 +109,7 @@ export function mapEmployeeRow(row: any): AuthEmployee {
     role,
     baseRole: role,
     permissions: resolvedPerms,
+    uiOverrides,
     activeDelegation: null,
     status: String(row.status || 'active'),
     lastActivity: row.last_activity ? String(row.last_activity) : String(row.lastActivity || ''),
@@ -328,7 +347,7 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
   const sesRes = await executor.query(
     `SELECT s.token_hash, s.employee_id, s.username, s.role, s.expires_at, s.is_revoked, s.last_seen_at,
             e.id AS emp_id, e.name, e.username AS emp_username, e.phone, e.email,
-            e.job_title, e.role AS emp_role, e.permissions, e.status AS emp_status,
+            e.job_title, e.role AS emp_role, e.permissions, e.ui_overrides, e.status AS emp_status,
             e.last_activity, e.created_at, e.updated_at
      FROM sessions s
      JOIN employees e ON e.id = s.employee_id
@@ -374,6 +393,7 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
     job_title: row.job_title,
     role: row.emp_role,
     permissions: row.permissions,
+    ui_overrides: row.ui_overrides,
     status: row.emp_status,
     last_activity: row.last_activity,
     created_at: row.created_at,

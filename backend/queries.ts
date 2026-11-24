@@ -70,9 +70,43 @@ export function buildPgSearchCondition(columns: string[], rawQuery: unknown, par
   return tokenClauses.length === 1 ? tokenClauses[0] : `(${tokenClauses.join(' AND ')})`;
 }
 
+const SQL_REJECTED_CONDITION = `(
+  COALESCE(r.rejected_at, '') <> '' OR
+  LOWER(COALESCE(r.internal_status, '')) IN ('مرفوض','مرفوضة','تم الرفض','rejected','declined','refused') OR
+  LOWER(COALESCE(r.original_status_ar, '')) IN ('مرفوض','مرفوضة','تم الرفض','rejected','declined','refused') OR
+  LOWER(COALESCE(r.original_status_code, '')) IN ('rejected','declined','refused')
+)`;
+
+const SQL_CANCELLED_CONDITION = `(
+  NOT ${SQL_REJECTED_CONDITION} AND (
+    COALESCE(r.cancelled_at, '') <> '' OR
+    LOWER(COALESCE(r.internal_status, '')) IN ('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','cancelled','canceled') OR
+    LOWER(COALESCE(r.original_status_ar, '')) IN ('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','cancelled','canceled') OR
+    LOWER(COALESCE(r.original_status_code, '')) IN ('cancelled','canceled')
+  )
+)`;
+
+const SQL_ACTIVE_CONDITION = `(NOT ${SQL_REJECTED_CONDITION} AND NOT ${SQL_CANCELLED_CONDITION})`;
+
+function redactReservationForUser<T extends Record<string, any>>(res: T, user: any): T {
+  if (!res || typeof res !== 'object') return res;
+  if (typeof crmCore.redactReservationSensitiveFields === 'function') {
+    return crmCore.redactReservationSensitiveFields(res, user);
+  }
+  return res;
+}
+
+function redactReservationsList<T extends Record<string, any>>(items: T[], user: any): T[] {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  if (typeof crmCore.canUserViewCustomerId === 'function' && crmCore.canUserViewCustomerId(user)) {
+    return items;
+  }
+  return items.map((item) => redactReservationForUser(item, user));
+}
+
 async function recordSyncTombstone(
   client: DbClient,
-  entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement',
+  entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement' | 'problem',
   entityIds: string[],
   meta: Record<string, any> = {}
 ): Promise<void> {
@@ -610,7 +644,7 @@ export async function getTodayAndRadar(
       const rowsRes = await executor.query(
         `SELECT r.*
          FROM reservations r
-         WHERE ${agentSql}(
+         WHERE ${agentSql}${SQL_ACTIVE_CONDITION} AND (
            r.start_date = $1
            OR (r.end_date >= $2 AND r.end_date <= $3)
            OR (r.extended_until_date >= $2 AND r.extended_until_date <= $3)
@@ -619,7 +653,9 @@ export async function getTodayAndRadar(
          LIMIT 2500`,
         params
       );
-      const mapped = rowsRes.rows.map((r) => mapReservationRowToClient(r, false));
+      const mapped = rowsRes.rows
+        .map((r) => mapReservationRowToClient(r, false))
+        .filter((m) => !(typeof crmCore.isInactiveReservation === 'function' && crmCore.isInactiveReservation(m)));
       const ids = mapped.map((m) => str(m.id)).filter(Boolean);
       if (ids.length > 0) {
         const fuSetRes = await executor.query<{ reservation_id: string }>(
@@ -672,9 +708,15 @@ export async function getTodayAndRadar(
     todayDate: todayStr,
     serverTime: new Date().toISOString(),
     counts,
-    todaySummary,
-    radarSummary,
-    items: candidates
+    todaySummary: {
+      ...todaySummary,
+      items: redactReservationsList(todaySummary?.items || [], session.user)
+    },
+    radarSummary: {
+      ...radarSummary,
+      items: redactReservationsList(radarSummary?.items || [], session.user)
+    },
+    items: redactReservationsList(candidates, session.user)
   };
 }
 
@@ -1130,6 +1172,17 @@ export async function getReservations(
     clauses.push(`r.assigned_employee_ids @> $${params.length}::jsonb`);
   }
 
+  const lifecycle = str(payload.lifecycle || 'active').toLowerCase();
+  if (lifecycle === 'rejected') {
+    clauses.push(SQL_REJECTED_CONDITION);
+  } else if (lifecycle === 'cancelled') {
+    clauses.push(SQL_CANCELLED_CONDITION);
+  } else if (lifecycle === 'inactive') {
+    clauses.push(`(${SQL_REJECTED_CONDITION} OR ${SQL_CANCELLED_CONDITION})`);
+  } else if (lifecycle !== 'all') {
+    clauses.push(SQL_ACTIVE_CONDITION);
+  }
+
   if (payload.employeeId) {
     params.push(JSON.stringify([str(payload.employeeId)]));
     clauses.push(`r.assigned_employee_ids @> $${params.length}::jsonb`);
@@ -1148,6 +1201,38 @@ export async function getReservations(
   if (payload.company) {
     params.push(str(payload.company));
     clauses.push(`r.company_name = $${params.length}`);
+  }
+
+  if (payload.companyNumber) {
+    const compNumCond = buildPgSearchCondition(['r.company_number'], payload.companyNumber, params);
+    if (compNumCond) clauses.push(compNumCond);
+  }
+
+  if (payload.oldCompanyName) {
+    const oldCompCond = buildPgSearchCondition(['r.company_name'], payload.oldCompanyName, params);
+    if (oldCompCond) clauses.push(oldCompCond);
+  }
+
+  if (payload.newCompanyName) {
+    const newCompCond = buildPgSearchCondition(['r.new_company_name'], payload.newCompanyName, params);
+    if (newCompCond) clauses.push(newCompCond);
+  }
+
+  if (payload.rejectionReason) {
+    const rejReasonCond = buildPgSearchCondition(['r.rejection_reason'], payload.rejectionReason, params);
+    if (rejReasonCond) clauses.push(rejReasonCond);
+  }
+
+  if (payload.cancellationReason) {
+    const canReasonCond = buildPgSearchCondition(['r.cancellation_reason'], payload.cancellationReason, params);
+    if (canReasonCond) clauses.push(canReasonCond);
+  }
+
+  if (payload.confirmedByEmployee || payload.actionByEmployee) {
+    const actorFilter = str(payload.confirmedByEmployee || payload.actionByEmployee);
+    params.push(actorFilter);
+    const pIdx = params.length;
+    clauses.push(`(r.rejected_by_id = $${pIdx} OR r.rejected_by_name = $${pIdx} OR r.cancelled_by_id = $${pIdx} OR r.cancelled_by_name = $${pIdx} OR r.last_updated_by_id = $${pIdx} OR r.last_updated_by_name = $${pIdx})`);
   }
 
   if (payload.branch) {
@@ -1190,16 +1275,23 @@ export async function getReservations(
     if (resNumCond) clauses.push(resNumCond);
   }
 
+  const canSearchId = typeof crmCore.canUserViewCustomerId === 'function' && crmCore.canUserViewCustomerId(session.user);
   if (payload.search) {
-    const searchCond = buildPgSearchCondition([
+    const searchCols = [
       'r.reservation_number',
       'r.customer_name',
       'r.customer_phone',
       'r.car_name',
       'r.plate_number',
       'r.branch_name',
-      'r.company_name'
-    ], payload.search, params);
+      'r.company_name',
+      'r.company_number',
+      'r.new_company_name'
+    ];
+    if (canSearchId) {
+      searchCols.push('r.customer_id_number');
+    }
+    const searchCond = buildPgSearchCondition(searchCols, payload.search, params);
     if (searchCond) clauses.push(searchCond);
   }
 
@@ -1284,8 +1376,15 @@ export async function getReservations(
 
     const timeField = str(payload.timeField || 'both').toLowerCase();
     const filtered = crmCore.filterReservations(mappedItems, [], {
+      lifecycle: str(payload.lifecycle || 'active').toLowerCase(),
       search: str(payload.search),
       reservationNumber: resNumberQuery,
+      companyNumber: str(payload.companyNumber),
+      oldCompanyName: str(payload.oldCompanyName),
+      newCompanyName: str(payload.newCompanyName),
+      rejectionReason: str(payload.rejectionReason),
+      cancellationReason: str(payload.cancellationReason),
+      confirmedByEmployee: str(payload.confirmedByEmployee || payload.actionByEmployee),
       timeField,
       timeFrom: str(payload.timeFrom),
       timeTo: str(payload.timeTo),
@@ -1300,10 +1399,10 @@ export async function getReservations(
     }, { role: session.user.role, employeeId: session.user.id, allowAgentViewAll: true, user: session.user });
 
     const total = filtered.length;
-    const paged = filtered.slice(offset, offset + pageSize).map((item: any) => {
+    const paged = redactReservationsList(filtered.slice(offset, offset + pageSize).map((item: any) => {
       const ov = crmCore.isReservationOverdueUnpaid(item, extByResId[item.id] || item.extensions, Date.now());
       return { ...item, overdueInfo: ov.isOverdueUnpaid ? ov : null };
-    });
+    }), session.user);
 
     return {
       items: paged,
@@ -1336,7 +1435,7 @@ export async function getReservations(
   const total = Number(countRes.rows[0]?.cnt || 0);
 
   return {
-    items: rowsRes.rows.map((r) => mapReservationRowToClient(r, false)),
+    items: redactReservationsList(rowsRes.rows.map((r) => mapReservationRowToClient(r, false)), session.user),
     total,
     page,
     pageSize,
@@ -1363,7 +1462,7 @@ export async function syncLocalCache(
     executor.query(
       `SELECT r.id, r.source_reservation_id, r.reservation_number, r.source_created_at,
               r.customer_name, r.customer_phone, r.customer_email, r.customer_id_number,
-              r.company_name, r.branch_name, r.deliver_branch_name, r.car_name, r.plate_number, r.car_category,
+              r.company_name, r.company_number, r.new_company_name, r.branch_name, r.deliver_branch_name, r.car_name, r.plate_number, r.car_category,
               r.start_date, r.start_time, r.original_end_date, r.original_end_time, r.end_date, r.end_time,
               r.extended_until_date, r.extended_until_time, r.days_count, r.extended_days_count, r.total_days_count,
               r.original_status_code, r.original_status_ar, r.pickup_type_ar, r.return_type_ar,
@@ -1371,7 +1470,10 @@ export async function syncLocalCache(
               r.base_amount, r.extensions_count, r.extensions_amount, r.total_amount, r.has_extensions,
               r.internal_status, r.priority, r.assigned_employee_ids, r.assigned_employee_names,
               r.last_update_text, r.last_updated_by_id, r.last_updated_by_name, r.last_updated_at,
-              r.has_problem, r.pinned_note, r.pinned_note_by_id, r.pinned_note_by_name, r.pinned_note_updated_at, r.no_answer_count,
+              r.has_problem, r.rejection_reason, r.car_status_at_request, r.refund_amount,
+              r.rejected_by_id, r.rejected_by_name, r.rejected_at,
+              r.cancellation_reason, r.cancelled_by_id, r.cancelled_by_name, r.cancelled_at,
+              r.pinned_note, r.pinned_note_by_id, r.pinned_note_by_name, r.pinned_note_updated_at, r.no_answer_count,
               r.created_at, r.updated_at, r.source_order, r.status_history,
               EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
@@ -1385,7 +1487,7 @@ export async function syncLocalCache(
     executor.query(`SELECT * FROM problems ORDER BY updated_at DESC LIMIT 500`)
   ]);
 
-  const reservations = resRows.rows.map((r) => mapReservationRowToClient(r, false));
+  const reservations = redactReservationsList(resRows.rows.map((r) => mapReservationRowToClient(r, false)), session.user);
   const extensions = extRows.rows.map(mapExtensionRowToClient);
   const followUps = fuRows.rows.map(formatFollowUpRow);
   const problems = prbRows.rows.map((p) => formatProblemRow(p));
@@ -1466,7 +1568,7 @@ export async function getReservationDetails(
   reservation.isFollowed = fuRes.rows.length > 0;
 
   return {
-    reservation,
+    reservation: redactReservationForUser(reservation, session.user),
     extensions: extRes.rows.map(mapExtensionRowToClient),
     assignments: asnRes.rows.map((a) => ({
       id: str(a.id),
@@ -1659,7 +1761,7 @@ export async function quickUpdateReservationStatus(
     );
 
     const nextHistory = crmCore.appendStatusStageEntry(resObj.statusHistory || [], {
-      source: 'quick_status',
+      source: crmCore.isRejectedStatus(newStatus) ? 'reject_action' : (crmCore.isCancelledStatus(newStatus) ? 'cancel_action' : 'quick_status'),
       previousStatus: prevStatus,
       newStatus,
       changedAt: nowIso,
@@ -1667,6 +1769,17 @@ export async function quickUpdateReservationStatus(
       changedByName: session.user.name,
       note: lastText
     });
+
+    const isRejTarget = crmCore.isRejectedStatus(newStatus);
+    const isCanTarget = !isRejTarget && crmCore.isCancelledStatus(newStatus);
+    const nextRejectedAt = isRejTarget ? (str(resObj.rejectedAt) || nowIso) : '';
+    const nextRejectedById = isRejTarget ? (str(resObj.rejectedById) || session.user.id) : '';
+    const nextRejectedByName = isRejTarget ? (str(resObj.rejectedByName) || session.user.name) : '';
+    const nextRejectionReason = isRejTarget ? (str(payload.rejectionReason || note) || str(resObj.rejectionReason)) : str(resObj.rejectionReason);
+    const nextCancelledAt = isCanTarget ? (str(resObj.cancelledAt) || nowIso) : '';
+    const nextCancelledById = isCanTarget ? (str(resObj.cancelledById) || session.user.id) : '';
+    const nextCancelledByName = isCanTarget ? (str(resObj.cancelledByName) || session.user.name) : '';
+    const nextCancellationReason = isCanTarget ? (str(payload.cancellationReason || note) || str(resObj.cancellationReason)) : str(resObj.cancellationReason);
 
     await tx.query(
       `UPDATE reservations
@@ -1676,9 +1789,21 @@ export async function quickUpdateReservationStatus(
            last_updated_by_name = $5,
            last_updated_at = $6,
            updated_at = $7::timestamptz,
-           status_history = $8::jsonb
+           status_history = $8::jsonb,
+           rejection_reason = $9,
+           rejected_by_id = $10,
+           rejected_by_name = $11,
+           rejected_at = $12,
+           cancellation_reason = $13,
+           cancelled_by_id = $14,
+           cancelled_by_name = $15,
+           cancelled_at = $16
        WHERE id = $1`,
-      [resId, newStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
+      [
+        resId, newStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory),
+        nextRejectionReason, nextRejectedById, nextRejectedByName, nextRejectedAt,
+        nextCancellationReason, nextCancelledById, nextCancelledByName, nextCancelledAt
+      ]
     );
 
     await logActivity(
@@ -1709,11 +1834,19 @@ export async function quickUpdateReservationStatus(
       lastUpdatedAt: nowIso,
       updatedAt: nowIso,
       statusHistory: nextHistory,
+      rejectionReason: nextRejectionReason,
+      rejectedById: nextRejectedById,
+      rejectedByName: nextRejectedByName,
+      rejectedAt: nextRejectedAt,
+      cancellationReason: nextCancellationReason,
+      cancelledById: nextCancelledById,
+      cancelledByName: nextCancelledByName,
+      cancelledAt: nextCancelledAt,
       isFollowed: true
     };
     await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
     await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-    return { reservation: updatedRes, followUp: fuObj };
+    return { reservation: redactReservationForUser(updatedRes, session.user), followUp: fuObj };
   });
 
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
@@ -1766,13 +1899,20 @@ export async function updateReservationDetails(
       ? num(payload.totalAmount, Number((nextBaseAmount + nextExtAmount).toFixed(2)))
       : existing.totalAmount;
 
+    const isRejTarget = crmCore.isRejectedStatus(nextStatus);
+    const isCanTarget = !isRejTarget && crmCore.isCancelledStatus(nextStatus);
+
     const nextObj: Record<string, any> = {
       ...existing,
       customerName: payload.customerName !== undefined ? str(payload.customerName) : existing.customerName,
       customerPhone: payload.customerPhone !== undefined ? str(payload.customerPhone) : existing.customerPhone,
       customerEmail: payload.customerEmail !== undefined ? str(payload.customerEmail) : existing.customerEmail,
-      customerIdNumber: payload.customerIdNumber !== undefined ? str(payload.customerIdNumber) : existing.customerIdNumber,
+      customerIdNumber: (payload.customerIdNumber !== undefined && crmCore.canUserViewCustomerId(session.user))
+        ? str(payload.customerIdNumber)
+        : existing.customerIdNumber,
       companyName: payload.companyName !== undefined ? str(payload.companyName) : existing.companyName,
+      companyNumber: payload.companyNumber !== undefined ? str(payload.companyNumber) : existing.companyNumber,
+      newCompanyName: payload.newCompanyName !== undefined ? str(payload.newCompanyName) : existing.newCompanyName,
       branchName: payload.branchName !== undefined ? str(payload.branchName) : existing.branchName,
       deliverBranchName: payload.deliverBranchName !== undefined ? str(payload.deliverBranchName) : existing.deliverBranchName,
       carName: payload.carName !== undefined ? str(payload.carName) : existing.carName,
@@ -1798,6 +1938,16 @@ export async function updateReservationDetails(
       hasExtensions: Boolean(nextExtCount > 0 || nextExtDaysCount > 0 || existing.hasExtensions),
       priority: payload.priority !== undefined ? str(payload.priority) : existing.priority,
       internalStatus: nextStatus,
+      rejectionReason: payload.rejectionReason !== undefined ? str(payload.rejectionReason) : existing.rejectionReason,
+      carStatusAtRequest: payload.carStatusAtRequest !== undefined ? str(payload.carStatusAtRequest) : existing.carStatusAtRequest,
+      refundAmount: payload.refundAmount !== undefined ? num(payload.refundAmount, 0) : num(existing.refundAmount, 0),
+      rejectedById: isRejTarget ? (str(existing.rejectedById) || session.user.id) : '',
+      rejectedByName: isRejTarget ? (str(existing.rejectedByName) || session.user.name) : '',
+      rejectedAt: isRejTarget ? (str(existing.rejectedAt) || nowIso) : '',
+      cancellationReason: payload.cancellationReason !== undefined ? str(payload.cancellationReason) : existing.cancellationReason,
+      cancelledById: isCanTarget ? (str(existing.cancelledById) || session.user.id) : '',
+      cancelledByName: isCanTarget ? (str(existing.cancelledByName) || session.user.name) : '',
+      cancelledAt: isCanTarget ? (str(existing.cancelledAt) || nowIso) : '',
       lastUpdateText: payload.lastUpdateText !== undefined ? str(payload.lastUpdateText) : `تعديل بيانات الحجز بواسطة ${session.user.name}`,
       lastUpdatedById: session.user.id,
       lastUpdatedByName: session.user.name,
@@ -1818,7 +1968,11 @@ export async function updateReservationDetails(
            extensions_count = $25, base_amount = $26, extensions_amount = $27, total_amount = $28,
            has_extensions = $29, priority = $30, internal_status = $31,
            last_update_text = $32, last_updated_by_id = $33, last_updated_by_name = $34,
-           last_updated_at = $35, updated_at = $36::timestamptz, status_history = $37::jsonb
+           last_updated_at = $35, updated_at = $36::timestamptz, status_history = $37::jsonb,
+           company_number = $38, new_company_name = $39, rejection_reason = $40,
+           car_status_at_request = $41, refund_amount = $42,
+           rejected_by_id = $43, rejected_by_name = $44, rejected_at = $45,
+           cancellation_reason = $46, cancelled_by_id = $47, cancelled_by_name = $48, cancelled_at = $49
        WHERE id = $1`,
       [
         resId,
@@ -1857,7 +2011,19 @@ export async function updateReservationDetails(
         nextObj.lastUpdatedByName,
         nextObj.lastUpdatedAt,
         nextObj.updatedAt,
-        JSON.stringify(nextObj.statusHistory)
+        JSON.stringify(nextObj.statusHistory),
+        nextObj.companyNumber || '',
+        nextObj.newCompanyName || '',
+        nextObj.rejectionReason || '',
+        nextObj.carStatusAtRequest || '',
+        num(nextObj.refundAmount, 0),
+        nextObj.rejectedById || '',
+        nextObj.rejectedByName || '',
+        nextObj.rejectedAt || '',
+        nextObj.cancellationReason || '',
+        nextObj.cancelledById || '',
+        nextObj.cancelledByName || '',
+        nextObj.cancelledAt || ''
       ]
     );
 
@@ -1875,7 +2041,7 @@ export async function updateReservationDetails(
     ]);
     await logActivity(tx, session.user, 'تعديل بيانات حجز', 'Reservation', existing.reservationNumber, 'تعديل تفاصيل الحجز بواسطة المشرف / الإدارة', diffs);
     await enqueueSheetsMirror(tx, 'Reservation', nextObj.id, 'upsertReservation', nextObj);
-    return nextObj;
+    return redactReservationForUser(nextObj, session.user);
   });
 
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
@@ -2139,8 +2305,19 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
       );
 
       const lastText = action + (notes ? ` — ${notes}` : '');
+      const isRejTarget = crmCore.isRejectedStatus(status);
+      const isCanTarget = !isRejTarget && crmCore.isCancelledStatus(status);
+      const nextRejectedAt = isRejTarget ? (str(resObj.rejectedAt) || nowIso) : str(resObj.rejectedAt);
+      const nextRejectedById = isRejTarget ? (str(resObj.rejectedById) || session.user.id) : str(resObj.rejectedById);
+      const nextRejectedByName = isRejTarget ? (str(resObj.rejectedByName) || session.user.name) : str(resObj.rejectedByName);
+      const nextRejectionReason = isRejTarget ? (str(payload.rejectionReason || notes || action) || str(resObj.rejectionReason)) : str(resObj.rejectionReason);
+      const nextCancelledAt = isCanTarget ? (str(resObj.cancelledAt) || nowIso) : str(resObj.cancelledAt);
+      const nextCancelledById = isCanTarget ? (str(resObj.cancelledById) || session.user.id) : str(resObj.cancelledById);
+      const nextCancelledByName = isCanTarget ? (str(resObj.cancelledByName) || session.user.name) : str(resObj.cancelledByName);
+      const nextCancellationReason = isCanTarget ? (str(payload.cancellationReason || notes || action) || str(resObj.cancellationReason)) : str(resObj.cancellationReason);
+
       const nextHistory = crmCore.appendStatusStageEntry(resObj.statusHistory || [], {
-        source: 'followup',
+        source: isRejTarget ? 'reject_action' : (isCanTarget ? 'cancel_action' : 'followup'),
         previousStatus: resObj.internalStatus,
         newStatus: status,
         changedAt: nowIso,
@@ -2153,9 +2330,15 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
         `UPDATE reservations
          SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
              last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
-             status_history = $8::jsonb
+             status_history = $8::jsonb,
+             rejection_reason = $9, rejected_by_id = $10, rejected_by_name = $11, rejected_at = $12,
+             cancellation_reason = $13, cancelled_by_id = $14, cancelled_by_name = $15, cancelled_at = $16
          WHERE id = $1`,
-        [resId, status, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
+        [
+          resId, status, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory),
+          nextRejectionReason, nextRejectedById, nextRejectedByName, nextRejectedAt,
+          nextCancellationReason, nextCancelledById, nextCancelledByName, nextCancelledAt
+        ]
       );
 
       await logActivity(tx, session.user, 'إضافة متابعة', 'FollowUp', resObj.reservationNumber, `الحالة: ${status} — ${action}`);
@@ -2176,11 +2359,19 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
         lastUpdatedAt: nowIso,
         updatedAt: nowIso,
         statusHistory: nextHistory,
+        rejectionReason: nextRejectionReason,
+        rejectedById: nextRejectedById,
+        rejectedByName: nextRejectedByName,
+        rejectedAt: nextRejectedAt,
+        cancellationReason: nextCancellationReason,
+        cancelledById: nextCancelledById,
+        cancelledByName: nextCancelledByName,
+        cancelledAt: nextCancelledAt,
         isFollowed: true
       };
       await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
       await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-      return { followUp: fuObj, reservation: updatedRes };
+      return { followUp: fuObj, reservation: redactReservationForUser(updatedRes, session.user) };
     });
 
     void flushSheetsMirrorOutbox(executor).catch(() => undefined);
@@ -2434,7 +2625,7 @@ export async function getMyFollowUps(executor: DbExecutor, session: AuthSession,
     : [];
 
   return {
-    assignedReservations: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
+    assignedReservations: redactReservationsList(resRows.rows.map((r) => mapReservationRowToClient(r, false)), session.user),
     followUps: fuRows.rows.map(formatFollowUpRow),
     mentionFollowUps,
     pinnedCriticalIds
@@ -2715,6 +2906,74 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
   return out;
 }
 
+export async function deleteProblem(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'update_problem');
+  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_close_delete_ticket')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية حذف التذاكر والمشكلات.');
+  }
+  const problemId = str(payload.problemId || payload.id);
+  if (!problemId) throw new Error('VALIDATION_ERROR: معرف المشكلة مطلوب.');
+
+  return runWithIdempotency(executor, session.user.id, 'deleteProblem', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const pRes = await tx.query(`SELECT * FROM problems WHERE id = $1 FOR UPDATE`, [problemId]);
+      if (!pRes.rows[0]) throw new Error('NOT_FOUND: المشكلة غير موجودة.');
+      const existing = formatProblemRow(pRes.rows[0]);
+      assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
+
+      await tx.query(`DELETE FROM problem_updates WHERE problem_id = $1`, [problemId]).catch(() => undefined);
+      await tx.query(`DELETE FROM notifications WHERE entity_type = $1 AND entity_id = $2`, ['Problem', problemId]).catch(() => undefined);
+      await tx.query(`DELETE FROM problems WHERE id = $1`, [problemId]);
+      await tx.query(`DELETE FROM issues WHERE id = $1`, [problemId]).catch(() => undefined);
+
+      let hasOpen = false;
+      const nowIso = new Date().toISOString();
+      if (existing.reservationId) {
+        const openCheck = await tx.query<{ cnt: string }>(
+          `SELECT COUNT(*)::text AS cnt FROM problems WHERE reservation_id = $1 AND status NOT IN ('مغلقة', 'تم الحل')`,
+          [existing.reservationId]
+        );
+        hasOpen = Number(openCheck.rows[0]?.cnt || 0) > 0;
+        await tx.query(
+          `UPDATE reservations SET has_problem = $2, updated_at = $3::timestamptz WHERE id = $1`,
+          [existing.reservationId, hasOpen, nowIso]
+        );
+      }
+
+      await recordSyncTombstone(tx, 'problem', [problemId], {
+        reservationId: existing.reservationId,
+        problemNumber: existing.problemNumber
+      });
+
+      await logActivity(
+        tx,
+        session.user,
+        'حذف مشكلة',
+        'Problem',
+        existing.problemNumber || problemId,
+        `حجز ${existing.reservationNumber || '-'} | ${existing.customerName || '-'} | ${String(existing.description || '').slice(0, 80)}`
+      );
+
+      await enqueueSheetsMirror(tx, 'Problem', problemId, 'deleteProblem', {
+        id: problemId,
+        problemNumber: existing.problemNumber,
+        reservationId: existing.reservationId
+      });
+
+      return {
+        id: problemId,
+        deleted: true,
+        problemNumber: existing.problemNumber,
+        reservationId: existing.reservationId,
+        hasOpenProblemsOnReservation: hasOpen
+      };
+    });
+
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
+  });
+}
+
 export async function getProblems(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
   const params: any[] = [];
   const clauses: string[] = [];
@@ -2939,7 +3198,7 @@ export async function getEmployeeDetails(executor: DbExecutor, session: AuthSess
       problemsCount: problems.length,
       statusCounts
     },
-    assignedReservations,
+    assignedReservations: redactReservationsList(assignedReservations, session.user),
     followUps,
     problems
   };
@@ -2965,24 +3224,27 @@ export async function createEmployee(executor: DbExecutor, session: AuthSession,
     const pHash = hashPassword(password, salt);
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : [role];
     const effectivePerms = crmCore.resolveEffectivePermissions(role, rawPerms);
+    const uiOverrides = typeof crmCore.normalizeUiOverrides === 'function'
+      ? crmCore.normalizeUiOverrides(payload.uiOverrides)
+      : {};
     const nowIso = new Date().toISOString();
     const id = generateId('EMP');
 
     await tx.query(
-      `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'active',$11::text,$12::timestamptz,$12::timestamptz)`,
-      [id, name, username, pHash, salt, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso, nowIso]
+      `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,'active',$12::text,$13::timestamptz,$13::timestamptz)`,
+      [id, name, username, pHash, salt, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), JSON.stringify(uiOverrides), nowIso, nowIso]
     );
     await tx.query(
-      `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'active',$9,$10::timestamptz,$10::timestamptz)`,
-      [id, name, username, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), nowIso, nowIso]
+      `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,'active',$10,$11::timestamptz,$11::timestamptz)`,
+      [id, name, username, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), JSON.stringify(uiOverrides), nowIso, nowIso]
     );
 
     await logActivity(tx, session.user, 'إضافة موظف', 'Employee', username, `إضافة ${name} بدور ${role}`);
     const emp = mapEmployeeRow({
       id, name, username, phone: str(payload.phone), email: str(payload.email),
-      job_title: str(payload.jobTitle), role, permissions: effectivePerms,
+      job_title: str(payload.jobTitle), role, permissions: effectivePerms, ui_overrides: uiOverrides,
       status: 'active', last_activity: nowIso, created_at: nowIso, updated_at: nowIso
     });
     await enqueueSheetsMirror(tx, 'Employee', id, 'upsertEmployee', { ...emp, passwordHash: pHash, salt });
@@ -3011,7 +3273,17 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
       throw new Error('FORBIDDEN: ترقية حساب إلى دور المبرمج متاحة للمبرمج فقط.');
     }
     const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : parseJsonArray(cur.permissions);
-    const nextPerms = crmCore.resolveEffectivePermissions(nextRole, rawPerms);
+    let nextPerms = crmCore.resolveEffectivePermissions(nextRole, rawPerms);
+    if (empId === session.employeeId && (cur.role === 'developer' || cur.role === 'general_manager')) {
+      for (const reqPerm of ['manage_employees', 'manage_settings', 'customize_ui']) {
+        if (nextPerms.indexOf('all') === -1 && nextPerms.indexOf(reqPerm) === -1) {
+          nextPerms = [...nextPerms, reqPerm];
+        }
+      }
+    }
+    const nextUiOverrides = payload.uiOverrides !== undefined && typeof crmCore.normalizeUiOverrides === 'function'
+      ? crmCore.normalizeUiOverrides(payload.uiOverrides)
+      : (typeof crmCore.normalizeUiOverrides === 'function' ? crmCore.normalizeUiOverrides(parseJsonValue(cur.ui_overrides, {})) : {});
 
     let nextUsername = str(cur.username);
     if (payload.username !== undefined) {
@@ -3056,16 +3328,16 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
     await tx.query(
       `UPDATE employees
        SET name = $2, username = $3, phone = $4, email = $5, job_title = $6, role = $7,
-           permissions = $8::jsonb, status = $9, password_hash = $10, salt = $11, updated_at = $12::timestamptz
+           permissions = $8::jsonb, ui_overrides = $9::jsonb, status = $10, password_hash = $11, salt = $12, updated_at = $13::timestamptz
        WHERE id = $1`,
-      [empId, nextName, nextUsername, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), nextStatus, nextHash, nextSalt, nowIso]
+      [empId, nextName, nextUsername, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), JSON.stringify(nextUiOverrides), nextStatus, nextHash, nextSalt, nowIso]
     );
     await tx.query(
       `UPDATE users
        SET name = $2, username = $3, phone = $4, email = $5, job_title = $6, role = $7,
-           permissions = $8::jsonb, status = $9, updated_at = $10::timestamptz
+           permissions = $8::jsonb, ui_overrides = $9::jsonb, status = $10, updated_at = $11::timestamptz
        WHERE id = $1`,
-      [empId, nextName, nextUsername, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), nextStatus, nowIso]
+      [empId, nextName, nextUsername, nextPhone, nextEmail, nextJob, nextRole, JSON.stringify(nextPerms), JSON.stringify(nextUiOverrides), nextStatus, nowIso]
     );
 
     if (nextStatus !== 'active') {
@@ -3088,7 +3360,7 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
     const emp = mapEmployeeRow({
       ...cur,
       name: nextName, username: nextUsername, phone: nextPhone, email: nextEmail, job_title: nextJob,
-      role: nextRole, permissions: nextPerms, status: nextStatus, updated_at: nowIso
+      role: nextRole, permissions: nextPerms, ui_overrides: nextUiOverrides, status: nextStatus, updated_at: nowIso
     });
     await enqueueSheetsMirror(tx, 'Employee', empId, 'upsertEmployee', { ...emp, passwordHash: nextHash, salt: nextSalt });
     return emp;
@@ -3547,7 +3819,7 @@ export async function saveUserLayoutPrefs(
 const RESERVATION_CLIENT_COLUMNS = `
   id, source_reservation_id, reservation_number, source_created_at,
   customer_name, customer_phone, customer_email, customer_id_number,
-  company_name, branch_name, deliver_branch_name,
+  company_name, company_number, new_company_name, branch_name, deliver_branch_name,
   car_name, plate_number, car_category,
   start_date, start_time, original_end_date, original_end_time,
   end_date, end_time, extended_until_date, extended_until_time,
@@ -3557,7 +3829,10 @@ const RESERVATION_CLIENT_COLUMNS = `
   base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
   internal_status, priority, assigned_employee_ids, assigned_employee_names,
   last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
-  has_problem, pinned_note, pinned_note_by_id, pinned_note_by_name, pinned_note_updated_at, no_answer_count,
+  has_problem, rejection_reason, car_status_at_request, refund_amount,
+  rejected_by_id, rejected_by_name, rejected_at,
+  cancellation_reason, cancelled_by_id, cancelled_by_name, cancelled_at,
+  pinned_note, pinned_note_by_id, pinned_note_by_name, pinned_note_updated_at, no_answer_count,
   created_at, updated_at, status_history
 `;
 
@@ -4726,7 +5001,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       [sinceDate]
     ),
     executor.query(
-      `SELECT id, name, username, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at
+      `SELECT id, name, username, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at
        FROM employees
        WHERE updated_at > $1::timestamptz
        ORDER BY updated_at DESC
@@ -4769,6 +5044,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
   const deletedReservationIds: string[] = [];
   const deletedEmployeeIds: string[] = [];
   const deletedAnnouncementIds: string[] = [];
+  const deletedProblemIds: string[] = [];
   let deletedAllReservationsBefore = '';
 
   for (const row of tombstoneRows.rows || []) {
@@ -4780,6 +5056,8 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       deletedEmployeeIds.push(eid);
     } else if (et === 'announcement' && eid) {
       deletedAnnouncementIds.push(eid);
+    } else if (et === 'problem' && eid) {
+      deletedProblemIds.push(eid);
     } else if (et === 'reservation_clear_all') {
       const dIso = row?.deleted_at instanceof Date ? row.deleted_at.toISOString() : str(row?.deleted_at);
       if (dIso && (!deletedAllReservationsBefore || dIso > deletedAllReservationsBefore)) {
@@ -4795,25 +5073,37 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
   const syncVersion = Math.max(getLocalCacheVersion(executor), Number(freshSyncVer || 0) || 0);
 
   let callWrapupShortcuts: any = undefined;
-  if (settingsUpdatedAt && typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function') {
+  let clientUiConfig: any = undefined;
+  if (settingsUpdatedAt || toBool(payload.includeUiConfig)) {
     const setMap = await getSettingsMap(executor).catch(() => ({} as Record<string, any>));
-    callWrapupShortcuts = crmCore.normalizeCallWrapupShortcutsConfig(setMap.call_wrapup_shortcuts);
+    if (typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function') {
+      callWrapupShortcuts = crmCore.normalizeCallWrapupShortcutsConfig(setMap.call_wrapup_shortcuts);
+    }
+    clientUiConfig = {
+      uiSimplification: crmCore.normalizeUiSimplificationSettings(setMap.ui_simplification),
+      roleUiDefaults: typeof crmCore.normalizeRoleUiDefaults === 'function' ? crmCore.normalizeRoleUiDefaults(setMap.role_ui_defaults) : {},
+      statsControlConfig: typeof crmCore.normalizeStatsControlConfig === 'function' ? crmCore.normalizeStatsControlConfig(setMap.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
+      callWrapupShortcuts: callWrapupShortcuts || { items: crmCore.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
+      handoverSettings: crmCore.normalizeHandoverSettings(setMap.handover_settings)
+    };
   }
 
   return {
     serverTime: new Date().toISOString(),
     syncVersion,
-    changedReservations: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
+    changedReservations: redactReservationsList(resRows.rows.map((r) => mapReservationRowToClient(r, false)), session.user),
     changedFollowUps: fuRows.rows.map(formatFollowUpRow),
     changedProblems: prbRows.rows.map((p) => formatProblemRow(p)),
     changedEmployees: empRows.rows.map((e) => mapEmployeeRow(e)),
     deletedReservationIds: Array.from(new Set(deletedReservationIds)),
     deletedEmployeeIds: Array.from(new Set(deletedEmployeeIds)),
     deletedAnnouncementIds: Array.from(new Set(deletedAnnouncementIds)),
+    deletedProblemIds: Array.from(new Set(deletedProblemIds)),
     deletedAllReservationsBefore,
     changedSettings: Boolean(settingsUpdatedAt),
     settingsUpdatedAt,
     ...(callWrapupShortcuts !== undefined ? { callWrapupShortcuts } : {}),
+    ...(clientUiConfig !== undefined ? { clientUiConfig } : {}),
     changedDelegations: Boolean(maxDelUpdRaw),
     changedRoles: Boolean(maxRoleUpdRaw),
     hasMoreReservations: resRows.rows.length >= 200,
@@ -5126,4 +5416,727 @@ export async function bulkReassignSelectedReservations(
     void flushSheetsMirrorOutbox(executor).catch(() => undefined);
     return out;
   });
+}
+
+// ---------- INACTIVE / REJECTED / CANCELLED RESERVATIONS & NATIONAL ID LOOKUP ----------
+
+export async function rejectReservation(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'reject_reservation');
+  const resId = str(payload.reservationId || payload.id);
+  const rejectionReason = str(payload.rejectionReason || payload.reason);
+  const companyNumber = str(payload.companyNumber);
+  const newCompanyName = str(payload.newCompanyName);
+  const carStatusAtRequest = str(payload.carStatusAtRequest);
+  const refundAmount = Math.max(0, num(payload.refundAmount, 0));
+  const note = str(payload.note || payload.notes);
+
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+  if (!rejectionReason) throw new Error('VALIDATION_ERROR: يرجى تحديد سبب الرفض.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 FOR UPDATE`, [resId]);
+    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const existing = mapReservationRowToClient(resQuery.rows[0], false);
+    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
+
+    const nowIso = new Date().toISOString();
+    const prevStatus = str(existing.internalStatus);
+    const nextStatus = 'مرفوض';
+    const lastText = `تم رفض الحجز: ${rejectionReason}${newCompanyName ? ` ← التحويل إلى: ${newCompanyName}` : ''}`;
+
+    const fuObj = {
+      id: generateId('FU'),
+      reservationId: existing.id,
+      reservationNumber: existing.reservationNumber,
+      customerName: existing.customerName,
+      employeeId: session.user.id,
+      employeeName: session.user.name,
+      status: nextStatus,
+      action: `رفض الحجز (${rejectionReason})`,
+      notes: note || (newCompanyName ? `الشركة الجديدة: ${newCompanyName} — مبلغ الاسترداد: ${refundAmount}` : ''),
+      followUpDate: nowIso.slice(0, 10),
+      followUpTime: nowIso.slice(11, 19),
+      createdAt: nowIso
+    };
+
+    await tx.query(
+      `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
+      [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
+    );
+
+    const nextHistory = crmCore.appendStatusStageEntry(existing.statusHistory || [], {
+      source: 'reject_action',
+      previousStatus: prevStatus,
+      newStatus: nextStatus,
+      changedAt: nowIso,
+      changedById: session.user.id,
+      changedByName: session.user.name,
+      note: lastText
+    });
+
+    await tx.query(
+      `UPDATE reservations
+       SET internal_status = $2,
+           rejection_reason = $3,
+           company_number = CASE WHEN $4 <> '' THEN $4 ELSE company_number END,
+           new_company_name = $5,
+           car_status_at_request = $6,
+           refund_amount = $7,
+           rejected_by_id = $8,
+           rejected_by_name = $9,
+           rejected_at = $10,
+           cancelled_by_id = '',
+           cancelled_by_name = '',
+           cancelled_at = '',
+           last_update_text = $11,
+           last_updated_by_id = $8,
+           last_updated_by_name = $9,
+           last_updated_at = $10,
+           updated_at = $13::timestamptz,
+           status_history = $12::jsonb
+       WHERE id = $1`,
+      [
+        existing.id,
+        nextStatus,
+        rejectionReason,
+        companyNumber,
+        newCompanyName,
+        carStatusAtRequest,
+        refundAmount,
+        session.user.id,
+        session.user.name,
+        nowIso,
+        lastText,
+        JSON.stringify(nextHistory),
+        nowIso
+      ]
+    );
+
+    await logActivity(
+      tx,
+      session.user,
+      'رفض حجز',
+      'Reservation',
+      existing.reservationNumber,
+      lastText,
+      [{ field: 'internalStatus', label: 'حالة الحجز', before: prevStatus || '-', after: nextStatus }]
+    );
+
+    const updatedRes: Record<string, any> = {
+      ...existing,
+      internalStatus: nextStatus,
+      rejectionReason,
+      companyNumber: companyNumber || existing.companyNumber || '',
+      newCompanyName,
+      carStatusAtRequest,
+      refundAmount,
+      rejectedById: session.user.id,
+      rejectedByName: session.user.name,
+      rejectedAt: nowIso,
+      cancelledById: '',
+      cancelledByName: '',
+      cancelledAt: '',
+      lastUpdateText: lastText,
+      lastUpdatedById: session.user.id,
+      lastUpdatedByName: session.user.name,
+      lastUpdatedAt: nowIso,
+      updatedAt: nowIso,
+      statusHistory: nextHistory,
+      isFollowed: true
+    };
+    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    return { reservation: redactReservationForUser(updatedRes, session.user), followUp: fuObj };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
+export async function cancelReservation(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'cancel_reservation');
+  const resId = str(payload.reservationId || payload.id);
+  const cancellationReason = str(payload.cancellationReason || payload.reason || payload.note || 'تم الإلغاء');
+  const note = str(payload.note || payload.notes);
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 FOR UPDATE`, [resId]);
+    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const existing = mapReservationRowToClient(resQuery.rows[0], false);
+    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
+
+    const nowIso = new Date().toISOString();
+    const prevStatus = str(existing.internalStatus);
+    const nextStatus = 'تم الإلغاء';
+    const lastText = `تم إلغاء الحجز: ${cancellationReason}${note && note !== cancellationReason ? ` — ${note}` : ''}`;
+
+    const fuObj = {
+      id: generateId('FU'),
+      reservationId: existing.id,
+      reservationNumber: existing.reservationNumber,
+      customerName: existing.customerName,
+      employeeId: session.user.id,
+      employeeName: session.user.name,
+      status: nextStatus,
+      action: `إلغاء الحجز (${cancellationReason})`,
+      notes: note,
+      followUpDate: nowIso.slice(0, 10),
+      followUpTime: nowIso.slice(11, 19),
+      createdAt: nowIso
+    };
+
+    await tx.query(
+      `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
+      [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
+    );
+
+    const nextHistory = crmCore.appendStatusStageEntry(existing.statusHistory || [], {
+      source: 'cancel_action',
+      previousStatus: prevStatus,
+      newStatus: nextStatus,
+      changedAt: nowIso,
+      changedById: session.user.id,
+      changedByName: session.user.name,
+      note: lastText
+    });
+
+    await tx.query(
+      `UPDATE reservations
+       SET internal_status = $2,
+           cancellation_reason = $3,
+           cancelled_by_id = $4,
+           cancelled_by_name = $5,
+           cancelled_at = $6,
+           rejected_by_id = '',
+           rejected_by_name = '',
+           rejected_at = '',
+           last_update_text = $7,
+           last_updated_by_id = $4,
+           last_updated_by_name = $5,
+           last_updated_at = $6,
+           updated_at = $9::timestamptz,
+           status_history = $8::jsonb
+       WHERE id = $1`,
+      [
+        existing.id,
+        nextStatus,
+        cancellationReason,
+        session.user.id,
+        session.user.name,
+        nowIso,
+        lastText,
+        JSON.stringify(nextHistory),
+        nowIso
+      ]
+    );
+
+    await logActivity(
+      tx,
+      session.user,
+      'إلغاء حجز',
+      'Reservation',
+      existing.reservationNumber,
+      lastText,
+      [{ field: 'internalStatus', label: 'حالة الحجز', before: prevStatus || '-', after: nextStatus }]
+    );
+
+    const updatedRes: Record<string, any> = {
+      ...existing,
+      internalStatus: nextStatus,
+      cancellationReason,
+      cancelledById: session.user.id,
+      cancelledByName: session.user.name,
+      cancelledAt: nowIso,
+      rejectedById: '',
+      rejectedByName: '',
+      rejectedAt: '',
+      lastUpdateText: lastText,
+      lastUpdatedById: session.user.id,
+      lastUpdatedByName: session.user.name,
+      lastUpdatedAt: nowIso,
+      updatedAt: nowIso,
+      statusHistory: nextHistory,
+      isFollowed: true
+    };
+    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    return { reservation: redactReservationForUser(updatedRes, session.user), followUp: fuObj };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
+export async function restoreReservation(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  const allowed =
+    crmCore.canUserPerform(session.user, 'reject_reservation') ||
+    crmCore.canUserPerform(session.user, 'cancel_reservation') ||
+    crmCore.canUserPerform(session.user, 'edit_reservation_details');
+  if (!allowed) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية استعادة الحجوزات غير الفعالة.');
+  }
+
+  const resId = str(payload.reservationId || payload.id);
+  const requestedTarget = str(payload.targetStatus || 'بانتظار التأكيد');
+  const nextStatus = (crmCore.isValidWorkflowStatus(requestedTarget) && !crmCore.isInactiveReservation({ internalStatus: requestedTarget }))
+    ? requestedTarget
+    : 'بانتظار التأكيد';
+  const note = str(payload.note || payload.reason || 'إعادة تفعيل الحجز');
+  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 FOR UPDATE`, [resId]);
+    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+    const existing = mapReservationRowToClient(resQuery.rows[0], false);
+    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
+
+    const nowIso = new Date().toISOString();
+    const prevStatus = str(existing.internalStatus);
+    const lastText = `تمت استعادة الحجز إلى النشط (${nextStatus})${note ? ` — ${note}` : ''}`;
+    const nextHistory = crmCore.appendStatusStageEntry(existing.statusHistory || [], {
+      source: 'restore_action',
+      previousStatus: prevStatus,
+      newStatus: nextStatus,
+      changedAt: nowIso,
+      changedById: session.user.id,
+      changedByName: session.user.name,
+      note: lastText
+    });
+
+    await tx.query(
+      `UPDATE reservations
+       SET internal_status = $2,
+           rejected_at = '',
+           cancelled_at = '',
+           last_update_text = $3,
+           last_updated_by_id = $4,
+           last_updated_by_name = $5,
+           last_updated_at = $6,
+           updated_at = $8::timestamptz,
+           status_history = $7::jsonb
+       WHERE id = $1`,
+      [existing.id, nextStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory), nowIso]
+    );
+
+    await logActivity(
+      tx,
+      session.user,
+      'استعادة حجز',
+      'Reservation',
+      existing.reservationNumber,
+      lastText,
+      [{ field: 'internalStatus', label: 'حالة الحجز', before: prevStatus || '-', after: nextStatus }]
+    );
+
+    const updatedRes: Record<string, any> = {
+      ...existing,
+      internalStatus: nextStatus,
+      rejectedAt: '',
+      cancelledAt: '',
+      lastUpdateText: lastText,
+      lastUpdatedById: session.user.id,
+      lastUpdatedByName: session.user.name,
+      lastUpdatedAt: nowIso,
+      updatedAt: nowIso,
+      statusHistory: nextHistory
+    };
+    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+    return { reservation: redactReservationForUser(updatedRes, session.user) };
+  });
+
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return out;
+}
+
+export async function getInactiveReservations(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'view_inactive_reservations');
+  const subTab = str(payload.subTab || payload.lifecycle || 'rejected').toLowerCase();
+  if (subTab === 'rejected' && typeof crmCore.canUserViewSubSection === 'function' && !crmCore.canUserViewSubSection(session.user, 'sub_view_rejected_tab')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية عرض تبويب الحجوزات المرفوضة.');
+  }
+  if (subTab === 'cancelled' && typeof crmCore.canUserViewSubSection === 'function' && !crmCore.canUserViewSubSection(session.user, 'sub_view_cancelled_tab')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية عرض تبويب الحجوزات الملغاة.');
+  }
+
+  const settings = await getSettingsMap(executor);
+  const allowAgentViewAll = settings.allow_agent_view_all !== false;
+  const params: any[] = [];
+  const clauses: string[] = [];
+
+  if (session.user.role === 'agent' && !allowAgentViewAll) {
+    params.push(JSON.stringify([session.user.id]));
+    clauses.push(`r.assigned_employee_ids @> $${params.length}::jsonb`);
+  }
+
+  if (subTab === 'cancelled') {
+    clauses.push(SQL_CANCELLED_CONDITION);
+  } else if (subTab === 'all' || subTab === 'inactive') {
+    clauses.push(`(${SQL_REJECTED_CONDITION} OR ${SQL_CANCELLED_CONDITION})`);
+  } else {
+    clauses.push(SQL_REJECTED_CONDITION);
+  }
+
+  const resNumberQuery = str(payload.reservationNumber).replace(/^#+/, '').trim();
+  if (resNumberQuery) {
+    const cond = buildPgSearchCondition(['r.reservation_number'], resNumberQuery, params);
+    if (cond) clauses.push(cond);
+  }
+  if (payload.companyNumber) {
+    const cond = buildPgSearchCondition(['r.company_number'], payload.companyNumber, params);
+    if (cond) clauses.push(cond);
+  }
+  const oldComp = str(payload.oldCompanyName || payload.company);
+  if (oldComp) {
+    const cond = buildPgSearchCondition(['r.company_name'], oldComp, params);
+    if (cond) clauses.push(cond);
+  }
+  if (payload.newCompanyName) {
+    const cond = buildPgSearchCondition(['r.new_company_name'], payload.newCompanyName, params);
+    if (cond) clauses.push(cond);
+  }
+  if (payload.status) {
+    params.push(str(payload.status));
+    clauses.push(`r.internal_status = $${params.length}`);
+  }
+  const rejReason = str(payload.rejectionReason);
+  if (rejReason) {
+    const cond = buildPgSearchCondition(['r.rejection_reason'], rejReason, params);
+    if (cond) clauses.push(cond);
+  }
+  const canReason = str(payload.cancellationReason);
+  if (canReason) {
+    const cond = buildPgSearchCondition(['r.cancellation_reason'], canReason, params);
+    if (cond) clauses.push(cond);
+  }
+  const empFilter = str(payload.confirmedByEmployee || payload.actionByEmployee || payload.employeeId);
+  if (empFilter) {
+    params.push(empFilter);
+    const pIdx = params.length;
+    clauses.push(`(r.rejected_by_id = $${pIdx} OR r.rejected_by_name = $${pIdx} OR r.cancelled_by_id = $${pIdx} OR r.cancelled_by_name = $${pIdx} OR r.last_updated_by_id = $${pIdx} OR r.last_updated_by_name = $${pIdx})`);
+  }
+
+  const dateFrom = str(payload.dateFrom).slice(0, 10);
+  const dateTo = str(payload.dateTo).slice(0, 10);
+  if (dateFrom) {
+    params.push(dateFrom);
+    clauses.push(`LEFT(COALESCE(NULLIF(r.rejected_at, ''), NULLIF(r.cancelled_at, ''), NULLIF(r.start_date, '')), 10) >= $${params.length}`);
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    clauses.push(`LEFT(COALESCE(NULLIF(r.rejected_at, ''), NULLIF(r.cancelled_at, ''), NULLIF(r.start_date, '')), 10) <= $${params.length}`);
+  }
+
+  if (payload.search) {
+    const canSearchId = typeof crmCore.canUserViewCustomerId === 'function' && crmCore.canUserViewCustomerId(session.user);
+    const cols = [
+      'r.reservation_number',
+      'r.customer_name',
+      'r.customer_phone',
+      'r.company_name',
+      'r.company_number',
+      'r.new_company_name',
+      'r.rejection_reason',
+      'r.cancellation_reason',
+      'r.rejected_by_name',
+      'r.cancelled_by_name',
+      'r.car_name',
+      'r.plate_number'
+    ];
+    if (canSearchId) cols.push('r.customer_id_number');
+    const cond = buildPgSearchCondition(cols, payload.search, params);
+    if (cond) clauses.push(cond);
+  }
+
+  const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const page = Math.max(1, num(payload.page, 1));
+  const pageSize = Math.min(200, Math.max(1, num(payload.pageSize, 10)));
+  const offset = (page - 1) * pageSize;
+
+  const listParams = [...params, pageSize, offset];
+  const scopeWhere = subTab === 'cancelled'
+    ? SQL_CANCELLED_CONDITION
+    : (subTab === 'all' || subTab === 'inactive' ? `(${SQL_REJECTED_CONDITION} OR ${SQL_CANCELLED_CONDITION})` : SQL_REJECTED_CONDITION);
+
+  const [countRes, rowsRes, facetRowsRes] = await Promise.all([
+    executor.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM reservations r ${whereSql}`, params),
+    executor.query(
+      `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
+       FROM reservations r
+       ${whereSql}
+       ORDER BY COALESCE(NULLIF(r.rejected_at, ''), NULLIF(r.cancelled_at, ''), r.updated_at::text) DESC, r.id DESC
+       LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams
+    ),
+    executor.query(
+      `SELECT DISTINCT company_name, new_company_name, rejection_reason, cancellation_reason, internal_status, rejected_by_name, cancelled_by_name
+       FROM reservations r
+       WHERE ${scopeWhere}
+       LIMIT 1000`
+    )
+  ]);
+
+  const compSet = new Set<string>();
+  const newCompSet = new Set<string>();
+  const reasonSet = new Set<string>();
+  const statusSet = new Set<string>();
+  const empSet = new Set<string>();
+  for (const fr of facetRowsRes.rows || []) {
+    if (str(fr.company_name)) compSet.add(str(fr.company_name));
+    if (str(fr.new_company_name)) newCompSet.add(str(fr.new_company_name));
+    if (str(fr.rejection_reason)) reasonSet.add(str(fr.rejection_reason));
+    if (str(fr.cancellation_reason)) reasonSet.add(str(fr.cancellation_reason));
+    if (str(fr.internal_status)) statusSet.add(str(fr.internal_status));
+    if (str(fr.rejected_by_name)) empSet.add(str(fr.rejected_by_name));
+    if (str(fr.cancelled_by_name)) empSet.add(str(fr.cancelled_by_name));
+  }
+
+  const total = Number(countRes.rows[0]?.cnt || 0);
+  return {
+    items: redactReservationsList(rowsRes.rows.map((r) => mapReservationRowToClient(r, false)), session.user),
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    facets: {
+      companies: Array.from(compSet).sort(),
+      newCompanies: Array.from(newCompSet).sort(),
+      reasons: Array.from(reasonSet).sort(),
+      statuses: Array.from(statusSet).sort(),
+      employees: Array.from(empSet).sort()
+    }
+  };
+}
+
+export async function searchCustomerByNationalId(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'view_customer_id');
+  if (typeof crmCore.canUserViewCustomerId === 'function' && !crmCore.canUserViewCustomerId(session.user)) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية استرجاع أو عرض رقم الهوية الوطنية للعملاء.');
+  }
+
+  const rawId = str(payload.nationalId || payload.customerIdNumber || payload.query);
+  const normalizedId = typeof crmCore.normalizeNationalId === 'function'
+    ? crmCore.normalizeNationalId(rawId)
+    : rawId.replace(/\D/g, '');
+  if (!normalizedId || normalizedId.length < 4) {
+    throw new Error('VALIDATION_ERROR: يرجى إدخال 4 أرقام على الأقل من رقم الهوية للبحث.');
+  }
+
+  const settings = await getSettingsMap(executor);
+  const allowAgentViewAll = settings.allow_agent_view_all !== false;
+  const likeEscapedId = normalizedId.toLowerCase().replace(/[\\%_]/g, '\\$&');
+  const params: any[] = [normalizedId, `%${likeEscapedId}%`];
+  let agentClause = '';
+  if (session.user.role === 'agent' && !allowAgentViewAll) {
+    params.push(JSON.stringify([session.user.id]));
+    agentClause = `AND r.assigned_employee_ids @> $${params.length}::jsonb`;
+  }
+
+  const normalizedColSql = `REGEXP_REPLACE(TRANSLATE(COALESCE(r.customer_id_number, ''), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}'), '[^0-9A-Za-z]', '', 'g')`;
+  const rowsRes = await executor.query(
+    `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
+     FROM reservations r
+     WHERE (
+       ${normalizedColSql} = $1
+       OR LOWER(${normalizedColSql}) LIKE $2 ESCAPE '\\'
+     )
+     ${agentClause}
+     ORDER BY r.updated_at DESC
+     LIMIT 300`,
+    params
+  );
+
+  const mapped = rowsRes.rows.map((r) => mapReservationRowToClient(r, false));
+  const grouped = crmCore.groupCustomerLookupResults(mapped, normalizedId);
+  return {
+    ...grouped,
+    query: normalizedId
+  };
+}
+
+function requireUiCustomizerPermission(session: AuthSession, includeRoleDefaults = false): void {
+  if (!session || !session.user) {
+    throw new Error('UNAUTHORIZED: يلزم تسجيل الدخول.');
+  }
+  const role = str(session.user.role);
+  if (role === 'developer' || role === 'general_manager') return;
+  if (crmCore.canUserPerform(session.user, 'customize_ui')) return;
+  if (includeRoleDefaults && crmCore.canUserPerform(session.user, 'manage_role_ui_defaults')) return;
+  if (crmCore.canUserPerform(session.user, 'manage_employees')) return;
+  throw new Error('FORBIDDEN: تخصيص الواجهة وإخفاء/إظهار الأقسام متاح للمبرمج والمدير العام أو المخولين فقط.');
+}
+
+export async function saveEmployeeUiOverrides(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requireUiCustomizerPermission(session, false);
+  const empId = str(payload.employeeId);
+  if (!empId) throw new Error('VALIDATION_ERROR: معرف الموظف مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const res = await tx.query(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [empId]);
+    const cur = res.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الموظف غير موجود.');
+    if (str(cur.role) === 'developer' && session.user.role !== 'developer') {
+      throw new Error('FORBIDDEN: تعديل إعدادات واجهة المبرمج متاح للمبرمج فقط.');
+    }
+
+    const normalized = typeof crmCore.normalizeUiOverrides === 'function'
+      ? crmCore.normalizeUiOverrides(payload.uiOverrides)
+      : {};
+    const nowIso = new Date().toISOString();
+
+    await tx.query(
+      `UPDATE employees SET ui_overrides = $2::jsonb, updated_at = $3::timestamptz WHERE id = $1`,
+      [empId, JSON.stringify(normalized), nowIso]
+    );
+    await tx.query(
+      `UPDATE users SET ui_overrides = $2::jsonb, updated_at = $3::timestamptz WHERE id = $1`,
+      [empId, JSON.stringify(normalized), nowIso]
+    );
+
+    await logActivity(tx, session.user, 'تخصيص واجهة موظف', 'Employee', str(cur.username || empId), `تحديث إعدادات إظهار/إخفاء الواجهة للموظف ${str(cur.name)}`);
+    const emp = mapEmployeeRow({ ...cur, ui_overrides: normalized, updated_at: nowIso });
+    await enqueueSheetsMirror(tx, 'Employee', empId, 'upsertEmployee', emp);
+    return emp;
+  });
+
+  invalidateAuthSessionCache(executor, { employeeId: empId });
+  invalidateScopes(executor, ['employees', 'settings']);
+  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+  return { employee: out };
+}
+
+export async function saveRoleUiDefaults(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requireUiCustomizerPermission(session, true);
+  const rawRoleDefaults = payload.roleUiDefaults !== undefined
+    ? payload.roleUiDefaults
+    : (payload.role_ui_defaults !== undefined ? payload.role_ui_defaults : payload);
+  const nextRoleDefaults = typeof crmCore.normalizeRoleUiDefaults === 'function'
+    ? crmCore.normalizeRoleUiDefaults(rawRoleDefaults)
+    : {};
+  const rawUiSimp = payload.uiSimplification !== undefined
+    ? payload.uiSimplification
+    : payload.ui_simplification;
+
+  await executor.withTransaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO settings (key, value, updated_by, updated_at)
+       VALUES ('role_ui_defaults', $1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [JSON.stringify(nextRoleDefaults), session.user.name]
+    );
+    if (rawUiSimp !== undefined) {
+      const nextUi = crmCore.normalizeUiSimplificationSettings(rawUiSimp);
+      await tx.query(
+        `INSERT INTO settings (key, value, updated_by, updated_at)
+         VALUES ('ui_simplification', $1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+        [JSON.stringify(nextUi), session.user.name]
+      );
+    }
+    await logActivity(tx, session.user, 'تخصيص واجهة الأدوار', 'Settings', 'role_ui_defaults', 'تحديث إعدادات إظهار/إخفاء الأقسام حسب الدور');
+  });
+
+  invalidateScopes(executor, ['settings', 'employees', 'roles', 'dashboard']);
+  const settingsMap = await getSettingsMap(executor);
+  const resolvedRoleDefaults = typeof crmCore.normalizeRoleUiDefaults === 'function'
+    ? crmCore.normalizeRoleUiDefaults(settingsMap.role_ui_defaults)
+    : nextRoleDefaults;
+  const resolvedUiSimp = crmCore.normalizeUiSimplificationSettings(settingsMap.ui_simplification);
+  return {
+    roleUiDefaults: resolvedRoleDefaults,
+    role_ui_defaults: resolvedRoleDefaults,
+    uiSimplification: resolvedUiSimp,
+    ui_simplification: resolvedUiSimp
+  };
+}
+
+export async function restoreUiDefaults(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requireUiCustomizerPermission(session, true);
+  const scope = str(payload.scope || 'all').toLowerCase();
+  const empId = str(payload.employeeId);
+  const roleKey = str(payload.role);
+
+  if (scope === 'employee' && empId) {
+    return saveEmployeeUiOverrides(executor, session, { employeeId: empId, uiOverrides: {} });
+  }
+
+  const prevMap = await getSettingsMap(executor);
+  if (scope === 'role' && roleKey) {
+    const curRoleDefaults = typeof crmCore.normalizeRoleUiDefaults === 'function'
+      ? crmCore.normalizeRoleUiDefaults(prevMap.role_ui_defaults)
+      : {};
+    if (curRoleDefaults[roleKey]) {
+      curRoleDefaults[roleKey] = {};
+    }
+    return saveRoleUiDefaults(executor, session, { roleUiDefaults: curRoleDefaults });
+  }
+
+  await executor.withTransaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO settings (key, value, updated_by, updated_at)
+       VALUES ('ui_simplification', '{}', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = '{}', updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [session.user.name]
+    );
+    await tx.query(
+      `INSERT INTO settings (key, value, updated_by, updated_at)
+       VALUES ('role_ui_defaults', '{}', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = '{}', updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [session.user.name]
+    );
+    if (toBool(payload.clearEmployees)) {
+      if (session.user.role === 'developer') {
+        await tx.query(`UPDATE employees SET ui_overrides = '{}'::jsonb, updated_at = NOW()`);
+        await tx.query(`UPDATE users SET ui_overrides = '{}'::jsonb, updated_at = NOW()`);
+      } else {
+        await tx.query(`UPDATE employees SET ui_overrides = '{}'::jsonb, updated_at = NOW() WHERE role <> 'developer'`);
+        await tx.query(`UPDATE users SET ui_overrides = '{}'::jsonb, updated_at = NOW() WHERE role <> 'developer'`);
+      }
+      invalidateAuthSessionCache(executor, { all: true });
+    }
+    await logActivity(tx, session.user, 'استعادة الإعدادات الافتراضية للواجهة', 'Settings', 'ui_defaults', 'استعادة الإعدادات الافتراضية لإظهار وإخفاء الأقسام');
+  });
+
+  invalidateScopes(executor, ['settings', 'employees', 'roles', 'dashboard']);
+  const defaultUi = crmCore.normalizeUiSimplificationSettings({});
+  return {
+    uiSimplification: defaultUi,
+    ui_simplification: defaultUi,
+    roleUiDefaults: {},
+    role_ui_defaults: {}
+  };
 }

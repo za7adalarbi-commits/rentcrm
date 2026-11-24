@@ -8,11 +8,11 @@
 var RG_SHEETS_SCHEMA = {
   Users: [
     'id', 'name', 'username', 'phone', 'email', 'jobTitle',
-    'role', 'permissions', 'status', 'lastActivity', 'createdAt', 'updatedAt'
+    'role', 'permissions', 'uiOverrides', 'status', 'lastActivity', 'createdAt', 'updatedAt'
   ],
   Employees: [
     'id', 'name', 'username', 'passwordHash', 'salt', 'phone', 'email',
-    'jobTitle', 'role', 'permissions', 'status', 'lastActivity', 'createdAt', 'updatedAt'
+    'jobTitle', 'role', 'permissions', 'uiOverrides', 'status', 'lastActivity', 'createdAt', 'updatedAt'
   ],
   Reservations: [
     'id', 'sourceReservationId', 'reservationNumber', 'sourceCreatedAt',
@@ -28,6 +28,9 @@ var RG_SHEETS_SCHEMA = {
     'internalStatus', 'priority', 'assignedEmployeeIds', 'assignedEmployeeNames',
     'lastUpdateText', 'lastUpdatedById', 'lastUpdatedByName', 'lastUpdatedAt',
     'hasProblem', 'pinnedNote', 'pinnedNoteById', 'pinnedNoteByName', 'pinnedNoteUpdatedAt', 'noAnswerCount',
+    'companyNumber', 'newCompanyName', 'rejectionReason', 'carStatusAtRequest', 'refundAmount',
+    'rejectedById', 'rejectedByName', 'rejectedAt',
+    'cancellationReason', 'cancelledById', 'cancelledByName', 'cancelledAt',
     'createdAt', 'updatedAt', 'statusHistory', 'rawJson', 'sourceOrder'
   ],
   Extensions: [
@@ -503,6 +506,7 @@ function syncUserSheetRecord(emp) {
     jobTitle: emp.jobTitle || '',
     role: emp.role || RG_ROLES.AGENT,
     permissions: typeof emp.permissions === 'string' ? emp.permissions : JSON.stringify(emp.permissions || []),
+    uiOverrides: typeof emp.uiOverrides === 'string' ? emp.uiOverrides : JSON.stringify(emp.uiOverrides || {}),
     status: emp.status || 'active',
     lastActivity: emp.lastActivity || '',
     createdAt: emp.createdAt || nowIso(),

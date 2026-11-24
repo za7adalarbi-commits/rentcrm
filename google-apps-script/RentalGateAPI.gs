@@ -753,7 +753,20 @@ function runRentalGateSyncInternal(actor, options) {
             )
           );
 
-          if (sourceChanged) {
+          var existingInactiveGs = Boolean(existing.rejectedAt || existing.cancelledAt) ||
+            ['مرفوض', 'مرفوضة', 'تم الرفض', 'ملغي', 'تم الإلغاء', 'ملغى', 'rejected', 'declined', 'cancelled', 'canceled']
+              .indexOf(prevInternal.toLowerCase()) !== -1;
+          var incomingInactiveGs = ['rejected', 'declined', 'cancelled', 'canceled'].indexOf(statusCode) !== -1 ||
+            ['مرفوض', 'مرفوضة', 'تم الرفض', 'ملغي', 'تم الإلغاء', 'ملغى'].indexOf(sourceStatusAr) !== -1;
+
+          if (existingInactiveGs && !incomingInactiveGs) {
+            nextInternalStatus = prevInternal || sourceStatusAr;
+            nextLastUpdateText = existing.lastUpdateText || ('تم السحب من Rental Gate بالحالة: ' + sourceStatusAr);
+            nextLastUpdatedById = existing.lastUpdatedById || actorId;
+            nextLastUpdatedByName = existing.lastUpdatedByName || actorName;
+            nextLastUpdatedAt = existing.lastUpdatedAt || nowStr;
+            nextStatusHistory = prevHist;
+          } else if (sourceChanged) {
             nextInternalStatus = sourceStatusAr;
             nextLastUpdateText = 'تحديث الحالة من Rental Gate: ' + (prevInternal || prevOrigAr || '-') + ' ← ' + sourceStatusAr;
             nextLastUpdatedById = actorId;
@@ -822,8 +835,31 @@ function runRentalGateSyncInternal(actor, options) {
           sourceCreatedAt: sourceCreatedRaw ? (formatDateTimeDisplay_(sourceCreatedRaw) || normalizeStr(sourceCreatedRaw)) : '',
           customerName: normalizeStr(item.clientName || item.customer_name || customerObj.name || customerObj.full_name || 'عميل'),
           customerPhone: normalizeStr(item.clientMobile || item.customer_phone || customerObj.phone || customerObj.mobile || ''),
-          customerEmail: normalizeStr(item.clientEmail || item.customer_email || customerObj.email || ''),
-          customerIdNumber: normalizeStr(item.clientNationalId || item.clientIdNumber || customerObj.idNumber || ''),
+          customerEmail: normalizeStr(item.clientEmail || item.customer_email || customerObj.email || (existing && existing.customerEmail) || ''),
+          customerIdNumber: (function () {
+            var idKeys = [
+              'clientNationalId', 'client_national_id', 'customerNationalId', 'customer_national_id',
+              'nationalId', 'national_id', 'nationalIdNumber', 'national_id_number',
+              'clientIdNumber', 'client_id_number', 'customerIdNumber', 'customer_id_number',
+              'idNumber', 'id_number', 'identityNumber', 'identity_number',
+              'iqamaNumber', 'iqama_number', 'clientIqama', 'client_iqama',
+              'nid', 'ssn', 'citizenId', 'citizen_id'
+            ];
+            var clientObj = (item.client && typeof item.client === 'object') ? item.client : {};
+            var sources = [item, customerObj, clientObj];
+            for (var si = 0; si < sources.length; si++) {
+              var srcObj = sources[si];
+              if (!srcObj || typeof srcObj !== 'object') continue;
+              for (var ki = 0; ki < idKeys.length; ki++) {
+                var rawCand = normalizeStr(srcObj[idKeys[ki]]);
+                if (rawCand && rawCand !== '-' && rawCand.toLowerCase() !== 'null' && rawCand.toLowerCase() !== 'undefined') {
+                  if (typeof convertEasternDigitsGs_ === 'function') rawCand = convertEasternDigitsGs_(rawCand);
+                  return rawCand.trim();
+                }
+              }
+            }
+            return normalizeStr(existing && existing.customerIdNumber) || '';
+          })(),
           companyName: normalizeStr(item.companyArName || item.companyEnName || item.company_name || companyObj.name || ''),
           branchName: receiveBranchName,
           deliverBranchName: deliverBranchName,

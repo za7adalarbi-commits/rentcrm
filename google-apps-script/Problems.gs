@@ -299,6 +299,59 @@ function updateProblem(session, payload) {
   });
 }
 
+function deleteProblem(session, payload) {
+  requirePermission(session, 'update_problem');
+  var p = payload || {};
+  var problemId = normalizeStr(p.problemId || p.id);
+  if (!problemId) throw new Error('معرف المشكلة مطلوب.');
+
+  return withScriptLock(function () {
+    var existing = findRecordById(RG_SHEETS.PROBLEMS, 'id', problemId);
+    if (!existing) throw new Error('المشكلة غير موجودة.');
+
+    if (typeof deleteRecordsWhere_ === 'function') {
+      deleteRecordsWhere_(RG_SHEETS.PROBLEM_UPDATES, function (u) { return u && u.problemId === problemId; });
+    }
+    deleteRecordByKey(RG_SHEETS.PROBLEMS, 'id', problemId);
+    if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
+      deleteRecordByKey(RG_SHEETS.ISSUES, 'id', problemId);
+    }
+
+    var now = nowIso();
+    var hasOpenProblem = false;
+    if (existing.reservationId) {
+      hasOpenProblem = readAllRecords(RG_SHEETS.PROBLEMS, false).some(function (pr) {
+        return pr.reservationId === existing.reservationId && pr.status !== 'مغلقة' && pr.status !== 'تم الحل';
+      });
+      var nextFlag = hasOpenProblem ? 'true' : 'false';
+      var resRow = findRecordById(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId);
+      if (resRow && String(toBool(resRow.hasProblem)) !== nextFlag) {
+        updateRecordByKey(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId, {
+          hasProblem: nextFlag,
+          updatedAt: now
+        });
+      }
+    }
+
+    logActivity(
+      session.user,
+      'حذف مشكلة',
+      'Problem',
+      existing.problemNumber || problemId,
+      'حجز ' + (existing.reservationNumber || '-') + ' | ' + (existing.customerName || '-')
+    );
+
+    bumpCacheVersion_('PRB');
+    return {
+      id: problemId,
+      deleted: true,
+      problemNumber: existing.problemNumber,
+      reservationId: existing.reservationId,
+      hasOpenProblemsOnReservation: hasOpenProblem
+    };
+  });
+}
+
 function getAllProblemsEnriched_() {
   var prbCacheKey = 'RG_PRB_ALL_V' + getCacheVersion_('PRB');
   try {

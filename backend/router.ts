@@ -152,6 +152,9 @@ export async function dispatchCrmRequest(
       case 'updateProblem':
         result = await queries.updateProblem(executor, session, payload);
         break;
+      case 'deleteProblem':
+        result = await queries.deleteProblem(executor, session, payload);
+        break;
       case 'getProblems':
         result = await queries.getProblems(executor, session, payload);
         break;
@@ -290,6 +293,30 @@ export async function dispatchCrmRequest(
       case 'bulkReassignSelectedReservations':
         result = await queries.bulkReassignSelectedReservations(executor, session, payload);
         break;
+      case 'rejectReservation':
+        result = await queries.rejectReservation(executor, session, payload);
+        break;
+      case 'cancelReservation':
+        result = await queries.cancelReservation(executor, session, payload);
+        break;
+      case 'restoreReservation':
+        result = await queries.restoreReservation(executor, session, payload);
+        break;
+      case 'getInactiveReservations':
+        result = await queries.getInactiveReservations(executor, session, payload);
+        break;
+      case 'searchCustomerByNationalId':
+        result = await queries.searchCustomerByNationalId(executor, session, payload);
+        break;
+      case 'saveEmployeeUiOverrides':
+        result = await queries.saveEmployeeUiOverrides(executor, session, payload);
+        break;
+      case 'saveRoleUiDefaults':
+        result = await queries.saveRoleUiDefaults(executor, session, payload);
+        break;
+      case 'restoreUiDefaults':
+        result = await queries.restoreUiDefaults(executor, session, payload);
+        break;
       default:
         return {
           success: false,
@@ -307,7 +334,10 @@ export async function dispatchCrmRequest(
       action === 'savePermissionDefinition' ||
       action === 'deletePermissionDefinition' ||
       action === 'applyUnifiedConnectionSetup' ||
-      action === 'updateSettings'
+      action === 'updateSettings' ||
+      action === 'saveEmployeeUiOverrides' ||
+      action === 'saveRoleUiDefaults' ||
+      action === 'restoreUiDefaults'
     ) {
       invalidateAuthSessionCache(executor, { all: true });
     }
