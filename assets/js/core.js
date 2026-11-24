@@ -1941,6 +1941,7 @@
   function filterReservations(reservations, followUps, filters, userContext) {
     var f = filters || {};
     var search = normalizeStr(f.search);
+    var reservationNumberQuery = normalizeStr(f.reservationNumber).replace(/^#+/, '').trim();
     var followedSet = {};
     if (Array.isArray(followUps)) {
       for (var i = 0; i < followUps.length; i++) {
@@ -1957,6 +1958,12 @@
 
       if (userContext && userContext.role === ROLES.AGENT && !allowAgentViewAll && !(userContext.user && canUserPerform(userContext.user, 'view_all_reservations'))) {
         if (assignedIds.indexOf(userContext.employeeId) === -1) continue;
+      }
+
+      if (reservationNumberQuery && !matchesSearchFields([
+        r.reservationNumber
+      ], reservationNumberQuery)) {
+        continue;
       }
 
       if (search && !matchesSearchFields([
@@ -2031,6 +2038,7 @@
     var pageSizeNum = Number(s.pageSize || 20);
     return {
       search: normalizeStr(s.search),
+      reservationNumber: normalizeStr(s.reservationNumber),
       company: normalizeStr(s.company),
       branch: normalizeStr(s.branch),
       status: normalizeStr(s.status),
@@ -2055,6 +2063,7 @@
     var f = (payload && typeof payload === 'object') ? payload : {};
     return Boolean(
       normalizeStr(f.search) ||
+      normalizeStr(f.reservationNumber) ||
       normalizeStr(f.company) ||
       normalizeStr(f.branch) ||
       normalizeStr(f.status) ||

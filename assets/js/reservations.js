@@ -211,7 +211,7 @@
 
     var defaultCols = loadSavedVisibleCols(currentUser);
     var state = Object.assign({
-      search: '', company: '', branch: '', status: '', employeeId: '', priority: '',
+      search: '', reservationNumber: '', company: '', branch: '', status: '', employeeId: '', priority: '',
       dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '',
       unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false,
       sortBy: 'lastUpdatedAt', sortDir: 'desc', page: 1, pageSize: 20,
@@ -253,7 +253,7 @@
       return (core && core.hasActiveReservationFilters)
         ? core.hasActiveReservationFilters(state)
         : Boolean(
-            state.search || state.company || state.branch || state.status || state.employeeId ||
+            state.search || state.reservationNumber || state.company || state.branch || state.status || state.employeeId ||
             state.priority || state.dateFrom || state.dateTo || state.timeFrom || state.timeTo ||
             state.unfollowedOnly || state.hasProblemsOnly || state.overdueUnpaidOnly
           );
@@ -385,8 +385,19 @@
               '</div>' +
             '</div>'
           ) : '') +
-          '<div class="filter-grid filter-grid-4">' +
-            '<input type="search" class="input" id="res-search" placeholder="' + t('search_placeholder') + '" value="' + esc(state.search || '') + '">' +
+          '<div class="rg-res-search-row">' +
+            '<div class="rg-res-search-field">' +
+              '<span class="rg-res-search-icon" aria-hidden="true">' +
+                '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>' +
+              '</span>' +
+              '<input type="search" class="input" id="res-search" placeholder="' + t('search_placeholder') + '" aria-label="' + t('search_placeholder') + '" value="' + esc(state.search || '') + '">' +
+            '</div>' +
+            '<div class="rg-res-search-field rg-res-number-search-field">' +
+              '<span class="rg-res-search-icon rg-res-hash-badge" aria-hidden="true">#</span>' +
+              '<input type="search" class="input rg-res-number-input" id="res-number-search" placeholder="' + t('res_number_search_placeholder') + '" aria-label="' + t('res_number_search_label') + '" value="' + esc(state.reservationNumber || '') + '">' +
+            '</div>' +
+          '</div>' +
+          '<div class="filter-grid filter-grid-4 rg-res-core-filter-grid">' +
             '<select class="select" id="res-company" aria-label="' + t('company') + '"><option value="">' + t('all_companies') + '</option>' +
               ((state.company && facets.companies.indexOf(state.company) === -1 ? [state.company] : []).concat(facets.companies || [])).map(function (c) { return '<option value="' + esc(c) + '"' + (state.company === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') +
             '</select>' +
@@ -399,14 +410,16 @@
             '<select class="select" id="res-emp" aria-label="' + t('employee') + '"><option value="">' + t('all_employees') + '</option>' +
               employees.map(function (e) { return '<option value="' + esc(e.id) + '"' + (state.employeeId === e.id ? ' selected' : '') + '>' + esc(e.name) + '</option>'; }).join('') +
             '</select>' +
-            '<select class="select rg-ui-res-extra-filter" id="res-prio" aria-label="' + t('priority') + '"><option value="">' + t('all_priorities') + '</option>' +
+          '</div>' +
+          '<div class="rg-res-extra-filter-grid rg-ui-res-extra-filter">' +
+            '<select class="select" id="res-prio" aria-label="' + t('priority') + '"><option value="">' + t('all_priorities') + '</option>' +
               root.RGCrmCore.PROBLEM_PRIORITIES.map(function (p) { return '<option value="' + esc(p) + '"' + (state.priority === p ? ' selected' : '') + '>' + esc(p) + '</option>'; }).join('') +
             '</select>' +
-            '<div class="rg-res-date-field rg-ui-res-extra-filter" id="res-from-wrap">' +
+            '<div class="rg-res-date-field" id="res-from-wrap">' +
               '<label class="rg-res-date-label" for="res-from"><span>' + (isEn ? 'Start Date (Optional)' : 'من تاريخ (البداية · اختياري)') + '</span></label>' +
               '<input type="date" class="input" id="res-from" data-rg-range-pair="res-filter-range" data-rg-range-role="start" value="' + esc(state.dateFrom || '') + '" aria-label="' + t('from_date') + '">' +
             '</div>' +
-            '<div class="rg-res-date-field rg-ui-res-extra-filter" id="res-to-wrap">' +
+            '<div class="rg-res-date-field" id="res-to-wrap">' +
               '<label class="rg-res-date-label" for="res-to">' +
                 '<span>' + (isEn ? 'End Date (Works Standalone)' : 'تاريخ النهاية (يعمل بمفرده)') + '</span>' +
                 '<span class="rg-res-standalone-tag" id="res-to-standalone-tag">' + (isEn ? 'Standalone ✓' : 'مستقل ✓') + '</span>' +
@@ -484,7 +497,7 @@
         '</div>'
       ) : '';
 
-      var cleanSearchEmpty = String(state.search || '').trim();
+      var cleanSearchEmpty = [String(state.search || '').trim(), String(state.reservationNumber || '').trim()].filter(Boolean).join(' · ');
       return bulkBarHtml + (list.length === 0
         ? '<div class="empty-state">' +
             (cleanSearchEmpty
@@ -1091,8 +1104,11 @@
       if (clearSearchEmptyBtn) {
         clearSearchEmptyBtn.addEventListener('click', function () {
           var sEl = document.getElementById('res-search');
+          var nEl = document.getElementById('res-number-search');
           if (sEl) sEl.value = '';
+          if (nEl) nEl.value = '';
           state.search = '';
+          state.reservationNumber = '';
           state.page = 1;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           refreshTableRegion({ forceRefresh: true });
@@ -1101,6 +1117,7 @@
     }
 
     var lastPaintedSearch = String(state.search || '').trim();
+    var lastPaintedResNumber = String(state.reservationNumber || '').trim();
 
     function updateDateFilterHint() {
       var hintEl = container.querySelector('#res-date-filter-hint');
@@ -1187,6 +1204,7 @@
       var region = container.querySelector('#res-table-region');
       if (!region) return;
       lastPaintedSearch = String(state.search || '').trim();
+      lastPaintedResNumber = String(state.reservationNumber || '').trim();
       currentItems = data.items || [];
       currentTotalPages = data.totalPages || 1;
       if (data.page && Number(data.page) > 0) {
@@ -1303,9 +1321,10 @@
     function preFilterVisibleItemsForSearch() {
       var core = root.RGCrmCore;
       var curSearchClean = String(state.search || '').trim();
+      var curResNumberClean = String(state.reservationNumber || '').trim();
       var region = container.querySelector('#res-table-region');
       if (!region) return;
-      if (curSearchClean && core && core.filterReservations && currentItems.length > 0) {
+      if ((curSearchClean || curResNumberClean) && core && core.filterReservations && currentItems.length > 0) {
         var userCtx = {
           role: (currentUser && currentUser.role) || 'agent',
           employeeId: currentEmpId,
@@ -1334,7 +1353,8 @@
       var seq = ++activeFetchSeq;
       var region = container.querySelector('#res-table-region');
       var curSearchClean = String(state.search || '').trim();
-      var searchChanged = curSearchClean !== lastPaintedSearch;
+      var curResNumberClean = String(state.reservationNumber || '').trim();
+      var searchChanged = (curSearchClean !== lastPaintedSearch) || (curResNumberClean !== lastPaintedResNumber);
       if (searchChanged && !o.silentRefresh) {
         preFilterVisibleItemsForSearch();
       } else if (region && !o.silentRefresh && currentItems.length === 0) {
@@ -1373,6 +1393,8 @@
 
     function applyFilterChange() {
       state.search = document.getElementById('res-search').value;
+      var resNumInp = document.getElementById('res-number-search');
+      state.reservationNumber = resNumInp ? resNumInp.value : '';
       state.company = document.getElementById('res-company').value;
       state.branch = document.getElementById('res-branch').value;
       state.status = document.getElementById('res-status').value;
@@ -1418,6 +1440,29 @@
       }
     });
 
+    var resNumberSearchEl = document.getElementById('res-number-search');
+    if (resNumberSearchEl) {
+      resNumberSearchEl.addEventListener('input', function () {
+        state.reservationNumber = this.value;
+        state.page = 1;
+        if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+        preFilterVisibleItemsForSearch();
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(applyFilterChange, 180);
+      });
+      resNumberSearchEl.addEventListener('search', function () {
+        clearTimeout(searchTimer);
+        applyFilterChange();
+      });
+      resNumberSearchEl.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          clearTimeout(searchTimer);
+          applyFilterChange();
+        }
+      });
+    }
+
     ['res-from', 'res-to'].forEach(function (id) {
       var dEl = document.getElementById(id);
       if (dEl) {
@@ -1431,8 +1476,10 @@
     });
 
     document.getElementById('res-reset-filters').addEventListener('click', function () {
-      Object.assign(state, { search: '', company: '', branch: '', status: '', employeeId: '', priority: '', dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '', unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false, page: 1 });
+      Object.assign(state, { search: '', reservationNumber: '', company: '', branch: '', status: '', employeeId: '', priority: '', dateFrom: '', dateTo: '', timeField: 'both', timeFrom: '', timeTo: '', unfollowedOnly: false, hasProblemsOnly: false, overdueUnpaidOnly: false, page: 1 });
       document.getElementById('res-search').value = '';
+      var resNumResetEl = document.getElementById('res-number-search');
+      if (resNumResetEl) resNumResetEl.value = '';
       document.getElementById('res-company').value = '';
       document.getElementById('res-branch').value = '';
       document.getElementById('res-status').value = '';

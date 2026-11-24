@@ -1593,6 +1593,77 @@ html[dir="rtl"] .password-field-wrap .input[dir="ltr"] {
   align-items: end;
 }
 
+.rg-res-search-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.rg-res-search-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.rg-res-search-field .input {
+  padding-inline-start: 38px;
+}
+
+.rg-res-number-input {
+  font-variant-numeric: tabular-nums;
+}
+
+.rg-res-search-icon {
+  position: absolute;
+  inset-inline-start: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  pointer-events: none;
+  transition: color var(--transition-fast);
+}
+
+.rg-res-hash-badge {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--bg-surface-subtle);
+  border: 1px solid var(--border-hairline);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.rg-res-search-field:focus-within .rg-res-search-icon {
+  color: var(--brand-primary);
+}
+
+.rg-res-search-field:focus-within .rg-res-hash-badge {
+  border-color: var(--brand-primary);
+  background: var(--brand-soft);
+  color: var(--brand-primary);
+}
+
+.rg-res-core-filter-grid {
+  margin-bottom: 10px;
+}
+
+html.rg-ui-hide-res-filters-extras .rg-res-core-filter-grid {
+  margin-bottom: 14px;
+}
+
+.rg-res-extra-filter-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
 .checkbox-grid {
   display: flex;
   flex-wrap: wrap;

@@ -9,6 +9,7 @@ function getReservations(session, params) {
   var restrictToAgent = session.role === RG_ROLES.AGENT && !allowAgentAll && !hasPermission(session, 'view_all_reservations');
 
   var search = normalizeStr(p.search).toLowerCase();
+  var reservationNumberQuery = normalizeStr(p.reservationNumber).replace(/^#+/, '').toLowerCase();
   var company = normalizeStr(p.company);
   var branch = normalizeStr(p.branch);
   var status = normalizeStr(p.status);
@@ -28,7 +29,7 @@ function getReservations(session, params) {
   var page = Math.max(1, toNumber(p.page, 1));
   var pageSize = Math.min(200, Math.max(1, toNumber(p.pageSize, 25)));
 
-  var isDefaultQuery = !search && !company && !branch && !status && !employeeId && !priority &&
+  var isDefaultQuery = !search && !reservationNumberQuery && !company && !branch && !status && !employeeId && !priority &&
     !dateFrom && !dateTo && !unfollowedOnly && !hasProblemsOnly && !hasExtensions &&
     !timeFrom && !timeTo && !overdueUnpaidOnly &&
     page === 1 && sortBy === 'lastUpdatedAt' && sortDir === -1;
@@ -138,6 +139,11 @@ function getReservations(session, params) {
       var rawEmp = String(r.assignedEmployeeIds || '');
       if (rawEmp.indexOf(employeeId) === -1) continue;
       if (safeJsonParse(rawEmp, []).indexOf(employeeId) === -1) continue;
+    }
+
+    if (reservationNumberQuery) {
+      var resNumNorm = normalizeStr(r.reservationNumber).toLowerCase();
+      if (resNumNorm.indexOf(reservationNumberQuery) === -1) continue;
     }
 
     if (search) {

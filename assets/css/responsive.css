@@ -71,6 +71,14 @@
   .filter-grid.filter-grid-4 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .rg-res-extra-filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .rg-res-extra-filter-grid > :first-child {
+    grid-column: 1 / -1;
+  }
 }
 
 @media (max-width: 820px) {
@@ -365,13 +373,23 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .rg-res-search-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
   .filter-grid.filter-grid-4 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
   }
 
-  .filter-grid.filter-grid-4 > :first-child,
-  .filter-grid.filter-grid-4 > :nth-child(6):nth-last-child(3) {
+  .rg-res-extra-filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .rg-res-extra-filter-grid > :first-child {
     grid-column: 1 / -1;
   }
 

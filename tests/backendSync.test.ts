@@ -146,9 +146,16 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       list = list.filter((r) => !state.follow_ups.some((f) => f.reservation_id === r.id));
     }
 
-    const searchMatch = whereSegment.match(/r\.reservation_number ILIKE \$(\d+)/);
+    const resNumOnlyMatch = whereSegment.match(/\(TRANSLATE\(COALESCE\(r\.reservation_number,\s*''\)[^)]*\)\s+ILIKE\s+\$(\d+)[^)]*\)(?!\s+OR)/);
+    if (resNumOnlyMatch) {
+      const needle = String(params[Number(resNumOnlyMatch[1]) - 1] || '').replace(/%/g, '').toLowerCase();
+      list = list.filter((r) => String(r.reservation_number || '').toLowerCase().includes(needle));
+    }
+
+    const searchMatch = whereSegment.match(/(?:r\.reservation_number ILIKE \$(\d+)|TRANSLATE\(COALESCE\(r\.reservation_number,\s*''\)[^)]*\)\s+ILIKE\s+\$(\d+)[^)]*\)\s+OR\s+TRANSLATE\(COALESCE\(r\.customer_name)/);
     if (searchMatch) {
-      const needle = String(params[Number(searchMatch[1]) - 1] || '').replace(/%/g, '').toLowerCase();
+      const pNum = Number(searchMatch[1] || searchMatch[2]);
+      const needle = String(params[pNum - 1] || '').replace(/%/g, '').toLowerCase();
       list = list.filter((r) =>
         String(r.reservation_number || '').toLowerCase().includes(needle) ||
         String(r.customer_name || '').toLowerCase().includes(needle) ||
@@ -3465,6 +3472,95 @@ test('backend getReservations filters by exact effective end date when dateTo is
   });
   assert.equal(rangeRes.success, true);
   assert.deepEqual(rangeRes.data.items.map((x: any) => x.id).sort(), ['RES_END_1', 'RES_END_2']);
+});
+
+test('dedicated reservationNumber search filter works in core.js, reservations.js UI, and backend getReservations', async () => {
+  const coreSrc = fs.readFileSync(path.join(process.cwd(), 'assets/js/core.js'), 'utf8');
+  const resJsSrc = fs.readFileSync(path.join(process.cwd(), 'assets/js/reservations.js'), 'utf8');
+
+  assert.ok(resJsSrc.includes('id="res-number-search"'), 'reservations.js must render #res-number-search input');
+  assert.ok(resJsSrc.includes('class="rg-res-search-row"'), 'reservations.js must group search fields in .rg-res-search-row');
+
+  const coreCtx: any = { window: {} };
+  coreCtx.window = coreCtx;
+  vm.runInNewContext(coreSrc, coreCtx);
+  const core = coreCtx.RGCrmCore;
+
+  const built = core.buildReservationQueryPayload({ search: 'أحمد', reservationNumber: ' #RG-204 ' });
+  assert.equal(built.search, 'أحمد');
+  assert.equal(built.reservationNumber, '#RG-204');
+  assert.equal(core.hasActiveReservationFilters({ reservationNumber: '204' }), true);
+  assert.equal(core.hasActiveReservationFilters({}), false);
+
+  const sampleList = [
+    { id: 'R1', reservationNumber: 'RG-1001', customerName: 'أحمد علي', customerPhone: '0501111111', assignedEmployeeIds: [] },
+    { id: 'R2', reservationNumber: 'RG-2045', customerName: 'أحمد سعيد', customerPhone: '0502222222', assignedEmployeeIds: [] },
+    { id: 'R3', reservationNumber: 'RG-2049', customerName: 'خالد محمد', customerPhone: '0502045000', assignedEmployeeIds: [] }
+  ];
+
+  // Filtering by reservationNumber matches only reservationNumber (not phone '0502045000')
+  const byNumOnly = core.filterReservations(sampleList, [], { reservationNumber: '#204' });
+  assert.deepEqual(Array.from(byNumOnly, (x: any) => x.id).sort(), ['R2', 'R3']);
+
+  // Arabic numerals normalization in reservationNumber
+  const byArabicDigits = core.filterReservations(sampleList, [], { reservationNumber: '١٠٠١' });
+  assert.deepEqual(Array.from(byArabicDigits, (x: any) => x.id), ['R1']);
+
+  // Combined general search + reservationNumber filter
+  const combined = core.filterReservations(sampleList, [], { search: 'أحمد', reservationNumber: '204' });
+  assert.deepEqual(Array.from(combined, (x: any) => x.id), ['R2']);
+
+  // Backend SQL / mock executor support
+  const executor = createInMemoryMockExecutor();
+  await dispatchCrmRequest(executor, { action: 'ping' });
+  const loginRes = await dispatchCrmRequest(executor, {
+    action: 'login',
+    payload: { username: 'Admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' }
+  });
+  assert.equal(loginRes.success, true);
+  const token = loginRes.data.token;
+
+  const now = new Date();
+  executor.state.reservations.push(
+    {
+      id: 'RES_NUM_1',
+      reservation_number: 'RG-5501',
+      customer_name: 'عميل خمسة',
+      customer_phone: '0550000001',
+      start_date: '2026-11-20',
+      end_date: '2026-11-22',
+      original_end_date: '2026-11-22',
+      internal_status: 'مؤكد',
+      priority: 'عادي',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: 'RES_NUM_2',
+      reservation_number: 'RG-7788',
+      customer_name: 'عميل سبعة',
+      customer_phone: '0555501000',
+      start_date: '2026-11-20',
+      end_date: '2026-11-22',
+      original_end_date: '2026-11-22',
+      internal_status: 'مؤكد',
+      priority: 'عادي',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      created_at: now,
+      updated_at: now
+    }
+  );
+
+  const backendRes = await dispatchCrmRequest(executor, {
+    action: 'getReservations',
+    token,
+    payload: { reservationNumber: '#5501' }
+  });
+  assert.equal(backendRes.success, true);
+  assert.deepEqual(backendRes.data.items.map((x: any) => x.id), ['RES_NUM_1']);
 });
 
 

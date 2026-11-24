@@ -1184,6 +1184,12 @@ export async function getReservations(
     clauses.push(`NOT EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id)`);
   }
 
+  const resNumberQuery = str(payload.reservationNumber).replace(/^#+/, '').trim();
+  if (resNumberQuery) {
+    const resNumCond = buildPgSearchCondition(['r.reservation_number'], resNumberQuery, params);
+    if (resNumCond) clauses.push(resNumCond);
+  }
+
   if (payload.search) {
     const searchCond = buildPgSearchCondition([
       'r.reservation_number',
@@ -1275,6 +1281,7 @@ export async function getReservations(
     const timeField = str(payload.timeField || 'both').toLowerCase();
     const filtered = crmCore.filterReservations(mappedItems, [], {
       search: str(payload.search),
+      reservationNumber: resNumberQuery,
       timeField,
       timeFrom: str(payload.timeFrom),
       timeTo: str(payload.timeTo),
