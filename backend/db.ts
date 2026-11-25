@@ -283,12 +283,17 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_id TEXT NOT NULL DEFAULT '';`,
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_name TEXT NOT NULL DEFAULT '';`,
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_at TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS reference_number TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS delivery_failure_reason TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS driver_notes TEXT NOT NULL DEFAULT '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_source_order ON reservations (source_order ASC NULLS LAST);`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_new_company_name ON reservations (new_company_name) WHERE new_company_name <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_rejected_at ON reservations (rejected_at DESC) WHERE rejected_at <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancelled_at DESC) WHERE cancelled_at <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_reference_number ON reservations (reference_number) WHERE reference_number <> '';`,
   `ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
   `ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '[]'::jsonb;`,
   `CREATE TABLE IF NOT EXISTS shift_announcements (
@@ -396,8 +401,10 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
 
 const NEVER_EXCLUDED_LIFECYCLE = new Set([
   'cancelled', 'canceled', 'declined', 'rejected', 'refused',
-  'ملغي', 'ملغى', 'ملغاة', 'تم الإلغاء', 'تم الالغاء',
-  'مرفوض', 'مرفوضة', 'تم الرفض'
+  'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'user_cancelled', 'admin_cancelled',
+  'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'auto_rejected',
+  'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل', 'تم الإلغاء', 'تم الالغاء', 'تم الالغاء من العميل', 'تم الإلغاء من العميل',
+  'مرفوض', 'مرفوضة', 'مرفوض من الموقع', 'تم الرفض', 'مرفوض من الشركة'
 ]);
 
 export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor): Promise<void> {
@@ -431,37 +438,106 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
       `UPDATE reservations
        SET rejected_at = '', rejected_by_id = '', rejected_by_name = ''
        WHERE COALESCE(rejected_at, '') <> ''
-         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('cancelled', 'canceled')`
+         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'user_cancelled', 'admin_cancelled')`
     );
     await executor.query(
       `UPDATE reservations
        SET cancelled_at = '', cancelled_by_id = '', cancelled_by_name = ''
        WHERE COALESCE(cancelled_at, '') <> ''
-         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('rejected', 'declined', 'refused')`
+         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'auto_rejected')`
     );
   } catch {
     // Non-fatal
   }
 
-  // 3) Backfill missing customer_id_number safely from each reservation's own raw_json
+  // 3) Backfill missing national ID & lifecycle detail fields safely from each reservation's own raw_json
   try {
-    const rowsRes = await executor.query<{ id: string; raw_json: string }>(
-      `SELECT id, raw_json FROM reservations
-       WHERE COALESCE(customer_id_number, '') = ''
-         AND raw_json LIKE '{%'
+    const rowsRes = await executor.query<{
+      id: string;
+      customer_id_number: string;
+      reference_number: string;
+      paid_amount: string | number;
+      delivery_failure_reason: string;
+      driver_notes: string;
+      new_company_name: string;
+      payment_status: string;
+      total_amount: string | number;
+      original_status_code: string;
+      original_status_ar: string;
+      internal_status: string;
+      raw_json: string;
+    }>(
+      `SELECT id, customer_id_number, reference_number, paid_amount, delivery_failure_reason,
+              driver_notes, new_company_name, payment_status, total_amount,
+              original_status_code, original_status_ar, internal_status, raw_json
+       FROM reservations
+       WHERE raw_json LIKE '{%'
+         AND (
+           COALESCE(customer_id_number, '') IN ('', '-', '—', '0', 'غير متاح', 'غير محدد')
+           OR COALESCE(reference_number, '') = ''
+           OR COALESCE(paid_amount, 0) = 0
+           OR COALESCE(delivery_failure_reason, '') = ''
+           OR COALESCE(driver_notes, '') = ''
+           OR COALESCE(new_company_name, '') = ''
+         )
        LIMIT 2000`
     );
     const ids: string[] = [];
     const cids: string[] = [];
+    const refs: string[] = [];
+    const paidAmts: number[] = [];
+    const failReasons: string[] = [];
+    const dNotes: string[] = [];
+    const newComps: string[] = [];
+
     for (const r of rowsRes?.rows || []) {
       try {
         const parsed = JSON.parse(String(r.raw_json || '{}'));
-        const extracted = typeof crmCore.extractCustomerNationalId === 'function'
-          ? crmCore.extractCustomerNationalId(parsed, null)
+        const curCid = String(r.customer_id_number || '').trim();
+        const cidInvalid = !curCid || curCid === '-' || curCid === '—' || curCid === 'غير متاح' || curCid === 'غير محدد' || /^0+$/.test(curCid);
+        const extractedCid = cidInvalid && typeof crmCore.extractCustomerNationalId === 'function'
+          ? String(crmCore.extractCustomerNationalId(parsed, null) || '')
           : '';
-        if (extracted) {
+        const refCand = !String(r.reference_number || '').trim()
+          ? String(parsed.referenceNumber || parsed.reference_number || parsed.refNumber || parsed.ref_number || parsed.sourceReference || parsed.externalReference || parsed.orderRef || parsed.reference || '').trim()
+          : '';
+        const failCand = !String(r.delivery_failure_reason || '').trim()
+          ? String(parsed.deliveryFailureReason || parsed.delivery_failure_reason || parsed.failedDeliveryReason || parsed.failed_delivery_reason || parsed.deliverFailReason || parsed.failReason || '').trim()
+          : '';
+        const notesCand = !String(r.driver_notes || '').trim()
+          ? String(parsed.driverNotes || parsed.driver_notes || parsed.driverNote || parsed.driver_note || parsed.deliveryNotes || parsed.delivery_notes || parsed.driverComment || '').trim()
+          : '';
+        const lcKind = typeof crmCore.classifyReservationLifecycle === 'function'
+          ? crmCore.classifyReservationLifecycle({
+              originalStatusCode: r.original_status_code,
+              originalStatusAr: r.original_status_ar,
+              internalStatus: r.internal_status
+            })
+          : 'active';
+        const newCompCand = (lcKind === 'rejected' && !String(r.new_company_name || '').trim())
+          ? String(parsed.newCompanyName || parsed.new_company_name || parsed.transferCompanyName || parsed.alternativeCompanyName || '').trim()
+          : '';
+        let paidCand = 0;
+        if (Number(r.paid_amount || 0) <= 0) {
+          const rawPaid = parsed.paidAmount ?? parsed.paid_amount ?? parsed.amountPaid ?? parsed.amount_paid;
+          if (rawPaid !== undefined && rawPaid !== null && rawPaid !== '' && Number(rawPaid) > 0) {
+            paidCand = Math.round(Number(rawPaid) * 100) / 100;
+          } else {
+            const pSt = String(r.payment_status || parsed.paymentStatus || parsed.paymentResult || '').trim().toLowerCase();
+            if (['paid', 'wallet_paid', 'paid_by_wallet', 'paid_wallet', 'refunded', 'مدفوع', 'مدفوع عن طريق المحفظة', 'مسترد'].includes(pSt)) {
+              paidCand = Math.max(0, Math.round(Number(r.total_amount || parsed.total || 0) * 100) / 100);
+            }
+          }
+        }
+
+        if (extractedCid || refCand || paidCand > 0 || failCand || notesCand || newCompCand) {
           ids.push(String(r.id));
-          cids.push(String(extracted));
+          cids.push(extractedCid);
+          refs.push(refCand);
+          paidAmts.push(paidCand);
+          failReasons.push(failCand);
+          dNotes.push(notesCand);
+          newComps.push(newCompCand);
         }
       } catch {
         // Skip malformed JSON
@@ -470,10 +546,15 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
     if (ids.length > 0) {
       await executor.query(
         `UPDATE reservations AS t
-         SET customer_id_number = v.cid
-         FROM unnest($1::text[], $2::text[]) AS v(id, cid)
-         WHERE t.id = v.id AND COALESCE(t.customer_id_number, '') = ''`,
-        [ids, cids]
+         SET customer_id_number = CASE WHEN COALESCE(t.customer_id_number, '') IN ('', '-', '—', '0', 'غير متاح', 'غير محدد') AND NULLIF(v.cid, '') IS NOT NULL THEN v.cid ELSE t.customer_id_number END,
+             reference_number = CASE WHEN COALESCE(t.reference_number, '') = '' AND NULLIF(v.ref_num, '') IS NOT NULL THEN v.ref_num ELSE t.reference_number END,
+             paid_amount = CASE WHEN COALESCE(t.paid_amount, 0) = 0 AND v.paid_amt > 0 THEN v.paid_amt ELSE t.paid_amount END,
+             delivery_failure_reason = CASE WHEN COALESCE(t.delivery_failure_reason, '') = '' AND NULLIF(v.fail_reason, '') IS NOT NULL THEN v.fail_reason ELSE t.delivery_failure_reason END,
+             driver_notes = CASE WHEN COALESCE(t.driver_notes, '') = '' AND NULLIF(v.drv_notes, '') IS NOT NULL THEN v.drv_notes ELSE t.driver_notes END,
+             new_company_name = CASE WHEN COALESCE(t.new_company_name, '') = '' AND NULLIF(v.new_comp, '') IS NOT NULL THEN v.new_comp ELSE t.new_company_name END
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::numeric[], $5::text[], $6::text[], $7::text[]) AS v(id, cid, ref_num, paid_amt, fail_reason, drv_notes, new_comp)
+         WHERE t.id = v.id`,
+        [ids, cids, refs, paidAmts, failReasons, dNotes, newComps]
       );
     }
   } catch {

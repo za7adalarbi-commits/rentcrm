@@ -111,6 +111,10 @@ CREATE TABLE IF NOT EXISTS reservations (
   cancelled_by_id TEXT NOT NULL DEFAULT '',
   cancelled_by_name TEXT NOT NULL DEFAULT '',
   cancelled_at TEXT NOT NULL DEFAULT '',
+  reference_number TEXT NOT NULL DEFAULT '',
+  paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+  delivery_failure_reason TEXT NOT NULL DEFAULT '',
+  driver_notes TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -513,10 +517,15 @@ ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_reason TEXT NOT N
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_name TEXT NOT NULL DEFAULT '';
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS reference_number TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS delivery_failure_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS driver_notes TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_new_company_name ON reservations (new_company_name) WHERE new_company_name <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_rejected_at ON reservations (rejected_at DESC) WHERE rejected_at <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancelled_at DESC) WHERE cancelled_at <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_reference_number ON reservations (reference_number) WHERE reference_number <> '';
 `;

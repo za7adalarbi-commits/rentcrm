@@ -71,14 +71,14 @@ export function buildPgSearchCondition(columns: string[], rawQuery: unknown, par
   return tokenClauses.length === 1 ? tokenClauses[0] : `(${tokenClauses.join(' AND ')})`;
 }
 
-const SQL_REJECTED_STATUS_LIST = `('مرفوض','مرفوضة','تم الرفض','rejected','declined','refused')`;
-const SQL_CANCELLED_STATUS_LIST = `('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','cancelled','canceled')`;
+const SQL_REJECTED_STATUS_LIST = `('مرفوض','مرفوضة','تم الرفض','مرفوض من الموقع','مرفوضة من الموقع','مرفوض من الشركة','مرفوضة من الشركة','rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','provider_rejected','company_rejected','admin_rejected','auto_rejected')`;
+const SQL_CANCELLED_STATUS_LIST = `('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','ملغي من العميل','ملغى من العميل','ملغاة من العميل','الغاء العميل','إلغاء العميل','cancelled','canceled','cancelled_by_customer','canceled_by_customer','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','admin_cancelled','admin_canceled')`;
 
 const SQL_EXPLICIT_REJECTED = `(
-  LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('rejected','declined','refused') OR
+  LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','provider_rejected','company_rejected','admin_rejected','auto_rejected') OR
   LOWER(TRIM(COALESCE(r.original_status_ar, ''))) IN ${SQL_REJECTED_STATUS_LIST} OR
   (
-    LOWER(TRIM(COALESCE(r.original_status_code, ''))) NOT IN ('cancelled','canceled') AND
+    LOWER(TRIM(COALESCE(r.original_status_code, ''))) NOT IN ('cancelled','canceled','cancelled_by_customer','canceled_by_customer','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','admin_cancelled','admin_canceled') AND
     LOWER(TRIM(COALESCE(r.original_status_ar, ''))) NOT IN ${SQL_CANCELLED_STATUS_LIST} AND
     LOWER(TRIM(COALESCE(r.internal_status, ''))) IN ${SQL_REJECTED_STATUS_LIST}
   )
@@ -86,7 +86,7 @@ const SQL_EXPLICIT_REJECTED = `(
 
 const SQL_EXPLICIT_CANCELLED = `(
   NOT ${SQL_EXPLICIT_REJECTED} AND (
-    LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('cancelled','canceled') OR
+    LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('cancelled','canceled','cancelled_by_customer','canceled_by_customer','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','admin_cancelled','admin_canceled') OR
     LOWER(TRIM(COALESCE(r.original_status_ar, ''))) IN ${SQL_CANCELLED_STATUS_LIST} OR
     LOWER(TRIM(COALESCE(r.internal_status, ''))) IN ${SQL_CANCELLED_STATUS_LIST}
   )
@@ -652,7 +652,9 @@ export async function getTodayAndRadar(
   const roleScope = restrictAgent ? `agent:${session.user.id}` : 'all';
 
   const rawToday = str(payload.todayDate);
-  const todayStr = /^\d{4}-\d{2}-\d{2}$/.test(rawToday) ? rawToday : new Date().toISOString().slice(0, 10);
+  const todayStr = /^\d{4}-\d{2}-\d{2}$/.test(rawToday)
+    ? rawToday
+    : (typeof crmCore.getRiyadhTodayDateStr === 'function' ? crmCore.getRiyadhTodayDateStr() : new Date().toISOString().slice(0, 10));
   const minDate = shiftIsoDateDays(todayStr, -2);
   const maxDate = shiftIsoDateDays(todayStr, 2);
 
@@ -760,7 +762,7 @@ export async function getDashboard(
   const allowAgentViewAll = settings.allow_agent_view_all !== false;
   const today = /^\d{4}-\d{2}-\d{2}$/.test(str(payload.todayDate))
     ? str(payload.todayDate)
-    : new Date().toISOString().slice(0, 10);
+    : (typeof crmCore.getRiyadhTodayDateStr === 'function' ? crmCore.getRiyadhTodayDateStr() : new Date().toISOString().slice(0, 10));
 
   const range = str(payload.range);
   let dateFrom = str(payload.dateFrom);
@@ -1308,6 +1310,8 @@ export async function getReservations(
   if (payload.search) {
     const searchCols = [
       'r.reservation_number',
+      'r.reference_number',
+      'r.source_reservation_id',
       'r.customer_name',
       'r.customer_phone',
       'r.car_name',
@@ -1317,7 +1321,9 @@ export async function getReservations(
       'r.company_number',
       'r.new_company_name',
       'r.rejection_reason',
-      'r.cancellation_reason'
+      'r.cancellation_reason',
+      'r.delivery_failure_reason',
+      'r.driver_notes'
     ];
     if (canSearchId) {
       searchCols.push('r.customer_id_number');
@@ -1332,7 +1338,9 @@ export async function getReservations(
     lastUpdatedAt: 'r.updated_at',
     updatedAt: 'r.updated_at',
     createdAt: 'r.created_at',
+    sourceCreatedAt: 'r.source_created_at',
     reservationNumber: 'r.reservation_number',
+    referenceNumber: 'r.reference_number',
     customerName: 'r.customer_name',
     customerPhone: 'r.customer_phone',
     companyName: 'r.company_name',
@@ -1345,9 +1353,12 @@ export async function getReservations(
     extendedUntilDate: 'r.extended_until_date',
     extensionsAmount: 'r.extensions_amount',
     totalAmount: 'r.total_amount',
+    paidAmount: 'r.paid_amount',
     originalStatusAr: 'r.original_status_ar',
     internalStatus: 'r.internal_status',
     priority: 'r.priority',
+    rejectedAt: 'r.rejected_at',
+    cancelledAt: 'r.cancelled_at',
     lastUpdatedByName: 'r.last_updated_by_name',
     sourceOrder: 'r.source_order'
   };
@@ -1383,26 +1394,35 @@ export async function getReservations(
     const scopeWhere = (session.user.role === 'agent' && !allowAgentViewAll)
       ? (scopeParams.push(JSON.stringify([session.user.id])), `WHERE r.assigned_employee_ids @> $1::jsonb`)
       : '';
-    const lcRes = await executor.query<{
-      total_cnt: string;
-      active_cnt: string;
-      cancelled_cnt: string;
-      rejected_cnt: string;
-    }>(
-      `SELECT
-         COUNT(*)::text AS total_cnt,
-         COUNT(*) FILTER (WHERE ${SQL_ACTIVE_CONDITION})::text AS active_cnt,
-         COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::text AS cancelled_cnt,
-         COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::text AS rejected_cnt
-       FROM reservations r ${scopeWhere}`,
-      scopeParams
-    ).catch(() => ({ rows: [] as any[] }));
+    const [lcRes, todayRadarRes] = await Promise.all([
+      executor.query<{
+        total_cnt: string;
+        active_cnt: string;
+        cancelled_cnt: string;
+        rejected_cnt: string;
+      }>(
+        `SELECT
+           COUNT(*)::text AS total_cnt,
+           COUNT(*) FILTER (WHERE ${SQL_ACTIVE_CONDITION})::text AS active_cnt,
+           COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::text AS cancelled_cnt,
+           COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::text AS rejected_cnt
+         FROM reservations r ${scopeWhere}`,
+        scopeParams
+      ).catch(() => ({ rows: [] as any[] })),
+      getTodayAndRadar(executor, session, {
+        summaryOnly: true,
+        forceRefresh: toBool(payload.forceRefresh)
+      }).catch(() => ({ counts: null }))
+    ]);
     const row = lcRes.rows?.[0] || {};
+    const trCounts = (todayRadarRes as any)?.counts || {};
     return {
       all: Number(row.total_cnt || 0),
       active: Number(row.active_cnt || 0),
       cancelled: Number(row.cancelled_cnt || 0),
-      rejected: Number(row.rejected_cnt || 0)
+      rejected: Number(row.rejected_cnt || 0),
+      today: Number(trCounts.todayTotal || 0),
+      radar: Number(trCounts.radarTotal || 0)
     };
   };
 
@@ -1523,19 +1543,20 @@ export async function syncLocalCache(
 
   const [resRows, extRows, fuRows, prbRows] = await Promise.all([
     executor.query(
-      `SELECT r.id, r.source_reservation_id, r.reservation_number, r.source_created_at,
+      `SELECT r.id, r.source_reservation_id, r.reservation_number, r.reference_number, r.source_created_at,
               r.customer_name, r.customer_phone, r.customer_email, r.customer_id_number,
               r.company_name, r.company_number, r.new_company_name, r.branch_name, r.deliver_branch_name, r.car_name, r.plate_number, r.car_category,
               r.start_date, r.start_time, r.original_end_date, r.original_end_time, r.end_date, r.end_time,
               r.extended_until_date, r.extended_until_time, r.days_count, r.extended_days_count, r.total_days_count,
               r.original_status_code, r.original_status_ar, r.pickup_type_ar, r.return_type_ar,
               r.payment_method, r.payment_status, r.daily_price, r.discount_amount, r.vat_amount,
-              r.base_amount, r.extensions_count, r.extensions_amount, r.total_amount, r.has_extensions,
+              r.base_amount, r.extensions_count, r.extensions_amount, r.total_amount, r.paid_amount, r.has_extensions,
               r.internal_status, r.priority, r.assigned_employee_ids, r.assigned_employee_names,
               r.last_update_text, r.last_updated_by_id, r.last_updated_by_name, r.last_updated_at,
               r.has_problem, r.rejection_reason, r.car_status_at_request, r.refund_amount,
               r.rejected_by_id, r.rejected_by_name, r.rejected_at,
               r.cancellation_reason, r.cancelled_by_id, r.cancelled_by_name, r.cancelled_at,
+              r.delivery_failure_reason, r.driver_notes,
               r.pinned_note, r.pinned_note_by_id, r.pinned_note_by_name, r.pinned_note_updated_at, r.no_answer_count,
               r.created_at, r.updated_at, r.source_order, r.status_history,
               EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
@@ -2425,7 +2446,7 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
 
       const updatedRes: Record<string, any> = {
         ...resObj,
-        internalStatus: status,
+        internalStatus: effectiveNextInternalStatus,
         lastUpdateText: lastText,
         lastUpdatedById: session.user.id,
         lastUpdatedByName: session.user.name,

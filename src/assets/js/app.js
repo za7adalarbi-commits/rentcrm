@@ -118,6 +118,9 @@
           restoredResFilters.sortBy = 'sourceOrder';
           restoredResFilters.sortDir = 'asc';
         }
+        if (!restoredResFilters.viewMode || restoredResFilters.viewMode === 'active') {
+          restoredResFilters.viewMode = 'all';
+        }
         state.reservations = restoredResFilters;
       }
       if (f.problems && typeof f.problems === 'object' && !state.problems) {
@@ -3167,13 +3170,17 @@
           payload: { range: d.range || '30d', dateFrom: d.dateFrom || '', dateTo: d.dateTo || '' }
         };
       }
-      case 'reservations':
+      case 'reservations': {
+        var resSt = state.reservations || {};
+        var vmPre = resSt.viewMode;
+        var lifePre = (vmPre === 'rejected' || vmPre === 'cancelled') ? vmPre : 'all';
         return {
           action: 'getReservations',
           payload: (root.RGCrmCore && root.RGCrmCore.buildReservationQueryPayload)
-            ? root.RGCrmCore.buildReservationQueryPayload(state.reservations || {})
-            : Object.assign({ page: 1, pageSize: 20, lifecycle: 'active' }, state.reservations || {})
+            ? root.RGCrmCore.buildReservationQueryPayload(Object.assign({}, resSt, { lifecycle: lifePre }))
+            : Object.assign({ page: 1, pageSize: 20, lifecycle: lifePre }, resSt)
         };
+      }
       case 'my-followups':
         return { action: 'getMyFollowUps', payload: {} };
       case 'team-followups':

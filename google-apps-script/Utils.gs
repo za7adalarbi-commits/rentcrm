@@ -426,6 +426,11 @@ function extractCustomerNationalIdGs_(apiItem, existing) {
   var userObj = (item.user && typeof item.user === 'object') ? item.user : {};
   var driverObj = (item.driver && typeof item.driver === 'object') ? item.driver : {};
   var renterObj = (item.renter && typeof item.renter === 'object') ? item.renter : {};
+  var clientInfoObj = (item.clientInfo && typeof item.clientInfo === 'object') ? item.clientInfo : {};
+  var customerInfoObj = (item.customerInfo && typeof item.customerInfo === 'object') ? item.customerInfo : {};
+  var driverInfoObj = (item.driverInfo && typeof item.driverInfo === 'object') ? item.driverInfo : {};
+  var documentObj = (item.document && typeof item.document === 'object') ? item.document : {};
+  var identityObj = (item.identity && typeof item.identity === 'object') ? item.identity : {};
   var idKeys = [
     'clientNationalId', 'client_national_id', 'customerNationalId', 'customer_national_id',
     'clientIdNumber', 'client_id_number', 'customerIdNumber', 'customer_id_number',
@@ -434,26 +439,37 @@ function extractCustomerNationalIdGs_(apiItem, existing) {
     'iqamaNumber', 'iqama_number', 'clientIqama', 'client_iqama',
     'residentId', 'resident_id', 'citizenId', 'citizen_id',
     'clientIdentity', 'clientIdentityNumber', 'clientIdNo', 'nid', 'ssn',
-    'passportNumber', 'passport_number'
+    'passportNumber', 'passport_number', 'number'
   ];
-  var sources = [item, cust, client, userObj, driverObj, renterObj];
+  var isInvalidIdValGs = function (valStr) {
+    if (!valStr) return true;
+    var low = valStr.toLowerCase();
+    return valStr === '-' || valStr === '—' || low === 'null' || low === 'undefined' ||
+      low === 'n/a' || low === 'na' || low === 'none' || valStr === 'غير متاح' ||
+      valStr === 'غير محدد' || /^0+$/.test(valStr);
+  };
+  var sources = [
+    item, cust, client, userObj, driverObj, renterObj,
+    clientInfoObj, customerInfoObj, driverInfoObj, documentObj, identityObj
+  ];
   for (var si = 0; si < sources.length; si++) {
     var srcObj = sources[si];
     if (!srcObj || typeof srcObj !== 'object') continue;
     for (var ki = 0; ki < idKeys.length; ki++) {
+      if (ki === idKeys.length - 1 && si === 0) continue; // skip root item.number
       var raw = srcObj[idKeys[ki]];
       if (raw === null || raw === undefined) continue;
       var rawCand = String(raw).trim();
       if (typeof convertEasternDigitsGs_ === 'function') rawCand = convertEasternDigitsGs_(rawCand).trim();
-      if (!rawCand || rawCand === '-' || rawCand.toLowerCase() === 'null' || rawCand.toLowerCase() === 'undefined') continue;
+      if (isInvalidIdValGs(rawCand)) continue;
       return rawCand;
     }
   }
   var prev = existing && existing.customerIdNumber ? String(existing.customerIdNumber).trim() : '';
   if (typeof convertEasternDigitsGs_ === 'function' && prev) prev = convertEasternDigitsGs_(prev).trim();
-  if (prev && prev !== '-' && prev.toLowerCase() !== 'null' && prev.toLowerCase() !== 'undefined') {
+  if (!isInvalidIdValGs(prev)) {
     var apiPhoneRaw = normalizeStr(
-      item.clientMobile || item.customerPhone || item.customer_phone || cust.phone || cust.mobile || client.phone || client.mobile
+      item.clientMobile || item.customerPhone || item.customer_phone || cust.phone || cust.mobile || client.phone || client.mobile || clientInfoObj.phone || clientInfoObj.mobile
     );
     var prevPhoneRaw = existing && existing.customerPhone ? normalizeStr(existing.customerPhone) : '';
     if (typeof convertEasternDigitsGs_ === 'function') {

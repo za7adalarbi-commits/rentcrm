@@ -213,6 +213,24 @@ test('UI overrides precedence, Developer protection, unified navigation removal 
   const appJs = readRepoFile('assets/js/app.js');
   assert.equal(appJs.includes("'inactive-reservations':"), false);
   assert.equal(appJs.includes("id: 'inactive-reservations'"), false);
+  assert.ok(appJs.includes("viewMode: 'all'"));
+
+  const reservationsJs = readRepoFile('assets/js/reservations.js');
+  assert.equal(reservationsJs.includes('res-active-tab-count'), false);
+  assert.equal(reservationsJs.includes('data-res-view="active"'), false);
+  assert.ok(reservationsJs.includes("viewMode: 'all'"));
+
+  const tabMatches = Array.from(reservationsJs.matchAll(/data-res-view="(all|today|radar|rejected|cancelled)"/g)).map((m) => m[1]);
+  assert.deepEqual(tabMatches, ['all', 'today', 'radar', 'rejected', 'cancelled']);
+
+  assert.ok(reservationsJs.includes('REJECTED_COLUMNS'));
+  assert.ok(reservationsJs.includes('CANCELLED_COLUMNS'));
+  assert.ok(reservationsJs.includes("label: 'الشركة الجديدة'"));
+  assert.ok(reservationsJs.includes("label: 'التأكيد بواسطة'"));
+  assert.ok(reservationsJs.includes("label: 'الرقم المرجعي'"));
+  assert.ok(reservationsJs.includes("label: 'سبب فشل التوصيل'"));
+  assert.ok(reservationsJs.includes("label: 'ملاحظات السائق'"));
+  assert.ok(reservationsJs.includes("var naText = isEn ? 'N/A' : 'غير متاح';"));
 
   const css = readRepoFile('assets/css/dashboard.css');
   for (const cls of [
@@ -258,6 +276,9 @@ test('Sandbox E2E: unified lifecycle tabs, forbidden manual reject/cancel/restor
     allList.data.total,
     activeList.data.lifecycleCounts.active + activeList.data.lifecycleCounts.rejected + activeList.data.lifecycleCounts.cancelled
   );
+  assert.equal(typeof activeList.data.lifecycleCounts.today, 'number');
+  assert.equal(typeof activeList.data.lifecycleCounts.radar, 'number');
+  assert.equal(allList.data.lifecycleCounts.all, allList.data.total);
 
   const firstActive = activeList.data.items[0];
   const firstRejected = rejectedList.data.items[0];
@@ -456,4 +477,33 @@ test('Sandbox E2E: UI overrides persist across logout/login & active fast-query 
   );
   assert.equal(devResolved.uiSimplification.hideNavReports, false);
 });
+
+test('National ID nested objects, junk placeholder filtering, sync actor fallback, and coreBridge parity', () => {
+  const bridgeCore = require('../backend/coreBridge.cjs');
+  assert.equal(typeof bridgeCore.extractCustomerNationalId, 'function');
+
+  // Junk placeholders must be ignored instead of stored as National IDs
+  assert.equal(core.extractCustomerNationalId({ customerIdNumber: '0000000000', customer: { national_id: 'غير متاح' } }, null), '');
+  assert.equal(core.extractCustomerNationalId({ clientInfo: { id_number: '٠٠١٢٣٤٥٦٧٨' } }, null), '0012345678');
+  assert.equal(bridgeCore.extractCustomerNationalId({ clientInfo: { id_number: '٠٠١٢٣٤٥٦٧٨' } }, null), '0012345678');
+
+  // Actor fallback for rejected reservations supports confirmedByName / actionByName
+  const mergedRejected = core.mergeSyncedReservation(
+    { id: 'RES_REJ_9', reservationNumber: '7771', internalStatus: 'قيد الانتظار', originalStatusCode: 'pending' },
+    {
+      id: 'RES_REJ_9',
+      reservationNumber: '7771',
+      status: 'rejected',
+      rejectionReason: 'السيارة غير متوفرة',
+      confirmedByName: 'مشرف المنصة',
+      actionAt: '2026-11-24T11:30:00Z'
+    },
+    [],
+    { id: 'SYNC', name: 'Sync' }
+  );
+  assert.equal(mergedRejected.rejectedByName, 'مشرف المنصة');
+  assert.equal(mergedRejected.rejectedAt, '2026-11-24T11:30:00Z');
+  assert.equal(core.classifyReservationLifecycle(mergedRejected), 'rejected');
+});
+
 

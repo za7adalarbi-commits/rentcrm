@@ -99,8 +99,23 @@
     finished_by_driver: 'تم التسليم من قبل السائق',
     cancelled: 'ملغي',
     canceled: 'ملغي',
+    cancelled_by_customer: 'ملغي',
+    canceled_by_customer: 'ملغي',
+    customer_cancelled: 'ملغي',
+    customer_canceled: 'ملغي',
+    user_cancelled: 'ملغي',
+    user_canceled: 'ملغي',
+    client_cancelled: 'ملغي',
+    admin_cancelled: 'ملغي',
     declined: 'مرفوض',
     rejected: 'مرفوض',
+    refused: 'مرفوض',
+    rejected_by_admin: 'مرفوض',
+    rejected_by_company: 'مرفوض',
+    provider_rejected: 'مرفوض',
+    admin_rejected: 'مرفوض',
+    company_rejected: 'مرفوض',
+    auto_rejected: 'مرفوض',
     expired: 'منتهي',
     no_show: 'لم يحضر',
     draft: 'مسودة',
@@ -138,8 +153,10 @@
   }());
 
   var MANUAL_BLOCKED_STATUS_TOKENS = [
-    'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused',
-    'تم الإلغاء', 'تم الالغاء', 'ملغي', 'ملغى', 'ملغاة', 'cancelled', 'canceled'
+    'مرفوض', 'مرفوضة', 'تم الرفض', 'مرفوض من الموقع', 'مرفوض من الشركة',
+    'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'company_rejected', 'auto_rejected',
+    'تم الإلغاء', 'تم الالغاء', 'تم الإلغاء من العميل', 'تم الالغاء من العميل', 'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل',
+    'cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled', 'client_cancelled', 'admin_cancelled'
   ];
 
   function isManualBlockedWorkflowStatus(status) {
@@ -576,13 +593,22 @@
     var userObj = (item.user && typeof item.user === 'object') ? item.user : {};
     var driverObj = (item.driver && typeof item.driver === 'object') ? item.driver : {};
     var renterObj = (item.renter && typeof item.renter === 'object') ? item.renter : {};
-    var nestedObjects = [cust, client, userObj, driverObj, renterObj];
+    var clientInfoObj = (item.clientInfo && typeof item.clientInfo === 'object') ? item.clientInfo : {};
+    var customerInfoObj = (item.customerInfo && typeof item.customerInfo === 'object') ? item.customerInfo : {};
+    var driverInfoObj = (item.driverInfo && typeof item.driverInfo === 'object') ? item.driverInfo : {};
+    var documentObj = (item.document && typeof item.document === 'object') ? item.document : {};
+    var identityObj = (item.identity && typeof item.identity === 'object') ? item.identity : {};
+    var nestedObjects = [
+      cust, client, userObj, driverObj, renterObj,
+      clientInfoObj, customerInfoObj, driverInfoObj, documentObj, identityObj
+    ];
     var candidates = [
       item.clientNationalId,
       item.client_national_id,
       item.customerNationalId,
       item.customer_national_id,
       item.clientIdNumber,
+      item.client_id_number,
       item.customerIdNumber,
       item.customer_id_number,
       item.nationalId,
@@ -629,6 +655,7 @@
         no.clientNationalId,
         no.client_national_id,
         no.clientIdNumber,
+        no.client_id_number,
         no.residentId,
         no.resident_id,
         no.citizenId,
@@ -636,21 +663,41 @@
         no.nid,
         no.ssn,
         no.passportNumber,
-        no.passport_number
+        no.passport_number,
+        no.number
       );
     }
+    var isInvalidIdValue = function (valStr) {
+      if (!valStr) return true;
+      var low = valStr.toLowerCase();
+      if (
+        valStr === '-' ||
+        valStr === '—' ||
+        low === 'null' ||
+        low === 'undefined' ||
+        low === 'n/a' ||
+        low === 'na' ||
+        low === 'none' ||
+        valStr === 'غير متاح' ||
+        valStr === 'غير محدد' ||
+        /^0+$/.test(valStr)
+      ) {
+        return true;
+      }
+      return false;
+    };
     for (var i = 0; i < candidates.length; i++) {
       var raw = candidates[i];
       if (raw === null || raw === undefined) continue;
       var s = convertEasternDigitsToAscii(String(raw)).trim();
-      if (!s || s === '-' || s.toLowerCase() === 'null' || s.toLowerCase() === 'undefined') continue;
+      if (isInvalidIdValue(s)) continue;
       return s;
     }
     var prev = existing && existing.customerIdNumber ? convertEasternDigitsToAscii(String(existing.customerIdNumber)).trim() : '';
-    if (prev && prev !== '-' && prev.toLowerCase() !== 'null' && prev.toLowerCase() !== 'undefined') {
+    if (!isInvalidIdValue(prev)) {
       // Only carry forward existing customerIdNumber if it belongs to the same customer/booking
       var apiPhone = convertEasternDigitsToAscii(normalizeStr(
-        item.clientMobile || item.customerPhone || item.customer_phone || cust.phone || cust.mobile || client.phone || client.mobile
+        item.clientMobile || item.customerPhone || item.customer_phone || cust.phone || cust.mobile || client.phone || client.mobile || clientInfoObj.phone || clientInfoObj.mobile
       )).replace(/\D+/g, '');
       var prevPhone = existing && existing.customerPhone
         ? convertEasternDigitsToAscii(normalizeStr(existing.customerPhone)).replace(/\D+/g, '')
@@ -1242,46 +1289,101 @@
     var incomingCancelled = finalLifecycle === 'cancelled';
 
     var resolvedNewCompanyName = incomingRejected
-      ? normalizeStr(apiItem.newCompanyName || apiItem.new_company_name || (existing && existing.newCompanyName) || '')
+      ? normalizeStr(apiItem.newCompanyName || apiItem.new_company_name || apiItem.transferCompanyName || apiItem.alternativeCompanyName || (existing && existing.newCompanyName) || '')
       : '';
     var resolvedRejectionReason = incomingRejected
-      ? normalizeStr(apiItem.rejectionReason || apiItem.rejectReason || apiItem.reason || (existing && existing.rejectionReason) || '')
+      ? normalizeStr(apiItem.rejectionReason || apiItem.rejection_reason || apiItem.rejectReason || apiItem.reject_reason || apiItem.reason || (existing && existing.rejectionReason) || '')
       : '';
     var resolvedCarStatusAtRequest = incomingRejected
-      ? normalizeStr(apiItem.carStatusAtRequest || (existing && existing.carStatusAtRequest) || '')
+      ? normalizeStr(apiItem.carStatusAtRequest || apiItem.car_status_at_request || (existing && existing.carStatusAtRequest) || '')
       : '';
+    var incomingRefundNum = apiItem.refundAmount !== undefined ? apiItem.refundAmount : (apiItem.refund_amount !== undefined ? apiItem.refund_amount : undefined);
     var resolvedRefundAmount = incomingRejected
-      ? ((existing && existing.refundAmount !== undefined && existing.refundAmount !== null && existing.refundAmount !== '')
-        ? toNum(existing.refundAmount, 0)
-        : toNum(apiItem.refundAmount || apiItem.refund_amount, 0))
+      ? ((incomingRefundNum !== undefined && incomingRefundNum !== null && incomingRefundNum !== '' && toNum(incomingRefundNum, 0) > 0)
+        ? toNum(incomingRefundNum, 0)
+        : ((existing && existing.refundAmount !== undefined && existing.refundAmount !== null && existing.refundAmount !== '')
+          ? toNum(existing.refundAmount, 0)
+          : toNum(incomingRefundNum, 0)))
       : 0;
     var resolvedRejectedById = incomingRejected
-      ? normalizeStr((existing && existing.rejectedById) || actorId)
+      ? normalizeStr(apiItem.rejectedById || apiItem.rejected_by_id || apiItem.confirmedById || apiItem.confirmed_by_id || apiItem.actionById || apiItem.action_by_id || (existing && existing.rejectedById) || actorId)
       : '';
     var resolvedRejectedByName = incomingRejected
-      ? normalizeStr((existing && existing.rejectedByName) || actorName)
+      ? normalizeStr(apiItem.rejectedByName || apiItem.rejected_by_name || apiItem.rejectedBy || apiItem.confirmedByName || apiItem.confirmed_by_name || apiItem.confirmedBy || apiItem.actionByName || apiItem.action_by_name || apiItem.actionBy || apiItem.adminName || (existing && existing.rejectedByName) || actorName)
       : '';
     var resolvedRejectedAt = incomingRejected
-      ? normalizeStr(apiItem.rejectedAt || (existing && existing.rejectedAt) || now)
+      ? normalizeStr(apiItem.rejectedAt || apiItem.rejected_at || apiItem.actionAt || (existing && existing.rejectedAt) || now)
       : '';
 
     var resolvedCancellationReason = incomingCancelled
-      ? normalizeStr(apiItem.cancellationReason || apiItem.cancelReason || apiItem.reason || (existing && existing.cancellationReason) || '')
+      ? normalizeStr(apiItem.cancellationReason || apiItem.cancellation_reason || apiItem.cancelReason || apiItem.cancel_reason || apiItem.reason || (existing && existing.cancellationReason) || '')
       : '';
     var resolvedCancelledById = incomingCancelled
-      ? normalizeStr((existing && existing.cancelledById) || actorId)
+      ? normalizeStr(apiItem.cancelledById || apiItem.cancelled_by_id || apiItem.canceled_by_id || apiItem.actionById || apiItem.action_by_id || (existing && existing.cancelledById) || actorId)
       : '';
     var resolvedCancelledByName = incomingCancelled
-      ? normalizeStr((existing && existing.cancelledByName) || actorName)
+      ? normalizeStr(apiItem.cancelledByName || apiItem.cancelled_by_name || apiItem.canceledByName || apiItem.canceled_by_name || apiItem.cancelledBy || apiItem.actionByName || apiItem.action_by_name || apiItem.actionBy || (existing && existing.cancelledByName) || actorName)
       : '';
     var resolvedCancelledAt = incomingCancelled
-      ? normalizeStr(apiItem.cancelledAt || (existing && existing.cancelledAt) || now)
+      ? normalizeStr(apiItem.cancelledAt || apiItem.cancelled_at || apiItem.canceledAt || apiItem.canceled_at || apiItem.actionAt || (existing && existing.cancelledAt) || now)
       : '';
+
+    var resolvedReferenceNumber = normalizeStr(
+      apiItem.referenceNumber ||
+      apiItem.reference_number ||
+      apiItem.refNumber ||
+      apiItem.ref_number ||
+      apiItem.sourceReference ||
+      apiItem.externalReference ||
+      apiItem.orderRef ||
+      apiItem.reference ||
+      (existing && existing.referenceNumber) ||
+      resApiId ||
+      ''
+    );
+
+    var rawPaidCandidate = apiItem.paidAmount !== undefined
+      ? apiItem.paidAmount
+      : (apiItem.paid_amount !== undefined
+        ? apiItem.paid_amount
+        : (apiItem.amountPaid !== undefined ? apiItem.amountPaid : apiItem.amount_paid));
+    var resolvedPaymentStatus = normalizeStr(apiItem.paymentStatus || apiItem.paymentResult || (existing && existing.paymentStatus) || '');
+    var paymentStatusLower = resolvedPaymentStatus.toLowerCase();
+    var resolvedPaidAmount = (rawPaidCandidate !== undefined && rawPaidCandidate !== null && rawPaidCandidate !== '')
+      ? Math.max(0, Math.round(toNum(rawPaidCandidate, 0) * 100) / 100)
+      : ((existing && toNum(existing.paidAmount, 0) > 0)
+        ? Math.round(toNum(existing.paidAmount, 0) * 100) / 100
+        : (['paid', 'wallet_paid', 'paid_by_wallet', 'paid_wallet', 'refunded', 'مدفوع', 'مدفوع عن طريق المحفظة', 'مسترد'].indexOf(paymentStatusLower) !== -1
+          ? totalAmount
+          : 0));
+
+    var resolvedDeliveryFailureReason = normalizeStr(
+      apiItem.deliveryFailureReason ||
+      apiItem.delivery_failure_reason ||
+      apiItem.failedDeliveryReason ||
+      apiItem.failed_delivery_reason ||
+      apiItem.deliverFailReason ||
+      apiItem.failReason ||
+      (existing && existing.deliveryFailureReason) ||
+      ''
+    );
+    var resolvedDriverNotes = normalizeStr(
+      apiItem.driverNotes ||
+      apiItem.driver_notes ||
+      apiItem.driverNote ||
+      apiItem.driver_note ||
+      apiItem.deliveryNotes ||
+      apiItem.delivery_notes ||
+      apiItem.driverComment ||
+      (existing && existing.driverNotes) ||
+      ''
+    );
 
     return {
       id: existing ? existing.id : ('RES_' + resNumber),
       sourceReservationId: resApiId || resNumber,
       reservationNumber: resNumber,
+      referenceNumber: resolvedReferenceNumber,
       sourceOrder: resolvedSourceOrder,
       sourceCreatedAt: formatDisplayDateTime(sourceCreatedRaw) || normalizeStr(sourceCreatedRaw),
       customerName: normalizeStr(apiItem.clientName || apiItem.customer_name || (apiItem.customer && apiItem.customer.name) || 'عميل'),
@@ -1312,11 +1414,12 @@
       pickupTypeAr: translateDeliveryType(apiItem.receiveType || apiItem.pickup_type || apiItem.delivery_type),
       returnTypeAr: translateDeliveryType(apiItem.deliverType || apiItem.return_type || apiItem.dropoff_type),
       paymentMethod: normalizeStr(apiItem.paymentType || apiItem.paymentMethod || ''),
-      paymentStatus: normalizeStr(apiItem.paymentStatus || apiItem.paymentResult || ''),
+      paymentStatus: resolvedPaymentStatus,
       dailyPrice: toNum(apiItem.dailyPrice || apiItem.dayPrice || apiItem.pricePerDay, 0),
       discountAmount: toNum(apiItem.discount || apiItem.discountAmount, 0),
       vatAmount: toNum(apiItem.vat || apiItem.vatAmount || apiItem.tax, 0),
       baseAmount: Math.round(baseAmount * 100) / 100,
+      paidAmount: resolvedPaidAmount,
       extensionsCount: extSummary.extensionsCount,
       extensionsAmount: extSummary.extensionsAmount,
       totalAmount: totalAmount,
@@ -1341,6 +1444,8 @@
       cancelledById: resolvedCancelledById,
       cancelledByName: resolvedCancelledByName,
       cancelledAt: resolvedCancelledAt,
+      deliveryFailureReason: resolvedDeliveryFailureReason,
+      driverNotes: resolvedDriverNotes,
       createdAt: existing ? existing.createdAt : now,
       updatedAt: now
     };
@@ -2299,6 +2404,8 @@
       if (search) {
         var searchHay = [
           r.reservationNumber,
+          r.referenceNumber,
+          r.sourceReservationId,
           r.customerName,
           r.customerPhone,
           r.carName,
@@ -2306,6 +2413,10 @@
           r.companyName,
           r.companyNumber,
           r.newCompanyName,
+          r.rejectionReason,
+          r.cancellationReason,
+          r.deliveryFailureReason,
+          r.driverNotes,
           r.branchName
         ];
         if (canViewCid) searchHay.push(r.customerIdNumber);
@@ -4994,12 +5105,17 @@
   }
 
   var CLOSED_RESERVATION_STATUSES = [
-    'تم الإلغاء', 'ملغي', 'cancelled', 'canceled', 'لم يتم الحجز', 'مرفوض', 'rejected',
+    'تم الإلغاء', 'تم الالغاء', 'تم الإلغاء من العميل', 'تم الالغاء من العميل', 'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل',
+    'cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled', 'client_cancelled', 'admin_cancelled',
+    'لم يتم الحجز',
+    'مرفوض', 'مرفوضة', 'تم الرفض', 'مرفوض من الموقع', 'مرفوض من الشركة',
+    'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'company_rejected', 'auto_rejected',
     'تم الإرجاع', 'تم الاستلام', 'منتهي', 'مكتمل', 'completed', 'returned', 'closed', 'لم يحضر', 'no_show'
   ];
 
   function isReservationClosedStatus(res) {
     var r = (res && typeof res === 'object') ? res : {};
+    if (isInactiveReservation(r)) return true;
     var internal = normalizeStr(r.internalStatus).toLowerCase();
     var origAr = normalizeStr(r.originalStatusAr).toLowerCase();
     var origCode = normalizeStr(r.originalStatusCode).toLowerCase();
@@ -5050,7 +5166,7 @@
     var gracePastHours = Math.max(0, Number(opts.gracePastHours !== undefined ? opts.gracePastHours : 12));
 
     if (!res || typeof res !== 'object') return null;
-    if (isReservationClosedStatus(res)) return null;
+    if (isInactiveReservation(res) || isReservationClosedStatus(res)) return null;
 
     var eff = resolveReservationEffectiveEnd(res);
     if (eff.timestampMs === null || !isFinite(eff.timestampMs)) return null;
@@ -5733,11 +5849,14 @@
   // ---------- TODAY'S PICKUPS & RETURNS RADAR ----------
 
   var REJECTED_STATUS_VALUES = [
-    'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused'
+    'مرفوض', 'مرفوضة', 'تم الرفض', 'مرفوض من الموقع', 'مرفوض من الشركة',
+    'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'company_rejected', 'auto_rejected'
   ];
 
   var CANCELLED_STATUS_VALUES = [
-    'تم الإلغاء', 'تم الالغاء', 'ملغي', 'ملغى', 'ملغاة', 'cancelled', 'canceled'
+    'تم الإلغاء', 'تم الالغاء', 'تم الإلغاء من العميل', 'تم الالغاء من العميل',
+    'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل',
+    'cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled', 'client_cancelled', 'admin_cancelled'
   ];
 
   var REJECTION_REASONS_LIST = [
@@ -6000,8 +6119,10 @@
   }
 
   var EXCLUDED_TODAY_STATUSES = [
-    'تم الإلغاء', 'تم الالغاء', 'ملغي', 'ملغى', 'ملغاة', 'cancelled', 'canceled',
-    'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused',
+    'تم الإلغاء', 'تم الالغاء', 'تم الإلغاء من العميل', 'تم الالغاء من العميل', 'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل',
+    'cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled', 'client_cancelled', 'admin_cancelled',
+    'مرفوض', 'مرفوضة', 'تم الرفض', 'مرفوض من الموقع', 'مرفوض من الشركة',
+    'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'company_rejected', 'auto_rejected',
     'لم يتم الحجز', 'لم يحضر', 'no_show'
   ];
 
