@@ -243,9 +243,11 @@
                 : (lc === 'cancelled'
                     ? '<span class="status-tag status-warning">' + (isEn ? 'Cancelled' : 'ملغي') + '</span>'
                     : '<span class="status-tag status-success">' + (isEn ? 'Active' : 'نشط') + '</span>');
+              var cleanReasonFn = (core && core.sanitizeReasonText) ? core.sanitizeReasonText : function (v) { return String(v || '').trim(); };
+              var emptyReasonHint = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
               var reasonTxt = lc === 'rejected'
-                ? (b.rejectionReason || b.lastUpdateText || '-')
-                : (lc === 'cancelled' ? (b.cancellationReason || b.lastUpdateText || '-') : (b.lastUpdateText || '-'));
+                ? (cleanReasonFn(b.rejectionReason) || emptyReasonHint)
+                : (lc === 'cancelled' ? (cleanReasonFn(b.cancellationReason) || emptyReasonHint) : (b.lastUpdateText || '-'));
               return '<tr>' +
                 '<td class="mono" dir="ltr"><strong>' + esc(b.reservationNumber || b.id) + '</strong></td>' +
                 '<td><div>' + esc(b.companyName || '-') + '</div><div class="cell-sub">' + esc(b.carName || '-') + '</div></td>' +
@@ -524,9 +526,26 @@
           '</div></td></tr>'
         : currentItems.map(function (r) {
             var isOpen = Boolean(state.expandedIds[r.id]);
+            var sanitizeInactReason = function (val) {
+              if (core && typeof core.sanitizeReasonText === 'function') {
+                return core.sanitizeReasonText(val);
+              }
+              var s = String(val || '').trim();
+              if (!s || s === '-' || s === '—' || s === 'غير متاح' || s === 'غير محدد' || /^(n\/a|na|null|undefined|none)$/i.test(s)) return '';
+              return s;
+            };
             var reasonVal = isCancelled
-              ? (r.cancellationReason || r.lastUpdateText || '-')
-              : (r.rejectionReason || r.lastUpdateText || '-');
+              ? sanitizeInactReason(r.cancellationReason)
+              : sanitizeInactReason(r.rejectionReason);
+            if (!reasonVal && r.rawJson && String(r.rawJson).trim().charAt(0) === '{' && core) {
+              try {
+                var parsedRawRow = JSON.parse(String(r.rawJson));
+                reasonVal = isCancelled
+                  ? (core.extractCancellationReason ? core.extractCancellationReason(parsedRawRow, null) : '')
+                  : (core.extractRejectionReason ? core.extractRejectionReason(parsedRawRow, null) : '');
+              } catch (_rawErr) {}
+            }
+            var emptyReasonText = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
             var actorVal = isCancelled
               ? (r.cancelledByName || r.lastUpdatedByName || '-')
               : (r.rejectedByName || r.lastUpdatedByName || '-');
@@ -551,8 +570,8 @@
                   '<div class="cell-primary">' + esc(r.companyName || '-') + '</div>' +
                   (r.companyNumber ? '<div class="cell-sub mono" dir="ltr">#' + esc(r.companyNumber) + '</div>' : '') +
                 '</td>' +
-                '<td>' + esc(r.newCompanyName || '-') + '</td>' +
-                '<td><span class="rg-inact-reason-txt">' + esc(reasonVal) + '</span></td>' +
+                '<td>' + esc(sanitizeInactReason(r.newCompanyName) || (isEn ? 'Not transferred' : 'لم يتم التحويل')) + '</td>' +
+                '<td><span class="rg-inact-reason-txt"' + (reasonVal ? '' : ' style="color:var(--text-muted);font-size:12px;"') + '>' + esc(reasonVal || emptyReasonText) + '</span></td>' +
                 '<td>' + statusTagHtml(r.internalStatus || r.originalStatusAr) + '</td>' +
                 '<td>' + esc(r.carStatusAtRequest || r.originalStatusAr || '-') + '</td>' +
                 '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(formatMoney(r.refundAmount || 0, isEn)) + '</td>' +
@@ -759,10 +778,20 @@
               dateCol
             ]);
             if (root.RGReports && typeof root.RGReports.exportExcelWorkbook === 'function') {
+              var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+              var exportRows = currentItems.map(function (row) {
+                var copy = Object.assign({}, row);
+                if (isCancelled) {
+                  copy.cancellationReason = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
+                } else {
+                  copy.rejectionReason = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
+                }
+                return copy;
+              });
               await root.RGReports.exportExcelWorkbook([{
                 name: isCancelled ? 'CancelledReservations' : 'RejectedReservations',
                 headers: headers,
-                rows: currentItems
+                rows: exportRows
               }], isCancelled ? 'rental-gate-cancelled-reservations.xlsx' : 'rental-gate-rejected-reservations.xlsx');
               if (ctx && ctx.toast) ctx.toast(isEn ? 'Exported to Excel.' : 'تم تصدير البيانات إلى ملف Excel بنجاح.');
             }

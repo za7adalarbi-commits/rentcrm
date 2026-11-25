@@ -569,7 +569,34 @@
       var isRejectedSchema = state.viewMode === 'rejected';
       var isCancelledSchema = state.viewMode === 'cancelled';
       var isDedicatedSchema = isRejectedSchema || isCancelledSchema;
-      var naText = isEn ? 'N/A' : 'غير متاح';
+      var sanitizeSourceReason = function (val) {
+        if (root.RGCrmCore && typeof root.RGCrmCore.sanitizeReasonText === 'function') {
+          return root.RGCrmCore.sanitizeReasonText(val);
+        }
+        var s = String(val || '').trim();
+        if (!s || s === '-' || s === '—' || s === 'غير متاح' || s === 'غير محدد' || /^(n\/a|na|null|undefined|none)$/i.test(s)) return '';
+        return s;
+      };
+      var resolveRowSourceReason = function (item, kind) {
+        var direct = sanitizeSourceReason(kind === 'rejected' ? item.rejectionReason : item.cancellationReason);
+        if (direct) return direct;
+        var rawText = String(item.rawJson || '').trim();
+        if (rawText.charAt(0) === '{' && root.RGCrmCore) {
+          try {
+            var parsedRaw = JSON.parse(rawText);
+            return kind === 'rejected'
+              ? (root.RGCrmCore.extractRejectionReason ? root.RGCrmCore.extractRejectionReason(parsedRaw, null) : '')
+              : (root.RGCrmCore.extractCancellationReason ? root.RGCrmCore.extractCancellationReason(parsedRaw, null) : '');
+          } catch (_e) {}
+        }
+        return '';
+      };
+      var emptyReasonLabel = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+      var notRecordedLabel = isEn ? 'Not recorded in source' : 'غير مسجل في المصدر';
+      var notTransferredLabel = isEn ? 'Not transferred' : 'لم يتم التحويل';
+      var noRefundLabel = isEn ? 'No refund recorded' : 'لا يوجد استرداد مسجل';
+      var noDriverNotesLabel = isEn ? 'No driver notes' : 'لا توجد ملاحظات مسجلة';
+      var noDeliveryFailLabel = isEn ? 'No failure recorded' : 'لم يُسجّل فشل توصيل';
       var visibleCols = isRejectedSchema
         ? REJECTED_COLUMNS.slice()
         : (isCancelledSchema
@@ -653,21 +680,21 @@
                     }
                   }
                   return '<td class="mono cell-res-num">' +
-                    '<div class="cell-res-head"><button type="button" class="btn-link-inline btn-open-res" dir="ltr" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber || naText) + '</button></div>' +
+                    '<div class="cell-res-head"><button type="button" class="btn-link-inline btn-open-res" dir="ltr" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber || notRecordedLabel) + '</button></div>' +
                     (badgeHtml ? '<div class="cell-badges">' + badgeHtml + '</div>' : '') +
                   '</td>';
                 }
                 if (c.key === 'referenceNumber') {
                   var refVal = r.referenceNumber || r.sourceReservationId || '';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                    (refVal ? '<span dir="ltr">' + esc(String(refVal)) + '</span>' : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                    (refVal ? '<span dir="ltr">' + esc(String(refVal)) + '</span>' : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') +
                   '</td>';
                 }
                 if (c.key === 'customerName') {
                   var showSubPhone = !colVisible.customerPhone && r.customerPhone;
                   var showSubId = !colVisible.customerIdNumber && canViewId && r.customerIdNumber;
                   return '<td class="cell-customer">' +
-                    '<div class="cell-primary">' + esc(r.customerName || naText) + '</div>' +
+                    '<div class="cell-primary">' + esc(r.customerName || notRecordedLabel) + '</div>' +
                     ((showSubPhone || showSubId) ? (
                       '<div class="cell-sub">' +
                         (showSubPhone ? '<span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' : '') +
@@ -678,7 +705,7 @@
                   '</td>';
                 }
                 if (c.key === 'customerPhone') {
-                  return '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone || (isDedicatedSchema ? naText : '-')) + '</span></td>';
+                  return '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone || (isDedicatedSchema ? notRecordedLabel : '-')) + '</span></td>';
                 }
                 if (c.key === 'customerIdNumber') {
                   return '<td class="mono" style="white-space:nowrap;"><span dir="ltr">' + esc(r.customerIdNumber ? String(r.customerIdNumber) : '-') + '</span></td>';
@@ -686,18 +713,18 @@
                 if (c.key === 'companyName') {
                   var compNum = r.companyNumber ? String(r.companyNumber).trim() : '';
                   return '<td class="cell-company">' +
-                    '<div class="cell-primary">' + esc(r.companyName || naText) + '</div>' +
+                    '<div class="cell-primary">' + esc(r.companyName || notRecordedLabel) + '</div>' +
                     (isDedicatedSchema && compNum ? '<div class="cell-sub mono" dir="ltr">#' + esc(compNum) + '</div>' : '') +
                   '</td>';
                 }
                 if (c.key === 'newCompanyName') {
-                  var newCompVal = String(r.newCompanyName || '').trim();
-                  return '<td>' + (newCompVal ? esc(newCompVal) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') + '</td>';
+                  var newCompVal = sanitizeSourceReason(r.newCompanyName);
+                  return '<td>' + (newCompVal ? esc(newCompVal) : '<span style="color:var(--text-muted);">' + esc(notTransferredLabel) + '</span>') + '</td>';
                 }
                 if (c.key === 'rejectionReason') {
-                  var rejReason = String(r.rejectionReason || '').trim();
-                  return '<td><div class="cell-clamp-2" title="' + esc(rejReason || naText) + '">' +
-                    (rejReason ? esc(rejReason) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  var rejReason = resolveRowSourceReason(r, 'rejected');
+                  return '<td><div class="cell-clamp-2" title="' + esc(rejReason || emptyReasonLabel) + '">' +
+                    (rejReason ? esc(rejReason) : '<span style="color:var(--text-muted);font-size:12px;">' + esc(emptyReasonLabel) + '</span>') +
                   '</div></td>';
                 }
                 if (c.key === 'refundAmount') {
@@ -707,17 +734,17 @@
                   var isRefundState = payStLower.indexOf('مسترد') !== -1 || payStLower.indexOf('refund') !== -1;
                   var refundDisplay = (refAmt > 0 || (hasRefundVal && refAmt === 0 && isRefundState))
                     ? ('<strong>' + refAmt + ' ر.س</strong>')
-                    : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>';
+                    : '<span style="color:var(--text-muted);">' + esc(noRefundLabel) + '</span>';
                   return '<td class="tabular-nums" style="white-space:nowrap;">' + refundDisplay + '</td>';
                 }
                 if (c.key === 'rejectedByName') {
                   var rejActor = String(r.rejectedByName || r.lastUpdatedByName || '').trim();
-                  return '<td>' + (rejActor ? esc(rejActor) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') + '</td>';
+                  return '<td>' + (rejActor ? esc(rejActor) : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') + '</td>';
                 }
                 if (c.key === 'rejectedAt') {
                   var rejAtVal = r.rejectedAt || r.lastUpdatedAt || r.createdAt || '';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                    (rejAtVal ? esc(formatTimestamp(rejAtVal, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                    (rejAtVal ? esc(formatTimestamp(rejAtVal, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') +
                   '</td>';
                 }
                 if (c.key === 'paidAmount') {
@@ -726,41 +753,41 @@
                   var isPaidOrRefunded = pStLower.indexOf('مدفوع') !== -1 || pStLower.indexOf('paid') !== -1 || pStLower.indexOf('مسترد') !== -1 || pStLower.indexOf('refund') !== -1;
                   var effectivePaid = rawPaid > 0 ? rawPaid : (isPaidOrRefunded && Number(r.totalAmount || 0) > 0 ? Number(r.totalAmount) : 0);
                   return '<td class="tabular-nums" style="white-space:nowrap;">' +
-                    (effectivePaid > 0 ? ('<strong>' + effectivePaid + ' ر.س</strong>') : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                    (effectivePaid > 0 ? ('<strong>' + effectivePaid + ' ر.س</strong>') : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') +
                   '</td>';
                 }
                 if (c.key === 'cancellationReason') {
-                  var canReason = String(r.cancellationReason || '').trim();
-                  return '<td><div class="cell-clamp-2" title="' + esc(canReason || naText) + '">' +
-                    (canReason ? esc(canReason) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  var canReason = resolveRowSourceReason(r, 'cancelled');
+                  return '<td><div class="cell-clamp-2" title="' + esc(canReason || emptyReasonLabel) + '">' +
+                    (canReason ? esc(canReason) : '<span style="color:var(--text-muted);font-size:12px;">' + esc(emptyReasonLabel) + '</span>') +
                   '</div></td>';
                 }
                 if (c.key === 'deliveryFailureReason') {
-                  var delFail = String(r.deliveryFailureReason || '').trim();
-                  return '<td><div class="cell-clamp-2" title="' + esc(delFail || naText) + '">' +
-                    (delFail ? esc(delFail) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  var delFail = sanitizeSourceReason(r.deliveryFailureReason);
+                  return '<td><div class="cell-clamp-2" title="' + esc(delFail || noDeliveryFailLabel) + '">' +
+                    (delFail ? esc(delFail) : '<span style="color:var(--text-muted);">' + esc(noDeliveryFailLabel) + '</span>') +
                   '</div></td>';
                 }
                 if (c.key === 'driverNotes') {
-                  var drvNotes = String(r.driverNotes || '').trim();
-                  return '<td><div class="cell-clamp-2" title="' + esc(drvNotes || naText) + '">' +
-                    (drvNotes ? esc(drvNotes) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  var drvNotes = sanitizeSourceReason(r.driverNotes);
+                  return '<td><div class="cell-clamp-2" title="' + esc(drvNotes || noDriverNotesLabel) + '">' +
+                    (drvNotes ? esc(drvNotes) : '<span style="color:var(--text-muted);">' + esc(noDriverNotesLabel) + '</span>') +
                   '</div></td>';
                 }
                 if (c.key === 'sourceCreatedAt') {
                   var bookedAt = r.sourceCreatedAt || r.createdAt || '';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                    (bookedAt ? esc(formatTimestamp(bookedAt, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                    (bookedAt ? esc(formatTimestamp(bookedAt, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') +
                   '</td>';
                 }
                 if (c.key === 'cancelledAt') {
                   var canAtVal = r.cancelledAt || r.lastUpdatedAt || r.updatedAt || '';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
-                    (canAtVal ? esc(formatTimestamp(canAtVal, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                    (canAtVal ? esc(formatTimestamp(canAtVal, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') +
                   '</td>';
                 }
                 if (c.key === 'carName') {
-                  var carLabel = r.carName ? formatCarNameDisplay(r.carName) : naText;
+                  var carLabel = r.carName ? formatCarNameDisplay(r.carName) : notRecordedLabel;
                   var metaParts = [];
                   if (!isDedicatedSchema) {
                     if (!colVisible.companyName && r.companyName) metaParts.push(r.companyName);
@@ -1981,10 +2008,20 @@
           var exportSheetName = state.viewMode === 'rejected'
             ? 'Rejected'
             : (state.viewMode === 'cancelled' ? 'Cancelled' : 'Reservations');
+          var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+          var exportRows = currentItems.map(function (row) {
+            var copy = Object.assign({}, row);
+            if (state.viewMode === 'rejected') {
+              copy.rejectionReason = (core.sanitizeReasonText ? core.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
+            } else if (state.viewMode === 'cancelled') {
+              copy.cancellationReason = (core.sanitizeReasonText ? core.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
+            }
+            return copy;
+          });
           await root.RGReports.exportExcelWorkbook([{
             name: exportSheetName,
             headers: exportHeaders,
-            rows: currentItems
+            rows: exportRows
           }], 'rental-gate-reservations.xlsx');
           ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
         } catch (err) {
@@ -4014,20 +4051,37 @@
                 (Number(r.vatAmount || 0) > 0 ? ' · ضريبة ' + Number(r.vatAmount) : '') +
                 (Number(r.discountAmount || 0) > 0 ? ' · خصم ' + Number(r.discountAmount) : '') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Last Update' : 'آخر تحديث') + '</span><span class="detail-v">' + fmtMentionText(r.lastUpdateText || '-') + '</span></div>' +
-              ((r.referenceNumber || lifecycleKindNow === 'cancelled') ? '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Reference #' : 'الرقم المرجعي') + '</span><span class="detail-v"><span class="mono" dir="ltr">' + esc(r.referenceNumber || r.sourceReservationId || 'غير متاح') + '</span></span></div>' : '') +
-              ((Number(r.paidAmount || 0) > 0 || lifecycleKindNow === 'cancelled') ? '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">' + (isEn ? 'Paid Amount' : 'المبلغ المدفوع') + '</span><span class="detail-v tabular-nums">' + (Number(r.paidAmount || 0) > 0 ? (Number(r.paidAmount) + ' ر.س') : 'غير متاح') + '</span></div>' : '') +
+              ((r.referenceNumber || lifecycleKindNow === 'cancelled') ? '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Reference #' : 'الرقم المرجعي') + '</span><span class="detail-v"><span class="mono" dir="ltr">' + esc(r.referenceNumber || r.sourceReservationId || (isEn ? 'Not recorded' : 'غير مسجل في المصدر')) + '</span></span></div>' : '') +
+              ((Number(r.paidAmount || 0) > 0 || lifecycleKindNow === 'cancelled') ? '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">' + (isEn ? 'Paid Amount' : 'المبلغ المدفوع') + '</span><span class="detail-v tabular-nums">' + (Number(r.paidAmount || 0) > 0 ? (Number(r.paidAmount) + ' ر.س') : (isEn ? 'Not recorded / 0' : 'غير مسجل في المصدر')) + '</span></div>' : '') +
               (lifecycleKindNow === 'rejected' ? (
-                '<div class="detail-kv"><span class="detail-k">الشركة الجديدة</span><span class="detail-v">' + esc(r.newCompanyName || 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv"><span class="detail-k">سبب الرفض</span><span class="detail-v">' + esc(r.rejectionReason || 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">الاسترداد</span><span class="detail-v tabular-nums">' + (Number(r.refundAmount || 0) > 0 ? (Number(r.refundAmount) + ' ر.س') : 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv"><span class="detail-k">التأكيد بواسطة</span><span class="detail-v">' + esc(r.rejectedByName || r.lastUpdatedByName || 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv"><span class="detail-k">تاريخ الرفض</span><span class="detail-v"><span class="mono" dir="ltr">' + esc((r.rejectedAt || r.lastUpdatedAt) ? formatTimestamp(r.rejectedAt || r.lastUpdatedAt, ctx.lang) : 'غير متاح') + '</span></span></div>'
+                (function () {
+                  var dClean = function (v) {
+                    return (core && core.sanitizeReasonText) ? core.sanitizeReasonText(v) : String(v || '').trim();
+                  };
+                  var dEmptyReason = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+                  var dRejReason = dClean(r.rejectionReason);
+                  var dNewComp = dClean(r.newCompanyName);
+                  return '<div class="detail-kv"><span class="detail-k">الشركة الجديدة</span><span class="detail-v">' + esc(dNewComp || (isEn ? 'Not transferred' : 'لم يتم التحويل')) + '</span></div>' +
+                    '<div class="detail-kv"><span class="detail-k">سبب الرفض</span><span class="detail-v">' + (dRejReason ? esc(dRejReason) : '<span style="color:var(--text-muted);">' + esc(dEmptyReason) + '</span>') + '</span></div>' +
+                    '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">الاسترداد</span><span class="detail-v tabular-nums">' + (Number(r.refundAmount || 0) > 0 ? (Number(r.refundAmount) + ' ر.س') : (isEn ? 'No refund recorded' : 'لا يوجد استرداد مسجل')) + '</span></div>' +
+                    '<div class="detail-kv"><span class="detail-k">التأكيد بواسطة</span><span class="detail-v">' + esc(r.rejectedByName || r.lastUpdatedByName || (isEn ? 'Not recorded' : 'غير مسجل في المصدر')) + '</span></div>' +
+                    '<div class="detail-kv"><span class="detail-k">تاريخ الرفض</span><span class="detail-v"><span class="mono" dir="ltr">' + esc((r.rejectedAt || r.lastUpdatedAt) ? formatTimestamp(r.rejectedAt || r.lastUpdatedAt, ctx.lang) : (isEn ? 'Not recorded' : 'غير مسجل في المصدر')) + '</span></span></div>';
+                }())
               ) : '') +
               (lifecycleKindNow === 'cancelled' ? (
-                '<div class="detail-kv"><span class="detail-k">سبب الإلغاء</span><span class="detail-v">' + esc(r.cancellationReason || 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv"><span class="detail-k">سبب فشل التوصيل</span><span class="detail-v">' + esc(r.deliveryFailureReason || 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv"><span class="detail-k">ملاحظات السائق</span><span class="detail-v">' + esc(r.driverNotes || 'غير متاح') + '</span></div>' +
-                '<div class="detail-kv"><span class="detail-k">تاريخ الإلغاء</span><span class="detail-v"><span class="mono" dir="ltr">' + esc((r.cancelledAt || r.lastUpdatedAt) ? formatTimestamp(r.cancelledAt || r.lastUpdatedAt, ctx.lang) : 'غير متاح') + '</span></span></div>'
+                (function () {
+                  var dClean = function (v) {
+                    return (core && core.sanitizeReasonText) ? core.sanitizeReasonText(v) : String(v || '').trim();
+                  };
+                  var dEmptyReason = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+                  var dCanReason = dClean(r.cancellationReason);
+                  var dDelFail = dClean(r.deliveryFailureReason);
+                  var dDrvNotes = dClean(r.driverNotes);
+                  return '<div class="detail-kv"><span class="detail-k">سبب الإلغاء</span><span class="detail-v">' + (dCanReason ? esc(dCanReason) : '<span style="color:var(--text-muted);">' + esc(dEmptyReason) + '</span>') + '</span></div>' +
+                    '<div class="detail-kv"><span class="detail-k">سبب فشل التوصيل</span><span class="detail-v">' + esc(dDelFail || (isEn ? 'No failure recorded' : 'لم يُسجّل فشل توصيل')) + '</span></div>' +
+                    '<div class="detail-kv"><span class="detail-k">ملاحظات السائق</span><span class="detail-v">' + esc(dDrvNotes || (isEn ? 'No driver notes' : 'لا توجد ملاحظات مسجلة')) + '</span></div>' +
+                    '<div class="detail-kv"><span class="detail-k">تاريخ الإلغاء</span><span class="detail-v"><span class="mono" dir="ltr">' + esc((r.cancelledAt || r.lastUpdatedAt) ? formatTimestamp(r.cancelledAt || r.lastUpdatedAt, ctx.lang) : (isEn ? 'Not recorded' : 'غير مسجل في المصدر')) + '</span></span></div>';
+                }())
               ) : '') +
             '</div>' +
 
