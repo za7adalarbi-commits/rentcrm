@@ -7,7 +7,7 @@
   var PREFS_KEY = 'rg_crm_user_prefs';
   var UI_SIMP_STORAGE_KEY = 'rg_crm_ui_simplification_v1';
   var ROUTE_FILTERS_STORAGE_KEY = 'rg_crm_route_filters_v1';
-  var VALID_ROUTES = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var VALID_ROUTES = ['dashboard', 'reservations', 'inactive-reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
 
   function saveRouteFilters(userOverride) {
     try {
@@ -2094,6 +2094,7 @@
       brand: 'RENTAL GATE CRM',
       nav_dashboard: 'لوحة التحكم',
       nav_reservations: 'الحجوزات',
+      nav_inactive_reservations: 'الحجوزات غير الفعالة',
       nav_my_followups: 'متابعاتي',
       nav_team_followups: 'متابعات الفريق',
       nav_problems: 'المشكلات',
@@ -2103,7 +2104,7 @@
       nav_settings: 'الإعدادات',
       nav_group_ops: 'العمليات الرئيسية',
       nav_group_admin: 'التحليلات والإدارة',
-      topbar_search_placeholder: 'بحث سريع برقم الحجز، العميل، الجوال...',
+      topbar_search_placeholder: 'بحث سريع برقم الحجز، العميل، الهوية، الجوال، الشركة أو السيارة...',
       dash_welcome: 'مرحباً بعودتك، ',
       dash_sub_ops: 'ملخص الأداء التشغيلي ومتابعات الحجوزات الفورية',
       recent_activity: 'أحدث النشاطات',
@@ -2150,7 +2151,7 @@
       toggle_columns: 'إظهار / إخفاء الأعمدة',
       pull_reservations: 'سحب الحجوزات',
       export_excel: 'تصدير Excel',
-      search_placeholder: 'بحث بالعميل، الجوال، السيارة، الشركة...',
+      search_placeholder: 'بحث برقم الحجز، الاسم، الهوية، الجوال، الشركة أو السيارة...',
       res_number_search_placeholder: 'بحث برقم الحجز...',
       res_number_search_label: 'بحث برقم الحجز',
       company: 'الشركة',
@@ -2176,6 +2177,7 @@
       brand: 'RENTAL GATE CRM',
       nav_dashboard: 'Dashboard',
       nav_reservations: 'Reservations',
+      nav_inactive_reservations: 'Inactive Reservations',
       nav_my_followups: 'My Follow-Ups',
       nav_team_followups: 'Team Follow-Ups',
       nav_problems: 'Problems',
@@ -2185,7 +2187,7 @@
       nav_settings: 'Settings & Sync',
       nav_group_ops: 'Core Operations',
       nav_group_admin: 'Analytics & Admin',
-      topbar_search_placeholder: 'Quick search reservations, customer, phone...',
+      topbar_search_placeholder: 'Quick search booking #, customer, ID, phone, company, car...',
       dash_welcome: 'Welcome back, ',
       dash_sub_ops: 'Real-time CRM operations & reservation pipeline overview',
       recent_activity: 'Recent Activity',
@@ -2232,7 +2234,7 @@
       toggle_columns: 'Columns',
       pull_reservations: 'Pull Reservations',
       export_excel: 'Export Excel',
-      search_placeholder: 'Search customer, phone, car, company...',
+      search_placeholder: 'Search booking #, name, ID, phone, company, or car...',
       res_number_search_placeholder: 'Search by reservation #...',
       res_number_search_label: 'Search by reservation number',
       company: 'Company',
@@ -2425,7 +2427,7 @@
           ]
         },
         {
-          duration: 580,
+          duration: 220,
           easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
           pseudoElement: '::view-transition-new(root)'
         }
@@ -2835,7 +2837,18 @@
     } catch (e) {}
   }
 
+  function clearUiSimplificationClasses() {
+    var html = document.documentElement;
+    if (!html || !html.classList) return;
+    Array.from(html.classList).forEach(function (cls) {
+      if (cls && cls.indexOf('rg-ui-hide-') === 0) {
+        html.classList.remove(cls);
+      }
+    });
+  }
+
   function renderLoginScreen() {
+    clearUiSimplificationClasses();
     var appRoot = document.getElementById('app-root');
     var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
     var isBackendLive = Boolean(root.RGApi.isBackendConnected && root.RGApi.isBackendConnected());
@@ -2908,7 +2921,7 @@
               '<div class="auth-visual-wordmark">' +
                 '<div class="auth-visual-brand-title" dir="ltr">RENTAL GATE</div>' +
                 '<div class="auth-visual-brand-rule" aria-hidden="true"></div>' +
-                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'من أول حجز لآخر مشوار.. بوابة التأجير معك في كل دار') + '</p>' +
+                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'نظام إدارة الحجوزات وخدمة العملاء') + '</p>' +
               '</div>' +
             '</div>' +
             '<div class="auth-visual-pillars" aria-label="System Capabilities">' +
@@ -3023,6 +3036,7 @@
   var NAV_ITEMS = [
     { id: 'dashboard', key: 'nav_dashboard', group: 'ops', icon: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z' },
     { id: 'reservations', key: 'nav_reservations', group: 'ops', icon: 'M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 16H5V9h14v11z' },
+    { id: 'inactive-reservations', key: 'nav_inactive_reservations', group: 'ops', icon: 'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10' },
     { id: 'my-followups', key: 'nav_my_followups', group: 'ops', icon: 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' },
     { id: 'team-followups', key: 'nav_team_followups', group: 'ops', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm14 14v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' },
     { id: 'problems', key: 'nav_problems', group: 'ops', icon: 'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01' },
@@ -3064,7 +3078,7 @@
           '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line md"></div><div class="rg-skeleton-box" style="height:175px;"></div></div>' +
           '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
         '</div>';
-    } else if (rId === 'reservations' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
+    } else if (rId === 'reservations' || rId === 'inactive-reservations' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
       var rows = '';
       for (var i = 0; i < 5; i++) {
         rows +=
@@ -3154,6 +3168,11 @@
             ? root.RGCrmCore.buildReservationQueryPayload(state.reservations || {})
             : Object.assign({ page: 1, pageSize: 20 }, state.reservations || {})
         };
+      case 'inactive-reservations':
+        return {
+          action: 'getInactiveReservations',
+          payload: { subTab: 'rejected', page: 1, pageSize: 10 }
+        };
       case 'my-followups':
         return { action: 'getMyFollowUps', payload: {} };
       case 'team-followups':
@@ -3218,6 +3237,9 @@
         break;
       case 'reservations':
         await root.RGReservations.render(slot, ctx);
+        break;
+      case 'inactive-reservations':
+        if (root.RGInactive && root.RGInactive.render) await root.RGInactive.render(slot, ctx);
         break;
       case 'my-followups':
         await root.RGFollowUps.renderMyFollowUps(slot, ctx);
@@ -4387,6 +4409,12 @@
               '</form>' +
             '</div>' +
             '<div class="topbar-actions">' +
+              ((root.RGInactive && (!root.RGCrmCore || ((!root.RGCrmCore.canUserViewCustomerId || root.RGCrmCore.canUserViewCustomerId(user)) && (!root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_customer_id_lookup')))))
+                ? '<button type="button" class="btn btn-sm rg-ui-res-id-lookup" id="topbar-id-lookup-btn" aria-label="' + (isEn ? 'ID Lookup' : 'بحث برقم الهوية') + '" title="' + (isEn ? 'Search customer by National ID' : 'البحث عن عميل وحجوزاته برقم الهوية') + '">' +
+                    renderIcon('M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12zm11 17l-4.35-4.35') +
+                    '<span class="topbar-desktop-only">' + (isEn ? 'ID Lookup' : 'بحث بالهوية') + '</span>' +
+                  '</button>'
+                : '') +
               (canPreview
                 ? '<button type="button" class="btn btn-sm rg-ui-preview-role-btn' + (isPreviewActive ? ' btn-primary' : '') + '" id="topbar-preview-role-btn" aria-label="' + (isEn ? 'Preview Role' : 'وضع المحاكاة') + '" title="' + (isEn ? 'Preview system as another role or employee' : 'معاينة النظام بصلاحيات دور أو موظف آخر') + '">' +
                     renderIcon('M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z') +
@@ -4426,6 +4454,13 @@
     renderPreviewRoleBanner();
     renderShiftAnnouncementBanner();
     updateOfflineBanner();
+
+    var idLookupTopBtn = document.getElementById('topbar-id-lookup-btn');
+    if (idLookupTopBtn && root.RGInactive && typeof root.RGInactive.openNationalIdLookupModal === 'function') {
+      idLookupTopBtn.addEventListener('click', function () {
+        root.RGInactive.openNationalIdLookupModal(buildAppCtx(), '');
+      });
+    }
 
     var previewTopBtn = document.getElementById('topbar-preview-role-btn');
     if (previewTopBtn) {
@@ -4580,6 +4615,8 @@
         clearRouteFiltersStorage();
         state.notifications = { items: [], unreadCount: 0 };
         resetEmployeesState();
+        state.uiSimplification = normalizeUiSimpFallback({});
+        clearUiSimplificationClasses();
         await root.RGAuth.logout();
         renderLoginScreen();
       });
@@ -5062,13 +5099,30 @@
       if (Array.isArray(d.locks)) {
         setActiveLocks(d.locks);
       }
+      if (d.roleUiDefaults) {
+        setRoleUiDefaults(d.roleUiDefaults);
+      }
+      if (d.uiSimplification) {
+        applyUiSimplification(d.uiSimplification, true);
+      }
       if (d.user && root.RGAuth && typeof root.RGAuth.setUser === 'function') {
         var prevRole = curUser.role;
         var prevDelId = curUser.activeDelegation ? curUser.activeDelegation.id : '';
         var nextDelId = d.user.activeDelegation ? d.user.activeDelegation.id : '';
-        if (d.user.role !== prevRole || prevDelId !== nextDelId) {
+        var prevPermsStr = JSON.stringify((curUser.permissions || []).slice().sort());
+        var nextPermsStr = JSON.stringify((d.user.permissions || []).slice().sort());
+        var prevOvStr = JSON.stringify(curUser.uiOverrides || {});
+        var nextOvStr = JSON.stringify(d.user.uiOverrides || {});
+        if (d.user.role !== prevRole || prevDelId !== nextDelId || prevPermsStr !== nextPermsStr || prevOvStr !== nextOvStr) {
           root.RGAuth.setUser(d.user);
-          renderAppShell(d.user);
+          applyUiSimplification(state.uiSimplification, true);
+          var hasOpenModalNow = Boolean(document.getElementById('modal-root') && document.getElementById('modal-root').firstElementChild);
+          if (hasOpenModalNow) {
+            refreshSidebarNavDom(d.user);
+          } else {
+            renderAppShell(d.user);
+            renderRoute().catch(function () {});
+          }
         }
       }
 
@@ -5112,6 +5166,7 @@
             (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
             (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
             (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+            (Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0) ||
             hasEmployeeChanges ||
             Boolean(d.changedSettings) ||
             Boolean(d.deletedAllReservationsBefore) ||
@@ -5123,6 +5178,9 @@
 
       if (hasChanges && root.RGApi) {
         var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps'];
+        if ((Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0)) {
+          scopesToInvalidate.push('problems', 'reservations', 'notifications');
+        }
         if ((Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) || d.deletedAllReservationsBefore) {
           scopesToInvalidate.push('reservations', 'followUps', 'problems');
         }
@@ -5404,7 +5462,11 @@
     switch (routeId) {
       case 'reservations':
         action = 'getReservations';
-        payload = { page: 1, pageSize: 20 };
+        payload = { page: 1, pageSize: 20, lifecycle: 'active' };
+        break;
+      case 'inactive-reservations':
+        action = 'getInactiveReservations';
+        payload = { subTab: 'rejected', page: 1, pageSize: 10 };
         break;
       case 'my-followups':
         action = 'getMyFollowUps';

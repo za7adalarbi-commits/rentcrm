@@ -71,6 +71,22 @@
     });
   }
 
+  function syncProblemDeleteInBackground(payload, ctx, onErrorRefresh) {
+    var reqPayload = Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, payload);
+    return root.RGApi.callApi('deleteProblem', reqPayload).then(function (res) {
+      if (res && res.success) {
+        if (ctx && ctx.refreshNotifications) ctx.refreshNotifications();
+      } else {
+        if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف المشكلة.', true);
+        if (onErrorRefresh) onErrorRefresh();
+      }
+      return res;
+    }).catch(function () {
+      if (ctx && ctx.toast) ctx.toast('تعذر الاتصال بالخادم أثناء حذف المشكلة.', true);
+      if (onErrorRefresh) onErrorRefresh();
+    });
+  }
+
   async function render(container, ctx) {
     var t = ctx.t;
     var state = ctx.state.problems || { status: '', priority: '', employeeId: '', search: '' };
@@ -308,6 +324,19 @@
       paintProblemsRegion(items);
     }
 
+    function filterAndRemoveLocalProblem(problemId) {
+      var targetId = String(problemId || '').trim();
+      if (!targetId) return;
+      allProblemsForRate = allProblemsForRate.filter(function (x) { return x && String(x.id) !== targetId; });
+      if (core && core.reapplyProblemDeltaToFilteredList) {
+        items = core.reapplyProblemDeltaToFilteredList(items, [], [], state, [targetId]);
+      } else {
+        items = items.filter(function (x) { return x && String(x.id) !== targetId; });
+      }
+      if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
+      paintProblemsRegion(items);
+    }
+
     function paintProblemsError(msg) {
       var region = container.querySelector('#prb-table-region');
       if (!region) return;
@@ -356,6 +385,7 @@
                 '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   '<button type="button" class="btn btn-sm btn-primary btn-manage-prb" data-id="' + esc(p.id) + '">متابعة / تحديث</button>' +
                   ((!closed && canCloseTicketBtn) ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb" data-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
+                  (canCloseTicketBtn ? '<button type="button" class="btn btn-sm btn-danger btn-delete-prb" data-id="' + esc(p.id) + '" data-num="' + esc(p.problemNumber) + '" data-confirm="0" aria-label="' + (isEn ? ('Delete problem ' + esc(p.problemNumber)) : ('حذف المشكلة ' + esc(p.problemNumber))) + '">' + (isEn ? 'Delete' : 'حذف') + '</button>' : '') +
                 '</div></td>' +
               '</tr>';
             }).join('') +
@@ -385,7 +415,8 @@
           var p = items.find(function (x) { return x.id === btn.getAttribute('data-id'); });
           if (p) {
             openProblemUpdateModal(p, employees, ctx, function (optUpdated) {
-              if (optUpdated) filterAndApplyLocalProblem(optUpdated);
+              if (optUpdated && optUpdated._deletedProblemId) filterAndRemoveLocalProblem(optUpdated._deletedProblemId);
+              else if (optUpdated) filterAndApplyLocalProblem(optUpdated);
               else refreshProblemsRegion();
             });
           }
@@ -424,6 +455,47 @@
               refreshProblemsRegion({ forceRefresh: true, silentRefresh: true });
             });
           }, { spamAction: 'updateProblem', spamSig: pid + ':مغلقة' });
+        });
+      });
+
+      region.querySelectorAll('.btn-delete-prb').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          if (btn.getAttribute('data-confirm') !== '1') {
+            btn.setAttribute('data-confirm', '1');
+            btn.textContent = isEn ? 'Confirm Delete?' : 'تأكيد الحذف؟';
+            setTimeout(function () {
+              if (document.body.contains(btn)) {
+                btn.setAttribute('data-confirm', '0');
+                btn.textContent = isEn ? 'Delete' : 'حذف';
+              }
+            }, 4000);
+            return;
+          }
+          var pid = btn.getAttribute('data-id');
+          var p = items.find(function (x) { return x.id === pid; });
+          if (!p) return;
+          runWithLock(btn, 'deleteProblem:' + pid, function () {
+            var prevItems = items.slice();
+            var prevAllProblems = allProblemsForRate.slice();
+            var delPayload = {
+              problemId: pid,
+              expectedUpdatedAt: p.updatedAt || '',
+              reservationId: p.reservationId || ''
+            };
+            var user = root.RGAuth.getUser();
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteProblem', delPayload, user);
+            }
+            filterAndRemoveLocalProblem(pid);
+            ctx.toast((isEn ? 'Deleted problem ' : 'تم حذف المشكلة ') + (p.problemNumber || '') + (isEn ? '.' : ' بنجاح.'));
+            return syncProblemDeleteInBackground(delPayload, ctx, function () {
+              items = prevItems;
+              allProblemsForRate = prevAllProblems;
+              paintProblemsRegion(items);
+              if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
+              refreshProblemsRegion({ forceRefresh: true, silentRefresh: true });
+            });
+          }, { spamAction: 'deleteProblem', spamSig: 'deleteProblem:' + pid });
         });
       });
     }
@@ -583,9 +655,11 @@
         }
         var d = (ev && ev.detail) || {};
         var changedProblems = Array.isArray(d.changedProblems) ? d.changedProblems : [];
+        var deletedPrbIds = Array.isArray(d.deletedProblemIds) ? d.deletedProblemIds : [];
         var deletedResIds = Array.isArray(d.deletedReservationIds) ? d.deletedReservationIds : [];
         var relevant = Boolean(
           changedProblems.length > 0 ||
+          deletedPrbIds.length > 0 ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
           deletedResIds.length > 0 ||
           (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
@@ -594,14 +668,20 @@
           Boolean(d.changedSettings)
         );
         if (!relevant) return;
-        if (changedProblems.length > 0 && core && core.reapplyProblemDeltaToFilteredList) {
-          allProblemsForRate = core.mergeDeltaRecords
-            ? core.mergeDeltaRecords(allProblemsForRate, changedProblems, 'id')
-            : allProblemsForRate;
-          items = core.reapplyProblemDeltaToFilteredList(items, changedProblems, [], state);
+        if ((changedProblems.length > 0 || deletedPrbIds.length > 0) && core && core.reapplyProblemDeltaToFilteredList) {
+          if (deletedPrbIds.length > 0) {
+            var delPrbSet = {};
+            deletedPrbIds.forEach(function (did) { if (did) delPrbSet[String(did)] = true; });
+            allProblemsForRate = allProblemsForRate.filter(function (x) { return x && !delPrbSet[String(x.id)]; });
+          }
+          if (changedProblems.length > 0 && core.mergeDeltaRecords) {
+            allProblemsForRate = core.mergeDeltaRecords(allProblemsForRate, changedProblems, 'id');
+          }
+          items = core.reapplyProblemDeltaToFilteredList(items, changedProblems, deletedResIds, state, deletedPrbIds);
           if (isRatesVisible) paintProblemRatesCard(allProblemsForRate);
           paintProblemsRegion(items);
-        } else if (changedProblems.length > 0) {
+        } else if (changedProblems.length > 0 || deletedPrbIds.length > 0) {
+          deletedPrbIds.forEach(function (did) { filterAndRemoveLocalProblem(did); });
           changedProblems.forEach(function (cp) { filterAndApplyLocalProblem(cp); });
         }
         schedulePrbRefreshWhenIdle({ silentRefresh: true, forceRefresh: true }).catch(function () {});
@@ -686,6 +766,7 @@
           '<div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
               ((!isAlreadyClosed && canCloseTicketModalBtn) ? '<button type="button" class="btn btn-danger" id="prb-close-ticket-btn">إغلاق المشكلة</button>' : '') +
+              (canCloseTicketModalBtn ? '<button type="button" class="btn btn-danger" id="prb-delete-ticket-btn" data-confirm="0">حذف المشكلة</button>' : '') +
               '<button type="button" class="btn" id="prb-open-res-btn">فتح الحجز المرتبط</button>' +
             '</div>' +
             '<button type="submit" class="btn btn-primary" id="prb-save-ticket-btn">' + (canEditTicket ? 'حفظ التذكرة والتحديث' : 'حفظ التحديث') + '</button>' +
@@ -837,6 +918,43 @@
     if (closeTicketBtn) {
       closeTicketBtn.addEventListener('click', function () {
         submitProblemUpdate('مغلقة', closeTicketBtn);
+      });
+    }
+
+    var deleteTicketBtn = document.getElementById('prb-delete-ticket-btn');
+    if (deleteTicketBtn) {
+      deleteTicketBtn.addEventListener('click', function () {
+        if (handledSubmit) return;
+        if (deleteTicketBtn.getAttribute('data-confirm') !== '1') {
+          deleteTicketBtn.setAttribute('data-confirm', '1');
+          deleteTicketBtn.textContent = 'تأكيد حذف المشكلة؟';
+          setTimeout(function () {
+            if (document.body.contains(deleteTicketBtn)) {
+              deleteTicketBtn.setAttribute('data-confirm', '0');
+              deleteTicketBtn.textContent = 'حذف المشكلة';
+            }
+          }, 4000);
+          return;
+        }
+        var delPayload = {
+          problemId: problem.id,
+          expectedUpdatedAt: problem.updatedAt || '',
+          reservationId: problem.reservationId || ''
+        };
+        runWithLock(deleteTicketBtn, 'deleteProblem:' + problem.id, function () {
+          handledSubmit = true;
+          closeModalNow();
+          if (root.RGApi.applyOptimisticMutation) {
+            root.RGApi.applyOptimisticMutation('deleteProblem', delPayload, user);
+          }
+          if (onSaved) onSaved({ _deletedProblemId: problem.id });
+          if (ctx && ctx.toast) {
+            ctx.toast('تم حذف المشكلة ' + (problem.problemNumber || '') + ' بنجاح.');
+          }
+          return syncProblemDeleteInBackground(delPayload, ctx, function () {
+            if (onSaved) onSaved(null);
+          });
+        }, { spamAction: 'deleteProblem', spamSig: 'deleteProblem:' + problem.id });
       });
     }
 

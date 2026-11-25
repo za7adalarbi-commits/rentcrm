@@ -226,6 +226,17 @@
     return true;
   }
 
+  function normalizeNationalId(v) {
+    if (v === null || v === undefined) return '';
+    return String(v)
+      .replace(/[٠-٩]/g, function (d) { return String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)); })
+      .replace(/[۰-۹]/g, function (d) { return String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)); })
+      .replace(/[\u200B-\u200F\u202A-\u202E\uFEFF]/g, '')
+      .replace(/[\s\-_]+/g, '')
+      .trim()
+      .toLowerCase();
+  }
+
   function toNum(v, fallback) {
     var n = Number(v);
     return isNaN(n) ? (fallback || 0) : n;
@@ -540,6 +551,61 @@
     );
   }
 
+  function extractCustomerNationalId(apiItem, existing) {
+    var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+    var cust = (item.customer && typeof item.customer === 'object') ? item.customer : {};
+    var client = (item.client && typeof item.client === 'object') ? item.client : {};
+    var candidates = [
+      item.clientNationalId,
+      item.clientIdNumber,
+      item.customerIdNumber,
+      item.customer_id_number,
+      item.nationalId,
+      item.national_id,
+      item.identityNumber,
+      item.identity_number,
+      item.idNumber,
+      item.id_number,
+      item.iqamaNumber,
+      item.iqama_number,
+      item.residentId,
+      item.resident_id,
+      item.clientIdentity,
+      item.clientIdentityNumber,
+      item.clientIdNo,
+      item.passportNumber,
+      cust.nationalId,
+      cust.national_id,
+      cust.idNumber,
+      cust.id_number,
+      cust.identityNumber,
+      cust.identity_number,
+      cust.iqamaNumber,
+      cust.iqama_number,
+      cust.clientNationalId,
+      cust.clientIdNumber,
+      cust.residentId,
+      client.nationalId,
+      client.national_id,
+      client.idNumber,
+      client.id_number,
+      client.identityNumber,
+      client.iqamaNumber
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      var raw = candidates[i];
+      if (raw === null || raw === undefined) continue;
+      var s = convertEasternDigitsToAscii(String(raw)).trim();
+      if (!s || s === '-' || s.toLowerCase() === 'null' || s.toLowerCase() === 'undefined') continue;
+      return s;
+    }
+    var prev = existing && existing.customerIdNumber ? convertEasternDigitsToAscii(String(existing.customerIdNumber)).trim() : '';
+    if (prev && prev !== '-' && prev.toLowerCase() !== 'null' && prev.toLowerCase() !== 'undefined') {
+      return prev;
+    }
+    return '';
+  }
+
   function extractReservationNumber(apiItem) {
     var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
     var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
@@ -599,6 +665,7 @@
 
   function shouldAutoReconcileSyncedStatus(existing, sourceStatusAr) {
     if (!existing || typeof existing !== 'object') return false;
+    if (isInactiveReservation(existing)) return false;
     var nextSrc = normalizeStr(sourceStatusAr);
     if (!nextSrc || nextSrc === 'غير محدد') return false;
     var prevInternal = normalizeStr(existing.internalStatus);
@@ -681,6 +748,12 @@
         return 'متابعة موظف';
       case 'supervisor_edit':
         return 'تعديل المشرف/المدير';
+      case 'reject_action':
+        return 'رفض الحجز';
+      case 'cancel_action':
+        return 'إلغاء الحجز';
+      case 'restore_action':
+        return 'استعادة الحجز';
       default:
         return 'تحديث النظام';
     }
@@ -1031,6 +1104,12 @@
         });
       }
 
+      var incomingInactive = isInactiveReservation({
+        internalStatus: sourceStatusAr,
+        originalStatusCode: statusCode,
+        originalStatusAr: sourceStatusAr
+      });
+      var existingInactive = isInactiveReservation(existing);
       var sourceChanged = Boolean(
         statusCode && (
           (prevSourceCode && statusCode !== prevSourceCode) ||
@@ -1038,7 +1117,14 @@
         )
       );
 
-      if (sourceChanged) {
+      if (existingInactive && !incomingInactive) {
+        nextInternalStatus = prevInternalStatus || sourceStatusAr;
+        nextLastUpdateText = existing.lastUpdateText || ('تم الاستيراد من Rental Gate');
+        nextLastUpdatedById = existing.lastUpdatedById || actorId;
+        nextLastUpdatedByName = existing.lastUpdatedByName || actorName;
+        nextLastUpdatedAt = existing.lastUpdatedAt || now;
+        nextStatusHistory = prevHistory;
+      } else if (sourceChanged) {
         nextInternalStatus = sourceStatusAr;
         nextLastUpdateText = 'تحديث الحالة من Rental Gate: ' + (prevInternalStatus || prevSourceAr || '-') + ' ← ' + sourceStatusAr;
         nextLastUpdatedById = actorId;
@@ -1090,6 +1176,25 @@
       ? Math.floor(parsedSeq)
       : ((isFinite(existingSeq) && existingSeq > 0) ? Math.floor(existingSeq) : null);
 
+    var resolvedCompanyNumber = normalizeStr((existing && existing.companyNumber) || apiItem.companyNumber || apiItem.company_number || apiItem.companyCode || apiItem.companyId || '');
+    var resolvedNewCompanyName = normalizeStr((existing && existing.newCompanyName) || apiItem.newCompanyName || apiItem.new_company_name || '');
+    var incomingRejected = isRejectedStatus({ internalStatus: nextInternalStatus, originalStatusCode: statusCode, originalStatusAr: sourceStatusAr });
+    var incomingCancelled = !incomingRejected && isCancelledStatus({ internalStatus: nextInternalStatus, originalStatusCode: statusCode, originalStatusAr: sourceStatusAr });
+
+    var resolvedRejectionReason = normalizeStr((existing && existing.rejectionReason) || apiItem.rejectionReason || apiItem.rejectReason || '');
+    var resolvedCarStatusAtRequest = normalizeStr((existing && existing.carStatusAtRequest) || apiItem.carStatusAtRequest || '');
+    var resolvedRefundAmount = (existing && existing.refundAmount !== undefined && existing.refundAmount !== null && existing.refundAmount !== '')
+      ? toNum(existing.refundAmount, 0)
+      : toNum(apiItem.refundAmount || apiItem.refund_amount, 0);
+    var resolvedRejectedById = normalizeStr((existing && existing.rejectedById) || (incomingRejected ? actorId : ''));
+    var resolvedRejectedByName = normalizeStr((existing && existing.rejectedByName) || (incomingRejected ? actorName : ''));
+    var resolvedRejectedAt = normalizeStr((existing && existing.rejectedAt) || (incomingRejected ? (apiItem.rejectedAt || now) : ''));
+
+    var resolvedCancellationReason = normalizeStr((existing && existing.cancellationReason) || apiItem.cancellationReason || apiItem.cancelReason || '');
+    var resolvedCancelledById = normalizeStr((existing && existing.cancelledById) || (incomingCancelled ? actorId : ''));
+    var resolvedCancelledByName = normalizeStr((existing && existing.cancelledByName) || (incomingCancelled ? actorName : ''));
+    var resolvedCancelledAt = normalizeStr((existing && existing.cancelledAt) || (incomingCancelled ? (apiItem.cancelledAt || now) : ''));
+
     return {
       id: existing ? existing.id : ('RES_' + resNumber),
       sourceReservationId: resApiId || resNumber,
@@ -1098,9 +1203,11 @@
       sourceCreatedAt: formatDisplayDateTime(sourceCreatedRaw) || normalizeStr(sourceCreatedRaw),
       customerName: normalizeStr(apiItem.clientName || apiItem.customer_name || (apiItem.customer && apiItem.customer.name) || 'عميل'),
       customerPhone: normalizeStr(apiItem.clientMobile || apiItem.customer_phone || (apiItem.customer && (apiItem.customer.phone || apiItem.customer.mobile)) || ''),
-      customerEmail: normalizeStr(apiItem.clientEmail || apiItem.customer_email || (apiItem.customer && apiItem.customer.email) || ''),
-      customerIdNumber: normalizeStr(apiItem.clientNationalId || apiItem.clientIdNumber || (apiItem.customer && apiItem.customer.idNumber) || ''),
+      customerEmail: normalizeStr(apiItem.clientEmail || apiItem.customer_email || (apiItem.customer && apiItem.customer.email) || (existing && existing.customerEmail) || ''),
+      customerIdNumber: extractCustomerNationalId(apiItem, existing),
       companyName: normalizeStr(apiItem.companyArName || apiItem.companyEnName || apiItem.company_name || (apiItem.company && apiItem.company.name) || ''),
+      companyNumber: resolvedCompanyNumber,
+      newCompanyName: resolvedNewCompanyName,
       branchName: receiveBranch,
       deliverBranchName: deliverBranch,
       carName: normalizeStr(apiItem.carNameAr || apiItem.carNameEn || apiItem.car_name || (apiItem.car && apiItem.car.name) || ''),
@@ -1141,6 +1248,16 @@
       lastUpdatedAt: nextLastUpdatedAt,
       statusHistory: nextStatusHistory,
       hasProblem: existing ? Boolean(existing.hasProblem) : false,
+      rejectionReason: resolvedRejectionReason,
+      carStatusAtRequest: resolvedCarStatusAtRequest,
+      refundAmount: resolvedRefundAmount,
+      rejectedById: resolvedRejectedById,
+      rejectedByName: resolvedRejectedByName,
+      rejectedAt: resolvedRejectedAt,
+      cancellationReason: resolvedCancellationReason,
+      cancelledById: resolvedCancelledById,
+      cancelledByName: resolvedCancelledByName,
+      cancelledAt: resolvedCancelledAt,
       createdAt: existing ? existing.createdAt : now,
       updatedAt: now
     };
@@ -1270,6 +1387,7 @@
 
   var SECTION_VIEW_PERMISSION_KEYS = [
     'view_reservations',
+    'view_inactive_reservations',
     'view_my_followups',
     'view_team_followups',
     'view_problems',
@@ -1290,6 +1408,11 @@
     'sub_view_emp_presets'
   ];
 
+  var EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS = [
+    'sub_view_rejected_tab',
+    'sub_view_cancelled_tab'
+  ];
+
   var ACTION_BUTTON_PERMISSION_KEYS = [
     'act_export_excel',
     'act_export_pdf',
@@ -1301,12 +1424,16 @@
     'act_claim_reservation',
     'act_close_delete_ticket',
     'act_report_problem',
-    'act_delete_employee'
+    'act_delete_employee',
+    'act_reject_reservation',
+    'act_cancel_reservation',
+    'act_customer_id_lookup'
   ];
 
   var ROUTE_PERMISSION_MAP = {
     dashboard: 'view_dashboard',
     reservations: 'view_reservations',
+    'inactive-reservations': 'view_inactive_reservations',
     'my-followups': 'view_my_followups',
     'team-followups': 'view_team_followups',
     problems: 'view_problems',
@@ -1318,13 +1445,13 @@
 
   var ALL_FULL_ACCESS_PERMS = [
     'view_dashboard', 'dash_perms_configured', 'perms_sections_configured', 'perms_subsections_configured', 'perms_actions_configured'
-  ].concat(DASHBOARD_PERMISSION_KEYS).concat(SECTION_VIEW_PERMISSION_KEYS).concat(SUBSECTION_VIEW_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
-    'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
-    'claim_reservation', 'unclaim_reservation', 'quick_update_status',
+  ].concat(DASHBOARD_PERMISSION_KEYS).concat(SECTION_VIEW_PERMISSION_KEYS).concat(SUBSECTION_VIEW_PERMISSION_KEYS).concat(EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
+    'view_all_reservations', 'view_customer_id', 'pull_reservations', 'assign_employees', 'add_followup',
+    'claim_reservation', 'unclaim_reservation', 'quick_update_status', 'reject_reservation', 'cancel_reservation',
     'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
     'create_problem', 'update_problem', 'delete_reservations', 'view_employees', 'manage_employees',
     'view_all_logs', 'sync_data', 'manage_api_connection', 'manage_settings',
-    'manage_role_ui_defaults', 'manage_announcements', 'manage_developer_tools', 'export_reports'
+    'manage_role_ui_defaults', 'customize_ui', 'manage_announcements', 'manage_developer_tools', 'export_reports'
   ]);
 
   var ROLE_PERMISSION_MATRIX = {
@@ -1332,18 +1459,20 @@
     general_manager: ALL_FULL_ACCESS_PERMS.filter(function (k) { return k !== 'manage_developer_tools'; }),
     supervisor: [
       'view_dashboard', 'dash_perms_configured', 'perms_sections_configured', 'perms_subsections_configured', 'perms_actions_configured'
-    ].concat(DASHBOARD_PERMISSION_KEYS).concat(SECTION_VIEW_PERMISSION_KEYS).concat(SUBSECTION_VIEW_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
-      'view_all_reservations', 'pull_reservations', 'assign_employees', 'add_followup',
-      'claim_reservation', 'unclaim_reservation', 'quick_update_status',
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat(SECTION_VIEW_PERMISSION_KEYS).concat(SUBSECTION_VIEW_PERMISSION_KEYS).concat(EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
+      'view_all_reservations', 'view_customer_id', 'pull_reservations', 'assign_employees', 'add_followup',
+      'claim_reservation', 'unclaim_reservation', 'quick_update_status', 'reject_reservation', 'cancel_reservation',
       'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
       'create_problem', 'update_problem', 'view_employees', 'view_all_logs',
       'sync_data', 'export_reports'
     ]),
     agent: [
       'view_dashboard', 'dash_perms_configured', 'perms_subsections_configured', 'perms_actions_configured'
-    ].concat(DASHBOARD_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS).concat([
-      'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
-      'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_myfu_mentions', 'sub_view_myfu_history',
+    ].concat(DASHBOARD_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS.filter(function (ak) {
+      return ak !== 'act_customer_id_lookup';
+    })).concat([
+      'view_reservations', 'view_inactive_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
+      'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab', 'sub_view_myfu_mentions', 'sub_view_myfu_history',
       'sub_view_prb_rates', 'sub_view_rep_charts',
       'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
       'quick_update_status', 'create_problem', 'update_problem', 'export_reports'
@@ -1353,6 +1482,7 @@
   var PERMISSIONS_CATALOG = [
     { key: 'view_dashboard', label: 'عرض قسم: لوحة التحكم والإحصائيات', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_reservations', label: 'عرض قسم: الحجوزات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_inactive_reservations', label: 'عرض قسم: الحجوزات غير الفعالة (المرفوضة والملغاة)', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_my_followups', label: 'عرض قسم: متابعاتي', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_team_followups', label: 'عرض قسم: متابعات الفريق', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_problems', label: 'عرض قسم: المشكلات والتذاكر', group: 'إظهار وإخفاء الأقسام والصفحات' },
@@ -1362,6 +1492,8 @@
     { key: 'view_settings', label: 'عرض قسم: الإعدادات', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_today_tab', label: 'عرض تبويب: التسليم والاستلام اليوم', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_radar_tab', label: 'عرض تبويب: رادار انتهاء الحجوزات (24 ساعة)', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_rejected_tab', label: 'عرض تبويب: الحجوزات المرفوضة', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_cancelled_tab', label: 'عرض تبويب: الحجوزات الملغاة', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_myfu_mentions', label: 'عرض تبويب: إشارات @Mention في متابعاتي', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_myfu_history', label: 'عرض قسم: سجل متابعاتي السابقة', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_prb_rates', label: 'عرض مؤشر: نسبة المشكلات لكل 100 حجز', group: 'إظهار وإخفاء الأقسام والصفحات' },
@@ -1379,6 +1511,9 @@
     { key: 'act_close_delete_ticket', label: 'أزرار إغلاق / حذف التذاكر والمشكلات', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_report_problem', label: 'زر تحويل الحجز إلى مشكلة', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_delete_employee', label: 'أزرار حذف وإيقاف الموظفين', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_reject_reservation', label: 'زر رفض الحجز ونقله للمرفوضة', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_cancel_reservation', label: 'زر إلغاء الحجز ونقله للملغاة', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_customer_id_lookup', label: 'زر الاستعلام عن العميل برقم الهوية', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'dash_view_hero_kpis', label: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', group: 'لوحة التحكم' },
     { key: 'dash_view_strip_kpis', label: 'شريط مؤشرات الحالات التفصيلية (KPI Strip)', group: 'لوحة التحكم' },
     { key: 'dash_view_daily_chart', label: 'رسم المتابعات اليومية', group: 'لوحة التحكم' },
@@ -1390,6 +1525,9 @@
     { key: 'dash_view_bottom_bento', label: 'أحدث الحجوزات والمشكلات المفتوحة والإجراءات السريعة', group: 'لوحة التحكم' },
     { key: 'dash_view_handover', label: 'زر تسليم الوردية (PDF) داخل لوحة التحكم', group: 'لوحة التحكم' },
     { key: 'view_all_reservations', label: 'استعراض جميع الحجوزات', group: 'الحجوزات' },
+    { key: 'view_customer_id', label: 'عرض رقم هوية العميل والبحث بالهوية', group: 'الحجوزات' },
+    { key: 'reject_reservation', label: 'رفض الحجوزات وتوثيق سبب الرفض', group: 'الحجوزات' },
+    { key: 'cancel_reservation', label: 'إلغاء الحجوزات وتوثيق سبب الإلغاء', group: 'الحجوزات' },
     { key: 'pull_reservations', label: 'سحب واستيراد وتحديث الحجوزات من قائمة الحجوزات', group: 'الحجوزات' },
     { key: 'claim_reservation', label: 'استلام الحجوزات ذاتيًا', group: 'الحجوزات' },
     { key: 'unclaim_reservation', label: 'إلغاء استلام الحجز', group: 'الحجوزات' },
@@ -1409,6 +1547,7 @@
     { key: 'manage_employees', label: 'إدارة حسابات الموظفين وصلاحياتهم', group: 'الإدارة والربط (API)' },
     { key: 'manage_settings', label: 'تعديل إعدادات النظام والتحديث التلقائي', group: 'الإدارة والربط (API)' },
     { key: 'manage_role_ui_defaults', label: 'التحكم المركزي بإعدادات وأعمدة واجهة الأدوار والوظائف', group: 'الإدارة والربط (API)' },
+    { key: 'customize_ui', label: 'تخصيص وإظهار/إخفاء الأقسام للموظفين والأدوار', group: 'الإدارة والربط (API)' },
     { key: 'manage_announcements', label: 'إدارة تعميمات وإعلانات الوردية', group: 'الإدارة والربط (API)' },
     { key: 'delete_reservations', label: 'حذف الحجوزات الجماعي والنسخ الاحتياطي', group: 'الإدارة والربط (API)' },
     { key: 'manage_developer_tools', label: 'الصلاحيات البرمجية الكاملة وفحص الخادم وكاش الموقع', group: 'الإدارة والربط (API)' }
@@ -1427,7 +1566,10 @@
       label: 'موظف متابعة أول (صلاحيات موسعة)',
       jobTitle: 'موظف متابعة أول',
       role: ROLES.AGENT,
-      permissions: ROLE_PERMISSION_MATRIX.agent.concat(['view_all_reservations', 'view_employees', 'edit_any_followup'])
+      permissions: ROLE_PERMISSION_MATRIX.agent.concat([
+        'view_all_reservations', 'view_customer_id', 'act_customer_id_lookup',
+        'reject_reservation', 'cancel_reservation', 'view_employees', 'edit_any_followup'
+      ])
     },
     {
       id: 'qa_reports',
@@ -1439,8 +1581,9 @@
         'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
         'dash_view_recent_activity', 'dash_view_charts_grid', 'dash_view_radar',
         'dash_view_heatmap', 'dash_view_leaderboard', 'dash_view_bottom_bento',
-        'view_reservations', 'view_reports', 'view_activity',
-        'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_prb_rates', 'sub_view_rep_charts',
+        'view_reservations', 'view_inactive_reservations', 'view_reports', 'view_activity',
+        'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab',
+        'sub_view_prb_rates', 'sub_view_rep_charts',
         'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports'
       ]
     },
@@ -1553,15 +1696,30 @@
     return true;
   }
 
+  var SUBSECTION_KEY_ALIASES = {
+    today_tab: 'sub_view_today_tab',
+    radar_tab: 'sub_view_radar_tab',
+    rejected_tab: 'sub_view_rejected_tab',
+    cancelled_tab: 'sub_view_cancelled_tab',
+    myfu_mentions: 'sub_view_myfu_mentions',
+    myfu_history: 'sub_view_myfu_history',
+    prb_rates: 'sub_view_prb_rates',
+    rep_charts: 'sub_view_rep_charts',
+    emp_delegations: 'sub_view_emp_delegations',
+    emp_presets: 'sub_view_emp_presets'
+  };
+
   function canUserViewSubSection(roleOrUser, subKey) {
     if (!roleOrUser || !subKey) return false;
     var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
     if (role === ROLES.DEVELOPER) return true;
+    var canonKey = SUBSECTION_KEY_ALIASES[subKey] || subKey;
     var allowed = resolveEffectivePermissions(roleOrUser);
+    var allSubKeys = SUBSECTION_VIEW_PERMISSION_KEYS.concat(EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS);
     var hasSubConfig = allowed.indexOf('perms_subsections_configured') !== -1 ||
-      SUBSECTION_VIEW_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
+      allSubKeys.some(function (k) { return allowed.indexOf(k) !== -1; });
     if (hasSubConfig) {
-      return allowed.indexOf(subKey) !== -1;
+      return allowed.indexOf(canonKey) !== -1 || allowed.indexOf(subKey) !== -1;
     }
     return true;
   }
@@ -1579,6 +1737,10 @@
     return true;
   }
 
+  function canUserViewCustomerId(roleOrUser) {
+    return canUserPerform(roleOrUser, 'view_customer_id');
+  }
+
   var EMPLOYEE_SECTION_GROUPS = [
     {
       id: 'main_sections',
@@ -1588,6 +1750,7 @@
       items: [
         { key: 'view_dashboard', routeId: 'dashboard', labelAr: 'لوحة التحكم والإحصائيات', labelEn: 'Dashboard & KPIs' },
         { key: 'view_reservations', routeId: 'reservations', labelAr: 'الحجوزات', labelEn: 'Reservations' },
+        { key: 'view_inactive_reservations', routeId: 'inactive-reservations', labelAr: 'الحجوزات غير الفعالة', labelEn: 'Inactive Reservations' },
         { key: 'view_my_followups', routeId: 'my-followups', labelAr: 'متابعاتي', labelEn: 'My Follow-Ups' },
         { key: 'view_team_followups', routeId: 'team-followups', labelAr: 'متابعات الفريق', labelEn: 'Team Follow-Ups' },
         { key: 'view_problems', routeId: 'problems', labelAr: 'المشكلات والتذاكر', labelEn: 'Problems & Tickets' },
@@ -1605,6 +1768,8 @@
       items: [
         { key: 'sub_view_today_tab', labelAr: 'تبويب التسليم والاستلام اليوم', labelEn: 'Today Pickups & Returns Tab' },
         { key: 'sub_view_radar_tab', labelAr: 'تبويب رادار انتهاء الحجوزات (24 ساعة)', labelEn: '24h Expiry Radar Tab' },
+        { key: 'sub_view_rejected_tab', labelAr: 'تبويب الحجوزات المرفوضة', labelEn: 'Rejected Reservations Tab' },
+        { key: 'sub_view_cancelled_tab', labelAr: 'تبويب الحجوزات الملغاة', labelEn: 'Cancelled Reservations Tab' },
         { key: 'sub_view_myfu_mentions', labelAr: 'تبويب إشارات @Mention في متابعاتي', labelEn: '@Mentions Tab' },
         { key: 'sub_view_myfu_history', labelAr: 'قسم سجل متابعاتي السابقة', labelEn: 'My Follow-Ups History' },
         { key: 'sub_view_prb_rates', labelAr: 'مؤشر نسبة المشكلات لكل 100 حجز', labelEn: 'Problems Per 100 Bookings' },
@@ -1647,6 +1812,9 @@
         { key: 'act_claim_reservation', labelAr: 'أزرار استلام / إلغاء استلام الحجز', labelEn: 'Claim / Unclaim Booking Buttons' },
         { key: 'act_close_delete_ticket', labelAr: 'أزرار إغلاق / حذف التذاكر والمشكلات', labelEn: 'Close / Delete Ticket Buttons' },
         { key: 'act_report_problem', labelAr: 'زر تحويل الحجز إلى مشكلة', labelEn: 'Report Problem Button' },
+        { key: 'act_reject_reservation', labelAr: 'زر رفض الحجز ونقله للمرفوضة', labelEn: 'Reject Booking Button' },
+        { key: 'act_cancel_reservation', labelAr: 'زر إلغاء الحجز ونقله للملغاة', labelEn: 'Cancel Booking Button' },
+        { key: 'act_customer_id_lookup', labelAr: 'زر الاستعلام عن العميل برقم الهوية', labelEn: 'National ID Lookup Button' },
         { key: 'act_delete_employee', labelAr: 'أزرار حذف وإيقاف الموظفين', labelEn: 'Delete / Toggle Employee Buttons' }
       ]
     }
@@ -1979,6 +2147,15 @@
     var f = filters || {};
     var search = normalizeStr(f.search);
     var reservationNumberQuery = normalizeStr(f.reservationNumber).replace(/^#+/, '').trim();
+    var companyNumberQuery = normalizeStr(f.companyNumber);
+    var oldCompanyQuery = normalizeStr(f.oldCompanyName);
+    var newCompanyQuery = normalizeStr(f.newCompanyName);
+    var rejectionReasonQuery = normalizeStr(f.rejectionReason);
+    var cancellationReasonQuery = normalizeStr(f.cancellationReason);
+    var confirmedByQuery = normalizeStr(f.confirmedByEmployee);
+    var lifecycle = normalizeStr(f.lifecycle).toLowerCase();
+    var canViewCid = Boolean(userContext && userContext.user && canUserViewCustomerId(userContext.user));
+
     var followedSet = {};
     if (Array.isArray(followUps)) {
       for (var i = 0; i < followUps.length; i++) {
@@ -1991,10 +2168,21 @@
 
     for (var j = 0; j < reservations.length; j++) {
       var r = reservations[j];
+      if (!r || typeof r !== 'object') continue;
       var assignedIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [];
 
       if (userContext && userContext.role === ROLES.AGENT && !allowAgentViewAll && !(userContext.user && canUserPerform(userContext.user, 'view_all_reservations'))) {
         if (assignedIds.indexOf(userContext.employeeId) === -1) continue;
+      }
+
+      if (lifecycle === 'active') {
+        if (isInactiveReservation(r)) continue;
+      } else if (lifecycle === 'rejected') {
+        if (!isRejectedStatus(r)) continue;
+      } else if (lifecycle === 'cancelled') {
+        if (!isCancelledStatus(r)) continue;
+      } else if (lifecycle === 'inactive') {
+        if (!isInactiveReservation(r)) continue;
       }
 
       if (reservationNumberQuery && !matchesSearchFields([
@@ -2003,26 +2191,65 @@
         continue;
       }
 
-      if (search && !matchesSearchFields([
-        r.reservationNumber,
-        r.customerName,
-        r.customerPhone,
-        r.carName,
-        r.plateNumber,
-        r.companyName,
-        r.branchName
-      ], search)) {
+      if (companyNumberQuery && !matchesSearchFields([r.companyNumber], companyNumberQuery)) {
         continue;
+      }
+      if (oldCompanyQuery && !matchesSearchFields([r.companyName], oldCompanyQuery)) {
+        continue;
+      }
+      if (newCompanyQuery && !matchesSearchFields([r.newCompanyName], newCompanyQuery)) {
+        continue;
+      }
+      if (rejectionReasonQuery && !matchesSearchFields([r.rejectionReason], rejectionReasonQuery)) {
+        continue;
+      }
+      if (cancellationReasonQuery && !matchesSearchFields([r.cancellationReason], cancellationReasonQuery)) {
+        continue;
+      }
+      if (confirmedByQuery) {
+        var actorHits = matchesSearchFields([
+          r.rejectedByName, r.rejectedById, r.cancelledByName, r.cancelledById,
+          r.lastUpdatedByName, r.lastUpdatedById
+        ].concat(Array.isArray(r.assignedEmployeeNames) ? r.assignedEmployeeNames : []), confirmedByQuery) ||
+          assignedIds.indexOf(confirmedByQuery) !== -1 ||
+          r.rejectedById === confirmedByQuery ||
+          r.cancelledById === confirmedByQuery;
+        if (!actorHits) continue;
+      }
+
+      if (search) {
+        var searchHay = [
+          r.reservationNumber,
+          r.customerName,
+          r.customerPhone,
+          r.carName,
+          r.plateNumber,
+          r.companyName,
+          r.companyNumber,
+          r.newCompanyName,
+          r.branchName
+        ];
+        if (canViewCid) searchHay.push(r.customerIdNumber);
+        if (!matchesSearchFields(searchHay, search)) {
+          continue;
+        }
       }
 
       if (f.company && r.companyName !== f.company) continue;
       if (f.branch && r.branchName !== f.branch) continue;
       if (f.status && r.internalStatus !== f.status && r.originalStatusAr !== f.status) continue;
       if (f.priority && r.priority !== f.priority) continue;
-      if (f.employeeId && assignedIds.indexOf(f.employeeId) === -1) continue;
+      if (f.employeeId && assignedIds.indexOf(f.employeeId) === -1 && r.rejectedById !== f.employeeId && r.cancelledById !== f.employeeId) continue;
       var fDateFrom = normalizeStr(f.dateFrom).substring(0, 10);
       var fDateTo = normalizeStr(f.dateTo).substring(0, 10);
-      if (fDateFrom && fDateTo) {
+      if (lifecycle === 'rejected' || lifecycle === 'cancelled' || lifecycle === 'inactive') {
+        var actionDateVal = normalizeStr(
+          (lifecycle === 'rejected' ? r.rejectedAt : (lifecycle === 'cancelled' ? r.cancelledAt : (r.rejectedAt || r.cancelledAt))) ||
+          r.lastUpdatedAt || r.startDate
+        ).substring(0, 10);
+        if (fDateFrom && actionDateVal < fDateFrom) continue;
+        if (fDateTo && actionDateVal > fDateTo) continue;
+      } else if (fDateFrom && fDateTo) {
         var rStartBoth = normalizeStr(r.startDate).substring(0, 10);
         if (rStartBoth < fDateFrom || rStartBoth > fDateTo) continue;
       } else if (fDateFrom) {
@@ -2054,7 +2281,11 @@
         if (!ovInfo.isOverdueUnpaid) continue;
       }
 
-      out.push(Object.assign({}, r, { isFollowed: resolvedFollowed }));
+      var itemOut = Object.assign({}, r, { isFollowed: resolvedFollowed });
+      if (userContext && userContext.user && !canViewCid) {
+        itemOut.customerIdNumber = '';
+      }
+      out.push(itemOut);
     }
 
     var rawSortBy = normalizeStr(f.sortBy);
@@ -2101,7 +2332,7 @@
     var resolvedSortDir = resolvedSortBy === 'sourceOrder'
       ? (normalizeStr(s.sortDir).toLowerCase() === 'desc' ? 'desc' : 'asc')
       : (normalizeStr(s.sortDir).toLowerCase() === 'asc' ? 'asc' : 'desc');
-    return {
+    var payloadOut = {
       search: normalizeStr(s.search),
       reservationNumber: normalizeStr(s.reservationNumber),
       company: normalizeStr(s.company),
@@ -2122,6 +2353,15 @@
       page: isFinite(pageNum) && pageNum >= 1 ? Math.floor(pageNum) : 1,
       pageSize: isFinite(pageSizeNum) && pageSizeNum >= 1 ? Math.floor(pageSizeNum) : 20
     };
+    var lifecycle = normalizeStr(s.lifecycle).toLowerCase();
+    if (lifecycle) payloadOut.lifecycle = lifecycle;
+    if (normalizeStr(s.companyNumber)) payloadOut.companyNumber = normalizeStr(s.companyNumber);
+    if (normalizeStr(s.oldCompanyName)) payloadOut.oldCompanyName = normalizeStr(s.oldCompanyName);
+    if (normalizeStr(s.newCompanyName)) payloadOut.newCompanyName = normalizeStr(s.newCompanyName);
+    if (normalizeStr(s.rejectionReason)) payloadOut.rejectionReason = normalizeStr(s.rejectionReason);
+    if (normalizeStr(s.cancellationReason)) payloadOut.cancellationReason = normalizeStr(s.cancellationReason);
+    if (normalizeStr(s.confirmedByEmployee)) payloadOut.confirmedByEmployee = normalizeStr(s.confirmedByEmployee);
+    return payloadOut;
   }
 
   function hasActiveReservationFilters(payload) {
@@ -2261,16 +2501,23 @@
     });
   }
 
-  function reapplyProblemDeltaToFilteredList(currentItems, changedProblems, deletedReservationIds, filters) {
+  function reapplyProblemDeltaToFilteredList(currentItems, changedProblems, deletedReservationIds, filters, deletedProblemIds) {
     var base = Array.isArray(currentItems) ? currentItems.slice() : [];
     var changed = Array.isArray(changedProblems) ? changedProblems : [];
     var delRes = Array.isArray(deletedReservationIds) ? deletedReservationIds : [];
+    var delPrb = Array.isArray(deletedProblemIds) ? deletedProblemIds : [];
     var f = filters || {};
 
     var delResMap = {};
     for (var d = 0; d < delRes.length; d++) {
       var drid = normalizeStr(delRes[d]);
       if (drid) delResMap[drid] = true;
+    }
+
+    var delPrbMap = {};
+    for (var dp = 0; dp < delPrb.length; dp++) {
+      var dpid = normalizeStr(delPrb[dp]);
+      if (dpid) delPrbMap[dpid] = true;
     }
 
     var changedById = {};
@@ -2286,7 +2533,7 @@
       var candNew = changed[c2];
       if (!candNew || !candNew.id) continue;
       var pidNew = String(candNew.id);
-      if (delResMap[normalizeStr(candNew.reservationId)]) continue;
+      if (delPrbMap[pidNew] || delResMap[normalizeStr(candNew.reservationId)]) continue;
       var isAlreadyInBase = base.some(function (x) { return x && String(x.id) === pidNew; });
       if (!isAlreadyInBase && !seen[pidNew]) {
         seen[pidNew] = true;
@@ -2300,12 +2547,12 @@
       var cur = base[i];
       if (!cur || !cur.id) continue;
       var pid = String(cur.id);
-      if (delResMap[normalizeStr(cur.reservationId)] || seen[pid]) continue;
+      if (delPrbMap[pid] || delResMap[normalizeStr(cur.reservationId)] || seen[pid]) continue;
       seen[pid] = true;
       var resolved = Object.prototype.hasOwnProperty.call(changedById, pid)
         ? Object.assign({}, cur, changedById[pid])
         : cur;
-      if (delResMap[normalizeStr(resolved.reservationId)]) continue;
+      if (delPrbMap[normalizeStr(resolved.id)] || delResMap[normalizeStr(resolved.reservationId)]) continue;
       if (filterProblemsList([resolved], f).length > 0) {
         out.push(resolved);
       }
@@ -2552,7 +2799,7 @@
   function resolveRouteFromLocation(pathname, hash, search, basePath, validRoutes, fallbackRoute) {
     var allowed = Array.isArray(validRoutes) && validRoutes.length
       ? validRoutes
-      : ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+      : ['dashboard', 'reservations', 'inactive-reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
     var fallback = fallbackRoute || 'dashboard';
 
     function cleanCandidate(raw) {
@@ -2939,6 +3186,8 @@
     getDashboard: { cacheable: true, ttlMs: 60000, scope: 'dashboard' },
     getTodayAndRadar: { cacheable: true, ttlMs: 25000, scope: 'todayRadar' },
     getReservations: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
+    getInactiveReservations: { cacheable: true, ttlMs: 45000, scope: 'reservations' },
+    searchCustomerByNationalId: { cacheable: false, ttlMs: 0, scope: 'reservations' },
     getReservationDetails: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getMyFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
     getTeamFollowUps: { cacheable: true, ttlMs: 60000, scope: 'followUps' },
@@ -2963,6 +3212,9 @@
     claimReservation: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     unclaimReservation: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     quickUpdateReservationStatus: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    rejectReservation: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    cancelReservation: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    restoreReservation: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     updateReservationDetails: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     saveReservationPinnedNote: ['reservations', 'todayRadar', 'followUps', 'activity'],
     togglePinnedCriticalReservation: ['followUps', 'reservations'],
@@ -2975,8 +3227,12 @@
     bulkReassignSelectedReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     createProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     updateProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    deleteProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     createEmployee: ['employees', 'dashboard', 'activity', 'reports'],
     updateEmployee: ['employees', 'dashboard', 'activity', 'reports'],
+    saveEmployeeUiOverrides: ['employees', 'settings', 'dashboard', 'activity'],
+    saveRoleUiDefaults: ['employees', 'settings', 'dashboard', 'activity'],
+    restoreUiDefaults: ['employees', 'settings', 'dashboard', 'activity'],
     disableEmployee: ['employees', 'dashboard', 'activity', 'reports'],
     deleteEmployee: ['employees', 'reservations', 'todayRadar', 'problems', 'dashboard', 'activity', 'reports'],
     saveDelegation: ['employees', 'activity', 'notifications'],
@@ -3019,7 +3275,10 @@
     _replayingOfflineQueue: true,
     originTabId: true,
     selectedResIds: true,
+    expandedRowIds: true,
     viewMode: true,
+    tab: true,
+    inactiveSubTab: true,
     radarFilter: true,
     radarSearch: true,
     todayFilter: true,
@@ -3391,7 +3650,8 @@
       case 'updateFollowUp':
         return act + ':' + normalizeStr(p.followUpId);
       case 'updateProblem':
-        return act + ':' + normalizeStr(p.problemId);
+      case 'deleteProblem':
+        return act + ':' + normalizeStr(p.problemId || p.id);
       case 'markNotificationRead':
         return act + ':' + (p.markAll ? 'ALL' : normalizeStr(p.notificationId));
       case 'createEmployee':
@@ -5393,8 +5653,258 @@
 
   // ---------- TODAY'S PICKUPS & RETURNS RADAR ----------
 
+  var REJECTED_STATUS_VALUES = [
+    'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused'
+  ];
+
+  var CANCELLED_STATUS_VALUES = [
+    'تم الإلغاء', 'تم الالغاء', 'ملغي', 'ملغى', 'ملغاة', 'cancelled', 'canceled'
+  ];
+
+  var REJECTION_REASONS_LIST = [
+    'عدم توفر السيارة',
+    'رفض الشركة للعميل',
+    'مشكلة في الهوية أو الرخصة',
+    'تعديل السعر أو شروط الدفع',
+    'تم التحويل لشركة أخرى',
+    'عدم مطابقة شروط العمر أو التأمين',
+    'طلب العميل إلغاء الطلب',
+    'أخرى'
+  ];
+
+  var CANCELLATION_REASONS_LIST = [
+    'طلب العميل',
+    'تغيير الموعد أو السفر',
+    'عدم الحضور للاستلام',
+    'عدم اكتمال السداد',
+    'عدم توفر المركبة بالفرع',
+    'حجز مكرر',
+    'أخرى'
+  ];
+
+  var CAR_STATUS_AT_REQUEST_OPTIONS = [
+    'متاحة عند الطلب',
+    'غير متاحة',
+    'تحتاج تأكيد الفرع',
+    'مؤجرة مسبقاً',
+    'قيد الصيانة',
+    'تم التحويل لشركة أخرى'
+  ];
+
+  function matchesStatusList(val, list) {
+    var norm = normalizeSearchText(val);
+    if (!norm) return false;
+    for (var i = 0; i < list.length; i++) {
+      if (norm === normalizeSearchText(list[i])) return true;
+    }
+    return false;
+  }
+
+  function isRejectedStatus(resOrStatus) {
+    if (!resOrStatus) return false;
+    if (typeof resOrStatus === 'string') {
+      return matchesStatusList(resOrStatus, REJECTED_STATUS_VALUES);
+    }
+    if (normalizeStr(resOrStatus.rejectedAt)) return true;
+    return matchesStatusList(resOrStatus.internalStatus, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.originalStatusAr, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.originalStatusCode, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.statusCode, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.status_code, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.statusAr, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.status_ar, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.status, REJECTED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.reservationStatus, REJECTED_STATUS_VALUES);
+  }
+
+  function isCancelledStatus(resOrStatus) {
+    if (!resOrStatus) return false;
+    if (typeof resOrStatus === 'string') {
+      return matchesStatusList(resOrStatus, CANCELLED_STATUS_VALUES);
+    }
+    if (normalizeStr(resOrStatus.cancelledAt) && !isRejectedStatus(resOrStatus)) return true;
+    return matchesStatusList(resOrStatus.internalStatus, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.originalStatusAr, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.originalStatusCode, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.statusCode, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.status_code, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.statusAr, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.status_ar, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.status, CANCELLED_STATUS_VALUES) ||
+      matchesStatusList(resOrStatus.reservationStatus, CANCELLED_STATUS_VALUES);
+  }
+
+  function isInactiveReservation(res) {
+    return isRejectedStatus(res) || isCancelledStatus(res);
+  }
+
+  function getReservationLifecycleKind(res) {
+    if (isRejectedStatus(res)) return 'rejected';
+    if (isCancelledStatus(res)) return 'cancelled';
+    return 'active';
+  }
+
+  function redactReservationSensitiveFields(res, user) {
+    if (!res || typeof res !== 'object') return res;
+    if (canUserViewCustomerId(user)) return res;
+    return Object.assign({}, res, { customerIdNumber: '' });
+  }
+
+  function groupCustomerLookupResults(reservations, targetNationalId) {
+    var list = Array.isArray(reservations) ? reservations : [];
+    var targetNorm = normalizeNationalId(targetNationalId);
+    var matched = [];
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (!r || typeof r !== 'object') continue;
+      var ridNorm = normalizeNationalId(r.customerIdNumber);
+      if (!ridNorm) continue;
+      if (targetNorm) {
+        var isExact = ridNorm === targetNorm;
+        var isPartial = targetNorm.length >= 4 && ridNorm.indexOf(targetNorm) !== -1;
+        if (!isExact && !isPartial) continue;
+      }
+      matched.push(r);
+    }
+
+    matched.sort(function (a, b) {
+      var ta = String(a.lastUpdatedAt || a.updatedAt || a.startDate || a.createdAt || '');
+      var tb = String(b.lastUpdatedAt || b.updatedAt || b.startDate || b.createdAt || '');
+      return tb.localeCompare(ta);
+    });
+
+    if (matched.length === 0) {
+      return {
+        found: false,
+        customer: null,
+        customers: [],
+        stats: { totalCount: 0, activeCount: 0, rejectedCount: 0, cancelledCount: 0, inactiveCount: 0 },
+        activeReservations: [],
+        inactiveReservations: [],
+        reservations: [],
+        totalMatches: 0
+      };
+    }
+
+    var groupsByNormId = {};
+    var groupOrder = [];
+    var allActive = [];
+    var allInactive = [];
+    var totalRejected = 0;
+    var totalCancelled = 0;
+
+    for (var j = 0; j < matched.length; j++) {
+      var item = matched[j];
+      var normId = normalizeNationalId(item.customerIdNumber);
+      if (!groupsByNormId[normId]) {
+        groupsByNormId[normId] = [];
+        groupOrder.push(normId);
+      }
+      groupsByNormId[normId].push(item);
+
+      var kind = getReservationLifecycleKind(item);
+      if (kind === 'rejected') {
+        totalRejected += 1;
+        allInactive.push(item);
+      } else if (kind === 'cancelled') {
+        totalCancelled += 1;
+        allInactive.push(item);
+      } else {
+        allActive.push(item);
+      }
+    }
+
+    if (targetNorm) {
+      groupOrder.sort(function (a, b) {
+        if (a === targetNorm && b !== targetNorm) return -1;
+        if (b === targetNorm && a !== targetNorm) return 1;
+        return 0;
+      });
+    }
+
+    var customerProfiles = groupOrder.map(function (gid) {
+      var items = groupsByNormId[gid];
+      var latest = items[0];
+      var companiesMap = {};
+      var phonesMap = {};
+      var cActive = [];
+      var cInactive = [];
+      var cRejected = 0;
+      var cCancelled = 0;
+      var cSpent = 0;
+
+      for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        var comp = normalizeStr(it.companyName);
+        if (comp) companiesMap[comp] = true;
+        var ph = normalizeStr(it.customerPhone);
+        if (ph) phonesMap[ph] = true;
+        var lc = getReservationLifecycleKind(it);
+        if (lc === 'rejected') {
+          cRejected += 1;
+          cInactive.push(it);
+        } else if (lc === 'cancelled') {
+          cCancelled += 1;
+          cInactive.push(it);
+        } else {
+          cActive.push(it);
+        }
+        cSpent += toNum(it.totalAmount, 0);
+      }
+
+      var rawIdStr = normalizeStr(latest.customerIdNumber);
+      var custNameStr = normalizeStr(latest.customerName) || '-';
+      var custPhoneStr = normalizeStr(latest.customerPhone) || '-';
+      var custEmailStr = normalizeStr(latest.customerEmail) || '';
+
+      return {
+        nationalId: gid,
+        customerIdNumber: gid,
+        normalizedIdNumber: gid,
+        name: custNameStr,
+        customerName: custNameStr,
+        phone: custPhoneStr,
+        customerPhone: custPhoneStr,
+        email: custEmailStr,
+        customerEmail: custEmailStr,
+        phones: Object.keys(phonesMap),
+        companies: Object.keys(companiesMap),
+        totalCount: items.length,
+        totalBookings: items.length,
+        totalReservations: items.length,
+        activeCount: cActive.length,
+        rejectedCount: cRejected,
+        cancelledCount: cCancelled,
+        inactiveCount: cInactive.length,
+        totalSpent: Math.round(cSpent * 100) / 100,
+        lastBookingDate: formatDisplayDate(latest.startDate || latest.createdAt) || '',
+        activeReservations: cActive,
+        inactiveReservations: cInactive,
+        reservations: items
+      };
+    });
+
+    return {
+      found: true,
+      customer: customerProfiles[0] || null,
+      customers: customerProfiles,
+      stats: {
+        totalCount: matched.length,
+        activeCount: allActive.length,
+        rejectedCount: totalRejected,
+        cancelledCount: totalCancelled,
+        inactiveCount: allInactive.length
+      },
+      activeReservations: allActive,
+      inactiveReservations: allInactive,
+      reservations: matched,
+      totalMatches: matched.length
+    };
+  }
+
   var EXCLUDED_TODAY_STATUSES = [
-    'تم الإلغاء', 'ملغي', 'cancelled', 'canceled', 'مرفوض', 'rejected',
+    'تم الإلغاء', 'تم الالغاء', 'ملغي', 'ملغى', 'ملغاة', 'cancelled', 'canceled',
+    'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused',
     'لم يتم الحجز', 'لم يحضر', 'no_show'
   ];
 
@@ -5405,6 +5915,7 @@
 
   function isExcludedMovementStatus(res) {
     var r = (res && typeof res === 'object') ? res : {};
+    if (isInactiveReservation(r)) return true;
     var internal = normalizeStr(r.internalStatus).toLowerCase();
     var origAr = normalizeStr(r.originalStatusAr).toLowerCase();
     var origCode = normalizeStr(r.originalStatusCode).toLowerCase();
@@ -5995,6 +6506,7 @@
 
   var UI_SIMPLIFICATION_OPTIONS = [
     // Group 1: Sidebar Navigation & Topbar
+    { key: 'hideNavInactiveReservations', legacyId: 'set-ui-hide-nav-inactive-res', cssClass: 'rg-ui-hide-nav-inactive-res', group: 'nav_topbar', labelAr: 'إخفاء صفحة «الحجوزات غير الفعالة» من القائمة الجانبية', labelEn: 'Hide "Inactive Reservations" from sidebar navigation' },
     { key: 'hideNavTeamFollowups', legacyId: 'set-ui-hide-nav-team-followups', cssClass: 'rg-ui-hide-nav-team-followups', group: 'nav_topbar', labelAr: 'إخفاء صفحة «متابعات الفريق» من القائمة الجانبية', labelEn: 'Hide "Team Follow-Ups" from sidebar navigation' },
     { key: 'hideNavProblems', legacyId: 'set-ui-hide-nav-problems', cssClass: 'rg-ui-hide-nav-problems', group: 'nav_topbar', labelAr: 'إخفاء صفحة «المشكلات» من القائمة الجانبية', labelEn: 'Hide "Problems" from sidebar navigation' },
     { key: 'hideNavReports', legacyId: 'set-ui-hide-nav-reports', cssClass: 'rg-ui-hide-nav-reports', group: 'nav_topbar', labelAr: 'إخفاء صفحة «التقارير والإحصائيات» من القائمة الجانبية', labelEn: 'Hide "Reports & Analytics" from sidebar navigation' },
@@ -6034,6 +6546,10 @@
     // Group 3: Reservations Page & Toolbar
     { key: 'hideResTodayTab', legacyId: 'set-ui-hide-res-today-tab', cssClass: 'rg-ui-hide-res-today-tab', group: 'reservations', labelAr: 'إخفاء تبويب وزر «التسليم والاستلام اليوم»', labelEn: 'Hide "Today\'s Pickups & Returns" tab & button' },
     { key: 'hideResRadarTab', legacyId: 'set-ui-hide-res-radar-tab', cssClass: 'rg-ui-hide-res-radar-tab', group: 'reservations', labelAr: 'إخفاء تبويب وزر «رادار انتهاء الحجوزات (24 ساعة)»', labelEn: 'Hide "24h Expiry Radar" tab & button' },
+    { key: 'hideResRejectedTab', legacyId: 'set-ui-hide-res-rejected-tab', cssClass: 'rg-ui-hide-res-rejected-tab', group: 'reservations', labelAr: 'إخفاء تبويب وزر «الحجوزات المرفوضة» في صفحة الحجوزات', labelEn: 'Hide "Rejected Reservations" tab in Reservations' },
+    { key: 'hideResCustomerIdLookupBtn', legacyId: 'set-ui-hide-res-id-lookup', cssClass: 'rg-ui-hide-res-id-lookup', group: 'reservations', labelAr: 'إخفاء زر «البحث برقم الهوية» في صفحة الحجوزات', labelEn: 'Hide "National ID Lookup" button in Reservations' },
+    { key: 'hideResRejectActionBtn', legacyId: 'set-ui-hide-res-reject-btn', cssClass: 'rg-ui-hide-res-reject-btn', group: 'reservations', labelAr: 'إخفاء أزرار «رفض الحجز» في الجداول والتفاصيل', labelEn: 'Hide "Reject Booking" action buttons' },
+    { key: 'hideResCancelActionBtn', legacyId: 'set-ui-hide-res-cancel-btn', cssClass: 'rg-ui-hide-res-cancel-btn', group: 'reservations', labelAr: 'إخفاء أزرار «إلغاء الحجز» في الجداول والتفاصيل', labelEn: 'Hide "Cancel Booking" action buttons' },
     { key: 'hideResPullBtn', legacyId: 'set-ui-hide-res-pull-btn', cssClass: 'rg-ui-hide-res-pull-btn', group: 'reservations', labelAr: 'إخفاء زر وشريط سحب الحجوزات من Rental Gate API في صفحة الحجوزات', labelEn: 'Hide Rental Gate API pull bar & button on Reservations' },
     { key: 'hideResImportExcel', legacyId: 'set-ui-hide-res-import-btn', cssClass: 'rg-ui-hide-res-import-btn', group: 'reservations', labelAr: 'إخفاء زر «استيراد من Excel» في صفحة الحجوزات', labelEn: 'Hide "Import Excel" button in Reservations' },
     { key: 'hideResColsToggle', legacyId: 'set-ui-hide-res-cols-btn', cssClass: 'rg-ui-hide-res-cols-btn', group: 'reservations', labelAr: 'إخفاء زر «إظهار/إخفاء الأعمدة» في جدول الحجوزات', labelEn: 'Hide "Toggle Columns" button in Reservations' },
@@ -6149,6 +6665,19 @@
     }
   };
 
+  var UI_FLAG_ALIASES = {
+    hideResRejectBtn: 'hideResRejectActionBtn',
+    hideResRejectActionBtn: 'hideResRejectBtn',
+    hideResCancelBtn: 'hideResCancelActionBtn',
+    hideResCancelActionBtn: 'hideResCancelBtn',
+    hideResIdLookup: 'hideResCustomerIdLookupBtn',
+    hideResCustomerIdLookupBtn: 'hideResIdLookup'
+  };
+
+  function toBoolFlagVal(val) {
+    return val === true || val === 'true' || val === 1;
+  }
+
   function normalizeUiSimplificationSettings(raw) {
     var input = raw;
     if (typeof raw === 'string') {
@@ -6166,11 +6695,12 @@
     var base = TEAM_UI_PRESETS[presetId] || TEAM_UI_PRESETS.full;
 
     function pickBool(key) {
-      if (presetId !== 'custom' && obj[key] === undefined) {
-        return Boolean(base[key]);
-      }
       if (obj[key] !== undefined) {
-        return obj[key] === true || obj[key] === 'true' || obj[key] === 1;
+        return toBoolFlagVal(obj[key]);
+      }
+      var alias = UI_FLAG_ALIASES[key];
+      if (alias && obj[alias] !== undefined) {
+        return toBoolFlagVal(obj[alias]);
       }
       return Boolean(base[key]);
     }
@@ -6178,7 +6708,12 @@
     var normalized = { preset: presetId };
     for (var i = 0; i < UI_SIMPLIFICATION_OPTIONS.length; i++) {
       var k = UI_SIMPLIFICATION_OPTIONS[i].key;
-      normalized[k] = pickBool(k);
+      var val = pickBool(k);
+      normalized[k] = val;
+      var aliasKey = UI_FLAG_ALIASES[k];
+      if (aliasKey) {
+        normalized[aliasKey] = val;
+      }
     }
     return normalized;
   }
@@ -6222,22 +6757,148 @@
     return out;
   }
 
+  var UI_OVERRIDE_META_KEYS = {
+    hiddenKeys: true,
+    shownKeys: true,
+    hidden: true,
+    shown: true,
+    flags: true,
+    visibleCols: true,
+    defaultRoute: true,
+    updatedAt: true,
+    updatedBy: true
+  };
+
+  function normalizeUiOverrides(raw) {
+    var input = raw;
+    if (typeof raw === 'string') {
+      try { input = JSON.parse(raw); } catch (_e) { input = {}; }
+    }
+    var obj = (input && typeof input === 'object' && !Array.isArray(input)) ? input : {};
+    var hiddenSeen = {};
+    var hiddenKeys = [];
+    var rawHidden = Array.isArray(obj.hiddenKeys) ? obj.hiddenKeys : (Array.isArray(obj.hidden) ? obj.hidden : []);
+    for (var i = 0; i < rawHidden.length; i++) {
+      var hk = normalizeStr(rawHidden[i]);
+      if (hk && !hiddenSeen[hk]) { hiddenSeen[hk] = true; hiddenKeys.push(hk); }
+    }
+    var shownSeen = {};
+    var shownKeys = [];
+    var rawShown = Array.isArray(obj.shownKeys) ? obj.shownKeys : (Array.isArray(obj.shown) ? obj.shown : []);
+    for (var j = 0; j < rawShown.length; j++) {
+      var sk = normalizeStr(rawShown[j]);
+      if (sk && !hiddenSeen[sk] && !shownSeen[sk]) { shownSeen[sk] = true; shownKeys.push(sk); }
+    }
+    var flags = {};
+    var flagsSrc = (obj.flags && typeof obj.flags === 'object' && !Array.isArray(obj.flags)) ? obj.flags : {};
+    var fKeys = Object.keys(flagsSrc);
+    for (var fi = 0; fi < fKeys.length; fi++) {
+      var fk = normalizeStr(fKeys[fi]);
+      if (fk && typeof flagsSrc[fKeys[fi]] === 'boolean') {
+        flags[fk] = flagsSrc[fKeys[fi]];
+        if (UI_FLAG_ALIASES[fk] && flags[UI_FLAG_ALIASES[fk]] === undefined) {
+          flags[UI_FLAG_ALIASES[fk]] = flagsSrc[fKeys[fi]];
+        }
+      }
+    }
+    var topKeys = Object.keys(obj);
+    for (var ti = 0; ti < topKeys.length; ti++) {
+      var tk = normalizeStr(topKeys[ti]);
+      if (!tk || UI_OVERRIDE_META_KEYS[tk]) continue;
+      if (typeof obj[topKeys[ti]] === 'boolean') {
+        flags[tk] = obj[topKeys[ti]];
+        if (UI_FLAG_ALIASES[tk] && flags[UI_FLAG_ALIASES[tk]] === undefined) {
+          flags[UI_FLAG_ALIASES[tk]] = obj[topKeys[ti]];
+        }
+      }
+    }
+    var rawCols = Array.isArray(obj.visibleCols) ? obj.visibleCols.map(normalizeStr).filter(Boolean) : [];
+    var colsOut = null;
+    if (rawCols.length) {
+      var colSeen = {};
+      colsOut = [];
+      for (var ci = 0; ci < rawCols.length; ci++) {
+        if (!colSeen[rawCols[ci]]) { colSeen[rawCols[ci]] = true; colsOut.push(rawCols[ci]); }
+      }
+    }
+    var out = {
+      hiddenKeys: hiddenKeys,
+      shownKeys: shownKeys,
+      flags: flags,
+      visibleCols: colsOut,
+      defaultRoute: normalizeStr(obj.defaultRoute),
+      updatedAt: normalizeStr(obj.updatedAt),
+      updatedBy: normalizeStr(obj.updatedBy)
+    };
+    var outFlagKeys = Object.keys(flags);
+    for (var ofi = 0; ofi < outFlagKeys.length; ofi++) {
+      out[outFlagKeys[ofi]] = flags[outFlagKeys[ofi]];
+    }
+    return out;
+  }
+
   function resolveRoleUiDefaultsForUser(user, roleUiDefaults, globalUiSimp) {
     var role = (user && user.role) ? normalizeStr(user.role) : ROLES.AGENT;
+    if (role === ROLES.DEVELOPER) {
+      var cleanDevUi = normalizeUiSimplificationSettings({ preset: 'full' });
+      for (var di = 0; di < UI_SIMPLIFICATION_OPTIONS.length; di++) {
+        var dk = UI_SIMPLIFICATION_OPTIONS[di].key;
+        cleanDevUi[dk] = false;
+        if (UI_FLAG_ALIASES[dk]) cleanDevUi[UI_FLAG_ALIASES[dk]] = false;
+      }
+      return {
+        role: role,
+        hasRoleOverride: false,
+        hasEmployeeOverride: false,
+        forceForRole: false,
+        uiSimplification: cleanDevUi,
+        uiOverrides: normalizeUiOverrides({}),
+        visibleCols: DEFAULT_RESERVATIONS_VISIBLE_COLS.slice()
+      };
+    }
     var normDefaults = normalizeRoleUiDefaults(roleUiDefaults);
     var cfg = normDefaults[role] || normDefaults[ROLES.AGENT];
     var baseGlobal = normalizeUiSimplificationSettings(globalUiSimp);
-    var effectiveUi = (cfg && cfg.enabled && cfg.uiSimplification)
+    var roleUi = (cfg && cfg.enabled && cfg.uiSimplification)
       ? cfg.uiSimplification
       : baseGlobal;
+    var effectiveUi = Object.assign({}, roleUi);
+    var empOverrides = normalizeUiOverrides(user && user.uiOverrides);
+    for (var i = 0; i < empOverrides.hiddenKeys.length; i++) {
+      var hk = empOverrides.hiddenKeys[i];
+      if (Object.prototype.hasOwnProperty.call(effectiveUi, hk)) {
+        effectiveUi[hk] = true;
+        if (UI_FLAG_ALIASES[hk]) effectiveUi[UI_FLAG_ALIASES[hk]] = true;
+      }
+    }
+    for (var j = 0; j < empOverrides.shownKeys.length; j++) {
+      var sk = empOverrides.shownKeys[j];
+      if (Object.prototype.hasOwnProperty.call(effectiveUi, sk)) {
+        effectiveUi[sk] = false;
+        if (UI_FLAG_ALIASES[sk]) effectiveUi[UI_FLAG_ALIASES[sk]] = false;
+      }
+    }
+    var flagKeys = Object.keys(empOverrides.flags);
+    for (var k = 0; k < flagKeys.length; k++) {
+      var fk = flagKeys[k];
+      effectiveUi[fk] = empOverrides.flags[fk];
+      if (UI_FLAG_ALIASES[fk]) {
+        effectiveUi[UI_FLAG_ALIASES[fk]] = empOverrides.flags[fk];
+      }
+    }
+    var visibleCols = (empOverrides.visibleCols && empOverrides.visibleCols.length)
+      ? empOverrides.visibleCols.slice()
+      : ((cfg && Array.isArray(cfg.visibleCols) && cfg.visibleCols.length)
+        ? cfg.visibleCols.slice()
+        : DEFAULT_RESERVATIONS_VISIBLE_COLS.slice());
     return {
       role: role,
       hasRoleOverride: Boolean(cfg && cfg.enabled),
+      hasEmployeeOverride: Boolean(empOverrides.hiddenKeys.length || empOverrides.shownKeys.length || flagKeys.length || empOverrides.visibleCols),
       forceForRole: Boolean(cfg && cfg.enabled && cfg.forceForRole),
       uiSimplification: effectiveUi,
-      visibleCols: (cfg && Array.isArray(cfg.visibleCols) && cfg.visibleCols.length)
-        ? cfg.visibleCols.slice()
-        : DEFAULT_RESERVATIONS_VISIBLE_COLS.slice()
+      uiOverrides: empOverrides,
+      visibleCols: visibleCols
     };
   }
 
@@ -6509,6 +7170,8 @@
     getDashboard: true,
     getTodayAndRadar: true,
     getReservations: true,
+    getInactiveReservations: true,
+    searchCustomerByNationalId: true,
     getReservationDetails: true,
     getMyFollowUps: true,
     getTeamFollowUps: true,
@@ -6962,7 +7625,7 @@
     return visible ? 'إخفاء مؤشر نسبة المشكلات' : 'إظهار مؤشر نسبة المشكلات';
   }
 
-  var NAV_ROUTE_IDS = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var NAV_ROUTE_IDS = ['dashboard', 'reservations', 'inactive-reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
   var PROTECTED_NAV_ROUTES = ['dashboard', 'settings'];
 
   var DASHBOARD_SECTION_DEFS = [
@@ -8025,6 +8688,7 @@
       (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
       (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
       (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+      (Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0) ||
       (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
       (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
       (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0) ||
@@ -8525,6 +9189,7 @@
     REPORT_COLUMNS_BY_TYPE: REPORT_COLUMNS_BY_TYPE,
     translateOriginalStatus: translateOriginalStatus,
     extractSourceReservationId: extractSourceReservationId,
+    extractCustomerNationalId: extractCustomerNationalId,
     extractReservationNumber: extractReservationNumber,
     extractReservationStatusCode: extractReservationStatusCode,
     shouldAutoReconcileSyncedStatus: shouldAutoReconcileSyncedStatus,
@@ -8708,9 +9373,24 @@
     formatProblemRateToggleLabel: formatProblemRateToggleLabel,
     NAV_ROUTE_IDS: NAV_ROUTE_IDS,
     SUBSECTION_VIEW_PERMISSION_KEYS: SUBSECTION_VIEW_PERMISSION_KEYS,
+    EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS: EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS,
     canUserViewSubSection: canUserViewSubSection,
     ACTION_BUTTON_PERMISSION_KEYS: ACTION_BUTTON_PERMISSION_KEYS,
     canUserUseActionButton: canUserUseActionButton,
+    canUserViewCustomerId: canUserViewCustomerId,
+    normalizeNationalId: normalizeNationalId,
+    REJECTED_STATUS_VALUES: REJECTED_STATUS_VALUES,
+    CANCELLED_STATUS_VALUES: CANCELLED_STATUS_VALUES,
+    REJECTION_REASONS_LIST: REJECTION_REASONS_LIST,
+    CANCELLATION_REASONS_LIST: CANCELLATION_REASONS_LIST,
+    CAR_STATUS_AT_REQUEST_OPTIONS: CAR_STATUS_AT_REQUEST_OPTIONS,
+    isRejectedStatus: isRejectedStatus,
+    isCancelledStatus: isCancelledStatus,
+    isInactiveReservation: isInactiveReservation,
+    getReservationLifecycleKind: getReservationLifecycleKind,
+    redactReservationSensitiveFields: redactReservationSensitiveFields,
+    groupCustomerLookupResults: groupCustomerLookupResults,
+    normalizeUiOverrides: normalizeUiOverrides,
     EMPLOYEE_SECTION_GROUPS: EMPLOYEE_SECTION_GROUPS,
     ensureSectionPermissionSentinels: ensureSectionPermissionSentinels,
     applyEmployeeSectionToggle: applyEmployeeSectionToggle,

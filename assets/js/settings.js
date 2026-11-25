@@ -141,7 +141,13 @@
     var canAccessApi = root.RGCrmCore.canAccessApi(user);
     var canSync = root.RGCrmCore.canUserPerform(user, 'sync_data');
     var canManageSettings = root.RGCrmCore.canUserPerform(user, 'manage_settings');
-    var canManageRoleUiDefaults = root.RGCrmCore.canUserPerform(user, 'manage_role_ui_defaults') || canManageSettings;
+    var canCustomizeUi = Boolean(user && (
+      user.role === 'developer' ||
+      user.role === 'general_manager' ||
+      root.RGCrmCore.canUserPerform(user, 'customize_ui') ||
+      root.RGCrmCore.canUserPerform(user, 'manage_role_ui_defaults')
+    ));
+    var canManageRoleUiDefaults = canCustomizeUi || canManageSettings;
     var cachedEmpData = root.RGApi.getCachedData ? root.RGApi.getCachedData('getEmployees', {}, true) : null;
     var personalCardHtml = buildPersonalAccountCardHtml(user, ctx);
 
@@ -531,47 +537,51 @@
         '</div>' +
       '</form>' +
 
-      (canManageSettings ? (
+      ((canManageSettings || canManageRoleUiDefaults) ? (
         '<form class="surface-card" id="sys-settings-form">' +
-          '<div class="section-header"><div><h2 class="section-title">' + t('nav_settings') + ' العامة والتحديث التلقائي</h2><p class="section-subtitle">تُحفظ الإعدادات مركزيًا وتُحدّث مؤقت Apps Script تلقائيًا.</p></div></div>' +
-          '<div class="form-grid-2">' +
-            '<div class="form-group"><label class="form-label" for="set-company">اسم الشركة</label><input class="input" id="set-company" value="' + escapeHtml(settings.company_name || 'RENTAL GATE') + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="set-ttl">مدة صلاحية الجلسة (ساعات)</label><input class="input tabular-nums" type="number" min="1" max="168" id="set-ttl" value="' + (settings.session_ttl_hours || 24) + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="set-excluded">الحالات المستبعدة أثناء السحب (مفصولة بفاصلة)</label><input class="input mono" id="set-excluded" value="' + escapeHtml(Array.isArray(settings.excluded_statuses) ? settings.excluded_statuses.join(', ') : 'draft, test, abandoned') + '"></div>' +
-            '<div class="form-group" style="justify-content:center;"><label class="checkbox-item"><input type="checkbox" id="set-agent-all"' + (settings.allow_agent_view_all ? ' checked' : '') + '> السماح لموظف خدمة العملاء باستعراض جميع الحجوزات</label></div>' +
+          '<div class="section-header"><div><h2 class="section-title">' + (canManageSettings ? (t('nav_settings') + ' العامة والتحديث التلقائي') : 'تخصيص الواجهة وإظهار/إخفاء الأقسام') + '</h2><p class="section-subtitle">' + (canManageSettings ? 'تُحفظ الإعدادات مركزيًا وتُحدّث مؤقت Apps Script تلقائيًا.' : 'إدارة ظهور وإخفاء الأقسام والأزرار وإعدادات كل دور.') + '</p></div>' +
+            (canCustomizeUi && !isDeveloperUser ? '<button type="button" class="btn btn-sm" id="btn-dev-open-sections">تخصيص الأقسام والواجهة لكل موظف</button>' : '') +
           '</div>' +
+          (canManageSettings ? (
+            '<div class="form-grid-2">' +
+              '<div class="form-group"><label class="form-label" for="set-company">اسم الشركة</label><input class="input" id="set-company" value="' + escapeHtml(settings.company_name || 'RENTAL GATE') + '"></div>' +
+              '<div class="form-group"><label class="form-label" for="set-ttl">مدة صلاحية الجلسة (ساعات)</label><input class="input tabular-nums" type="number" min="1" max="168" id="set-ttl" value="' + (settings.session_ttl_hours || 24) + '"></div>' +
+              '<div class="form-group"><label class="form-label" for="set-excluded">الحالات المستبعدة أثناء السحب (مفصولة بفاصلة)</label><input class="input mono" id="set-excluded" value="' + escapeHtml(Array.isArray(settings.excluded_statuses) ? settings.excluded_statuses.join(', ') : 'draft, test, abandoned') + '"></div>' +
+              '<div class="form-group" style="justify-content:center;"><label class="checkbox-item"><input type="checkbox" id="set-agent-all"' + (settings.allow_agent_view_all ? ' checked' : '') + '> السماح لموظف خدمة العملاء باستعراض جميع الحجوزات</label></div>' +
+            '</div>' +
 
-          '<div style="margin-top:16px;padding:14px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-            '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">' +
-              '<div><strong style="font-size:14px;">إعدادات التحديث التلقائي من Rental Gate API</strong>' +
-              '<div style="font-size:12px;color:var(--text-muted);">يعمل تلقائيًا كل 12 ساعة افتراضيًا عبر Trigger في Google Apps Script، ويمكنك تعديل الفترة بالساعات والدقائق هنا.</div></div>' +
-              '<label class="checkbox-item" style="font-weight:700;"><input type="checkbox" id="set-auto-sync-enabled"' + (autoSyncEnabled ? ' checked' : '') + '> تفعيل التحديث التلقائي</label>' +
-            '</div>' +
-            '<div class="form-grid-2" style="align-items:end;">' +
-              '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">' +
-                '<div class="form-group">' +
-                  '<label class="form-label" for="set-auto-sync-hours">فترة التحديث (الساعات)</label>' +
-                  '<input class="input tabular-nums" type="number" min="0" max="168" id="set-auto-sync-hours" value="' + autoSyncHours + '">' +
+            '<div style="margin-top:16px;padding:14px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
+              '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">' +
+                '<div><strong style="font-size:14px;">إعدادات التحديث التلقائي من Rental Gate API</strong>' +
+                '<div style="font-size:12px;color:var(--text-muted);">يعمل تلقائيًا كل 12 ساعة افتراضيًا عبر Trigger في Google Apps Script، ويمكنك تعديل الفترة بالساعات والدقائق هنا.</div></div>' +
+                '<label class="checkbox-item" style="font-weight:700;"><input type="checkbox" id="set-auto-sync-enabled"' + (autoSyncEnabled ? ' checked' : '') + '> تفعيل التحديث التلقائي</label>' +
+              '</div>' +
+              '<div class="form-grid-2" style="align-items:end;">' +
+                '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">' +
+                  '<div class="form-group">' +
+                    '<label class="form-label" for="set-auto-sync-hours">فترة التحديث (الساعات)</label>' +
+                    '<input class="input tabular-nums" type="number" min="0" max="168" id="set-auto-sync-hours" value="' + autoSyncHours + '">' +
+                  '</div>' +
+                  '<div class="form-group">' +
+                    '<label class="form-label" for="set-auto-sync-minutes">فترة التحديث (الدقائق)</label>' +
+                    '<input class="input tabular-nums" type="number" min="0" max="59" id="set-auto-sync-minutes" value="' + autoSyncMinutes + '">' +
+                  '</div>' +
                 '</div>' +
                 '<div class="form-group">' +
-                  '<label class="form-label" for="set-auto-sync-minutes">فترة التحديث (الدقائق)</label>' +
-                  '<input class="input tabular-nums" type="number" min="0" max="59" id="set-auto-sync-minutes" value="' + autoSyncMinutes + '">' +
+                  '<span class="form-label">اختيارات سريعة</span>' +
+                  '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 5 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="5">كل 5 دقائق</button>' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 15 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="15">كل 15 دقيقة</button>' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 30 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="30">كل 30 دقيقة</button>' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 1 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="1" data-minutes="0">كل ساعة</button>' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 6 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="6" data-minutes="0">كل 6 ساعات</button>' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 12 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="12" data-minutes="0">كل 12 ساعة (الافتراضي)</button>' +
+                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 24 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="24" data-minutes="0">كل 24 ساعة</button>' +
+                  '</div>' +
                 '</div>' +
               '</div>' +
-              '<div class="form-group">' +
-                '<span class="form-label">اختيارات سريعة</span>' +
-                '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 5 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="5">كل 5 دقائق</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 15 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="15">كل 15 دقيقة</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 30 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="30">كل 30 دقيقة</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 1 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="1" data-minutes="0">كل ساعة</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 6 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="6" data-minutes="0">كل 6 ساعات</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 12 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="12" data-minutes="0">كل 12 ساعة (الافتراضي)</button>' +
-                  '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 24 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="24" data-minutes="0">كل 24 ساعة</button>' +
-                '</div>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
+            '</div>'
+          ) : '') +
 
           '<div class="rg-ui-simp-panel" id="set-ui-simplification-panel">' +
             '<div class="rg-ui-simp-header">' +
@@ -598,6 +608,7 @@
               '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
                 '<button type="button" class="btn btn-sm" id="btn-ui-show-all">إظهار الكل</button>' +
                 '<button type="button" class="btn btn-sm btn-danger" id="btn-ui-hide-all">إخفاء الكل</button>' +
+                '<button type="button" class="btn btn-sm" id="btn-ui-restore-defaults">استعادة الإعدادات الافتراضية</button>' +
               '</div>' +
             '</div>' +
             '<div class="rg-ui-groups-stack" id="set-ui-flags-grid">' +
@@ -652,25 +663,27 @@
 
           '<div style="margin-top:14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-              '<button type="submit" class="btn btn-primary" id="btn-save-sys-settings">حفظ الإعدادات وتحديث المزامنة التلقائية</button>' +
+              '<button type="submit" class="btn btn-primary" id="btn-save-sys-settings">' + (canManageSettings ? 'حفظ الإعدادات وتحديث المزامنة التلقائية' : 'حفظ تخصيصات الواجهة والأدوار') + '</button>' +
               (canPreviewSettings
                 ? '<button type="button" class="btn rg-preview-inline-btn" id="btn-preview-role-defaults">👁️ معاينة النظام بدور: موظف خدمة العملاء</button>'
                 : '') +
             '</div>' +
           '</div>' +
         '</form>' +
-        '<div class="surface-card rg-ui-set-danger" id="danger-zone-reservations-card" style="border-top:3px solid var(--status-danger-text, #f43f5e);">' +
-          '<div class="section-header" style="margin-bottom:8px;">' +
-            '<div>' +
-              '<h2 class="section-title" style="color:var(--status-danger-text, #f43f5e);">إدارة بيانات الحجوزات (الاستيراد والحذف الآمن)</h2>' +
-              '<p class="section-subtitle">استورد الحجوزات مباشرة من ملف Excel، أو احذف الحجوزات حسب شهر محدد أو سنة محددة أو الكل مع تصدير نسخة Excel احتياطية تلقائياً قبل المسح.</p>' +
+        (canManageSettings ? (
+          '<div class="surface-card rg-ui-set-danger" id="danger-zone-reservations-card" style="border-top:3px solid var(--status-danger-text, #f43f5e);">' +
+            '<div class="section-header" style="margin-bottom:8px;">' +
+              '<div>' +
+                '<h2 class="section-title" style="color:var(--status-danger-text, #f43f5e);">إدارة بيانات الحجوزات (الاستيراد والحذف الآمن)</h2>' +
+                '<p class="section-subtitle">استورد الحجوزات مباشرة من ملف Excel، أو احذف الحجوزات حسب شهر محدد أو سنة محددة أو الكل مع تصدير نسخة Excel احتياطية تلقائياً قبل المسح.</p>' +
+              '</div>' +
+              '<div class="toolbar-row" style="margin-bottom:0;">' +
+                '<button type="button" class="btn" id="btn-import-excel-reservations">استيراد حجوزات من Excel</button>' +
+                '<button type="button" class="btn btn-danger" id="btn-delete-all-reservations">حذف الحجوزات (شهر / سنة / الكل)</button>' +
+              '</div>' +
             '</div>' +
-            '<div class="toolbar-row" style="margin-bottom:0;">' +
-              '<button type="button" class="btn" id="btn-import-excel-reservations">استيراد حجوزات من Excel</button>' +
-              '<button type="button" class="btn btn-danger" id="btn-delete-all-reservations">حذف الحجوزات (شهر / سنة / الكل)</button>' +
-            '</div>' +
-          '</div>' +
-        '</div>'
+          '</div>'
+        ) : '')
       ) : '');
 
     bindPersonalAccountCard(container, ctx);
@@ -1255,6 +1268,31 @@
       });
     }
 
+    var uiRestoreBtn = document.getElementById('btn-ui-restore-defaults');
+    if (uiRestoreBtn) {
+      uiRestoreBtn.addEventListener('click', function () {
+        runWithLock(uiRestoreBtn, 'restoreUiDefaults:all', async function () {
+          var res = await root.RGApi.callApi('restoreUiDefaults', { scope: 'all', clearEmployees: false, _spamChecked: true });
+          if (!res || !res.success) {
+            ctx.toast((res && res.message) || 'تعذر استعادة الإعدادات الافتراضية.', true);
+            return;
+          }
+          var d = res.data || {};
+          if (d.role_ui_defaults) {
+            if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(d.role_ui_defaults);
+            else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(d.role_ui_defaults);
+          }
+          if (d.ui_simplification) {
+            if (ctx.applyUiSimplification) ctx.applyUiSimplification(d.ui_simplification);
+            else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(d.ui_simplification);
+          }
+          clearSettingsUnsavedGuard();
+          ctx.toast('تمت استعادة الإعدادات الافتراضية للواجهة بنجاح.');
+          render(container, ctx);
+        });
+      });
+    }
+
     container.querySelectorAll('.rg-ui-group-show-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var grpId = btn.getAttribute('data-group');
@@ -1340,6 +1378,7 @@
           '<div class="rg-role-toggles-row">' +
             '<label class="checkbox-item" style="font-weight:700;"><input type="checkbox" id="role-ui-enabled"' + (curCfg.enabled ? ' checked' : '') + '> تفعيل إعدادات واجهة خاصة بهذا الدور</label>' +
             '<label class="checkbox-item"><input type="checkbox" id="role-ui-force"' + (curCfg.forceForRole ? ' checked' : '') + '> فرض الأعمدة والإعدادات ومنع التجاوز المحلي للموظفين</label>' +
+            '<button type="button" class="btn btn-sm" id="btn-role-ui-restore-tab">استعادة الافتراضي لهذا الدور</button>' +
           '</div>' +
           '<div class="rg-role-jobs-strip">' +
             '<div class="rg-role-jobs-head"><strong>الوظائف المرتبطة بهذا الدور (' + matchingJobs.length + '):</strong></div>' +
@@ -1439,6 +1478,32 @@
             d.enabled = true;
             renderRoleDefaultsEditor();
           }
+        });
+      }
+      var roleRestoreTabBtn = document.getElementById('btn-role-ui-restore-tab');
+      if (roleRestoreTabBtn) {
+        roleRestoreTabBtn.addEventListener('click', function () {
+          runWithLock(roleRestoreTabBtn, 'restoreRoleUi:' + activeRoleDefaultTab, async function () {
+            var res = await root.RGApi.callApi('restoreUiDefaults', {
+              scope: 'role',
+              role: activeRoleDefaultTab,
+              _spamChecked: true
+            });
+            if (!res || !res.success) {
+              ctx.toast((res && res.message) || 'تعذر استعادة الافتراضي لهذا الدور.', true);
+              return;
+            }
+            var d = res.data || {};
+            if (d.role_ui_defaults) {
+              roleUiDefaultsDraft = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+                ? root.RGCrmCore.normalizeRoleUiDefaults(d.role_ui_defaults)
+                : d.role_ui_defaults;
+              if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(roleUiDefaultsDraft);
+              else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(roleUiDefaultsDraft);
+            }
+            ctx.toast('تمت استعادة الإعدادات الافتراضية لهذا الدور.');
+            renderRoleDefaultsEditor();
+          });
         });
       }
       if (rPreset) {
@@ -1545,6 +1610,45 @@
     }
 
     async function saveSystemSettingsCore(skipReload) {
+      var nextUiRaw = {
+        preset: uiPresetSelect ? uiPresetSelect.value : 'full'
+      };
+      uiFlagEls.forEach(function (chk) {
+        var key = chk.getAttribute('data-ui-key');
+        if (key) nextUiRaw[key] = Boolean(chk.checked);
+      });
+      var normUiSimp = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
+        ? root.RGCrmCore.normalizeUiSimplificationSettings(nextUiRaw)
+        : nextUiRaw;
+      var normRoleDefaults = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
+        ? root.RGCrmCore.normalizeRoleUiDefaults(roleUiDefaultsDraft)
+        : roleUiDefaultsDraft;
+
+      var prevUiSimp = (root.RGApp && root.RGApp.getUiSimplification) ? root.RGApp.getUiSimplification() : null;
+      var prevRoleDefaults = (root.RGApp && root.RGApp.getRoleUiDefaults) ? root.RGApp.getRoleUiDefaults() : null;
+
+      if (!canManageSettings) {
+        if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(normRoleDefaults);
+        else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(normRoleDefaults);
+        if (ctx.applyUiSimplification) ctx.applyUiSimplification(normUiSimp);
+        else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(normUiSimp);
+        clearSettingsUnsavedGuard();
+        var uiOnlyRes = await root.RGApi.callApi('saveRoleUiDefaults', {
+          ui_simplification: normUiSimp,
+          role_ui_defaults: normRoleDefaults,
+          _spamChecked: true
+        });
+        if (uiOnlyRes && uiOnlyRes.success) {
+          ctx.toast('تم حفظ تخصيصات الواجهة وإعدادات الأدوار بنجاح.');
+          if (!skipReload) render(container, ctx);
+          return true;
+        }
+        if (prevRoleDefaults && ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(prevRoleDefaults);
+        if (prevUiSimp && ctx.applyUiSimplification) ctx.applyUiSimplification(prevUiSimp);
+        ctx.toast((uiOnlyRes && uiOnlyRes.message) || 'تعذر حفظ تخصيصات الواجهة.', true);
+        return false;
+      }
+
       var hoursEl = document.getElementById('set-auto-sync-hours');
       var minutesEl = document.getElementById('set-auto-sync-minutes');
       var rawHours = Number(hoursEl && hoursEl.value !== '' ? hoursEl.value : 0);
@@ -1561,23 +1665,7 @@
         ? root.RGCrmCore.normalizeAutoSyncInterval(rawHours, rawMinutes)
         : { hours: Math.max(0, Math.min(168, Math.round(rawHours || 0))), minutes: Math.max(0, Math.min(59, Math.round(rawMinutes || 0))) };
 
-      var nextUiRaw = {
-        preset: uiPresetSelect ? uiPresetSelect.value : 'full'
-      };
-      uiFlagEls.forEach(function (chk) {
-        var key = chk.getAttribute('data-ui-key');
-        if (key) nextUiRaw[key] = Boolean(chk.checked);
-      });
-      var normUiSimp = (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
-        ? root.RGCrmCore.normalizeUiSimplificationSettings(nextUiRaw)
-        : nextUiRaw;
-      var normRoleDefaults = (root.RGCrmCore && root.RGCrmCore.normalizeRoleUiDefaults)
-        ? root.RGCrmCore.normalizeRoleUiDefaults(roleUiDefaultsDraft)
-        : roleUiDefaultsDraft;
-
       var excluded = (document.getElementById('set-excluded').value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-      var prevUiSimp = (root.RGApp && root.RGApp.getUiSimplification) ? root.RGApp.getUiSimplification() : null;
-      var prevRoleDefaults = (root.RGApp && root.RGApp.getRoleUiDefaults) ? root.RGApp.getRoleUiDefaults() : null;
 
       if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(normRoleDefaults);
       else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(normRoleDefaults);

@@ -234,9 +234,15 @@
     var selectedResIds = state.selectedResIds;
     var canViewTodayTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_today_tab');
     var canViewRadarTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_radar_tab');
-    if (state.viewMode !== 'radar' && state.viewMode !== 'today') state.viewMode = 'all';
+    var canViewRejectedTab = Boolean(
+      root.RGInactive &&
+      (!root.RGCrmCore || !root.RGCrmCore.canUserPerform || root.RGCrmCore.canUserPerform(currentUser, 'view_inactive_reservations')) &&
+      (!root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_rejected_tab'))
+    );
+    if (state.viewMode !== 'radar' && state.viewMode !== 'today' && state.viewMode !== 'rejected') state.viewMode = 'all';
     if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'all';
     if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'all';
+    if (state.viewMode === 'rejected' && !canViewRejectedTab) state.viewMode = 'all';
     ctx.state.reservations = state;
     if (ctx.saveRouteFilters) ctx.saveRouteFilters();
 
@@ -245,7 +251,7 @@
       var base = (core && core.buildReservationQueryPayload)
         ? core.buildReservationQueryPayload(state)
         : Object.assign({ page: 1, pageSize: 20 }, state);
-      return extra ? Object.assign({}, base, extra) : base;
+      return extra ? Object.assign({ lifecycle: 'active' }, base, extra) : Object.assign({ lifecycle: 'active' }, base);
     }
 
     function checkHasActiveResFilters() {
@@ -291,6 +297,21 @@
     var canResColumns = canAction('act_res_columns');
     var canExportExcel = canAction('act_export_excel');
     var canClaimButtons = canAction('act_claim_reservation');
+    var canRejectBtn = Boolean(
+      root.RGInactive && currentUser && root.RGCrmCore &&
+      root.RGCrmCore.canUserPerform(currentUser, 'reject_reservation') &&
+      canAction('act_reject_reservation')
+    );
+    var canCancelBtn = Boolean(
+      root.RGInactive && currentUser && root.RGCrmCore &&
+      root.RGCrmCore.canUserPerform(currentUser, 'cancel_reservation') &&
+      canAction('act_cancel_reservation')
+    );
+    var canLookupIdBtn = Boolean(
+      root.RGInactive && currentUser && root.RGCrmCore &&
+      (!root.RGCrmCore.canUserViewCustomerId || root.RGCrmCore.canUserViewCustomerId(currentUser)) &&
+      canAction('act_customer_id_lookup')
+    );
     var isGeneralManager = Boolean(
       currentUser &&
       (currentUser.role === root.RGCrmCore.ROLES.GENERAL_MANAGER ||
@@ -346,6 +367,7 @@
             '<p class="section-subtitle">' + (isEn ? 'Matching results:' : 'إجمالي النتائج المطابقة:') + ' <strong class="tabular-nums" id="res-total-count">' + payload.total + '</strong> · ' + (isEn ? 'Claim bookings, track pickups/returns & calendar, or monitor 24h expiry radar' : 'يمكنك استلام أي حجز، متابعة التسليم والاستلام والتقويم، أو مراقبة رادار الانتهاء') + '</p>' +
           '</div>' +
           '<div class="toolbar-row" style="margin-bottom:0;">' +
+            (canLookupIdBtn ? '<button type="button" class="btn btn-sm btn-charcoal rg-ui-res-id-lookup" id="res-id-lookup-btn">🪪 ' + (isEn ? 'National ID Lookup' : 'بحث برقم الهوية') + '</button>' : '') +
             (canHandoverPdf ? '<button type="button" class="btn btn-sm rg-ui-handover-btn" id="res-handover-btn">' + (isEn ? 'Shift Handover (PDF)' : 'تسليم الوردية (PDF)') + '</button>' : '') +
             (canPullReservations ? '<button type="button" class="btn btn-charcoal rg-ui-res-pull-btn" id="res-pull-btn" title="جلب أحدث الحجوزات والتمديدات">' + t('pull_reservations') + '</button>' : '') +
             (canImportExcel ? '<button type="button" class="btn rg-ui-res-import-btn" id="res-import-xlsx">' + (isEn ? 'Import Excel' : 'استيراد من Excel') + '</button>' : '') +
@@ -367,6 +389,12 @@
             '<button type="button" class="res-view-tab' + (state.viewMode === 'radar' ? ' is-active' : '') + '" data-res-view="radar" role="tab" aria-selected="' + (state.viewMode === 'radar') + '">' +
               '<span>' + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات (24 ساعة)') + '</span>' +
               '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
+            '</button>'
+          ) : '') +
+          (canViewRejectedTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'rejected' ? ' is-active' : '') + '" data-res-view="rejected" role="tab" aria-selected="' + (state.viewMode === 'rejected') + '">' +
+              '<span>' + (isEn ? 'Rejected Reservations' : 'الحجوزات المرفوضة') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="rejected-tab-count" id="res-rejected-tab-count">—</span>' +
             '</button>'
           ) : '') +
         '</div>' +
@@ -463,6 +491,7 @@
         '</div>' +
         '<div id="res-today-view"' + (state.viewMode === 'today' ? '' : ' class="hidden"') + '></div>' +
         '<div id="res-radar-view"' + (state.viewMode === 'radar' ? '' : ' class="hidden"') + '></div>' +
+        '<div id="res-rejected-view"' + (state.viewMode === 'rejected' ? '' : ' class="hidden"') + '></div>' +
       '</div>';
 
     var activeFetchSeq = 0;
@@ -680,6 +709,8 @@
                 '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   claimBtnHtml +
                   '<button type="button" class="btn btn-sm btn-primary btn-open-res" data-id="' + esc(r.id) + '">التفاصيل</button>' +
+                  (canRejectBtn ? '<button type="button" class="btn btn-sm btn-danger btn-reject-res rg-ui-res-reject-btn" data-id="' + esc(r.id) + '">رفض</button>' : '') +
+                  (canCancelBtn ? '<button type="button" class="btn btn-sm btn-cancel-res rg-ui-res-cancel-btn" data-id="' + esc(r.id) + '">إلغاء</button>' : '') +
                 '</div></td>' +
               '</tr>';
             }).join('') +
@@ -1101,6 +1132,30 @@
         });
       });
 
+      region.querySelectorAll('.btn-reject-res').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var rid = btn.getAttribute('data-id');
+          var match = currentItems.find(function (x) { return x && x.id === rid; });
+          if (match && root.RGInactive && root.RGInactive.openRejectModal) {
+            root.RGInactive.openRejectModal(match, ctx, function (updatedRes) {
+              syncLocalReservationSnapshot(updatedRes);
+            });
+          }
+        });
+      });
+
+      region.querySelectorAll('.btn-cancel-res').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var rid = btn.getAttribute('data-id');
+          var match = currentItems.find(function (x) { return x && x.id === rid; });
+          if (match && root.RGInactive && root.RGInactive.openCancelModal) {
+            root.RGInactive.openCancelModal(match, ctx, function (updatedRes) {
+              syncLocalReservationSnapshot(updatedRes);
+            });
+          }
+        });
+      });
+
       var clearSearchEmptyBtn = region.querySelector('#res-empty-clear-search');
       if (clearSearchEmptyBtn) {
         clearSearchEmptyBtn.addEventListener('click', function () {
@@ -1277,7 +1332,16 @@
         }
         if (it && byIdChg[it.id]) {
           matchedAny = true;
-          nextList.push(Object.assign({}, it, byIdChg[it.id]));
+          var mergedIt = Object.assign({}, it, byIdChg[it.id]);
+          if (core && core.isInactiveReservation && core.isInactiveReservation(mergedIt)) {
+            removedCount += 1;
+            return;
+          }
+          nextList.push(mergedIt);
+          return;
+        }
+        if (it && core && core.isInactiveReservation && core.isInactiveReservation(it)) {
+          removedCount += 1;
           return;
         }
         nextList.push(it);
@@ -1291,21 +1355,37 @@
     }
 
     function syncLocalReservationSnapshot(updatedRes) {
+      var core = root.RGCrmCore;
+      var isNowInactive = Boolean(updatedRes && core && core.isInactiveReservation && core.isInactiveReservation(updatedRes));
       if (updatedRes && updatedRes.id) {
         applyLocalResChangesToTable([updatedRes]);
         if (Array.isArray(radarRawReservations)) {
-          radarRawReservations = radarRawReservations.map(function (it) {
-            return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
-          });
+          if (isNowInactive) {
+            radarRawReservations = radarRawReservations.filter(function (it) { return it && it.id !== updatedRes.id; });
+          } else {
+            radarRawReservations = radarRawReservations.map(function (it) {
+              return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
+            });
+          }
           paintRadarView();
           paintTodayView();
         }
         if (Array.isArray(calendarRawItems)) {
-          calendarRawItems = calendarRawItems.map(function (it) {
-            return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
-          });
+          if (isNowInactive) {
+            calendarRawItems = calendarRawItems.filter(function (it) { return it && it.id !== updatedRes.id; });
+          } else {
+            calendarRawItems = calendarRawItems.map(function (it) {
+              return (it && it.id === updatedRes.id) ? Object.assign({}, it, updatedRes) : it;
+            });
+          }
           if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
             paintTodayView();
+          }
+        }
+        if (canViewRejectedTab) {
+          refreshRejectedTabBadge();
+          if (state.viewMode === 'rejected') {
+            mountRejectedTab();
           }
         }
       } else {
@@ -1315,6 +1395,12 @@
           ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true });
         } else {
           calendarRawItems = null;
+        }
+        if (canViewRejectedTab) {
+          refreshRejectedTabBadge();
+          if (state.viewMode === 'rejected') {
+            mountRejectedTab();
+          }
         }
       }
     }
@@ -1783,6 +1869,7 @@
       var seq = ++calendarFetchSeq;
       calendarLoadError = '';
       var resp = await root.RGApi.callApi('getReservations', {
+        lifecycle: 'active',
         page: 1,
         pageSize: 500,
         forceRefresh: force,
@@ -2911,18 +2998,58 @@
       }
     }
 
+    function refreshRejectedTabBadge() {
+      if (!canViewRejectedTab) return;
+      root.RGApi.callApi('getInactiveReservations', {
+        subTab: 'rejected',
+        page: 1,
+        pageSize: 1,
+        silentRefresh: true
+      }).then(function (resp) {
+        var el = document.getElementById('res-rejected-tab-count');
+        if (el && resp && resp.success && resp.data) {
+          el.textContent = String(resp.data.total || 0);
+        }
+      }).catch(function () {});
+    }
+
+    function mountRejectedTab() {
+      var rejHost = document.getElementById('res-rejected-view');
+      if (!rejHost || !root.RGInactive || !root.RGInactive.renderRejectedPanel) return;
+      root.RGInactive.renderRejectedPanel(rejHost, ctx, {
+        mode: 'rejected',
+        forceRefresh: true,
+        onCountChange: function (_m, totalCnt) {
+          var el = document.getElementById('res-rejected-tab-count');
+          if (el) el.textContent = String(totalCnt || 0);
+        }
+      });
+    }
+
+    var idLookupTopBtn = document.getElementById('res-id-lookup-btn');
+    if (idLookupTopBtn && root.RGInactive && root.RGInactive.openNationalIdLookupModal) {
+      idLookupTopBtn.addEventListener('click', function () {
+        root.RGInactive.openNationalIdLookupModal(ctx, '');
+      });
+    }
+
     function setViewMode(nextMode) {
-      var targetMode = nextMode === 'radar' ? 'radar' : (nextMode === 'today' ? 'today' : 'all');
+      var targetMode = nextMode === 'radar'
+        ? 'radar'
+        : (nextMode === 'today' ? 'today' : (nextMode === 'rejected' ? 'rejected' : 'all'));
       if (targetMode === 'today' && !canViewTodayTab) targetMode = 'all';
       if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'all';
+      if (targetMode === 'rejected' && !canViewRejectedTab) targetMode = 'all';
       state.viewMode = targetMode;
       if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       var allViewEl = document.getElementById('res-all-view');
       var todayViewEl = document.getElementById('res-today-view');
       var radarViewEl = document.getElementById('res-radar-view');
+      var rejectedViewEl = document.getElementById('res-rejected-view');
       if (allViewEl) allViewEl.classList.toggle('hidden', state.viewMode !== 'all');
       if (todayViewEl) todayViewEl.classList.toggle('hidden', state.viewMode !== 'today');
       if (radarViewEl) radarViewEl.classList.toggle('hidden', state.viewMode !== 'radar');
+      if (rejectedViewEl) rejectedViewEl.classList.toggle('hidden', state.viewMode !== 'rejected');
       container.querySelectorAll('[data-res-view]').forEach(function (tabBtn) {
         var isAct = tabBtn.getAttribute('data-res-view') === state.viewMode;
         tabBtn.classList.toggle('is-active', isAct);
@@ -2937,6 +3064,10 @@
         }
         if (radarRawReservations === null) refreshRadarData(false);
         else paintTodayView();
+      } else if (state.viewMode === 'rejected') {
+        mountRejectedTab();
+      } else {
+        refreshTableRegion({ silentRefresh: true });
       }
     }
 
@@ -2945,6 +3076,13 @@
         setViewMode(tabBtn.getAttribute('data-res-view'));
       });
     });
+
+    if (canViewRejectedTab) {
+      refreshRejectedTabBadge();
+      if (state.viewMode === 'rejected') {
+        mountRejectedTab();
+      }
+    }
 
     if (canViewTodayTab || canViewRadarTab) {
       if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
@@ -3030,6 +3168,7 @@
           (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
           (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
+          (Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0) ||
           (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
           (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
           Boolean(d.deletedAllReservationsBefore) ||
@@ -3052,21 +3191,22 @@
             delResIds.forEach(function (id) { if (id) delSet[id] = true; });
             if (Array.isArray(radarRawReservations)) {
               radarRawReservations = core.mergeDeltaRecords(radarRawReservations, chgResList, 'id');
-              if (delResIds.length) {
-                radarRawReservations = radarRawReservations.filter(function (it) { return it && !delSet[it.id]; });
-              }
+              radarRawReservations = radarRawReservations.filter(function (it) {
+                return it && !delSet[it.id] && !(core.isInactiveReservation && core.isInactiveReservation(it));
+              });
               paintRadarView();
               if (state.todayDisplayMode !== 'calendar') paintTodayView();
             }
             if (Array.isArray(calendarRawItems)) {
               calendarRawItems = core.mergeDeltaRecords(calendarRawItems, chgResList, 'id');
-              if (delResIds.length) {
-                calendarRawItems = calendarRawItems.filter(function (it) { return it && !delSet[it.id]; });
-              }
+              calendarRawItems = calendarRawItems.filter(function (it) {
+                return it && !delSet[it.id] && !(core.isInactiveReservation && core.isInactiveReservation(it));
+              });
               if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
                 paintTodayView();
               }
             }
+            if (canViewRejectedTab) refreshRejectedTabBadge();
           }
         }
         scheduleResRefreshWhenIdle({ silent: true, forceRefresh: true });
@@ -3453,11 +3593,15 @@
       var changedResProblem = Array.isArray(det.changedProblems)
         ? det.changedProblems.some(function (p) { return p && String(p.reservationId) === curResId; })
         : false;
+      var deletedResProblem = Array.isArray(det.deletedProblemIds) && Array.isArray(d.problems)
+        ? d.problems.some(function (p) { return p && det.deletedProblemIds.some(function (dpid) { return String(dpid) === String(p.id); }); })
+        : false;
 
       var hasResUpdate = Boolean(
         (changedRes && changedRes.updatedAt && changedRes.updatedAt !== d.reservation.updatedAt && (!user || changedRes.lastUpdatedById !== user.id)) ||
         changedResFollowUp ||
-        changedResProblem
+        changedResProblem ||
+        deletedResProblem
       );
       if (hasResUpdate) {
         var byName = (changedRes && changedRes.lastUpdatedByName) || (isEn ? 'colleague' : 'زميل');
@@ -3529,6 +3673,13 @@
       var noAnswerCount = Number(r.noAnswerCount || 0);
       var overdueInfo = core.isReservationOverdueUnpaid ? core.isReservationOverdueUnpaid(r, d.extensions) : null;
 
+      var canViewId = !core.canUserViewCustomerId || core.canUserViewCustomerId(user);
+      var canRejectDrawer = Boolean(root.RGInactive && user && (!core.canUserPerform || core.canUserPerform(user, 'reject_reservation')) && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_reject_reservation')));
+      var canCancelDrawer = Boolean(root.RGInactive && user && (!core.canUserPerform || core.canUserPerform(user, 'cancel_reservation')) && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_cancel_reservation')));
+      var canRestoreDrawer = Boolean(user && (!core.canUserPerform || core.canUserPerform(user, 'reject_reservation') || core.canUserPerform(user, 'cancel_reservation') || core.canUserPerform(user, 'edit_reservation_details')));
+      var isResInactiveNow = Boolean(core.isInactiveReservation && core.isInactiveReservation(r));
+      var lifecycleKindNow = core.getReservationLifecycleKind ? core.getReservationLifecycleKind(r) : 'active';
+
       modalRoot.innerHTML =
         '<div class="drawer-backdrop" id="res-drawer-backdrop" data-res-id="' + esc(r.id) + '" role="dialog" aria-modal="true" aria-labelledby="drawer-res-title">' +
           '<div class="drawer-panel">' +
@@ -3541,7 +3692,7 @@
                 '<div class="meta-inline">' +
                   '<span>' + esc(r.customerName) + '</span><span>·</span><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' +
                   (r.customerEmail ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono" dir="ltr">' + esc(r.customerEmail) + '</span></span>' : '') +
-                  (r.customerIdNumber ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono">' + (isEn ? 'ID: ' : 'هوية: ') + '<span dir="ltr">' + esc(r.customerIdNumber) + '</span></span></span>' : '') +
+                  (canViewId && r.customerIdNumber ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono">' + (isEn ? 'ID: ' : 'هوية: ') + '<span dir="ltr">' + esc(r.customerIdNumber) + '</span></span></span>' : '') +
                 '</div>' +
               '</div>' +
               '<div class="toolbar-row" style="margin-bottom:0;">' +
@@ -3551,11 +3702,30 @@
                 (canPinNote ? '<button type="button" class="btn btn-sm btn-warning" id="drawer-header-pin-note-btn">📌 ' + (isEn ? 'Supervisor Pinned Note' : 'ملاحظة مشرف/مدير مثبتة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-ics-btn" title="' + (isEn ? 'Add pickup & return to Google Calendar (.ics)' : 'إضافة موعد الاستلام والتسليم للتقويم (.ics)') + '">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
                 (canEditReservation ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-edit-res-btn">' + (isEn ? 'Edit Booking' : 'تعديل تفاصيل الحجز') + '</button>' : '') +
+                (!isResInactiveNow && canRejectDrawer ? '<button type="button" class="btn btn-sm btn-danger rg-ui-res-reject-btn" id="drawer-reject-btn">' + (isEn ? 'Reject' : 'رفض الحجز') + '</button>' : '') +
+                (!isResInactiveNow && canCancelDrawer ? '<button type="button" class="btn btn-sm rg-ui-res-cancel-btn" id="drawer-cancel-btn">' + (isEn ? 'Cancel Booking' : 'إلغاء الحجز') + '</button>' : '') +
+                (isResInactiveNow && canRestoreDrawer ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-restore-btn">' + (isEn ? 'Restore to Active' : 'استعادة إلى النشط') + '</button>' : '') +
                 (canExportPdfBtn ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '') +
                 (canReportProblemBtn ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">' + (isEn ? 'Report Problem' : 'تحويل إلى مشكلة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-close-btn">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
               '</div>' +
             '</div>' +
+            (isResInactiveNow ? (
+              '<div class="rg-error-banner" style="margin-bottom:10px;border-color:rgba(217,31,43,0.32);background:rgba(217,31,43,0.07);">' +
+                '<div class="rg-error-banner-body">' +
+                  '<div class="rg-error-banner-title" style="color:var(--text-primary);">' +
+                    (lifecycleKindNow === 'rejected'
+                      ? (isEn ? 'Rejected Booking' : 'حجز مرفوض (خارج الدورة النشطة)')
+                      : (isEn ? 'Cancelled Booking' : 'حجز ملغي (خارج الدورة النشطة)')) +
+                  '</div>' +
+                  '<div class="rg-error-banner-msg">' +
+                    (lifecycleKindNow === 'rejected'
+                      ? ((r.rejectionReason ? ('السبب: ' + esc(r.rejectionReason)) : '') + (r.newCompanyName ? (' · الشركة الجديدة: ' + esc(r.newCompanyName)) : '') + (r.rejectedByName ? (' · بواسطة: ' + esc(r.rejectedByName)) : ''))
+                      : ((r.cancellationReason ? ('السبب: ' + esc(r.cancellationReason)) : '') + (r.cancelledByName ? (' · بواسطة: ' + esc(r.cancelledByName)) : ''))) +
+                  '</div>' +
+                '</div>' +
+              '</div>'
+            ) : '') +
 
             '<div id="drawer-softlock-host">' +
               (drawerLockInfo
@@ -3755,6 +3925,7 @@
                         '<span class="status-tag ' + priorityClass(p.priority) + '">' + esc(p.priority) + '</span>' +
                         '<span class="status-tag ' + (prbClosed ? 'status-success' : 'status-info') + '">' + esc(p.status) + '</span>' +
                         ((!prbClosed && canCloseTicketDrawerBtn) ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb-in-drawer" data-prb-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
+                        (canCloseTicketDrawerBtn ? '<button type="button" class="btn btn-sm btn-danger btn-delete-prb-in-drawer" data-prb-id="' + esc(p.id) + '" data-prb-num="' + esc(p.problemNumber) + '" data-confirm="0" aria-label="حذف المشكلة ' + esc(p.problemNumber) + '">حذف</button>' : '') +
                         '<button type="button" class="btn btn-sm btn-primary btn-edit-prb-in-drawer" data-prb-id="' + esc(p.id) + '">' +
                           (canEditTicket ? 'تعديل التذكرة' : 'تحديث التذكرة') +
                         '</button>' +
@@ -4295,6 +4466,50 @@
         });
       });
 
+      modalRoot.querySelectorAll('.btn-delete-prb-in-drawer').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          if (btn.getAttribute('data-confirm') !== '1') {
+            btn.setAttribute('data-confirm', '1');
+            btn.textContent = isEn ? 'Confirm?' : 'تأكيد الحذف؟';
+            setTimeout(function () {
+              if (document.body.contains(btn)) {
+                btn.setAttribute('data-confirm', '0');
+                btn.textContent = isEn ? 'Delete' : 'حذف';
+              }
+            }, 4000);
+            return;
+          }
+          var prbId = btn.getAttribute('data-prb-id');
+          var prb = d.problems.find(function (x) { return x.id === prbId; });
+          if (!prb) return;
+          runWithLock(btn, 'deleteProblem:' + prbId, function () {
+            var delPayload = {
+              problemId: prbId,
+              expectedUpdatedAt: prb.updatedAt || '',
+              reservationId: r.id
+            };
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteProblem', delPayload, user);
+            }
+            d.problems = (d.problems || []).filter(function (it) { return it.id !== prbId; });
+            d.problemUpdates = (d.problemUpdates || []).filter(function (u) { return u.problemId !== prbId; });
+            d.reservation = Object.assign({}, r, {
+              hasProblem: d.problems.some(function (it) { return !isProblemClosed(it.status); })
+            });
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast((isEn ? 'Deleted problem ' : 'تم حذف المشكلة ') + (prb.problemNumber || '') + (isEn ? '.' : ' بنجاح.'));
+            return root.RGApi.callApi('deleteProblem', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, delPayload)).then(function (resp) {
+              if (resp && resp.success) ctx.refreshNotifications();
+              else { ctx.toast((resp && resp.message) || 'تعذر حذف المشكلة.', true); reopenSelf(null); }
+            }).catch(function () {
+              ctx.toast('تعذر الاتصال بالخادم أثناء حذف المشكلة.', true);
+              reopenSelf(null);
+            });
+          }, { spamAction: 'deleteProblem', spamSig: 'deleteProblem:' + prbId });
+        });
+      });
+
       modalRoot.querySelectorAll('.btn-edit-prb-in-drawer').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var prbId = btn.getAttribute('data-prb-id');
@@ -4303,7 +4518,10 @@
             var enriched = Object.assign({}, prb, {
               updates: (d.problemUpdates || []).filter(function (u) { return u.problemId === prb.id; })
             });
-            root.RGProblems.openProblemUpdateModal(enriched, resolvedEmployees, ctx, function () { reopenSelf(); }, reopenSelf);
+            root.RGProblems.openProblemUpdateModal(enriched, resolvedEmployees, ctx, function (savedPrb) {
+              if (savedPrb && savedPrb._deletedProblemId) notifyParentUpdated();
+              reopenSelf(savedPrb);
+            }, reopenSelf);
           }
         });
       });
@@ -4453,6 +4671,56 @@
 
       var drawerCharts = renderDrawerCharts(d);
 
+      var drawerRejectBtn = document.getElementById('drawer-reject-btn');
+      if (drawerRejectBtn && root.RGInactive && root.RGInactive.openRejectModal) {
+        drawerRejectBtn.addEventListener('click', function () {
+          requestDrawerExit(function () {
+            cleanupDrawerLifecycle();
+            root.RGInactive.openRejectModal(r, ctx, function (updatedRes) {
+              notifyParentUpdated(updatedRes);
+            });
+          });
+        });
+      }
+
+      var drawerCancelBtn = document.getElementById('drawer-cancel-btn');
+      if (drawerCancelBtn && root.RGInactive && root.RGInactive.openCancelModal) {
+        drawerCancelBtn.addEventListener('click', function () {
+          requestDrawerExit(function () {
+            cleanupDrawerLifecycle();
+            root.RGInactive.openCancelModal(r, ctx, function (updatedRes) {
+              notifyParentUpdated(updatedRes);
+            });
+          });
+        });
+      }
+
+      var drawerRestoreBtn = document.getElementById('drawer-restore-btn');
+      if (drawerRestoreBtn) {
+        drawerRestoreBtn.addEventListener('click', function () {
+          runWithLock(drawerRestoreBtn, 'restoreReservation:' + r.id, async function () {
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('restoreReservation', { reservationId: r.id, targetStatus: 'بانتظار التأكيد' }, user);
+            }
+            var resp = await root.RGApi.callApi('restoreReservation', {
+              reservationId: r.id,
+              targetStatus: 'بانتظار التأكيد',
+              _keepOptimisticCache: true,
+              _spamChecked: true
+            });
+            if (!resp || !resp.success) {
+              ctx.toast((resp && resp.message) || 'تعذر استعادة الحجز.', true);
+              return;
+            }
+            var nextResObj = (resp.data && resp.data.reservation) || Object.assign({}, r, { internalStatus: 'بانتظار التأكيد', rejectedAt: '', cancelledAt: '' });
+            d.reservation = nextResObj;
+            ctx.toast('تمت استعادة الحجز إلى الحجوزات النشطة بنجاح.');
+            paintDrawer();
+            notifyParentUpdated(nextResObj);
+          }, { spamAction: 'restoreReservation', spamSig: r.id });
+        });
+      }
+
       var drawerPdfBtn = document.getElementById('drawer-pdf-btn');
       if (drawerPdfBtn) {
         drawerPdfBtn.addEventListener('click', function () {
@@ -4548,6 +4816,8 @@
   }
 
   function openEditReservationModal(reservation, ctx, onSaved, onCancel) {
+    var curUserEdit = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var canEditCustomerId = !root.RGCrmCore || !root.RGCrmCore.canUserViewCustomerId || root.RGCrmCore.canUserViewCustomerId(curUserEdit);
     var modalRoot = document.getElementById('modal-root');
     modalRoot.innerHTML =
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="res-edit-title">' +
@@ -4563,7 +4833,7 @@
             '<div class="form-group"><label class="form-label" for="re-customer">اسم العميل</label><input class="input" id="re-customer" value="' + esc(reservation.customerName) + '" required></div>' +
             '<div class="form-group"><label class="form-label" for="re-phone">رقم الجوال</label><input class="input mono" id="re-phone" value="' + esc(reservation.customerPhone) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-email">بريد العميل</label><input class="input mono" id="re-email" value="' + esc(reservation.customerEmail || '') + '"></div>' +
-            '<div class="form-group"><label class="form-label" for="re-idnum">رقم الهوية / الإقامة</label><input class="input mono" id="re-idnum" value="' + esc(reservation.customerIdNumber || '') + '"></div>' +
+            (canEditCustomerId ? '<div class="form-group"><label class="form-label" for="re-idnum">رقم الهوية / الإقامة</label><input class="input mono" id="re-idnum" value="' + esc(reservation.customerIdNumber || '') + '"></div>' : '') +
             '<div class="form-group"><label class="form-label" for="re-company">شركة التأجير</label><input class="input" id="re-company" value="' + esc(reservation.companyName) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-branch">فرع الاستلام</label><input class="input" id="re-branch" value="' + esc(reservation.branchName) + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-deliv-branch">فرع التسليم</label><input class="input" id="re-deliv-branch" value="' + esc(reservation.deliverBranchName || reservation.branchName || '') + '"></div>' +
@@ -4639,7 +4909,7 @@
         customerName: document.getElementById('re-customer').value,
         customerPhone: document.getElementById('re-phone').value,
         customerEmail: document.getElementById('re-email').value,
-        customerIdNumber: document.getElementById('re-idnum').value,
+        customerIdNumber: (canEditCustomerId && document.getElementById('re-idnum')) ? document.getElementById('re-idnum').value : undefined,
         companyName: document.getElementById('re-company').value,
         branchName: document.getElementById('re-branch').value,
         deliverBranchName: document.getElementById('re-deliv-branch').value,
