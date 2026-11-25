@@ -102,7 +102,7 @@ function getSettings(session) {
 
   return {
     company_name: map.company_name || 'RENTAL GATE',
-    excluded_statuses: safeJsonParse(map.excluded_statuses, ['draft', 'test', 'abandoned']),
+    excluded_statuses: sanitizeExcludedStatusesListGs_(safeJsonParse(map.excluded_statuses, ['draft', 'test', 'abandoned'])),
     session_ttl_hours: toNumber(map.session_ttl_hours, 24),
     allow_agent_view_all: toBool(map.allow_agent_view_all !== undefined ? map.allow_agent_view_all : 'true'),
     default_language: map.default_language || 'ar',
@@ -141,8 +141,9 @@ function updateSettings(session, payload) {
       var k = allowedKeys[i];
       if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
       var val = p[k];
-      if (k === 'excluded_statuses' && Array.isArray(val)) {
-        val = JSON.stringify(val);
+      if (k === 'excluded_statuses') {
+        var parsedEx = Array.isArray(val) ? val : safeJsonParse(val, []);
+        val = JSON.stringify(sanitizeExcludedStatusesListGs_(parsedEx));
       } else if (k === 'ui_simplification') {
         val = JSON.stringify(normalizeUiSimplificationSettings_(val));
       } else if (k === 'handover_settings') {

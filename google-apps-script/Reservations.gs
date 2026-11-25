@@ -59,6 +59,7 @@ function getReservations(session, params) {
   var companiesMap = cachedFacets ? null : {};
   var branchesMap = cachedFacets ? null : {};
   var matched = [];
+  var lifecycleCounts = { all: 0, active: 0, cancelled: 0, rejected: 0 };
 
   var followedKey = 'RG_FOLLOWED_RES_V' + fuVer;
   var followedResIds = getCompressedJsonCache_(followedKey);
@@ -106,8 +107,14 @@ function getReservations(session, params) {
       if (safeJsonParse(rawMy, []).indexOf(session.employeeId) === -1) continue;
     }
 
-    var isRejRow = Boolean(r.rejectedAt) || gsMatchStatusList_(r, ['rejected', 'declined', 'مرفوض', 'مرفوضة', 'تم الرفض']);
-    var isCanRow = !isRejRow && (Boolean(r.cancelledAt) || gsMatchStatusList_(r, ['cancelled', 'canceled', 'ملغي', 'تم الإلغاء', 'ملغى']));
+    var rowLc = classifyReservationLifecycleGs_(r);
+    lifecycleCounts.all += 1;
+    if (rowLc === 'rejected') lifecycleCounts.rejected += 1;
+    else if (rowLc === 'cancelled') lifecycleCounts.cancelled += 1;
+    else lifecycleCounts.active += 1;
+
+    var isRejRow = rowLc === 'rejected';
+    var isCanRow = rowLc === 'cancelled';
     var isInactRow = isRejRow || isCanRow;
     if (lifecycle === 'rejected' && !isRejRow) continue;
     if (lifecycle === 'cancelled' && !isCanRow) continue;
@@ -234,7 +241,8 @@ function getReservations(session, params) {
     page: page,
     pageSize: pageSize,
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
-    facets: cachedFacets
+    facets: cachedFacets,
+    lifecycleCounts: lifecycleCounts
   };
 
   if (defaultCacheKey) {
@@ -359,10 +367,16 @@ function quickUpdateReservationStatus(session, payload) {
   if (!status || !isValidWorkflowStatus_(status)) {
     throw new Error('حالة الحجز غير صالحة.');
   }
+  if (isManualBlockedWorkflowStatusGs_(status)) {
+    throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن رفض أو إلغاء الحجز يدوياً من داخل النظام؛ تتم المزامنة تلقائياً مع الموقع الخارجي.');
+  }
 
   return withScriptLock(function () {
     var reservation = findRecordById(RG_SHEETS.RESERVATIONS, 'id', reservationId);
     if (!reservation) throw new Error('الحجز غير موجود.');
+    if (classifyReservationLifecycleGs_(reservation) !== 'active') {
+      throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تغيير حالة حجز مرفوض أو ملغي من الموقع يدوياً من داخل النظام.');
+    }
 
     var now = new Date();
     var nowStr = now.toISOString();
@@ -481,8 +495,20 @@ function updateReservationDetails(session, payload) {
     if (p.baseAmount !== undefined) patch.baseAmount = toNumber(p.baseAmount, 0);
     if (p.extensionsAmount !== undefined) patch.extensionsAmount = toNumber(p.extensionsAmount, 0);
     if (p.totalAmount !== undefined) patch.totalAmount = toNumber(p.totalAmount, 0);
-    if (p.internalStatus && isValidWorkflowStatus_(p.internalStatus)) {
-      patch.internalStatus = p.internalStatus;
+    if (p.internalStatus !== undefined) {
+      var reqInternal = normalizeStr(p.internalStatus);
+      if (!reqInternal || !isValidWorkflowStatus_(reqInternal)) {
+        throw new Error('حالة الحجز غير صالحة.');
+      }
+      if (reqInternal !== existing.internalStatus) {
+        if (classifyReservationLifecycleGs_(existing) !== 'active') {
+          throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تغيير حالة حجز مرفوض أو ملغي من الموقع يدوياً من داخل النظام.');
+        }
+        if (isManualBlockedWorkflowStatusGs_(reqInternal)) {
+          throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن رفض أو إلغاء الحجز يدوياً من داخل النظام؛ تتم المزامنة تلقائياً مع الموقع الخارجي.');
+        }
+        patch.internalStatus = reqInternal;
+      }
     }
     if (p.priority && RG_PROBLEM_PRIORITIES.indexOf(p.priority) !== -1) {
       patch.priority = p.priority;
@@ -529,6 +555,18 @@ function updateReservationDetails(session, payload) {
     }
     return updated;
   });
+}
+
+function rejectReservation(session, payload) {
+  throw new Error('FORBIDDEN_MANUAL_ACTION: الرفض اليدوي للحجوزات غير مسموح من داخل النظام؛ تتم مزامنة الحجوزات المرفوضة تلقائياً من الموقع الخارجي.');
+}
+
+function cancelReservation(session, payload) {
+  throw new Error('FORBIDDEN_MANUAL_ACTION: الإلغاء اليدوي للحجوزات غير مسموح من داخل النظام؛ تتم مزامنة الحجوزات الملغاة تلقائياً من الموقع الخارجي.');
+}
+
+function restoreReservation(session, payload) {
+  throw new Error('FORBIDDEN_MANUAL_ACTION: استعادة الحجوزات غير الفعالة يدوياً غير مسموح؛ تتم مزامنة الحالة تلقائياً من الموقع الخارجي.');
 }
 
 function saveReservationPinnedNote(session, payload) {

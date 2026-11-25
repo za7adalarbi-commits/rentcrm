@@ -49,13 +49,16 @@ function pickRowsFromPayloadObj_(obj) {
 function extractPagePayload_(body, pageIndex, pageSize) {
   var size = pageSize ? Math.max(1, Number(pageSize) || 100) : 100;
   if (!body || typeof body !== 'object') {
-    return { rows: [], totalPages: 1, hasTotalPages: false, isLast: true };
+    return { rows: [], totalPages: 1, totalElements: 0, hasTotalPages: false, currentPageNum: null, nextPageUrl: '', isLast: true };
   }
   if (Array.isArray(body)) {
     return {
       rows: body,
       totalPages: 1,
+      totalElements: body.length,
       hasTotalPages: false,
+      currentPageNum: null,
+      nextPageUrl: '',
       isLast: body.length < size
     };
   }
@@ -103,28 +106,82 @@ function extractPagePayload_(body, pageIndex, pageSize) {
       (body.meta && body.meta.last_page !== undefined ? body.meta.last_page :
       (body.pagination && body.pagination.last_page !== undefined ? body.pagination.last_page : undefined)))));
 
-  var hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
+  var hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && rawTotalPages !== '' && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
   var totalPages = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : 1;
+
+  var rawTotalElements =
+    (metaHolder && metaHolder.totalElements !== undefined) ? metaHolder.totalElements :
+    ((metaHolder && metaHolder.total !== undefined) ? metaHolder.total :
+    ((metaHolder && metaHolder.total_count !== undefined) ? metaHolder.total_count :
+    ((metaHolder && metaHolder.meta && metaHolder.meta.total !== undefined) ? metaHolder.meta.total :
+    (body.totalElements !== undefined ? body.totalElements :
+    (body.total !== undefined ? body.total : body.total_count)))));
+  var totalElements = (rawTotalElements !== undefined && rawTotalElements !== null && !isNaN(Number(rawTotalElements)))
+    ? Number(rawTotalElements)
+    : safeRows.length;
 
   var explicitLast = (metaHolder && metaHolder.last !== undefined) ? metaHolder.last : body.last;
   var explicitHasMore = (metaHolder && metaHolder.hasMore !== undefined)
     ? metaHolder.hasMore
     : ((metaHolder && metaHolder.has_more !== undefined) ? metaHolder.has_more : (body.hasMore !== undefined ? body.hasMore : body.has_more));
 
+  var nextPageUrl = normalizeStr(
+    (metaHolder && (metaHolder.next_page_url || (metaHolder.meta && metaHolder.meta.next_page_url) || (metaHolder.links && metaHolder.links.next))) ||
+    body.next_page_url || (body.meta && body.meta.next_page_url) || (body.links && body.links.next) || ''
+  );
+
+  var rawCurrentPage =
+    (metaHolder && metaHolder.current_page !== undefined) ? metaHolder.current_page :
+    ((metaHolder && metaHolder.meta && metaHolder.meta.current_page !== undefined) ? metaHolder.meta.current_page :
+    ((metaHolder && metaHolder.pageNumber !== undefined) ? metaHolder.pageNumber :
+    ((metaHolder && metaHolder.number !== undefined) ? metaHolder.number :
+    (body.current_page !== undefined ? body.current_page :
+    ((body.meta && body.meta.current_page !== undefined) ? body.meta.current_page :
+    (body.pageNumber !== undefined ? body.pageNumber : body.number))))));
+  var hasCurrentPage = rawCurrentPage !== undefined && rawCurrentPage !== null && rawCurrentPage !== '' && !isNaN(Number(rawCurrentPage));
+  var currentPageNum = hasCurrentPage ? Number(rawCurrentPage) : null;
+
+  var serverPageSize = Number(
+    (metaHolder && (metaHolder.size || metaHolder.per_page || metaHolder.pageSize || (metaHolder.meta && metaHolder.meta.per_page))) ||
+    body.size || body.per_page || body.pageSize || size
+  );
+  var effectivePageSize = (!isNaN(serverPageSize) && serverPageSize > 0) ? serverPageSize : size;
+
+  var hasOneBasedMeta = Boolean(
+    (metaHolder && (metaHolder.current_page !== undefined || metaHolder.last_page !== undefined)) ||
+    body.current_page !== undefined || body.last_page !== undefined
+  );
+
   var isLast;
   if (safeRows.length === 0) {
     isLast = true;
   } else if (explicitLast === true || explicitHasMore === false) {
     isLast = true;
+  } else if (nextPageUrl) {
+    isLast = false;
   } else if (hasTotalPages) {
-    isLast = (pageIndex + 1) >= totalPages;
+    if (currentPageNum !== null && currentPageNum >= 1 && (pageIndex === 0 ? currentPageNum === 1 : true) && hasOneBasedMeta) {
+      isLast = currentPageNum >= totalPages;
+    } else {
+      isLast = (pageIndex + 1) >= totalPages;
+    }
   } else if (explicitLast === false || explicitHasMore === true) {
     isLast = false;
+  } else if (rawTotalElements !== undefined && rawTotalElements !== null && Number(rawTotalElements) > effectivePageSize) {
+    isLast = (pageIndex + 1) * effectivePageSize >= Number(rawTotalElements);
   } else {
-    isLast = safeRows.length < size;
+    isLast = safeRows.length < effectivePageSize;
   }
 
-  return { rows: safeRows, totalPages: totalPages, hasTotalPages: hasTotalPages, isLast: isLast };
+  return {
+    rows: safeRows,
+    totalPages: totalPages,
+    totalElements: totalElements,
+    hasTotalPages: hasTotalPages,
+    currentPageNum: currentPageNum,
+    nextPageUrl: nextPageUrl,
+    isLast: isLast
+  };
 }
 
 function callRentalGateEndpoint(url, token, pageZeroBased, size) {
@@ -171,14 +228,18 @@ function fetchAllRentalGatePages(url, token) {
   var firstInfo = extractPagePayload_(firstBody, 0, pageSize);
   appendUniquePageRows_(allItems, seenMap, firstInfo.rows, 'res');
 
-  if (firstInfo.isLast || firstInfo.rows.length === 0) {
+  var firstHasMoreByTotal = firstInfo.totalElements > 0 && allItems.length < firstInfo.totalElements && firstInfo.rows.length > 0;
+  if ((firstInfo.isLast && !firstHasMoreByTotal) || firstInfo.rows.length === 0) {
     return { items: allItems, pagesFetched: pagesFetched };
   }
 
+  var oneBasedOffset = (firstInfo.currentPageNum === 1) ? 1 : 0;
+
   if (firstInfo.hasTotalPages && firstInfo.totalPages > 1) {
-    var lastPageIdx = Math.min(firstInfo.totalPages - 1, maxPages - 1);
+    var startIdx = 1 + oneBasedOffset;
+    var lastPageIdx = Math.min(firstInfo.totalPages - (oneBasedOffset ? 0 : 1), maxPages - 1);
     var batchSize = 10;
-    for (var startPage = 1; startPage <= lastPageIdx; startPage += batchSize) {
+    for (var startPage = startIdx; startPage <= lastPageIdx; startPage += batchSize) {
       var endPage = Math.min(startPage + batchSize - 1, lastPageIdx);
       var reqs = [];
       for (var p = startPage; p <= endPage; p++) {
@@ -190,7 +251,8 @@ function fetchAllRentalGatePages(url, token) {
       for (var r = 0; r < responses.length; r++) {
         var info = extractPagePayload_(parseRentalGateResponse_(responses[r]), startPage + r, pageSize);
         var added = appendUniquePageRows_(allItems, seenMap, info.rows, 'res');
-        if (info.isLast || info.rows.length === 0 || (info.rows.length > 0 && added === 0)) {
+        var batchHasMoreByTotal = info.totalElements > 0 && allItems.length < info.totalElements && info.rows.length > 0;
+        if ((info.isLast && !batchHasMoreByTotal) || info.rows.length === 0 || (info.rows.length > 0 && added === 0)) {
           stopEarly = true;
         }
       }
@@ -200,12 +262,13 @@ function fetchAllRentalGatePages(url, token) {
   }
 
   // Fallback when totalPages is omitted by upstream API: page until isLast / empty / duplicate page
-  for (var page = 1; page < maxPages; page++) {
+  for (var page = 1 + oneBasedOffset; page < maxPages; page++) {
     var pageBody = callRentalGateEndpoint(url, token, page, pageSize);
     pagesFetched++;
     var pageInfo = extractPagePayload_(pageBody, page, pageSize);
     var pageAdded = appendUniquePageRows_(allItems, seenMap, pageInfo.rows, 'res');
-    if (pageInfo.isLast || pageInfo.rows.length === 0 || pageAdded === 0) break;
+    var loopHasMoreByTotal = pageInfo.totalElements > 0 && allItems.length < pageInfo.totalElements && pageInfo.rows.length > 0;
+    if ((pageInfo.isLast && !loopHasMoreByTotal) || pageInfo.rows.length === 0 || pageAdded === 0) break;
   }
 
   return { items: allItems, pagesFetched: pagesFetched };
@@ -232,19 +295,26 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
   appendUniquePageRows_(resItems, resSeen, resInfo0.rows, 'res');
   var pagesFetched = 2;
 
+  var extOneBasedOffset = (extInfo0.currentPageNum === 1) ? 1 : 0;
+  var resOneBasedOffset = (resInfo0.currentPageNum === 1) ? 1 : 0;
+  var extHasMoreByTotal0 = extInfo0.totalElements > 0 && extItems.length < extInfo0.totalElements && extInfo0.rows.length > 0;
+  var resHasMoreByTotal0 = resInfo0.totalElements > 0 && resItems.length < resInfo0.totalElements && resInfo0.rows.length > 0;
+
   var remainingReqs = [];
   var remainingMeta = [];
 
-  if (!extInfo0.isLast && extInfo0.rows.length > 0 && extInfo0.hasTotalPages && extInfo0.totalPages > 1) {
-    var extLast = Math.min(extInfo0.totalPages - 1, maxPages - 1);
-    for (var ep = 1; ep <= extLast; ep++) {
+  if ((!extInfo0.isLast || extHasMoreByTotal0) && extInfo0.rows.length > 0 && extInfo0.hasTotalPages && extInfo0.totalPages > 1) {
+    var extStart = 1 + extOneBasedOffset;
+    var extLast = Math.min(extInfo0.totalPages - (extOneBasedOffset ? 0 : 1), maxPages - 1);
+    for (var ep = extStart; ep <= extLast; ep++) {
       remainingReqs.push(buildRentalGateRequest_(extUrl, token, ep, pageSize));
       remainingMeta.push({ kind: 'ext', page: ep });
     }
   }
-  if (!resInfo0.isLast && resInfo0.rows.length > 0 && resInfo0.hasTotalPages && resInfo0.totalPages > 1) {
-    var resLast = Math.min(resInfo0.totalPages - 1, maxPages - 1);
-    for (var rp = 1; rp <= resLast; rp++) {
+  if ((!resInfo0.isLast || resHasMoreByTotal0) && resInfo0.rows.length > 0 && resInfo0.hasTotalPages && resInfo0.totalPages > 1) {
+    var resStart = 1 + resOneBasedOffset;
+    var resLast = Math.min(resInfo0.totalPages - (resOneBasedOffset ? 0 : 1), maxPages - 1);
+    for (var rp = resStart; rp <= resLast; rp++) {
       remainingReqs.push(buildRentalGateRequest_(resUrl, token, rp, pageSize));
       remainingMeta.push({ kind: 'res', page: rp });
     }
@@ -264,23 +334,25 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
     }
   }
 
-  // Fallback for endpoints that return hasMore / last:false without totalPages
-  if (!resInfo0.isLast && !resInfo0.hasTotalPages && resInfo0.rows.length > 0) {
-    for (var rPage = 1; rPage < maxPages; rPage++) {
+  // Fallback for endpoints that return hasMore / last:false / total without totalPages
+  if ((!resInfo0.isLast || resHasMoreByTotal0) && !resInfo0.hasTotalPages && resInfo0.rows.length > 0) {
+    for (var rPage = 1 + resOneBasedOffset; rPage < maxPages; rPage++) {
       var rBody = callRentalGateEndpoint(resUrl, token, rPage, pageSize);
       pagesFetched++;
       var rInfo = extractPagePayload_(rBody, rPage, pageSize);
       var rAdded = appendUniquePageRows_(resItems, resSeen, rInfo.rows, 'res');
-      if (rInfo.isLast || rInfo.rows.length === 0 || rAdded === 0) break;
+      var rHasMore = rInfo.totalElements > 0 && resItems.length < rInfo.totalElements && rInfo.rows.length > 0;
+      if ((rInfo.isLast && !rHasMore) || rInfo.rows.length === 0 || rAdded === 0) break;
     }
   }
-  if (!extInfo0.isLast && !extInfo0.hasTotalPages && extInfo0.rows.length > 0) {
-    for (var ePage = 1; ePage < maxPages; ePage++) {
+  if ((!extInfo0.isLast || extHasMoreByTotal0) && !extInfo0.hasTotalPages && extInfo0.rows.length > 0) {
+    for (var ePage = 1 + extOneBasedOffset; ePage < maxPages; ePage++) {
       var eBody = callRentalGateEndpoint(extUrl, token, ePage, pageSize);
       pagesFetched++;
       var eInfo = extractPagePayload_(eBody, ePage, pageSize);
       var eAdded = appendUniquePageRows_(extItems, extSeen, eInfo.rows, 'ext');
-      if (eInfo.isLast || eInfo.rows.length === 0 || eAdded === 0) break;
+      var eHasMore = eInfo.totalElements > 0 && extItems.length < eInfo.totalElements && eInfo.rows.length > 0;
+      if ((eInfo.isLast && !eHasMore) || eInfo.rows.length === 0 || eAdded === 0) break;
     }
   }
 
@@ -377,6 +449,8 @@ function serializeReservationForClient_(sr, isFollowedFlag) {
     customerEmail: sr.customerEmail || '',
     customerIdNumber: sr.customerIdNumber || '',
     companyName: sr.companyName,
+    companyNumber: sr.companyNumber || '',
+    newCompanyName: sr.newCompanyName || '',
     branchName: sr.branchName,
     deliverBranchName: sr.deliverBranchName || sr.branchName || '',
     carName: sr.carName,
@@ -416,6 +490,16 @@ function serializeReservationForClient_(sr, isFollowedFlag) {
     lastUpdatedByName: sr.lastUpdatedByName,
     lastUpdatedAt: sr.lastUpdatedAt,
     hasProblem: toBool(sr.hasProblem),
+    rejectionReason: sr.rejectionReason || '',
+    carStatusAtRequest: sr.carStatusAtRequest || '',
+    refundAmount: toNumber(sr.refundAmount, 0),
+    rejectedById: sr.rejectedById || '',
+    rejectedByName: sr.rejectedByName || '',
+    rejectedAt: sr.rejectedAt || '',
+    cancellationReason: sr.cancellationReason || '',
+    cancelledById: sr.cancelledById || '',
+    cancelledByName: sr.cancelledByName || '',
+    cancelledAt: sr.cancelledAt || '',
     pinnedNote: sr.pinnedNote || '',
     pinnedNoteById: sr.pinnedNoteById || '',
     pinnedNoteByName: sr.pinnedNoteByName || '',
@@ -517,7 +601,7 @@ function runRentalGateSyncInternal(actor, options) {
 
     try {
       var excludedSetting = findRecordById(RG_SHEETS.SETTINGS, 'key', 'excluded_statuses');
-      var excludedStatuses = safeJsonParse(excludedSetting ? excludedSetting.value : '[]', []);
+      var excludedStatuses = sanitizeExcludedStatusesListGs_(safeJsonParse(excludedSetting ? excludedSetting.value : '[]', []));
       var excludedSet = {};
       for (var e = 0; e < excludedStatuses.length; e++) {
         excludedSet[normalizeStr(excludedStatuses[e]).toLowerCase()] = true;
@@ -746,27 +830,23 @@ function runRentalGateSyncInternal(actor, options) {
             });
           }
 
+          var incomingLifecycleGs = classifyReservationLifecycleGs_({
+            originalStatusCode: statusCode,
+            originalStatusAr: sourceStatusAr,
+            internalStatus: sourceStatusAr
+          });
+          var existingLifecycleGs = classifyReservationLifecycleGs_(existing);
+
           var sourceChanged = Boolean(
-            statusCode && (
+            (statusCode && (
               (prevCode && statusCode !== prevCode) ||
               (!prevCode && prevOrigAr && sourceStatusAr !== prevOrigAr)
-            )
+            )) ||
+            (incomingLifecycleGs !== existingLifecycleGs) ||
+            (!statusCode && prevOrigAr && sourceStatusAr && sourceStatusAr !== prevOrigAr)
           );
 
-          var existingInactiveGs = Boolean(existing.rejectedAt || existing.cancelledAt) ||
-            ['مرفوض', 'مرفوضة', 'تم الرفض', 'ملغي', 'تم الإلغاء', 'ملغى', 'rejected', 'declined', 'cancelled', 'canceled']
-              .indexOf(prevInternal.toLowerCase()) !== -1;
-          var incomingInactiveGs = ['rejected', 'declined', 'cancelled', 'canceled'].indexOf(statusCode) !== -1 ||
-            ['مرفوض', 'مرفوضة', 'تم الرفض', 'ملغي', 'تم الإلغاء', 'ملغى'].indexOf(sourceStatusAr) !== -1;
-
-          if (existingInactiveGs && !incomingInactiveGs) {
-            nextInternalStatus = prevInternal || sourceStatusAr;
-            nextLastUpdateText = existing.lastUpdateText || ('تم السحب من Rental Gate بالحالة: ' + sourceStatusAr);
-            nextLastUpdatedById = existing.lastUpdatedById || actorId;
-            nextLastUpdatedByName = existing.lastUpdatedByName || actorName;
-            nextLastUpdatedAt = existing.lastUpdatedAt || nowStr;
-            nextStatusHistory = prevHist;
-          } else if (sourceChanged) {
+          if (sourceChanged) {
             nextInternalStatus = sourceStatusAr;
             nextLastUpdateText = 'تحديث الحالة من Rental Gate: ' + (prevInternal || prevOrigAr || '-') + ' ← ' + sourceStatusAr;
             nextLastUpdatedById = actorId;
@@ -828,6 +908,14 @@ function runRentalGateSyncInternal(actor, options) {
         var deliverBranchName = normalizeStr(item.deliverBranchArName || item.deliverBranchEnName || item.returnBranchName || receiveBranchName);
         var sourceCreatedRaw = item.reservationDate || item.createdAt || item.created_at || '';
 
+        var finalLifecycleGs = classifyReservationLifecycleGs_({
+          originalStatusCode: statusCode,
+          originalStatusAr: sourceStatusAr,
+          internalStatus: nextInternalStatus
+        });
+        var isRejSync = finalLifecycleGs === 'rejected';
+        var isCanSync = finalLifecycleGs === 'cancelled';
+
         var resPayload = {
           id: resId,
           sourceReservationId: resApiId || resNumber,
@@ -836,31 +924,10 @@ function runRentalGateSyncInternal(actor, options) {
           customerName: normalizeStr(item.clientName || item.customer_name || customerObj.name || customerObj.full_name || 'عميل'),
           customerPhone: normalizeStr(item.clientMobile || item.customer_phone || customerObj.phone || customerObj.mobile || ''),
           customerEmail: normalizeStr(item.clientEmail || item.customer_email || customerObj.email || (existing && existing.customerEmail) || ''),
-          customerIdNumber: (function () {
-            var idKeys = [
-              'clientNationalId', 'client_national_id', 'customerNationalId', 'customer_national_id',
-              'nationalId', 'national_id', 'nationalIdNumber', 'national_id_number',
-              'clientIdNumber', 'client_id_number', 'customerIdNumber', 'customer_id_number',
-              'idNumber', 'id_number', 'identityNumber', 'identity_number',
-              'iqamaNumber', 'iqama_number', 'clientIqama', 'client_iqama',
-              'nid', 'ssn', 'citizenId', 'citizen_id'
-            ];
-            var clientObj = (item.client && typeof item.client === 'object') ? item.client : {};
-            var sources = [item, customerObj, clientObj];
-            for (var si = 0; si < sources.length; si++) {
-              var srcObj = sources[si];
-              if (!srcObj || typeof srcObj !== 'object') continue;
-              for (var ki = 0; ki < idKeys.length; ki++) {
-                var rawCand = normalizeStr(srcObj[idKeys[ki]]);
-                if (rawCand && rawCand !== '-' && rawCand.toLowerCase() !== 'null' && rawCand.toLowerCase() !== 'undefined') {
-                  if (typeof convertEasternDigitsGs_ === 'function') rawCand = convertEasternDigitsGs_(rawCand);
-                  return rawCand.trim();
-                }
-              }
-            }
-            return normalizeStr(existing && existing.customerIdNumber) || '';
-          })(),
+          customerIdNumber: extractCustomerNationalIdGs_(item, existing),
           companyName: normalizeStr(item.companyArName || item.companyEnName || item.company_name || companyObj.name || ''),
+          companyNumber: normalizeStr((existing && existing.companyNumber) || item.companyNumber || item.company_number || item.companyCode || item.companyId || ''),
+          newCompanyName: isRejSync ? normalizeStr(item.newCompanyName || item.new_company_name || (existing && existing.newCompanyName) || '') : '',
           branchName: receiveBranchName,
           deliverBranchName: deliverBranchName,
           carName: normalizeStr(item.carNameAr || item.carNameEn || item.car_name || carObj.name || (carObj.brand ? (carObj.brand + ' ' + (carObj.model || '')) : '')),
@@ -900,6 +967,16 @@ function runRentalGateSyncInternal(actor, options) {
           lastUpdatedByName: nextLastUpdatedByName,
           lastUpdatedAt: nextLastUpdatedAt,
           hasProblem: existing ? existing.hasProblem : 'false',
+          rejectionReason: isRejSync ? normalizeStr(item.rejectionReason || item.rejectReason || item.reason || (existing && existing.rejectionReason) || '') : '',
+          carStatusAtRequest: isRejSync ? normalizeStr(item.carStatusAtRequest || (existing && existing.carStatusAtRequest) || '') : '',
+          refundAmount: isRejSync ? ((existing && existing.refundAmount !== undefined && existing.refundAmount !== null && existing.refundAmount !== '') ? toNumber(existing.refundAmount, 0) : toNumber(item.refundAmount || item.refund_amount, 0)) : 0,
+          rejectedById: isRejSync ? normalizeStr((existing && existing.rejectedById) || actorId) : '',
+          rejectedByName: isRejSync ? normalizeStr((existing && existing.rejectedByName) || actorName) : '',
+          rejectedAt: isRejSync ? normalizeStr(item.rejectedAt || (existing && existing.rejectedAt) || nowStr) : '',
+          cancellationReason: isCanSync ? normalizeStr(item.cancellationReason || item.cancelReason || item.reason || (existing && existing.cancellationReason) || '') : '',
+          cancelledById: isCanSync ? normalizeStr((existing && existing.cancelledById) || actorId) : '',
+          cancelledByName: isCanSync ? normalizeStr((existing && existing.cancelledByName) || actorName) : '',
+          cancelledAt: isCanSync ? normalizeStr(item.cancelledAt || (existing && existing.cancelledAt) || nowStr) : '',
           pinnedNote: existing ? normalizeStr(existing.pinnedNote) : '',
           pinnedNoteById: existing ? normalizeStr(existing.pinnedNoteById) : '',
           pinnedNoteByName: existing ? normalizeStr(existing.pinnedNoteByName) : '',

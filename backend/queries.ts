@@ -39,7 +39,8 @@ import {
   ingestIncrementalSyncBatch,
   mapExtensionRowToClient,
   mapReservationRowToClient,
-  pullFromRentalGateDirect
+  pullFromRentalGateDirect,
+  sanitizeExcludedStatusesList
 } from './syncService.js';
 
 function str(v: unknown, fallback = ''): string {
@@ -70,19 +71,47 @@ export function buildPgSearchCondition(columns: string[], rawQuery: unknown, par
   return tokenClauses.length === 1 ? tokenClauses[0] : `(${tokenClauses.join(' AND ')})`;
 }
 
+const SQL_REJECTED_STATUS_LIST = `('مرفوض','مرفوضة','تم الرفض','rejected','declined','refused')`;
+const SQL_CANCELLED_STATUS_LIST = `('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','cancelled','canceled')`;
+
+const SQL_EXPLICIT_REJECTED = `(
+  LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('rejected','declined','refused') OR
+  LOWER(TRIM(COALESCE(r.original_status_ar, ''))) IN ${SQL_REJECTED_STATUS_LIST} OR
+  (
+    LOWER(TRIM(COALESCE(r.original_status_code, ''))) NOT IN ('cancelled','canceled') AND
+    LOWER(TRIM(COALESCE(r.original_status_ar, ''))) NOT IN ${SQL_CANCELLED_STATUS_LIST} AND
+    LOWER(TRIM(COALESCE(r.internal_status, ''))) IN ${SQL_REJECTED_STATUS_LIST}
+  )
+)`;
+
+const SQL_EXPLICIT_CANCELLED = `(
+  NOT ${SQL_EXPLICIT_REJECTED} AND (
+    LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('cancelled','canceled') OR
+    LOWER(TRIM(COALESCE(r.original_status_ar, ''))) IN ${SQL_CANCELLED_STATUS_LIST} OR
+    LOWER(TRIM(COALESCE(r.internal_status, ''))) IN ${SQL_CANCELLED_STATUS_LIST}
+  )
+)`;
+
+const SQL_HAS_EXPLICIT_STATUS = `(
+  TRIM(COALESCE(r.original_status_code, '')) <> '' OR
+  (TRIM(COALESCE(r.original_status_ar, '')) <> '' AND TRIM(COALESCE(r.original_status_ar, '')) <> 'غير محدد') OR
+  (TRIM(COALESCE(r.internal_status, '')) <> '' AND TRIM(COALESCE(r.internal_status, '')) <> 'غير محدد')
+)`;
+
 const SQL_REJECTED_CONDITION = `(
-  COALESCE(r.rejected_at, '') <> '' OR
-  LOWER(COALESCE(r.internal_status, '')) IN ('مرفوض','مرفوضة','تم الرفض','rejected','declined','refused') OR
-  LOWER(COALESCE(r.original_status_ar, '')) IN ('مرفوض','مرفوضة','تم الرفض','rejected','declined','refused') OR
-  LOWER(COALESCE(r.original_status_code, '')) IN ('rejected','declined','refused')
+  ${SQL_EXPLICIT_REJECTED} OR (
+    NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+    COALESCE(r.rejected_at, '') <> '' AND
+    (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+  )
 )`;
 
 const SQL_CANCELLED_CONDITION = `(
   NOT ${SQL_REJECTED_CONDITION} AND (
-    COALESCE(r.cancelled_at, '') <> '' OR
-    LOWER(COALESCE(r.internal_status, '')) IN ('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','cancelled','canceled') OR
-    LOWER(COALESCE(r.original_status_ar, '')) IN ('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','cancelled','canceled') OR
-    LOWER(COALESCE(r.original_status_code, '')) IN ('cancelled','canceled')
+    ${SQL_EXPLICIT_CANCELLED} OR (
+      NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+      COALESCE(r.cancelled_at, '') <> ''
+    )
   )
 )`;
 
@@ -574,7 +603,7 @@ export async function ensureSeededDatabase(executor: DbExecutor): Promise<void> 
 
     const defaultSettings: Array<[string, string]> = [
       ['company_name', 'Rental Gate CRM'],
-      ['excluded_statuses', JSON.stringify(['cancelled', 'canceled', 'declined', 'rejected'])],
+      ['excluded_statuses', JSON.stringify(['draft', 'test', 'abandoned'])],
       ['session_ttl_hours', '12'],
       ['allow_agent_view_all', 'true'],
       ['default_language', 'ar'],
@@ -1286,7 +1315,9 @@ export async function getReservations(
       'r.branch_name',
       'r.company_name',
       'r.company_number',
-      'r.new_company_name'
+      'r.new_company_name',
+      'r.rejection_reason',
+      'r.cancellation_reason'
     ];
     if (canSearchId) {
       searchCols.push('r.customer_id_number');
@@ -1347,8 +1378,36 @@ export async function getReservations(
   const hasTimeFilter = Boolean(str(payload.timeFrom) || str(payload.timeTo));
   const overdueUnpaidOnly = toBool(payload.overdueUnpaidOnly);
 
+  const loadLifecycleCounts = async () => {
+    const scopeParams: any[] = [];
+    const scopeWhere = (session.user.role === 'agent' && !allowAgentViewAll)
+      ? (scopeParams.push(JSON.stringify([session.user.id])), `WHERE r.assigned_employee_ids @> $1::jsonb`)
+      : '';
+    const lcRes = await executor.query<{
+      total_cnt: string;
+      active_cnt: string;
+      cancelled_cnt: string;
+      rejected_cnt: string;
+    }>(
+      `SELECT
+         COUNT(*)::text AS total_cnt,
+         COUNT(*) FILTER (WHERE ${SQL_ACTIVE_CONDITION})::text AS active_cnt,
+         COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::text AS cancelled_cnt,
+         COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::text AS rejected_cnt
+       FROM reservations r ${scopeWhere}`,
+      scopeParams
+    ).catch(() => ({ rows: [] as any[] }));
+    const row = lcRes.rows?.[0] || {};
+    return {
+      all: Number(row.total_cnt || 0),
+      active: Number(row.active_cnt || 0),
+      cancelled: Number(row.cancelled_cnt || 0),
+      rejected: Number(row.rejected_cnt || 0)
+    };
+  };
+
   if (hasTimeFilter || overdueUnpaidOnly) {
-    const [allMatchedRes, extRowsRes, facets] = await Promise.all([
+    const [allMatchedRes, extRowsRes, facets, lifecycleCounts] = await Promise.all([
       executor.query(
         `SELECT r.*,
                 EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
@@ -1361,7 +1420,8 @@ export async function getReservations(
       overdueUnpaidOnly
         ? executor.query(`SELECT * FROM extensions`)
         : Promise.resolve({ rows: [] }),
-      getCachedReservationFacets(executor)
+      getCachedReservationFacets(executor),
+      loadLifecycleCounts()
     ]);
 
     const mappedItems = allMatchedRes.rows.map((r) => mapReservationRowToClient(r, false));
@@ -1410,12 +1470,13 @@ export async function getReservations(
       page,
       pageSize,
       totalPages: Math.max(1, Math.ceil(total / pageSize)),
-      facets
+      facets,
+      lifecycleCounts
     };
   }
 
   const listParams = [...params, pageSize, offset];
-  const [countRes, rowsRes, facets] = await Promise.all([
+  const [countRes, rowsRes, facets, lifecycleCounts] = await Promise.all([
     executor.query<{ cnt: string }>(
       `SELECT COUNT(*)::text AS cnt FROM reservations r ${whereSql}`,
       params
@@ -1429,7 +1490,8 @@ export async function getReservations(
        LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
       listParams
     ),
-    getCachedReservationFacets(executor)
+    getCachedReservationFacets(executor),
+    loadLifecycleCounts()
   ]);
 
   const total = Number(countRes.rows[0]?.cnt || 0);
@@ -1440,7 +1502,8 @@ export async function getReservations(
     page,
     pageSize,
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
-    facets
+    facets,
+    lifecycleCounts
   };
 }
 
@@ -1727,12 +1790,18 @@ export async function quickUpdateReservationStatus(
   if (!crmCore.isValidWorkflowStatus(newStatus)) {
     throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
   }
+  if (crmCore.isManualBlockedWorkflowStatus(newStatus)) {
+    throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن رفض أو إلغاء الحجوزات يدوياً؛ يتم تحديث هذه الحالات تلقائياً عبر المزامنة فقط.');
+  }
 
   const out = await executor.withTransaction(async (tx) => {
     const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
     if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
 
     const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+    if (crmCore.isInactiveReservation(resObj)) {
+      throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تعديل حالة حجز مرفوض أو ملغى يدوياً؛ الحالة مقيدة بالموقع الخارجي.');
+    }
     assertOptimisticLock(resObj.updatedAt, payload.expectedUpdatedAt);
     const prevStatus = str(resObj.internalStatus);
     const nowIso = new Date().toISOString();
@@ -1869,8 +1938,13 @@ export async function updateReservationDetails(
     assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
     const nextStatus = payload.internalStatus !== undefined ? str(payload.internalStatus) : existing.internalStatus;
-    if (payload.internalStatus !== undefined && !crmCore.isValidWorkflowStatus(nextStatus)) {
-      throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
+    if (payload.internalStatus !== undefined && nextStatus !== existing.internalStatus) {
+      if (!crmCore.isValidWorkflowStatus(nextStatus)) {
+        throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
+      }
+      if (crmCore.isManualBlockedWorkflowStatus(nextStatus) || crmCore.isInactiveReservation(existing)) {
+        throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن رفض أو إلغاء الحجز أو تغيير حالة حجز غير نشط يدوياً.');
+      }
     }
 
     const nowIso = new Date().toISOString();
@@ -1899,8 +1973,9 @@ export async function updateReservationDetails(
       ? num(payload.totalAmount, Number((nextBaseAmount + nextExtAmount).toFixed(2)))
       : existing.totalAmount;
 
-    const isRejTarget = crmCore.isRejectedStatus(nextStatus);
-    const isCanTarget = !isRejTarget && crmCore.isCancelledStatus(nextStatus);
+    const existingLifecycle = crmCore.getReservationLifecycleKind(existing);
+    const isRejTarget = existingLifecycle === 'rejected';
+    const isCanTarget = existingLifecycle === 'cancelled';
 
     const nextObj: Record<string, any> = {
       ...existing,
@@ -2274,12 +2349,16 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
   const notes = str(payload.notes);
   if (!resId || !status || !action) throw new Error('VALIDATION_ERROR: الحجز والحالة والإجراء حقول مطلوبة.');
   if (!crmCore.isValidWorkflowStatus(status)) throw new Error('VALIDATION_ERROR: حالة المتابعة غير معتمدة.');
+  if (crmCore.isManualBlockedWorkflowStatus(status)) {
+    throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تعيين حالة مرفوض أو ملغى يدوياً من المتابعات؛ يتم سحبها من الموقع الخارجي فقط.');
+  }
 
   return runWithIdempotency(executor, session.user.id, 'addFollowUp', str(payload.clientRequestId), async () => {
     const out = await executor.withTransaction(async (tx) => {
       const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
       if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
       const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+      const effectiveNextInternalStatus = crmCore.isInactiveReservation(resObj) ? resObj.internalStatus : status;
 
       const nowIso = new Date().toISOString();
       const fuObj = {
@@ -2289,7 +2368,7 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
         customerName: resObj.customerName,
         employeeId: session.user.id,
         employeeName: session.user.name,
-        status,
+        status: effectiveNextInternalStatus,
         action,
         notes,
         followUpDate: nowIso.slice(0, 10),
@@ -2305,40 +2384,34 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
       );
 
       const lastText = action + (notes ? ` — ${notes}` : '');
-      const isRejTarget = crmCore.isRejectedStatus(status);
-      const isCanTarget = !isRejTarget && crmCore.isCancelledStatus(status);
-      const nextRejectedAt = isRejTarget ? (str(resObj.rejectedAt) || nowIso) : str(resObj.rejectedAt);
-      const nextRejectedById = isRejTarget ? (str(resObj.rejectedById) || session.user.id) : str(resObj.rejectedById);
-      const nextRejectedByName = isRejTarget ? (str(resObj.rejectedByName) || session.user.name) : str(resObj.rejectedByName);
-      const nextRejectionReason = isRejTarget ? (str(payload.rejectionReason || notes || action) || str(resObj.rejectionReason)) : str(resObj.rejectionReason);
-      const nextCancelledAt = isCanTarget ? (str(resObj.cancelledAt) || nowIso) : str(resObj.cancelledAt);
-      const nextCancelledById = isCanTarget ? (str(resObj.cancelledById) || session.user.id) : str(resObj.cancelledById);
-      const nextCancelledByName = isCanTarget ? (str(resObj.cancelledByName) || session.user.name) : str(resObj.cancelledByName);
-      const nextCancellationReason = isCanTarget ? (str(payload.cancellationReason || notes || action) || str(resObj.cancellationReason)) : str(resObj.cancellationReason);
+      const nextRejectedAt = str(resObj.rejectedAt);
+      const nextRejectedById = str(resObj.rejectedById);
+      const nextRejectedByName = str(resObj.rejectedByName);
+      const nextRejectionReason = str(resObj.rejectionReason);
+      const nextCancelledAt = str(resObj.cancelledAt);
+      const nextCancelledById = str(resObj.cancelledById);
+      const nextCancelledByName = str(resObj.cancelledByName);
+      const nextCancellationReason = str(resObj.cancellationReason);
 
-      const nextHistory = crmCore.appendStatusStageEntry(resObj.statusHistory || [], {
-        source: isRejTarget ? 'reject_action' : (isCanTarget ? 'cancel_action' : 'followup'),
-        previousStatus: resObj.internalStatus,
-        newStatus: status,
-        changedAt: nowIso,
-        changedById: session.user.id,
-        changedByName: session.user.name,
-        note: lastText
-      });
+      const nextHistory = effectiveNextInternalStatus !== resObj.internalStatus
+        ? crmCore.appendStatusStageEntry(resObj.statusHistory || [], {
+            source: 'followup',
+            previousStatus: resObj.internalStatus,
+            newStatus: effectiveNextInternalStatus,
+            changedAt: nowIso,
+            changedById: session.user.id,
+            changedByName: session.user.name,
+            note: lastText
+          })
+        : (resObj.statusHistory || []);
 
       await tx.query(
         `UPDATE reservations
          SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
              last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
-             status_history = $8::jsonb,
-             rejection_reason = $9, rejected_by_id = $10, rejected_by_name = $11, rejected_at = $12,
-             cancellation_reason = $13, cancelled_by_id = $14, cancelled_by_name = $15, cancelled_at = $16
+             status_history = $8::jsonb
          WHERE id = $1`,
-        [
-          resId, status, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory),
-          nextRejectionReason, nextRejectedById, nextRejectedByName, nextRejectedAt,
-          nextCancellationReason, nextCancelledById, nextCancelledByName, nextCancelledAt
-        ]
+        [resId, effectiveNextInternalStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
       );
 
       await logActivity(tx, session.user, 'إضافة متابعة', 'FollowUp', resObj.reservationNumber, `الحالة: ${status} — ${action}`);
@@ -2394,8 +2467,13 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     }
 
     const newStatus = payload.status !== undefined ? str(payload.status) : existing.status;
-    if (payload.status !== undefined && !crmCore.isValidWorkflowStatus(newStatus)) {
-      throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
+    if (payload.status !== undefined) {
+      if (!crmCore.isValidWorkflowStatus(newStatus)) {
+        throw new Error('VALIDATION_ERROR: الحالة المحددة غير معتمدة.');
+      }
+      if (newStatus !== existing.status && crmCore.isManualBlockedWorkflowStatus(newStatus)) {
+        throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تعيين حالة مرفوض أو ملغى يدوياً من المتابعات.');
+      }
     }
     const newAction = payload.action !== undefined ? str(payload.action) : existing.action;
     const newNotes = payload.notes !== undefined ? str(payload.notes) : existing.notes;
@@ -2431,12 +2509,13 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     const lastResQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [existing.reservationId]);
     if (lastResQuery.rows[0]) {
       const rObj = mapReservationRowToClient(lastResQuery.rows[0], false);
+      const effectiveResStatus = crmCore.isInactiveReservation(rObj) ? rObj.internalStatus : newStatus;
       const lastText = newAction + (newNotes ? ` — ${newNotes}` : '');
-      const nextHistory = newStatus !== rObj.internalStatus
+      const nextHistory = effectiveResStatus !== rObj.internalStatus
         ? crmCore.appendStatusStageEntry(rObj.statusHistory || [], {
             source: 'followup_edit',
             previousStatus: rObj.internalStatus,
-            newStatus,
+            newStatus: effectiveResStatus,
             changedAt: nowIso,
             changedById: session.user.id,
             changedByName: session.user.name,
@@ -2450,7 +2529,7 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
              last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz,
              status_history = $8::jsonb
          WHERE id = $1`,
-        [rObj.id, newStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
+        [rObj.id, effectiveResStatus, lastText, session.user.id, session.user.name, nowIso, nowIso, JSON.stringify(nextHistory)]
       );
     }
 
@@ -3631,6 +3710,7 @@ export async function getSettings(executor: DbExecutor, session: AuthSession) {
   );
   return {
     ...map,
+    excluded_statuses: sanitizeExcludedStatusesList(map.excluded_statuses),
     ui_simplification: crmCore.normalizeUiSimplificationSettings(map.ui_simplification),
     role_ui_defaults: typeof crmCore.normalizeRoleUiDefaults === 'function' ? crmCore.normalizeRoleUiDefaults(map.role_ui_defaults) : {},
     stats_control_config: typeof crmCore.normalizeStatsControlConfig === 'function' ? crmCore.normalizeStatsControlConfig(map.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
@@ -3705,7 +3785,9 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   const prevMap = await getSettingsMap(executor);
   const updates: Array<[string, string]> = [];
   if (payload.company_name) updates.push(['company_name', str(payload.company_name)]);
-  if (Array.isArray(payload.excluded_statuses)) updates.push(['excluded_statuses', JSON.stringify(payload.excluded_statuses)]);
+  if (Array.isArray(payload.excluded_statuses)) {
+    updates.push(['excluded_statuses', JSON.stringify(sanitizeExcludedStatusesList(payload.excluded_statuses))]);
+  }
   if (payload.session_ttl_hours) updates.push(['session_ttl_hours', String(num(payload.session_ttl_hours, 12))]);
   if (typeof payload.allow_agent_view_all === 'boolean') updates.push(['allow_agent_view_all', String(payload.allow_agent_view_all)]);
   if (payload.default_language) updates.push(['default_language', str(payload.default_language)]);
@@ -5421,346 +5503,30 @@ export async function bulkReassignSelectedReservations(
 // ---------- INACTIVE / REJECTED / CANCELLED RESERVATIONS & NATIONAL ID LOOKUP ----------
 
 export async function rejectReservation(
-  executor: DbExecutor,
+  _executor: DbExecutor,
   session: AuthSession,
-  payload: Record<string, any> = {}
+  _payload: Record<string, any> = {}
 ) {
-  requirePermission(session, 'reject_reservation');
-  const resId = str(payload.reservationId || payload.id);
-  const rejectionReason = str(payload.rejectionReason || payload.reason);
-  const companyNumber = str(payload.companyNumber);
-  const newCompanyName = str(payload.newCompanyName);
-  const carStatusAtRequest = str(payload.carStatusAtRequest);
-  const refundAmount = Math.max(0, num(payload.refundAmount, 0));
-  const note = str(payload.note || payload.notes);
-
-  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
-  if (!rejectionReason) throw new Error('VALIDATION_ERROR: يرجى تحديد سبب الرفض.');
-
-  const out = await executor.withTransaction(async (tx) => {
-    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 FOR UPDATE`, [resId]);
-    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
-    const existing = mapReservationRowToClient(resQuery.rows[0], false);
-    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
-
-    const nowIso = new Date().toISOString();
-    const prevStatus = str(existing.internalStatus);
-    const nextStatus = 'مرفوض';
-    const lastText = `تم رفض الحجز: ${rejectionReason}${newCompanyName ? ` ← التحويل إلى: ${newCompanyName}` : ''}`;
-
-    const fuObj = {
-      id: generateId('FU'),
-      reservationId: existing.id,
-      reservationNumber: existing.reservationNumber,
-      customerName: existing.customerName,
-      employeeId: session.user.id,
-      employeeName: session.user.name,
-      status: nextStatus,
-      action: `رفض الحجز (${rejectionReason})`,
-      notes: note || (newCompanyName ? `الشركة الجديدة: ${newCompanyName} — مبلغ الاسترداد: ${refundAmount}` : ''),
-      followUpDate: nowIso.slice(0, 10),
-      followUpTime: nowIso.slice(11, 19),
-      createdAt: nowIso
-    };
-
-    await tx.query(
-      `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
-      [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
-    );
-
-    const nextHistory = crmCore.appendStatusStageEntry(existing.statusHistory || [], {
-      source: 'reject_action',
-      previousStatus: prevStatus,
-      newStatus: nextStatus,
-      changedAt: nowIso,
-      changedById: session.user.id,
-      changedByName: session.user.name,
-      note: lastText
-    });
-
-    await tx.query(
-      `UPDATE reservations
-       SET internal_status = $2,
-           rejection_reason = $3,
-           company_number = CASE WHEN $4 <> '' THEN $4 ELSE company_number END,
-           new_company_name = $5,
-           car_status_at_request = $6,
-           refund_amount = $7,
-           rejected_by_id = $8,
-           rejected_by_name = $9,
-           rejected_at = $10,
-           cancelled_by_id = '',
-           cancelled_by_name = '',
-           cancelled_at = '',
-           last_update_text = $11,
-           last_updated_by_id = $8,
-           last_updated_by_name = $9,
-           last_updated_at = $10,
-           updated_at = $13::timestamptz,
-           status_history = $12::jsonb
-       WHERE id = $1`,
-      [
-        existing.id,
-        nextStatus,
-        rejectionReason,
-        companyNumber,
-        newCompanyName,
-        carStatusAtRequest,
-        refundAmount,
-        session.user.id,
-        session.user.name,
-        nowIso,
-        lastText,
-        JSON.stringify(nextHistory),
-        nowIso
-      ]
-    );
-
-    await logActivity(
-      tx,
-      session.user,
-      'رفض حجز',
-      'Reservation',
-      existing.reservationNumber,
-      lastText,
-      [{ field: 'internalStatus', label: 'حالة الحجز', before: prevStatus || '-', after: nextStatus }]
-    );
-
-    const updatedRes: Record<string, any> = {
-      ...existing,
-      internalStatus: nextStatus,
-      rejectionReason,
-      companyNumber: companyNumber || existing.companyNumber || '',
-      newCompanyName,
-      carStatusAtRequest,
-      refundAmount,
-      rejectedById: session.user.id,
-      rejectedByName: session.user.name,
-      rejectedAt: nowIso,
-      cancelledById: '',
-      cancelledByName: '',
-      cancelledAt: '',
-      lastUpdateText: lastText,
-      lastUpdatedById: session.user.id,
-      lastUpdatedByName: session.user.name,
-      lastUpdatedAt: nowIso,
-      updatedAt: nowIso,
-      statusHistory: nextHistory,
-      isFollowed: true
-    };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-    return { reservation: redactReservationForUser(updatedRes, session.user), followUp: fuObj };
-  });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
+  requireApiAccess(session);
+  throw new Error('FORBIDDEN_MANUAL_ACTION: تم إيقاف رفض الحجوزات يدوياً؛ تُسحب الحالات المرفوضة تلقائياً من موقع Rental Gate فقط.');
 }
 
 export async function cancelReservation(
-  executor: DbExecutor,
+  _executor: DbExecutor,
   session: AuthSession,
-  payload: Record<string, any> = {}
+  _payload: Record<string, any> = {}
 ) {
-  requirePermission(session, 'cancel_reservation');
-  const resId = str(payload.reservationId || payload.id);
-  const cancellationReason = str(payload.cancellationReason || payload.reason || payload.note || 'تم الإلغاء');
-  const note = str(payload.note || payload.notes);
-  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
-
-  const out = await executor.withTransaction(async (tx) => {
-    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 FOR UPDATE`, [resId]);
-    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
-    const existing = mapReservationRowToClient(resQuery.rows[0], false);
-    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
-
-    const nowIso = new Date().toISOString();
-    const prevStatus = str(existing.internalStatus);
-    const nextStatus = 'تم الإلغاء';
-    const lastText = `تم إلغاء الحجز: ${cancellationReason}${note && note !== cancellationReason ? ` — ${note}` : ''}`;
-
-    const fuObj = {
-      id: generateId('FU'),
-      reservationId: existing.id,
-      reservationNumber: existing.reservationNumber,
-      customerName: existing.customerName,
-      employeeId: session.user.id,
-      employeeName: session.user.name,
-      status: nextStatus,
-      action: `إلغاء الحجز (${cancellationReason})`,
-      notes: note,
-      followUpDate: nowIso.slice(0, 10),
-      followUpTime: nowIso.slice(11, 19),
-      createdAt: nowIso
-    };
-
-    await tx.query(
-      `INSERT INTO follow_ups (id, reservation_id, reservation_number, customer_name, employee_id, employee_name, status, action, notes, follow_up_date, follow_up_time, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
-      [fuObj.id, fuObj.reservationId, fuObj.reservationNumber, fuObj.customerName, fuObj.employeeId, fuObj.employeeName, fuObj.status, fuObj.action, fuObj.notes, fuObj.followUpDate, fuObj.followUpTime, fuObj.createdAt]
-    );
-
-    const nextHistory = crmCore.appendStatusStageEntry(existing.statusHistory || [], {
-      source: 'cancel_action',
-      previousStatus: prevStatus,
-      newStatus: nextStatus,
-      changedAt: nowIso,
-      changedById: session.user.id,
-      changedByName: session.user.name,
-      note: lastText
-    });
-
-    await tx.query(
-      `UPDATE reservations
-       SET internal_status = $2,
-           cancellation_reason = $3,
-           cancelled_by_id = $4,
-           cancelled_by_name = $5,
-           cancelled_at = $6,
-           rejected_by_id = '',
-           rejected_by_name = '',
-           rejected_at = '',
-           last_update_text = $7,
-           last_updated_by_id = $4,
-           last_updated_by_name = $5,
-           last_updated_at = $6,
-           updated_at = $9::timestamptz,
-           status_history = $8::jsonb
-       WHERE id = $1`,
-      [
-        existing.id,
-        nextStatus,
-        cancellationReason,
-        session.user.id,
-        session.user.name,
-        nowIso,
-        lastText,
-        JSON.stringify(nextHistory),
-        nowIso
-      ]
-    );
-
-    await logActivity(
-      tx,
-      session.user,
-      'إلغاء حجز',
-      'Reservation',
-      existing.reservationNumber,
-      lastText,
-      [{ field: 'internalStatus', label: 'حالة الحجز', before: prevStatus || '-', after: nextStatus }]
-    );
-
-    const updatedRes: Record<string, any> = {
-      ...existing,
-      internalStatus: nextStatus,
-      cancellationReason,
-      cancelledById: session.user.id,
-      cancelledByName: session.user.name,
-      cancelledAt: nowIso,
-      rejectedById: '',
-      rejectedByName: '',
-      rejectedAt: '',
-      lastUpdateText: lastText,
-      lastUpdatedById: session.user.id,
-      lastUpdatedByName: session.user.name,
-      lastUpdatedAt: nowIso,
-      updatedAt: nowIso,
-      statusHistory: nextHistory,
-      isFollowed: true
-    };
-    await enqueueSheetsMirror(tx, 'FollowUp', fuObj.id, 'appendFollowUp', fuObj);
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-    return { reservation: redactReservationForUser(updatedRes, session.user), followUp: fuObj };
-  });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
+  requireApiAccess(session);
+  throw new Error('FORBIDDEN_MANUAL_ACTION: تم إيقاف إلغاء الحجوزات يدوياً؛ تُسحب الحالات الملغاة تلقائياً من موقع Rental Gate فقط.');
 }
 
 export async function restoreReservation(
-  executor: DbExecutor,
+  _executor: DbExecutor,
   session: AuthSession,
-  payload: Record<string, any> = {}
+  _payload: Record<string, any> = {}
 ) {
-  const allowed =
-    crmCore.canUserPerform(session.user, 'reject_reservation') ||
-    crmCore.canUserPerform(session.user, 'cancel_reservation') ||
-    crmCore.canUserPerform(session.user, 'edit_reservation_details');
-  if (!allowed) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية استعادة الحجوزات غير الفعالة.');
-  }
-
-  const resId = str(payload.reservationId || payload.id);
-  const requestedTarget = str(payload.targetStatus || 'بانتظار التأكيد');
-  const nextStatus = (crmCore.isValidWorkflowStatus(requestedTarget) && !crmCore.isInactiveReservation({ internalStatus: requestedTarget }))
-    ? requestedTarget
-    : 'بانتظار التأكيد';
-  const note = str(payload.note || payload.reason || 'إعادة تفعيل الحجز');
-  if (!resId) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
-
-  const out = await executor.withTransaction(async (tx) => {
-    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 FOR UPDATE`, [resId]);
-    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
-    const existing = mapReservationRowToClient(resQuery.rows[0], false);
-    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
-
-    const nowIso = new Date().toISOString();
-    const prevStatus = str(existing.internalStatus);
-    const lastText = `تمت استعادة الحجز إلى النشط (${nextStatus})${note ? ` — ${note}` : ''}`;
-    const nextHistory = crmCore.appendStatusStageEntry(existing.statusHistory || [], {
-      source: 'restore_action',
-      previousStatus: prevStatus,
-      newStatus: nextStatus,
-      changedAt: nowIso,
-      changedById: session.user.id,
-      changedByName: session.user.name,
-      note: lastText
-    });
-
-    await tx.query(
-      `UPDATE reservations
-       SET internal_status = $2,
-           rejected_at = '',
-           cancelled_at = '',
-           last_update_text = $3,
-           last_updated_by_id = $4,
-           last_updated_by_name = $5,
-           last_updated_at = $6,
-           updated_at = $8::timestamptz,
-           status_history = $7::jsonb
-       WHERE id = $1`,
-      [existing.id, nextStatus, lastText, session.user.id, session.user.name, nowIso, JSON.stringify(nextHistory), nowIso]
-    );
-
-    await logActivity(
-      tx,
-      session.user,
-      'استعادة حجز',
-      'Reservation',
-      existing.reservationNumber,
-      lastText,
-      [{ field: 'internalStatus', label: 'حالة الحجز', before: prevStatus || '-', after: nextStatus }]
-    );
-
-    const updatedRes: Record<string, any> = {
-      ...existing,
-      internalStatus: nextStatus,
-      rejectedAt: '',
-      cancelledAt: '',
-      lastUpdateText: lastText,
-      lastUpdatedById: session.user.id,
-      lastUpdatedByName: session.user.name,
-      lastUpdatedAt: nowIso,
-      updatedAt: nowIso,
-      statusHistory: nextHistory
-    };
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-    return { reservation: redactReservationForUser(updatedRes, session.user) };
-  });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
+  requireApiAccess(session);
+  throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تغيير حالة الحجز المرفوض أو الملغى يدوياً؛ تتبع الحالة للموقع الخارجي.');
 }
 
 export async function getInactiveReservations(
@@ -5768,7 +5534,7 @@ export async function getInactiveReservations(
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
-  requirePermission(session, 'view_inactive_reservations');
+  requirePermission(session, 'view_reservations');
   const subTab = str(payload.subTab || payload.lifecycle || 'rejected').toLowerCase();
   if (subTab === 'rejected' && typeof crmCore.canUserViewSubSection === 'function' && !crmCore.canUserViewSubSection(session.user, 'sub_view_rejected_tab')) {
     throw new Error('FORBIDDEN: ليس لديك صلاحية عرض تبويب الحجوزات المرفوضة.');

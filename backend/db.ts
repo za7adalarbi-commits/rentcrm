@@ -1,8 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import pg from 'pg';
 import { FIXED_SERVER_CONFIG } from './fixedConfig.js';
 import { SCHEMA_SQL } from './schemaSql.js';
+
+const require = createRequire(import.meta.url);
+const crmCore = require('./coreBridge.cjs');
 
 const { Pool } = pg;
 
@@ -380,6 +384,7 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
           await runOptionalDdl(executor, ddl);
         }
       }
+      await runLifecycleAndNationalIdMaintenance(executor);
       schemaInitialized = true;
     } finally {
       schemaInitPromise = null;
@@ -387,6 +392,93 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
   })();
 
   return schemaInitPromise;
+}
+
+const NEVER_EXCLUDED_LIFECYCLE = new Set([
+  'cancelled', 'canceled', 'declined', 'rejected', 'refused',
+  'ملغي', 'ملغى', 'ملغاة', 'تم الإلغاء', 'تم الالغاء',
+  'مرفوض', 'مرفوضة', 'تم الرفض'
+]);
+
+export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor): Promise<void> {
+  // 1) Remove rejected/cancelled statuses from settings.excluded_statuses if seeded earlier
+  try {
+    const setRes = await executor.query<{ value: string }>(
+      `SELECT value FROM settings WHERE key = 'excluded_statuses' LIMIT 1`
+    );
+    const rawVal = setRes?.rows?.[0]?.value;
+    if (rawVal) {
+      const parsed = JSON.parse(rawVal);
+      if (Array.isArray(parsed)) {
+        const cleaned = parsed
+          .map((x) => String(x || '').trim().toLowerCase())
+          .filter((x) => x && !NEVER_EXCLUDED_LIFECYCLE.has(x));
+        if (cleaned.length !== parsed.length) {
+          await executor.query(
+            `UPDATE settings SET value = $1, updated_at = NOW() WHERE key = 'excluded_statuses'`,
+            [JSON.stringify(cleaned)]
+          );
+        }
+      }
+    }
+  } catch {
+    // Non-fatal in mock/unit environments
+  }
+
+  // 2) Clear stale cross-timestamps on reservations whose explicit original_status_code dictates another lifecycle
+  try {
+    await executor.query(
+      `UPDATE reservations
+       SET rejected_at = '', rejected_by_id = '', rejected_by_name = ''
+       WHERE COALESCE(rejected_at, '') <> ''
+         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('cancelled', 'canceled')`
+    );
+    await executor.query(
+      `UPDATE reservations
+       SET cancelled_at = '', cancelled_by_id = '', cancelled_by_name = ''
+       WHERE COALESCE(cancelled_at, '') <> ''
+         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('rejected', 'declined', 'refused')`
+    );
+  } catch {
+    // Non-fatal
+  }
+
+  // 3) Backfill missing customer_id_number safely from each reservation's own raw_json
+  try {
+    const rowsRes = await executor.query<{ id: string; raw_json: string }>(
+      `SELECT id, raw_json FROM reservations
+       WHERE COALESCE(customer_id_number, '') = ''
+         AND raw_json LIKE '{%'
+       LIMIT 2000`
+    );
+    const ids: string[] = [];
+    const cids: string[] = [];
+    for (const r of rowsRes?.rows || []) {
+      try {
+        const parsed = JSON.parse(String(r.raw_json || '{}'));
+        const extracted = typeof crmCore.extractCustomerNationalId === 'function'
+          ? crmCore.extractCustomerNationalId(parsed, null)
+          : '';
+        if (extracted) {
+          ids.push(String(r.id));
+          cids.push(String(extracted));
+        }
+      } catch {
+        // Skip malformed JSON
+      }
+    }
+    if (ids.length > 0) {
+      await executor.query(
+        `UPDATE reservations AS t
+         SET customer_id_number = v.cid
+         FROM unnest($1::text[], $2::text[]) AS v(id, cid)
+         WHERE t.id = v.id AND COALESCE(t.customer_id_number, '') = ''`,
+        [ids, cids]
+      );
+    }
+  } catch {
+    // Non-fatal
+  }
 }
 
 export function resetSchemaInitFlagForTesting(): void {

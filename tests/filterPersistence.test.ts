@@ -378,15 +378,19 @@ test('api.js applyDeltaSyncToCache and applyOptimisticMutation preserve active f
   const unfilteredAfterDelta = api.getCachedData('getReservations', { page: 1, pageSize: 20 }, true);
   assert.equal(unfilteredAfterDelta.items.length, 4);
 
-  // 2) Optimistic mutation changes RES_1 status from 'مؤكد' to 'ملغي' -> disappears from filtered cache, stays updated in unfiltered cache
+  // 2) Blocked manual transition ('ملغي') is ignored by applyOptimisticMutation, while allowed active status ('تم التسليم') drops from status='مؤكد' filtered cache
   api.applyOptimisticMutation('quickUpdateReservationStatus', { reservationId: 'RES_1', status: 'ملغي' }, { id: 'EMP_1', name: 'Ahmed' });
+  const afterBlockedOpt = api.getCachedData('getReservations', { page: 1, pageSize: 20, status: 'مؤكد' }, true);
+  assert.deepEqual(Array.from(afterBlockedOpt.items, (r: any) => r.id), ['RES_4', 'RES_1']);
+
+  api.applyOptimisticMutation('quickUpdateReservationStatus', { reservationId: 'RES_1', status: 'تم التسليم' }, { id: 'EMP_1', name: 'Ahmed' });
   const filteredAfterOpt = api.getCachedData('getReservations', { page: 1, pageSize: 20, status: 'مؤكد' }, true);
   assert.deepEqual(Array.from(filteredAfterOpt.items, (r: any) => r.id), ['RES_4']);
   assert.equal(filteredAfterOpt.total, 1);
 
   const unfilteredAfterOpt = api.getCachedData('getReservations', { page: 1, pageSize: 20 }, true);
   const res1Unfiltered = unfilteredAfterOpt.items.find((r: any) => r.id === 'RES_1');
-  assert.equal(res1Unfiltered.internalStatus, 'ملغي');
+  assert.equal(res1Unfiltered.internalStatus, 'تم التسليم');
 
   // 3) Optimistic problem close drops PRB_1 from status=جديدة filtered cache
   api.applyOptimisticMutation('updateProblem', { problemId: 'PRB_1', status: 'مغلقة', priority: 'عادي' }, { id: 'EMP_1', name: 'Ahmed' });

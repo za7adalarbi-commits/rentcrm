@@ -537,18 +537,33 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
           updated_at: new Date(params[49][i]),
           status_history: JSON.parse(params[50][i]),
           raw_json: params[51][i],
-          source_order: Array.isArray(params[52]) ? (params[52][i] ?? null) : null
+          source_order: Array.isArray(params[52]) ? (params[52][i] ?? null) : null,
+          company_number: Array.isArray(params[53]) ? (params[53][i] ?? '') : '',
+          new_company_name: Array.isArray(params[54]) ? (params[54][i] ?? '') : '',
+          rejection_reason: Array.isArray(params[55]) ? (params[55][i] ?? '') : '',
+          car_status_at_request: Array.isArray(params[56]) ? (params[56][i] ?? '') : '',
+          refund_amount: Array.isArray(params[57]) ? (params[57][i] ?? 0) : 0,
+          rejected_by_id: Array.isArray(params[58]) ? (params[58][i] ?? '') : '',
+          rejected_by_name: Array.isArray(params[59]) ? (params[59][i] ?? '') : '',
+          rejected_at: Array.isArray(params[60]) ? (params[60][i] ?? '') : '',
+          cancellation_reason: Array.isArray(params[61]) ? (params[61][i] ?? '') : '',
+          cancelled_by_id: Array.isArray(params[62]) ? (params[62][i] ?? '') : '',
+          cancelled_by_name: Array.isArray(params[63]) ? (params[63][i] ?? '') : '',
+          cancelled_at: Array.isArray(params[64]) ? (params[64][i] ?? '') : ''
         };
         const idx = state.reservations.findIndex((r) => r.reservation_number === rec.reservation_number);
         if (idx === -1) {
           state.reservations.push(rec);
           outRows.push({ inserted: true });
         } else {
+          const prev = state.reservations[idx];
+          const samePhoneOrEmpty = !rec.customer_phone || !prev.customer_phone || rec.customer_phone === prev.customer_phone;
           state.reservations[idx] = {
             ...rec,
-            id: state.reservations[idx].id,
-            created_at: state.reservations[idx].created_at,
-            source_order: rec.source_order ?? state.reservations[idx].source_order ?? null
+            id: prev.id,
+            customer_id_number: rec.customer_id_number || (samePhoneOrEmpty ? (prev.customer_id_number || '') : ''),
+            created_at: prev.created_at,
+            source_order: rec.source_order ?? prev.source_order ?? null
           };
           outRows.push({ inserted: false });
         }
@@ -2025,8 +2040,8 @@ test('pullFromRentalGateDirect ingests reservationId-only DTOs inside nested pay
       return new Response('{}', { status: 404 });
     }) as any;
 
-    // Seed excluded_statuses setting like production DB
-    db.state.settings.push({ key: 'excluded_statuses', value: JSON.stringify(['cancelled', 'canceled']) });
+    // Seed excluded_statuses setting like legacy DB (cancelled/rejected must NEVER be excluded, while draft is excluded)
+    db.state.settings.push({ key: 'excluded_statuses', value: JSON.stringify(['cancelled', 'canceled', 'rejected', 'draft']) });
 
     const pullRes = await pullFromRentalGateDirect(
       db,
@@ -2034,33 +2049,69 @@ test('pullFromRentalGateDirect ingests reservationId-only DTOs inside nested pay
       {},
       mockFetch
     );
-    assert.equal(pullRes.importedCount, 2);
+    assert.equal(pullRes.importedCount, 3);
     assert.equal(pullRes.extensionsCount, 1);
     assert.equal(pullRes.fetchedCount, 3);
-    assert.equal(pullRes.excludedFilteredCount, 1);
-    assert.equal(db.state.reservations.length, 2);
+    assert.equal(pullRes.excludedFilteredCount, 0);
+    assert.equal(db.state.reservations.length, 3);
     const res6001 = db.state.reservations.find((r) => r.reservation_number === '6001');
+    const res6002 = db.state.reservations.find((r) => r.reservation_number === '6002');
     assert.ok(res6001);
+    assert.ok(res6002);
     assert.equal(res6001.total_amount, 1050);
+    assert.equal(res6002.original_status_code, 'cancelled');
+    assert.ok(res6002.cancelled_at);
+    assert.equal(res6002.rejected_at, '');
 
-    // Optional extensions endpoint 404 does not abort reservations pull
-    const mockNoExtFetch = (async (url: any) => {
+    // Multi-page 1-based API (?page=0 -> current_page: 1, last_page: 2, next_page_url present) + rejected + draft
+    const mockPaged1Based = (async (url: any) => {
       const u = String(url);
       if (u.includes('reservations/filter')) {
-        return new Response(JSON.stringify([
-          { reservationId: 6004, clientName: 'راشد الدوسري', reservationStatus: 'CONFIRMED', total: 500 }
-        ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        if (u.includes('page=0')) {
+          return new Response(JSON.stringify({
+            data: [
+              { reservationId: 6010, clientName: 'سعيد المالكي', reservationStatus: 'REJECTED', rejectionReason: 'عدم توفر مركبة', clientNationalId: '0098765432', total: 400 },
+              { reservationId: 6011, clientName: 'مسودة', reservationStatus: 'DRAFT', total: 100 }
+            ],
+            current_page: 1,
+            last_page: 2,
+            total: 3,
+            per_page: 2,
+            next_page_url: 'https://api.rentalgate.net/api/reservations/filter?page=2'
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({
+          data: [
+            { reservationId: 6012, clientName: 'ناصر الحربي', reservationStatus: 'CANCELLED', cancellationReason: 'إلغاء العميل', clientMobile: '0551112233', total: 650 }
+          ],
+          current_page: 2,
+          last_page: 2,
+          total: 3,
+          per_page: 2,
+          next_page_url: null
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       return new Response('Not Found', { status: 404 });
     }) as any;
 
-    const pullNoExt = await pullFromRentalGateDirect(
+    const pull1Based = await pullFromRentalGateDirect(
       db,
       { id: 'EMP_ADMIN', name: 'المدير العام', role: 'general_manager' },
       {},
-      mockNoExtFetch
+      mockPaged1Based
     );
-    assert.equal(pullNoExt.importedCount, 1);
+    assert.equal(pull1Based.fetchedCount, 3);
+    assert.equal(pull1Based.excludedFilteredCount, 1);
+    assert.equal(pull1Based.importedCount, 2);
+    const rej6010 = db.state.reservations.find((r) => r.reservation_number === '6010');
+    const can6012 = db.state.reservations.find((r) => r.reservation_number === '6012');
+    assert.ok(rej6010);
+    assert.ok(can6012);
+    assert.equal(rej6010.customer_id_number, '0098765432');
+    assert.ok(rej6010.rejected_at);
+    assert.equal(rej6010.cancelled_at, '');
+    assert.ok(can6012.cancelled_at);
+    assert.equal(can6012.rejected_at, '');
   } finally {
     if (prevRg === undefined) delete process.env.RG_TOKEN;
     else process.env.RG_TOKEN = prevRg;

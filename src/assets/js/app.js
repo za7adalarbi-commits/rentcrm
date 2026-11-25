@@ -7,7 +7,7 @@
   var PREFS_KEY = 'rg_crm_user_prefs';
   var UI_SIMP_STORAGE_KEY = 'rg_crm_ui_simplification_v1';
   var ROUTE_FILTERS_STORAGE_KEY = 'rg_crm_route_filters_v1';
-  var VALID_ROUTES = ['dashboard', 'reservations', 'inactive-reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var VALID_ROUTES = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
 
   function saveRouteFilters(userOverride) {
     try {
@@ -214,10 +214,14 @@
       redirected = sessionStorage.getItem('rg_crm_redirect_route') || '';
       if (redirected) sessionStorage.removeItem('rg_crm_redirect_route');
     } catch (e) {}
+    var rawHash = window.location.hash || (redirected ? '#' + redirected : '');
+    if (String(rawHash).toLowerCase().indexOf('inactive-reservations') !== -1) {
+      rawHash = '#reservations';
+    }
     if (root.RGCrmCore && root.RGCrmCore.resolveRouteFromLocation) {
       return root.RGCrmCore.resolveRouteFromLocation(
         window.location.pathname,
-        window.location.hash || (redirected ? '#' + redirected : ''),
+        rawHash,
         window.location.search,
         root.__RG_BASE_URL__ || '/',
         VALID_ROUTES,
@@ -1614,9 +1618,11 @@
     var workingCfg = core && core.normalizeCallWrapupShortcutsConfig
       ? core.normalizeCallWrapupShortcutsConfig(getCallWrapupShortcutsConfig())
       : { items: [], customized: false, updatedAt: '', updatedBy: '' };
-    var workflowOpts = (core && Array.isArray(core.WORKFLOW_STATUS_OPTIONS))
-      ? core.WORKFLOW_STATUS_OPTIONS
-      : ['تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم الإنشاء', 'تم الإلغاء', 'تم التمديد', 'لم يتم الحجز'];
+    var workflowOpts = (core && Array.isArray(core.MANUAL_WORKFLOW_STATUS_OPTIONS))
+      ? core.MANUAL_WORKFLOW_STATUS_OPTIONS
+      : ((core && typeof core.getWorkflowStatusOptions === 'function')
+          ? core.getWorkflowStatusOptions('')
+          : ['قيد الانتظار', 'تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم الإنشاء', 'تم التمديد', 'لم يتم الحجز']);
 
     async function persistShortcutsConfig(nextCfg, triggerBtn, successMsg) {
       return withActionLock(triggerBtn, 'saveCallWrapupShortcuts', async function () {
@@ -1989,7 +1995,8 @@
             });
           } else {
             var nextStatus = outcome.suggestedStatus || callInfo.currentStatus || 'قيد الانتظار';
-            if (root.RGCrmCore && root.RGCrmCore.isValidWorkflowStatus && !root.RGCrmCore.isValidWorkflowStatus(nextStatus)) {
+            if (root.RGCrmCore && ((root.RGCrmCore.isValidWorkflowStatus && !root.RGCrmCore.isValidWorkflowStatus(nextStatus)) ||
+                (root.RGCrmCore.isManualBlockedWorkflowStatus && root.RGCrmCore.isManualBlockedWorkflowStatus(nextStatus)))) {
               nextStatus = 'قيد الانتظار';
             }
             res = await root.RGApi.callApi('addFollowUp', {
@@ -3036,7 +3043,6 @@
   var NAV_ITEMS = [
     { id: 'dashboard', key: 'nav_dashboard', group: 'ops', icon: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z' },
     { id: 'reservations', key: 'nav_reservations', group: 'ops', icon: 'M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 16H5V9h14v11z' },
-    { id: 'inactive-reservations', key: 'nav_inactive_reservations', group: 'ops', icon: 'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10' },
     { id: 'my-followups', key: 'nav_my_followups', group: 'ops', icon: 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' },
     { id: 'team-followups', key: 'nav_team_followups', group: 'ops', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm14 14v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' },
     { id: 'problems', key: 'nav_problems', group: 'ops', icon: 'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01' },
@@ -3078,7 +3084,7 @@
           '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line md"></div><div class="rg-skeleton-box" style="height:175px;"></div></div>' +
           '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
         '</div>';
-    } else if (rId === 'reservations' || rId === 'inactive-reservations' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
+    } else if (rId === 'reservations' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
       var rows = '';
       for (var i = 0; i < 5; i++) {
         rows +=
@@ -3166,12 +3172,7 @@
           action: 'getReservations',
           payload: (root.RGCrmCore && root.RGCrmCore.buildReservationQueryPayload)
             ? root.RGCrmCore.buildReservationQueryPayload(state.reservations || {})
-            : Object.assign({ page: 1, pageSize: 20 }, state.reservations || {})
-        };
-      case 'inactive-reservations':
-        return {
-          action: 'getInactiveReservations',
-          payload: { subTab: 'rejected', page: 1, pageSize: 10 }
+            : Object.assign({ page: 1, pageSize: 20, lifecycle: 'active' }, state.reservations || {})
         };
       case 'my-followups':
         return { action: 'getMyFollowUps', payload: {} };
@@ -3238,9 +3239,6 @@
       case 'reservations':
         await root.RGReservations.render(slot, ctx);
         break;
-      case 'inactive-reservations':
-        if (root.RGInactive && root.RGInactive.render) await root.RGInactive.render(slot, ctx);
-        break;
       case 'my-followups':
         await root.RGFollowUps.renderMyFollowUps(slot, ctx);
         break;
@@ -3280,6 +3278,7 @@
   }
 
   function resolveSafeRouteForUser(routeId, user, lp) {
+    if (String(routeId || '') === 'inactive-reservations') routeId = 'reservations';
     if (!user) return routeId || 'dashboard';
     var navItem = NAV_ITEMS.find(function (n) { return n.id === routeId; });
     var hiddenRoutes = (lp && Array.isArray(lp.hiddenRoutes)) ? lp.hiddenRoutes : [];
@@ -5490,10 +5489,6 @@
         action = 'getReservations';
         payload = { page: 1, pageSize: 20, lifecycle: 'active' };
         break;
-      case 'inactive-reservations':
-        action = 'getInactiveReservations';
-        payload = { subTab: 'rejected', page: 1, pageSize: 10 };
-        break;
       case 'my-followups':
         action = 'getMyFollowUps';
         break;
@@ -5811,8 +5806,10 @@
   window.addEventListener('hashchange', function () {
     var curU = root.RGAuth.getUser();
     if (!curU) return;
+    var hashRaw = String(window.location.hash || '');
+    if (hashRaw.toLowerCase().indexOf('inactive-reservations') !== -1) hashRaw = '#reservations';
     var nextRoute = root.RGCrmCore && root.RGCrmCore.resolveRouteFromLocation
-      ? root.RGCrmCore.resolveRouteFromLocation(window.location.pathname, window.location.hash, window.location.search, root.__RG_BASE_URL__ || '/', VALID_ROUTES, 'dashboard')
+      ? root.RGCrmCore.resolveRouteFromLocation(window.location.pathname, hashRaw, window.location.search, root.__RG_BASE_URL__ || '/', VALID_ROUTES, 'dashboard')
       : 'dashboard';
     nextRoute = resolveSafeRouteForUser(nextRoute, curU, getLayoutPrefs(curU));
     if (nextRoute !== state.route) {

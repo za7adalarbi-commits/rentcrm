@@ -127,6 +127,15 @@ function handleApiRequest(e, method) {
       case 'updateReservationDetails':
         result = updateReservationDetails(session, payload);
         break;
+      case 'rejectReservation':
+        result = rejectReservation(session, payload);
+        break;
+      case 'cancelReservation':
+        result = cancelReservation(session, payload);
+        break;
+      case 'restoreReservation':
+        result = restoreReservation(session, payload);
+        break;
       case 'saveReservationPinnedNote':
         result = saveReservationPinnedNote(session, payload);
         break;

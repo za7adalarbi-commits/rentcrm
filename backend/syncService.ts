@@ -285,28 +285,23 @@ function normalizeIncomingReservation(
     const prevInternal = str(existingClient.internalStatus);
     const prevHist = crmCore.normalizeStatusHistory(existingClient.statusHistory || []);
 
-    const existingInactive = crmCore.isInactiveReservation(existingClient);
-    const incomingInactive = crmCore.isInactiveReservation({
+    const existingLifecycle = crmCore.getReservationLifecycleKind(existingClient);
+    const incomingLifecycle = crmCore.getReservationLifecycleKind({
       internalStatus: sourceStatusAr,
       originalStatusCode: rawCode,
       originalStatusAr: sourceStatusAr
     });
 
     const sourceChanged = Boolean(
-      rawCode && (
+      (rawCode && (
         (prevCode && rawCode !== prevCode) ||
         (!prevCode && prevOrigAr && sourceStatusAr !== prevOrigAr)
-      )
+      )) ||
+      (incomingLifecycle !== existingLifecycle) ||
+      (!rawCode && prevOrigAr && sourceStatusAr && sourceStatusAr !== prevOrigAr)
     );
 
-    if (existingInactive && !incomingInactive) {
-      nextInternalStatus = prevInternal || sourceStatusAr;
-      nextLastUpdateText = existingClient.lastUpdateText || nextLastUpdateText;
-      nextLastUpdatedById = existingClient.lastUpdatedById || actor.id;
-      nextLastUpdatedByName = existingClient.lastUpdatedByName || actor.name;
-      nextLastUpdatedAt = existingClient.lastUpdatedAt || nowIso;
-      nextStatusHistory = prevHist.length > 0 ? prevHist : nextStatusHistory;
-    } else if (sourceChanged) {
+    if (sourceChanged) {
       nextInternalStatus = sourceStatusAr;
       nextLastUpdateText = `تحديث الحالة من Rental Gate: ${prevInternal || prevOrigAr || '-'} ← ${sourceStatusAr}`;
       nextLastUpdatedById = actor.id;
@@ -385,18 +380,13 @@ function normalizeIncomingReservation(
       ? Math.floor(explicitOrder)
       : (prevOrder > 0 ? Math.floor(prevOrder) : (seqFallback > 0 ? Math.floor(seqFallback) : null));
 
-  const isRejectedRes = crmCore.isRejectedStatus({
-    internalStatus: nextInternalStatus,
+  const finalLifecycle = crmCore.getReservationLifecycleKind({
     originalStatusCode: rawCode,
     originalStatusAr: sourceStatusAr,
-    rejectedAt: existingClient?.rejectedAt || merged.rejectedAt
+    internalStatus: nextInternalStatus
   });
-  const isCancelledRes = !isRejectedRes && crmCore.isCancelledStatus({
-    internalStatus: nextInternalStatus,
-    originalStatusCode: rawCode,
-    originalStatusAr: sourceStatusAr,
-    cancelledAt: existingClient?.cancelledAt || merged.cancelledAt
-  });
+  const isRejectedRes = finalLifecycle === 'rejected';
+  const isCancelledRes = finalLifecycle === 'cancelled';
 
   const record: Record<string, any> = {
     id: resId,
@@ -406,10 +396,10 @@ function normalizeIncomingReservation(
     customerName: str(merged.customerName || 'عميل'),
     customerPhone: str(merged.customerPhone),
     customerEmail: str(merged.customerEmail || existingClient?.customerEmail),
-    customerIdNumber: (typeof crmCore.extractCustomerNationalId === 'function' ? crmCore.extractCustomerNationalId(raw, existingClient) : '') || str(merged.customerIdNumber || existingClient?.customerIdNumber),
+    customerIdNumber: (typeof crmCore.extractCustomerNationalId === 'function' ? crmCore.extractCustomerNationalId(raw, existingClient) : '') || str(merged.customerIdNumber),
     companyName: str(merged.companyName),
     companyNumber: str(existingClient?.companyNumber || merged.companyNumber || raw.companyNumber || raw.company_number || raw.companyCode || ''),
-    newCompanyName: str(existingClient?.newCompanyName || merged.newCompanyName || raw.newCompanyName || ''),
+    newCompanyName: isRejectedRes ? str(merged.newCompanyName || raw.newCompanyName || existingClient?.newCompanyName || '') : '',
     branchName: str(merged.branchName),
     deliverBranchName: str(merged.deliverBranchName || merged.branchName),
     carName: str(merged.carName),
@@ -453,18 +443,20 @@ function normalizeIncomingReservation(
     lastUpdatedByName: nextLastUpdatedByName,
     lastUpdatedAt: nextLastUpdatedAt,
     hasProblem: existingClient ? boolVal(existingClient.hasProblem) : boolVal(merged.hasProblem),
-    rejectionReason: str(existingClient?.rejectionReason || merged.rejectionReason || raw.rejectionReason || ''),
-    carStatusAtRequest: str(existingClient?.carStatusAtRequest || merged.carStatusAtRequest || raw.carStatusAtRequest || ''),
-    refundAmount: existingClient && existingClient.refundAmount !== undefined && Number(existingClient.refundAmount) > 0
-      ? num(existingClient.refundAmount, 0)
-      : num(merged.refundAmount ?? raw.refundAmount, 0),
-    rejectedById: str(existingClient?.rejectedById || merged.rejectedById || (isRejectedRes ? actor.id : '')),
-    rejectedByName: str(existingClient?.rejectedByName || merged.rejectedByName || (isRejectedRes ? actor.name : '')),
-    rejectedAt: str(existingClient?.rejectedAt || merged.rejectedAt || (isRejectedRes ? nowIso : '')),
-    cancellationReason: str(existingClient?.cancellationReason || merged.cancellationReason || raw.cancellationReason || ''),
-    cancelledById: str(existingClient?.cancelledById || merged.cancelledById || (isCancelledRes ? actor.id : '')),
-    cancelledByName: str(existingClient?.cancelledByName || merged.cancelledByName || (isCancelledRes ? actor.name : '')),
-    cancelledAt: str(existingClient?.cancelledAt || merged.cancelledAt || (isCancelledRes ? nowIso : '')),
+    rejectionReason: isRejectedRes ? str(merged.rejectionReason || raw.rejectionReason || raw.rejectReason || existingClient?.rejectionReason || '') : '',
+    carStatusAtRequest: isRejectedRes ? str(merged.carStatusAtRequest || raw.carStatusAtRequest || existingClient?.carStatusAtRequest || '') : '',
+    refundAmount: isRejectedRes
+      ? (existingClient && existingClient.refundAmount !== undefined && Number(existingClient.refundAmount) > 0
+        ? num(existingClient.refundAmount, 0)
+        : num(merged.refundAmount ?? raw.refundAmount, 0))
+      : 0,
+    rejectedById: isRejectedRes ? str(existingClient?.rejectedById || merged.rejectedById || actor.id) : '',
+    rejectedByName: isRejectedRes ? str(existingClient?.rejectedByName || merged.rejectedByName || actor.name) : '',
+    rejectedAt: isRejectedRes ? str(merged.rejectedAt || existingClient?.rejectedAt || nowIso) : '',
+    cancellationReason: isCancelledRes ? str(merged.cancellationReason || raw.cancellationReason || raw.cancelReason || existingClient?.cancellationReason || '') : '',
+    cancelledById: isCancelledRes ? str(existingClient?.cancelledById || merged.cancelledById || actor.id) : '',
+    cancelledByName: isCancelledRes ? str(existingClient?.cancelledByName || merged.cancelledByName || actor.name) : '',
+    cancelledAt: isCancelledRes ? str(merged.cancelledAt || existingClient?.cancelledAt || nowIso) : '',
     createdAt: existingClient?.createdAt || str(merged.createdAt) || nowIso,
     updatedAt: nowIso,
     sourceOrder: resolvedSourceOrder,
@@ -665,7 +657,7 @@ export async function ingestIncrementalSyncBatch(
              customer_name = EXCLUDED.customer_name,
              customer_phone = EXCLUDED.customer_phone,
              customer_email = COALESCE(NULLIF(EXCLUDED.customer_email, ''), reservations.customer_email),
-             customer_id_number = COALESCE(NULLIF(EXCLUDED.customer_id_number, ''), reservations.customer_id_number),
+             customer_id_number = COALESCE(NULLIF(EXCLUDED.customer_id_number, ''), CASE WHEN NULLIF(EXCLUDED.customer_phone, '') IS NOT NULL AND NULLIF(reservations.customer_phone, '') IS NOT NULL AND EXCLUDED.customer_phone <> reservations.customer_phone THEN '' ELSE reservations.customer_id_number END),
              company_name = EXCLUDED.company_name,
              branch_name = EXCLUDED.branch_name,
              deliver_branch_name = EXCLUDED.deliver_branch_name,
@@ -711,17 +703,17 @@ export async function ingestIncrementalSyncBatch(
              raw_json = EXCLUDED.raw_json,
              source_order = COALESCE(EXCLUDED.source_order, reservations.source_order),
              company_number = COALESCE(NULLIF(EXCLUDED.company_number, ''), reservations.company_number),
-             new_company_name = COALESCE(NULLIF(EXCLUDED.new_company_name, ''), reservations.new_company_name),
-             rejection_reason = COALESCE(NULLIF(EXCLUDED.rejection_reason, ''), reservations.rejection_reason),
-             car_status_at_request = COALESCE(NULLIF(EXCLUDED.car_status_at_request, ''), reservations.car_status_at_request),
-             refund_amount = CASE WHEN EXCLUDED.refund_amount > 0 THEN EXCLUDED.refund_amount ELSE reservations.refund_amount END,
-             rejected_by_id = COALESCE(NULLIF(EXCLUDED.rejected_by_id, ''), reservations.rejected_by_id),
-             rejected_by_name = COALESCE(NULLIF(EXCLUDED.rejected_by_name, ''), reservations.rejected_by_name),
-             rejected_at = COALESCE(NULLIF(EXCLUDED.rejected_at, ''), reservations.rejected_at),
-             cancellation_reason = COALESCE(NULLIF(EXCLUDED.cancellation_reason, ''), reservations.cancellation_reason),
-             cancelled_by_id = COALESCE(NULLIF(EXCLUDED.cancelled_by_id, ''), reservations.cancelled_by_id),
-             cancelled_by_name = COALESCE(NULLIF(EXCLUDED.cancelled_by_name, ''), reservations.cancelled_by_name),
-             cancelled_at = COALESCE(NULLIF(EXCLUDED.cancelled_at, ''), reservations.cancelled_at)
+             new_company_name = EXCLUDED.new_company_name,
+             rejection_reason = EXCLUDED.rejection_reason,
+             car_status_at_request = EXCLUDED.car_status_at_request,
+             refund_amount = EXCLUDED.refund_amount,
+             rejected_by_id = EXCLUDED.rejected_by_id,
+             rejected_by_name = EXCLUDED.rejected_by_name,
+             rejected_at = EXCLUDED.rejected_at,
+             cancellation_reason = EXCLUDED.cancellation_reason,
+             cancelled_by_id = EXCLUDED.cancelled_by_id,
+             cancelled_by_name = EXCLUDED.cancelled_by_name,
+             cancelled_at = EXCLUDED.cancelled_at
            RETURNING (xmax = 0) AS inserted`,
           [
             chunk.map((r) => r.id),
@@ -1216,9 +1208,9 @@ export function extractRentalGatePagePayload(
   json: any,
   pageIndex = 0,
   pageSize = 100
-): { rows: any[]; totalPages: number | null; totalElements: number; isLast: boolean } {
+): { rows: any[]; totalPages: number | null; totalElements: number; isLast: boolean; currentPageNum: number | null; nextPageUrl: string } {
   if (!json || typeof json !== 'object') {
-    return { rows: [], totalPages: null, totalElements: 0, isLast: true };
+    return { rows: [], totalPages: null, totalElements: 0, isLast: true, currentPageNum: null, nextPageUrl: '' };
   }
 
   if (Array.isArray(json)) {
@@ -1226,7 +1218,9 @@ export function extractRentalGatePagePayload(
       rows: json,
       totalPages: null,
       totalElements: json.length,
-      isLast: json.length < pageSize
+      isLast: json.length < pageSize,
+      currentPageNum: null,
+      nextPageUrl: ''
     };
   }
 
@@ -1302,21 +1296,82 @@ export function extractRentalGatePagePayload(
     metaHolder?.hasMore !== undefined
       ? metaHolder.hasMore
       : (metaHolder?.has_more !== undefined ? metaHolder.has_more : (json?.hasMore ?? json?.has_more));
+  const nextPageUrl = str(
+    metaHolder?.next_page_url ?? metaHolder?.meta?.next_page_url ?? metaHolder?.links?.next ??
+    json?.next_page_url ?? json?.meta?.next_page_url ?? json?.links?.next ?? ''
+  );
+  const rawCurrentPage =
+    metaHolder?.current_page ?? metaHolder?.meta?.current_page ?? metaHolder?.pageNumber ?? metaHolder?.number ??
+    json?.current_page ?? json?.meta?.current_page ?? json?.pageNumber ?? json?.number;
+  const hasCurrentPage = rawCurrentPage !== undefined && rawCurrentPage !== null && rawCurrentPage !== '' && !isNaN(Number(rawCurrentPage));
+  const currentPageNum = hasCurrentPage ? Number(rawCurrentPage) : null;
+  const serverPageSize = Number(
+    metaHolder?.size ?? metaHolder?.per_page ?? metaHolder?.pageSize ?? metaHolder?.meta?.per_page ??
+    json?.size ?? json?.per_page ?? json?.pageSize ?? pageSize
+  );
+  const effectivePageSize = isFinite(serverPageSize) && serverPageSize > 0 ? serverPageSize : pageSize;
 
   let isLast: boolean;
   if (safeRows.length === 0) {
     isLast = true;
   } else if (explicitLast === true || explicitHasMore === false) {
     isLast = true;
+  } else if (nextPageUrl) {
+    isLast = false;
   } else if (totalPages !== null) {
-    isLast = pageIndex + 1 >= totalPages;
+    const isOneBasedCurrent = currentPageNum !== null && currentPageNum >= 1 && (pageIndex === 0 ? currentPageNum === 1 : true) &&
+      (metaHolder?.current_page !== undefined || metaHolder?.last_page !== undefined || json?.current_page !== undefined || json?.last_page !== undefined);
+    if (isOneBasedCurrent) {
+      isLast = currentPageNum >= totalPages;
+    } else {
+      isLast = pageIndex + 1 >= totalPages;
+    }
   } else if (explicitLast === false || explicitHasMore === true) {
     isLast = false;
+  } else if (rawTotalElements !== undefined && rawTotalElements !== null && Number(rawTotalElements) > effectivePageSize) {
+    isLast = (pageIndex + 1) * effectivePageSize >= Number(rawTotalElements);
   } else {
-    isLast = safeRows.length < pageSize;
+    isLast = safeRows.length < effectivePageSize;
   }
 
-  return { rows: safeRows, totalPages, totalElements, isLast };
+  return {
+    rows: safeRows,
+    totalPages,
+    totalElements,
+    isLast,
+    currentPageNum,
+    nextPageUrl
+  };
+}
+
+const NEVER_EXCLUDE_LIFECYCLE_STATUSES = new Set([
+  'cancelled',
+  'canceled',
+  'declined',
+  'rejected',
+  'refused',
+  'ملغي',
+  'ملغى',
+  'ملغاة',
+  'تم الإلغاء',
+  'تم الالغاء',
+  'مرفوض',
+  'مرفوضة',
+  'تم الرفض'
+]);
+
+export function sanitizeExcludedStatusesList(rawList: unknown): string[] {
+  const arr = Array.isArray(rawList) ? rawList : [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const val of arr) {
+    const cleaned = str(val).toLowerCase();
+    if (!cleaned || seen.has(cleaned)) continue;
+    if (NEVER_EXCLUDE_LIFECYCLE_STATUSES.has(cleaned)) continue;
+    seen.add(cleaned);
+    out.push(cleaned);
+  }
+  return out;
 }
 
 export async function pullFromRentalGateDirect(
@@ -1340,8 +1395,10 @@ export async function pullFromRentalGateDirect(
     const items: any[] = [];
     const seenKeys = new Set<string>();
     let pages = 0;
-    for (let page = 0; page < maxPages; page++) {
-      const resp = await fetchFn(`${baseApi}/${endpoint}?page=${page}&size=${pageSize}`, {
+    let oneBasedOffset = 0;
+    for (let step = 0; step < maxPages; step++) {
+      const pageParam = step + oneBasedOffset;
+      const resp = await fetchFn(`${baseApi}/${endpoint}?page=${pageParam}&size=${pageSize}`, {
         method: 'GET',
         headers: {
           Authorization: `Bearer ${rgToken}`,
@@ -1362,7 +1419,11 @@ export async function pullFromRentalGateDirect(
         throw new Error(str(json.message || json.error || 'RG_API_ERROR: رفضت واجهة Rental Gate الطلب.'));
       }
       pages++;
-      const parsedPage = extractRentalGatePagePayload(json, page, pageSize);
+      const parsedPage = extractRentalGatePagePayload(json, pageParam, pageSize);
+      // Detect 1-based pagination APIs (e.g. ?page=0 returned current_page=1) so ?page=1 doesn't repeat page 1
+      if (step === 0 && parsedPage.currentPageNum === 1 && !parsedPage.isLast) {
+        oneBasedOffset = 1;
+      }
       let added = 0;
       for (const row of parsedPage.rows) {
         const rowKey = str(
@@ -1379,7 +1440,8 @@ export async function pullFromRentalGateDirect(
         items.push(row);
         added++;
       }
-      if (parsedPage.isLast || (parsedPage.rows.length > 0 && added === 0)) break;
+      const hasMoreByTotal = parsedPage.totalElements > 0 && items.length < parsedPage.totalElements && parsedPage.rows.length > 0;
+      if ((parsedPage.isLast && !hasMoreByTotal) || (parsedPage.rows.length > 0 && added === 0)) break;
     }
     return { items, pages };
   };
@@ -1400,7 +1462,7 @@ export async function pullFromRentalGateDirect(
       excludedStatuses = [];
     }
   }
-  const excludedSet = new Set(excludedStatuses.map((s) => str(s).toLowerCase()));
+  const excludedSet = new Set(sanitizeExcludedStatusesList(excludedStatuses));
 
   const dedupedAllRes = crmCore.dedupeReservationsByNumber(resPaged.items).map((item: any, idx: number) => ({
     ...item,

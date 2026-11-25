@@ -127,121 +127,168 @@ test('Core National ID normalization, lifecycle classification, redaction, and c
   assert.equal(emptyLookup.customer, null);
 });
 
-test('Sync merge & auto-reconciliation never reactivate rejected or cancelled reservations', () => {
-  const existingRejected = {
-    id: 'RES_REJ_1',
+test('Sync merge reconciles to authoritative external status without leaving conflicting lifecycle timestamps', () => {
+  const existingActive = {
+    id: 'RES_SYNC_1',
     reservationNumber: '8881',
-    internalStatus: 'مرفوض',
-    rejectionReason: 'رفض من الشركة',
-    rejectedByName: 'المدير العام',
-    rejectedAt: '2026-11-24T10:00:00.000Z',
+    internalStatus: 'قيد الانتظار',
+    originalStatusCode: 'pending',
+    originalStatusAr: 'قيد الانتظار',
+    lastUpdateText: 'تم السحب من Rental Gate بالحالة: قيد الانتظار'
+  };
+  const incomingRejected = {
+    id: 'RES_SYNC_1',
+    reservationNumber: '8881',
+    status: 'rejected',
+    rejectionReason: 'تأخر التسليم من الشركة',
     newCompanyName: 'Badger',
-    refundAmount: 450,
-    carStatusAtRequest: 'متاحة',
-    statusCode: 'confirmed'
+    refundAmount: 450
   };
-  const incomingActivePayload = {
-    id: 'RES_REJ_1',
-    reservationNumber: '8881',
-    statusCode: 'confirmed',
-    statusAr: 'مؤكد',
-    internalStatus: 'تم التأكيد'
-  };
+  const mergedRejected = core.mergeSyncedReservation(existingActive, incomingRejected, [], { id: 'SYNC', name: 'Sync' });
+  assert.equal(mergedRejected.internalStatus, 'مرفوض');
+  assert.equal(core.getReservationLifecycleKind(mergedRejected), 'rejected');
+  assert.ok(mergedRejected.rejectedAt);
+  assert.equal(mergedRejected.cancelledAt, '');
+  assert.equal(mergedRejected.rejectionReason, 'تأخر التسليم من الشركة');
 
-  assert.equal(core.shouldAutoReconcileSyncedStatus('مرفوض', 'confirmed'), false);
-  assert.equal(core.shouldAutoReconcileSyncedStatus('تم الإلغاء', 'active'), false);
-  const merged = core.mergeSyncedReservation(existingRejected, incomingActivePayload);
-  assert.equal(merged.internalStatus, 'مرفوض');
-  assert.equal(merged.rejectionReason, 'رفض من الشركة');
-  assert.equal(merged.newCompanyName, 'Badger');
-  assert.equal(core.isInactiveReservation(merged), true);
+  // If external Rental Gate later updates status to cancelled or active, sync reflects external status cleanly and clears rejectedAt
+  const incomingCancelled = {
+    id: 'RES_SYNC_1',
+    reservationNumber: '8881',
+    status: 'cancelled',
+    cancellationReason: 'إلغاء من العميل'
+  };
+  const mergedCancelled = core.mergeSyncedReservation(mergedRejected, incomingCancelled, [], { id: 'SYNC', name: 'Sync' });
+  assert.equal(mergedCancelled.internalStatus, 'ملغي');
+  assert.equal(core.getReservationLifecycleKind(mergedCancelled), 'cancelled');
+  assert.equal(mergedCancelled.rejectedAt, '');
+  assert.ok(mergedCancelled.cancelledAt);
+
+  // Conflicting status/timestamp combinations obey authoritative external status without swapping across tabs
+  assert.equal(core.classifyReservationLifecycle({
+    originalStatusCode: 'cancelled',
+    internalStatus: 'مرفوض',
+    rejectedAt: '2026-11-24T10:00:00Z'
+  }), 'cancelled');
+  assert.equal(core.classifyReservationLifecycle({
+    originalStatusCode: 'confirmed',
+    internalStatus: 'تم التأكيد',
+    rejectedAt: '2026-11-24T10:00:00Z'
+  }), 'active');
+  assert.equal(core.isManualBlockedWorkflowStatus('مرفوض'), true);
+  assert.equal(core.isManualBlockedWorkflowStatus('تم الإلغاء'), true);
+  assert.equal(core.isManualBlockedWorkflowStatus('تم التأكيد'), false);
+  assert.equal(core.getWorkflowStatusOptions('مرفوض').includes('مرفوض'), false);
 });
 
-test('UI overrides precedence, Developer protection, and inactive.js / index.html / CSS wiring', () => {
+test('UI overrides precedence, Developer protection, unified navigation removal of inactive-reservations, and CSS wiring', () => {
   const roleDefaults = {
     agent: {
       enabled: true,
       forceForRole: false,
-      uiSimplification: { preset: 'custom', hideResRejectBtn: true, hideNavInactiveReservations: false }
+      uiSimplification: { preset: 'custom', hideResCancelledTab: true, hideResRejectedTab: false }
     }
   };
   const agentUser = {
     id: 'EMP_AG1',
     role: 'agent',
-    uiOverrides: { hideResRejectBtn: false, hideResIdLookup: true }
+    uiOverrides: { hideResCancelledTab: false, hideResIdLookup: true }
   };
   const resolvedAgent = core.resolveRoleUiDefaultsForUser(agentUser, roleDefaults, {});
-  assert.equal(resolvedAgent.uiSimplification.hideResRejectBtn, false);
+  assert.equal(resolvedAgent.uiSimplification.hideResCancelledTab, false);
   assert.equal(resolvedAgent.uiSimplification.hideResIdLookup, true);
 
   const devUser = {
     id: 'EMP_DEV',
     role: 'developer',
-    uiOverrides: { hideResRejectBtn: true, hideNavInactiveReservations: true }
+    uiOverrides: { hideResCancelledTab: true, hideResRejectedTab: true }
   };
-  const resolvedDev = core.resolveRoleUiDefaultsForUser(devUser, roleDefaults, { hideNavInactiveReservations: true });
-  assert.equal(resolvedDev.uiSimplification.hideNavInactiveReservations, false);
-  assert.equal(resolvedDev.uiSimplification.hideResRejectBtn, false);
+  const resolvedDev = core.resolveRoleUiDefaultsForUser(devUser, roleDefaults, { hideResRejectedTab: true });
+  assert.equal(resolvedDev.uiSimplification.hideResRejectedTab, false);
+  assert.equal(resolvedDev.uiSimplification.hideResCancelledTab, false);
 
   const html = readRepoFile('index.html');
-  assert.match(html, /assets\/js\/inactive\.js/);
+  assert.equal(html.includes('href="#inactive-reservations"'), false);
+
+  const appJs = readRepoFile('assets/js/app.js');
+  assert.equal(appJs.includes("'inactive-reservations':"), false);
+  assert.equal(appJs.includes("id: 'inactive-reservations'"), false);
 
   const css = readRepoFile('assets/css/dashboard.css');
   for (const cls of [
-    'rg-ui-hide-nav-inactive-reservations',
     'rg-ui-hide-res-rejected-tab',
-    'rg-ui-hide-res-id-lookup',
-    'rg-ui-hide-res-reject-btn',
-    'rg-ui-hide-res-cancel-btn'
+    'rg-ui-hide-res-cancelled-tab',
+    'rg-ui-hide-res-id-lookup'
   ]) {
     assert.ok(css.includes(`html.${cls}`), `Expected CSS class ${cls} in dashboard.css`);
   }
+  assert.equal(css.includes('rg-ui-hide-nav-inactive-reservations'), false);
+  assert.equal(css.includes('rg-ui-hide-res-reject-btn'), false);
+  assert.equal(css.includes('rg-ui-hide-res-cancel-btn'), false);
 });
 
-test('Sandbox E2E: reject, cancel, restore, inactive filters, National ID lookup, RBAC, and UI overrides', async () => {
+test('Sandbox E2E: unified lifecycle tabs, forbidden manual reject/cancel/restore, National ID lookup, RBAC, and UI overrides', async () => {
   const { api } = createSandboxHarness();
 
   const adminLogin = await api.callApi('login', { username: 'admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' });
   assert.equal(adminLogin.success, true);
 
-  // Pull active list and pickup/return feed before mutations
-  const activeBefore = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'active' });
-  assert.equal(activeBefore.success, true);
-  assert.ok(activeBefore.data.items.length >= 2);
+  // 1) Active list returns active bookings only + full lifecycleCounts, while cancelled & rejected appear under dedicated lifecycle tabs
+  const activeList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'active' });
+  assert.equal(activeList.success, true);
+  assert.ok(activeList.data.items.length >= 2);
+  assert.equal(activeList.data.items.some((r: any) => core.isInactiveReservation(r)), false);
+  assert.ok(activeList.data.lifecycleCounts);
+  assert.ok(activeList.data.lifecycleCounts.rejected >= 1);
+  assert.ok(activeList.data.lifecycleCounts.cancelled >= 1);
 
-  const firstRes = activeBefore.data.items[0];
-  const secondRes = activeBefore.data.items[1];
+  const rejectedList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'rejected' });
+  assert.equal(rejectedList.success, true);
+  assert.ok(rejectedList.data.items.length >= 1);
+  assert.equal(rejectedList.data.items.every((r: any) => core.classifyReservationLifecycle(r) === 'rejected'), true);
 
-  // 1) Reject first reservation
-  const rejRes = await api.callApi('rejectReservation', {
-    reservationId: firstRes.id,
-    rejectionReason: 'تأخر التسليم من الشركة',
-    companyNumber: 'CMP-778',
-    newCompanyName: 'شركة بديل للسيارات',
-    carStatusAtRequest: 'متاحة عند الطلب',
-    refundAmount: 650,
-    note: 'تحويل فوري'
-  });
-  assert.equal(rejRes.success, true);
-  assert.equal(rejRes.data.reservation.internalStatus, 'مرفوض');
-  assert.equal(rejRes.data.reservation.newCompanyName, 'شركة بديل للسيارات');
-  assert.equal(rejRes.data.reservation.refundAmount, 650);
+  const cancelledList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'cancelled' });
+  assert.equal(cancelledList.success, true);
+  assert.ok(cancelledList.data.items.length >= 1);
+  assert.equal(cancelledList.data.items.every((r: any) => core.classifyReservationLifecycle(r) === 'cancelled'), true);
 
-  // 2) Cancel second reservation
-  const canRes = await api.callApi('cancelReservation', {
-    reservationId: secondRes.id,
-    cancellationReason: 'طلب العميل الإلغاء',
-    note: 'إلغاء مؤكد'
-  });
-  assert.equal(canRes.success, true);
-  assert.equal(canRes.data.reservation.internalStatus, 'تم الإلغاء');
+  const allList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'all' });
+  assert.equal(allList.success, true);
+  assert.equal(
+    allList.data.total,
+    activeList.data.lifecycleCounts.active + activeList.data.lifecycleCounts.rejected + activeList.data.lifecycleCounts.cancelled
+  );
 
-  // 3) Neither rejected nor cancelled booking appears in active list OR today movements
-  const activeAfter = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'active', forceRefresh: true });
-  const activeIds = new Set(activeAfter.data.items.map((r: any) => r.id));
-  assert.equal(activeIds.has(firstRes.id), false);
-  assert.equal(activeIds.has(secondRes.id), false);
+  const firstActive = activeList.data.items[0];
+  const firstRejected = rejectedList.data.items[0];
+  const firstCancelled = cancelledList.data.items[0];
 
+  // 2) Manual reject, cancel, restore, and manual status transitions into rejected/cancelled or out of inactive are strictly forbidden
+  const rejRes = await api.callApi('rejectReservation', { reservationId: firstActive.id, rejectionReason: 'اختبار' });
+  assert.equal(rejRes.success, false);
+  assert.equal(rejRes.error, 'FORBIDDEN_MANUAL_ACTION');
+
+  const canRes = await api.callApi('cancelReservation', { reservationId: firstActive.id, cancellationReason: 'اختبار' });
+  assert.equal(canRes.success, false);
+  assert.equal(canRes.error, 'FORBIDDEN_MANUAL_ACTION');
+
+  const restRes = await api.callApi('restoreReservation', { reservationId: firstRejected.id, targetStatus: 'قيد المتابعة' });
+  assert.equal(restRes.success, false);
+  assert.equal(restRes.error, 'FORBIDDEN_MANUAL_ACTION');
+
+  const quickRejAttempt = await api.callApi('quickUpdateReservationStatus', { reservationId: firstActive.id, status: 'مرفوض' });
+  assert.equal(quickRejAttempt.success, false);
+  assert.equal(quickRejAttempt.error, 'FORBIDDEN_MANUAL_ACTION');
+
+  const quickCanAttempt = await api.callApi('quickUpdateReservationStatus', { reservationId: firstActive.id, status: 'تم الإلغاء' });
+  assert.equal(quickCanAttempt.success, false);
+  assert.equal(quickCanAttempt.error, 'FORBIDDEN_MANUAL_ACTION');
+
+  const editInactiveAttempt = await api.callApi('quickUpdateReservationStatus', { reservationId: firstCancelled.id, status: 'تم التأكيد' });
+  assert.equal(editInactiveAttempt.success, false);
+  assert.equal(editInactiveAttempt.error, 'FORBIDDEN_MANUAL_ACTION');
+
+  // 3) Neither rejected nor cancelled bookings appear in today movements or 24h radar
   const todayAfter = await api.callApi('getTodayAndRadar', { forceRefresh: true });
   assert.equal(todayAfter.success, true);
   const pickupReturnIds = new Set([
@@ -250,38 +297,27 @@ test('Sandbox E2E: reject, cancel, restore, inactive filters, National ID lookup
     ...(todayAfter.data.todayItems || []),
     ...(todayAfter.data.radarItems || [])
   ].map((r: any) => r.id));
-  assert.equal(pickupReturnIds.has(firstRes.id), false);
-  assert.equal(pickupReturnIds.has(secondRes.id), false);
+  assert.equal(pickupReturnIds.has(firstRejected.id), false);
+  assert.equal(pickupReturnIds.has(firstCancelled.id), false);
 
-  // 4) Both appear in their dedicated inactive sub-tabs with preserved details
-  const rejTab = await api.callApi('getInactiveReservations', { subTab: 'rejected', companyNumber: 'CMP-778' });
-  assert.equal(rejTab.success, true);
-  assert.equal(rejTab.data.items.some((r: any) => r.id === firstRes.id && r.newCompanyName === 'شركة بديل للسيارات'), true);
+  // 4) National ID lookup with Arabic digits & leading zeros returns single deduplicated profile
+  const leadingZeroRow = allList.data.items.find((r: any) => r.customerIdNumber === '0098765432');
+  assert.ok(leadingZeroRow);
+  const arabicId = '٠٠٩٨٧٦٥٤٣٢';
+  const lookupRes = await api.callApi('searchCustomerByNationalId', { nationalId: arabicId });
+  assert.equal(lookupRes.success, true);
+  assert.equal(lookupRes.data.found, true);
+  assert.equal(lookupRes.data.customer.nationalId, '0098765432');
 
-  const canTab = await api.callApi('getInactiveReservations', { subTab: 'cancelled' });
-  assert.equal(canTab.success, true);
-  assert.equal(canTab.data.items.some((r: any) => r.id === secondRes.id), true);
+  const noIdRow = allList.data.items.find((r: any) => r.id === 'RES_1005');
+  assert.ok(noIdRow);
+  assert.equal(noIdRow.customerIdNumber, '');
 
-  // 5) National ID lookup with Arabic digits returns single deduplicated profile & both active+inactive bookings
-  if (firstRes.customerIdNumber) {
-    const arabicId = String(firstRes.customerIdNumber).replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[Number(d)]);
-    const lookupRes = await api.callApi('searchCustomerByNationalId', { nationalId: arabicId });
-    assert.equal(lookupRes.success, true);
-    assert.equal(lookupRes.data.found, true);
-    assert.equal(lookupRes.data.customer.nationalId, core.normalizeNationalId(firstRes.customerIdNumber));
-    assert.ok(lookupRes.data.inactiveReservations.some((r: any) => r.id === firstRes.id));
-  }
   const emptyLookup = await api.callApi('searchCustomerByNationalId', { nationalId: '0000000000' });
   assert.equal(emptyLookup.success, true);
   assert.equal(emptyLookup.data.found, false);
 
-  // 6) Restore returns booking back to Active Reservations
-  const restRes = await api.callApi('restoreReservation', { reservationId: firstRes.id, targetStatus: 'قيد المتابعة' });
-  assert.equal(restRes.success, true);
-  const activeRestored = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'active', forceRefresh: true });
-  assert.equal(activeRestored.data.items.some((r: any) => r.id === firstRes.id), true);
-
-  // 7) UI overrides & Restore Defaults work for GM, while Developer account stays protected
+  // 5) UI overrides & Restore Defaults work for GM, while Developer account stays protected
   const empRes = await api.callApi('getEmployees', {});
   const agentEmp = empRes.data.items.find((e: any) => e.username === 'agent1');
   const devEmp = empRes.data.items.find((e: any) => e.role === 'developer');
@@ -290,47 +326,45 @@ test('Sandbox E2E: reject, cancel, restore, inactive filters, National ID lookup
 
   const ovSave = await api.callApi('saveEmployeeUiOverrides', {
     employeeId: agentEmp.id,
-    uiOverrides: { hideResIdLookup: true, hideResRejectBtn: true }
+    uiOverrides: { hideResIdLookup: true, hideResCancelledTab: true }
   });
   assert.equal(ovSave.success, true);
   assert.equal(ovSave.data.employee.uiOverrides.hideResIdLookup, true);
+  assert.equal(ovSave.data.employee.uiOverrides.hideResCancelledTab, true);
 
   const devProtectAttempt = await api.callApi('saveEmployeeUiOverrides', {
     employeeId: devEmp.id,
-    uiOverrides: { hideNavInactiveReservations: true }
+    uiOverrides: { hideResCancelledTab: true }
   });
   assert.equal(devProtectAttempt.success, false);
   assert.equal(devProtectAttempt.error, 'FORBIDDEN');
 
   const roleUiSave = await api.callApi('saveRoleUiDefaults', {
     role_ui_defaults: {
-      agent: { enabled: true, forceForRole: false, uiSimplification: { preset: 'custom', hideResCancelBtn: true } }
+      agent: { enabled: true, forceForRole: false, uiSimplification: { preset: 'custom', hideResCancelledTab: true } }
     },
     ui_simplification: { preset: 'custom', hideDashboardHeatmap: true }
   });
   assert.equal(roleUiSave.success, true);
-  assert.equal(roleUiSave.data.role_ui_defaults.agent.uiSimplification.hideResCancelBtn, true);
+  assert.equal(roleUiSave.data.role_ui_defaults.agent.uiSimplification.hideResCancelledTab, true);
 
   const restoreAll = await api.callApi('restoreUiDefaults', { scope: 'all', clearEmployees: true });
   assert.equal(restoreAll.success, true);
   assert.deepEqual(JSON.parse(JSON.stringify(restoreAll.data.role_ui_defaults)), {});
 
-  // 8) Restricted agent RBAC checks & Customer ID redaction
+  // 6) Restricted agent RBAC checks & Customer ID redaction
   const agentLogin = await api.callApi('login', { username: 'agent1', password: process.env.RG_SEED_AGENT_PASSWORD || 'Agent@123' });
   assert.equal(agentLogin.success, true);
   const agentList = await api.callApi('getReservations', { page: 1, pageSize: 20, lifecycle: 'active' });
   assert.equal(agentList.success, true);
   assert.equal(agentList.data.items.every((r: any) => !r.customerIdNumber), true);
 
-  const deniedLookup = await api.callApi('searchCustomerByNationalId', { nationalId: '1067231845' });
+  const deniedLookup = await api.callApi('searchCustomerByNationalId', { nationalId: '0098765432' });
   assert.equal(deniedLookup.success, false);
   assert.equal(deniedLookup.error, 'FORBIDDEN');
-
-  const deniedReject = await api.callApi('rejectReservation', { reservationId: firstRes.id, rejectionReason: 'اختبار' });
-  assert.equal(deniedReject.success, false);
 });
 
-test('National ID leading zeros, partial multi-customer lookup separation, and non-destructive re-sync', () => {
+test('National ID leading zeros, cross-customer phone mismatch isolation, and non-destructive re-sync', () => {
   // Leading zeros must remain intact as String (never converted to Number)
   assert.equal(core.normalizeNationalId('0098765432'), '0098765432');
   assert.equal(core.normalizeNationalId('٠٠٩٨٧٦٥٤٣٢'), '0098765432');
@@ -339,30 +373,37 @@ test('National ID leading zeros, partial multi-customer lookup separation, and n
   assert.equal(extId, '0045678901');
   assert.equal(typeof extId, 'string');
 
-  // Re-sync backfill preserves existing ID when incoming payload omits it, and updates when missing
+  // Re-sync backfill updates when missing, preserves when same customer, clears when customer phone changed (no cross-client leak)
   const oldWithoutId = {
     id: 'RES_BACKFILL_1',
     reservationNumber: '9001',
     customerName: 'عميل قديم',
+    customerPhone: '0501111111',
     customerIdNumber: '',
     internalStatus: 'تم التأكيد',
     originalStatusCode: 'confirmed'
   };
   const backfilled = core.mergeSyncedReservation(
     oldWithoutId,
-    { id: '9001', reservationNumber: '9001', clientNationalId: '0011223344', status: 'confirmed' },
+    { id: '9001', reservationNumber: '9001', clientMobile: '0501111111', clientNationalId: '0011223344', status: 'confirmed' },
     [],
     { id: 'SYNC', name: 'Sync' }
   );
   assert.equal(backfilled.customerIdNumber, '0011223344');
 
-  const preservedAfterEmptySync = core.mergeSyncedReservation(
+  const preservedSameCustomer = core.mergeSyncedReservation(
     backfilled,
-    { id: '9001', reservationNumber: '9001', status: 'confirmed' },
+    { id: '9001', reservationNumber: '9001', clientMobile: '0501111111', status: 'confirmed' },
     [],
     { id: 'SYNC', name: 'Sync' }
   );
-  assert.equal(preservedAfterEmptySync.customerIdNumber, '0011223344');
+  assert.equal(preservedSameCustomer.customerIdNumber, '0011223344');
+
+  const clearedDifferentCustomer = core.extractCustomerNationalId(
+    { reservationNumber: '9001', clientMobile: '0559998888' },
+    backfilled
+  );
+  assert.equal(clearedDifferentCustomer, '');
 
   // Partial National ID search (>=4 digits) returns distinct customer profiles without mixing bookings
   const partialRes = core.groupCustomerLookupResults([
@@ -387,7 +428,6 @@ test('Sandbox E2E: UI overrides persist across logout/login & active fast-query 
   const gmLogin = await api.callApi('login', { username: 'admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' });
   assert.equal(gmLogin.success, true);
 
-  // Import Excel with mixed active/rejected/cancelled rows -> getReservations must stay strictly active
   const beforeList = await api.callApi('getReservations', { page: 1, pageSize: 100 });
   assert.equal(beforeList.success, true);
   assert.equal(beforeList.data.items.some((r: any) => core.isInactiveReservation(r)), false);
@@ -396,22 +436,19 @@ test('Sandbox E2E: UI overrides persist across logout/login & active fast-query 
   const agentEmp = empRes.data.items.find((e: any) => e.username === 'agent1');
   assert.ok(agentEmp);
 
-  // Save UI overrides for agent1
   const saveOv = await api.callApi('saveEmployeeUiOverrides', {
     employeeId: agentEmp.id,
-    uiOverrides: { hideNavReports: true, hideResRejectBtn: true }
+    uiOverrides: { hideNavReports: true, hideResCancelledTab: true }
   });
   assert.equal(saveOv.success, true);
 
-  // Logout & login as agent1 -> overrides persist on session user and resolve cleanly
   await api.callApi('logout', {});
   const agentLogin = await api.callApi('login', { username: 'agent1', password: process.env.RG_SEED_AGENT_PASSWORD || 'Agent@123' });
   assert.equal(agentLogin.success, true);
   const resolvedAgentUi = core.resolveRoleUiDefaultsForUser(agentLogin.data.user, {}, {});
   assert.equal(resolvedAgentUi.uiSimplification.hideNavReports, true);
-  assert.equal(resolvedAgentUi.uiSimplification.hideResRejectActionBtn, true);
+  assert.equal(resolvedAgentUi.uiSimplification.hideResCancelledTab, true);
 
-  // Developer user remains immune to UI hide flags
   const devResolved = core.resolveRoleUiDefaultsForUser(
     { id: 'DEV1', role: 'developer', uiOverrides: { hideNavReports: true, hideNavSettings: true } },
     { developer: { enabled: true, forceForRole: true, uiSimplification: { hideNavReports: true } } },

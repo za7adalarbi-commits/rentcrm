@@ -227,11 +227,17 @@ function addFollowUp(session, payload) {
   if (!status || !isValidWorkflowStatus_(status)) {
     throw new Error('حالة المتابعة غير صالحة.');
   }
+  if (isManualBlockedWorkflowStatusGs_(status)) {
+    throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن رفض أو إلغاء الحجز يدوياً من داخل النظام؛ تتم المزامنة تلقائياً مع الموقع الخارجي.');
+  }
   if (!action) throw new Error('يرجى كتابة الإجراء المتخذ.');
 
   return withScriptLock(function () {
     var reservation = findRecordById(RG_SHEETS.RESERVATIONS, 'id', reservationId);
     if (!reservation) throw new Error('الحجز غير موجود.');
+    if (classifyReservationLifecycleGs_(reservation) !== 'active') {
+      throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تغيير حالة حجز مرفوض أو ملغي من الموقع يدوياً من داخل النظام.');
+    }
 
     var assignedIds = safeJsonParse(reservation.assignedEmployeeIds, []);
     var now = new Date();
@@ -343,7 +349,16 @@ function updateFollowUp(session, payload) {
     }
 
     var patch = {};
-    if (p.status && isValidWorkflowStatus_(p.status)) patch.status = p.status;
+    if (p.status !== undefined) {
+      var reqStatus = normalizeStr(p.status);
+      if (!reqStatus || !isValidWorkflowStatus_(reqStatus)) {
+        throw new Error('حالة المتابعة غير صالحة.');
+      }
+      if (isManualBlockedWorkflowStatusGs_(reqStatus) && reqStatus !== existing.status) {
+        throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن رفض أو إلغاء الحجز يدوياً من داخل النظام؛ تتم المزامنة تلقائياً مع الموقع الخارجي.');
+      }
+      patch.status = reqStatus;
+    }
     if (p.action) patch.action = normalizeStr(p.action);
     if (p.notes !== undefined) patch.notes = normalizeStr(p.notes);
 
@@ -369,13 +384,16 @@ function updateFollowUp(session, payload) {
 
     if (toBool(p.syncToReservation) && updated) {
       var resObj = findRecordById(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId);
+      if (resObj && classifyReservationLifecycleGs_(resObj) !== 'active' && updated.status && updated.status !== resObj.internalStatus) {
+        throw new Error('FORBIDDEN_MANUAL_ACTION: لا يمكن تعديل حالة حجز مرفوض أو ملغي من الموقع يدوياً من داخل النظام.');
+      }
       var resPatch = {
         lastUpdatedById: session.employeeId,
         lastUpdatedByName: session.user.name,
         lastUpdatedAt: nowIso(),
         updatedAt: nowIso()
       };
-      if (updated.status) resPatch.internalStatus = updated.status;
+      if (updated.status && !isManualBlockedWorkflowStatusGs_(updated.status)) resPatch.internalStatus = updated.status;
       if (updated.action) resPatch.lastUpdateText = updated.action + (updated.notes ? ' — ' + updated.notes : '');
       if (resObj && updated.status && updated.status !== resObj.internalStatus) {
         var updStages = appendStatusStageEntry_(resObj.statusHistory, {

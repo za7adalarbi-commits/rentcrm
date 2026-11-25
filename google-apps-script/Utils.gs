@@ -314,6 +314,17 @@ function extractReservationStatusCode_(apiItem, preferOriginalCode) {
   return normalizeStr(raw).toLowerCase().replace(/[\s-]+/g, '_');
 }
 
+var RG_MANUAL_BLOCKED_STATUSES_ = [
+  'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused',
+  'ملغي', 'ملغى', 'ملغاة', 'تم الإلغاء', 'تم الالغاء', 'cancelled', 'canceled'
+];
+
+function isManualBlockedWorkflowStatusGs_(status) {
+  var clean = normalizeStr(status).toLowerCase();
+  if (!clean) return false;
+  return RG_MANUAL_BLOCKED_STATUSES_.indexOf(clean) !== -1;
+}
+
 var RG_WORKFLOW_STATUS_OPTIONS = (function () {
   var seen = {};
   var out = [];
@@ -333,9 +344,128 @@ var RG_WORKFLOW_STATUS_OPTIONS = (function () {
   return out;
 }());
 
+var RG_MANUAL_WORKFLOW_STATUS_OPTIONS = RG_WORKFLOW_STATUS_OPTIONS.filter(function (st) {
+  return !isManualBlockedWorkflowStatusGs_(st);
+});
+
 function isValidWorkflowStatus_(status) {
   var clean = normalizeStr(status);
   return Boolean(clean && RG_WORKFLOW_STATUS_OPTIONS.indexOf(clean) !== -1);
+}
+
+function isValidManualWorkflowStatus_(status) {
+  var clean = normalizeStr(status);
+  return Boolean(clean && !isManualBlockedWorkflowStatusGs_(clean) && RG_MANUAL_WORKFLOW_STATUS_OPTIONS.indexOf(clean) !== -1);
+}
+
+var RG_NEVER_EXCLUDE_STATUSES_ = {
+  cancelled: true, canceled: true, declined: true, rejected: true, refused: true,
+  'ملغي': true, 'ملغى': true, 'ملغاة': true, 'تم الإلغاء': true, 'تم الالغاء': true,
+  'مرفوض': true, 'مرفوضة': true, 'تم الرفض': true
+};
+
+function sanitizeExcludedStatusesListGs_(rawList) {
+  var arr = Array.isArray(rawList) ? rawList : [];
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < arr.length; i++) {
+    var cleaned = normalizeStr(arr[i]).toLowerCase();
+    if (!cleaned || seen[cleaned] || RG_NEVER_EXCLUDE_STATUSES_[cleaned]) continue;
+    seen[cleaned] = true;
+    out.push(cleaned);
+  }
+  return out;
+}
+
+function classifyReservationLifecycleGs_(resOrStatus) {
+  if (!resOrStatus) return 'active';
+  function classifyToken(raw) {
+    var s = normalizeStr(raw).toLowerCase();
+    if (!s) return '';
+    if (s === 'rejected' || s === 'declined' || s === 'refused' ||
+        s === 'مرفوض' || s === 'مرفوضة' || s === 'تم الرفض') {
+      return 'rejected';
+    }
+    if (s === 'cancelled' || s === 'canceled' ||
+        s === 'ملغي' || s === 'ملغى' || s === 'ملغاة' ||
+        s === 'تم الإلغاء' || s === 'تم الالغاء') {
+      return 'cancelled';
+    }
+    return 'explicit_active';
+  }
+  if (typeof resOrStatus === 'string') {
+    var strCls = classifyToken(resOrStatus);
+    return (strCls === 'rejected' || strCls === 'cancelled') ? strCls : 'active';
+  }
+  var extCandidates = [
+    resOrStatus.originalStatusCode,
+    resOrStatus.statusCode,
+    resOrStatus.reservationStatus,
+    resOrStatus.status,
+    resOrStatus.originalStatusAr,
+    resOrStatus.statusAr
+  ];
+  var sawExtActive = false;
+  for (var i = 0; i < extCandidates.length; i++) {
+    var cls = classifyToken(extCandidates[i]);
+    if (cls === 'rejected' || cls === 'cancelled') return cls;
+    if (cls === 'explicit_active') sawExtActive = true;
+  }
+  var intCls = classifyToken(resOrStatus.internalStatus);
+  if (intCls === 'rejected' || intCls === 'cancelled') return intCls;
+  if (sawExtActive || intCls === 'explicit_active') return 'active';
+  if (normalizeStr(resOrStatus.rejectedAt)) return 'rejected';
+  if (normalizeStr(resOrStatus.cancelledAt)) return 'cancelled';
+  return 'active';
+}
+
+function extractCustomerNationalIdGs_(apiItem, existing) {
+  var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+  var cust = (item.customer && typeof item.customer === 'object') ? item.customer : {};
+  var client = (item.client && typeof item.client === 'object') ? item.client : {};
+  var userObj = (item.user && typeof item.user === 'object') ? item.user : {};
+  var driverObj = (item.driver && typeof item.driver === 'object') ? item.driver : {};
+  var renterObj = (item.renter && typeof item.renter === 'object') ? item.renter : {};
+  var idKeys = [
+    'clientNationalId', 'client_national_id', 'customerNationalId', 'customer_national_id',
+    'clientIdNumber', 'client_id_number', 'customerIdNumber', 'customer_id_number',
+    'nationalId', 'national_id', 'nationalIdNumber', 'national_id_number',
+    'identityNumber', 'identity_number', 'idNumber', 'id_number', 'idNo', 'id_no',
+    'iqamaNumber', 'iqama_number', 'clientIqama', 'client_iqama',
+    'residentId', 'resident_id', 'citizenId', 'citizen_id',
+    'clientIdentity', 'clientIdentityNumber', 'clientIdNo', 'nid', 'ssn',
+    'passportNumber', 'passport_number'
+  ];
+  var sources = [item, cust, client, userObj, driverObj, renterObj];
+  for (var si = 0; si < sources.length; si++) {
+    var srcObj = sources[si];
+    if (!srcObj || typeof srcObj !== 'object') continue;
+    for (var ki = 0; ki < idKeys.length; ki++) {
+      var raw = srcObj[idKeys[ki]];
+      if (raw === null || raw === undefined) continue;
+      var rawCand = String(raw).trim();
+      if (typeof convertEasternDigitsGs_ === 'function') rawCand = convertEasternDigitsGs_(rawCand).trim();
+      if (!rawCand || rawCand === '-' || rawCand.toLowerCase() === 'null' || rawCand.toLowerCase() === 'undefined') continue;
+      return rawCand;
+    }
+  }
+  var prev = existing && existing.customerIdNumber ? String(existing.customerIdNumber).trim() : '';
+  if (typeof convertEasternDigitsGs_ === 'function' && prev) prev = convertEasternDigitsGs_(prev).trim();
+  if (prev && prev !== '-' && prev.toLowerCase() !== 'null' && prev.toLowerCase() !== 'undefined') {
+    var apiPhoneRaw = normalizeStr(
+      item.clientMobile || item.customerPhone || item.customer_phone || cust.phone || cust.mobile || client.phone || client.mobile
+    );
+    var prevPhoneRaw = existing && existing.customerPhone ? normalizeStr(existing.customerPhone) : '';
+    if (typeof convertEasternDigitsGs_ === 'function') {
+      apiPhoneRaw = convertEasternDigitsGs_(apiPhoneRaw);
+      prevPhoneRaw = convertEasternDigitsGs_(prevPhoneRaw);
+    }
+    var apiPhone = apiPhoneRaw.replace(/\D+/g, '');
+    var prevPhone = prevPhoneRaw.replace(/\D+/g, '');
+    if (apiPhone && prevPhone && apiPhone !== prevPhone) return '';
+    return prev;
+  }
+  return '';
 }
 
 function resolveSourceWorkflowStatus_(apiItem) {
@@ -357,6 +487,13 @@ function shouldAutoReconcileSyncedStatus_(existing, sourceStatusAr) {
   var prevInternal = normalizeStr(existing.internalStatus);
   if (!prevInternal) return true;
   if (prevInternal === nextSrc) return false;
+
+  var incomingLifecycle = classifyReservationLifecycleGs_({
+    internalStatus: nextSrc,
+    originalStatusAr: nextSrc
+  });
+  var existingLifecycle = classifyReservationLifecycleGs_(existing);
+  if (incomingLifecycle !== existingLifecycle) return true;
 
   var history = normalizeStatusHistory_(existing.statusHistory);
   for (var i = 0; i < history.length; i++) {
