@@ -23,6 +23,10 @@ export interface SyncBatchPayload {
   deletedReservationNumbers?: string[];
   appliedRange?: Record<string, any>;
   isFullSnapshot?: boolean;
+  cancelledAuthoritativeSynced?: boolean;
+  rejectedAuthoritativeSynced?: boolean;
+  cancelledSourceIds?: string[];
+  rejectedSourceIds?: string[];
 }
 
 export interface SyncIngestResult {
@@ -153,6 +157,17 @@ export function mapReservationRowToClient(row: any, includeRaw = false): Record<
     cancelledAt: str(row.cancelled_at ?? row.cancelledAt),
     deliveryFailureReason: crmCore.sanitizeReasonText(row.delivery_failure_reason ?? row.deliveryFailureReason),
     driverNotes: crmCore.sanitizeReasonText(row.driver_notes ?? row.driverNotes),
+    isSourceCancelled: (row.is_source_cancelled === null || row.is_source_cancelled === undefined)
+      ? (typeof row.isSourceCancelled === 'boolean' ? row.isSourceCancelled : null)
+      : Boolean(row.is_source_cancelled),
+    isSourceRejected: (row.is_source_rejected === null || row.is_source_rejected === undefined)
+      ? (typeof row.isSourceRejected === 'boolean' ? row.isSourceRejected : null)
+      : Boolean(row.is_source_rejected),
+    rccStatus: str(row.rcc_status ?? row.rccStatus),
+    rccReason: str(row.rcc_reason ?? row.rccReason),
+    cancelledFromDecline: boolVal(row.cancelled_from_decline ?? row.cancelledFromDecline),
+    cancelledFromHold: boolVal(row.cancelled_from_hold ?? row.cancelledFromHold),
+    penaltyAmount: num(row.penalty_amount ?? row.penaltyAmount, 0),
     pinnedNote: str(row.pinned_note ?? row.pinnedNote),
     pinnedNoteById: str(row.pinned_note_by_id ?? row.pinnedNoteById),
     pinnedNoteByName: str(row.pinned_note_by_name ?? row.pinnedNoteByName),
@@ -415,8 +430,18 @@ function normalizeIncomingReservation(
     originalStatusAr: sourceStatusAr,
     internalStatus: nextInternalStatus
   });
-  const isRejectedRes = finalLifecycle === 'rejected';
-  const isCancelledRes = finalLifecycle === 'cancelled';
+  const resolvedIsSourceRejected: boolean | null = typeof raw.isSourceRejected === 'boolean'
+    ? raw.isSourceRejected
+    : (typeof merged.isSourceRejected === 'boolean'
+      ? merged.isSourceRejected
+      : (typeof existingClient?.isSourceRejected === 'boolean' ? existingClient.isSourceRejected : null));
+  const resolvedIsSourceCancelled: boolean | null = typeof raw.isSourceCancelled === 'boolean'
+    ? raw.isSourceCancelled
+    : (typeof merged.isSourceCancelled === 'boolean'
+      ? merged.isSourceCancelled
+      : (typeof existingClient?.isSourceCancelled === 'boolean' ? existingClient.isSourceCancelled : null));
+  const isRejectedRes = typeof resolvedIsSourceRejected === 'boolean' ? resolvedIsSourceRejected : (finalLifecycle === 'rejected');
+  const isCancelledRes = typeof resolvedIsSourceCancelled === 'boolean' ? resolvedIsSourceCancelled : (finalLifecycle === 'cancelled');
 
   const rawPaidCand = merged.paidAmount !== undefined
     ? merged.paidAmount
@@ -437,11 +462,23 @@ function normalizeIncomingReservation(
     id: resId,
     sourceReservationId: srcResId,
     reservationNumber: resNumber,
-    referenceNumber: str(
-      merged.referenceNumber || raw.referenceNumber || raw.reference_number ||
-      raw.refNumber || raw.ref_number || raw.sourceReference || raw.externalReference ||
-      raw.orderRef || existingClient?.referenceNumber || srcResId || ''
-    ),
+    referenceNumber: (isRejectedRes || isCancelledRes)
+      ? (typeof crmCore.extractExplicitReferenceNumber === 'function'
+          ? crmCore.extractExplicitReferenceNumber(
+              { ...raw, referenceNumber: merged.referenceNumber ?? raw.referenceNumber },
+              existingClient,
+              [resNumber, srcResId]
+            )
+          : str(
+              merged.referenceNumber || raw.referenceNumber || raw.reference_number ||
+              raw.refNumber || raw.ref_number || raw.sourceReference || raw.externalReference ||
+              raw.orderRef || existingClient?.referenceNumber || ''
+            ))
+      : str(
+          merged.referenceNumber || raw.referenceNumber || raw.reference_number ||
+          raw.refNumber || raw.ref_number || raw.sourceReference || raw.externalReference ||
+          raw.orderRef || existingClient?.referenceNumber || srcResId || ''
+        ),
     sourceCreatedAt: str(merged.sourceCreatedAt),
     customerName: str(merged.customerName || 'عميل'),
     customerPhone: str(merged.customerPhone),
@@ -496,7 +533,7 @@ function normalizeIncomingReservation(
     hasProblem: existingClient ? boolVal(existingClient.hasProblem) : boolVal(merged.hasProblem),
     rejectionReason: isRejectedRes ? (crmCore.sanitizeReasonText(merged.rejectionReason) || crmCore.extractRejectionReason(raw, existingClient)) : '',
     carStatusAtRequest: isRejectedRes ? (crmCore.sanitizeReasonText(merged.carStatusAtRequest || raw.carStatusAtRequest || raw.car_status_at_request) || crmCore.sanitizeReasonText(existingClient?.carStatusAtRequest) || '') : '',
-    refundAmount: isRejectedRes
+    refundAmount: (isRejectedRes || isCancelledRes)
       ? ((merged.refundAmount !== undefined && num(merged.refundAmount, 0) > 0)
         ? num(merged.refundAmount, 0)
         : (raw.refundAmount !== undefined && num(raw.refundAmount, 0) > 0
@@ -505,15 +542,22 @@ function normalizeIncomingReservation(
             ? num(raw.refund_amount, 0)
             : num(existingClient?.refundAmount ?? merged.refundAmount ?? raw.refundAmount ?? raw.refund_amount, 0))))
       : 0,
-    rejectedById: isRejectedRes ? str(existingClient?.rejectedById || merged.rejectedById || raw.rejectedById || raw.rejected_by_id || raw.confirmedById || raw.confirmed_by_id || raw.actionById || raw.action_by_id || actor.id) : '',
-    rejectedByName: isRejectedRes ? str(existingClient?.rejectedByName || merged.rejectedByName || raw.rejectedByName || raw.rejected_by_name || raw.rejectedBy || raw.confirmedByName || raw.confirmed_by_name || raw.confirmedBy || raw.actionByName || raw.action_by_name || raw.actionBy || raw.adminName || actor.name) : '',
-    rejectedAt: isRejectedRes ? str(merged.rejectedAt || raw.rejectedAt || raw.rejected_at || raw.actionAt || existingClient?.rejectedAt || nowIso) : '',
-    cancellationReason: isCancelledRes ? (crmCore.sanitizeReasonText(merged.cancellationReason) || crmCore.extractCancellationReason(raw, existingClient)) : '',
+    rejectedById: isRejectedRes ? str(raw.rejectedById || merged.rejectedById || raw.rejected_by_id || raw.confirmedById || raw.confirmed_by_id || raw.actionById || raw.action_by_id || existingClient?.rejectedById || actor.id) : '',
+    rejectedByName: isRejectedRes ? str(raw.rejectedByName || merged.rejectedByName || raw.rejected_by_name || raw.rejectedBy || raw.confirmedByName || raw.confirmed_by_name || raw.confirmedBy || raw.actionByName || raw.action_by_name || raw.actionBy || raw.adminName || existingClient?.rejectedByName || actor.name) : '',
+    rejectedAt: isRejectedRes ? str(raw.rejectedAt || merged.rejectedAt || raw.rejected_at || raw.actionAt || existingClient?.rejectedAt || nowIso) : '',
+    cancellationReason: isCancelledRes ? (crmCore.sanitizeReasonText(raw.cancellationReason || merged.cancellationReason) || crmCore.extractCancellationReason(raw, existingClient)) : '',
     cancelledById: isCancelledRes ? str(existingClient?.cancelledById || merged.cancelledById || raw.cancelledById || raw.cancelled_by_id || raw.canceled_by_id || raw.actionById || raw.action_by_id || actor.id) : '',
     cancelledByName: isCancelledRes ? str(existingClient?.cancelledByName || merged.cancelledByName || raw.cancelledByName || raw.cancelled_by_name || raw.canceledByName || raw.canceled_by_name || raw.cancelledBy || raw.actionByName || raw.action_by_name || raw.actionBy || actor.name) : '',
     cancelledAt: isCancelledRes ? str(merged.cancelledAt || raw.cancelledAt || raw.cancelled_at || raw.canceledAt || raw.canceled_at || raw.actionAt || existingClient?.cancelledAt || nowIso) : '',
     deliveryFailureReason: crmCore.sanitizeReasonText(merged.deliveryFailureReason || raw.deliveryFailureReason || raw.delivery_failure_reason || raw.failedDeliveryReason || raw.failed_delivery_reason || raw.deliverFailReason || raw.failReason) || crmCore.sanitizeReasonText(existingClient?.deliveryFailureReason) || '',
     driverNotes: crmCore.sanitizeReasonText(merged.driverNotes || raw.driverNotes || raw.driver_notes || raw.driverNote || raw.driver_note || raw.deliveryNotes || raw.delivery_notes || raw.driverComment) || crmCore.sanitizeReasonText(existingClient?.driverNotes) || '',
+    isSourceCancelled: resolvedIsSourceCancelled,
+    isSourceRejected: resolvedIsSourceRejected,
+    rccStatus: str(raw.rccStatus ?? merged.rccStatus ?? existingClient?.rccStatus),
+    rccReason: str(raw.rccReason ?? merged.rccReason ?? existingClient?.rccReason),
+    cancelledFromDecline: raw.cancelledFromDecline !== undefined ? boolVal(raw.cancelledFromDecline) : boolVal(existingClient?.cancelledFromDecline),
+    cancelledFromHold: raw.cancelledFromHold !== undefined ? boolVal(raw.cancelledFromHold) : boolVal(existingClient?.cancelledFromHold),
+    penaltyAmount: raw.penaltyAmount !== undefined ? num(raw.penaltyAmount, 0) : num(existingClient?.penaltyAmount, 0),
     createdAt: existingClient?.createdAt || str(merged.createdAt) || nowIso,
     updatedAt: nowIso,
     sourceOrder: resolvedSourceOrder,
@@ -661,6 +705,16 @@ export async function ingestIncrementalSyncBatch(
             `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
             [existing.id, resNum]
           ).catch(() => undefined);
+          for (const tbl of ['extensions', 'assignments', 'follow_ups', 'follow_up_history', 'problems']) {
+            await tx.query(
+              `UPDATE ${tbl} SET reservation_number = $2 WHERE reservation_id = $1`,
+              [existing.id, resNum]
+            ).catch(() => undefined);
+          }
+          await tx.query(
+            `UPDATE problem_updates SET reservation_number = $2 WHERE problem_id IN (SELECT id FROM problems WHERE reservation_id = $1)`,
+            [existing.id, resNum]
+          ).catch(() => undefined);
           existingByNumber.delete(existing.reservationNumber);
           existing.reservationNumber = resNum;
           existingByNumber.set(resNum, existing);
@@ -699,7 +753,9 @@ export async function ingestIncrementalSyncBatch(
              company_number, new_company_name, rejection_reason, car_status_at_request, refund_amount,
              rejected_by_id, rejected_by_name, rejected_at,
              cancellation_reason, cancelled_by_id, cancelled_by_name, cancelled_at,
-             reference_number, paid_amount, delivery_failure_reason, driver_notes
+             reference_number, paid_amount, delivery_failure_reason, driver_notes,
+             is_source_cancelled, is_source_rejected, rcc_status, rcc_reason,
+             cancelled_from_decline, cancelled_from_hold, penalty_amount
            )
            SELECT * FROM unnest(
              $1::text[], $2::text[], $3::text[], $4::text[],
@@ -716,7 +772,9 @@ export async function ingestIncrementalSyncBatch(
              $54::text[], $55::text[], $56::text[], $57::text[], $58::numeric[],
              $59::text[], $60::text[], $61::text[],
              $62::text[], $63::text[], $64::text[], $65::text[],
-             $66::text[], $67::numeric[], $68::text[], $69::text[]
+             $66::text[], $67::numeric[], $68::text[], $69::text[],
+             $70::boolean[], $71::boolean[], $72::text[], $73::text[],
+             $74::boolean[], $75::boolean[], $76::numeric[]
            )
            ON CONFLICT (reservation_number) DO UPDATE SET
              source_reservation_id = EXCLUDED.source_reservation_id,
@@ -781,10 +839,26 @@ export async function ingestIncrementalSyncBatch(
              cancelled_by_id = EXCLUDED.cancelled_by_id,
              cancelled_by_name = EXCLUDED.cancelled_by_name,
              cancelled_at = EXCLUDED.cancelled_at,
-             reference_number = COALESCE(NULLIF(EXCLUDED.reference_number, ''), reservations.reference_number),
+             reference_number = CASE
+               WHEN NULLIF(EXCLUDED.reference_number, '') IS NOT NULL THEN EXCLUDED.reference_number
+               WHEN (COALESCE(EXCLUDED.is_source_rejected, FALSE) = TRUE OR COALESCE(EXCLUDED.is_source_cancelled, FALSE) = TRUE)
+                 AND (
+                   reservations.reference_number = EXCLUDED.reservation_number
+                   OR reservations.reference_number = EXCLUDED.source_reservation_id
+                 )
+               THEN ''
+               ELSE reservations.reference_number
+             END,
              paid_amount = CASE WHEN EXCLUDED.paid_amount > 0 THEN EXCLUDED.paid_amount ELSE reservations.paid_amount END,
              delivery_failure_reason = COALESCE(NULLIF(EXCLUDED.delivery_failure_reason, ''), reservations.delivery_failure_reason),
-             driver_notes = COALESCE(NULLIF(EXCLUDED.driver_notes, ''), reservations.driver_notes)
+             driver_notes = COALESCE(NULLIF(EXCLUDED.driver_notes, ''), reservations.driver_notes),
+             is_source_cancelled = COALESCE(EXCLUDED.is_source_cancelled, reservations.is_source_cancelled),
+             is_source_rejected = COALESCE(EXCLUDED.is_source_rejected, reservations.is_source_rejected),
+             rcc_status = COALESCE(NULLIF(EXCLUDED.rcc_status, ''), reservations.rcc_status),
+             rcc_reason = COALESCE(NULLIF(EXCLUDED.rcc_reason, ''), reservations.rcc_reason),
+             cancelled_from_decline = EXCLUDED.cancelled_from_decline,
+             cancelled_from_hold = EXCLUDED.cancelled_from_hold,
+             penalty_amount = CASE WHEN EXCLUDED.penalty_amount > 0 THEN EXCLUDED.penalty_amount ELSE reservations.penalty_amount END
            RETURNING (xmax = 0) AS inserted`,
           [
             chunk.map((r) => r.id),
@@ -855,7 +929,14 @@ export async function ingestIncrementalSyncBatch(
             chunk.map((r) => r.referenceNumber || ''),
             chunk.map((r) => num(r.paidAmount, 0)),
             chunk.map((r) => r.deliveryFailureReason || ''),
-            chunk.map((r) => r.driverNotes || '')
+            chunk.map((r) => r.driverNotes || ''),
+            chunk.map((r) => (typeof r.isSourceCancelled === 'boolean' ? r.isSourceCancelled : null)),
+            chunk.map((r) => (typeof r.isSourceRejected === 'boolean' ? r.isSourceRejected : null)),
+            chunk.map((r) => r.rccStatus || ''),
+            chunk.map((r) => r.rccReason || ''),
+            chunk.map((r) => Boolean(r.cancelledFromDecline)),
+            chunk.map((r) => Boolean(r.cancelledFromHold)),
+            chunk.map((r) => num(r.penaltyAmount, 0))
           ]
         );
 
@@ -873,7 +954,9 @@ export async function ingestIncrementalSyncBatch(
             str(prev.internalStatus) !== str(r.internalStatus) ||
             str(prev.endDate) !== str(r.endDate) ||
             num(prev.extensionsCount, 0) !== num(r.extensionsCount, 0) ||
-            num(prev.totalAmount, 0) !== num(r.totalAmount, 0);
+            num(prev.totalAmount, 0) !== num(r.totalAmount, 0) ||
+            prev.isSourceCancelled !== r.isSourceCancelled ||
+            prev.isSourceRejected !== r.isSourceRejected;
           if (genuinelyChanged) {
             mutatedReservations.push(clientRes);
           }
@@ -887,6 +970,32 @@ export async function ingestIncrementalSyncBatch(
             `UPDATE reservations SET source_order = NULL
              WHERE source_order IS NOT NULL AND reservation_number <> ALL($1::text[])`,
             [liveResNums]
+          );
+        }
+      }
+      if (payload?.isFullSnapshot === true && payload?.cancelledAuthoritativeSynced === true) {
+        const canSrcIds = Array.isArray(payload.cancelledSourceIds)
+          ? payload.cancelledSourceIds.map((x) => str(x)).filter(Boolean)
+          : [];
+        if (canSrcIds.length > 0) {
+          await tx.query(
+            `UPDATE reservations SET is_source_cancelled = FALSE
+             WHERE COALESCE(is_source_cancelled, TRUE) <> FALSE
+               AND source_reservation_id <> ALL($1::text[])`,
+            [canSrcIds]
+          );
+        }
+      }
+      if (payload?.isFullSnapshot === true && payload?.rejectedAuthoritativeSynced === true) {
+        const rejSrcIds = Array.isArray(payload.rejectedSourceIds)
+          ? payload.rejectedSourceIds.map((x) => str(x)).filter(Boolean)
+          : [];
+        if (rejSrcIds.length > 0) {
+          await tx.query(
+            `UPDATE reservations SET is_source_rejected = FALSE
+             WHERE COALESCE(is_source_rejected, TRUE) <> FALSE
+               AND source_reservation_id <> ALL($1::text[])`,
+            [rejSrcIds]
           );
         }
       }
@@ -1610,6 +1719,7 @@ export async function pullFromRentalGateDirect(
       let pages = 0;
       let explicitNextUrl = '';
       let consecutiveZeroAdded = 0;
+      let succeeded = false;
       for (let step = 0; step < maxPages; step++) {
         const targetUrl = explicitNextUrl || `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
         if (visitedUrls.has(targetUrl)) break;
@@ -1629,15 +1739,16 @@ export async function pullFromRentalGateDirect(
         if (!resp.ok) {
           const errBody = await resp.text().catch(() => '');
           if (optional && resp.status !== 401 && resp.status !== 403) {
-            return { items, pages };
+            return { items, pages, ok: succeeded };
           }
           throw new Error(`RG_API_HTTP_${resp.status}: ${errBody.slice(0, 200)}`);
         }
         const json: any = await resp.json();
         if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
-          if (optional) return { items, pages };
+          if (optional) return { items, pages, ok: succeeded };
           throw new Error(str(json.message || json.error || 'RG_API_ERROR: رفضت واجهة Rental Gate الطلب.'));
         }
+        succeeded = true;
         pages++;
         const parsedPage = extractRentalGatePagePayload(json, pageParam, pageSize);
         let added = 0;
@@ -1645,7 +1756,7 @@ export async function pullFromRentalGateDirect(
           const extKey = str(row?.extendId || row?.extensionNumber || row?.extension_number);
           const resNum = str(crmCore.extractReservationNumber(row)).replace(/^#+/, '').trim();
           const srcId = str(crmCore.extractSourceReservationId(row));
-          const rowKey = extKey || (resNum && srcId && resNum !== srcId ? `${resNum}::${srcId}` : (resNum || srcId));
+          const rowKey = extKey || (srcId && resNum && resNum !== srcId ? `${srcId}::${resNum}` : (srcId || resNum));
           if (rowKey) {
             if (seenKeys.has(rowKey)) continue;
             seenKeys.add(rowKey);
@@ -1672,13 +1783,210 @@ export async function pullFromRentalGateDirect(
           break;
         }
       }
-      return { items, pages };
+      return { items, pages, ok: succeeded };
     };
 
-    const [resPaged, extPaged] = await Promise.all([
+    const [resPaged, extPaged, canPaged, rccPaged] = await Promise.all([
       fetchPaged('reservations/filter', false),
-      fetchPaged('reservation-extends/filter', true)
+      fetchPaged('reservation-extends/filter', true),
+      fetchPaged('admin/cancelled-reservations', true),
+      fetchPaged('reservation-company-changes/admin/filter', true)
     ]);
+
+    const cancelledBySrcId = new Map<string, any>();
+    if (canPaged.ok) {
+      for (const cRow of canPaged.items) {
+        const sid = str(cRow?.reservationId ?? cRow?.sourceReservationId);
+        if (sid && !cancelledBySrcId.has(sid)) {
+          cancelledBySrcId.set(sid, cRow);
+        }
+      }
+    }
+
+    const rccBySrcId = new Map<string, any>();
+    if (rccPaged.ok) {
+      for (const rRow of rccPaged.items) {
+        const sid = str(rRow?.reservationId ?? rRow?.sourceReservationId);
+        if (!sid) continue;
+        const prev = rccBySrcId.get(sid);
+        if (!prev || num(rRow?.id, 0) >= num(prev?.id, 0)) {
+          rccBySrcId.set(sid, rRow);
+        }
+      }
+    }
+
+    // Backfill any cancelled/rejected booking ID missing from reservations/filter so none are lost
+    const presentSrcIds = new Set<string>(
+      resPaged.items.map((it: any) => str(crmCore.extractSourceReservationId(it) || crmCore.extractReservationNumber(it))).filter(Boolean)
+    );
+    const missingAuthoritativeIds = Array.from(new Set([
+      ...cancelledBySrcId.keys(),
+      ...rccBySrcId.keys()
+    ])).filter((sid) => sid && !presentSrcIds.has(sid));
+    if (missingAuthoritativeIds.length > 0 && missingAuthoritativeIds.length <= 100) {
+      const missingFetched = await Promise.all(
+        missingAuthoritativeIds.map(async (sid) => {
+          try {
+            const resp = await fetchFn(`${baseApi}/reservations/${encodeURIComponent(sid)}`, {
+              method: 'GET',
+              headers: {
+                Authorization: `Bearer ${rgToken}`,
+                Accept: 'application/json',
+                lang: 'ar'
+              }
+            });
+            if (!resp.ok) return null;
+            const detail: any = await resp.json().catch(() => null);
+            if (!detail || typeof detail !== 'object') return null;
+            return {
+              ...detail,
+              reservationId: detail.reservationId ?? sid,
+              clientName: detail.client?.name ?? detail.clientName,
+              clientMobile: detail.client?.mobile ?? detail.client?.phone ?? detail.clientMobile,
+              companyArName: detail.companyCar?.company?.arabicName ?? detail.companyCar?.company?.name ?? detail.companyArName,
+              companyEnName: detail.companyCar?.company?.englishName ?? detail.companyEnName,
+              carNameEn: detail.companyCar?.car?.carNameEn ?? detail.carNameEn,
+              carNameAr: detail.companyCar?.car?.carNameAr ?? detail.carNameAr
+            };
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const mf of missingFetched) {
+        if (mf) resPaged.items.push(mf);
+      }
+    }
+
+    const resHasHeuristicCancelled = resPaged.items.some((it: any) =>
+      crmCore.isCancelledStatus(it) || String(crmCore.extractReservationStatusCode(it, true) || '').includes('cancel')
+    );
+    const resHasHeuristicRejected = resPaged.items.some((it: any) =>
+      crmCore.isRejectedStatus(it) || String(crmCore.extractReservationStatusCode(it, true) || '').includes('declin') || String(crmCore.extractReservationStatusCode(it, true) || '').includes('reject')
+    );
+    const canAuthoritative = canPaged.ok && (cancelledBySrcId.size > 0 || !resHasHeuristicCancelled);
+    const rccAuthoritative = rccPaged.ok && (rccBySrcId.size > 0 || !resHasHeuristicRejected);
+
+    const enrichedResItems = resPaged.items.map((rawItem: any) => {
+      const sid = str(crmCore.extractSourceReservationId(rawItem) || crmCore.extractReservationNumber(rawItem));
+      const canRec = sid ? cancelledBySrcId.get(sid) : null;
+      const rccRec = sid ? rccBySrcId.get(sid) : null;
+      const copy: Record<string, any> = { ...rawItem };
+      if (canAuthoritative) {
+        copy.isSourceCancelled = Boolean(canRec);
+      }
+      if (rccAuthoritative) {
+        copy.isSourceRejected = Boolean(rccRec);
+      }
+
+      const isLifecycleProtected = Boolean(
+        copy.isSourceCancelled === true ||
+        copy.isSourceRejected === true ||
+        crmCore.isRejectedStatus(copy) ||
+        crmCore.isCancelledStatus(copy)
+      );
+
+      if (isLifecycleProtected) {
+        const rawNested = (rawItem?.reservation && typeof rawItem.reservation === 'object') ? rawItem.reservation : {};
+        const rawExplicitBooking = str(
+          rawItem?.reservationNumber ?? rawItem?.reservation_number ??
+          rawItem?.reservationNo ?? rawItem?.reservation_no ??
+          rawItem?.reservationCode ?? rawItem?.reservation_code ??
+          rawItem?.bookingNumber ?? rawItem?.booking_number ??
+          rawItem?.bookingCode ?? rawItem?.booking_code ??
+          rawItem?.contractNumber ?? rawItem?.contract_number ??
+          rawItem?.orderNumber ?? rawItem?.order_number ??
+          rawItem?.code ?? rawItem?.serialNumber ?? rawItem?.serial_number ?? rawItem?.number ??
+          rawNested?.reservationNumber ?? rawNested?.reservation_number ??
+          rawNested?.reservationCode ?? rawNested?.code
+        );
+        const rawExplicitRef = str(
+          rawItem?.referenceNumber ?? rawItem?.reference_number ??
+          rawItem?.refNumber ?? rawItem?.ref_number ??
+          rawItem?.sourceReference ?? rawItem?.externalReference ??
+          rawItem?.orderRef ?? rawItem?.reference ??
+          rawNested?.referenceNumber ?? rawNested?.reference_number ??
+          rawNested?.refNumber ?? rawNested?.ref_number ?? rawNested?.reference
+        );
+        const pinnedBookingNum = (rawExplicitBooking && (!rawExplicitRef || rawExplicitBooking !== rawExplicitRef || !sid))
+          ? rawExplicitBooking
+          : (sid || rawExplicitBooking);
+        if (pinnedBookingNum) {
+          copy.reservationNumber = pinnedBookingNum;
+        }
+        const refCandidates = [
+          canRec?.referenceNumber, canRec?.reference_number, canRec?.refNumber, canRec?.ref_number,
+          rccRec?.referenceNumber, rccRec?.reference_number, rccRec?.refNumber, rccRec?.ref_number,
+          rawExplicitRef,
+          canRec?.reservationNumber, canRec?.reservation_number,
+          rccRec?.reservationNumber, rccRec?.reservation_number
+        ]
+          .map((x) => str(x))
+          .filter((val) => val && val !== pinnedBookingNum && val !== sid);
+        if (refCandidates.length > 0) {
+          copy.referenceNumber = refCandidates[0];
+        } else {
+          delete copy.referenceNumber;
+        }
+      }
+
+      if (canRec) {
+        if (!isLifecycleProtected && canRec.reservationNumber) copy.referenceNumber = str(canRec.reservationNumber);
+        if (canRec.paid !== undefined && canRec.paid !== null) copy.paidAmount = num(canRec.paid, 0);
+        if (canRec.cancelledFromDecline !== undefined) copy.cancelledFromDecline = Boolean(canRec.cancelledFromDecline);
+        if (canRec.cancelledFromHold !== undefined) copy.cancelledFromHold = Boolean(canRec.cancelledFromHold);
+        if (canRec.penaltyAmount !== undefined && canRec.penaltyAmount !== null) copy.penaltyAmount = num(canRec.penaltyAmount, 0);
+        const reasonTitle = crmCore.sanitizeReasonText(canRec.cancellationReasonArabic || canRec.cancellationReasonEnglish);
+        const reasonNotes = crmCore.sanitizeReasonText(canRec.cancellationNotes);
+        if (reasonTitle && reasonNotes && reasonTitle !== reasonNotes) {
+          copy.cancellationReason = `${reasonTitle} — ${reasonNotes}`;
+        } else if (reasonTitle || reasonNotes) {
+          copy.cancellationReason = reasonTitle || reasonNotes;
+        }
+        const delFail = crmCore.sanitizeReasonText(canRec.deliveryFailureReasonArabic || canRec.deliveryFailureReasonEnglish);
+        if (delFail) copy.deliveryFailureReason = delFail;
+        const drvNotes = crmCore.sanitizeReasonText(canRec.driverNotes);
+        if (drvNotes) copy.driverNotes = drvNotes;
+        if (copy.refundAmount === undefined && canRec.paid !== undefined && canRec.paid !== null) {
+          copy.refundAmount = Math.max(0, Math.round((num(canRec.paid, 0) - num(canRec.penaltyAmount, 0)) * 100) / 100);
+        }
+      }
+      if (rccRec) {
+        if (!isLifecycleProtected && rccRec.reservationNumber && !copy.referenceNumber) copy.referenceNumber = str(rccRec.reservationNumber);
+        copy.rccStatus = str(rccRec.status);
+        copy.rccReason = str(rccRec.reason);
+        if (rccRec.companyId !== undefined && rccRec.companyId !== null && !copy.companyNumber) {
+          copy.companyNumber = str(rccRec.companyId);
+        }
+        if (rccRec.targetCompanyName) {
+          copy.newCompanyName = str(rccRec.targetCompanyName);
+        }
+        if (rccRec.reservationStatusAtRequest) {
+          const translatedReq = crmCore.translateOriginalStatus(str(rccRec.reservationStatusAtRequest).toLowerCase());
+          copy.carStatusAtRequest = (translatedReq && translatedReq !== 'غير محدد') ? translatedReq : str(rccRec.reservationStatusAtRequest);
+        }
+        const rccDetails = crmCore.sanitizeReasonText(rccRec.details);
+        const fallbackReasonAr = str(rccRec.reason).toUpperCase() === 'TIME_OUT'
+          ? 'انتهاء مهلة التأكيد (TIME_OUT)'
+          : (str(rccRec.reason).toUpperCase() === 'REJECTED_BY_COMPANY' ? 'رفض من الشركة' : '');
+        if (rccDetails || fallbackReasonAr) {
+          copy.rejectionReason = rccDetails || fallbackReasonAr;
+        }
+        if (rccRec.clientRefundAmount !== undefined && rccRec.clientRefundAmount !== null) {
+          copy.refundAmount = num(rccRec.clientRefundAmount, 0);
+        }
+        if (rccRec.paidAmount !== undefined && rccRec.paidAmount !== null && num(rccRec.paidAmount, 0) > 0 && !copy.paidAmount) {
+          copy.paidAmount = num(rccRec.paidAmount, 0);
+        }
+        const rejActorId = str(rccRec.confirmedByUserId ?? rccRec.rejectedByUserId ?? '');
+        const rejActorName = str(rccRec.confirmedByUserName ?? rccRec.rejectedByUserName ?? '');
+        const rejActorAt = str(rccRec.confirmedAt ?? rccRec.createdAt ?? '');
+        if (rejActorId) copy.rejectedById = rejActorId;
+        if (rejActorName) copy.rejectedByName = rejActorName;
+        if (rejActorAt) copy.rejectedAt = rejActorAt;
+      }
+      return copy;
+    });
 
     const settingsRes = await executor.query<{ value: string }>(
       `SELECT value FROM settings WHERE key = 'excluded_statuses' LIMIT 1`
@@ -1693,12 +2001,12 @@ export async function pullFromRentalGateDirect(
     }
     const excludedSet = new Set(sanitizeExcludedStatusesList(excludedStatuses));
 
-    const dedupedAllRes = crmCore.dedupeReservationsByNumber(resPaged.items).map((item: any, idx: number) => ({
+    const dedupedAllRes = crmCore.dedupeReservationsByNumber(enrichedResItems).map((item: any, idx: number) => ({
       ...item,
       __sourceOrder: idx + 1
     }));
     const existingCheckNums = dedupedAllRes
-      .filter((item: any) => excludedSet.has(crmCore.extractReservationStatusCode(item, false)))
+      .filter((item: any) => !item.isSourceCancelled && !item.isSourceRejected && excludedSet.has(crmCore.extractReservationStatusCode(item, false)))
       .map((item: any) => str(crmCore.extractReservationNumber(item)))
       .filter(Boolean);
     let existingNumsSet = new Set<string>();
@@ -1710,6 +2018,7 @@ export async function pullFromRentalGateDirect(
       existingNumsSet = new Set((existRows.rows || []).map((r: any) => str(r.reservation_number)).filter(Boolean));
     }
     const afterExcludedRes = dedupedAllRes.filter((item: any) => {
+      if (item.isSourceCancelled || item.isSourceRejected) return true;
       const code = crmCore.extractReservationStatusCode(item, false);
       if (!excludedSet.has(code)) return true;
       const numKey = str(crmCore.extractReservationNumber(item));
@@ -1727,9 +2036,13 @@ export async function pullFromRentalGateDirect(
     const syncResult = await ingestIncrementalSyncBatch(executor, {
       source: 'rental_gate_direct',
       actor,
-      pagesFetched: resPaged.pages + extPaged.pages,
+      pagesFetched: resPaged.pages + extPaged.pages + canPaged.pages + rccPaged.pages,
       appliedRange,
       isFullSnapshot: !appliedRange?.hasCustomRange,
+      cancelledAuthoritativeSynced: canAuthoritative && !appliedRange?.hasCustomRange,
+      rejectedAuthoritativeSynced: rccAuthoritative && !appliedRange?.hasCustomRange,
+      cancelledSourceIds: canAuthoritative ? Array.from(cancelledBySrcId.keys()) : undefined,
+      rejectedSourceIds: rccAuthoritative ? Array.from(rccBySrcId.keys()) : undefined,
       reservations: filteredRes,
       extensions: dedupedExt
     });

@@ -1269,6 +1269,49 @@ test('personal layout prefs and calendar timeline helpers support monthly, weekl
   assert.equal(searchFiltered.events.every((e: any) => e.reservationId === 'RES_B'), true);
 });
 
+test('rejected and cancelled bookings never swap referenceNumber into reservationNumber or duplicate sourceReservationId', () => {
+  // Reference-only payload on rejected booking uses numeric reservationId for booking number
+  assert.equal(
+    core.extractReservationNumber({ reservationId: 8801, referenceNumber: 'RG-REF-8801', reservationStatus: 'rejected' }),
+    '8801'
+  );
+  assert.equal(
+    core.extractExplicitReferenceNumber(
+      { reservationId: 8801, referenceNumber: 'RG-REF-8801', reservationStatus: 'rejected' },
+      null,
+      ['8801']
+    ),
+    'RG-REF-8801'
+  );
+
+  // Distinct booking code + reference code on cancelled booking keep each in its field
+  assert.equal(
+    core.extractReservationNumber({ reservationId: 8802, reservationCode: 'BKG-8802', reference: 'REF-CAN-8802', status: 'cancelled' }),
+    'BKG-8802'
+  );
+  assert.equal(
+    core.extractExplicitReferenceNumber(
+      { reservationId: 8802, reservationCode: 'BKG-8802', reference: 'REF-CAN-8802', status: 'cancelled' },
+      null,
+      ['BKG-8802', '8802']
+    ),
+    'REF-CAN-8802'
+  );
+
+  // If external payload has no reference number, cancelled/rejected record keeps referenceNumber empty
+  const syncedNoRef = core.mergeSyncedReservation(
+    { id: 'RES_8803', sourceReservationId: '8803', reservationNumber: '8803', referenceNumber: '8803', originalStatusCode: 'cancelled', originalStatusAr: 'ملغي', internalStatus: 'ملغي' },
+    { reservationId: 8803, reservationStatus: 'cancelled_by_customer', clientName: 'عميل' },
+    [],
+    { id: 'SYNC', name: 'Sync' }
+  );
+  assert.equal(syncedNoRef.reservationNumber, '8803');
+  assert.equal(syncedNoRef.referenceNumber, '');
+
+  // Active booking still prefers explicit reference if no reservationCode is given
+  assert.equal(core.extractReservationNumber({ reservationId: 8804, reference: 'REF-8804', status: 'confirmed' }), 'REF-8804');
+});
+
 
 
 

@@ -232,6 +232,9 @@ test('UI overrides precedence, Developer protection, unified navigation removal 
   assert.ok(reservationsJs.includes("label: 'ملاحظات السائق'"));
   assert.ok(reservationsJs.includes('لم يُسجّل سبب في المصدر لهذا الحجز'));
   assert.equal(reservationsJs.includes("var naText = isEn ? 'N/A' : 'غير متاح';"), false);
+  assert.equal(reservationsJs.includes('naText'), false);
+  assert.ok(reservationsJs.includes('rg-lifecycle-table'));
+  assert.ok(reservationsJs.includes('rg-lifecycle-banner-card'));
 
   const css = readRepoFile('assets/css/dashboard.css');
   for (const cls of [
@@ -258,18 +261,32 @@ test('Sandbox E2E: unified lifecycle tabs, forbidden manual reject/cancel/restor
   assert.ok(activeList.data.items.length >= 2);
   assert.equal(activeList.data.items.some((r: any) => core.isInactiveReservation(r)), false);
   assert.ok(activeList.data.lifecycleCounts);
-  assert.ok(activeList.data.lifecycleCounts.rejected >= 1);
-  assert.ok(activeList.data.lifecycleCounts.cancelled >= 1);
+  assert.ok(activeList.data.lifecycleCounts.rejected >= 2);
+  assert.ok(activeList.data.lifecycleCounts.cancelled >= 2);
 
   const rejectedList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'rejected' });
   assert.equal(rejectedList.success, true);
-  assert.ok(rejectedList.data.items.length >= 1);
+  assert.ok(rejectedList.data.items.length >= 2);
   assert.equal(rejectedList.data.items.every((r: any) => core.classifyReservationLifecycle(r) === 'rejected'), true);
 
   const cancelledList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'cancelled' });
   assert.equal(cancelledList.success, true);
-  assert.ok(cancelledList.data.items.length >= 1);
+  assert.ok(cancelledList.data.items.length >= 2);
   assert.equal(cancelledList.data.items.every((r: any) => core.classifyReservationLifecycle(r) === 'cancelled'), true);
+
+  // Verify distinct Booking # and Reference # on Sandbox Rejected & Cancelled fixtures
+  const r1006 = cancelledList.data.items.find((r: any) => r.id === 'RES_1006');
+  const r1011 = cancelledList.data.items.find((r: any) => r.id === 'RES_1011');
+  const r1010 = rejectedList.data.items.find((r: any) => r.id === 'RES_1010');
+  const r1012 = rejectedList.data.items.find((r: any) => r.id === 'RES_1012');
+  assert.equal(r1006?.reservationNumber, 'RG-2026-8846');
+  assert.equal(r1006?.referenceNumber, 'RG-CAN-884601');
+  assert.equal(r1011?.reservationNumber, '885101');
+  assert.equal(r1011?.referenceNumber, 'RG-CAN-885101');
+  assert.equal(r1010?.reservationNumber, 'RG-2026-8850');
+  assert.equal(r1010?.referenceNumber, 'RG-DEC-885001');
+  assert.equal(r1012?.reservationNumber, '885201');
+  assert.equal(r1012?.referenceNumber, '');
 
   const allList = await api.callApi('getReservations', { page: 1, pageSize: 100, lifecycle: 'all' });
   assert.equal(allList.success, true);

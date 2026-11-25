@@ -480,11 +480,19 @@ function serializeReservationForClient_(sr, isFollowedFlag) {
   var daysCnt = toNumber(sr.daysCount, 1);
   var extDaysCnt = toNumber(sr.extendedDaysCount, 0);
   var totalDaysCnt = toNumber(sr.totalDaysCount, daysCnt + extDaysCnt);
+  var lcClient = (typeof classifyReservationLifecycleGs_ === 'function')
+    ? classifyReservationLifecycleGs_(sr)
+    : 'active';
+  var isProtectedClient = lcClient === 'rejected' || lcClient === 'cancelled';
+  var rawRefClient = normalizeStr(sr.referenceNumber);
+  var cleanRefClient = isProtectedClient
+    ? ((rawRefClient && rawRefClient !== normalizeStr(sr.reservationNumber) && (!normalizeStr(sr.sourceReservationId) || rawRefClient !== normalizeStr(sr.sourceReservationId))) ? rawRefClient : '')
+    : (rawRefClient || normalizeStr(sr.sourceReservationId) || '');
   return {
     id: sr.id,
     sourceReservationId: sr.sourceReservationId || sr.reservationNumber || '',
     reservationNumber: sr.reservationNumber,
-    referenceNumber: sr.referenceNumber || sr.sourceReservationId || '',
+    referenceNumber: cleanRefClient,
     sourceCreatedAt: sr.sourceCreatedAt || sr.createdAt || '',
     customerName: sr.customerName,
     customerPhone: sr.customerPhone,
@@ -765,11 +773,34 @@ function runRentalGateSyncInternal(actor, options) {
       for (var i = 0; i < resItems.length; i++) {
         var item = resItems[i];
         var resApiId = extractSourceReservationId_(item);
-        var resNumber = extractReservationNumber_(item) || resApiId;
+        var statusCode = extractReservationStatusCode_(item, false);
+        var prelimStatusAr = resolveSourceWorkflowStatus_(item);
+        var prelimLc = (typeof classifyReservationLifecycleGs_ === 'function')
+          ? classifyReservationLifecycleGs_({
+              originalStatusCode: statusCode,
+              originalStatusAr: prelimStatusAr,
+              isSourceRejected: item.isSourceRejected === true,
+              isSourceCancelled: item.isSourceCancelled === true
+            })
+          : 'active';
+        var resNumber;
+        if (prelimLc === 'rejected' || prelimLc === 'cancelled') {
+          var explicitRefPre = normalizeStr(item.referenceNumber || item.reference_number || item.refNumber || item.ref_number || item.sourceReference || item.externalReference || item.orderRef || item.reference || '');
+          var explicitBookPre = normalizeStr(
+            item.reservationNumber || item.reservation_number || item.reservationNo || item.reservation_no ||
+            item.reservationCode || item.reservation_code || item.bookingNumber || item.booking_number ||
+            item.bookingCode || item.booking_code || item.contractNumber || item.contract_number ||
+            item.orderNumber || item.order_number || item.code || item.serialNumber || item.serial_number || item.number || ''
+          );
+          resNumber = (explicitBookPre && (!explicitRefPre || explicitBookPre !== explicitRefPre || !resApiId))
+            ? explicitBookPre
+            : (resApiId || explicitBookPre);
+        } else {
+          resNumber = extractReservationNumber_(item) || resApiId;
+        }
         if (!resNumber || resSeenMap[resNumber]) continue;
         resSeenMap[resNumber] = true;
 
-        var statusCode = extractReservationStatusCode_(item, false);
         if (excludedSet[statusCode]) {
           excludedFilteredCount++;
           continue;
@@ -1022,7 +1053,21 @@ function runRentalGateSyncInternal(actor, options) {
           cancelledById: isCanSync ? normalizeStr((existing && existing.cancelledById) || item.cancelledById || item.cancelled_by_id || item.canceled_by_id || item.actionById || actorId) : '',
           cancelledByName: isCanSync ? normalizeStr((existing && existing.cancelledByName) || item.cancelledByName || item.cancelled_by_name || item.canceledByName || item.canceled_by_name || item.cancelledBy || item.actionByName || actorName) : '',
           cancelledAt: isCanSync ? normalizeStr(item.cancelledAt || item.cancelled_at || item.canceledAt || item.canceled_at || item.actionAt || (existing && existing.cancelledAt) || nowStr) : '',
-          referenceNumber: normalizeStr(item.referenceNumber || item.reference_number || item.refNumber || item.ref_number || item.sourceReference || item.externalReference || item.orderRef || item.reference || (existing && existing.referenceNumber) || resApiId || ''),
+          referenceNumber: (isRejSync || isCanSync)
+            ? (function () {
+                var candList = [
+                  item.referenceNumber, item.reference_number, item.refNumber, item.ref_number,
+                  item.sourceReference, item.externalReference, item.orderRef, item.reference,
+                  existing && existing.referenceNumber
+                ];
+                for (var ci = 0; ci < candList.length; ci++) {
+                  var cv = normalizeStr(candList[ci]);
+                  if (!cv || cv === resNumber || (resApiId && cv === resApiId)) continue;
+                  return cv;
+                }
+                return '';
+              })()
+            : normalizeStr(item.referenceNumber || item.reference_number || item.refNumber || item.ref_number || item.sourceReference || item.externalReference || item.orderRef || item.reference || (existing && existing.referenceNumber) || resApiId || ''),
           paidAmount: (function () {
             var rp = item.paidAmount !== undefined ? item.paidAmount : (item.paid_amount !== undefined ? item.paid_amount : (item.amountPaid !== undefined ? item.amountPaid : item.amount_paid));
             if (rp !== undefined && rp !== null && rp !== '') return Math.max(0, Math.round(toNumber(rp, 0) * 100) / 100);

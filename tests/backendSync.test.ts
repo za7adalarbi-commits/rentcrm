@@ -7,7 +7,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { crmCore, hashPassword, hashToken, normalizeLoginUsername, verifySharedSecret } from '../backend/auth';
 import { maskDatabaseUrl, persistCoreFilesOnDisk } from '../backend/coreBinding';
-import { runLifecycleAndNationalIdMaintenance, type DbClient, type DbExecutor, type QueryResult } from '../backend/db';
+import { runLifecycleAndNationalIdMaintenance, type DbClient, type DbExecutor, type QueryResult, type QueryResultRow } from '../backend/db';
 import { FIXED_SERVER_CONFIG } from '../backend/fixedConfig';
 import { dispatchCrmRequest } from '../backend/router';
 import {
@@ -58,6 +58,16 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     });
   }
 
+  function mockIsRejected(r: any): boolean {
+    if (typeof r.is_source_rejected === 'boolean') return r.is_source_rejected;
+    return mockRowLifecycle(r) === 'rejected';
+  }
+
+  function mockIsCancelled(r: any): boolean {
+    if (typeof r.is_source_cancelled === 'boolean') return r.is_source_cancelled;
+    return mockRowLifecycle(r) === 'cancelled';
+  }
+
   function filterMockReservations(sql: string, params: any[], paramLimit?: number): any[] {
     let list = state.reservations.slice();
     const limit = typeof paramLimit === 'number' ? paramLimit : params.length;
@@ -70,17 +80,14 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     const hasRejCond = whereSegment.includes("'rejected_by_provider'");
     const hasCanCond = whereSegment.includes("'cancelled_by_provider'");
     if (hasRejCond && !hasCanCond) {
-      list = list.filter((r) => mockRowLifecycle(r) === 'rejected');
+      list = list.filter((r) => mockIsRejected(r));
     } else if (hasRejCond && hasCanCond) {
       if (whereSegment.includes('AND NOT (')) {
-        list = list.filter((r) => mockRowLifecycle(r) === 'active');
-      } else if (/OR\s*\(\s*NOT\s*\(/i.test(whereSegment)) {
-        list = list.filter((r) => {
-          const lc = mockRowLifecycle(r);
-          return lc === 'rejected' || lc === 'cancelled';
-        });
+        list = list.filter((r) => !mockIsRejected(r) && !mockIsCancelled(r));
+      } else if (/\)\s*OR\s*\(\s*CASE/i.test(whereSegment)) {
+        list = list.filter((r) => mockIsRejected(r) || mockIsCancelled(r));
       } else {
-        list = list.filter((r) => mockRowLifecycle(r) === 'cancelled');
+        list = list.filter((r) => mockIsCancelled(r));
       }
     }
 
@@ -577,7 +584,18 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
           cancellation_reason: Array.isArray(params[61]) ? (params[61][i] ?? '') : '',
           cancelled_by_id: Array.isArray(params[62]) ? (params[62][i] ?? '') : '',
           cancelled_by_name: Array.isArray(params[63]) ? (params[63][i] ?? '') : '',
-          cancelled_at: Array.isArray(params[64]) ? (params[64][i] ?? '') : ''
+          cancelled_at: Array.isArray(params[64]) ? (params[64][i] ?? '') : '',
+          reference_number: Array.isArray(params[65]) ? (params[65][i] ?? '') : '',
+          paid_amount: Array.isArray(params[66]) ? (params[66][i] ?? 0) : 0,
+          delivery_failure_reason: Array.isArray(params[67]) ? (params[67][i] ?? '') : '',
+          driver_notes: Array.isArray(params[68]) ? (params[68][i] ?? '') : '',
+          is_source_cancelled: Array.isArray(params[69]) ? (params[69][i] ?? null) : null,
+          is_source_rejected: Array.isArray(params[70]) ? (params[70][i] ?? null) : null,
+          rcc_status: Array.isArray(params[71]) ? (params[71][i] ?? '') : '',
+          rcc_reason: Array.isArray(params[72]) ? (params[72][i] ?? '') : '',
+          cancelled_from_decline: Array.isArray(params[73]) ? Boolean(params[73][i]) : false,
+          cancelled_from_hold: Array.isArray(params[74]) ? Boolean(params[74][i]) : false,
+          penalty_amount: Array.isArray(params[75]) ? (params[75][i] ?? 0) : 0
         };
         const idx = state.reservations.findIndex((r) => r.reservation_number === rec.reservation_number);
         if (idx === -1) {
@@ -591,12 +609,40 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
             id: prev.id,
             customer_id_number: rec.customer_id_number || (samePhoneOrEmpty ? (prev.customer_id_number || '') : ''),
             created_at: prev.created_at,
-            source_order: rec.source_order ?? prev.source_order ?? null
+            source_order: rec.source_order ?? prev.source_order ?? null,
+            is_source_cancelled: rec.is_source_cancelled !== null && rec.is_source_cancelled !== undefined ? rec.is_source_cancelled : (prev.is_source_cancelled ?? null),
+            is_source_rejected: rec.is_source_rejected !== null && rec.is_source_rejected !== undefined ? rec.is_source_rejected : (prev.is_source_rejected ?? null),
+            rcc_status: rec.rcc_status || prev.rcc_status || '',
+            rcc_reason: rec.rcc_reason || prev.rcc_reason || ''
           };
           outRows.push({ inserted: false });
         }
       }
       return { rows: outRows as any[], rowCount: outRows.length };
+    }
+
+    if (sql.startsWith('UPDATE reservations SET is_source_cancelled = FALSE')) {
+      const keepIds: string[] = Array.isArray(params[0]) ? params[0] : [];
+      let cleared = 0;
+      for (const r of state.reservations) {
+        if (r.is_source_cancelled !== false && !keepIds.includes(String(r.source_reservation_id || ''))) {
+          r.is_source_cancelled = false;
+          cleared++;
+        }
+      }
+      return { rows: [], rowCount: cleared };
+    }
+
+    if (sql.startsWith('UPDATE reservations SET is_source_rejected = FALSE')) {
+      const keepIds: string[] = Array.isArray(params[0]) ? params[0] : [];
+      let cleared = 0;
+      for (const r of state.reservations) {
+        if (r.is_source_rejected !== false && !keepIds.includes(String(r.source_reservation_id || ''))) {
+          r.is_source_rejected = false;
+          cleared++;
+        }
+      }
+      return { rows: [], rowCount: cleared };
     }
 
     if (sql.startsWith('UPDATE reservations SET source_order = NULL')) {
@@ -818,10 +864,11 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       let cancelledCnt = 0;
       let rejectedCnt = 0;
       for (const r of list) {
-        const lc = mockRowLifecycle(r);
-        if (lc === 'rejected') rejectedCnt++;
-        else if (lc === 'cancelled') cancelledCnt++;
-        else activeCnt++;
+        const isRej = mockIsRejected(r);
+        const isCan = mockIsCancelled(r);
+        if (isRej) rejectedCnt++;
+        if (isCan) cancelledCnt++;
+        if (!isRej && !isCan) activeCnt++;
       }
       return {
         rows: [{
@@ -906,9 +953,8 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       for (const r of list) {
         const createdDay = r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at || '').slice(0, 10);
         if (r.start_date === todayStr || createdDay === todayStr) todayCnt++;
-        const lc = mockRowLifecycle(r);
-        if (lc === 'rejected') rejectedCnt++;
-        else if (lc === 'cancelled') cancelledCnt++;
+        if (mockIsRejected(r)) rejectedCnt++;
+        if (mockIsCancelled(r)) cancelledCnt++;
       }
       return {
         rows: [{ total_cnt: list.length, today_cnt: todayCnt, cancelled_cnt: cancelledCnt, rejected_cnt: rejectedCnt }] as any[],
@@ -3804,7 +3850,8 @@ test('Booking order matches Rental Gate source sequence across pull, pagination,
       mockFetch
     );
     assert.equal(pullRes.fetchedCount, 10);
-    assert.equal(pullRes.pagesFetched, 3);
+    // 2 pages reservations/filter + 1 extension + 1 cancelled + 1 company-changes = 5
+    assert.equal(pullRes.pagesFetched, 5);
     assert.equal(pullRes.importedCount, 10);
 
     const p1 = await dispatchCrmRequest(db, { action: 'getReservations', token, payload: { page: 1, pageSize: 5 } });
@@ -4082,6 +4129,266 @@ test('Clamped 1-based pagination probes page=1 then advances to page=2 without s
     else process.env.RG_TOKEN = prevRgToken;
   }
 });
+
+test('Authoritative /admin/cancelled-reservations & /reservation-company-changes/admin/filter resolve dual & reassigned overlaps to exact 40 cancelled and 58 rejected with 0 duplicates', async () => {
+  const db = createInMemoryMockExecutor();
+  await dispatchCrmRequest(db, { action: 'ping' });
+  const loginRes = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'Admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' }
+  });
+  assert.equal(loginRes.success, true);
+  const token = loginRes.data.token;
+
+  // Build exact production-matching shape:
+  // - 34 pure CANCELLED (in reservations/filter + cancelled-reservations)
+  // - 3 CANCELLED that moved to REFUND_PROCESSED/REJECTED_BY_COMPANY (excluded from cancelled-reservations, present in company-changes -> count only in Rejected)
+  // - 6 CANCELLED with cancelledFromDecline=true (present in BOTH cancelled-reservations AND company-changes -> count in BOTH Cancelled & Rejected)
+  // - 44 DECLINED (present in company-changes)
+  // - 5 FINISHED with COMPANY_CHANGED (present in company-changes -> count in Rejected while keeping single row)
+  // - 10 normal active CONFIRMED bookings
+  // Total = 102 unique bookings -> 40 Cancelled, 58 Rejected
+  const filterItems: any[] = [];
+  const cancelledItems: any[] = [];
+  const rccItems: any[] = [];
+
+  for (let i = 1; i <= 34; i++) {
+    const id = 1000 + i;
+    filterItems.push({ reservationId: id, clientName: `Pure Can ${i}`, reservationStatus: 'CANCELLED', startDate: '2026-11-20T10:00:00', total: 200 });
+    cancelledItems.push({ reservationId: id, reservationNumber: `RG-CAN-${id}`, cancelledFromDecline: false, cancellationReasonArabic: `سبب إلغاء ${i}`, paid: 200 });
+  }
+  for (let i = 1; i <= 3; i++) {
+    const id = 2000 + i;
+    filterItems.push({ reservationId: id, clientName: `Refund Rej ${i}`, reservationStatus: 'CANCELLED', startDate: '2026-11-20T10:00:00', total: 300 });
+    rccItems.push({ id: 900 + i, reservationId: id, reservationNumber: `RG-REF-${id}`, status: 'REFUND_PROCESSED', reason: 'REJECTED_BY_COMPANY', clientRefundAmount: 300 });
+  }
+  for (let i = 1; i <= 6; i++) {
+    const id = 3000 + i;
+    filterItems.push({ reservationId: id, clientName: `Dual ${i}`, reservationStatus: 'CANCELLED', startDate: '2026-11-20T10:00:00', total: 400 });
+    cancelledItems.push({ reservationId: id, reservationNumber: `RG-DUAL-${id}`, cancelledFromDecline: true, cancellationReasonArabic: 'تم رفضه وإلغاؤه', paid: 400 });
+    rccItems.push({ id: 800 + i, reservationId: id, reservationNumber: `RG-DUAL-${id}`, status: 'CLIENT_CANCELLED', reason: 'REJECTED_BY_COMPANY', targetCompanyName: 'Alghazal', confirmedByUserName: 'مشرف اختبار' });
+  }
+  for (let i = 1; i <= 44; i++) {
+    const id = 4000 + i;
+    filterItems.push({ reservationId: id, clientName: `Declined ${i}`, reservationStatus: 'DECLINED', startDate: '2026-11-20T10:00:00', total: 500 });
+    rccItems.push({ id: 700 + i, reservationId: id, reservationNumber: `RG-DEC-${id}`, status: 'REFUND_PROCESSED', reason: 'REJECTED_BY_COMPANY', details: `رفض ${i}` });
+  }
+  for (let i = 1; i <= 5; i++) {
+    const id = 5000 + i;
+    filterItems.push({ reservationId: id, clientName: `Reassigned Fin ${i}`, reservationStatus: 'FINISHED', startDate: '2026-11-20T10:00:00', total: 600 });
+    rccItems.push({ id: 600 + i, reservationId: id, reservationNumber: `RG-FIN-${id}`, status: 'COMPANY_CHANGED', reason: i <= 3 ? 'REJECTED_BY_COMPANY' : 'TIME_OUT', targetCompanyName: 'Almaqam' });
+  }
+  for (let i = 1; i <= 10; i++) {
+    const id = 6000 + i;
+    filterItems.push({ reservationId: id, clientName: `Active ${i}`, reservationStatus: 'CONFIRMED', startDate: '2026-11-20T10:00:00', total: 700 });
+  }
+
+  const prevRgToken = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_test_token_authoritative_overlap';
+
+  const mockFetch = (async (url: any) => {
+    const u = new URL(String(url));
+    const page = Number(u.searchParams.get('page') || '0');
+    const jsonResp = (rows: any[], total: number) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ content: page === 0 ? rows : [], totalElements: total, totalPages: 1, last: true }),
+      text: async () => JSON.stringify({ content: page === 0 ? rows : [], totalElements: total, totalPages: 1, last: true })
+    }) as any;
+    if (u.pathname.includes('/reservations/filter')) return jsonResp(filterItems, filterItems.length);
+    if (u.pathname.includes('/admin/cancelled-reservations')) return jsonResp(cancelledItems, cancelledItems.length);
+    if (u.pathname.includes('/reservation-company-changes/admin/filter')) return jsonResp(rccItems, rccItems.length);
+    return jsonResp([], 0);
+  }) as any;
+
+  try {
+    await pullFromRentalGateDirect(db, { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' }, { maxPages: 5 }, mockFetch);
+    assert.equal(db.state.reservations.length, 102);
+
+    const [allRes, rejRes, canRes, dashRes, inactRej, inactCan] = await Promise.all([
+      dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'all', page: 1, pageSize: 200 } }),
+      dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'rejected', page: 1, pageSize: 200 } }),
+      dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'cancelled', page: 1, pageSize: 200 } }),
+      dispatchCrmRequest(db, { action: 'getDashboard', token, payload: { forceRefresh: true } }),
+      dispatchCrmRequest(db, { action: 'getInactiveReservations', token, payload: { subTab: 'rejected', page: 1, pageSize: 200 } }),
+      dispatchCrmRequest(db, { action: 'getInactiveReservations', token, payload: { subTab: 'cancelled', page: 1, pageSize: 200 } })
+    ]);
+
+    assert.equal(allRes.data.total, 102);
+    assert.equal(allRes.data.lifecycleCounts.cancelled, 40);
+    assert.equal(allRes.data.lifecycleCounts.rejected, 58);
+    assert.equal(rejRes.data.total, 58);
+    assert.equal(canRes.data.total, 40);
+    assert.equal(dashRes.data.kpis.cancelled, 40);
+    assert.equal(dashRes.data.kpis.rejected, 58);
+    assert.equal(inactRej.data.total, 58);
+    assert.equal(inactCan.data.total, 40);
+
+    // Verify canonical key & dual classification properties
+    const refundRow = db.state.reservations.find((r) => r.source_reservation_id === '2001');
+    assert.equal(refundRow?.is_source_cancelled, false);
+    assert.equal(refundRow?.is_source_rejected, true);
+
+    const dualRow = db.state.reservations.find((r) => r.source_reservation_id === '3001');
+    assert.equal(dualRow?.is_source_cancelled, true);
+    assert.equal(dualRow?.is_source_rejected, true);
+    assert.equal(dualRow?.reservation_number, '3001');
+    assert.equal(dualRow?.reference_number, 'RG-DUAL-3001');
+
+    const finChangedRow = db.state.reservations.find((r) => r.source_reservation_id === '5001');
+    assert.equal(finChangedRow?.is_source_cancelled, false);
+    assert.equal(finChangedRow?.is_source_rejected, true);
+    assert.equal(finChangedRow?.rcc_status, 'COMPANY_CHANGED');
+  } finally {
+    if (prevRgToken === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRgToken;
+  }
+});
+
+test('runLifecycleAndNationalIdMaintenance Step 4 repairs historical swapped and duplicated booking vs reference numbers on rejected and cancelled rows only', async () => {
+  const rows: any[] = [
+    {
+      id: 'R_SWAPPED_REJ',
+      source_reservation_id: '901',
+      reservation_number: 'RG-REJ-901',
+      reference_number: '901',
+      original_status_code: 'rejected',
+      original_status_ar: 'مرفوض',
+      internal_status: 'مرفوض',
+      is_source_rejected: true,
+      is_source_cancelled: false,
+      raw_json: JSON.stringify({ reservationId: 901, referenceNumber: 'RG-REJ-901', reservationStatus: 'rejected' })
+    },
+    {
+      id: 'R_DISTINCT_CAN',
+      source_reservation_id: '902',
+      reservation_number: 'RG-CAN-902',
+      reference_number: '902',
+      original_status_code: 'cancelled',
+      original_status_ar: 'ملغي',
+      internal_status: 'تم الإلغاء',
+      is_source_rejected: false,
+      is_source_cancelled: true,
+      raw_json: JSON.stringify({ reservationId: 902, reservationNumber: 'BKG-902', referenceNumber: 'RG-CAN-902', reservationStatus: 'cancelled' })
+    },
+    {
+      id: 'R_FALLBACK_CAN',
+      source_reservation_id: '903',
+      reservation_number: '903',
+      reference_number: '903',
+      original_status_code: 'cancelled_by_customer',
+      original_status_ar: 'ملغي من العميل',
+      internal_status: 'ملغي من العميل',
+      is_source_rejected: false,
+      is_source_cancelled: true,
+      raw_json: JSON.stringify({ reservationId: 903, reservationStatus: 'cancelled_by_customer' })
+    },
+    {
+      id: 'R_NO_RAW_REJ',
+      source_reservation_id: '904',
+      reservation_number: 'RG-LEGACY-904',
+      reference_number: 'RG-LEGACY-904',
+      original_status_code: 'rejected_by_provider',
+      original_status_ar: 'مرفوض من المزود',
+      internal_status: 'مرفوض من المزود',
+      is_source_rejected: true,
+      is_source_cancelled: false,
+      raw_json: ''
+    },
+    {
+      id: 'R_ACTIVE_UNTOUCHED',
+      source_reservation_id: '905',
+      reservation_number: 'RG-ACTIVE-905',
+      reference_number: 'RG-ACTIVE-905',
+      original_status_code: 'confirmed',
+      original_status_ar: 'مؤكد',
+      internal_status: 'مؤكد',
+      is_source_rejected: false,
+      is_source_cancelled: false,
+      raw_json: JSON.stringify({ reservationId: 905, referenceNumber: 'RG-ACTIVE-905', reservationStatus: 'confirmed' })
+    },
+    {
+      id: 'R_NO_RAW_SWAP_CAN',
+      source_reservation_id: '906',
+      reservation_number: 'RG-LEGACY-SWAP-906',
+      reference_number: '906',
+      original_status_code: 'cancelled',
+      original_status_ar: 'ملغي',
+      internal_status: 'تم الإلغاء',
+      is_source_rejected: false,
+      is_source_cancelled: true,
+      raw_json: ''
+    }
+  ];
+  const childFollowUps = [{ id: 'FU_901', reservation_id: 'R_SWAPPED_REJ', reservation_number: 'RG-REJ-901' }];
+  const childProblems = [{ id: 'PRB_902', reservation_id: 'R_DISTINCT_CAN', reservation_number: 'RG-CAN-902' }];
+  const childProblemUpdates = [{ id: 'PRBU_902', reservation_number: 'RG-CAN-902' }];
+
+  const mockExec: DbExecutor = {
+    async query<T extends QueryResultRow = any>(text: string, params: any[] = []): Promise<QueryResult<T>> {
+      const sql = text.trim();
+      if (sql.startsWith('SELECT id, source_reservation_id, reservation_number, reference_number,')) {
+        return { rows: rows as T[], rowCount: rows.length };
+      }
+      if (sql === 'UPDATE reservations SET reservation_number = $2 WHERE id = $1') {
+        const target = rows.find((x) => x.id === params[0]);
+        if (target) target.reservation_number = params[1];
+        return { rows: [], rowCount: target ? 1 : 0 };
+      }
+      if (sql === 'UPDATE reservations SET reference_number = $2 WHERE id = $1') {
+        const target = rows.find((x) => x.id === params[0]);
+        if (target) target.reference_number = params[1];
+        return { rows: [], rowCount: target ? 1 : 0 };
+      }
+      if (sql.startsWith('UPDATE follow_ups SET reservation_number = $2')) {
+        for (const f of childFollowUps) {
+          if (f.reservation_id === params[0] || f.reservation_number === params[2]) f.reservation_number = params[1];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.startsWith('UPDATE problems SET reservation_number = $2')) {
+        for (const p of childProblems) {
+          if (p.reservation_id === params[0] || p.reservation_number === params[2]) p.reservation_number = params[1];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.startsWith('UPDATE problem_updates SET reservation_number = $2')) {
+        for (const pu of childProblemUpdates) {
+          if (pu.reservation_number === params[1]) pu.reservation_number = params[0];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    async withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
+      return fn(mockExec);
+    }
+  };
+
+  await runLifecycleAndNationalIdMaintenance(mockExec);
+
+  assert.equal(rows[0].reservation_number, '901');
+  assert.equal(rows[0].reference_number, 'RG-REJ-901');
+  assert.equal(childFollowUps[0].reservation_number, '901');
+
+  assert.equal(rows[1].reservation_number, 'BKG-902');
+  assert.equal(rows[1].reference_number, 'RG-CAN-902');
+  assert.equal(childProblems[0].reservation_number, 'BKG-902');
+  assert.equal(childProblemUpdates[0].reservation_number, 'BKG-902');
+
+  assert.equal(rows[2].reservation_number, '903');
+  assert.equal(rows[2].reference_number, '');
+
+  assert.equal(rows[3].reservation_number, '904');
+  assert.equal(rows[3].reference_number, 'RG-LEGACY-904');
+
+  assert.equal(rows[4].reservation_number, 'RG-ACTIVE-905');
+  assert.equal(rows[4].reference_number, 'RG-ACTIVE-905');
+
+  assert.equal(rows[5].reservation_number, '906');
+  assert.equal(rows[5].reference_number, 'RG-LEGACY-SWAP-906');
+});
+
 
 
 

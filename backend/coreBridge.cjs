@@ -744,9 +744,84 @@
     return '';
   }
 
+  function isProtectedRejectedOrCancelledItem(item) {
+    if (!item || typeof item !== 'object') return false;
+    if (item.isSourceRejected === true || item.isSourceCancelled === true) return true;
+    return isRejectedStatus(item) || isCancelledStatus(item);
+  }
+
+  function extractExplicitReferenceNumber(apiItem, existing, excludeValues) {
+    var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+    var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+    var excluded = {};
+    if (Array.isArray(excludeValues)) {
+      for (var e = 0; e < excludeValues.length; e++) {
+        var ev = normalizeStr(excludeValues[e]);
+        if (ev) excluded[ev] = true;
+      }
+    }
+    var candidates = [
+      item.referenceNumber,
+      item.reference_number,
+      item.refNumber,
+      item.ref_number,
+      item.sourceReference,
+      item.externalReference,
+      item.orderRef,
+      item.reference,
+      nested.referenceNumber,
+      nested.reference_number,
+      nested.refNumber,
+      nested.ref_number,
+      nested.reference
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      var val = normalizeStr(candidates[i]);
+      if (!val || excluded[val]) continue;
+      return val;
+    }
+    if (existing && typeof existing === 'object') {
+      var exVal = normalizeStr(existing.referenceNumber);
+      if (exVal && !excluded[exVal]) return exVal;
+    }
+    return '';
+  }
+
   function extractReservationNumber(apiItem) {
     var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
     var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+    if (isProtectedRejectedOrCancelledItem(item)) {
+      var srcId = extractSourceReservationId(item);
+      var explicitRef = extractExplicitReferenceNumber(item, null);
+      var explicitBooking = normalizeStr(
+        item.reservationNumber ||
+        item.reservation_number ||
+        item.reservationNo ||
+        item.reservation_no ||
+        item.reservationCode ||
+        item.reservation_code ||
+        item.bookingNumber ||
+        item.booking_number ||
+        item.bookingCode ||
+        item.booking_code ||
+        item.contractNumber ||
+        item.contract_number ||
+        item.orderNumber ||
+        item.order_number ||
+        item.code ||
+        item.serialNumber ||
+        item.serial_number ||
+        item.number ||
+        nested.reservationNumber ||
+        nested.reservation_number ||
+        nested.reservationCode ||
+        nested.code
+      );
+      if (explicitBooking && (!explicitRef || explicitBooking !== explicitRef || !srcId)) {
+        return explicitBooking;
+      }
+      return normalizeStr(srcId || explicitBooking);
+    }
     return normalizeStr(
       item.reservationNumber ||
       item.reservation_number ||
@@ -957,6 +1032,7 @@
     var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
     var directCandidates = [
       item.cancellationReason, item.cancellation_reason,
+      item.cancellationReasonArabic, item.cancellationReasonEnglish, item.cancellationNotes,
       item.cancelReason, item.cancel_reason,
       item.canceledReason, item.canceled_reason,
       item.cancelledReason, item.cancelled_reason,
@@ -1539,10 +1615,20 @@
       originalStatusAr: sourceStatusAr,
       internalStatus: nextInternalStatus
     });
-    var incomingRejected = finalLifecycle === 'rejected';
-    var incomingCancelled = finalLifecycle === 'cancelled';
+    var resolvedIsSourceRejected = typeof apiItem.isSourceRejected === 'boolean'
+      ? apiItem.isSourceRejected
+      : (existing && typeof existing.isSourceRejected === 'boolean' ? existing.isSourceRejected : null);
+    var resolvedIsSourceCancelled = typeof apiItem.isSourceCancelled === 'boolean'
+      ? apiItem.isSourceCancelled
+      : (existing && typeof existing.isSourceCancelled === 'boolean' ? existing.isSourceCancelled : null);
+    var incomingRejected = (typeof resolvedIsSourceRejected === 'boolean')
+      ? resolvedIsSourceRejected
+      : (finalLifecycle === 'rejected');
+    var incomingCancelled = (typeof resolvedIsSourceCancelled === 'boolean')
+      ? resolvedIsSourceCancelled
+      : (finalLifecycle === 'cancelled');
 
-    var newCompanyRaw = apiItem.newCompanyName || apiItem.new_company_name || apiItem.transferCompanyName || apiItem.transfer_company_name || apiItem.alternativeCompanyName || apiItem.alternative_company_name || (apiItem.newCompany && (apiItem.newCompany.arName || apiItem.newCompany.enName || apiItem.newCompany.name)) || (apiItem.transferCompany && (apiItem.transferCompany.arName || apiItem.transferCompany.enName || apiItem.transferCompany.name));
+    var newCompanyRaw = apiItem.newCompanyName || apiItem.new_company_name || apiItem.targetCompanyName || apiItem.target_company_name || apiItem.transferCompanyName || apiItem.transfer_company_name || apiItem.alternativeCompanyName || apiItem.alternative_company_name || (apiItem.newCompany && (apiItem.newCompany.arName || apiItem.newCompany.enName || apiItem.newCompany.name)) || (apiItem.transferCompany && (apiItem.transferCompany.arName || apiItem.transferCompany.enName || apiItem.transferCompany.name));
     var resolvedNewCompanyName = incomingRejected
       ? (sanitizeReasonText(newCompanyRaw) || (existing && isSameBookingContext(apiItem, existing) ? sanitizeReasonText(existing.newCompanyName) : '') || '')
       : '';
@@ -1550,10 +1636,10 @@
       ? extractRejectionReason(apiItem, existing)
       : '';
     var resolvedCarStatusAtRequest = incomingRejected
-      ? (sanitizeReasonText(apiItem.carStatusAtRequest || apiItem.car_status_at_request) || (existing && isSameBookingContext(apiItem, existing) ? sanitizeReasonText(existing.carStatusAtRequest) : '') || '')
+      ? (sanitizeReasonText(apiItem.carStatusAtRequest || apiItem.car_status_at_request || apiItem.reservationStatusAtRequest) || (existing && isSameBookingContext(apiItem, existing) ? sanitizeReasonText(existing.carStatusAtRequest) : '') || '')
       : '';
-    var incomingRefundNum = apiItem.refundAmount !== undefined ? apiItem.refundAmount : (apiItem.refund_amount !== undefined ? apiItem.refund_amount : undefined);
-    var resolvedRefundAmount = incomingRejected
+    var incomingRefundNum = apiItem.refundAmount !== undefined ? apiItem.refundAmount : (apiItem.refund_amount !== undefined ? apiItem.refund_amount : (apiItem.clientRefundAmount !== undefined ? apiItem.clientRefundAmount : undefined));
+    var resolvedRefundAmount = (incomingRejected || incomingCancelled)
       ? ((incomingRefundNum !== undefined && incomingRefundNum !== null && incomingRefundNum !== '' && toNum(incomingRefundNum, 0) > 0)
         ? toNum(incomingRefundNum, 0)
         : ((existing && isSameBookingContext(apiItem, existing) && existing.refundAmount !== undefined && existing.refundAmount !== null && existing.refundAmount !== '')
@@ -1561,13 +1647,13 @@
           : toNum(incomingRefundNum, 0)))
       : 0;
     var resolvedRejectedById = incomingRejected
-      ? normalizeStr(apiItem.rejectedById || apiItem.rejected_by_id || apiItem.confirmedById || apiItem.confirmed_by_id || apiItem.actionById || apiItem.action_by_id || (existing && existing.rejectedById) || actorId)
+      ? normalizeStr(apiItem.rejectedById || apiItem.rejected_by_id || apiItem.confirmedById || apiItem.confirmed_by_id || apiItem.confirmedByUserId || apiItem.rejectedByUserId || apiItem.actionById || apiItem.action_by_id || (existing && existing.rejectedById) || actorId)
       : '';
     var resolvedRejectedByName = incomingRejected
-      ? normalizeStr(apiItem.rejectedByName || apiItem.rejected_by_name || apiItem.rejectedBy || apiItem.confirmedByName || apiItem.confirmed_by_name || apiItem.confirmedBy || apiItem.actionByName || apiItem.action_by_name || apiItem.actionBy || apiItem.adminName || (existing && existing.rejectedByName) || actorName)
+      ? normalizeStr(apiItem.rejectedByName || apiItem.rejected_by_name || apiItem.rejectedBy || apiItem.confirmedByName || apiItem.confirmed_by_name || apiItem.confirmedByUserName || apiItem.rejectedByUserName || apiItem.confirmedBy || apiItem.actionByName || apiItem.action_by_name || apiItem.actionBy || apiItem.adminName || (existing && existing.rejectedByName) || actorName)
       : '';
     var resolvedRejectedAt = incomingRejected
-      ? normalizeStr(apiItem.rejectedAt || apiItem.rejected_at || apiItem.actionAt || (existing && existing.rejectedAt) || now)
+      ? normalizeStr(apiItem.rejectedAt || apiItem.rejected_at || apiItem.confirmedAt || apiItem.actionAt || (existing && existing.rejectedAt) || now)
       : '';
 
     var resolvedCancellationReason = incomingCancelled
@@ -1583,19 +1669,21 @@
       ? normalizeStr(apiItem.cancelledAt || apiItem.cancelled_at || apiItem.canceledAt || apiItem.canceled_at || apiItem.actionAt || (existing && existing.cancelledAt) || now)
       : '';
 
-    var resolvedReferenceNumber = normalizeStr(
-      apiItem.referenceNumber ||
-      apiItem.reference_number ||
-      apiItem.refNumber ||
-      apiItem.ref_number ||
-      apiItem.sourceReference ||
-      apiItem.externalReference ||
-      apiItem.orderRef ||
-      apiItem.reference ||
-      (existing && existing.referenceNumber) ||
-      resApiId ||
-      ''
-    );
+    var resolvedReferenceNumber = (incomingRejected || incomingCancelled)
+      ? extractExplicitReferenceNumber(apiItem, existing, [resNumber, resApiId])
+      : normalizeStr(
+          apiItem.referenceNumber ||
+          apiItem.reference_number ||
+          apiItem.refNumber ||
+          apiItem.ref_number ||
+          apiItem.sourceReference ||
+          apiItem.externalReference ||
+          apiItem.orderRef ||
+          apiItem.reference ||
+          (existing && existing.referenceNumber) ||
+          resApiId ||
+          ''
+        );
 
     var rawPaidCandidate = apiItem.paidAmount !== undefined
       ? apiItem.paidAmount
@@ -1703,6 +1791,13 @@
       cancelledAt: resolvedCancelledAt,
       deliveryFailureReason: resolvedDeliveryFailureReason,
       driverNotes: resolvedDriverNotes,
+      isSourceCancelled: resolvedIsSourceCancelled,
+      isSourceRejected: resolvedIsSourceRejected,
+      rccStatus: normalizeStr(apiItem.rccStatus || (existing && existing.rccStatus) || ''),
+      rccReason: normalizeStr(apiItem.rccReason || (existing && existing.rccReason) || ''),
+      cancelledFromDecline: Boolean(apiItem.cancelledFromDecline !== undefined ? apiItem.cancelledFromDecline : (existing && existing.cancelledFromDecline)),
+      cancelledFromHold: Boolean(apiItem.cancelledFromHold !== undefined ? apiItem.cancelledFromHold : (existing && existing.cancelledFromHold)),
+      penaltyAmount: toNum(apiItem.penaltyAmount !== undefined ? apiItem.penaltyAmount : (existing && existing.penaltyAmount), 0),
       createdAt: existing ? existing.createdAt : now,
       updatedAt: now
     };
@@ -3138,9 +3233,8 @@
       var r = filteredRes[i];
       var st = r.internalStatus || 'تم الإنشاء';
       statusCounts[st] = (statusCounts[st] || 0) + 1;
-      var lcKind = classifyReservationLifecycle(r);
-      if (lcKind === 'cancelled') cancelledCount++;
-      else if (lcKind === 'rejected') rejectedCount++;
+      if (isCancelledStatus(r)) cancelledCount++;
+      if (isRejectedStatus(r)) rejectedCount++;
       var createdDate = normalizeStr(r.createdAt).substring(0, 10);
       var startDate = normalizeStr(r.startDate).substring(0, 10);
       if (createdDate === today || startDate === today) {
@@ -6191,6 +6285,11 @@
       if (matchesStatusList(resOrStatus, CANCELLED_STATUS_VALUES)) return 'cancelled';
       return 'active';
     }
+    if (typeof resOrStatus.isSourceRejected === 'boolean' || typeof resOrStatus.isSourceCancelled === 'boolean') {
+      if (resOrStatus.isSourceRejected === true && resOrStatus.isSourceCancelled !== true) return 'rejected';
+      if (resOrStatus.isSourceCancelled === true && resOrStatus.isSourceRejected !== true) return 'cancelled';
+      if (resOrStatus.isSourceRejected === false && resOrStatus.isSourceCancelled === false) return 'active';
+    }
     // Authoritative external status fields ALWAYS take precedence over stale internalStatus or timestamps
     var externalFields = [
       resOrStatus.originalStatusCode,
@@ -6209,6 +6308,9 @@
       sawExplicitExternal = true;
       if (matchesStatusList(fv, REJECTED_STATUS_VALUES)) return 'rejected';
       if (matchesStatusList(fv, CANCELLED_STATUS_VALUES)) return 'cancelled';
+    }
+    if (resOrStatus.isSourceRejected === true && resOrStatus.isSourceCancelled === true) {
+      return 'rejected';
     }
     // If an explicit external status was stated (e.g. confirmed / completed / started) and was NOT rejected/cancelled, treat as active
     if (sawExplicitExternal) {
@@ -6231,16 +6333,21 @@
   }
 
   function isRejectedStatus(resOrStatus) {
+    if (resOrStatus && typeof resOrStatus === 'object' && typeof resOrStatus.isSourceRejected === 'boolean') {
+      return resOrStatus.isSourceRejected;
+    }
     return classifyReservationLifecycle(resOrStatus) === 'rejected';
   }
 
   function isCancelledStatus(resOrStatus) {
+    if (resOrStatus && typeof resOrStatus === 'object' && typeof resOrStatus.isSourceCancelled === 'boolean') {
+      return resOrStatus.isSourceCancelled;
+    }
     return classifyReservationLifecycle(resOrStatus) === 'cancelled';
   }
 
   function isInactiveReservation(res) {
-    var lc = classifyReservationLifecycle(res);
-    return lc === 'rejected' || lc === 'cancelled';
+    return isRejectedStatus(res) || isCancelledStatus(res);
   }
 
   function getReservationLifecycleKind(res) {
@@ -9937,6 +10044,8 @@
     sanitizeReasonText: sanitizeReasonText,
     extractRejectionReason: extractRejectionReason,
     extractCancellationReason: extractCancellationReason,
-    extractReservationStatusCode: extractReservationStatusCode
+    extractReservationStatusCode: extractReservationStatusCode,
+    extractExplicitReferenceNumber: extractExplicitReferenceNumber,
+    isProtectedRejectedOrCancelledItem: isProtectedRejectedOrCancelledItem
   };
 }));

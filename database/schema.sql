@@ -114,6 +114,13 @@ CREATE TABLE IF NOT EXISTS reservations (
   paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
   delivery_failure_reason TEXT NOT NULL DEFAULT '',
   driver_notes TEXT NOT NULL DEFAULT '',
+  is_source_cancelled BOOLEAN DEFAULT NULL,
+  is_source_rejected BOOLEAN DEFAULT NULL,
+  rcc_status TEXT NOT NULL DEFAULT '',
+  rcc_reason TEXT NOT NULL DEFAULT '',
+  cancelled_from_decline BOOLEAN NOT NULL DEFAULT FALSE,
+  cancelled_from_hold BOOLEAN NOT NULL DEFAULT FALSE,
+  penalty_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -520,6 +527,13 @@ ALTER TABLE reservations ADD COLUMN IF NOT EXISTS reference_number TEXT NOT NULL
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS delivery_failure_reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS driver_notes TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS is_source_cancelled BOOLEAN DEFAULT NULL;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS is_source_rejected BOOLEAN DEFAULT NULL;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rcc_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rcc_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_from_decline BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_from_hold BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS penalty_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';
@@ -527,4 +541,5 @@ CREATE INDEX IF NOT EXISTS idx_reservations_new_company_name ON reservations (ne
 CREATE INDEX IF NOT EXISTS idx_reservations_rejected_at ON reservations (rejected_at DESC) WHERE rejected_at <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancelled_at DESC) WHERE cancelled_at <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_reference_number ON reservations (reference_number) WHERE reference_number <> '';
-
+CREATE INDEX IF NOT EXISTS idx_reservations_is_source_cancelled ON reservations (is_source_cancelled) WHERE is_source_cancelled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_reservations_is_source_rejected ON reservations (is_source_rejected) WHERE is_source_rejected = TRUE;

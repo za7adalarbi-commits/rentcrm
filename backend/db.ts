@@ -287,7 +287,16 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;`,
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS delivery_failure_reason TEXT NOT NULL DEFAULT '';`,
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS driver_notes TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS is_source_cancelled BOOLEAN DEFAULT NULL;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS is_source_rejected BOOLEAN DEFAULT NULL;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rcc_status TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rcc_reason TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_from_decline BOOLEAN NOT NULL DEFAULT FALSE;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_from_hold BOOLEAN NOT NULL DEFAULT FALSE;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS penalty_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_source_order ON reservations (source_order ASC NULLS LAST);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_is_source_cancelled ON reservations (is_source_cancelled) WHERE is_source_cancelled = TRUE;`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_is_source_rejected ON reservations (is_source_rejected) WHERE is_source_rejected = TRUE;`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_new_company_name ON reservations (new_company_name) WHERE new_company_name <> '';`,
@@ -456,12 +465,14 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
       `UPDATE reservations
        SET rejected_at = '', rejected_by_id = '', rejected_by_name = ''
        WHERE COALESCE(rejected_at, '') <> ''
+         AND COALESCE(is_source_rejected, FALSE) = FALSE
          AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_CANCELLED_SOURCE_CODES}`
     );
     await executor.query(
       `UPDATE reservations
        SET cancelled_at = '', cancelled_by_id = '', cancelled_by_name = ''
        WHERE COALESCE(cancelled_at, '') <> ''
+         AND COALESCE(is_source_cancelled, FALSE) = FALSE
          AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_REJECTED_SOURCE_CODES}`
     );
     await executor.query(
@@ -475,6 +486,8 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
              ELSE internal_status
            END
        WHERE LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_ACTIVE_SOURCE_CODES}
+         AND COALESCE(is_source_rejected, FALSE) = FALSE
+         AND COALESCE(is_source_cancelled, FALSE) = FALSE
          AND (
            COALESCE(cancelled_at, '') <> ''
            OR COALESCE(rejected_at, '') <> ''
@@ -499,6 +512,8 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
   try {
     const rowsRes = await executor.query<{
       id: string;
+      source_reservation_id: string;
+      reservation_number: string;
       customer_id_number: string;
       reference_number: string;
       paid_amount: string | number;
@@ -516,12 +531,15 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
       original_status_code: string;
       original_status_ar: string;
       internal_status: string;
+      is_source_rejected: boolean | null;
+      is_source_cancelled: boolean | null;
       raw_json: string;
     }>(
-      `SELECT id, customer_id_number, reference_number, paid_amount, delivery_failure_reason,
+      `SELECT id, source_reservation_id, reservation_number, customer_id_number, reference_number, paid_amount, delivery_failure_reason,
               driver_notes, new_company_name, rejection_reason, cancellation_reason,
               rejected_by_name, cancelled_by_name, rejected_at, cancelled_at,
-              payment_status, total_amount, original_status_code, original_status_ar, internal_status, raw_json
+              payment_status, total_amount, original_status_code, original_status_ar, internal_status,
+              is_source_rejected, is_source_cancelled, raw_json
        FROM reservations
        WHERE raw_json LIKE '{%'
          AND (
@@ -562,8 +580,19 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
         const extractedCid = cidInvalid && typeof crmCore.extractCustomerNationalId === 'function'
           ? String(crmCore.extractCustomerNationalId(parsed, null) || '')
           : '';
+        const lcKind = typeof crmCore.classifyReservationLifecycle === 'function'
+          ? crmCore.classifyReservationLifecycle({
+              originalStatusCode: r.original_status_code,
+              originalStatusAr: r.original_status_ar,
+              internalStatus: r.internal_status,
+              isSourceRejected: Boolean(r.is_source_rejected),
+              isSourceCancelled: Boolean(r.is_source_cancelled)
+            })
+          : 'active';
         const refCand = !String(r.reference_number || '').trim()
-          ? String(parsed.referenceNumber || parsed.reference_number || parsed.refNumber || parsed.ref_number || parsed.sourceReference || parsed.externalReference || parsed.orderRef || parsed.reference || '').trim()
+          ? (lcKind !== 'active' && typeof crmCore.extractExplicitReferenceNumber === 'function'
+              ? crmCore.extractExplicitReferenceNumber(parsed, null, [r.reservation_number, r.source_reservation_id])
+              : String(parsed.referenceNumber || parsed.reference_number || parsed.refNumber || parsed.ref_number || parsed.sourceReference || parsed.externalReference || parsed.orderRef || parsed.reference || '').trim())
           : '';
         const failCand = !String(r.delivery_failure_reason || '').trim()
           ? crmCore.sanitizeReasonText(parsed.deliveryFailureReason || parsed.delivery_failure_reason || parsed.failedDeliveryReason || parsed.failed_delivery_reason || parsed.deliverFailReason || parsed.failReason || '')
@@ -571,13 +600,6 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
         const notesCand = !String(r.driver_notes || '').trim()
           ? crmCore.sanitizeReasonText(parsed.driverNotes || parsed.driver_notes || parsed.driverNote || parsed.driver_note || parsed.deliveryNotes || parsed.delivery_notes || parsed.driverComment || '')
           : '';
-        const lcKind = typeof crmCore.classifyReservationLifecycle === 'function'
-          ? crmCore.classifyReservationLifecycle({
-              originalStatusCode: r.original_status_code,
-              originalStatusAr: r.original_status_ar,
-              internalStatus: r.internal_status
-            })
-          : 'active';
         const newCompCand = (lcKind === 'rejected' && !crmCore.sanitizeReasonText(r.new_company_name))
           ? crmCore.sanitizeReasonText(parsed.newCompanyName || parsed.new_company_name || parsed.transferCompanyName || parsed.alternativeCompanyName || '')
           : '';
@@ -651,6 +673,147 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
          WHERE t.id = v.id`,
         [ids, cids, refs, paidAmts, failReasons, dNotes, newComps, rejReasons, canReasons, rejByNames, canByNames, rejAts, canAts]
       );
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  // 4) Repair historical swapped / duplicated booking vs. reference numbers exclusively on Rejected & Cancelled rows
+  try {
+    const lifecycleRes = await executor.query<{
+      id: string;
+      source_reservation_id: string;
+      reservation_number: string;
+      reference_number: string;
+      original_status_code: string;
+      original_status_ar: string;
+      internal_status: string;
+      is_source_rejected: boolean | null;
+      is_source_cancelled: boolean | null;
+      raw_json: string;
+    }>(
+      `SELECT id, source_reservation_id, reservation_number, reference_number,
+              original_status_code, original_status_ar, internal_status,
+              is_source_rejected, is_source_cancelled, raw_json
+       FROM reservations`
+    );
+
+    const allRows = lifecycleRes?.rows || [];
+    const usedResNumbers = new Set<string>();
+    for (const row of allRows) {
+      const rn = String(row.reservation_number || '').trim();
+      if (rn) usedResNumbers.add(rn);
+    }
+
+    for (const r of allRows) {
+      const lcKind = typeof crmCore.classifyReservationLifecycle === 'function'
+        ? crmCore.classifyReservationLifecycle({
+            originalStatusCode: r.original_status_code,
+            originalStatusAr: r.original_status_ar,
+            internalStatus: r.internal_status,
+            isSourceRejected: Boolean(r.is_source_rejected),
+            isSourceCancelled: Boolean(r.is_source_cancelled)
+          })
+        : 'active';
+      const isProtected = Boolean(r.is_source_rejected) || Boolean(r.is_source_cancelled) || lcKind === 'rejected' || lcKind === 'cancelled';
+      if (!isProtected) continue;
+
+      const curResNum = String(r.reservation_number || '').trim();
+      const curRefNum = String(r.reference_number || '').trim();
+      let effSrcId = String(r.source_reservation_id || '').trim();
+      let targetResNum = curResNum;
+      let targetRefNum = curRefNum;
+
+      const rawStr = String(r.raw_json || '').trim();
+      if (rawStr.startsWith('{')) {
+        try {
+          const parsedRaw = JSON.parse(rawStr);
+          const probe = {
+            ...parsedRaw,
+            isSourceRejected: Boolean(r.is_source_rejected),
+            isSourceCancelled: Boolean(r.is_source_cancelled),
+            originalStatusCode: r.original_status_code || parsedRaw.originalStatusCode || parsedRaw.reservationStatus || parsedRaw.status,
+            originalStatusAr: r.original_status_ar || parsedRaw.originalStatusAr,
+            internalStatus: r.internal_status || parsedRaw.internalStatus
+          };
+          if (!effSrcId && typeof crmCore.extractSourceReservationId === 'function') {
+            effSrcId = String(crmCore.extractSourceReservationId(probe) || '').trim();
+          }
+          const extractedBooking = typeof crmCore.extractReservationNumber === 'function'
+            ? String(crmCore.extractReservationNumber(probe) || '').trim()
+            : '';
+          if (extractedBooking) {
+            targetResNum = extractedBooking;
+          } else if (effSrcId) {
+            targetResNum = effSrcId;
+          }
+          const refFromRaw = typeof crmCore.extractExplicitReferenceNumber === 'function'
+            ? String(crmCore.extractExplicitReferenceNumber(probe, { referenceNumber: curRefNum }, [targetResNum, effSrcId]) || '').trim()
+            : '';
+          if (refFromRaw) {
+            targetRefNum = refFromRaw;
+          } else if (
+            effSrcId &&
+            targetResNum === effSrcId &&
+            curResNum &&
+            curResNum !== effSrcId &&
+            (!curRefNum || curRefNum === effSrcId || curRefNum === curResNum)
+          ) {
+            // Historical swap where external reference was placed into reservation_number and source_reservation_id into reference_number
+            targetRefNum = curResNum;
+          } else if (curRefNum === targetResNum || (effSrcId && curRefNum === effSrcId)) {
+            targetRefNum = '';
+          }
+        } catch {
+          // Malformed raw_json: fall back to column-level repair below
+          if (effSrcId && curResNum && curRefNum && curResNum === curRefNum && curResNum !== effSrcId) {
+            targetResNum = effSrcId;
+            targetRefNum = curRefNum;
+          } else if (effSrcId && curRefNum === effSrcId && curResNum && curResNum !== effSrcId) {
+            targetResNum = effSrcId;
+            targetRefNum = curResNum;
+          } else if (curRefNum && (curRefNum === targetResNum || (effSrcId && curRefNum === effSrcId))) {
+            targetRefNum = '';
+          }
+        }
+      } else {
+        if (effSrcId && curResNum && curRefNum && curResNum === curRefNum && curResNum !== effSrcId) {
+          targetResNum = effSrcId;
+          targetRefNum = curRefNum;
+        } else if (effSrcId && curRefNum === effSrcId && curResNum && curResNum !== effSrcId) {
+          targetResNum = effSrcId;
+          targetRefNum = curResNum;
+        } else if (curRefNum && (curRefNum === targetResNum || (effSrcId && curRefNum === effSrcId))) {
+          targetRefNum = '';
+        }
+      }
+
+      if (targetRefNum && (targetRefNum === targetResNum || (effSrcId && targetRefNum === effSrcId))) {
+        targetRefNum = '';
+      }
+
+      let finalResNum = curResNum;
+      if (targetResNum && targetResNum !== curResNum && !usedResNumbers.has(targetResNum)) {
+        await executor.query(`UPDATE reservations SET reservation_number = $2 WHERE id = $1`, [r.id, targetResNum]);
+        const childTables = ['extensions', 'assignments', 'follow_ups', 'follow_up_history', 'problems', 'problem_updates'];
+        for (const tbl of childTables) {
+          const condCol = tbl === 'problem_updates' ? '' : 'reservation_id = $1 OR ';
+          await executor.query(
+            `UPDATE ${tbl} SET reservation_number = $2 WHERE ${condCol}reservation_number = $3`,
+            tbl === 'problem_updates' ? [targetResNum, curResNum] : [r.id, targetResNum, curResNum]
+          );
+        }
+        if (curResNum) usedResNumbers.delete(curResNum);
+        usedResNumbers.add(targetResNum);
+        finalResNum = targetResNum;
+      }
+
+      if (targetRefNum === finalResNum || (effSrcId && targetRefNum === effSrcId)) {
+        targetRefNum = '';
+      }
+      if (targetRefNum !== curRefNum) {
+        await executor.query(`UPDATE reservations SET reference_number = $2 WHERE id = $1`, [r.id, targetRefNum]);
+      }
     }
   } catch {
     // Non-fatal

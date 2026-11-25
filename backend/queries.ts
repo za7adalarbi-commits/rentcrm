@@ -108,20 +108,36 @@ const SQL_HAS_EXPLICIT_STATUS = `(
 )`;
 
 const SQL_REJECTED_CONDITION = `(
-  ${SQL_EXPLICIT_REJECTED} OR (
-    NOT ${SQL_HAS_EXPLICIT_STATUS} AND
-    COALESCE(r.rejected_at, '') <> '' AND
-    (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
-  )
+  CASE
+    WHEN r.is_source_rejected IS NOT NULL THEN r.is_source_rejected = TRUE
+    ELSE (
+      ${SQL_EXPLICIT_REJECTED} OR (
+        NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+        COALESCE(r.rejected_at, '') <> '' AND
+        (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+      )
+    )
+  END
 )`;
 
 const SQL_CANCELLED_CONDITION = `(
-  NOT ${SQL_REJECTED_CONDITION} AND (
-    ${SQL_EXPLICIT_CANCELLED} OR (
-      NOT ${SQL_HAS_EXPLICIT_STATUS} AND
-      COALESCE(r.cancelled_at, '') <> ''
+  CASE
+    WHEN r.is_source_cancelled IS NOT NULL THEN r.is_source_cancelled = TRUE
+    ELSE (
+      NOT (
+        ${SQL_EXPLICIT_REJECTED} OR (
+          NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+          COALESCE(r.rejected_at, '') <> '' AND
+          (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+        )
+      ) AND (
+        ${SQL_EXPLICIT_CANCELLED} OR (
+          NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+          COALESCE(r.cancelled_at, '') <> ''
+        )
+      )
     )
-  )
+  END
 )`;
 
 const SQL_ACTIVE_CONDITION = `(NOT ${SQL_REJECTED_CONDITION} AND NOT ${SQL_CANCELLED_CONDITION})`;
