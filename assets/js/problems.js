@@ -382,7 +382,7 @@
                 '<td>' + esc(p.createdByName) + '</td>' +
                 '<td>' + esc((p.assignedEmployeeNames || []).join('، ') || '-') + '</td>' +
                 '<td class="mono tabular-nums" dir="ltr" style="white-space:nowrap;">' + esc(fmtDateTime(p.updatedAt, ctx)) + '</td>' +
-                '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
+                '<td><div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">' +
                   '<button type="button" class="btn btn-sm btn-primary btn-manage-prb" data-id="' + esc(p.id) + '">متابعة / تحديث</button>' +
                   ((!closed && canCloseTicketBtn) ? '<button type="button" class="btn btn-sm btn-danger btn-close-prb" data-id="' + esc(p.id) + '">إغلاق المشكلة</button>' : '') +
                   (canCloseTicketBtn ? '<button type="button" class="btn btn-sm btn-danger btn-delete-prb" data-id="' + esc(p.id) + '" data-num="' + esc(p.problemNumber) + '" data-confirm="0" aria-label="' + (isEn ? ('Delete problem ' + esc(p.problemNumber)) : ('حذف المشكلة ' + esc(p.problemNumber))) + '">' + (isEn ? 'Delete' : 'حذف') + '</button>' : '') +

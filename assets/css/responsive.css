@@ -557,13 +557,21 @@
   }
 
   .res-view-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
-    flex-wrap: wrap;
+    gap: 6px;
   }
 
   .res-view-tab {
-    flex: 1 1 auto;
-    justify-content: center;
+    width: 100%;
+    min-width: 0;
+    min-height: 40px;
+    padding: 7px 10px;
+    font-size: 12px;
+    justify-content: space-between;
+    white-space: normal;
+    text-align: start;
   }
 
   .ext-compare-grid {
