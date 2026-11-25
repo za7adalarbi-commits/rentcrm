@@ -69,6 +69,8 @@ function getDashboard(session, params) {
   var filteredTotal = 0;
   var todayReservations = 0;
   var newReservations = 0;
+  var cancelledCount = 0;
+  var rejectedCount = 0;
 
   for (var i = 0; i < reservations.length; i++) {
     var res = reservations[i];
@@ -84,6 +86,9 @@ function getDashboard(session, params) {
     filteredTotal++;
     var st = res.internalStatus || 'تم الإنشاء';
     statusCounts[st] = (statusCounts[st] || 0) + 1;
+    var lcKind = typeof classifyReservationLifecycleGs_ === 'function' ? classifyReservationLifecycleGs_(res) : 'active';
+    if (lcKind === 'cancelled') cancelledCount++;
+    else if (lcKind === 'rejected') rejectedCount++;
     if (formatDateOnly(res.createdAt) === todayStr || formatDateOnly(res.startDate) === todayStr) {
       todayReservations++;
     }
@@ -157,7 +162,8 @@ function getDashboard(session, params) {
       delivered: statusCounts['تم التسليم'] || 0,
       received: statusCounts['تم الاستلام'] || 0,
       created: statusCounts['تم الإنشاء'] || 0,
-      cancelled: statusCounts['تم الإلغاء'] || 0,
+      cancelled: cancelledCount,
+      rejected: rejectedCount,
       extended: statusCounts['تم التمديد'] || 0,
       notBooked: statusCounts['لم يتم الحجز'] || 0,
       openProblems: openProblems,

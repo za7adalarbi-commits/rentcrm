@@ -230,7 +230,8 @@ test('UI overrides precedence, Developer protection, unified navigation removal 
   assert.ok(reservationsJs.includes("label: 'الرقم المرجعي'"));
   assert.ok(reservationsJs.includes("label: 'سبب فشل التوصيل'"));
   assert.ok(reservationsJs.includes("label: 'ملاحظات السائق'"));
-  assert.ok(reservationsJs.includes("var naText = isEn ? 'N/A' : 'غير متاح';"));
+  assert.ok(reservationsJs.includes('لم يُسجّل سبب في المصدر لهذا الحجز'));
+  assert.equal(reservationsJs.includes("var naText = isEn ? 'N/A' : 'غير متاح';"), false);
 
   const css = readRepoFile('assets/css/dashboard.css');
   for (const cls of [
@@ -505,5 +506,83 @@ test('National ID nested objects, junk placeholder filtering, sync actor fallbac
   assert.equal(mergedRejected.rejectedAt, '2026-11-24T11:30:00Z');
   assert.equal(core.classifyReservationLifecycle(mergedRejected), 'rejected');
 });
+
+test('Reason extraction isolates per-booking reasons, strips placeholder strings, and never falls back to lastUpdateText in UI', () => {
+  // Placeholder values must never masquerade as reasons
+  assert.equal(core.sanitizeReasonText('غير متاح'), '');
+  assert.equal(core.sanitizeReasonText('N/A'), '');
+  assert.equal(core.sanitizeReasonText('-'), '');
+  assert.equal(core.sanitizeReasonText('لا يوجد'), '');
+  assert.equal(core.sanitizeReasonText('انتهاء صلاحية العرض'), 'انتهاء صلاحية العرض');
+
+  // Nested reason object & statusHistory extraction
+  const fromNestedRej = core.extractRejectionReason({
+    rejection: { reasonAr: 'رفض المزود لعدم توفر السيارة' }
+  });
+  assert.equal(fromNestedRej, 'رفض المزود لعدم توفر السيارة');
+
+  const fromHistoryCan = core.extractCancellationReason({
+    statusHistory: [
+      { status: 'confirmed', note: 'تم التأكيد' },
+      { status: 'cancelled_by_customer', note: 'طلب العميل الإلغاء قبل الموعد' }
+    ]
+  });
+  assert.equal(fromHistoryCan, 'طلب العميل الإلغاء قبل الموعد');
+
+  // Per-booking isolation in mergeSyncedReservation: booking B must never inherit booking A reason,
+  // and updating one booking without a reason preserves its own existing genuine reason unless booking changed
+  const mergedWithNewReason = core.mergeSyncedReservation(
+    {
+      id: 'RES_A',
+      reservationNumber: '101',
+      rejectionReason: 'غير متاح',
+      internalStatus: 'مرفوض'
+    },
+    {
+      id: '101',
+      reservationNumber: '101',
+      status: 'rejected_by_provider',
+      cancelReason: 'عدم توفر الفئة بالفرع'
+    },
+    [],
+    { id: 'SYNC', name: 'Sync' }
+  );
+  assert.equal(mergedWithNewReason.rejectionReason, 'عدم توفر الفئة بالفرع');
+  assert.equal(core.classifyReservationLifecycle(mergedWithNewReason), 'rejected');
+
+  // Authoritative external active status overrides stale internal_status / stale cancelledAt
+  const reconciledActive = core.mergeSyncedReservation(
+    {
+      id: 'RES_RECON_1',
+      reservationNumber: '202',
+      internalStatus: 'تم الإلغاء',
+      originalStatusCode: 'cancelled',
+      cancelledAt: '2026-11-20T10:00:00Z'
+    },
+    {
+      id: '202',
+      reservationNumber: '202',
+      status: 'confirmed'
+    },
+    [],
+    { id: 'SYNC', name: 'Sync' }
+  );
+  assert.equal(core.classifyReservationLifecycle(reconciledActive), 'active');
+  assert.equal(reconciledActive.internalStatus, 'مؤكد');
+  assert.equal(reconciledActive.cancelledAt, '');
+
+  // UI files must never show blanket 'غير متاح' for missing reasons or reuse lastUpdateText as a reason
+  const reservationsJs = readRepoFile('assets/js/reservations.js');
+  const inactiveJs = readRepoFile('assets/js/inactive.js');
+  assert.equal(reservationsJs.includes("var naText = isEn ? 'N/A' : 'غير متاح';"), false);
+  assert.equal(reservationsJs.includes("|| 'غير متاح'"), false);
+  assert.ok(reservationsJs.includes('لم يُسجّل سبب في المصدر لهذا الحجز'));
+  assert.equal(inactiveJs.includes('r.rejectionReason || r.lastUpdateText'), false);
+  assert.equal(inactiveJs.includes('b.rejectionReason || b.lastUpdateText'), false);
+  assert.equal(inactiveJs.includes('r.cancellationReason || r.lastUpdateText'), false);
+  assert.equal(inactiveJs.includes('b.cancellationReason || b.lastUpdateText'), false);
+  assert.ok(inactiveJs.includes('لم يُسجّل سبب في المصدر لهذا الحجز'));
+});
+
 
 

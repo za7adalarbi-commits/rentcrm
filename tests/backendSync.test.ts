@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
-import { hashPassword, hashToken, normalizeLoginUsername, verifySharedSecret } from '../backend/auth';
+import { crmCore, hashPassword, hashToken, normalizeLoginUsername, verifySharedSecret } from '../backend/auth';
 import { maskDatabaseUrl, persistCoreFilesOnDisk } from '../backend/coreBinding';
-import type { DbClient, DbExecutor, QueryResult } from '../backend/db';
+import { runLifecycleAndNationalIdMaintenance, type DbClient, type DbExecutor, type QueryResult } from '../backend/db';
 import { FIXED_SERVER_CONFIG } from '../backend/fixedConfig';
 import { dispatchCrmRequest } from '../backend/router';
 import {
@@ -48,13 +48,41 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     error_logs: []
   };
 
+  function mockRowLifecycle(r: any): 'active' | 'rejected' | 'cancelled' {
+    return crmCore.classifyReservationLifecycle({
+      originalStatusCode: r.original_status_code,
+      originalStatusAr: r.original_status_ar,
+      internalStatus: r.internal_status,
+      rejectedAt: r.rejected_at,
+      cancelledAt: r.cancelled_at
+    });
+  }
+
   function filterMockReservations(sql: string, params: any[], paramLimit?: number): any[] {
     let list = state.reservations.slice();
     const limit = typeof paramLimit === 'number' ? paramLimit : params.length;
-    const afterFrom = sql.split(/\bFROM\s+reservations(?:\s+r)?\b/i)[1] || sql;
+    const fromParts = sql.split(/\bFROM\s+reservations(?:\s+r)?\b/i);
+    const afterFrom = fromParts.length > 1 ? fromParts.slice(1).join(' ') : sql;
     const whereSegment = (afterFrom.split(/\bWHERE\b/i)[1] || '').split(/\b(?:ORDER BY|GROUP BY|LIMIT)\b/i)[0] || '';
     const refMatches = Array.from(whereSegment.matchAll(/\$(\d+)/g));
     const idxSet = new Set(refMatches.map((m) => Number(m[1]) - 1).filter((idx) => idx >= 0 && idx < limit));
+
+    const hasRejCond = whereSegment.includes("'rejected_by_provider'");
+    const hasCanCond = whereSegment.includes("'cancelled_by_provider'");
+    if (hasRejCond && !hasCanCond) {
+      list = list.filter((r) => mockRowLifecycle(r) === 'rejected');
+    } else if (hasRejCond && hasCanCond) {
+      if (whereSegment.includes('AND NOT (')) {
+        list = list.filter((r) => mockRowLifecycle(r) === 'active');
+      } else if (/OR\s*\(\s*NOT\s*\(/i.test(whereSegment)) {
+        list = list.filter((r) => {
+          const lc = mockRowLifecycle(r);
+          return lc === 'rejected' || lc === 'cancelled';
+        });
+      } else {
+        list = list.filter((r) => mockRowLifecycle(r) === 'cancelled');
+      }
+    }
 
     if (whereSegment.includes('assigned_employee_ids @>') && idxSet.size > 0) {
       for (const idx of idxSet) {
@@ -784,6 +812,28 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
       return { rows: [], rowCount: 1 };
     }
 
+    if (sql.startsWith('SELECT COUNT(*)::text AS total_cnt')) {
+      const list = filterMockReservations(sql, params);
+      let activeCnt = 0;
+      let cancelledCnt = 0;
+      let rejectedCnt = 0;
+      for (const r of list) {
+        const lc = mockRowLifecycle(r);
+        if (lc === 'rejected') rejectedCnt++;
+        else if (lc === 'cancelled') cancelledCnt++;
+        else activeCnt++;
+      }
+      return {
+        rows: [{
+          total_cnt: String(list.length),
+          active_cnt: String(activeCnt),
+          cancelled_cnt: String(cancelledCnt),
+          rejected_cnt: String(rejectedCnt)
+        }] as any[],
+        rowCount: 1
+      };
+    }
+
     if (sql.startsWith('SELECT COUNT(*)::text AS cnt FROM reservations')) {
       const list = filterMockReservations(sql, params);
       return { rows: [{ cnt: String(list.length) }] as any[], rowCount: 1 };
@@ -850,11 +900,20 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     if (sql.startsWith('SELECT COUNT(*)::int AS total_cnt')) {
       const todayStr = String(params[params.length - 1] || '');
       const list = filterMockReservations(sql, params, params.length - 1);
-      const todayCnt = list.filter((r) => {
+      let todayCnt = 0;
+      let cancelledCnt = 0;
+      let rejectedCnt = 0;
+      for (const r of list) {
         const createdDay = r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at || '').slice(0, 10);
-        return r.start_date === todayStr || createdDay === todayStr;
-      }).length;
-      return { rows: [{ total_cnt: list.length, today_cnt: todayCnt }] as any[], rowCount: 1 };
+        if (r.start_date === todayStr || createdDay === todayStr) todayCnt++;
+        const lc = mockRowLifecycle(r);
+        if (lc === 'rejected') rejectedCnt++;
+        else if (lc === 'cancelled') cancelledCnt++;
+      }
+      return {
+        rows: [{ total_cnt: list.length, today_cnt: todayCnt, cancelled_cnt: cancelledCnt, rejected_cnt: rejectedCnt }] as any[],
+        rowCount: 1
+      };
     }
 
     if (sql.startsWith("SELECT COALESCE(NULLIF(internal_status, ''), 'تم الإنشاء') AS internal_status")) {
@@ -3828,6 +3887,202 @@ test('Booking order matches Rental Gate source sequence across pull, pagination,
   const loadedSnap = await winCtx.RGIdbCache.loadNamespaceSnapshot('test_ns');
   assert.deepEqual(Array.from(loadedSnap.reservations, (x: any) => x.reservationNumber), expectedSequence);
 });
+
+test('Pagination never skips page=1 when 0-based API returns current_page=1, syncs exact 40 cancelled & 58 rejected, and reconciles stale internal_status', async () => {
+  const db = createInMemoryMockExecutor();
+  await dispatchCrmRequest(db, { action: 'ping' });
+  const loginRes = await dispatchCrmRequest(db, {
+    action: 'login',
+    payload: { username: 'Admin', password: process.env.RG_SEED_ADMIN_PASSWORD || 'Admin@123' }
+  });
+  assert.equal(loginRes.success, true);
+  const token = loginRes.data.token;
+
+  // Pre-seed 3 bookings that had stale 'تم الإلغاء' internal_status even though external status is 'confirmed'
+  // (simulating the exact +3 extra cancelled bug) + 1 'غير متاح' placeholder reason
+  const now = new Date();
+  for (let i = 1; i <= 3; i++) {
+    db.state.reservations.push({
+      id: `RES_STALE_${i}`,
+      source_reservation_id: `${90000 + i}`,
+      reservation_number: `STALE-${i}`,
+      customer_name: `عميل مسترجع ${i}`,
+      original_status_code: 'confirmed',
+      original_status_ar: 'تم التأكيد',
+      internal_status: 'تم الإلغاء',
+      cancelled_at: '2026-11-10T10:00:00Z',
+      cancellation_reason: 'غير متاح',
+      assigned_employee_ids: [],
+      assigned_employee_names: [],
+      start_date: '2026-11-20',
+      created_at: now,
+      updated_at: now,
+      status_history: []
+    });
+  }
+
+  // Build 120 bookings at source: 40 cancelled, 58 rejected (including rejected_by_provider & object status & nested reasons), 22 confirmed
+  // Across 5 pages (25 per page, 0-based ?page=0..4), while API returns misleading current_page: page + 1
+  const sourceRecords: any[] = [];
+  for (let i = 1; i <= 40; i++) {
+    sourceRecords.push({
+      id: 20000 + i,
+      reservationNumber: `CAN-${String(i).padStart(3, '0')}`,
+      clientName: `Cancelled Customer ${i}`,
+      status: i % 2 === 0 ? 'cancelled_by_customer' : 'cancelled_by_provider',
+      cancellationDetails: i <= 30 ? { reasonAr: `سبب إلغاء خاص بالحجز ${i}` } : undefined,
+      startDate: '2026-11-20T10:00:00',
+      total: 400 + i
+    });
+  }
+  for (let i = 1; i <= 58; i++) {
+    sourceRecords.push({
+      id: 30000 + i,
+      reservationNumber: `REJ-${String(i).padStart(3, '0')}`,
+      clientName: `Rejected Customer ${i}`,
+      reservationStatus: i % 3 === 0 ? { code: 'rejected_by_provider', ar: 'تم الرفض من المزود' } : 'rejected',
+      rejection: i <= 44 ? { reason: `سبب رفض خاص بالحجز ${i}` } : undefined,
+      rejectionReason: i > 44 ? 'غير متاح' : undefined,
+      startDate: '2026-11-20T10:00:00',
+      total: 500 + i
+    });
+  }
+  for (let i = 1; i <= 22; i++) {
+    sourceRecords.push({
+      id: 40000 + i,
+      reservationNumber: `ACT-${String(i).padStart(3, '0')}`,
+      clientName: `Active Customer ${i}`,
+      status: 'confirmed',
+      startDate: '2026-11-20T10:00:00',
+      total: 600 + i
+    });
+  }
+
+  const prevRgToken = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_test_token_40_58';
+  const fetchedFilterPages: number[] = [];
+
+  const mockFetch = (async (url: any) => {
+    const u = new URL(String(url));
+    if (u.pathname.includes('/reservations/filter')) {
+      const page = Number(u.searchParams.get('page') || '0');
+      fetchedFilterPages.push(page);
+      const pageSize = 25;
+      const items = sourceRecords.slice(page * pageSize, (page + 1) * pageSize);
+      const totalPages = Math.ceil(sourceRecords.length / pageSize);
+      const bodyObj = {
+        data: {
+          items,
+          current_page: page + 1, // Deliberately 1-based metadata on a 0-based ?page endpoint!
+          last_page: totalPages,
+          totalItems: sourceRecords.length
+        }
+      };
+      return { ok: true, status: 200, json: async () => bodyObj, text: async () => JSON.stringify(bodyObj) } as any;
+    }
+    const emptyObj = { data: { items: [], totalItems: 0, totalPages: 1 } };
+    return { ok: true, status: 200, json: async () => emptyObj, text: async () => JSON.stringify(emptyObj) } as any;
+  }) as any;
+
+  try {
+    const pullRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { maxPages: 10 },
+      mockFetch
+    );
+    // Page 1 MUST have been requested & not skipped!
+    assert.ok(fetchedFilterPages.includes(0));
+    assert.ok(fetchedFilterPages.includes(1), `Expected ?page=1 to be fetched, got: ${fetchedFilterPages.join(',')}`);
+    assert.equal(pullRes.fetchedCount, 120);
+
+    // Check getReservations lifecycleCounts & getDashboard KPI counts match exact 40 cancelled & 58 rejected
+    const listRes = await dispatchCrmRequest(db, {
+      action: 'getReservations',
+      token,
+      payload: { lifecycle: 'active', page: 1, pageSize: 25 }
+    });
+    assert.equal(listRes.success, true);
+    assert.equal(listRes.data.lifecycleCounts.cancelled, 40);
+    assert.equal(listRes.data.lifecycleCounts.rejected, 58);
+    assert.equal(listRes.data.lifecycleCounts.active, 25); // 22 active + 3 stale records whose external status was confirmed
+
+    const dashRes = await dispatchCrmRequest(db, {
+      action: 'getDashboard',
+      token,
+      payload: { forceRefresh: true }
+    });
+    assert.equal(dashRes.success, true);
+    assert.equal(dashRes.data.kpis.cancelled, 40);
+    assert.equal(dashRes.data.kpis.rejected, 58);
+
+    // Verify per-booking reason accuracy and placeholder scrubbing
+    const rej1 = db.state.reservations.find((r) => r.reservation_number === 'REJ-001');
+    const rej45 = db.state.reservations.find((r) => r.reservation_number === 'REJ-045');
+    const can1 = db.state.reservations.find((r) => r.reservation_number === 'CAN-001');
+    const can31 = db.state.reservations.find((r) => r.reservation_number === 'CAN-031');
+    assert.equal(rej1?.rejection_reason, 'سبب رفض خاص بالحجز 1');
+    assert.equal(rej45?.rejection_reason, ''); // 'غير متاح' placeholder scrubbed, not kept
+    assert.equal(can1?.cancellation_reason, 'سبب إلغاء خاص بالحجز 1');
+    assert.equal(can31?.cancellation_reason, '');
+  } finally {
+    if (prevRgToken === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRgToken;
+  }
+});
+
+test('Clamped 1-based pagination probes page=1 then advances to page=2 without stalling or skipping', async () => {
+  const db = createInMemoryMockExecutor();
+  const prevRgToken = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_test_token_clamped';
+  const requestedPages: number[] = [];
+
+  const p1Items = Array.from({ length: 10 }, (_, idx) => ({
+    id: 5000 + idx,
+    reservationNumber: `C1-${idx + 1}`,
+    clientName: `Customer ${idx + 1}`,
+    status: 'rejected',
+    rejectionReason: `Reason C1-${idx + 1}`,
+    startDate: '2026-11-20'
+  }));
+  const p2Items = Array.from({ length: 8 }, (_, idx) => ({
+    id: 5100 + idx,
+    reservationNumber: `C2-${idx + 1}`,
+    clientName: `Customer 2-${idx + 1}`,
+    status: 'rejected',
+    rejectionReason: `Reason C2-${idx + 1}`,
+    startDate: '2026-11-20'
+  }));
+
+  const mockFetch = (async (url: any) => {
+    const u = new URL(String(url));
+    if (u.pathname.includes('/reservations/filter')) {
+      const page = Number(u.searchParams.get('page') || '0');
+      requestedPages.push(page);
+      // Clamped 1-based behavior: page=0 and page=1 return page 1 items, page=2 returns page 2 items, page>=3 returns empty
+      const items = page <= 1 ? p1Items : (page === 2 ? p2Items : []);
+      const bodyObj = { data: { items, totalItems: 18, current_page: page <= 1 ? 1 : page, last_page: 2 } };
+      return { ok: true, status: 200, json: async () => bodyObj, text: async () => JSON.stringify(bodyObj) } as any;
+    }
+    const emptyObj = { data: { items: [], totalItems: 0 } };
+    return { ok: true, status: 200, json: async () => emptyObj, text: async () => JSON.stringify(emptyObj) } as any;
+  }) as any;
+
+  try {
+    const pullRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { maxPages: 6 },
+      mockFetch
+    );
+    assert.equal(pullRes.fetchedCount, 18);
+    assert.deepEqual(requestedPages.slice(0, 3), [0, 1, 2]);
+  } finally {
+    if (prevRgToken === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRgToken;
+  }
+});
+
 
 
 

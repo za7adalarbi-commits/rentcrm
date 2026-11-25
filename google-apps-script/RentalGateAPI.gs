@@ -199,7 +199,10 @@ function rowPageDedupKey_(row, kind) {
   if (kind === 'ext') {
     return normalizeStr(row.extendId || row.extensionNumber || row.extension_number || row.id || row.code);
   }
-  return extractReservationNumber_(row) || extractSourceReservationId_(row);
+  var resNum = extractReservationNumber_(row).replace(/^#+/, '').trim();
+  var srcId = extractSourceReservationId_(row);
+  if (resNum && srcId && resNum !== srcId) return resNum + '::' + srcId;
+  return resNum || srcId;
 }
 
 function appendUniquePageRows_(targetArr, seenMap, rows, kind) {
@@ -233,11 +236,21 @@ function fetchAllRentalGatePages(url, token) {
     return { items: allItems, pagesFetched: pagesFetched };
   }
 
-  var oneBasedOffset = (firstInfo.currentPageNum === 1) ? 1 : 0;
+  // Probe page=1 explicitly before inferring 1-based clamping so 0-based APIs with current_page=1 never skip page=1
+  var probeBody = callRentalGateEndpoint(url, token, 1, pageSize);
+  pagesFetched++;
+  var probeInfo = extractPagePayload_(probeBody, 1, pageSize);
+  var probeAdded = appendUniquePageRows_(allItems, seenMap, probeInfo.rows, 'res');
+  var oneBasedClamped = (probeInfo.rows.length > 0 && probeAdded === 0) ? 1 : 0;
+  var probeHasMore = probeInfo.totalElements > 0 && allItems.length < probeInfo.totalElements && probeInfo.rows.length > 0;
+  if ((probeInfo.isLast && !probeHasMore && !oneBasedClamped) || probeInfo.rows.length === 0) {
+    return { items: allItems, pagesFetched: pagesFetched };
+  }
 
-  if (firstInfo.hasTotalPages && firstInfo.totalPages > 1) {
-    var startIdx = 1 + oneBasedOffset;
-    var lastPageIdx = Math.min(firstInfo.totalPages - (oneBasedOffset ? 0 : 1), maxPages - 1);
+  var knownTotalPages = Math.max(firstInfo.hasTotalPages ? firstInfo.totalPages : 0, probeInfo.hasTotalPages ? probeInfo.totalPages : 0);
+  if (knownTotalPages > 1) {
+    var startIdx = 2;
+    var lastPageIdx = Math.min(knownTotalPages - (oneBasedClamped ? 0 : 1), maxPages - 1);
     var batchSize = 10;
     for (var startPage = startIdx; startPage <= lastPageIdx; startPage += batchSize) {
       var endPage = Math.min(startPage + batchSize - 1, lastPageIdx);
@@ -262,7 +275,7 @@ function fetchAllRentalGatePages(url, token) {
   }
 
   // Fallback when totalPages is omitted by upstream API: page until isLast / empty / duplicate page
-  for (var page = 1 + oneBasedOffset; page < maxPages; page++) {
+  for (var page = 2; page < maxPages; page++) {
     var pageBody = callRentalGateEndpoint(url, token, page, pageSize);
     pagesFetched++;
     var pageInfo = extractPagePayload_(pageBody, page, pageSize);
@@ -295,26 +308,54 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
   appendUniquePageRows_(resItems, resSeen, resInfo0.rows, 'res');
   var pagesFetched = 2;
 
-  var extOneBasedOffset = (extInfo0.currentPageNum === 1) ? 1 : 0;
-  var resOneBasedOffset = (resInfo0.currentPageNum === 1) ? 1 : 0;
-  var extHasMoreByTotal0 = extInfo0.totalElements > 0 && extItems.length < extInfo0.totalElements && extInfo0.rows.length > 0;
-  var resHasMoreByTotal0 = resInfo0.totalElements > 0 && resItems.length < resInfo0.totalElements && resInfo0.rows.length > 0;
+  // Probe page=1 for any non-finished endpoint before assuming 1-based clamping (never skip page=1)
+  var probeReqs = [];
+  var probeKinds = [];
+  if ((!extInfo0.isLast || extHasMoreByTotal0) && extInfo0.rows.length > 0) {
+    probeReqs.push(buildRentalGateRequest_(extUrl, token, 1, pageSize));
+    probeKinds.push('ext');
+  }
+  if ((!resInfo0.isLast || resHasMoreByTotal0) && resInfo0.rows.length > 0) {
+    probeReqs.push(buildRentalGateRequest_(resUrl, token, 1, pageSize));
+    probeKinds.push('res');
+  }
+
+  var extOneBasedOffset = 0;
+  var resOneBasedOffset = 0;
+  var extInfo1 = null;
+  var resInfo1 = null;
+  if (probeReqs.length > 0) {
+    var probeResponses = UrlFetchApp.fetchAll(probeReqs);
+    pagesFetched += probeResponses.length;
+    for (var pi = 0; pi < probeResponses.length; pi++) {
+      var pKind = probeKinds[pi];
+      var pInfo = extractPagePayload_(parseRentalGateResponse_(probeResponses[pi]), 1, pageSize);
+      var pAdded = appendUniquePageRows_(pKind === 'ext' ? extItems : resItems, pKind === 'ext' ? extSeen : resSeen, pInfo.rows, pKind);
+      if (pKind === 'ext') {
+        extInfo1 = pInfo;
+        if (pInfo.rows.length > 0 && pAdded === 0) extOneBasedOffset = 1;
+      } else {
+        resInfo1 = pInfo;
+        if (pInfo.rows.length > 0 && pAdded === 0) resOneBasedOffset = 1;
+      }
+    }
+  }
 
   var remainingReqs = [];
   var remainingMeta = [];
+  var extHasMore1 = extInfo1 && ((!extInfo1.isLast) || (extInfo1.totalElements > 0 && extItems.length < extInfo1.totalElements && extInfo1.rows.length > 0) || extOneBasedOffset === 1);
+  var resHasMore1 = resInfo1 && ((!resInfo1.isLast) || (resInfo1.totalElements > 0 && resItems.length < resInfo1.totalElements && resInfo1.rows.length > 0) || resOneBasedOffset === 1);
 
-  if ((!extInfo0.isLast || extHasMoreByTotal0) && extInfo0.rows.length > 0 && extInfo0.hasTotalPages && extInfo0.totalPages > 1) {
-    var extStart = 1 + extOneBasedOffset;
+  if (extHasMore1 && extInfo0.hasTotalPages && extInfo0.totalPages > 1) {
     var extLast = Math.min(extInfo0.totalPages - (extOneBasedOffset ? 0 : 1), maxPages - 1);
-    for (var ep = extStart; ep <= extLast; ep++) {
+    for (var ep = 2; ep <= extLast; ep++) {
       remainingReqs.push(buildRentalGateRequest_(extUrl, token, ep, pageSize));
       remainingMeta.push({ kind: 'ext', page: ep });
     }
   }
-  if ((!resInfo0.isLast || resHasMoreByTotal0) && resInfo0.rows.length > 0 && resInfo0.hasTotalPages && resInfo0.totalPages > 1) {
-    var resStart = 1 + resOneBasedOffset;
+  if (resHasMore1 && resInfo0.hasTotalPages && resInfo0.totalPages > 1) {
     var resLast = Math.min(resInfo0.totalPages - (resOneBasedOffset ? 0 : 1), maxPages - 1);
-    for (var rp = resStart; rp <= resLast; rp++) {
+    for (var rp = 2; rp <= resLast; rp++) {
       remainingReqs.push(buildRentalGateRequest_(resUrl, token, rp, pageSize));
       remainingMeta.push({ kind: 'res', page: rp });
     }
@@ -335,8 +376,8 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
   }
 
   // Fallback for endpoints that return hasMore / last:false / total without totalPages
-  if ((!resInfo0.isLast || resHasMoreByTotal0) && !resInfo0.hasTotalPages && resInfo0.rows.length > 0) {
-    for (var rPage = 1 + resOneBasedOffset; rPage < maxPages; rPage++) {
+  if (resHasMore1 && !resInfo0.hasTotalPages && resInfo1.rows.length > 0) {
+    for (var rPage = 2; rPage < maxPages; rPage++) {
       var rBody = callRentalGateEndpoint(resUrl, token, rPage, pageSize);
       pagesFetched++;
       var rInfo = extractPagePayload_(rBody, rPage, pageSize);
@@ -345,8 +386,8 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
       if ((rInfo.isLast && !rHasMore) || rInfo.rows.length === 0 || rAdded === 0) break;
     }
   }
-  if ((!extInfo0.isLast || extHasMoreByTotal0) && !extInfo0.hasTotalPages && extInfo0.rows.length > 0) {
-    for (var ePage = 1 + extOneBasedOffset; ePage < maxPages; ePage++) {
+  if (extHasMore1 && !extInfo0.hasTotalPages && extInfo1.rows.length > 0) {
+    for (var ePage = 2; ePage < maxPages; ePage++) {
       var eBody = callRentalGateEndpoint(extUrl, token, ePage, pageSize);
       pagesFetched++;
       var eInfo = extractPagePayload_(eBody, ePage, pageSize);
@@ -931,7 +972,7 @@ function runRentalGateSyncInternal(actor, options) {
           customerIdNumber: extractCustomerNationalIdGs_(item, existing),
           companyName: normalizeStr(item.companyArName || item.companyEnName || item.company_name || companyObj.name || ''),
           companyNumber: normalizeStr((existing && existing.companyNumber) || item.companyNumber || item.company_number || item.companyCode || item.companyId || ''),
-          newCompanyName: isRejSync ? normalizeStr(item.newCompanyName || item.new_company_name || (existing && existing.newCompanyName) || '') : '',
+          newCompanyName: isRejSync ? (sanitizeReasonTextGs_(item.newCompanyName || item.new_company_name || item.transferCompanyName || item.alternativeCompanyName) || (existing && sanitizeReasonTextGs_(existing.newCompanyName)) || '') : '',
           branchName: receiveBranchName,
           deliverBranchName: deliverBranchName,
           carName: normalizeStr(item.carNameAr || item.carNameEn || item.car_name || carObj.name || (carObj.brand ? (carObj.brand + ' ' + (carObj.model || '')) : '')),
@@ -971,13 +1012,13 @@ function runRentalGateSyncInternal(actor, options) {
           lastUpdatedByName: nextLastUpdatedByName,
           lastUpdatedAt: nextLastUpdatedAt,
           hasProblem: existing ? existing.hasProblem : 'false',
-          rejectionReason: isRejSync ? normalizeStr(item.rejectionReason || item.rejection_reason || item.rejectReason || item.reject_reason || item.reason || (existing && existing.rejectionReason) || '') : '',
-          carStatusAtRequest: isRejSync ? normalizeStr(item.carStatusAtRequest || item.car_status_at_request || (existing && existing.carStatusAtRequest) || '') : '',
+          rejectionReason: isRejSync ? extractRejectionReasonGs_(item, existing) : '',
+          carStatusAtRequest: isRejSync ? (sanitizeReasonTextGs_(item.carStatusAtRequest || item.car_status_at_request) || (existing && sanitizeReasonTextGs_(existing.carStatusAtRequest)) || '') : '',
           refundAmount: isRejSync ? ((existing && existing.refundAmount !== undefined && existing.refundAmount !== null && existing.refundAmount !== '') ? toNumber(existing.refundAmount, 0) : toNumber(item.refundAmount || item.refund_amount, 0)) : 0,
           rejectedById: isRejSync ? normalizeStr((existing && existing.rejectedById) || item.rejectedById || item.rejected_by_id || item.confirmedById || item.confirmed_by_id || item.actionById || actorId) : '',
           rejectedByName: isRejSync ? normalizeStr((existing && existing.rejectedByName) || item.rejectedByName || item.rejected_by_name || item.rejectedBy || item.confirmedByName || item.confirmed_by_name || item.confirmedBy || item.actionByName || item.adminName || actorName) : '',
           rejectedAt: isRejSync ? normalizeStr(item.rejectedAt || item.rejected_at || item.actionAt || (existing && existing.rejectedAt) || nowStr) : '',
-          cancellationReason: isCanSync ? normalizeStr(item.cancellationReason || item.cancellation_reason || item.cancelReason || item.cancel_reason || item.reason || (existing && existing.cancellationReason) || '') : '',
+          cancellationReason: isCanSync ? extractCancellationReasonGs_(item, existing) : '',
           cancelledById: isCanSync ? normalizeStr((existing && existing.cancelledById) || item.cancelledById || item.cancelled_by_id || item.canceled_by_id || item.actionById || actorId) : '',
           cancelledByName: isCanSync ? normalizeStr((existing && existing.cancelledByName) || item.cancelledByName || item.cancelled_by_name || item.canceledByName || item.canceled_by_name || item.cancelledBy || item.actionByName || actorName) : '',
           cancelledAt: isCanSync ? normalizeStr(item.cancelledAt || item.cancelled_at || item.canceledAt || item.canceled_at || item.actionAt || (existing && existing.cancelledAt) || nowStr) : '',
@@ -989,8 +1030,8 @@ function runRentalGateSyncInternal(actor, options) {
             var pst = normalizeStr(item.paymentStatus || item.paymentResult || (existing && existing.paymentStatus) || '').toLowerCase();
             return ['paid', 'wallet_paid', 'paid_by_wallet', 'paid_wallet', 'refunded', 'مدفوع', 'مدفوع عن طريق المحفظة', 'مسترد'].indexOf(pst) !== -1 ? totalAmount : 0;
           })(),
-          deliveryFailureReason: normalizeStr(item.deliveryFailureReason || item.delivery_failure_reason || item.failedDeliveryReason || item.failed_delivery_reason || item.deliverFailReason || item.failReason || (existing && existing.deliveryFailureReason) || ''),
-          driverNotes: normalizeStr(item.driverNotes || item.driver_notes || item.driverNote || item.driver_note || item.deliveryNotes || item.delivery_notes || item.driverComment || (existing && existing.driverNotes) || ''),
+          deliveryFailureReason: sanitizeReasonTextGs_(item.deliveryFailureReason || item.delivery_failure_reason || item.failedDeliveryReason || item.failed_delivery_reason || item.deliverFailReason || item.failReason) || (existing && sanitizeReasonTextGs_(existing.deliveryFailureReason)) || '',
+          driverNotes: sanitizeReasonTextGs_(item.driverNotes || item.driver_notes || item.driverNote || item.driver_note || item.deliveryNotes || item.delivery_notes || item.driverComment) || (existing && sanitizeReasonTextGs_(existing.driverNotes)) || '',
           pinnedNote: existing ? normalizeStr(existing.pinnedNote) : '',
           pinnedNoteById: existing ? normalizeStr(existing.pinnedNoteById) : '',
           pinnedNoteByName: existing ? normalizeStr(existing.pinnedNoteByName) : '',
@@ -999,7 +1040,7 @@ function runRentalGateSyncInternal(actor, options) {
           createdAt: existing ? existing.createdAt : nowStr,
           updatedAt: nowStr,
           statusHistory: JSON.stringify(nextStatusHistory),
-          rawJson: JSON.stringify(item).substring(0, 4000),
+          rawJson: JSON.stringify(item).substring(0, 16000),
           sourceOrder: (item.__sourceOrder && Number(item.__sourceOrder) > 0)
             ? Math.floor(Number(item.__sourceOrder))
             : ((existing && existing.sourceOrder && Number(existing.sourceOrder) > 0) ? Math.floor(Number(existing.sourceOrder)) : (i + 1))

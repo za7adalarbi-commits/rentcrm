@@ -99,8 +99,57 @@ var RG_STATUS_MAP = {
   finished_by_driver: 'تم التسليم من قبل السائق',
   cancelled: 'ملغي',
   canceled: 'ملغي',
+  cancelled_by_customer: 'ملغي',
+  canceled_by_customer: 'ملغي',
+  cancelled_by_client: 'ملغي',
+  canceled_by_client: 'ملغي',
+  cancelled_by_user: 'ملغي',
+  canceled_by_user: 'ملغي',
+  cancelled_by_admin: 'ملغي',
+  canceled_by_admin: 'ملغي',
+  cancelled_by_provider: 'ملغي',
+  canceled_by_provider: 'ملغي',
+  cancelled_by_company: 'ملغي',
+  canceled_by_company: 'ملغي',
+  customer_cancelled: 'ملغي',
+  customer_canceled: 'ملغي',
+  user_cancelled: 'ملغي',
+  user_canceled: 'ملغي',
+  client_cancelled: 'ملغي',
+  client_canceled: 'ملغي',
+  admin_cancelled: 'ملغي',
+  admin_canceled: 'ملغي',
+  provider_cancelled: 'ملغي',
+  provider_canceled: 'ملغي',
+  company_cancelled: 'ملغي',
+  company_canceled: 'ملغي',
+  system_cancelled: 'ملغي',
+  system_canceled: 'ملغي',
+  auto_cancelled: 'ملغي',
+  auto_canceled: 'ملغي',
   declined: 'مرفوض',
   rejected: 'مرفوض',
+  refused: 'مرفوض',
+  rejected_by_admin: 'مرفوض',
+  rejected_by_company: 'مرفوض',
+  rejected_by_provider: 'مرفوض',
+  rejected_by_customer: 'مرفوض',
+  rejected_by_client: 'مرفوض',
+  rejected_by_user: 'مرفوض',
+  provider_rejected: 'مرفوض',
+  admin_rejected: 'مرفوض',
+  company_rejected: 'مرفوض',
+  customer_rejected: 'مرفوض',
+  client_rejected: 'مرفوض',
+  user_rejected: 'مرفوض',
+  auto_rejected: 'مرفوض',
+  system_rejected: 'مرفوض',
+  declined_by_admin: 'مرفوض',
+  declined_by_company: 'مرفوض',
+  declined_by_provider: 'مرفوض',
+  refused_by_admin: 'مرفوض',
+  refused_by_company: 'مرفوض',
+  refused_by_provider: 'مرفوض',
   expired: 'منتهي',
   no_show: 'لم يحضر',
   draft: 'مسودة',
@@ -305,24 +354,171 @@ function extractReservationNumber_(apiItem) {
   );
 }
 
-function extractReservationStatusCode_(apiItem, preferOriginalCode) {
-  var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
-  var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
-  var raw = preferOriginalCode
-    ? (item.originalStatusCode || item.reservationStatus || item.status || item.status_code || item.bookingStatus || item.contractStatus || item.statusEn || nested.reservationStatus || nested.status)
-    : (item.reservationStatus || item.status || item.status_code || item.bookingStatus || item.contractStatus || item.statusEn || item.originalStatusCode || nested.reservationStatus || nested.status);
+function extractStatusTokenValueGs_(raw) {
+  if (raw === null || raw === undefined) return '';
+  if (typeof raw === 'object') {
+    raw = raw.code || raw.statusCode || raw.status_code || raw.reservationStatus ||
+      raw.value || raw.key || raw.slug || raw.name || raw.en || raw.status || raw.label || raw.ar || '';
+  }
   return normalizeStr(raw).toLowerCase().replace(/[\s-]+/g, '_');
 }
 
+function extractReservationStatusCode_(apiItem, preferOriginalCode) {
+  var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+  var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+  var candidates = preferOriginalCode
+    ? [
+        item.originalStatusCode, item.reservationStatus, item.status, item.status_code,
+        item.bookingStatus, item.booking_status, item.contractStatus, item.contract_status,
+        item.statusEn, item.status_en, nested.reservationStatus, nested.status, nested.status_code
+      ]
+    : [
+        item.reservationStatus, item.status, item.status_code, item.bookingStatus, item.booking_status,
+        item.contractStatus, item.contract_status, item.statusEn, item.status_en, item.originalStatusCode,
+        nested.reservationStatus, nested.status, nested.status_code
+      ];
+  for (var i = 0; i < candidates.length; i++) {
+    var tok = extractStatusTokenValueGs_(candidates[i]);
+    if (tok) return tok;
+  }
+  return '';
+}
+
+function sanitizeReasonTextGs_(raw) {
+  if (raw === null || raw === undefined) return '';
+  if (Array.isArray(raw)) {
+    for (var i = 0; i < raw.length; i++) {
+      var fromArr = sanitizeReasonTextGs_(raw[i]);
+      if (fromArr) return fromArr;
+    }
+    return '';
+  }
+  if (typeof raw === 'object') {
+    var objFields = [
+      raw.reasonAr, raw.reason_ar, raw.reasonEn, raw.reason_en,
+      raw.rejectionReason, raw.rejection_reason, raw.cancellationReason, raw.cancellation_reason,
+      raw.reason, raw.text, raw.message, raw.description, raw.desc,
+      raw.note, raw.notes, raw.comment, raw.ar, raw.en, raw.label, raw.title, raw.name, raw.value
+    ];
+    for (var j = 0; j < objFields.length; j++) {
+      var fromObj = sanitizeReasonTextGs_(objFields[j]);
+      if (fromObj) return fromObj;
+    }
+    return '';
+  }
+  var s = normalizeStr(raw).replace(/\s+/g, ' ');
+  if (!s) return '';
+  var low = s.toLowerCase();
+  if (
+    s === '-' || s === '—' || s === '–' || /^[-–—]+$/.test(s) ||
+    low === 'n/a' || low === 'na' || low === 'null' || low === 'undefined' || low === 'none' ||
+    low === 'not available' || low === 'no reason' ||
+    s === 'غير متاح' || s === 'غير محدد' || s === 'لا يوجد' || s === 'لايوجد' ||
+    s === 'بدون سبب' || s === 'غير مسجل' || s === 'غير مذكور'
+  ) {
+    return '';
+  }
+  return s;
+}
+
+function extractRejectionReasonGs_(apiItem, existing) {
+  var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+  var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+  var direct = [
+    item.rejectionReason, item.rejection_reason, item.rejectReason, item.reject_reason,
+    item.refusalReason, item.refusal_reason, item.declineReason, item.decline_reason,
+    item.rejectionReasonAr, item.rejection_reason_ar, item.rejectionReasonEn, item.rejection_reason_en,
+    item.providerRejectionReason, item.companyRejectionReason, item.adminRejectionReason,
+    item.rejectionNote, item.rejection_note, item.rejectNote, item.reject_note,
+    item.rejectionComment, item.rejectComment,
+    nested.rejectionReason, nested.rejection_reason, nested.rejectReason
+  ];
+  for (var i = 0; i < direct.length; i++) {
+    var hit = sanitizeReasonTextGs_(direct[i]);
+    if (hit) return hit;
+  }
+  var containers = [
+    item.rejection, item.rejectionInfo, item.rejection_info, item.rejectionDetails, item.rejection_details,
+    item.rejectInfo, item.rejectDetails, item.refusal, item.decline,
+    item.statusDetails, item.statusInfo, item.lastAction, item.action, item.audit, nested.rejection
+  ];
+  for (var j = 0; j < containers.length; j++) {
+    var objHit = sanitizeReasonTextGs_(containers[j]);
+    if (objHit) return objHit;
+  }
+  var general = [
+    item.statusReason, item.status_reason, item.actionReason, item.action_reason,
+    item.reasonAr, item.reason_ar, item.reasonEn, item.reason_en, item.reason,
+    item.statusNote, item.status_note, item.adminNote, item.companyNote, item.providerNote,
+    item.comment, item.notes, item.note, nested.reason, nested.note
+  ];
+  for (var g = 0; g < general.length; g++) {
+    var genHit = sanitizeReasonTextGs_(general[g]);
+    if (genHit) return genHit;
+  }
+  var itemStatus = extractReservationStatusCode_(item, false);
+  if (classifyReservationLifecycleGs_({ originalStatusCode: itemStatus, originalStatusAr: item.originalStatusAr || item.statusAr }) === 'rejected') {
+    var sharedCancel = [
+      item.cancelReason, item.cancel_reason, item.cancellationReason, item.cancellation_reason,
+      nested.cancelReason, nested.cancel_reason, nested.cancellationReason, nested.cancellation_reason
+    ];
+    for (var sc = 0; sc < sharedCancel.length; sc++) {
+      var scHit = sanitizeReasonTextGs_(sharedCancel[sc]);
+      if (scHit) return scHit;
+    }
+  }
+  return (existing && sanitizeReasonTextGs_(existing.rejectionReason)) || '';
+}
+
+function extractCancellationReasonGs_(apiItem, existing) {
+  var item = (apiItem && typeof apiItem === 'object') ? apiItem : {};
+  var nested = (item.reservation && typeof item.reservation === 'object') ? item.reservation : {};
+  var direct = [
+    item.cancellationReason, item.cancellation_reason, item.cancelReason, item.cancel_reason,
+    item.canceledReason, item.canceled_reason, item.cancelledReason, item.cancelled_reason,
+    item.cancellationReasonAr, item.cancellation_reason_ar, item.cancellationReasonEn, item.cancellation_reason_en,
+    item.clientCancelReason, item.customerCancelReason, item.userCancelReason, item.adminCancelReason,
+    item.cancellationNote, item.cancellation_note, item.cancelNote, item.cancel_note,
+    item.cancellationComment, item.cancelComment,
+    nested.cancellationReason, nested.cancellation_reason, nested.cancelReason
+  ];
+  for (var i = 0; i < direct.length; i++) {
+    var hit = sanitizeReasonTextGs_(direct[i]);
+    if (hit) return hit;
+  }
+  var containers = [
+    item.cancellation, item.cancellationInfo, item.cancellation_info, item.cancellationDetails, item.cancellation_details,
+    item.cancelInfo, item.cancelDetails, item.statusDetails, item.statusInfo, item.lastAction, item.action, item.audit, nested.cancellation
+  ];
+  for (var j = 0; j < containers.length; j++) {
+    var objHit = sanitizeReasonTextGs_(containers[j]);
+    if (objHit) return objHit;
+  }
+  var general = [
+    item.statusReason, item.status_reason, item.actionReason, item.action_reason,
+    item.reasonAr, item.reason_ar, item.reasonEn, item.reason_en, item.reason,
+    item.statusNote, item.status_note, item.adminNote, item.clientNote, item.customerNote,
+    item.comment, item.notes, item.note, nested.reason, nested.note
+  ];
+  for (var g = 0; g < general.length; g++) {
+    var genHit = sanitizeReasonTextGs_(general[g]);
+    if (genHit) return genHit;
+  }
+  return (existing && sanitizeReasonTextGs_(existing.cancellationReason)) || '';
+}
+
 var RG_MANUAL_BLOCKED_STATUSES_ = [
-  'مرفوض', 'مرفوضة', 'تم الرفض', 'rejected', 'declined', 'refused',
-  'ملغي', 'ملغى', 'ملغاة', 'تم الإلغاء', 'تم الالغاء', 'cancelled', 'canceled'
+  'مرفوض', 'مرفوضة', 'تم الرفض', 'تم الرفض من الشركة', 'تم الرفض من المزود', 'مرفوض من الموقع', 'مرفوض من الشركة', 'مرفوض من المزود',
+  'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'rejected_by_provider', 'rejected_by_customer', 'rejected_by_client', 'rejected_by_user', 'provider_rejected', 'admin_rejected', 'company_rejected', 'auto_rejected', 'system_rejected',
+  'ملغي', 'ملغى', 'ملغاة', 'تم الإلغاء', 'تم الالغاء', 'ملغي من العميل', 'ملغي من الشركة', 'ملغي من الإدارة',
+  'cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'cancelled_by_client', 'canceled_by_client', 'cancelled_by_user', 'canceled_by_user', 'cancelled_by_admin', 'canceled_by_admin', 'cancelled_by_provider', 'canceled_by_provider', 'cancelled_by_company', 'canceled_by_company', 'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled', 'client_cancelled', 'client_canceled', 'admin_cancelled', 'admin_canceled', 'provider_cancelled', 'company_cancelled', 'system_cancelled', 'auto_cancelled'
 ];
 
 function isManualBlockedWorkflowStatusGs_(status) {
-  var clean = normalizeStr(status).toLowerCase();
+  var clean = normalizeStr(status).toLowerCase().replace(/[\s-]+/g, '_');
+  var cleanRaw = normalizeStr(status).toLowerCase();
   if (!clean) return false;
-  return RG_MANUAL_BLOCKED_STATUSES_.indexOf(clean) !== -1;
+  return RG_MANUAL_BLOCKED_STATUSES_.indexOf(clean) !== -1 || RG_MANUAL_BLOCKED_STATUSES_.indexOf(cleanRaw) !== -1;
 }
 
 var RG_WORKFLOW_STATUS_OPTIONS = (function () {
@@ -358,11 +554,13 @@ function isValidManualWorkflowStatus_(status) {
   return Boolean(clean && !isManualBlockedWorkflowStatusGs_(clean) && RG_MANUAL_WORKFLOW_STATUS_OPTIONS.indexOf(clean) !== -1);
 }
 
-var RG_NEVER_EXCLUDE_STATUSES_ = {
-  cancelled: true, canceled: true, declined: true, rejected: true, refused: true,
-  'ملغي': true, 'ملغى': true, 'ملغاة': true, 'تم الإلغاء': true, 'تم الالغاء': true,
-  'مرفوض': true, 'مرفوضة': true, 'تم الرفض': true
-};
+var RG_NEVER_EXCLUDE_STATUSES_ = (function () {
+  var map = {};
+  for (var i = 0; i < RG_MANUAL_BLOCKED_STATUSES_.length; i++) {
+    map[RG_MANUAL_BLOCKED_STATUSES_[i]] = true;
+  }
+  return map;
+}());
 
 function sanitizeExcludedStatusesListGs_(rawList) {
   var arr = Array.isArray(rawList) ? rawList : [];
@@ -370,27 +568,59 @@ function sanitizeExcludedStatusesListGs_(rawList) {
   var out = [];
   for (var i = 0; i < arr.length; i++) {
     var cleaned = normalizeStr(arr[i]).toLowerCase();
-    if (!cleaned || seen[cleaned] || RG_NEVER_EXCLUDE_STATUSES_[cleaned]) continue;
+    var normTok = cleaned.replace(/[\s-]+/g, '_');
+    if (!cleaned || seen[cleaned] || RG_NEVER_EXCLUDE_STATUSES_[cleaned] || RG_NEVER_EXCLUDE_STATUSES_[normTok]) continue;
     seen[cleaned] = true;
     out.push(cleaned);
   }
   return out;
 }
 
+var RG_REJECTED_SET_GS_ = {
+  rejected: true, declined: true, refused: true,
+  rejected_by_admin: true, rejected_by_company: true, rejected_by_provider: true,
+  rejected_by_customer: true, rejected_by_client: true, rejected_by_user: true,
+  provider_rejected: true, company_rejected: true, admin_rejected: true,
+  customer_rejected: true, client_rejected: true, user_rejected: true,
+  auto_rejected: true, system_rejected: true,
+  declined_by_admin: true, declined_by_company: true, declined_by_provider: true,
+  refused_by_admin: true, refused_by_company: true, refused_by_provider: true,
+  'مرفوض': true, 'مرفوضة': true, 'تم الرفض': true, 'تم الرفض من الشركة': true, 'تم الرفض من المزود': true,
+  'مرفوض من الموقع': true, 'مرفوض من الشركة': true, 'مرفوض من المزود': true, 'مرفوض من الإدارة': true, 'مرفوض من الادارة': true
+};
+
+var RG_CANCELLED_SET_GS_ = {
+  cancelled: true, canceled: true,
+  cancelled_by_customer: true, canceled_by_customer: true,
+  cancelled_by_client: true, canceled_by_client: true,
+  cancelled_by_user: true, canceled_by_user: true,
+  cancelled_by_admin: true, canceled_by_admin: true,
+  cancelled_by_provider: true, canceled_by_provider: true,
+  cancelled_by_company: true, canceled_by_company: true,
+  customer_cancelled: true, customer_canceled: true,
+  user_cancelled: true, user_canceled: true,
+  client_cancelled: true, client_canceled: true,
+  admin_cancelled: true, admin_canceled: true,
+  provider_cancelled: true, provider_canceled: true,
+  company_cancelled: true, company_canceled: true,
+  system_cancelled: true, system_canceled: true,
+  auto_cancelled: true, auto_canceled: true,
+  'ملغي': true, 'ملغى': true, 'ملغاة': true,
+  'تم الإلغاء': true, 'تم الالغاء': true,
+  'تم الإلغاء من العميل': true, 'تم الالغاء من العميل': true,
+  'ملغي من العميل': true, 'ملغى من العميل': true,
+  'ملغي من الشركة': true, 'ملغى من الشركة': true,
+  'ملغي من الإدارة': true, 'ملغي من الادارة': true
+};
+
 function classifyReservationLifecycleGs_(resOrStatus) {
   if (!resOrStatus) return 'active';
   function classifyToken(raw) {
-    var s = normalizeStr(raw).toLowerCase();
-    if (!s) return '';
-    if (s === 'rejected' || s === 'declined' || s === 'refused' ||
-        s === 'مرفوض' || s === 'مرفوضة' || s === 'تم الرفض') {
-      return 'rejected';
-    }
-    if (s === 'cancelled' || s === 'canceled' ||
-        s === 'ملغي' || s === 'ملغى' || s === 'ملغاة' ||
-        s === 'تم الإلغاء' || s === 'تم الالغاء') {
-      return 'cancelled';
-    }
+    var s = typeof raw === 'object' ? extractStatusTokenValueGs_(raw) : normalizeStr(raw).toLowerCase();
+    if (!s || s === 'غير محدد') return '';
+    var u = s.replace(/[\s-]+/g, '_');
+    if (RG_REJECTED_SET_GS_[s] || RG_REJECTED_SET_GS_[u]) return 'rejected';
+    if (RG_CANCELLED_SET_GS_[s] || RG_CANCELLED_SET_GS_[u]) return 'cancelled';
     return 'explicit_active';
   }
   if (typeof resOrStatus === 'string') {
@@ -411,9 +641,10 @@ function classifyReservationLifecycleGs_(resOrStatus) {
     if (cls === 'rejected' || cls === 'cancelled') return cls;
     if (cls === 'explicit_active') sawExtActive = true;
   }
+  if (sawExtActive) return 'active';
   var intCls = classifyToken(resOrStatus.internalStatus);
   if (intCls === 'rejected' || intCls === 'cancelled') return intCls;
-  if (sawExtActive || intCls === 'explicit_active') return 'active';
+  if (intCls === 'explicit_active') return 'active';
   if (normalizeStr(resOrStatus.rejectedAt)) return 'rejected';
   if (normalizeStr(resOrStatus.cancelledAt)) return 'cancelled';
   return 'active';
@@ -509,7 +740,9 @@ function shouldAutoReconcileSyncedStatus_(existing, sourceStatusAr) {
     originalStatusAr: nextSrc
   });
   var existingLifecycle = classifyReservationLifecycleGs_(existing);
+  var prevInternalLifecycle = classifyReservationLifecycleGs_(prevInternal);
   if (incomingLifecycle !== existingLifecycle) return true;
+  if (prevInternalLifecycle !== incomingLifecycle && incomingLifecycle === 'active') return true;
 
   var history = normalizeStatusHistory_(existing.statusHistory);
   for (var i = 0; i < history.length; i++) {

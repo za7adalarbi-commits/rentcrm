@@ -117,18 +117,42 @@ export function mapReservationRowToClient(row: any, includeRaw = false): Record<
     lastUpdatedByName: str(row.last_updated_by_name ?? row.lastUpdatedByName),
     lastUpdatedAt: str(row.last_updated_at ?? row.lastUpdatedAt),
     hasProblem: boolVal(row.has_problem ?? row.hasProblem),
-    rejectionReason: str(row.rejection_reason ?? row.rejectionReason),
-    carStatusAtRequest: str(row.car_status_at_request ?? row.carStatusAtRequest),
+    rejectionReason: (() => {
+      const clean = crmCore.sanitizeReasonText(row.rejection_reason ?? row.rejectionReason);
+      if (clean) return clean;
+      const rawText = str(row.raw_json ?? row.rawJson);
+      if (rawText.startsWith('{')) {
+        try {
+          return crmCore.extractRejectionReason(JSON.parse(rawText), null);
+        } catch {
+          return '';
+        }
+      }
+      return '';
+    })(),
+    carStatusAtRequest: crmCore.sanitizeReasonText(row.car_status_at_request ?? row.carStatusAtRequest),
     refundAmount: num(row.refund_amount ?? row.refundAmount, 0),
     rejectedById: str(row.rejected_by_id ?? row.rejectedById),
     rejectedByName: str(row.rejected_by_name ?? row.rejectedByName),
     rejectedAt: str(row.rejected_at ?? row.rejectedAt),
-    cancellationReason: str(row.cancellation_reason ?? row.cancellationReason),
+    cancellationReason: (() => {
+      const clean = crmCore.sanitizeReasonText(row.cancellation_reason ?? row.cancellationReason);
+      if (clean) return clean;
+      const rawText = str(row.raw_json ?? row.rawJson);
+      if (rawText.startsWith('{')) {
+        try {
+          return crmCore.extractCancellationReason(JSON.parse(rawText), null);
+        } catch {
+          return '';
+        }
+      }
+      return '';
+    })(),
     cancelledById: str(row.cancelled_by_id ?? row.cancelledById),
     cancelledByName: str(row.cancelled_by_name ?? row.cancelledByName),
     cancelledAt: str(row.cancelled_at ?? row.cancelledAt),
-    deliveryFailureReason: str(row.delivery_failure_reason ?? row.deliveryFailureReason),
-    driverNotes: str(row.driver_notes ?? row.driverNotes),
+    deliveryFailureReason: crmCore.sanitizeReasonText(row.delivery_failure_reason ?? row.deliveryFailureReason),
+    driverNotes: crmCore.sanitizeReasonText(row.driver_notes ?? row.driverNotes),
     pinnedNote: str(row.pinned_note ?? row.pinnedNote),
     pinnedNoteById: str(row.pinned_note_by_id ?? row.pinnedNoteById),
     pinnedNoteByName: str(row.pinned_note_by_name ?? row.pinnedNoteByName),
@@ -470,8 +494,8 @@ function normalizeIncomingReservation(
     lastUpdatedByName: nextLastUpdatedByName,
     lastUpdatedAt: nextLastUpdatedAt,
     hasProblem: existingClient ? boolVal(existingClient.hasProblem) : boolVal(merged.hasProblem),
-    rejectionReason: isRejectedRes ? str(merged.rejectionReason || raw.rejectionReason || raw.rejection_reason || raw.rejectReason || raw.reject_reason || raw.reason || existingClient?.rejectionReason || '') : '',
-    carStatusAtRequest: isRejectedRes ? str(merged.carStatusAtRequest || raw.carStatusAtRequest || raw.car_status_at_request || existingClient?.carStatusAtRequest || '') : '',
+    rejectionReason: isRejectedRes ? (crmCore.sanitizeReasonText(merged.rejectionReason) || crmCore.extractRejectionReason(raw, existingClient)) : '',
+    carStatusAtRequest: isRejectedRes ? (crmCore.sanitizeReasonText(merged.carStatusAtRequest || raw.carStatusAtRequest || raw.car_status_at_request) || crmCore.sanitizeReasonText(existingClient?.carStatusAtRequest) || '') : '',
     refundAmount: isRejectedRes
       ? ((merged.refundAmount !== undefined && num(merged.refundAmount, 0) > 0)
         ? num(merged.refundAmount, 0)
@@ -484,17 +508,17 @@ function normalizeIncomingReservation(
     rejectedById: isRejectedRes ? str(existingClient?.rejectedById || merged.rejectedById || raw.rejectedById || raw.rejected_by_id || raw.confirmedById || raw.confirmed_by_id || raw.actionById || raw.action_by_id || actor.id) : '',
     rejectedByName: isRejectedRes ? str(existingClient?.rejectedByName || merged.rejectedByName || raw.rejectedByName || raw.rejected_by_name || raw.rejectedBy || raw.confirmedByName || raw.confirmed_by_name || raw.confirmedBy || raw.actionByName || raw.action_by_name || raw.actionBy || raw.adminName || actor.name) : '',
     rejectedAt: isRejectedRes ? str(merged.rejectedAt || raw.rejectedAt || raw.rejected_at || raw.actionAt || existingClient?.rejectedAt || nowIso) : '',
-    cancellationReason: isCancelledRes ? str(merged.cancellationReason || raw.cancellationReason || raw.cancellation_reason || raw.cancelReason || raw.cancel_reason || raw.reason || existingClient?.cancellationReason || '') : '',
+    cancellationReason: isCancelledRes ? (crmCore.sanitizeReasonText(merged.cancellationReason) || crmCore.extractCancellationReason(raw, existingClient)) : '',
     cancelledById: isCancelledRes ? str(existingClient?.cancelledById || merged.cancelledById || raw.cancelledById || raw.cancelled_by_id || raw.canceled_by_id || raw.actionById || raw.action_by_id || actor.id) : '',
     cancelledByName: isCancelledRes ? str(existingClient?.cancelledByName || merged.cancelledByName || raw.cancelledByName || raw.cancelled_by_name || raw.canceledByName || raw.canceled_by_name || raw.cancelledBy || raw.actionByName || raw.action_by_name || raw.actionBy || actor.name) : '',
     cancelledAt: isCancelledRes ? str(merged.cancelledAt || raw.cancelledAt || raw.cancelled_at || raw.canceledAt || raw.canceled_at || raw.actionAt || existingClient?.cancelledAt || nowIso) : '',
-    deliveryFailureReason: str(merged.deliveryFailureReason || raw.deliveryFailureReason || raw.delivery_failure_reason || raw.failedDeliveryReason || raw.failed_delivery_reason || raw.deliverFailReason || raw.failReason || existingClient?.deliveryFailureReason || ''),
-    driverNotes: str(merged.driverNotes || raw.driverNotes || raw.driver_notes || raw.driverNote || raw.driver_note || raw.deliveryNotes || raw.delivery_notes || raw.driverComment || existingClient?.driverNotes || ''),
+    deliveryFailureReason: crmCore.sanitizeReasonText(merged.deliveryFailureReason || raw.deliveryFailureReason || raw.delivery_failure_reason || raw.failedDeliveryReason || raw.failed_delivery_reason || raw.deliverFailReason || raw.failReason) || crmCore.sanitizeReasonText(existingClient?.deliveryFailureReason) || '',
+    driverNotes: crmCore.sanitizeReasonText(merged.driverNotes || raw.driverNotes || raw.driver_notes || raw.driverNote || raw.driver_note || raw.deliveryNotes || raw.delivery_notes || raw.driverComment) || crmCore.sanitizeReasonText(existingClient?.driverNotes) || '',
     createdAt: existingClient?.createdAt || str(merged.createdAt) || nowIso,
     updatedAt: nowIso,
     sourceOrder: resolvedSourceOrder,
     statusHistory: nextStatusHistory,
-    rawJson: str(merged.rawJson) || JSON.stringify(raw).slice(0, 8000)
+    rawJson: str(merged.rawJson) || JSON.stringify(raw).slice(0, 24000)
   };
 
   return { record, followUpHistoryEntry };
@@ -543,6 +567,10 @@ export async function ingestIncrementalSyncBatch(
       const lookupNums = Array.from(new Set([
         ...incomingRes.map((r) => str(crmCore.extractReservationNumber(r))),
         ...incomingRes.map((r) => normLookupKey(crmCore.extractReservationNumber(r))),
+        ...incomingRes.map((r) => {
+          const clean = normLookupKey(crmCore.extractReservationNumber(r));
+          return clean ? `#${clean}` : '';
+        }),
         ...incomingRes.map((r) => str(crmCore.extractSourceReservationId(r))),
         ...incomingExt.map((e) => str(e.reservationNumber || e.reservation_number || e.reservationId)),
         ...incomingExt.map((e) => str(e.sourceReservationId || e.reservationId))
@@ -1430,17 +1458,42 @@ const NEVER_EXCLUDE_LIFECYCLE_STATUSES = new Set([
   'canceled_by_user',
   'cancelled_by_admin',
   'canceled_by_admin',
+  'cancelled_by_provider',
+  'canceled_by_provider',
+  'cancelled_by_company',
+  'canceled_by_company',
   'admin_cancelled',
   'admin_canceled',
+  'provider_cancelled',
+  'provider_canceled',
+  'company_cancelled',
+  'company_canceled',
+  'system_cancelled',
+  'system_canceled',
+  'auto_cancelled',
+  'auto_canceled',
   'declined',
   'rejected',
   'rejected_by_admin',
   'rejected_by_company',
   'rejected_by_provider',
+  'rejected_by_customer',
+  'rejected_by_client',
+  'rejected_by_user',
   'provider_rejected',
   'company_rejected',
   'admin_rejected',
+  'customer_rejected',
+  'client_rejected',
+  'user_rejected',
   'auto_rejected',
+  'system_rejected',
+  'declined_by_admin',
+  'declined_by_company',
+  'declined_by_provider',
+  'refused_by_admin',
+  'refused_by_company',
+  'refused_by_provider',
   'refused',
   'ملغي',
   'ملغى',
@@ -1450,15 +1503,27 @@ const NEVER_EXCLUDE_LIFECYCLE_STATUSES = new Set([
   'ملغي من العميل',
   'ملغى من العميل',
   'ملغاة من العميل',
+  'ملغي من الشركة',
+  'ملغى من الشركة',
+  'ملغي من الادارة',
+  'ملغي من الإدارة',
+  'ملغي تلقائيا',
+  'ملغي تلقائياً',
   'الغاء العميل',
   'إلغاء العميل',
   'مرفوض',
   'مرفوضة',
   'تم الرفض',
+  'تم الرفض من الشركة',
+  'تم الرفض من المزود',
   'مرفوض من الموقع',
   'مرفوضة من الموقع',
   'مرفوض من الشركة',
-  'مرفوضة من الشركة'
+  'مرفوضة من الشركة',
+  'مرفوض من المزود',
+  'مرفوض من الإدارة',
+  'مرفوض تلقائيا',
+  'مرفوض تلقائياً'
 ]);
 
 export function sanitizeExcludedStatusesList(rawList: unknown): string[] {
@@ -1527,18 +1592,30 @@ export async function pullFromRentalGateDirect(
       }
     };
 
+    const extractUrlPageIndex = (urlStr: string, fallbackPage: number): number => {
+      try {
+        const u = new URL(urlStr, baseApi + '/');
+        const p = u.searchParams.get('page');
+        if (p !== null && p !== '' && !isNaN(Number(p))) return Number(p);
+      } catch {
+        // ignore URL parse error
+      }
+      return fallbackPage;
+    };
+
     const fetchPaged = async (endpoint: string, optional = false) => {
       const items: any[] = [];
       const seenKeys = new Set<string>();
       const visitedUrls = new Set<string>();
       let pages = 0;
-      let oneBasedOffset = 0;
       let explicitNextUrl = '';
+      let consecutiveZeroAdded = 0;
       for (let step = 0; step < maxPages; step++) {
-        const pageParam = step + oneBasedOffset;
-        const targetUrl = explicitNextUrl || `${baseApi}/${endpoint}?page=${pageParam}&size=${pageSize}`;
+        const targetUrl = explicitNextUrl || `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
         if (visitedUrls.has(targetUrl)) break;
         visitedUrls.add(targetUrl);
+        const pageParam = extractUrlPageIndex(targetUrl, step);
+        const usedExplicitNext = Boolean(explicitNextUrl);
         explicitNextUrl = '';
 
         const resp = await fetchFn(targetUrl, {
@@ -1563,19 +1640,12 @@ export async function pullFromRentalGateDirect(
         }
         pages++;
         const parsedPage = extractRentalGatePagePayload(json, pageParam, pageSize);
-        // Detect 1-based pagination APIs (e.g. ?page=0 returned current_page=1) so ?page=1 doesn't repeat page 1
-        if (step === 0 && parsedPage.currentPageNum === 1 && !parsedPage.isLast) {
-          oneBasedOffset = 1;
-        }
         let added = 0;
         for (const row of parsedPage.rows) {
-          const rowKey = str(
-            row?.extendId ||
-            row?.extensionNumber ||
-            row?.extension_number ||
-            crmCore.extractReservationNumber(row) ||
-            crmCore.extractSourceReservationId(row)
-          );
+          const extKey = str(row?.extendId || row?.extensionNumber || row?.extension_number);
+          const resNum = str(crmCore.extractReservationNumber(row)).replace(/^#+/, '').trim();
+          const srcId = str(crmCore.extractSourceReservationId(row));
+          const rowKey = extKey || (resNum && srcId && resNum !== srcId ? `${resNum}::${srcId}` : (resNum || srcId));
           if (rowKey) {
             if (seenKeys.has(rowKey)) continue;
             seenKeys.add(rowKey);
@@ -1583,13 +1653,23 @@ export async function pullFromRentalGateDirect(
           items.push(row);
           added++;
         }
-        const hasMoreByTotal = parsedPage.totalElements > 0 && items.length < parsedPage.totalElements && parsedPage.rows.length > 0;
-        if ((parsedPage.isLast && !hasMoreByTotal) || (parsedPage.rows.length > 0 && added === 0)) break;
+        if (parsedPage.rows.length > 0 && added === 0) {
+          consecutiveZeroAdded++;
+        } else {
+          consecutiveZeroAdded = 0;
+        }
         if (parsedPage.nextPageUrl) {
           const safeNext = resolveSafeNextUrl(parsedPage.nextPageUrl);
           if (safeNext && !visitedUrls.has(safeNext)) {
             explicitNextUrl = safeNext;
           }
+        }
+        const hasMoreByTotal = parsedPage.totalElements > 0 && items.length < parsedPage.totalElements && parsedPage.rows.length > 0;
+        // Never treat a clamped 1-based duplicate on step=1 (?page=1 duplicating ?page=0) as end-of-list when next pages remain
+        const isFirstProbeDuplicate = step === 1 && !usedExplicitNext && parsedPage.rows.length > 0 && added === 0;
+        const stopOnZeroAdded = parsedPage.rows.length > 0 && added === 0 && !isFirstProbeDuplicate && !explicitNextUrl && (!hasMoreByTotal || consecutiveZeroAdded >= 2);
+        if ((parsedPage.isLast && !hasMoreByTotal && !explicitNextUrl) || stopOnZeroAdded) {
+          break;
         }
       }
       return { items, pages };
@@ -1618,7 +1698,7 @@ export async function pullFromRentalGateDirect(
       __sourceOrder: idx + 1
     }));
     const existingCheckNums = dedupedAllRes
-      .filter((item: any) => excludedSet.has(str(item.reservationStatus || item.status || item.status_code).toLowerCase()))
+      .filter((item: any) => excludedSet.has(crmCore.extractReservationStatusCode(item, false)))
       .map((item: any) => str(crmCore.extractReservationNumber(item)))
       .filter(Boolean);
     let existingNumsSet = new Set<string>();
@@ -1630,7 +1710,7 @@ export async function pullFromRentalGateDirect(
       existingNumsSet = new Set((existRows.rows || []).map((r: any) => str(r.reservation_number)).filter(Boolean));
     }
     const afterExcludedRes = dedupedAllRes.filter((item: any) => {
-      const code = str(item.reservationStatus || item.status || item.status_code).toLowerCase();
+      const code = crmCore.extractReservationStatusCode(item, false);
       if (!excludedSet.has(code)) return true;
       const numKey = str(crmCore.extractReservationNumber(item));
       return existingNumsSet.has(numKey);

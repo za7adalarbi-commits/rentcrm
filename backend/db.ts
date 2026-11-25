@@ -401,11 +401,29 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
 
 const NEVER_EXCLUDED_LIFECYCLE = new Set([
   'cancelled', 'canceled', 'declined', 'rejected', 'refused',
-  'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'user_cancelled', 'admin_cancelled',
-  'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'auto_rejected',
-  'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل', 'تم الإلغاء', 'تم الالغاء', 'تم الالغاء من العميل', 'تم الإلغاء من العميل',
-  'مرفوض', 'مرفوضة', 'مرفوض من الموقع', 'تم الرفض', 'مرفوض من الشركة'
+  'cancelled_by_customer', 'canceled_by_customer', 'cancelled_by_client', 'canceled_by_client',
+  'cancelled_by_user', 'canceled_by_user', 'cancelled_by_admin', 'canceled_by_admin',
+  'cancelled_by_provider', 'canceled_by_provider', 'cancelled_by_company', 'canceled_by_company',
+  'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled',
+  'client_cancelled', 'client_canceled', 'admin_cancelled', 'admin_canceled',
+  'provider_cancelled', 'provider_canceled', 'company_cancelled', 'company_canceled',
+  'system_cancelled', 'system_canceled', 'auto_cancelled', 'auto_canceled',
+  'rejected_by_admin', 'rejected_by_company', 'rejected_by_provider',
+  'rejected_by_customer', 'rejected_by_client', 'rejected_by_user',
+  'provider_rejected', 'admin_rejected', 'company_rejected',
+  'customer_rejected', 'client_rejected', 'user_rejected',
+  'auto_rejected', 'system_rejected',
+  'declined_by_admin', 'declined_by_company', 'declined_by_provider',
+  'refused_by_admin', 'refused_by_company', 'refused_by_provider',
+  'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل', 'ملغى من العميل', 'ملغي من الشركة', 'ملغى من الشركة',
+  'ملغي من الادارة', 'ملغي من الإدارة', 'تم الإلغاء', 'تم الالغاء', 'تم الالغاء من العميل', 'تم الإلغاء من العميل',
+  'مرفوض', 'مرفوضة', 'مرفوض من الموقع', 'تم الرفض', 'تم الرفض من الشركة', 'تم الرفض من المزود',
+  'مرفوض من الشركة', 'مرفوض من المزود', 'مرفوض من الإدارة', 'مرفوض تلقائيا', 'مرفوض تلقائياً'
 ]);
+
+const EXPLICIT_ACTIVE_SOURCE_CODES = `('confirmed','completed','finished','closed','ended','active','started','in_progress','booked','reserved','delivered','picked_up','received','on_rent','rented','car_received','ongoing','returned','extended','automatically_extended','approved','accepted','admin_approved','paid','wallet_paid','paid_by_wallet','paid_wallet','hold','on_hold','onhold','pending','new','created')`;
+const EXPLICIT_CANCELLED_SOURCE_CODES = `('cancelled','canceled','cancelled_by_customer','canceled_by_customer','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','cancelled_by_provider','canceled_by_provider','cancelled_by_company','canceled_by_company','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','admin_cancelled','admin_canceled','provider_cancelled','provider_canceled','company_cancelled','company_canceled','system_cancelled','system_canceled','auto_cancelled','auto_canceled')`;
+const EXPLICIT_REJECTED_SOURCE_CODES = `('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','refused_by_admin','refused_by_company','refused_by_provider')`;
 
 export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor): Promise<void> {
   // 1) Remove rejected/cancelled statuses from settings.excluded_statuses if seeded earlier
@@ -432,25 +450,52 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
     // Non-fatal in mock/unit environments
   }
 
-  // 2) Clear stale cross-timestamps on reservations whose explicit original_status_code dictates another lifecycle
+  // 2) Clear stale cross-timestamps, repair stale internal_status when external original_status_code is active, and scrub stored placeholder reasons
   try {
     await executor.query(
       `UPDATE reservations
        SET rejected_at = '', rejected_by_id = '', rejected_by_name = ''
        WHERE COALESCE(rejected_at, '') <> ''
-         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'customer_cancelled', 'user_cancelled', 'admin_cancelled')`
+         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_CANCELLED_SOURCE_CODES}`
     );
     await executor.query(
       `UPDATE reservations
        SET cancelled_at = '', cancelled_by_id = '', cancelled_by_name = ''
        WHERE COALESCE(cancelled_at, '') <> ''
-         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ('rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'provider_rejected', 'admin_rejected', 'auto_rejected')`
+         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_REJECTED_SOURCE_CODES}`
+    );
+    await executor.query(
+      `UPDATE reservations
+       SET cancelled_at = '', cancelled_by_id = '', cancelled_by_name = '',
+           rejected_at = '', rejected_by_id = '', rejected_by_name = '',
+           internal_status = CASE
+             WHEN LOWER(TRIM(COALESCE(internal_status, ''))) IN ('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','مرفوض','مرفوضة','تم الرفض')
+               AND TRIM(COALESCE(original_status_ar, '')) NOT IN ('', 'غير محدد')
+             THEN original_status_ar
+             ELSE internal_status
+           END
+       WHERE LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_ACTIVE_SOURCE_CODES}
+         AND (
+           COALESCE(cancelled_at, '') <> ''
+           OR COALESCE(rejected_at, '') <> ''
+           OR LOWER(TRIM(COALESCE(internal_status, ''))) IN ('تم الإلغاء','تم الالغاء','ملغي','ملغى','ملغاة','مرفوض','مرفوضة','تم الرفض')
+         )`
+    );
+    await executor.query(
+      `UPDATE reservations
+       SET rejection_reason = ''
+       WHERE TRIM(COALESCE(rejection_reason, '')) IN ('-', '—', '–', '--', '---', 'N/A', 'n/a', 'NA', 'na', 'null', 'undefined', 'none', 'غير متاح', 'غير محدد', 'لا يوجد', 'لايوجد', 'بدون سبب', 'غير مسجل', 'غير مذكور')`
+    );
+    await executor.query(
+      `UPDATE reservations
+       SET cancellation_reason = ''
+       WHERE TRIM(COALESCE(cancellation_reason, '')) IN ('-', '—', '–', '--', '---', 'N/A', 'n/a', 'NA', 'na', 'null', 'undefined', 'none', 'غير متاح', 'غير محدد', 'لا يوجد', 'لايوجد', 'بدون سبب', 'غير مسجل', 'غير مذكور')`
     );
   } catch {
     // Non-fatal
   }
 
-  // 3) Backfill missing national ID & lifecycle detail fields safely from each reservation's own raw_json
+  // 3) Backfill missing national ID & lifecycle detail fields (including rejection/cancellation reasons) safely from each reservation's own raw_json
   try {
     const rowsRes = await executor.query<{
       id: string;
@@ -460,6 +505,12 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
       delivery_failure_reason: string;
       driver_notes: string;
       new_company_name: string;
+      rejection_reason: string;
+      cancellation_reason: string;
+      rejected_by_name: string;
+      cancelled_by_name: string;
+      rejected_at: string;
+      cancelled_at: string;
       payment_status: string;
       total_amount: string | number;
       original_status_code: string;
@@ -468,8 +519,9 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
       raw_json: string;
     }>(
       `SELECT id, customer_id_number, reference_number, paid_amount, delivery_failure_reason,
-              driver_notes, new_company_name, payment_status, total_amount,
-              original_status_code, original_status_ar, internal_status, raw_json
+              driver_notes, new_company_name, rejection_reason, cancellation_reason,
+              rejected_by_name, cancelled_by_name, rejected_at, cancelled_at,
+              payment_status, total_amount, original_status_code, original_status_ar, internal_status, raw_json
        FROM reservations
        WHERE raw_json LIKE '{%'
          AND (
@@ -479,6 +531,12 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
            OR COALESCE(delivery_failure_reason, '') = ''
            OR COALESCE(driver_notes, '') = ''
            OR COALESCE(new_company_name, '') = ''
+           OR COALESCE(rejection_reason, '') IN ('', '-', '—', 'غير متاح', 'غير محدد', 'لا يوجد', 'لايوجد', 'بدون سبب', 'غير مسجل', 'غير مذكور')
+           OR COALESCE(cancellation_reason, '') IN ('', '-', '—', 'غير متاح', 'غير محدد', 'لا يوجد', 'لايوجد', 'بدون سبب', 'غير مسجل', 'غير مذكور')
+           OR COALESCE(rejected_by_name, '') = ''
+           OR COALESCE(cancelled_by_name, '') = ''
+           OR COALESCE(rejected_at, '') = ''
+           OR COALESCE(cancelled_at, '') = ''
          )
        LIMIT 2000`
     );
@@ -489,6 +547,12 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
     const failReasons: string[] = [];
     const dNotes: string[] = [];
     const newComps: string[] = [];
+    const rejReasons: string[] = [];
+    const canReasons: string[] = [];
+    const rejByNames: string[] = [];
+    const canByNames: string[] = [];
+    const rejAts: string[] = [];
+    const canAts: string[] = [];
 
     for (const r of rowsRes?.rows || []) {
       try {
@@ -502,10 +566,10 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
           ? String(parsed.referenceNumber || parsed.reference_number || parsed.refNumber || parsed.ref_number || parsed.sourceReference || parsed.externalReference || parsed.orderRef || parsed.reference || '').trim()
           : '';
         const failCand = !String(r.delivery_failure_reason || '').trim()
-          ? String(parsed.deliveryFailureReason || parsed.delivery_failure_reason || parsed.failedDeliveryReason || parsed.failed_delivery_reason || parsed.deliverFailReason || parsed.failReason || '').trim()
+          ? crmCore.sanitizeReasonText(parsed.deliveryFailureReason || parsed.delivery_failure_reason || parsed.failedDeliveryReason || parsed.failed_delivery_reason || parsed.deliverFailReason || parsed.failReason || '')
           : '';
         const notesCand = !String(r.driver_notes || '').trim()
-          ? String(parsed.driverNotes || parsed.driver_notes || parsed.driverNote || parsed.driver_note || parsed.deliveryNotes || parsed.delivery_notes || parsed.driverComment || '').trim()
+          ? crmCore.sanitizeReasonText(parsed.driverNotes || parsed.driver_notes || parsed.driverNote || parsed.driver_note || parsed.deliveryNotes || parsed.delivery_notes || parsed.driverComment || '')
           : '';
         const lcKind = typeof crmCore.classifyReservationLifecycle === 'function'
           ? crmCore.classifyReservationLifecycle({
@@ -514,9 +578,28 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
               internalStatus: r.internal_status
             })
           : 'active';
-        const newCompCand = (lcKind === 'rejected' && !String(r.new_company_name || '').trim())
-          ? String(parsed.newCompanyName || parsed.new_company_name || parsed.transferCompanyName || parsed.alternativeCompanyName || '').trim()
+        const newCompCand = (lcKind === 'rejected' && !crmCore.sanitizeReasonText(r.new_company_name))
+          ? crmCore.sanitizeReasonText(parsed.newCompanyName || parsed.new_company_name || parsed.transferCompanyName || parsed.alternativeCompanyName || '')
           : '';
+        const rejReasonCand = (lcKind === 'rejected' && !crmCore.sanitizeReasonText(r.rejection_reason))
+          ? crmCore.extractRejectionReason(parsed, null)
+          : '';
+        const canReasonCand = (lcKind === 'cancelled' && !crmCore.sanitizeReasonText(r.cancellation_reason))
+          ? crmCore.extractCancellationReason(parsed, null)
+          : '';
+        const rejByCand = (lcKind === 'rejected' && !String(r.rejected_by_name || '').trim())
+          ? String(parsed.rejectedByName || parsed.rejected_by_name || parsed.rejectedBy || parsed.confirmedByName || parsed.confirmed_by_name || parsed.actionByName || parsed.action_by_name || parsed.adminName || '').trim()
+          : '';
+        const canByCand = (lcKind === 'cancelled' && !String(r.cancelled_by_name || '').trim())
+          ? String(parsed.cancelledByName || parsed.cancelled_by_name || parsed.canceledByName || parsed.canceled_by_name || parsed.cancelledBy || parsed.actionByName || parsed.action_by_name || '').trim()
+          : '';
+        const rejAtCand = (lcKind === 'rejected' && !String(r.rejected_at || '').trim())
+          ? String(parsed.rejectedAt || parsed.rejected_at || parsed.actionAt || '').trim()
+          : '';
+        const canAtCand = (lcKind === 'cancelled' && !String(r.cancelled_at || '').trim())
+          ? String(parsed.cancelledAt || parsed.cancelled_at || parsed.canceledAt || parsed.canceled_at || parsed.actionAt || '').trim()
+          : '';
+
         let paidCand = 0;
         if (Number(r.paid_amount || 0) <= 0) {
           const rawPaid = parsed.paidAmount ?? parsed.paid_amount ?? parsed.amountPaid ?? parsed.amount_paid;
@@ -530,7 +613,7 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
           }
         }
 
-        if (extractedCid || refCand || paidCand > 0 || failCand || notesCand || newCompCand) {
+        if (extractedCid || refCand || paidCand > 0 || failCand || notesCand || newCompCand || rejReasonCand || canReasonCand || rejByCand || canByCand || rejAtCand || canAtCand) {
           ids.push(String(r.id));
           cids.push(extractedCid);
           refs.push(refCand);
@@ -538,6 +621,12 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
           failReasons.push(failCand);
           dNotes.push(notesCand);
           newComps.push(newCompCand);
+          rejReasons.push(rejReasonCand);
+          canReasons.push(canReasonCand);
+          rejByNames.push(rejByCand);
+          canByNames.push(canByCand);
+          rejAts.push(rejAtCand);
+          canAts.push(canAtCand);
         }
       } catch {
         // Skip malformed JSON
@@ -551,10 +640,16 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
              paid_amount = CASE WHEN COALESCE(t.paid_amount, 0) = 0 AND v.paid_amt > 0 THEN v.paid_amt ELSE t.paid_amount END,
              delivery_failure_reason = CASE WHEN COALESCE(t.delivery_failure_reason, '') = '' AND NULLIF(v.fail_reason, '') IS NOT NULL THEN v.fail_reason ELSE t.delivery_failure_reason END,
              driver_notes = CASE WHEN COALESCE(t.driver_notes, '') = '' AND NULLIF(v.drv_notes, '') IS NOT NULL THEN v.drv_notes ELSE t.driver_notes END,
-             new_company_name = CASE WHEN COALESCE(t.new_company_name, '') = '' AND NULLIF(v.new_comp, '') IS NOT NULL THEN v.new_comp ELSE t.new_company_name END
-         FROM unnest($1::text[], $2::text[], $3::text[], $4::numeric[], $5::text[], $6::text[], $7::text[]) AS v(id, cid, ref_num, paid_amt, fail_reason, drv_notes, new_comp)
+             new_company_name = CASE WHEN COALESCE(t.new_company_name, '') = '' AND NULLIF(v.new_comp, '') IS NOT NULL THEN v.new_comp ELSE t.new_company_name END,
+             rejection_reason = CASE WHEN COALESCE(t.rejection_reason, '') IN ('', '-', '—', 'غير متاح', 'غير محدد') AND NULLIF(v.rej_reason, '') IS NOT NULL THEN v.rej_reason ELSE t.rejection_reason END,
+             cancellation_reason = CASE WHEN COALESCE(t.cancellation_reason, '') IN ('', '-', '—', 'غير متاح', 'غير محدد') AND NULLIF(v.can_reason, '') IS NOT NULL THEN v.can_reason ELSE t.cancellation_reason END,
+             rejected_by_name = CASE WHEN COALESCE(t.rejected_by_name, '') = '' AND NULLIF(v.rej_by, '') IS NOT NULL THEN v.rej_by ELSE t.rejected_by_name END,
+             cancelled_by_name = CASE WHEN COALESCE(t.cancelled_by_name, '') = '' AND NULLIF(v.can_by, '') IS NOT NULL THEN v.can_by ELSE t.cancelled_by_name END,
+             rejected_at = CASE WHEN COALESCE(t.rejected_at, '') = '' AND NULLIF(v.rej_at, '') IS NOT NULL THEN v.rej_at ELSE t.rejected_at END,
+             cancelled_at = CASE WHEN COALESCE(t.cancelled_at, '') = '' AND NULLIF(v.can_at, '') IS NOT NULL THEN v.can_at ELSE t.cancelled_at END
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::numeric[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[]) AS v(id, cid, ref_num, paid_amt, fail_reason, drv_notes, new_comp, rej_reason, can_reason, rej_by, can_by, rej_at, can_at)
          WHERE t.id = v.id`,
-        [ids, cids, refs, paidAmts, failReasons, dNotes, newComps]
+        [ids, cids, refs, paidAmts, failReasons, dNotes, newComps, rejReasons, canReasons, rejByNames, canByNames, rejAts, canAts]
       );
     }
   } catch {
