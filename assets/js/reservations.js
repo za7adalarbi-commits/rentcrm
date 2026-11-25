@@ -28,6 +28,35 @@
     { key: 'lastUpdatedAt', label: 'التاريخ والوقت' }
   ];
 
+  var REJECTED_COLUMNS = [
+    { key: 'reservationNumber', label: 'رقم الحجز', sortable: true },
+    { key: 'customerName', label: 'اسم العميل', sortable: true },
+    { key: 'companyName', label: 'الشركة', sortable: true },
+    { key: 'newCompanyName', label: 'الشركة الجديدة', sortable: false },
+    { key: 'rejectionReason', label: 'سبب الرفض', sortable: false },
+    { key: 'internalStatus', label: 'الحالة', sortable: true },
+    { key: 'refundAmount', label: 'الاسترداد', sortable: false },
+    { key: 'rejectedByName', label: 'التأكيد بواسطة', sortable: false },
+    { key: 'rejectedAt', label: 'التاريخ', sortable: true }
+  ];
+
+  var CANCELLED_COLUMNS = [
+    { key: 'reservationNumber', label: 'رقم الحجز', sortable: true },
+    { key: 'referenceNumber', label: 'الرقم المرجعي', sortable: true },
+    { key: 'customerName', label: 'اسم العميل', sortable: true },
+    { key: 'customerPhone', label: 'جوال العميل', sortable: true },
+    { key: 'carName', label: 'السيارة', sortable: true },
+    { key: 'paidAmount', label: 'المبلغ المدفوع', sortable: true },
+    { key: 'cancellationReason', label: 'سبب الإلغاء', sortable: false },
+    { key: 'deliveryFailureReason', label: 'سبب فشل التوصيل', sortable: false },
+    { key: 'driverNotes', label: 'ملاحظات السائق', sortable: false },
+    { key: 'sourceCreatedAt', label: 'تاريخ الحجز', sortable: true },
+    { key: 'startDate', label: 'تاريخ البداية', sortable: true },
+    { key: 'cancelledAt', label: 'تاريخ الإلغاء', sortable: true },
+    { key: 'internalStatus', label: 'حالة الحجز', sortable: true }
+  ];
+
+
   var DEFAULT_VISIBLE_COLS = [
     'reservationNumber',
     'customerName',
@@ -218,7 +247,7 @@
       sortBy: 'sourceOrder', sortDir: 'asc', explicitSort: false, page: 1, pageSize: 20,
       visibleCols: defaultCols,
       selectedResIds: {},
-      viewMode: 'active',
+      viewMode: 'all',
       radarFilter: 'all',
       radarSearch: '',
       todayFilter: 'all',
@@ -238,24 +267,24 @@
     var canViewRadarTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_radar_tab');
     var canViewCancelledTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_cancelled_tab');
     var canViewRejectedTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_rejected_tab');
-    var VALID_VIEW_MODES = ['active', 'cancelled', 'rejected', 'all', 'today', 'radar'];
-    if (VALID_VIEW_MODES.indexOf(state.viewMode) === -1) state.viewMode = 'active';
-    if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'active';
-    if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'active';
-    if (state.viewMode === 'cancelled' && !canViewCancelledTab) state.viewMode = 'active';
-    if (state.viewMode === 'rejected' && !canViewRejectedTab) state.viewMode = 'active';
+    var VALID_VIEW_MODES = ['all', 'today', 'radar', 'rejected', 'cancelled'];
+    if (state.viewMode === 'active' || VALID_VIEW_MODES.indexOf(state.viewMode) === -1) state.viewMode = 'all';
+    if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'all';
+    if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'all';
+    if (state.viewMode === 'cancelled' && !canViewCancelledTab) state.viewMode = 'all';
+    if (state.viewMode === 'rejected' && !canViewRejectedTab) state.viewMode = 'all';
     ctx.state.reservations = state;
     if (ctx.saveRouteFilters) ctx.saveRouteFilters();
 
     function getActiveLifecycleFilter() {
-      if (state.viewMode === 'cancelled' || state.viewMode === 'rejected' || state.viewMode === 'all') {
+      if (state.viewMode === 'cancelled' || state.viewMode === 'rejected') {
         return state.viewMode;
       }
-      return 'active';
+      return 'all';
     }
 
     function isListViewMode(vm) {
-      return vm === 'active' || vm === 'cancelled' || vm === 'rejected' || vm === 'all';
+      return vm === 'all' || vm === 'rejected' || vm === 'cancelled';
     }
 
     function doesResMatchViewLifecycle(rec, lifecycleMode) {
@@ -396,22 +425,6 @@
           '</div>' +
         '</div>' +
         '<div class="res-view-tabs" role="tablist" aria-label="' + (isEn ? 'Reservations View' : 'تبويبات الحجوزات') + '">' +
-          '<button type="button" class="res-view-tab' + (state.viewMode === 'active' ? ' is-active' : '') + '" data-res-view="active" role="tab" aria-selected="' + (state.viewMode === 'active') + '">' +
-            '<span>' + (isEn ? 'Active Reservations' : 'الحجوزات النشطة') + '</span>' +
-            '<span class="res-tab-count tabular-nums" data-testid="active-tab-count" id="res-active-tab-count">—</span>' +
-          '</button>' +
-          (canViewCancelledTab ? (
-            '<button type="button" class="res-view-tab' + (state.viewMode === 'cancelled' ? ' is-active' : '') + '" data-res-view="cancelled" role="tab" aria-selected="' + (state.viewMode === 'cancelled') + '">' +
-              '<span>' + (isEn ? 'Cancelled by Customer' : 'الحجوزات الملغاة') + '</span>' +
-              '<span class="res-tab-count tabular-nums" data-testid="cancelled-tab-count" id="res-cancelled-tab-count">—</span>' +
-            '</button>'
-          ) : '') +
-          (canViewRejectedTab ? (
-            '<button type="button" class="res-view-tab' + (state.viewMode === 'rejected' ? ' is-active' : '') + '" data-res-view="rejected" role="tab" aria-selected="' + (state.viewMode === 'rejected') + '">' +
-              '<span>' + (isEn ? 'Rejected by Site' : 'الحجوزات المرفوضة') + '</span>' +
-              '<span class="res-tab-count tabular-nums" data-testid="rejected-tab-count" id="res-rejected-tab-count">—</span>' +
-            '</button>'
-          ) : '') +
           '<button type="button" class="res-view-tab' + (state.viewMode === 'all' ? ' is-active' : '') + '" data-res-view="all" role="tab" aria-selected="' + (state.viewMode === 'all') + '">' +
             '<span>' + (isEn ? 'All Reservations' : 'جميع الحجوزات') + '</span>' +
             '<span class="res-tab-count tabular-nums" data-testid="all-tab-count" id="res-all-tab-count">—</span>' +
@@ -419,13 +432,25 @@
           (canViewTodayTab ? (
             '<button type="button" class="res-view-tab' + (state.viewMode === 'today' ? ' is-active' : '') + '" data-res-view="today" role="tab" aria-selected="' + (state.viewMode === 'today') + '">' +
               '<span>' + (isEn ? 'Pickups & Returns' : 'التسليم والاستلام') + '</span>' +
-              '<span class="res-tab-count tabular-nums" data-testid="today-tab-count" id="res-today-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="today-tab-count" id="res-today-tab-count">—</span>' +
             '</button>'
           ) : '') +
           (canViewRadarTab ? (
             '<button type="button" class="res-view-tab' + (state.viewMode === 'radar' ? ' is-active' : '') + '" data-res-view="radar" role="tab" aria-selected="' + (state.viewMode === 'radar') + '">' +
               '<span>' + (isEn ? '24h Expiry Radar' : 'رادار انتهاء الحجوزات (24 ساعة)') + '</span>' +
-              '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count">—</span>' +
+            '</button>'
+          ) : '') +
+          (canViewRejectedTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'rejected' ? ' is-active' : '') + '" data-res-view="rejected" role="tab" aria-selected="' + (state.viewMode === 'rejected') + '">' +
+              '<span>' + (isEn ? 'Rejected Reservations' : 'الحجوزات المرفوضة') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="rejected-tab-count" id="res-rejected-tab-count">—</span>' +
+            '</button>'
+          ) : '') +
+          (canViewCancelledTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'cancelled' ? ' is-active' : '') + '" data-res-view="cancelled" role="tab" aria-selected="' + (state.viewMode === 'cancelled') + '">' +
+              '<span>' + (isEn ? 'Cancelled Reservations' : 'الحجوزات الملغاة') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="cancelled-tab-count" id="res-cancelled-tab-count">—</span>' +
             '</button>'
           ) : '') +
         '</div>' +
@@ -527,18 +552,39 @@
 
     var activeFetchSeq = 0;
 
+    function isDedicatedLifecycleSchemaMode() {
+      return state.viewMode === 'rejected' || state.viewMode === 'cancelled';
+    }
+
+    function syncColsButtonVisibility() {
+      var dedicated = isDedicatedLifecycleSchemaMode();
+      var colsBtn = document.getElementById('res-cols-btn');
+      var colsPanel = document.getElementById('res-cols-panel');
+      if (colsBtn) colsBtn.classList.toggle('hidden', dedicated);
+      if (colsPanel && dedicated) colsPanel.classList.add('hidden');
+    }
+
     function buildTableRegionHtml(data) {
       var list = data.items || [];
-      var visibleCols = ALL_COLUMNS.filter(function (c) {
-        if (c.key === 'customerIdNumber' && !canViewId) return false;
-        return state.visibleCols.indexOf(c.key) !== -1;
-      });
+      var isRejectedSchema = state.viewMode === 'rejected';
+      var isCancelledSchema = state.viewMode === 'cancelled';
+      var isDedicatedSchema = isRejectedSchema || isCancelledSchema;
+      var naText = isEn ? 'N/A' : 'غير متاح';
+      var visibleCols = isRejectedSchema
+        ? REJECTED_COLUMNS.slice()
+        : (isCancelledSchema
+            ? CANCELLED_COLUMNS.slice()
+            : ALL_COLUMNS.filter(function (c) {
+                if (c.key === 'customerIdNumber' && !canViewId) return false;
+                return state.visibleCols.indexOf(c.key) !== -1;
+              }));
       var colVisible = {};
       visibleCols.forEach(function (c) { colVisible[c.key] = true; });
-      var selectedIdsList = Object.keys(selectedResIds).filter(function (k) { return Boolean(selectedResIds[k]); });
-      var allPageSelected = list.length > 0 && list.every(function (x) { return Boolean(selectedResIds[x.id]); });
+      var showBulkCol = Boolean(canBulkReassign && !isDedicatedSchema);
+      var selectedIdsList = showBulkCol ? Object.keys(selectedResIds).filter(function (k) { return Boolean(selectedResIds[k]); }) : [];
+      var allPageSelected = showBulkCol && list.length > 0 && list.every(function (x) { return Boolean(selectedResIds[x.id]); });
 
-      var bulkBarHtml = canBulkReassign ? (
+      var bulkBarHtml = showBulkCol ? (
         '<div id="res-bulk-action-bar" class="rg-bulk-bar rg-ui-res-bulk' + (selectedIdsList.length === 0 ? ' hidden' : '') + '">' +
           '<div class="rg-bulk-bar-info">' +
             '<span class="rg-bulk-count-badge tabular-nums" id="res-bulk-count">' + selectedIdsList.length + '</span>' +
@@ -570,12 +616,15 @@
               : (isEn ? 'No bookings match the current filters.' : 'لا توجد حجوزات مطابقة للفلاتر الحالية.')) +
           '</div>'
         : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
-            (canBulkReassign ? '<th class="res-bulk-th rg-ui-res-bulk"><input type="checkbox" id="res-bulk-select-all" aria-label="' + (isEn ? 'Select all on page' : 'تحديد كل الحجوزات في الصفحة') + '"' + (allPageSelected ? ' checked' : '') + '></th>' : '') +
+            (showBulkCol ? '<th class="res-bulk-th rg-ui-res-bulk"><input type="checkbox" id="res-bulk-select-all" aria-label="' + (isEn ? 'Select all on page' : 'تحديد كل الحجوزات في الصفحة') + '"' + (allPageSelected ? ' checked' : '') + '></th>' : '') +
             visibleCols.map(function (c) {
-              var arrow = state.sortBy === c.key ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
-              return '<th class="sortable" data-sort="' + c.key + '">' + c.label + arrow + '</th>';
+              var isSortable = c.sortable !== false;
+              var arrow = (isSortable && state.sortBy === c.key) ? (state.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+              return isSortable
+                ? '<th class="sortable" data-sort="' + c.key + '">' + c.label + arrow + '</th>'
+                : '<th>' + c.label + '</th>';
             }).join('') +
-            '<th>إجراءات</th>' +
+            '<th>' + (isDedicatedSchema ? (isEn ? 'Actions' : 'الأوامر') : 'إجراءات') + '</th>' +
           '</tr></thead><tbody>' +
             list.map(function (r) {
               var assignedIds = Array.isArray(r.assignedEmployeeIds) ? r.assignedEmployeeIds : [];
@@ -593,24 +642,32 @@
                 var extCount = Number(r.extensionsCount || (r.hasExtensions ? 1 : 0));
                 if (c.key === 'reservationNumber') {
                   var badgeHtml = '';
-                  if (extCount > 0) badgeHtml += '<span class="status-tag status-info tabular-nums">تمديد ×' + extCount + '</span>';
-                  if (r.hasProblem) badgeHtml += '<span class="status-tag status-danger">مشكلة</span>';
-                  if (overdueInfo && overdueInfo.isOverdueUnpaid) {
-                    badgeHtml += '<span class="rg-overdue-badge" title="' + esc(isEn ? 'Overdue return without paid extension' : 'متأخرة عن الإرجاع بدون تمديد مدفوع') + '">⏰ <span dir="ltr">' + esc(isEn ? overdueInfo.labelEn : overdueInfo.labelAr) + '</span></span>';
-                  }
-                  if (colleagueLock) {
-                    badgeHtml += '<span class="rg-softlock-chip" title="' + esc(isEn ? ('Editing by ' + colleagueLock.lockedByName) : ('يتابعه حالياً: ' + colleagueLock.lockedByName)) + '">🔒 ' + esc(colleagueLock.lockedByName) + '</span>';
+                  if (!isDedicatedSchema) {
+                    if (extCount > 0) badgeHtml += '<span class="status-tag status-info tabular-nums">تمديد ×' + extCount + '</span>';
+                    if (r.hasProblem) badgeHtml += '<span class="status-tag status-danger">مشكلة</span>';
+                    if (overdueInfo && overdueInfo.isOverdueUnpaid) {
+                      badgeHtml += '<span class="rg-overdue-badge" title="' + esc(isEn ? 'Overdue return without paid extension' : 'متأخرة عن الإرجاع بدون تمديد مدفوع') + '">⏰ <span dir="ltr">' + esc(isEn ? overdueInfo.labelEn : overdueInfo.labelAr) + '</span></span>';
+                    }
+                    if (colleagueLock) {
+                      badgeHtml += '<span class="rg-softlock-chip" title="' + esc(isEn ? ('Editing by ' + colleagueLock.lockedByName) : ('يتابعه حالياً: ' + colleagueLock.lockedByName)) + '">🔒 ' + esc(colleagueLock.lockedByName) + '</span>';
+                    }
                   }
                   return '<td class="mono cell-res-num">' +
-                    '<div class="cell-res-head"><button type="button" class="btn-link-inline btn-open-res" dir="ltr" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber) + '</button></div>' +
+                    '<div class="cell-res-head"><button type="button" class="btn-link-inline btn-open-res" dir="ltr" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber || naText) + '</button></div>' +
                     (badgeHtml ? '<div class="cell-badges">' + badgeHtml + '</div>' : '') +
+                  '</td>';
+                }
+                if (c.key === 'referenceNumber') {
+                  var refVal = r.referenceNumber || r.sourceReservationId || '';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
+                    (refVal ? '<span dir="ltr">' + esc(String(refVal)) + '</span>' : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
                   '</td>';
                 }
                 if (c.key === 'customerName') {
                   var showSubPhone = !colVisible.customerPhone && r.customerPhone;
                   var showSubId = !colVisible.customerIdNumber && canViewId && r.customerIdNumber;
                   return '<td class="cell-customer">' +
-                    '<div class="cell-primary">' + esc(r.customerName || '-') + '</div>' +
+                    '<div class="cell-primary">' + esc(r.customerName || naText) + '</div>' +
                     ((showSubPhone || showSubId) ? (
                       '<div class="cell-sub">' +
                         (showSubPhone ? '<span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' : '') +
@@ -621,16 +678,94 @@
                   '</td>';
                 }
                 if (c.key === 'customerPhone') {
-                  return '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></td>';
+                  return '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone || (isDedicatedSchema ? naText : '-')) + '</span></td>';
                 }
                 if (c.key === 'customerIdNumber') {
                   return '<td class="mono" style="white-space:nowrap;"><span dir="ltr">' + esc(r.customerIdNumber ? String(r.customerIdNumber) : '-') + '</span></td>';
                 }
+                if (c.key === 'companyName') {
+                  var compNum = r.companyNumber ? String(r.companyNumber).trim() : '';
+                  return '<td class="cell-company">' +
+                    '<div class="cell-primary">' + esc(r.companyName || naText) + '</div>' +
+                    (isDedicatedSchema && compNum ? '<div class="cell-sub mono" dir="ltr">#' + esc(compNum) + '</div>' : '') +
+                  '</td>';
+                }
+                if (c.key === 'newCompanyName') {
+                  var newCompVal = String(r.newCompanyName || '').trim();
+                  return '<td>' + (newCompVal ? esc(newCompVal) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') + '</td>';
+                }
+                if (c.key === 'rejectionReason') {
+                  var rejReason = String(r.rejectionReason || '').trim();
+                  return '<td><div class="cell-clamp-2" title="' + esc(rejReason || naText) + '">' +
+                    (rejReason ? esc(rejReason) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</div></td>';
+                }
+                if (c.key === 'refundAmount') {
+                  var hasRefundVal = r.refundAmount !== undefined && r.refundAmount !== null && r.refundAmount !== '';
+                  var refAmt = Number(r.refundAmount || 0);
+                  var payStLower = String(r.paymentStatus || '').toLowerCase();
+                  var isRefundState = payStLower.indexOf('مسترد') !== -1 || payStLower.indexOf('refund') !== -1;
+                  var refundDisplay = (refAmt > 0 || (hasRefundVal && refAmt === 0 && isRefundState))
+                    ? ('<strong>' + refAmt + ' ر.س</strong>')
+                    : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>';
+                  return '<td class="tabular-nums" style="white-space:nowrap;">' + refundDisplay + '</td>';
+                }
+                if (c.key === 'rejectedByName') {
+                  var rejActor = String(r.rejectedByName || r.lastUpdatedByName || '').trim();
+                  return '<td>' + (rejActor ? esc(rejActor) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') + '</td>';
+                }
+                if (c.key === 'rejectedAt') {
+                  var rejAtVal = r.rejectedAt || r.lastUpdatedAt || r.createdAt || '';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
+                    (rejAtVal ? esc(formatTimestamp(rejAtVal, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</td>';
+                }
+                if (c.key === 'paidAmount') {
+                  var rawPaid = Number(r.paidAmount || 0);
+                  var pStLower = String(r.paymentStatus || '').toLowerCase();
+                  var isPaidOrRefunded = pStLower.indexOf('مدفوع') !== -1 || pStLower.indexOf('paid') !== -1 || pStLower.indexOf('مسترد') !== -1 || pStLower.indexOf('refund') !== -1;
+                  var effectivePaid = rawPaid > 0 ? rawPaid : (isPaidOrRefunded && Number(r.totalAmount || 0) > 0 ? Number(r.totalAmount) : 0);
+                  return '<td class="tabular-nums" style="white-space:nowrap;">' +
+                    (effectivePaid > 0 ? ('<strong>' + effectivePaid + ' ر.س</strong>') : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</td>';
+                }
+                if (c.key === 'cancellationReason') {
+                  var canReason = String(r.cancellationReason || '').trim();
+                  return '<td><div class="cell-clamp-2" title="' + esc(canReason || naText) + '">' +
+                    (canReason ? esc(canReason) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</div></td>';
+                }
+                if (c.key === 'deliveryFailureReason') {
+                  var delFail = String(r.deliveryFailureReason || '').trim();
+                  return '<td><div class="cell-clamp-2" title="' + esc(delFail || naText) + '">' +
+                    (delFail ? esc(delFail) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</div></td>';
+                }
+                if (c.key === 'driverNotes') {
+                  var drvNotes = String(r.driverNotes || '').trim();
+                  return '<td><div class="cell-clamp-2" title="' + esc(drvNotes || naText) + '">' +
+                    (drvNotes ? esc(drvNotes) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</div></td>';
+                }
+                if (c.key === 'sourceCreatedAt') {
+                  var bookedAt = r.sourceCreatedAt || r.createdAt || '';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
+                    (bookedAt ? esc(formatTimestamp(bookedAt, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</td>';
+                }
+                if (c.key === 'cancelledAt') {
+                  var canAtVal = r.cancelledAt || r.lastUpdatedAt || r.updatedAt || '';
+                  return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
+                    (canAtVal ? esc(formatTimestamp(canAtVal, ctx.lang)) : '<span style="color:var(--text-muted);">' + esc(naText) + '</span>') +
+                  '</td>';
+                }
                 if (c.key === 'carName') {
-                  var carLabel = formatCarNameDisplay(r.carName);
+                  var carLabel = r.carName ? formatCarNameDisplay(r.carName) : naText;
                   var metaParts = [];
-                  if (!colVisible.companyName && r.companyName) metaParts.push(r.companyName);
-                  if (!colVisible.branchName && r.branchName) metaParts.push(r.branchName);
+                  if (!isDedicatedSchema) {
+                    if (!colVisible.companyName && r.companyName) metaParts.push(r.companyName);
+                    if (!colVisible.branchName && r.branchName) metaParts.push(r.branchName);
+                  }
                   return '<td class="cell-car">' +
                     '<div class="cell-primary cell-car-name" title="' + esc(r.carName || '') + '">' + esc(carLabel) + '</div>' +
                     (metaParts.length ? '<div class="cell-sub">' + esc(metaParts.join(' · ')) + '</div>' : '') +
@@ -652,6 +787,10 @@
                   '</td>';
                 }
                 if (c.key === 'internalStatus') {
+                  if (isDedicatedSchema) {
+                    var dedicatedStatusLabel = r.originalStatusAr || r.internalStatus || (isRejectedSchema ? 'مرفوض' : 'ملغي');
+                    return '<td><span class="status-tag ' + statusClass(dedicatedStatusLabel) + '">' + esc(dedicatedStatusLabel) + '</span></td>';
+                  }
                   var subAssignee = !colVisible.assignedEmployeeNames
                     ? (assignedNames.length ? assignedNames.join('، ') : 'متاح للاستلام')
                     : '';
@@ -687,10 +826,15 @@
                   '</div></td>';
                 }
                 if (c.key === 'startDate') {
+                  if (isDedicatedSchema && !r.startDate) {
+                    return '<td class="tabular-nums" style="white-space:nowrap;"><span style="color:var(--text-muted);">' + esc(naText) + '</span></td>';
+                  }
                   var totStartDays = Number(r.totalDaysCount || r.daysCount || 1);
                   var periodParts = [];
-                  if (!colVisible.endDate && r.endDate) periodParts.push('حتى ' + formatDateOnly(r.endDate));
-                  if (!colVisible.daysCount) periodParts.push(totStartDays + ' يوم');
+                  if (!isDedicatedSchema) {
+                    if (!colVisible.endDate && r.endDate) periodParts.push('حتى ' + formatDateOnly(r.endDate));
+                    if (!colVisible.daysCount) periodParts.push(totStartDays + ' يوم');
+                  }
                   return '<td class="tabular-nums" style="white-space:nowrap;">' +
                     (r.startTime
                       ? renderBookingTimezoneHtml(r.startDate, r.startTime, { compact: true })
@@ -750,7 +894,7 @@
                 if (c.key === 'lastUpdatedAt') {
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(formatTimestamp(r.lastUpdatedAt)) + '</td>';
                 }
-                return '<td class="tabular-nums">' + esc(r[c.key] || '-') + '</td>';
+                return '<td class="tabular-nums">' + esc(r[c.key] || (isDedicatedSchema ? naText : '-')) + '</td>';
               }).join('');
 
               var isClaimLocked = Boolean(
@@ -758,16 +902,17 @@
                 root.RGApp.isActionLocked &&
                 (root.RGApp.isActionLocked('claimReservation:' + r.id) || root.RGApp.isActionLocked('unclaimReservation:' + r.id))
               );
-              var claimBtnHtml = canClaimButtons
+              var rowIsInactiveBtn = Boolean(isDedicatedSchema || (root.RGCrmCore && root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(r)));
+              var claimBtnHtml = (canClaimButtons && !rowIsInactiveBtn)
                 ? (isMine
                   ? '<button type="button" class="btn btn-sm btn-danger btn-unclaim-res" data-id="' + esc(r.id) + '" title="إلغاء الاستلام من حسابك"' + (isClaimLocked ? ' disabled aria-busy="true"' : '') + '>مستلم ✓ · إلغاء</button>'
                   : '<button type="button" class="btn btn-sm btn-charcoal btn-claim-res" data-id="' + esc(r.id) + '" title="استلام الحجز عندي للمتابعة"' + (isClaimLocked ? ' disabled aria-busy="true"' : '') + '>استلام عندي</button>')
                 : '';
 
               return '<tr data-res-id="' + esc(r.id) + '" class="' +
-                (overdueInfo && overdueInfo.isOverdueUnpaid ? 'is-overdue-unpaid ' : '') +
-                (selectedResIds[r.id] ? 'is-selected-row' : '') + '">' +
-                (canBulkReassign ? '<td class="res-bulk-td rg-ui-res-bulk"><input type="checkbox" class="res-row-select-chk" data-id="' + esc(r.id) + '" aria-label="تحديد الحجز ' + esc(r.reservationNumber) + '"' + (selectedResIds[r.id] ? ' checked' : '') + '></td>' : '') +
+                (!isDedicatedSchema && overdueInfo && overdueInfo.isOverdueUnpaid ? 'is-overdue-unpaid ' : '') +
+                (showBulkCol && selectedResIds[r.id] ? 'is-selected-row' : '') + '">' +
+                (showBulkCol ? '<td class="res-bulk-td rg-ui-res-bulk"><input type="checkbox" class="res-row-select-chk" data-id="' + esc(r.id) + '" aria-label="تحديد الحجز ' + esc(r.reservationNumber) + '"' + (selectedResIds[r.id] ? ' checked' : '') + '></td>' : '') +
                 tds +
                 '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   claimBtnHtml +
@@ -1332,10 +1477,11 @@
     function updateLifecycleCountsUi(countsObj) {
       if (!countsObj || typeof countsObj !== 'object') return;
       var map = {
-        active: 'res-active-tab-count',
-        cancelled: 'res-cancelled-tab-count',
+        all: 'res-all-tab-count',
+        today: 'res-today-tab-count',
+        radar: 'res-radar-tab-count',
         rejected: 'res-rejected-tab-count',
-        all: 'res-all-tab-count'
+        cancelled: 'res-cancelled-tab-count'
       };
       Object.keys(map).forEach(function (k) {
         if (countsObj[k] === undefined || countsObj[k] === null) return;
@@ -1361,6 +1507,7 @@
       if (data.lifecycleCounts) {
         updateLifecycleCountsUi(data.lifecycleCounts);
       }
+      syncColsButtonVisibility();
       updateLifecycleBanner();
       region.innerHTML = buildTableRegionHtml(data);
       bindTableRegionEvents(region);
@@ -1826,9 +1973,17 @@
       exportBtn.addEventListener('click', async function () {
         exportBtn.disabled = true;
         try {
+          var exportHeaders = state.viewMode === 'rejected'
+            ? REJECTED_COLUMNS.slice()
+            : (state.viewMode === 'cancelled'
+                ? CANCELLED_COLUMNS.slice()
+                : ALL_COLUMNS.filter(function (col) { return col.key !== 'customerIdNumber' || canViewId; }));
+          var exportSheetName = state.viewMode === 'rejected'
+            ? 'Rejected'
+            : (state.viewMode === 'cancelled' ? 'Cancelled' : 'Reservations');
           await root.RGReports.exportExcelWorkbook([{
-            name: 'Reservations',
-            headers: ALL_COLUMNS.filter(function (col) { return col.key !== 'customerIdNumber' || canViewId; }),
+            name: exportSheetName,
+            headers: exportHeaders,
             rows: currentItems
           }], 'rental-gate-reservations.xlsx');
           ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
@@ -3041,9 +3196,11 @@
         if (extracted !== null) {
           radarLoadError = '';
           radarRawReservations = extracted;
-        } else if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+        } else if (!checkHasActiveResFilters() && !initialLoadError && currentItems.length > 0 && Number(payload.total || 0) <= currentItems.length) {
           radarLoadError = '';
-          radarRawReservations = currentItems.slice();
+          radarRawReservations = currentItems.filter(function (it) {
+            return it && !(core && core.isInactiveReservation && core.isInactiveReservation(it));
+          });
         } else if (radarRawReservations === null) {
           radarLoadError = (resp && resp.message) || 'تعذر تحميل بيانات اليوم والرادار.';
           var tb = document.getElementById('res-today-tab-count');
@@ -3061,9 +3218,11 @@
       } catch (_e) {
         if (seq !== radarFetchSeq || !container.isConnected) return;
         if (radarRawReservations === null) {
-          if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+          if (!checkHasActiveResFilters() && !initialLoadError && currentItems.length > 0 && Number(payload.total || 0) <= currentItems.length) {
             radarLoadError = '';
-            radarRawReservations = currentItems.slice();
+            radarRawReservations = currentItems.filter(function (it) {
+              return it && !(core && core.isInactiveReservation && core.isInactiveReservation(it));
+            });
           } else {
             radarLoadError = 'تعذر الاتصال بالخادم أثناء تحميل بيانات اليوم والرادار.';
           }
@@ -3081,11 +3240,11 @@
     }
 
     function setViewMode(nextMode) {
-      var targetMode = VALID_VIEW_MODES.indexOf(nextMode) !== -1 ? nextMode : 'active';
-      if (targetMode === 'today' && !canViewTodayTab) targetMode = 'active';
-      if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'active';
-      if (targetMode === 'cancelled' && !canViewCancelledTab) targetMode = 'active';
-      if (targetMode === 'rejected' && !canViewRejectedTab) targetMode = 'active';
+      var targetMode = VALID_VIEW_MODES.indexOf(nextMode) !== -1 ? nextMode : 'all';
+      if (targetMode === 'today' && !canViewTodayTab) targetMode = 'all';
+      if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'all';
+      if (targetMode === 'cancelled' && !canViewCancelledTab) targetMode = 'all';
+      if (targetMode === 'rejected' && !canViewRejectedTab) targetMode = 'all';
       var listModeChanged = isListViewMode(targetMode) && targetMode !== state.viewMode;
       state.viewMode = targetMode;
       if (listModeChanged) state.page = 1;
@@ -3096,6 +3255,7 @@
       if (allViewEl) allViewEl.classList.toggle('hidden', !isListViewMode(state.viewMode));
       if (todayViewEl) todayViewEl.classList.toggle('hidden', state.viewMode !== 'today');
       if (radarViewEl) radarViewEl.classList.toggle('hidden', state.viewMode !== 'radar');
+      syncColsButtonVisibility();
       container.querySelectorAll('[data-res-view]').forEach(function (tabBtn) {
         var isAct = tabBtn.getAttribute('data-res-view') === state.viewMode;
         tabBtn.classList.toggle('is-active', isAct);
@@ -3123,9 +3283,12 @@
     });
 
     if (canViewTodayTab || canViewRadarTab) {
-      if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
-        radarRawReservations = currentItems.slice();
-        calendarRawItems = currentItems.slice();
+      if (!checkHasActiveResFilters() && !initialLoadError && currentItems.length > 0 && Number(payload.total || 0) <= currentItems.length) {
+        var activeOnlyForOps = currentItems.filter(function (it) {
+          return it && !(root.RGCrmCore && root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(it));
+        });
+        radarRawReservations = activeOnlyForOps.slice();
+        calendarRawItems = activeOnlyForOps.slice();
         paintRadarView();
         paintTodayView();
       } else {
@@ -3851,6 +4014,21 @@
                 (Number(r.vatAmount || 0) > 0 ? ' · ضريبة ' + Number(r.vatAmount) : '') +
                 (Number(r.discountAmount || 0) > 0 ? ' · خصم ' + Number(r.discountAmount) : '') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Last Update' : 'آخر تحديث') + '</span><span class="detail-v">' + fmtMentionText(r.lastUpdateText || '-') + '</span></div>' +
+              ((r.referenceNumber || lifecycleKindNow === 'cancelled') ? '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Reference #' : 'الرقم المرجعي') + '</span><span class="detail-v"><span class="mono" dir="ltr">' + esc(r.referenceNumber || r.sourceReservationId || 'غير متاح') + '</span></span></div>' : '') +
+              ((Number(r.paidAmount || 0) > 0 || lifecycleKindNow === 'cancelled') ? '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">' + (isEn ? 'Paid Amount' : 'المبلغ المدفوع') + '</span><span class="detail-v tabular-nums">' + (Number(r.paidAmount || 0) > 0 ? (Number(r.paidAmount) + ' ر.س') : 'غير متاح') + '</span></div>' : '') +
+              (lifecycleKindNow === 'rejected' ? (
+                '<div class="detail-kv"><span class="detail-k">الشركة الجديدة</span><span class="detail-v">' + esc(r.newCompanyName || 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv"><span class="detail-k">سبب الرفض</span><span class="detail-v">' + esc(r.rejectionReason || 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">الاسترداد</span><span class="detail-v tabular-nums">' + (Number(r.refundAmount || 0) > 0 ? (Number(r.refundAmount) + ' ر.س') : 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv"><span class="detail-k">التأكيد بواسطة</span><span class="detail-v">' + esc(r.rejectedByName || r.lastUpdatedByName || 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv"><span class="detail-k">تاريخ الرفض</span><span class="detail-v"><span class="mono" dir="ltr">' + esc((r.rejectedAt || r.lastUpdatedAt) ? formatTimestamp(r.rejectedAt || r.lastUpdatedAt, ctx.lang) : 'غير متاح') + '</span></span></div>'
+              ) : '') +
+              (lifecycleKindNow === 'cancelled' ? (
+                '<div class="detail-kv"><span class="detail-k">سبب الإلغاء</span><span class="detail-v">' + esc(r.cancellationReason || 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv"><span class="detail-k">سبب فشل التوصيل</span><span class="detail-v">' + esc(r.deliveryFailureReason || 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv"><span class="detail-k">ملاحظات السائق</span><span class="detail-v">' + esc(r.driverNotes || 'غير متاح') + '</span></div>' +
+                '<div class="detail-kv"><span class="detail-k">تاريخ الإلغاء</span><span class="detail-v"><span class="mono" dir="ltr">' + esc((r.cancelledAt || r.lastUpdatedAt) ? formatTimestamp(r.cancelledAt || r.lastUpdatedAt, ctx.lang) : 'غير متاح') + '</span></span></div>'
+              ) : '') +
             '</div>' +
 
             buildStatusStagesHtml(r) +

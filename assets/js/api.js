@@ -1261,11 +1261,12 @@
 
   function computeLifecycleCounts(list, userContext) {
     var core = root.RGCrmCore;
-    var counts = { all: 0, active: 0, cancelled: 0, rejected: 0 };
+    var counts = { all: 0, active: 0, cancelled: 0, rejected: 0, today: 0, radar: 0 };
     if (!Array.isArray(list) || !core) return counts;
     var u = userContext || {};
     var restrictAgent = u.role === 'agent' && u.allowAgentViewAll === false &&
       !(u.user && core.canUserPerform && core.canUserPerform(u.user, 'view_all_reservations'));
+    var activeItems = [];
     list.forEach(function (r) {
       if (!r) return;
       if (restrictAgent) {
@@ -1277,8 +1278,21 @@
         : (core.isRejectedStatus && core.isRejectedStatus(r) ? 'rejected' : (core.isCancelledStatus && core.isCancelledStatus(r) ? 'cancelled' : 'active'));
       if (life === 'rejected') counts.rejected += 1;
       else if (life === 'cancelled') counts.cancelled += 1;
-      else counts.active += 1;
+      else {
+        counts.active += 1;
+        activeItems.push(r);
+      }
     });
+    var todayStr = (core.getRiyadhTodayDateStr && core.getRiyadhTodayDateStr()) ||
+      (core.getRiyadhDateString && core.getRiyadhDateString()) ||
+      new Date().toISOString().substring(0, 10);
+    var nowMs = Date.now();
+    if (core.computeTodayMovementsSummary) {
+      counts.today = Number(core.computeTodayMovementsSummary(activeItems, nowMs, { todayDate: todayStr, subFilter: 'all' }).totalCount || 0);
+    }
+    if (core.computeExpiryRadarSummary) {
+      counts.radar = Number(core.computeExpiryRadarSummary(activeItems, nowMs, { subFilter: 'all', windowHours: 24, gracePastHours: 12 }).totalCount || 0);
+    }
     return counts;
   }
 
@@ -2906,6 +2920,7 @@
       {
         id: 'RES_1006',
         sourceReservationId: '884601',
+        referenceNumber: 'REF-RG-884601',
         reservationNumber: 'RG-2026-8846',
         sourceCreatedAt: t5 + 'T10:00:00.000Z',
         customerName: 'بندر عوض الزهراني',
@@ -2941,6 +2956,7 @@
         discountAmount: 0,
         vatAmount: 136.96,
         baseAmount: 1050,
+        paidAmount: 1050,
         extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 1050,
@@ -2954,6 +2970,8 @@
         lastUpdatedByName: 'خالد الحربي',
         lastUpdatedAt: t5 + 'T15:10:00.000Z',
         cancellationReason: 'تغيير خطط السفر بناءً على طلب العميل',
+        deliveryFailureReason: 'لم يرد العميل على اتصال السائق قبل الموعد',
+        driverNotes: 'تم إبلاغ المشرف بإلغاء الطلب من جهة العميل',
         cancelledById: 'EMP_AG1',
         cancelledByName: 'خالد الحربي',
         cancelledAt: t5 + 'T15:10:00.000Z',
@@ -3240,6 +3258,7 @@
       {
         id: 'RES_1012',
         sourceReservationId: '885012',
+        referenceNumber: 'REF-RG-885212',
         reservationNumber: 'RG-2026-8852',
         sourceCreatedAt: t1 + 'T07:20:00.000Z',
         customerName: 'سلطان عبدالعزيز الغامدي',
@@ -3275,6 +3294,7 @@
         discountAmount: 0,
         vatAmount: 31.5,
         baseAmount: 241.5,
+        paidAmount: 241.5,
         extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 241.5,
@@ -3284,6 +3304,8 @@
         assignedEmployeeIds: ['EMP_AG2'],
         assignedEmployeeNames: ['نورة القحطاني'],
         cancellationReason: 'تأخر الرحلة وطلب العميل الإلغاء',
+        deliveryFailureReason: '',
+        driverNotes: '',
         cancelledById: 'EMP_AG2',
         cancelledByName: 'نورة القحطاني',
         cancelledAt: t1 + 'T10:30:00.000Z',
