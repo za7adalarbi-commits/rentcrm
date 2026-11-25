@@ -2704,10 +2704,25 @@
           var uiKey = sel.getAttribute('data-ui-key');
           var val = sel.value;
           var workingOv = Object.assign({}, getWorkingUiOverrides(curEmp));
-          if (val === 'hide') workingOv[uiKey] = true;
-          else if (val === 'show') workingOv[uiKey] = false;
-          else delete workingOv[uiKey];
-          draftUiOverridesByEmpId[curEmp.id] = workingOv;
+          var nextFlags = Object.assign({}, (workingOv.flags && typeof workingOv.flags === 'object') ? workingOv.flags : {});
+          var aliasKey = (core && core.UI_FLAG_ALIASES && core.UI_FLAG_ALIASES[uiKey]) || '';
+          if (val === 'hide') {
+            workingOv[uiKey] = true;
+            nextFlags[uiKey] = true;
+            if (aliasKey) { workingOv[aliasKey] = true; nextFlags[aliasKey] = true; }
+          } else if (val === 'show') {
+            workingOv[uiKey] = false;
+            nextFlags[uiKey] = false;
+            if (aliasKey) { workingOv[aliasKey] = false; nextFlags[aliasKey] = false; }
+          } else {
+            delete workingOv[uiKey];
+            delete nextFlags[uiKey];
+            if (aliasKey) { delete workingOv[aliasKey]; delete nextFlags[aliasKey]; }
+          }
+          workingOv.flags = nextFlags;
+          draftUiOverridesByEmpId[curEmp.id] = (core && typeof core.normalizeUiOverrides === 'function')
+            ? core.normalizeUiOverrides(workingOv)
+            : workingOv;
           drawSectionsModal();
         });
       });

@@ -8,7 +8,7 @@ import healthHandler from './api/health.js';
 import syncHandler from './api/sync.js';
 import versionHandler from './api/version.js';
 import { requireAuth } from './backend/auth.js';
-import { createPgExecutor, getDatabaseUrl, isDatabaseConfigured } from './backend/db.js';
+import { createPgExecutor, ensureSchemaInitialized, getDatabaseUrl, isDatabaseConfigured } from './backend/db.js';
 import { ensurePgRealtimeListener, subscribeCrmEvents } from './backend/realtime.js';
 import { attachAppVersionHeaders } from './backend/versionManifest.js';
 
@@ -175,7 +175,9 @@ async function startServer() {
     let userId = 'sandbox';
     if (isDatabaseConfigured()) {
       try {
-        const session = await requireAuth(createPgExecutor(), rawToken);
+        const exec = createPgExecutor();
+        await ensureSchemaInitialized(exec);
+        const session = await requireAuth(exec, rawToken);
         userId = session.user.id;
       } catch (err: any) {
         res.status(401).json({

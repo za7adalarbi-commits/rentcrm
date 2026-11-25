@@ -5080,6 +5080,11 @@
         lastSyncVersion = d.syncVersion;
       }
 
+      var prevRole = curUser.role;
+      var prevDelId = curUser.activeDelegation ? curUser.activeDelegation.id : '';
+      var prevPermsStr = JSON.stringify((curUser.permissions || []).slice().sort());
+      var prevOvStr = JSON.stringify(curUser.uiOverrides || {});
+
       if (root.RGApi && typeof root.RGApi.applyDeltaSyncToCache === 'function') {
         root.RGApi.applyDeltaSyncToCache(d);
       }
@@ -5099,30 +5104,51 @@
       if (Array.isArray(d.locks)) {
         setActiveLocks(d.locks);
       }
-      if (d.roleUiDefaults) {
-        setRoleUiDefaults(d.roleUiDefaults);
+
+      var deltaUiCfg = d.clientUiConfig && typeof d.clientUiConfig === 'object' ? d.clientUiConfig : null;
+      var nextRoleDefaults = d.roleUiDefaults || (deltaUiCfg && deltaUiCfg.roleUiDefaults) || null;
+      var nextUiSimp = d.uiSimplification || (deltaUiCfg && deltaUiCfg.uiSimplification) || null;
+      var uiCfgChanged = false;
+      if (nextRoleDefaults) {
+        var prevRoleDefFp = computeFingerprintSafe(state.roleUiDefaults || {});
+        setRoleUiDefaults(nextRoleDefaults);
+        if (computeFingerprintSafe(state.roleUiDefaults || {}) !== prevRoleDefFp) {
+          uiCfgChanged = true;
+        }
       }
-      if (d.uiSimplification) {
-        applyUiSimplification(d.uiSimplification, true);
+      if (nextUiSimp) {
+        var prevUiSimpFp = computeFingerprintSafe(state.uiSimplification || {});
+        applyUiSimplification(nextUiSimp, true);
+        if (computeFingerprintSafe(state.uiSimplification || {}) !== prevUiSimpFp) {
+          uiCfgChanged = true;
+        }
       }
+      if (deltaUiCfg && deltaUiCfg.statsControlConfig) {
+        setStatsControlConfig(deltaUiCfg.statsControlConfig);
+      }
+      if (deltaUiCfg && deltaUiCfg.handoverSettings) {
+        setHandoverSettings(deltaUiCfg.handoverSettings);
+      }
+
+      var userShellChanged = false;
       if (d.user && root.RGAuth && typeof root.RGAuth.setUser === 'function') {
-        var prevRole = curUser.role;
-        var prevDelId = curUser.activeDelegation ? curUser.activeDelegation.id : '';
         var nextDelId = d.user.activeDelegation ? d.user.activeDelegation.id : '';
-        var prevPermsStr = JSON.stringify((curUser.permissions || []).slice().sort());
         var nextPermsStr = JSON.stringify((d.user.permissions || []).slice().sort());
-        var prevOvStr = JSON.stringify(curUser.uiOverrides || {});
         var nextOvStr = JSON.stringify(d.user.uiOverrides || {});
         if (d.user.role !== prevRole || prevDelId !== nextDelId || prevPermsStr !== nextPermsStr || prevOvStr !== nextOvStr) {
+          userShellChanged = true;
           root.RGAuth.setUser(d.user);
-          applyUiSimplification(state.uiSimplification, true);
-          var hasOpenModalNow = Boolean(document.getElementById('modal-root') && document.getElementById('modal-root').firstElementChild);
-          if (hasOpenModalNow) {
-            refreshSidebarNavDom(d.user);
-          } else {
-            renderAppShell(d.user);
-            renderRoute().catch(function () {});
-          }
+        }
+      }
+      if (userShellChanged || uiCfgChanged) {
+        var effectiveShellUser = d.user || (root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : curUser);
+        applyUiSimplification(state.uiSimplification, true);
+        var hasOpenModalNow = Boolean(document.getElementById('modal-root') && document.getElementById('modal-root').firstElementChild);
+        if (hasOpenModalNow) {
+          refreshSidebarNavDom(effectiveShellUser);
+        } else {
+          renderAppShell(effectiveShellUser);
+          renderRoute().catch(function () {});
         }
       }
 
@@ -5650,6 +5676,17 @@
       return;
     }
 
+    var restoredUiCfg = (root.RGAuth && root.RGAuth.consumeRestoredUiConfig)
+      ? root.RGAuth.consumeRestoredUiConfig()
+      : null;
+    if (restoredUiCfg && restoredUiCfg.roleUiDefaults) {
+      setRoleUiDefaults(restoredUiCfg.roleUiDefaults);
+    }
+    if (restoredUiCfg && restoredUiCfg.uiSimplification) {
+      applyUiSimplification(restoredUiCfg.uiSimplification, true);
+    } else {
+      applyUiSimplification(state.uiSimplification, true);
+    }
     restoreRouteFilters(user);
     hydrateLayoutPrefsFromServer(
       (root.RGAuth && root.RGAuth.consumeRestoredLayoutPrefs) ? root.RGAuth.consumeRestoredLayoutPrefs() : null,
@@ -5688,7 +5725,11 @@
     syncCurrentUserShell: function (updatedUser) {
       if (!updatedUser) return;
       var activeUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : updatedUser;
-      var resolvedActive = (activeUser && activeUser.id === updatedUser.id && !activeUser.isPreviewSession) ? updatedUser : activeUser;
+      var isSelfUpdate = Boolean(activeUser && activeUser.id === updatedUser.id && !activeUser.isPreviewSession);
+      var resolvedActive = isSelfUpdate ? updatedUser : activeUser;
+      if (isSelfUpdate && root.RGAuth && typeof root.RGAuth.setUser === 'function') {
+        root.RGAuth.setUser(updatedUser);
+      }
       var nameEls = document.querySelectorAll('#user-profile-menu-btn .sidebar-user-name');
       nameEls.forEach(function (el) { el.textContent = resolvedActive.name || ''; });
       var avatarEls = document.querySelectorAll('#user-profile-menu-btn .sidebar-user-avatar');

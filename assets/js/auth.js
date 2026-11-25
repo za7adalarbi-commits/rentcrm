@@ -7,6 +7,7 @@
   var currentUser = null;
   var pendingBootstrap = null;
   var restoredLayoutPrefs = null;
+  var restoredUiConfig = null;
 
   function getUser() {
     return currentUser;
@@ -28,13 +29,18 @@
     if (bs.user) {
       root.RGApi.primeCache('getMe', {}, {
         user: bs.user,
-        layoutPrefs: bs.layoutPrefs || null
+        layoutPrefs: bs.layoutPrefs || null,
+        roleUiDefaults: bs.roleUiDefaults || undefined,
+        uiSimplification: bs.uiSimplification || undefined
       });
     }
     if (bs.dashboard) root.RGApi.primeCache('getDashboard', { range: r }, bs.dashboard);
     if (bs.employees) root.RGApi.primeCache('getEmployees', {}, bs.employees);
     if (bs.notifications) root.RGApi.primeCache('getNotifications', {}, bs.notifications);
     if (bs.problems) root.RGApi.primeCache('getProblems', {}, bs.problems);
+    if (bs.roleUiDefaults && root.RGApp && root.RGApp.setRoleUiDefaults) {
+      root.RGApp.setRoleUiDefaults(bs.roleUiDefaults);
+    }
     if (bs.uiSimplification && root.RGApp && root.RGApp.applyUiSimplification) {
       root.RGApp.applyUiSimplification(bs.uiSimplification);
     }
@@ -52,6 +58,12 @@
     return out;
   }
 
+  function consumeRestoredUiConfig() {
+    var out = restoredUiConfig;
+    restoredUiConfig = null;
+    return out;
+  }
+
   async function restoreSession() {
     var token = root.RGApi.getToken();
     if (!token) return null;
@@ -60,12 +72,19 @@
       if (res && res.success && res.data && res.data.user) {
         currentUser = res.data.user;
         restoredLayoutPrefs = res.data.layoutPrefs || null;
+        restoredUiConfig = (res.data.roleUiDefaults || res.data.uiSimplification)
+          ? {
+              roleUiDefaults: res.data.roleUiDefaults || null,
+              uiSimplification: res.data.uiSimplification || null
+            }
+          : null;
         return currentUser;
       }
     } catch (e) {}
     root.RGApi.setToken('');
     currentUser = null;
     restoredLayoutPrefs = null;
+    restoredUiConfig = null;
     return null;
   }
 
@@ -115,6 +134,7 @@
   async function logout() {
     pendingBootstrap = null;
     restoredLayoutPrefs = null;
+    restoredUiConfig = null;
     try {
       if (root.RGApi.getToken()) {
         await root.RGApi.callApi('logout', {});
@@ -133,6 +153,7 @@
     logout: logout,
     consumeBootstrap: consumeBootstrap,
     consumeRestoredLayoutPrefs: consumeRestoredLayoutPrefs,
+    consumeRestoredUiConfig: consumeRestoredUiConfig,
     primeBootstrapCaches: primeBootstrapCaches
   };
 })(window);

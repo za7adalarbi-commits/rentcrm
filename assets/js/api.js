@@ -4193,7 +4193,23 @@
         var meNormLayout = (core && core.normalizeUserLayoutPrefs)
           ? core.normalizeUserLayoutPrefs(meLayout)
           : { navOrder: [], hiddenRoutes: [], dashOrder: [], dashHidden: [] };
-        return { success: true, message: '', data: { user: session.user, layoutPrefs: meNormLayout }, error: null };
+        var meRoleDefaults = (core && core.normalizeRoleUiDefaults)
+          ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults)
+          : {};
+        var meUiSimp = (core && core.normalizeUiSimplificationSettings)
+          ? core.normalizeUiSimplificationSettings(db.settings.ui_simplification)
+          : (db.settings.ui_simplification || { preset: 'full' });
+        return {
+          success: true,
+          message: '',
+          data: {
+            user: session.user,
+            layoutPrefs: meNormLayout,
+            roleUiDefaults: meRoleDefaults,
+            uiSimplification: meUiSimp
+          },
+          error: null
+        };
       }
 
       case 'getAppBootstrap': {
