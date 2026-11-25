@@ -2193,9 +2193,105 @@
     return allowed.indexOf(action) !== -1;
   }
 
-  function canUserViewDashboardSection(roleOrUser, permKey) {
+  var UI_ROUTE_HIDE_KEYS = {
+    'team-followups': 'hideNavTeamFollowups',
+    problems: 'hideNavProblems',
+    reports: 'hideNavReports',
+    employees: 'hideNavEmployees',
+    activity: 'hideNavActivity'
+  };
+
+  var UI_SUBSECTION_HIDE_KEYS = {
+    sub_view_today_tab: 'hideResTodayTab',
+    sub_view_radar_tab: 'hideResRadarTab',
+    sub_view_rejected_tab: 'hideResRejectedTab',
+    sub_view_cancelled_tab: 'hideResCancelledTab',
+    sub_view_myfu_mentions: 'hideMyfuMentionsTab',
+    sub_view_myfu_history: 'hideMyfuHistoryCard',
+    sub_view_prb_rates: 'hideProblemsRateIndicator',
+    sub_view_rep_charts: 'hideReportsCharts',
+    sub_view_emp_delegations: 'hideEmployeesDelegations',
+    sub_view_emp_presets: 'hideRolePresetsSection'
+  };
+
+  var UI_DASHBOARD_HIDE_KEYS = {
+    dash_view_hero_kpis: 'hideDashHeroKpis',
+    dash_view_strip_kpis: 'hideDashStripKpis',
+    dash_view_daily_chart: 'hideDashDailyChart',
+    dash_view_recent_activity: 'hideDashRecentActivity',
+    dash_view_charts_grid: 'hideDashChartsGrid',
+    dash_view_radar: 'hideDashboardRadar',
+    dash_view_heatmap: 'hideDashboardHeatmap',
+    dash_view_leaderboard: 'hideDashLeaderboard',
+    dash_view_bottom_bento: 'hideDashBottomBento',
+    dash_view_handover: 'hideShiftHandoverBtn'
+  };
+
+  var UI_ACTION_HIDE_KEYS = {
+    act_export_excel: 'hideResExportExcel',
+    act_export_pdf: 'hideDrawerPdfBtn',
+    act_pull_reservations: 'hideResPullBtn',
+    act_import_excel: 'hideResImportExcel',
+    act_bulk_reassign: 'hideResBulkReassign',
+    act_handover_pdf: 'hideShiftHandoverBtn',
+    act_res_columns: 'hideResColsToggle',
+    act_claim_reservation: ['hideResClaimBtns', 'hideDrawerClaimBtns'],
+    act_report_problem: 'hideDrawerReportProblemBtn',
+    act_customer_id_lookup: 'hideResCustomerIdLookupBtn',
+    act_delete_employee: 'hideEmployeesRowActions'
+  };
+
+  function isUiOptionHiddenForUser(roleOrUser, hideKey, uiContext) {
+    if (!roleOrUser || !hideKey) return false;
+    var key = normalizeStr(hideKey);
+    if (!key) return false;
+    var role = typeof roleOrUser === 'string' ? normalizeStr(roleOrUser) : normalizeStr(roleOrUser.role);
+    if (role === ROLES.DEVELOPER) return false;
+    var userObj = (roleOrUser && typeof roleOrUser === 'object') ? roleOrUser : { role: role, uiOverrides: {} };
+    var aliasKey = UI_FLAG_ALIASES[key] || '';
+    var empOv = normalizeUiOverrides(userObj.uiOverrides);
+
+    if (Object.prototype.hasOwnProperty.call(empOv.flags, key) && typeof empOv.flags[key] === 'boolean') {
+      return empOv.flags[key];
+    }
+    if (aliasKey && Object.prototype.hasOwnProperty.call(empOv.flags, aliasKey) && typeof empOv.flags[aliasKey] === 'boolean') {
+      return empOv.flags[aliasKey];
+    }
+    if (empOv.hiddenKeys.indexOf(key) !== -1 || (aliasKey && empOv.hiddenKeys.indexOf(aliasKey) !== -1)) {
+      return true;
+    }
+    if (empOv.shownKeys.indexOf(key) !== -1 || (aliasKey && empOv.shownKeys.indexOf(aliasKey) !== -1)) {
+      return false;
+    }
+
+    var globalHost = typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : null);
+    var activeUiCtx = (uiContext && typeof uiContext === 'object')
+      ? uiContext
+      : ((globalHost && globalHost.RGApp && typeof globalHost.RGApp.getActiveUiContext === 'function')
+          ? globalHost.RGApp.getActiveUiContext()
+          : null);
+
+    if (activeUiCtx && typeof activeUiCtx === 'object') {
+      var resolved = resolveRoleUiDefaultsForUser(userObj, activeUiCtx.roleUiDefaults, activeUiCtx.uiSimplification);
+      var eff = (resolved && resolved.uiSimplification) || {};
+      if (typeof eff[key] === 'boolean') return eff[key];
+      if (aliasKey && typeof eff[aliasKey] === 'boolean') return eff[aliasKey];
+    }
+
+    if (userObj._effectiveUi && typeof userObj._effectiveUi === 'object') {
+      if (typeof userObj._effectiveUi[key] === 'boolean') return userObj._effectiveUi[key];
+      if (aliasKey && typeof userObj._effectiveUi[aliasKey] === 'boolean') return userObj._effectiveUi[aliasKey];
+    }
+    return false;
+  }
+
+  function canUserViewDashboardSection(roleOrUser, permKey, uiContext) {
     if (!roleOrUser || !permKey) return false;
     var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
+    var uiHideKey = UI_DASHBOARD_HIDE_KEYS[permKey];
+    if (role !== ROLES.DEVELOPER && uiHideKey && isUiOptionHiddenForUser(roleOrUser, uiHideKey, uiContext)) {
+      return false;
+    }
     var allowed = resolveEffectivePermissions(roleOrUser);
     if (role !== ROLES.DEVELOPER && allowed.indexOf('view_dashboard') === -1) return false;
     var hasGranularConfig = allowed.indexOf('dash_perms_configured') !== -1 ||
@@ -2206,10 +2302,14 @@
     return true;
   }
 
-  function canUserViewRoute(roleOrUser, routeId) {
+  function canUserViewRoute(roleOrUser, routeId, uiContext) {
     if (!roleOrUser || !routeId) return false;
     var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
     if (role === ROLES.DEVELOPER) return NAV_ROUTE_IDS.indexOf(routeId) !== -1;
+    var uiHideKey = UI_ROUTE_HIDE_KEYS[routeId];
+    if (uiHideKey && isUiOptionHiddenForUser(roleOrUser, uiHideKey, uiContext)) {
+      return false;
+    }
     var allowed = resolveEffectivePermissions(roleOrUser);
     var hasSectionConfig = allowed.indexOf('perms_sections_configured') !== -1 ||
       SECTION_VIEW_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
@@ -2248,11 +2348,15 @@
     emp_presets: 'sub_view_emp_presets'
   };
 
-  function canUserViewSubSection(roleOrUser, subKey) {
+  function canUserViewSubSection(roleOrUser, subKey, uiContext) {
     if (!roleOrUser || !subKey) return false;
     var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
     if (role === ROLES.DEVELOPER) return true;
     var canonKey = SUBSECTION_KEY_ALIASES[subKey] || subKey;
+    var uiHideKey = UI_SUBSECTION_HIDE_KEYS[canonKey];
+    if (uiHideKey && isUiOptionHiddenForUser(roleOrUser, uiHideKey, uiContext)) {
+      return false;
+    }
     var allowed = resolveEffectivePermissions(roleOrUser);
     var allSubKeys = SUBSECTION_VIEW_PERMISSION_KEYS.concat(EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS);
     var hasSubConfig = allowed.indexOf('perms_subsections_configured') !== -1 ||
@@ -2263,10 +2367,19 @@
     return true;
   }
 
-  function canUserUseActionButton(roleOrUser, actionKey) {
+  function canUserUseActionButton(roleOrUser, actionKey, uiContext) {
     if (!roleOrUser || !actionKey) return false;
     var role = typeof roleOrUser === 'string' ? roleOrUser : (roleOrUser && roleOrUser.role);
     if (role === ROLES.DEVELOPER) return true;
+    var uiHideSpec = UI_ACTION_HIDE_KEYS[actionKey];
+    if (Array.isArray(uiHideSpec)) {
+      var allHidden = uiHideSpec.length > 0 && uiHideSpec.every(function (hk) {
+        return isUiOptionHiddenForUser(roleOrUser, hk, uiContext);
+      });
+      if (allHidden) return false;
+    } else if (uiHideSpec && isUiOptionHiddenForUser(roleOrUser, uiHideSpec, uiContext)) {
+      return false;
+    }
     var allowed = resolveEffectivePermissions(roleOrUser);
     var hasActionsConfig = allowed.indexOf('perms_actions_configured') !== -1 ||
       ACTION_BUTTON_PERMISSION_KEYS.some(function (k) { return allowed.indexOf(k) !== -1; });
@@ -2420,9 +2533,12 @@
     return out;
   }
 
-  function getEmployeeSectionVisibilitySummary(roleOrUser, optionalPerms) {
+  function getEmployeeSectionVisibilitySummary(roleOrUser, optionalPermsOrUiContext) {
+    var uiCtx = (optionalPermsOrUiContext && typeof optionalPermsOrUiContext === 'object' && !Array.isArray(optionalPermsOrUiContext))
+      ? optionalPermsOrUiContext
+      : null;
     var userObj = typeof roleOrUser === 'string'
-      ? { role: roleOrUser, permissions: Array.isArray(optionalPerms) ? optionalPerms : [] }
+      ? { role: roleOrUser, permissions: Array.isArray(optionalPermsOrUiContext) ? optionalPermsOrUiContext : [] }
       : (roleOrUser || { role: ROLES.AGENT, permissions: [] });
     var visibleMainCount = 0;
     var totalMainCount = EMPLOYEE_SECTION_GROUPS[0].items.length;
@@ -2436,22 +2552,22 @@
 
     for (var m = 0; m < EMPLOYEE_SECTION_GROUPS[0].items.length; m++) {
       var mItem = EMPLOYEE_SECTION_GROUPS[0].items[m];
-      if (canUserViewRoute(userObj, mItem.routeId)) visibleMainCount++;
+      if (canUserViewRoute(userObj, mItem.routeId, uiCtx)) visibleMainCount++;
       else hiddenKeys.push(mItem.key);
     }
     for (var s = 0; s < EMPLOYEE_SECTION_GROUPS[1].items.length; s++) {
       var sItem = EMPLOYEE_SECTION_GROUPS[1].items[s];
-      if (canUserViewSubSection(userObj, sItem.key)) visibleSubCount++;
+      if (canUserViewSubSection(userObj, sItem.key, uiCtx)) visibleSubCount++;
       else hiddenKeys.push(sItem.key);
     }
     for (var d = 0; d < EMPLOYEE_SECTION_GROUPS[2].items.length; d++) {
       var dItem = EMPLOYEE_SECTION_GROUPS[2].items[d];
-      if (canUserViewDashboardSection(userObj, dItem.key)) visibleDashCount++;
+      if (canUserViewDashboardSection(userObj, dItem.key, uiCtx)) visibleDashCount++;
       else hiddenKeys.push(dItem.key);
     }
     for (var a = 0; a < EMPLOYEE_SECTION_GROUPS[3].items.length; a++) {
       var aItem = EMPLOYEE_SECTION_GROUPS[3].items[a];
-      if (canUserUseActionButton(userObj, aItem.key)) visibleActionCount++;
+      if (canUserUseActionButton(userObj, aItem.key, uiCtx)) visibleActionCount++;
       else hiddenKeys.push(aItem.key);
     }
 
@@ -3387,6 +3503,7 @@
     var map = {};
     var order = [];
     var seenSrcByResNum = {};
+    var seenKeyBySrcId = {};
     var list = Array.isArray(items) ? items : [];
     for (var i = 0; i < list.length; i++) {
       var item = list[i];
@@ -3396,11 +3513,15 @@
       var normNum = rawNum.replace(/^#+/, '').trim();
       if (!normNum && !srcId) continue;
       var baseKey = normNum || srcId;
-      var finalKey = baseKey;
-      if (srcId && Object.prototype.hasOwnProperty.call(seenSrcByResNum, baseKey) && seenSrcByResNum[baseKey] && seenSrcByResNum[baseKey] !== srcId) {
+      var finalKey = (srcId && Object.prototype.hasOwnProperty.call(seenKeyBySrcId, srcId))
+        ? seenKeyBySrcId[srcId]
+        : baseKey;
+      if (finalKey === baseKey && srcId && Object.prototype.hasOwnProperty.call(seenSrcByResNum, baseKey) && seenSrcByResNum[baseKey] && seenSrcByResNum[baseKey] !== srcId) {
         finalKey = baseKey + '::' + srcId;
-      } else if (srcId && !seenSrcByResNum[baseKey]) {
-        seenSrcByResNum[baseKey] = srcId;
+      }
+      if (srcId) {
+        if (!seenKeyBySrcId[srcId]) seenKeyBySrcId[srcId] = finalKey;
+        if (!seenSrcByResNum[baseKey]) seenSrcByResNum[baseKey] = srcId;
       }
       if (!Object.prototype.hasOwnProperty.call(map, finalKey)) {
         order.push(finalKey);
@@ -3411,7 +3532,9 @@
         var prevKeys = Object.keys(prev || {});
         for (var pk = 0; pk < prevKeys.length; pk++) {
           var k = prevKeys[pk];
-          if ((merged[k] === undefined || merged[k] === null || merged[k] === '') && prev[k] !== undefined && prev[k] !== null && prev[k] !== '') {
+          var nextEmpty = (merged[k] === undefined || merged[k] === null || merged[k] === '' || (Array.isArray(merged[k]) && merged[k].length === 0));
+          var prevHas = (prev[k] !== undefined && prev[k] !== null && prev[k] !== '' && (!Array.isArray(prev[k]) || prev[k].length > 0));
+          if (nextEmpty && prevHas) {
             merged[k] = prev[k];
           }
         }
@@ -3419,6 +3542,51 @@
       }
     }
     return order.map(function (k) { return map[k]; });
+  }
+
+  function dedupeEmployeesList(items) {
+    var list = Array.isArray(items) ? items : [];
+    var realUsernames = {};
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i];
+      if (!row || typeof row !== 'object') continue;
+      var rid = normalizeStr(row.id);
+      if (!rid || rid.indexOf('EMP_OPT_') === 0) continue;
+      var uname = normalizeLoginUsername(row.username || '');
+      if (uname) realUsernames[uname] = true;
+    }
+    var byId = {};
+    var idByUsername = {};
+    var order = [];
+    for (var j = 0; j < list.length; j++) {
+      var emp = list[j];
+      if (!emp || typeof emp !== 'object') continue;
+      var eid = normalizeStr(emp.id);
+      if (!eid) continue;
+      var normUser = normalizeLoginUsername(emp.username || '');
+      if (eid.indexOf('EMP_OPT_') === 0 && normUser && realUsernames[normUser]) {
+        continue;
+      }
+      var targetId = eid;
+      if (normUser && Object.prototype.hasOwnProperty.call(idByUsername, normUser) && idByUsername[normUser].indexOf('EMP_OPT_') !== 0 && eid.indexOf('EMP_OPT_') !== 0) {
+        targetId = idByUsername[normUser];
+      }
+      if (!Object.prototype.hasOwnProperty.call(byId, targetId)) {
+        order.push(targetId);
+        byId[targetId] = emp;
+        if (normUser && !idByUsername[normUser]) {
+          idByUsername[normUser] = targetId;
+        }
+      } else {
+        var prevEmp = byId[targetId];
+        var mergedEmp = Object.assign({}, prevEmp, emp);
+        if (eid !== targetId && targetId.indexOf('EMP_OPT_') !== 0) {
+          mergedEmp.id = targetId;
+        }
+        byId[targetId] = mergedEmp;
+      }
+    }
+    return order.map(function (idKey) { return byId[idKey]; });
   }
 
   function dedupeExtensionsByNumber(items) {
@@ -8363,7 +8531,7 @@
     return spans;
   }
 
-  function getFirstAllowedRoute(user, layoutPrefs, candidateOrder) {
+  function getFirstAllowedRoute(user, layoutPrefs, candidateOrder, uiContext) {
     var lp = normalizeUserLayoutPrefs(layoutPrefs);
     var hiddenSet = {};
     for (var h = 0; h < lp.hiddenRoutes.length; h++) {
@@ -8372,7 +8540,7 @@
 
     function isAllowed(routeId) {
       if (!user || !routeId) return false;
-      return canUserViewRoute(user, routeId);
+      return canUserViewRoute(user, routeId, uiContext);
     }
 
     var searchOrder = [];
@@ -10046,6 +10214,12 @@
     extractCancellationReason: extractCancellationReason,
     extractReservationStatusCode: extractReservationStatusCode,
     extractExplicitReferenceNumber: extractExplicitReferenceNumber,
-    isProtectedRejectedOrCancelledItem: isProtectedRejectedOrCancelledItem
+    isProtectedRejectedOrCancelledItem: isProtectedRejectedOrCancelledItem,
+    UI_ROUTE_HIDE_KEYS: UI_ROUTE_HIDE_KEYS,
+    UI_SUBSECTION_HIDE_KEYS: UI_SUBSECTION_HIDE_KEYS,
+    UI_DASHBOARD_HIDE_KEYS: UI_DASHBOARD_HIDE_KEYS,
+    UI_ACTION_HIDE_KEYS: UI_ACTION_HIDE_KEYS,
+    isUiOptionHiddenForUser: isUiOptionHiddenForUser,
+    dedupeEmployeesList: dedupeEmployeesList
   };
 }));

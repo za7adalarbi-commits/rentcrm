@@ -1672,17 +1672,22 @@ html.rg-ui-hide-res-filters-extras .rg-res-core-filter-grid {
 
 .checkbox-item {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   font-size: 13px;
+  line-height: 1.4;
   cursor: pointer;
   color: var(--text-secondary);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .checkbox-item input[type="checkbox"] {
   accent-color: var(--brand-primary);
   width: 16px;
   height: 16px;
+  flex-shrink: 0;
+  margin-top: 2px;
   cursor: pointer;
 }
 
@@ -5981,7 +5986,11 @@ html.dark .rg-tz-line.is-eg .rg-tz-tag {
   user-select: none;
   font-size: 12.5px;
   font-weight: 600;
+  line-height: 1.35;
   color: var(--text-primary);
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .rg-switch-control {
@@ -6111,12 +6120,13 @@ html.dark .rg-tz-line.is-eg .rg-tz-tag {
   border-radius: var(--radius-sm);
   background: var(--bg-surface-subtle);
   padding: 12px;
+  min-width: 0;
 }
 
 .rg-esec-items-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
   margin-top: 10px;
 }
 
@@ -6124,11 +6134,13 @@ html.dark .rg-tz-line.is-eg .rg-tz-tag {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 8px 10px;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 9px 12px;
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-sm);
   background: var(--bg-surface);
+  min-width: 0;
 }
 
 /* ==========================================================================

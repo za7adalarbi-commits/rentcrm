@@ -522,7 +522,11 @@
       error: '',
       lastUpdatedAt: new Date().toISOString()
     };
-    if (Array.isArray(data.items)) nextPatch.items = data.items.slice();
+    if (Array.isArray(data.items)) {
+      nextPatch.items = (root.RGCrmCore && typeof root.RGCrmCore.dedupeEmployeesList === 'function')
+        ? root.RGCrmCore.dedupeEmployeesList(data.items)
+        : data.items.slice();
+    }
     if (data.rolePresets !== undefined) {
       nextPatch.rolePresets = (root.RGCrmCore && root.RGCrmCore.normalizeRolePresets)
         ? root.RGCrmCore.normalizeRolePresets(data.rolePresets)
@@ -652,6 +656,9 @@
       nextItems[foundIdx] = Object.assign({}, prevItems[foundIdx], employeeObj);
     } else {
       nextItems.push(employeeObj);
+    }
+    if (root.RGCrmCore && typeof root.RGCrmCore.dedupeEmployeesList === 'function') {
+      nextItems = root.RGCrmCore.dedupeEmployeesList(nextItems);
     }
     return setEmployeesState({
       items: nextItems,
@@ -790,6 +797,16 @@
       openCallWrapUpBar(lastOpenCallInfo);
     }
     return state.callWrapupShortcutsConfig;
+  }
+
+  function getActiveUiContext() {
+    var activeDefaults = (state.previewSession && state.previewSession.draftRoleUiDefaults)
+      ? state.previewSession.draftRoleUiDefaults
+      : state.roleUiDefaults;
+    return {
+      roleUiDefaults: activeDefaults || {},
+      uiSimplification: normalizeUiSimpFallback(state.uiSimplification)
+    };
   }
 
   function getEffectiveRoleUiResolution(userOverride) {
@@ -2050,6 +2067,7 @@
       getActiveCallWrapupShortcuts: getActiveCallWrapupShortcuts,
       mountCallShortcutsControlPanel: mountCallShortcutsControlPanel,
       openDeveloperCallShortcutsModal: openDeveloperCallShortcutsModal,
+      getActiveUiContext: getActiveUiContext,
       getEffectiveRoleUiResolution: getEffectiveRoleUiResolution,
       getRealUser: getRealUser,
       getPreviewState: getPreviewState,
@@ -3296,7 +3314,7 @@
       }
     }
     if (root.RGCrmCore && root.RGCrmCore.getFirstAllowedRoute) {
-      return root.RGCrmCore.getFirstAllowedRoute(user, lp);
+      return root.RGCrmCore.getFirstAllowedRoute(user, lp, undefined, getActiveUiContext());
     }
     return 'reservations';
   }
@@ -3384,7 +3402,7 @@
   function isNavRouteAllowedForUser(item, user) {
     if (!item || !user) return false;
     if (root.RGCrmCore && root.RGCrmCore.canUserViewRoute) {
-      return root.RGCrmCore.canUserViewRoute(user, item.id);
+      return root.RGCrmCore.canUserViewRoute(user, item.id, getActiveUiContext());
     }
     if (item.id === 'dashboard' && !root.RGCrmCore.canUserPerform(user, 'view_dashboard')) {
       return false;
@@ -4621,8 +4639,13 @@
         clearRouteFiltersStorage();
         state.notifications = { items: [], unreadCount: 0 };
         resetEmployeesState();
+        state.roleUiDefaults = {};
+        state.statsControlConfig = { excludedFromStatsEmployeeIds: [] };
         state.uiSimplification = normalizeUiSimpFallback({});
         clearUiSimplificationClasses();
+        if (root.RGApi && typeof root.RGApi.clearCache === 'function') {
+          try { await root.RGApi.clearCache(['*']); } catch (_cErr) {}
+        }
         await root.RGAuth.logout();
         renderLoginScreen();
       });
@@ -5180,6 +5203,9 @@
           var delEmpMap = {};
           d.deletedEmployeeIds.forEach(function (did) { if (did) delEmpMap[String(did)] = true; });
           mergedEmps = mergedEmps.filter(function (emp) { return emp && !delEmpMap[String(emp.id)]; });
+        }
+        if (root.RGCrmCore && typeof root.RGCrmCore.dedupeEmployeesList === 'function') {
+          mergedEmps = root.RGCrmCore.dedupeEmployeesList(mergedEmps);
         }
         setEmployeesState({
           items: mergedEmps,
@@ -5750,6 +5776,7 @@
     getStatsControlConfig: getStatsControlConfig,
     setStatsControlConfig: setStatsControlConfig,
     animateProgressiveReveal: animateProgressiveReveal,
+    getActiveUiContext: getActiveUiContext,
     getEffectiveRoleUiResolution: getEffectiveRoleUiResolution,
     getRealUser: getRealUser,
     getPreviewState: getPreviewState,

@@ -656,6 +656,40 @@
     display: grid;
     grid-template-columns: 1fr;
   }
+
+  #ef-permissions-grid,
+  .rg-esec-items-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .rg-esec-item-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .rg-esec-item-row .rg-switch-label {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .rg-stats-ctrl-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .rg-stats-ctrl-person {
+    min-width: 0;
+    flex-basis: auto;
+  }
+
+  .rg-stats-ctrl-toggles {
+    gap: 10px;
+  }
+
+  .checkbox-grid {
+    gap: 8px 12px;
+  }
 }
 
 @media print {

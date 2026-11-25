@@ -347,7 +347,7 @@
                   '<th>مشكلات</th>' +
                   '<th>آخر نشاط</th>' +
                   '<th>العملاء</th>' +
-                  (canManage ? '<th>الإجراءات</th>' : '') +
+                  ((canManage || canCustomizeUi) ? '<th>الإجراءات</th>' : '') +
                 '</tr>' +
               '</thead>' +
               '<tbody>' +
@@ -1833,6 +1833,15 @@
       }
 
       async function executeSaveEmployee() {
+        var empFormEl = document.getElementById('emp-form');
+        if (empFormEl && empFormEl.dataset.submitting === '1') return false;
+        if (empFormEl) empFormEl.dataset.submitting = '1';
+        var efSaveBtn = document.getElementById('ef-save-btn');
+        if (efSaveBtn) { efSaveBtn.disabled = true; efSaveBtn.setAttribute('aria-busy', 'true'); }
+        function releaseEmpFormLock() {
+          if (empFormEl && empFormEl.isConnected !== false) delete empFormEl.dataset.submitting;
+          if (efSaveBtn && efSaveBtn.isConnected !== false) { efSaveBtn.disabled = false; efSaveBtn.removeAttribute('aria-busy'); }
+        }
         var errEl = document.getElementById('emp-form-err');
         if (errEl) errEl.classList.add('hidden');
 
@@ -1866,21 +1875,25 @@
         if (!payload.name) {
           errEl.textContent = 'يرجى إدخال الاسم الكامل للموظف.';
           errEl.classList.remove('hidden');
+          releaseEmpFormLock();
           return false;
         }
         if (!payload.username) {
           errEl.textContent = 'اسم المستخدم مطلوب.';
           errEl.classList.remove('hidden');
+          releaseEmpFormLock();
           return false;
         }
         if (!isEdit && (!pwd || pwd.length < 6)) {
           errEl.textContent = 'اسم المستخدم وكلمة المرور (6 أحرف على الأقل) مطلوبان.';
           errEl.classList.remove('hidden');
+          releaseEmpFormLock();
           return false;
         }
         if (pwd && pwd.length < 6) {
           errEl.textContent = 'كلمة المرور يجب أن تكون 6 أحرف على الأقل.';
           errEl.classList.remove('hidden');
+          releaseEmpFormLock();
           return false;
         }
         if (isEdit) {
@@ -1895,6 +1908,7 @@
             [payload.employeeId || '', payload.username, payload.name, payload.role, selectedPerms.length, pwd ? 'pw' : ''].join('|');
           var empSpamCheck = root.RGApp.checkActionSpam(isEdit ? 'updateEmployee' : 'createEmployee', empSpamSig);
           if (!empSpamCheck.allowed) {
+            releaseEmpFormLock();
             return false;
           }
           payload._spamChecked = true;
@@ -1967,12 +1981,15 @@
           var newOptEmp = {
             id: 'EMP_OPT_' + Date.now(),
             name: payload.name,
-            username: payload.username,
+            username: (root.RGCrmCore && typeof root.RGCrmCore.normalizeLoginUsername === 'function')
+              ? root.RGCrmCore.normalizeLoginUsername(payload.username)
+              : String(payload.username || '').trim().toLowerCase(),
             phone: payload.phone,
             email: payload.email,
             jobTitle: payload.jobTitle || 'موظف خدمة العملاء',
             role: payload.role,
             permissions: selectedPerms,
+            uiOverrides: (existing && existing.uiOverrides) || {},
             status: 'active',
             reservationsCount: 0,
             followUpsCount: 0,
@@ -1992,6 +2009,9 @@
               if (typeof ctx.appState.removeEmployeeLocal === 'function') {
                 ctx.appState.removeEmployeeLocal(newOptEmp.id);
               }
+              if (root.RGApi && root.RGApi.invalidateScopes) {
+                root.RGApi.invalidateScopes(['employees']);
+              }
               ctx.toast((bgCreateRes && bgCreateRes.message) || 'تعذر إنشاء حساب الموظف على الخادم.', true);
               return;
             }
@@ -2005,25 +2025,32 @@
             if (typeof ctx.appState.removeEmployeeLocal === 'function') {
               ctx.appState.removeEmployeeLocal(newOptEmp.id);
             }
+            if (root.RGApi && root.RGApi.invalidateScopes) {
+              root.RGApi.invalidateScopes(['employees']);
+            }
             ctx.toast('تعذر الاتصال بالخادم أثناء إنشاء حساب الموظف.', true);
           });
           return true;
         }
 
-        var res = await root.RGApi.callApi(isEdit ? 'updateEmployee' : 'createEmployee', payload);
-        if (!res.success) {
-          errEl.textContent = res.message;
-          errEl.classList.remove('hidden');
-          return false;
+        try {
+          var res = await root.RGApi.callApi(isEdit ? 'updateEmployee' : 'createEmployee', payload);
+          if (!res.success) {
+            errEl.textContent = res.message;
+            errEl.classList.remove('hidden');
+            return false;
+          }
+          clearEmpGuard();
+          if (res.data && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
+            ctx.appState.upsertEmployeeInState(res.data);
+          }
+          ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
+          modalRoot.innerHTML = '';
+          if (onSaved) onSaved(res.data);
+          return true;
+        } finally {
+          releaseEmpFormLock();
         }
-        clearEmpGuard();
-        if (res.data && ctx && ctx.appState && typeof ctx.appState.upsertEmployeeInState === 'function') {
-          ctx.appState.upsertEmployeeInState(res.data);
-        }
-        ctx.toast(isEdit ? 'تم تحديث بيانات وصلاحيات الموظف.' : 'تم إنشاء حساب الموظف بالصلاحيات المحددة بنجاح.');
-        modalRoot.innerHTML = '';
-        if (onSaved) onSaved(res.data);
-        return true;
       }
 
       if (root.RGApp && typeof root.RGApp.setUnsavedGuard === 'function') {
@@ -2373,6 +2400,7 @@
       return;
     }
     var focusGroupId = (opts && opts.focusGroup) ? String(opts.focusGroup) : '';
+    var hasDoneInitialFocus = false;
 
     var employeesList = Array.isArray(allEmployees) && allEmployees.length
       ? allEmployees.slice()
@@ -2409,8 +2437,6 @@
     var activeEmpId = preferredEmp.id;
     var searchTerm = '';
     var draftPermsByEmpId = {};
-    var draftUiOverridesByEmpId = {};
-    var uiOptsList = (core && Array.isArray(core.UI_SIMPLIFICATION_OPTIONS)) ? core.UI_SIMPLIFICATION_OPTIONS : [];
     var initialStatsConfig = getStatsControlConfigFromApp(ctx);
     var excludedMap = {};
     initialStatsConfig.excludedFromStatsEmployeeIds.forEach(function (id) { excludedMap[id] = true; });
@@ -2426,66 +2452,25 @@
       return draftPermsByEmpId[emp.id];
     }
 
-    function getWorkingUiOverrides(emp) {
-      if (!emp) return {};
-      if (!draftUiOverridesByEmpId[emp.id]) {
-        draftUiOverridesByEmpId[emp.id] = (core && typeof core.normalizeUiOverrides === 'function')
-          ? core.normalizeUiOverrides(emp.uiOverrides || {})
-          : Object.assign({}, emp.uiOverrides || {});
-      }
-      return draftUiOverridesByEmpId[emp.id];
-    }
-
     function drawSectionsModal() {
+      var prevScrollEl = document.getElementById('esec-groups-scroll');
+      var savedScrollTop = prevScrollEl ? prevScrollEl.scrollTop : 0;
       var curEmp = employeesList.find(function (e) { return e.id === activeEmpId; }) || employeesList[0];
       activeEmpId = curEmp.id;
       var curPerms = getWorkingPerms(curEmp);
-      var curUiOv = getWorkingUiOverrides(curEmp);
-      var tempUser = { role: curEmp.role, permissions: curPerms, uiOverrides: curUiOv };
+      var tempUser = { role: curEmp.role, permissions: curPerms, uiOverrides: curEmp.uiOverrides || {} };
       var isDevTarget = curEmp.role === 'developer';
-      var isLockedTarget = isDevTarget;
+      var activeUiCtx = (root.RGApp && typeof root.RGApp.getActiveUiContext === 'function')
+        ? root.RGApp.getActiveUiContext()
+        : null;
       var summary = core && core.getEmployeeSectionVisibilitySummary
-        ? core.getEmployeeSectionVisibilitySummary(tempUser)
+        ? core.getEmployeeSectionVisibilitySummary(tempUser, activeUiCtx)
         : { totalVisible: 0, totalAvailable: 0 };
       var appearInStats = !excludedMap[curEmp.id];
       var canViewStats = core && core.canEmployeeViewStatistics
         ? core.canEmployeeViewStatistics(tempUser)
         : true;
       var q = String(searchTerm || '').trim().toLowerCase();
-
-      var filteredUiOpts = uiOptsList.filter(function (opt) {
-        if (!q) return true;
-        return (String(opt.labelAr || '') + ' ' + String(opt.labelEn || '') + ' ' + String(opt.key || '')).toLowerCase().indexOf(q) !== -1;
-      });
-      var ovActiveCount = uiOptsList.filter(function (opt) { return curUiOv[opt.key] !== undefined; }).length;
-      var uiOverridesCardHtml =
-        '<div class="rg-esec-group-card" data-esec-group="ui_overrides">' +
-          '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;">' +
-            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-              '<strong style="font-size:13.5px;color:var(--text-primary);">تخصيص واجهة الموظف الفردية (إظهار / إخفاء العناصر)</strong>' +
-              '<span class="status-tag status-info tabular-nums">' + ovActiveCount + ' تخصيص فردي</span>' +
-            '</div>' +
-            (!isLockedTarget ? '<button type="button" class="btn btn-sm" id="esec-restore-ui-btn">استعادة الافتراضي للموظف</button>' : '') +
-          '</div>' +
-          (filteredUiOpts.length === 0
-            ? '<div style="font-size:12px;color:var(--text-muted);">لا توجد عناصر واجهة مطابقة للبحث.</div>'
-            : '<div class="rg-esec-items-grid">' +
-                filteredUiOpts.map(function (opt) {
-                  var ovVal = curUiOv[opt.key] === true ? 'hide' : (curUiOv[opt.key] === false ? 'show' : 'inherit');
-                  return '<div class="rg-esec-item-row">' +
-                    '<div style="min-width:0;flex:1;">' +
-                      '<div style="font-size:12.5px;font-weight:600;color:var(--text-primary);line-height:1.35;">' + esc(opt.labelAr) + '</div>' +
-                      '<div class="mono" style="font-size:10.5px;color:var(--text-muted);" dir="ltr">' + esc(opt.key) + '</div>' +
-                    '</div>' +
-                    '<select class="select esec-ui-ov-sel" data-ui-key="' + esc(opt.key) + '"' + (isLockedTarget ? ' disabled' : '') + ' style="width:auto;min-width:130px;padding:4px 8px;min-height:32px;font-size:12px;">' +
-                      '<option value="inherit"' + (ovVal === 'inherit' ? ' selected' : '') + '>افتراضي الدور</option>' +
-                      '<option value="hide"' + (ovVal === 'hide' ? ' selected' : '') + '>إخفاء قسري</option>' +
-                      '<option value="show"' + (ovVal === 'show' ? ' selected' : '') + '>إظهار قسري</option>' +
-                    '</select>' +
-                  '</div>';
-                }).join('') +
-              '</div>') +
-        '</div>';
 
       var groupsHtml = groups.map(function (grp) {
         var filteredItems = grp.items.filter(function (it) {
@@ -2538,7 +2523,7 @@
             '<div class="modal-header">' +
               '<div>' +
                 '<h3 class="modal-title" id="esec-modal-title">' + (focusGroupId === 'table_actions' ? 'إظهار / إخفاء أزرار وإجراءات الجداول لكل موظف' : 'إظهار / إخفاء الأقسام وعناصر الواجهة لكل موظف') + '</h3>' +
-                '<p class="section-subtitle">تحكم دقيق في الصفحات الرئيسية، التبويبات الفرعية، تخصيصات الواجهة الفردية، وأزرار الجداول والتصدير بشكل مستقل لكل حساب.</p>' +
+                '<p class="section-subtitle">تحكم دقيق في الصفحات الرئيسية، التبويبات الفرعية، بطاقات لوحة التحكم، وأزرار الجداول والتصدير بشكل مستقل لكل حساب.</p>' +
               '</div>' +
               '<button type="button" class="btn btn-sm" id="esec-close-top" data-modal-close>إغلاق</button>' +
             '</div>' +
@@ -2588,7 +2573,6 @@
               '</div>'
             ) : '') +
             '<div id="esec-groups-scroll" style="display:flex;flex-direction:column;gap:12px;max-height:46vh;overflow-y:auto;padding-inline-end:4px;">' +
-              uiOverridesCardHtml +
               (groupsHtml || '<div class="empty-state" style="padding:18px;">لا توجد أقسام أو أزرار مطابقة لعبارة البحث.</div>') +
             '</div>' +
             '<div id="esec-err" class="form-error hidden" style="margin-top:10px;"></div>' +
@@ -2599,7 +2583,13 @@
           '</div>' +
         '</div>';
 
-      if (focusGroupId) {
+      var nextScrollEl = document.getElementById('esec-groups-scroll');
+      if (nextScrollEl && savedScrollTop > 0) {
+        nextScrollEl.scrollTop = savedScrollTop;
+      }
+
+      if (focusGroupId && !hasDoneInitialFocus) {
+        hasDoneInitialFocus = true;
         var targetGrpEl = modalRoot.querySelector('[data-esec-group="' + focusGroupId + '"]');
         if (targetGrpEl && typeof targetGrpEl.scrollIntoView === 'function') {
           setTimeout(function () {
@@ -2698,65 +2688,6 @@
         });
       });
 
-      modalRoot.querySelectorAll('.esec-ui-ov-sel').forEach(function (sel) {
-        sel.addEventListener('change', function () {
-          if (isLockedTarget) return;
-          var uiKey = sel.getAttribute('data-ui-key');
-          var val = sel.value;
-          var workingOv = Object.assign({}, getWorkingUiOverrides(curEmp));
-          var nextFlags = Object.assign({}, (workingOv.flags && typeof workingOv.flags === 'object') ? workingOv.flags : {});
-          var aliasKey = (core && core.UI_FLAG_ALIASES && core.UI_FLAG_ALIASES[uiKey]) || '';
-          if (val === 'hide') {
-            workingOv[uiKey] = true;
-            nextFlags[uiKey] = true;
-            if (aliasKey) { workingOv[aliasKey] = true; nextFlags[aliasKey] = true; }
-          } else if (val === 'show') {
-            workingOv[uiKey] = false;
-            nextFlags[uiKey] = false;
-            if (aliasKey) { workingOv[aliasKey] = false; nextFlags[aliasKey] = false; }
-          } else {
-            delete workingOv[uiKey];
-            delete nextFlags[uiKey];
-            if (aliasKey) { delete workingOv[aliasKey]; delete nextFlags[aliasKey]; }
-          }
-          workingOv.flags = nextFlags;
-          draftUiOverridesByEmpId[curEmp.id] = (core && typeof core.normalizeUiOverrides === 'function')
-            ? core.normalizeUiOverrides(workingOv)
-            : workingOv;
-          drawSectionsModal();
-        });
-      });
-
-      var restoreUiBtn = document.getElementById('esec-restore-ui-btn');
-      if (restoreUiBtn && !isLockedTarget) {
-        restoreUiBtn.addEventListener('click', function () {
-          runWithLock(restoreUiBtn, 'restoreEmpUi:' + curEmp.id, async function () {
-            var rRes = await root.RGApi.callApi('restoreUiDefaults', {
-              scope: 'employee',
-              employeeId: curEmp.id,
-              _spamChecked: true
-            });
-            if (!rRes || !rRes.success) {
-              if (ctx && ctx.toast) ctx.toast((rRes && rRes.message) || 'تعذر استعادة الافتراضي للموظف.', true);
-              return;
-            }
-            curEmp.uiOverrides = {};
-            draftUiOverridesByEmpId[curEmp.id] = {};
-            if (root.RGApp && typeof root.RGApp.upsertEmployeeInState === 'function') {
-              root.RGApp.upsertEmployeeInState(curEmp);
-            }
-            if (realActor && curEmp.id === realActor.id) {
-              var nextCur = Object.assign({}, realActor, { uiOverrides: {} });
-              if (root.RGAuth && typeof root.RGAuth.setUser === 'function') root.RGAuth.setUser(nextCur);
-              if (root.RGApp && typeof root.RGApp.applyUiSimplification === 'function') root.RGApp.applyUiSimplification(null, true);
-              if (root.RGApp && typeof root.RGApp.syncCurrentUserShell === 'function') root.RGApp.syncCurrentUserShell(nextCur);
-            }
-            if (ctx && ctx.toast) ctx.toast('تمت استعادة الإعدادات الافتراضية للواجهة لهذا الموظف.');
-            drawSectionsModal();
-          });
-        });
-      }
-
       var saveBtn = document.getElementById('esec-save-btn');
       if (saveBtn) {
         saveBtn.addEventListener('click', function () {
@@ -2773,14 +2704,7 @@
                 : (Array.isArray(tObj.permissions) ? tObj.permissions : []);
               return JSON.stringify(draftPermsByEmpId[id].slice().sort()) !== JSON.stringify(origPerms.slice().sort());
             });
-            var changedUiEmpIds = Object.keys(draftUiOverridesByEmpId).filter(function (id) {
-              var tObj = employeesList.find(function (e) { return e.id === id; });
-              if (!tObj || tObj.role === 'developer') return false;
-              var origOv = (core && typeof core.normalizeUiOverrides === 'function') ? core.normalizeUiOverrides(tObj.uiOverrides || {}) : (tObj.uiOverrides || {});
-              return JSON.stringify(draftUiOverridesByEmpId[id] || {}) !== JSON.stringify(origOv || {});
-            });
-
-            if (changedEmpIds.length === 0 && changedUiEmpIds.length === 0 && !statsChanged) {
+            if (changedEmpIds.length === 0 && !statsChanged) {
               ctx.toast('لم يتم تغيير أي أقسام أو إعدادات عن الوضع الحالي.');
               closeModal();
               return;
@@ -2815,29 +2739,6 @@
               }
             }
 
-            for (var uIdx = 0; uIdx < changedUiEmpIds.length; uIdx++) {
-              var uiEmpId = changedUiEmpIds[uIdx];
-              var uiTarget = employeesList.find(function (e) { return e.id === uiEmpId; });
-              if (!uiTarget || uiTarget.role === 'developer') continue;
-              var nextOv = draftUiOverridesByEmpId[uiEmpId] || {};
-              var ovRes = await root.RGApi.callApi('saveEmployeeUiOverrides', {
-                employeeId: uiTarget.id,
-                uiOverrides: nextOv,
-                _spamChecked: true
-              });
-              if (!ovRes || !ovRes.success) {
-                if (errEl) {
-                  errEl.textContent = (ovRes && ovRes.message) || 'تعذر حفظ تخصيصات الواجهة للموظف.';
-                  errEl.classList.remove('hidden');
-                }
-                return;
-              }
-              uiTarget.uiOverrides = nextOv;
-              if (root.RGApp && typeof root.RGApp.upsertEmployeeInState === 'function') {
-                root.RGApp.upsertEmployeeInState(Object.assign({}, uiTarget, { uiOverrides: nextOv }));
-              }
-            }
-
             if (statsChanged) {
               var nextStatsCfg = {
                 excludedFromStatsEmployeeIds: nextExcludedIds,
@@ -2866,19 +2767,18 @@
             }
             if (root.RGApp && realActor) {
               var updatedCur = employeesList.find(function (e) { return e.id === realActor.id; });
-              if (updatedCur && (draftPermsByEmpId[updatedCur.id] || draftUiOverridesByEmpId[updatedCur.id])) {
+              if (updatedCur && draftPermsByEmpId[updatedCur.id]) {
                 var syncedUser = Object.assign({}, updatedCur, {
-                  permissions: draftPermsByEmpId[updatedCur.id] || updatedCur.permissions,
-                  uiOverrides: draftUiOverridesByEmpId[updatedCur.id] || updatedCur.uiOverrides
+                  permissions: draftPermsByEmpId[updatedCur.id] || updatedCur.permissions
                 });
                 if (typeof root.RGApp.syncCurrentUserShell === 'function') root.RGApp.syncCurrentUserShell(syncedUser);
                 if (typeof root.RGApp.applyUiSimplification === 'function') root.RGApp.applyUiSimplification(null, true);
               }
             }
-            ctx.toast('تم حفظ إعدادات إظهار وإخفاء الأقسام والواجهة بنجاح.');
+            ctx.toast('تم حفظ إعدادات إظهار وإخفاء الأقسام بنجاح.');
             closeModal();
             if (onSaved) onSaved();
-          }, { spamAction: 'updateEmployee', spamSig: 'devSections:' + curEmp.id + ':' + (draftPermsByEmpId[curEmp.id] ? draftPermsByEmpId[curEmp.id].join(',') : '') + ':' + JSON.stringify(draftUiOverridesByEmpId[curEmp.id] || {}) });
+          }, { spamAction: 'updateEmployee', spamSig: 'devSections:' + curEmp.id + ':' + (draftPermsByEmpId[curEmp.id] ? draftPermsByEmpId[curEmp.id].join(',') : '') });
         });
       }
     }

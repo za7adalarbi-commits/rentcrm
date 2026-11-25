@@ -2402,9 +2402,13 @@
         if (actName === 'getEmployees' && Array.isArray(data.items)) {
           var exists = data.items.some(function (emp) { return emp && emp.id === newOptEmp.id; });
           if (exists) return undefined;
+          var nextEmpList = data.items.concat([newOptEmp]);
+          if (core && typeof core.dedupeEmployeesList === 'function') {
+            nextEmpList = core.dedupeEmployeesList(nextEmpList);
+          }
           return Object.assign({}, data, {
-            items: data.items.concat([newOptEmp]),
-            total: Number(data.total || data.items.length) + 1
+            items: nextEmpList,
+            total: nextEmpList.length
           });
         }
         return undefined;
@@ -2913,10 +2917,6 @@
         totalDaysCount: 3,
         originalStatusCode: 'cancelled',
         originalStatusAr: 'ملغي',
-        isSourceCancelled: true,
-        isSourceRejected: false,
-        cancellationReason: 'ألغى العميل الحجز قبل الموعد بـ 24 ساعة',
-        cancelledAt: t5 + 'T15:10:00.000Z',
         pickupTypeAr: 'توصيل للموقع',
         returnTypeAr: 'تسليم في الفرع',
         paymentMethod: 'مدى (Mada)',
@@ -2928,7 +2928,6 @@
         extensionsCount: 0,
         extensionsAmount: 0,
         totalAmount: 1050,
-        paidAmount: 1050,
         hasExtensions: false,
         internalStatus: 'تم الإلغاء',
         priority: 'عادي',
@@ -3162,121 +3161,118 @@
         sourceReservationId: '885101',
         reservationNumber: '885101',
         referenceNumber: 'RG-CAN-885101',
-        sourceCreatedAt: t2 + 'T08:30:00.000Z',
-        customerName: 'طارق فهد السديري',
-        customerPhone: '0554411229',
-        customerEmail: 't.alsudairi@example.sa',
-        customerIdNumber: '1092233445',
-        companyName: 'يلو (الوفاق)',
-        branchName: 'الرياض - المطار',
-        deliverBranchName: 'الرياض - المطار',
-        carName: 'كيا سبورتاج 2026',
-        carCategory: 'SUV متوسطة',
-        plateNumber: 'ب ن ر 5502',
+        sourceCreatedAt: t2 + 'T08:00:00.000Z',
+        customerName: 'طارق فهد السبيعي',
+        customerPhone: '0551122334',
+        customerEmail: 't.alsubaie@example.sa',
+        customerIdNumber: '1044556677',
+        companyName: 'ذيب لتأجير السيارات',
+        newCompanyName: '',
+        branchName: 'الرياض - حي الياسمين',
+        deliverBranchName: 'الرياض - حي الياسمين',
+        carName: 'تويوتا كامري 2026',
+        carCategory: 'سيدان متوسطة',
+        plateNumber: 'س ع ص 5511',
         startDate: t2,
-        startTime: '14:00',
+        startTime: '12:00',
         originalEndDate: t0,
-        originalEndTime: '14:00',
+        originalEndTime: '12:00',
         endDate: t0,
-        endTime: '14:00',
+        endTime: '12:00',
         extendedUntilDate: '',
         extendedUntilTime: '',
         daysCount: 2,
         extendedDaysCount: 0,
         totalDaysCount: 2,
-        originalStatusCode: 'cancelled_by_customer',
-        originalStatusAr: 'ملغي من العميل',
+        originalStatusCode: 'cancelled',
+        originalStatusAr: 'ملغي',
         isSourceRejected: false,
         isSourceCancelled: true,
-        cancellationReason: 'تغيير خطة السفر وتأجيل الرحلة',
-        deliveryFailureReason: '',
-        driverNotes: 'العميل أبلغ عبر الدعم قبل التحرك',
-        cancelledAt: t2 + 'T11:20:00.000Z',
-        pickupTypeAr: 'توصيل للمطار',
+        cancellationReason: 'تغيير خطة السفر من قبل العميل',
+        cancelledAt: t2 + 'T14:20:00.000Z',
+        cancelledByName: 'دعم المنصة',
+        pickupTypeAr: 'استلام من الفرع',
         returnTypeAr: 'تسليم في الفرع',
         paymentMethod: 'Apple Pay',
         paymentStatus: 'مسترد',
-        dailyPrice: 290,
+        dailyPrice: 240,
         discountAmount: 0,
-        vatAmount: 87,
-        baseAmount: 667,
+        vatAmount: 72,
+        baseAmount: 552,
         extensionsCount: 0,
         extensionsAmount: 0,
-        totalAmount: 667,
-        paidAmount: 667,
+        totalAmount: 552,
         hasExtensions: false,
-        internalStatus: 'ملغي من العميل',
+        internalStatus: 'تم الإلغاء',
         priority: 'عادي',
-        assignedEmployeeIds: [],
-        assignedEmployeeNames: [],
-        lastUpdateText: 'تم إلغاء الحجز من العميل في المنصة',
-        lastUpdatedById: 'EMP_ADMIN',
-        lastUpdatedByName: 'Rental Gate API',
-        lastUpdatedAt: t2 + 'T11:20:00.000Z',
+        assignedEmployeeIds: ['EMP_AG2'],
+        assignedEmployeeNames: ['نورة القحطاني'],
+        lastUpdateText: 'تم إلغاء الحجز حسب طلب العميل',
+        lastUpdatedById: 'EMP_AG2',
+        lastUpdatedByName: 'نورة القحطاني',
+        lastUpdatedAt: t2 + 'T14:20:00.000Z',
         hasProblem: false,
-        createdAt: t2 + 'T08:30:00.000Z',
-        updatedAt: t2 + 'T11:20:00.000Z'
+        createdAt: t2 + 'T08:00:00.000Z',
+        updatedAt: t2 + 'T14:20:00.000Z'
       },
       {
         id: 'RES_1012',
         sourceReservationId: '885201',
         reservationNumber: '885201',
         referenceNumber: '',
-        sourceCreatedAt: t1 + 'T12:15:00.000Z',
-        customerName: 'ماهر سعود البقمي',
-        customerPhone: '0567788001',
-        customerEmail: 'm.albaqami@example.sa',
-        customerIdNumber: '1054433221',
-        companyName: 'المفتاح لتأجير السيارات',
-        newCompanyName: '',
-        branchName: 'الدمام - حي الشاطئ',
-        deliverBranchName: 'الدمام - حي الشاطئ',
-        carName: 'تويوتا كامري 2026',
-        carCategory: 'سيدان متوسطة',
-        plateNumber: 'س ع ص 3319',
+        sourceCreatedAt: t1 + 'T07:30:00.000Z',
+        customerName: 'ماجد ناصر الشهري',
+        customerPhone: '0502233445',
+        customerEmail: 'm.alshehri@example.sa',
+        customerIdNumber: '1055667788',
+        companyName: 'مفتاح لتأجير السيارات',
+        newCompanyName: 'ذيب لتأجير السيارات',
+        branchName: 'الخبر - الكورنيش',
+        deliverBranchName: 'الخبر - الكورنيش',
+        carName: 'كيا سبورتاج 2026',
+        carCategory: 'SUV مدمجة',
+        plateNumber: 'ق ر ش 8852',
         startDate: t1,
-        startTime: '16:00',
+        startTime: '09:30',
         originalEndDate: t0,
-        originalEndTime: '16:00',
+        originalEndTime: '09:30',
         endDate: t0,
-        endTime: '16:00',
+        endTime: '09:30',
         extendedUntilDate: '',
         extendedUntilTime: '',
         daysCount: 1,
         extendedDaysCount: 0,
         totalDaysCount: 1,
-        originalStatusCode: 'rejected_by_provider',
-        originalStatusAr: 'مرفوض من المزود',
+        originalStatusCode: 'rejected',
+        originalStatusAr: 'مرفوض',
         isSourceRejected: true,
         isSourceCancelled: false,
-        rejectionReason: 'المركبة تحت الصيانة الدورية',
-        refundAmount: 320,
-        rejectedAt: t1 + 'T13:10:00.000Z',
-        rejectedByName: 'إدارة التشغيل',
+        rejectionReason: 'العميل لم يستوفِ شروط العمر أو الرخصة',
+        rejectedAt: t1 + 'T10:15:00.000Z',
+        rejectedByName: 'مشرف الفرع',
         pickupTypeAr: 'استلام من الفرع',
         returnTypeAr: 'تسليم في الفرع',
         paymentMethod: 'مدى (Mada)',
         paymentStatus: 'مسترد',
-        dailyPrice: 278.26,
+        dailyPrice: 280,
         discountAmount: 0,
-        vatAmount: 41.74,
-        baseAmount: 320,
+        vatAmount: 42,
+        baseAmount: 322,
         extensionsCount: 0,
         extensionsAmount: 0,
-        totalAmount: 320,
-        paidAmount: 320,
+        totalAmount: 322,
         hasExtensions: false,
-        internalStatus: 'مرفوض من المزود',
+        internalStatus: 'مرفوض',
         priority: 'عادي',
-        assignedEmployeeIds: [],
-        assignedEmployeeNames: [],
-        lastUpdateText: 'المركبة تحت الصيانة الدورية',
+        assignedEmployeeIds: ['EMP_AG1'],
+        assignedEmployeeNames: ['خالد الحربي'],
+        lastUpdateText: 'العميل لم يستوفِ شروط العمر أو الرخصة',
         lastUpdatedById: 'EMP_SUP1',
         lastUpdatedByName: 'سارة العتيبي',
-        lastUpdatedAt: t1 + 'T13:10:00.000Z',
+        lastUpdatedAt: t1 + 'T10:15:00.000Z',
         hasProblem: false,
-        createdAt: t1 + 'T12:15:00.000Z',
-        updatedAt: t1 + 'T13:10:00.000Z'
+        createdAt: t1 + 'T07:30:00.000Z',
+        updatedAt: t1 + 'T10:15:00.000Z'
       }
     ];
 
@@ -3630,7 +3626,6 @@
     return {
       _schemaV3ExactRg: true,
       _schemaV4Ops: true,
-      _schemaV5LifecycleRefFix: true,
       employees: employees,
       reservations: reservations,
       extensions: extensions,
@@ -3814,65 +3809,6 @@
           if (resRec.pinnedNoteByName === undefined) { resRec.pinnedNoteByName = ''; dirty = true; }
           if (resRec.pinnedNoteUpdatedAt === undefined) { resRec.pinnedNoteUpdatedAt = ''; dirty = true; }
           if (resRec.noAnswerCount === undefined) { resRec.noAnswerCount = 0; dirty = true; }
-        });
-
-        var coreMigrate = root.RGCrmCore;
-        if (!parsed._schemaV5LifecycleRefFix) {
-          var defByIdV5 = {};
-          defaults.reservations.forEach(function (dr) { if (dr && dr.id) defByIdV5[dr.id] = dr; });
-          ['RES_1006', 'RES_1010'].forEach(function (patchId) {
-            var targetSeed = parsed.reservations.find(function (r) { return r && r.id === patchId; });
-            var defSeed = defByIdV5[patchId];
-            if (targetSeed && defSeed) {
-              if (defSeed.referenceNumber && targetSeed.reservationNumber === defSeed.referenceNumber) {
-                targetSeed.reservationNumber = defSeed.reservationNumber;
-                targetSeed.referenceNumber = defSeed.referenceNumber;
-                dirty = true;
-              } else if (!targetSeed.referenceNumber || targetSeed.referenceNumber === targetSeed.reservationNumber || targetSeed.referenceNumber === targetSeed.sourceReservationId) {
-                targetSeed.referenceNumber = defSeed.referenceNumber || '';
-                dirty = true;
-              }
-              if (patchId === 'RES_1006') {
-                if (!targetSeed.cancellationReason) { targetSeed.cancellationReason = defSeed.cancellationReason; dirty = true; }
-                if (!targetSeed.cancelledAt) { targetSeed.cancelledAt = defSeed.cancelledAt; dirty = true; }
-                if (!targetSeed.paidAmount) { targetSeed.paidAmount = defSeed.paidAmount; dirty = true; }
-                if (targetSeed.isSourceCancelled === undefined) { targetSeed.isSourceCancelled = true; dirty = true; }
-              }
-            }
-          });
-          ['RES_1011', 'RES_1012'].forEach(function (extraId) {
-            if (!parsed.reservations.some(function (r) { return r && r.id === extraId; }) && defByIdV5[extraId]) {
-              parsed.reservations.push(defByIdV5[extraId]);
-              dirty = true;
-            }
-          });
-          parsed._schemaV5LifecycleRefFix = true;
-          dirty = true;
-        }
-
-        parsed.reservations.forEach(function (resRec) {
-          if (!resRec || typeof resRec !== 'object') return;
-          var isProtSb = Boolean(
-            resRec.isSourceRejected === true ||
-            resRec.isSourceCancelled === true ||
-            (coreMigrate && coreMigrate.classifyReservationLifecycle && coreMigrate.classifyReservationLifecycle(resRec) !== 'active')
-          );
-          if (!isProtSb) return;
-          var curNumSb = String(resRec.reservationNumber || '').trim();
-          var curRefSb = String(resRec.referenceNumber || '').trim();
-          var srcIdSb = String(resRec.sourceReservationId || '').trim();
-          if (curRefSb && (curRefSb === curNumSb || (srcIdSb && curRefSb === srcIdSb))) {
-            if (srcIdSb && curNumSb === curRefSb && curNumSb !== srcIdSb) {
-              resRec.reservationNumber = srcIdSb;
-              resRec.referenceNumber = curRefSb;
-            } else if (srcIdSb && curRefSb === srcIdSb && curNumSb && curNumSb !== srcIdSb) {
-              resRec.reservationNumber = srcIdSb;
-              resRec.referenceNumber = curNumSb;
-            } else {
-              resRec.referenceNumber = '';
-            }
-            dirty = true;
-          }
         });
       }
 
@@ -4096,6 +4032,28 @@
       return { success: false, message: authErr.message, data: null, error: authErr.message };
     }
 
+    var sbUiContext = {
+      roleUiDefaults: (core && core.normalizeRoleUiDefaults) ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults) : (db.settings.role_ui_defaults || {}),
+      uiSimplification: (core && core.normalizeUiSimplificationSettings) ? core.normalizeUiSimplificationSettings(db.settings.ui_simplification) : (db.settings.ui_simplification || {})
+    };
+    function sbForbidden(msg) {
+      return {
+        success: false,
+        message: 'FORBIDDEN: ' + (msg || 'ليس لديك صلاحية تنفيذ هذا الإجراء أو عرض هذا القسم.'),
+        data: null,
+        error: 'FORBIDDEN'
+      };
+    }
+    function sbCanRoute(routeId) {
+      return !core || !core.canUserViewRoute || core.canUserViewRoute(session.user, routeId, sbUiContext);
+    }
+    function sbCanSub(subKey) {
+      return !core || !core.canUserViewSubSection || core.canUserViewSubSection(session.user, subKey, sbUiContext);
+    }
+    function sbCanAct(actKey) {
+      return !core || !core.canUserUseActionButton || core.canUserUseActionButton(session.user, actKey, sbUiContext);
+    }
+
     switch (action) {
       case 'logout': {
         db.sessions.forEach(function (s) { if (s.token === token) s.isRevoked = true; });
@@ -4108,20 +4066,37 @@
         var meNormLayout = (core && core.normalizeUserLayoutPrefs)
           ? core.normalizeUserLayoutPrefs(meLayout)
           : { navOrder: [], hiddenRoutes: [], dashOrder: [], dashHidden: [] };
-        return { success: true, message: '', data: { user: session.user, layoutPrefs: meNormLayout }, error: null };
+        var meStatsCtrl = (core && core.normalizeStatsControlConfig)
+          ? core.normalizeStatsControlConfig(db.settings.stats_control_config)
+          : { excludedFromStatsEmployeeIds: [] };
+        return {
+          success: true,
+          message: '',
+          data: {
+            user: session.user,
+            layoutPrefs: meNormLayout,
+            uiSimplification: sbUiContext.uiSimplification,
+            roleUiDefaults: sbUiContext.roleUiDefaults,
+            statsControlConfig: meStatsCtrl
+          },
+          error: null
+        };
       }
 
       case 'getAppBootstrap': {
-        var bsDash = sandboxExecute('getDashboard', token, payload && payload.range ? payload : { range: '30d' });
+        var bsDash = sbCanRoute('dashboard')
+          ? sandboxExecute('getDashboard', token, payload && payload.range ? payload : { range: '30d' })
+          : { success: false, data: null };
         var bsNotif = sandboxExecute('getNotifications', token, {});
-        var bsEmp = sandboxExecute('getEmployees', token, {});
-        var bsPrb = sandboxExecute('getProblems', token, {});
-        var uiSimpBoot = core && core.normalizeUiSimplificationSettings
-          ? core.normalizeUiSimplificationSettings(db.settings.ui_simplification)
-          : (db.settings.ui_simplification || { preset: 'full' });
-        var roleUiDefaultsBoot = core && core.normalizeRoleUiDefaults
-          ? core.normalizeRoleUiDefaults(db.settings.role_ui_defaults)
-          : {};
+        var bsEmp = (core.canUserPerform(session.user, 'view_employees') && sbCanRoute('employees')) ||
+            sbCanRoute('reservations') || sbCanRoute('problems') || sbCanRoute('team-followups')
+          ? sandboxExecute('getEmployees', token, {})
+          : { success: false, data: { items: [], total: 0 } };
+        var bsPrb = sbCanRoute('problems')
+          ? sandboxExecute('getProblems', token, {})
+          : { success: false, data: { items: [], total: 0 } };
+        var uiSimpBoot = sbUiContext.uiSimplification;
+        var roleUiDefaultsBoot = sbUiContext.roleUiDefaults;
         var statsControlBoot = core && core.normalizeStatsControlConfig
           ? core.normalizeStatsControlConfig(db.settings.stats_control_config)
           : { excludedFromStatsEmployeeIds: [] };
@@ -4163,6 +4138,9 @@
       }
 
       case 'getDashboard': {
+        if (!sbCanRoute('dashboard')) {
+          return sbForbidden('ليس لديك صلاحية عرض لوحة التحكم.');
+        }
         var rangeKey = payload.range || payload.datePreset || '30d';
         var todayStr = /^\d{4}-\d{2}-\d{2}$/.test(String(payload.todayDate || ''))
           ? String(payload.todayDate)
@@ -4216,6 +4194,9 @@
       }
 
       case 'getTodayAndRadar': {
+        if (!payload.summaryOnly && !sbCanRoute('reservations')) {
+          return sbForbidden('ليس لديك صلاحية عرض الحجوزات.');
+        }
         var trTodayStr = /^\d{4}-\d{2}-\d{2}$/.test(String(payload.todayDate || ''))
           ? String(payload.todayDate)
           : todayIso(0);
@@ -4281,6 +4262,9 @@
       }
 
       case 'syncLocalCache': {
+        if (!sbCanRoute('reservations')) {
+          return sbForbidden('ليس لديك صلاحية عرض الحجوزات.');
+        }
         var restrictSyncAgent = session.role === 'agent' && db.settings.allow_agent_view_all === false && !core.canUserPerform(session.user, 'view_all_reservations');
         var followedLocalSet = {};
         db.followUps.forEach(function (f) {
@@ -4308,6 +4292,19 @@
       }
 
       case 'getReservations': {
+        if (!sbCanRoute('reservations')) {
+          return sbForbidden('ليس لديك صلاحية عرض الحجوزات.');
+        }
+        var reqLifecycleSb = String(((payload || {}).lifecycle) || 'active').toLowerCase();
+        if (reqLifecycleSb === 'rejected' && !sbCanSub('sub_view_rejected_tab')) {
+          return sbForbidden('ليس لديك صلاحية عرض تبويب الحجوزات المرفوضة.');
+        }
+        if (reqLifecycleSb === 'cancelled' && !sbCanSub('sub_view_cancelled_tab')) {
+          return sbForbidden('ليس لديك صلاحية عرض تبويب الحجوزات الملغاة.');
+        }
+        if (reqLifecycleSb === 'inactive' && !sbCanSub('sub_view_rejected_tab') && !sbCanSub('sub_view_cancelled_tab')) {
+          return sbForbidden('ليس لديك صلاحية عرض الحجوزات المرفوضة أو الملغاة.');
+        }
         var companies = {};
         var branches = {};
         db.reservations.forEach(function (r) {
@@ -4353,6 +4350,9 @@
       }
 
       case 'getReservationDetails': {
+        if (!sbCanRoute('reservations') && !sbCanRoute('my-followups') && !sbCanRoute('team-followups') && !sbCanRoute('problems')) {
+          return sbForbidden('ليس لديك صلاحية عرض تفاصيل الحجز.');
+        }
         var res = db.reservations.find(function (r) {
           return r.id === payload.reservationId || r.reservationNumber === payload.reservationNumber;
         });
@@ -4470,6 +4470,9 @@
       }
 
       case 'claimReservation': {
+        if (!core.canUserPerform(session.user, 'claim_reservation') || !sbCanAct('act_claim_reservation')) {
+          return sbForbidden('ليس لديك صلاحية استلام الحجز.');
+        }
         var rClm = db.reservations.find(function (r) { return r.id === payload.reservationId; });
         if (!rClm) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
         var clmRes = core.claimReservationRecord(rClm, session.user);
@@ -4497,6 +4500,9 @@
       }
 
       case 'unclaimReservation': {
+        if (!core.canUserPerform(session.user, 'unclaim_reservation') || !sbCanAct('act_claim_reservation')) {
+          return sbForbidden('ليس لديك صلاحية إلغاء استلام الحجز.');
+        }
         var rUnc = db.reservations.find(function (r) { return r.id === payload.reservationId; });
         if (!rUnc) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
         var uncRes = core.unclaimReservationRecord(rUnc, session.employeeId);
@@ -4940,6 +4946,9 @@
       }
 
       case 'getMyFollowUps': {
+        if (!sbCanRoute('my-followups')) {
+          return sbForbidden('ليس لديك صلاحية عرض متابعاتي.');
+        }
         var myMentionFus = (core && core.filterMentionFollowUps)
           ? core.filterMentionFollowUps(db.followUps, session.user, db.employees)
           : [];
@@ -4961,6 +4970,9 @@
       }
 
       case 'getTeamFollowUps': {
+        if (!sbCanRoute('team-followups')) {
+          return sbForbidden('ليس لديك صلاحية عرض متابعات الفريق.');
+        }
         var teamFus = (core && core.filterTeamFollowUpsList)
           ? core.filterTeamFollowUpsList(db.followUps, payload)
           : db.followUps.filter(function (f) {
@@ -5137,8 +5149,9 @@
       }
 
       case 'deleteProblem': {
-        if (!core.canUserPerform(session.user, 'update_problem') ||
-            (core.canUserUseActionButton && !core.canUserUseActionButton(session.user, 'act_close_delete_ticket'))) {
+        if (!sbCanRoute('problems') ||
+            !core.canUserPerform(session.user, 'update_problem') ||
+            (core.canUserUseActionButton && !core.canUserUseActionButton(session.user, 'act_close_delete_ticket', sbUiContext))) {
           return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية حذف التذاكر والمشكلات.', data: null, error: 'FORBIDDEN' };
         }
         var delPrbIdSb = String(payload.problemId || payload.id || '').trim();
@@ -5191,6 +5204,9 @@
       }
 
       case 'getProblems': {
+        if (!sbCanRoute('problems')) {
+          return sbForbidden('ليس لديك صلاحية عرض المشكلات والتذاكر.');
+        }
         var filteredPrbs = (core && core.filterProblemsList)
           ? core.filterProblemsList(db.problems, payload)
           : db.problems.filter(function (p) {
@@ -5208,6 +5224,9 @@
       }
 
       case 'getProblemDetails': {
+        if (!sbCanRoute('problems')) {
+          return sbForbidden('ليس لديك صلاحية عرض تفاصيل المشكلة.');
+        }
         var pidTarget = String(payload.problemId || payload.problemNumber || '').trim();
         var foundPrb = db.problems.find(function (p) {
           return p.id === pidTarget || p.problemNumber === pidTarget;
@@ -5228,7 +5247,12 @@
       }
 
       case 'getEmployees': {
-        if (!core.canUserPerform(session.user, 'view_employees')) {
+        var canFullEmpView = core.canUserPerform(session.user, 'view_employees') && sbCanRoute('employees');
+        if (!canFullEmpView) {
+          var canEmpDirectory = sbCanRoute('reservations') || sbCanRoute('problems') || sbCanRoute('team-followups') || sbCanRoute('reports');
+          if (!canEmpDirectory) {
+            return sbForbidden('ليس لديك صلاحية عرض قائمة الموظفين.');
+          }
           var dirRows = db.employees
             .filter(function (e) { return e && String(e.status || 'active').toLowerCase() === 'active'; })
             .map(function (e) {
@@ -5630,6 +5654,9 @@
       }
 
       case 'getActivityLogs': {
+        if (!sbCanRoute('activity')) {
+          return sbForbidden('ليس لديك صلاحية عرض سجل النشاطات.');
+        }
         var logs = db.activityLog.filter(function (l) {
           if (!core.canUserPerform(session.user, 'view_all_logs') && l.userId !== session.employeeId) return false;
           if (payload.userId && l.userId !== payload.userId) return false;
@@ -5695,7 +5722,7 @@
           if (!core.canAccessApi(session.user) || !core.canUserPerform(session.user, 'sync_data')) {
             return { success: false, message: 'FORBIDDEN: صلاحيات API مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
           }
-        } else if (!core.canUserPerform(session.user, 'pull_reservations')) {
+        } else if (!core.canUserPerform(session.user, 'pull_reservations') || !sbCanAct('act_pull_reservations')) {
           return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية سحب الحجوزات.', data: null, error: 'FORBIDDEN' };
         }
 
@@ -5942,8 +5969,14 @@
       }
 
       case 'getReports': {
+        if (!sbCanRoute('reports')) {
+          return sbForbidden('ليس لديك صلاحية عرض التقارير.');
+        }
         var rType = payload.reportType || 'all_reservations';
         if (payload.logExport) {
+          if (!core.canUserPerform(session.user, 'export_reports') || (!sbCanAct('act_export_excel') && !sbCanAct('act_export_pdf'))) {
+            return sbForbidden('ليس لديك صلاحية تصدير التقارير.');
+          }
           appendSandboxActivity(db, session.user, 'تصدير تقرير', 'Report', rType, 'تصدير تقرير: ' + rType);
           saveSandboxDb(db);
         }
@@ -6300,7 +6333,7 @@
       }
 
       case 'importReservationsFromExcel': {
-        if (!core.canUserPerform(session.user, 'pull_reservations') && !core.canUserPerform(session.user, 'manage_settings')) {
+        if ((!core.canUserPerform(session.user, 'pull_reservations') && !core.canUserPerform(session.user, 'manage_settings')) || !sbCanAct('act_import_excel')) {
           return { success: false, message: 'FORBIDDEN: لا تملك صلاحية استيراد الحجوزات.', data: null, error: 'FORBIDDEN' };
         }
         var rawImportRows = Array.isArray(payload && payload.rows) ? payload.rows : [];
@@ -6634,7 +6667,7 @@
       }
 
       case 'bulkReassignEmployeeReservations': {
-        if (!core.canUserPerform(session.user, 'assign_employees')) {
+        if (!core.canUserPerform(session.user, 'assign_employees') || !sbCanAct('act_bulk_reassign')) {
           return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية تحويل الحجوزات.', data: null, error: 'FORBIDDEN' };
         }
         var fromId = String(payload.fromEmployeeId || '').trim();
@@ -6742,7 +6775,7 @@
       }
 
       case 'bulkReassignSelectedReservations': {
-        if (!core.canUserPerform(session.user, 'assign_employees')) {
+        if (!core.canUserPerform(session.user, 'assign_employees') || !sbCanAct('act_bulk_reassign')) {
           return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إعادة توزيع الحجوزات.', data: null, error: 'FORBIDDEN' };
         }
         var selResIds = Array.isArray(payload.reservationIds)
@@ -6871,7 +6904,7 @@
       }
 
       case 'searchCustomerByNationalId': {
-        if (!core.canUserViewCustomerId || !core.canUserViewCustomerId(session.user)) {
+        if (!core.canUserViewCustomerId || !core.canUserViewCustomerId(session.user) || !sbCanAct('act_customer_id_lookup')) {
           return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية البحث برقم الهوية.', data: null, error: 'FORBIDDEN' };
         }
         var rawNat = String(payload.nationalId || payload.customerIdNumber || payload.query || '').trim();
@@ -7235,7 +7268,10 @@
             if (delEmpIds.length > 0) {
               nextItems = nextItems.filter(function (emp) { return emp && !delEmpMap[String(emp.id)]; });
             }
-            return Object.assign({}, data, { items: nextItems });
+            if (typeof core.dedupeEmployeesList === 'function') {
+              nextItems = core.dedupeEmployeesList(nextItems);
+            }
+            return Object.assign({}, data, { items: nextItems, total: nextItems.length });
           }
           return undefined;
         });
@@ -8015,7 +8051,7 @@
           var skipOptimisticClear = payload && payload._keepOptimisticCache;
           if (skipOptimisticClear) {
             var secondaryOnly = invScopes.filter(function (s) {
-              return s === 'dashboard' || s === 'todayRadar' || s === 'reports' || s === 'activity' || s === 'employees' || (action === 'deleteProblem' && s === 'notifications');
+              return s === 'dashboard' || s === 'todayRadar' || s === 'reports' || s === 'activity' || (action !== 'createEmployee' && s === 'employees') || (action === 'deleteProblem' && s === 'notifications');
             });
             if (secondaryOnly.length > 0) pendingIdbOps.push(clearCache(secondaryOnly));
             if (action === 'createProblem' && parsed.data && parsed.data.id) {
@@ -8042,6 +8078,18 @@
                 }
                 if (actName === 'getProblemDetails' && data.problem && data.problem.id === parsed.data.id) {
                   return Object.assign({}, data, { problem: Object.assign({}, data.problem, parsed.data) });
+                }
+                return undefined;
+              });
+            }
+            if (action === 'createEmployee' && parsed.data && parsed.data.id) {
+              patchCachedScopes(['employees'], function (data, actName) {
+                if (actName === 'getEmployees' && Array.isArray(data.items)) {
+                  var cleaned = data.items.concat([parsed.data]);
+                  if (typeof core.dedupeEmployeesList === 'function') {
+                    cleaned = core.dedupeEmployeesList(cleaned);
+                  }
+                  return Object.assign({}, data, { items: cleaned, total: cleaned.length });
                 }
                 return undefined;
               });

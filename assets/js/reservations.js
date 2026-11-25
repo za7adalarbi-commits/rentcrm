@@ -30,7 +30,6 @@
 
   var REJECTED_COLUMNS = [
     { key: 'reservationNumber', label: 'رقم الحجز', sortable: true },
-    { key: 'referenceNumber', label: 'الرقم المرجعي', sortable: true },
     { key: 'customerName', label: 'اسم العميل', sortable: true },
     { key: 'companyName', label: 'الشركة', sortable: true },
     { key: 'newCompanyName', label: 'الشركة الجديدة', sortable: false },
@@ -650,7 +649,7 @@
                   : ('لا توجد نتائج مطابقة للبحث «' + esc(cleanSearchEmpty) + '». <button type="button" class="btn btn-sm" id="res-empty-clear-search">مسح البحث</button>'))
               : (isEn ? 'No bookings match the current filters.' : 'لا توجد حجوزات مطابقة للفلاتر الحالية.')) +
           '</div>'
-        : '<div class="table-wrap' + (isDedicatedSchema ? (' rg-lifecycle-table-wrap is-' + state.viewMode + '-wrap') : '') + '"' + (isDedicatedSchema ? (' data-res-view="' + esc(state.viewMode) + '"') : '') + '><table class="data-table' + (isDedicatedSchema ? (' rg-lifecycle-table is-' + state.viewMode + '-table') : '') + '"><thead><tr>' +
+        : '<div class="table-wrap' + (isDedicatedSchema ? ' rg-lifecycle-table-wrap' : '') + '"><table class="data-table' + (isDedicatedSchema ? ' rg-lifecycle-table' : '') + '"><thead><tr>' +
             (showBulkCol ? '<th class="res-bulk-th rg-ui-res-bulk"><input type="checkbox" id="res-bulk-select-all" aria-label="' + (isEn ? 'Select all on page' : 'تحديد كل الحجوزات في الصفحة') + '"' + (allPageSelected ? ' checked' : '') + '></th>' : '') +
             visibleCols.map(function (c) {
               var isSortable = c.sortable !== false;
@@ -693,10 +692,7 @@
                   '</td>';
                 }
                 if (c.key === 'referenceNumber') {
-                  var rawRefCell = String(r.referenceNumber || '').trim();
-                  var refVal = isDedicatedSchema
-                    ? ((rawRefCell && rawRefCell !== String(r.reservationNumber || '').trim() && (!r.sourceReservationId || rawRefCell !== String(r.sourceReservationId).trim())) ? rawRefCell : '')
-                    : (rawRefCell || String(r.sourceReservationId || '').trim());
+                  var refVal = r.referenceNumber || r.sourceReservationId || '';
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' +
                     (refVal ? '<span dir="ltr">' + esc(String(refVal)) + '</span>' : '<span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span>') +
                   '</td>';
@@ -975,40 +971,11 @@
         '</div>';
     }
 
-    function syncStickyActionsClass(regionEl) {
-      if (!regionEl) return;
-      var wrap = regionEl.querySelector('.table-wrap');
-      var tbl = regionEl.querySelector('.data-table');
-      if (!wrap || !tbl) return;
-      if (tbl.scrollWidth > wrap.clientWidth + 4) {
-        tbl.classList.add('has-sticky-actions');
-      } else {
-        tbl.classList.remove('has-sticky-actions');
-      }
-    }
-
     function bindTableRegionEvents(region) {
       var wrap = region.querySelector('.table-wrap');
-      if (wrap && isDedicatedLifecycleSchemaMode()) {
-        wrap.scrollLeft = 0;
-      }
-      syncStickyActionsClass(region);
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(function () {
-          if (region.isConnected) syncStickyActionsClass(region);
-        });
-      }
-      if (!container._rgLifecycleResizeBound) {
-        container._rgLifecycleResizeBound = true;
-        var onResTableResize = function () {
-          if (!container || !container.isConnected) {
-            window.removeEventListener('resize', onResTableResize);
-            return;
-          }
-          var reg = container.querySelector('#res-table-region');
-          if (reg) syncStickyActionsClass(reg);
-        };
-        window.addEventListener('resize', onResTableResize);
+      var tbl = region.querySelector('.data-table');
+      if (wrap && tbl && tbl.scrollWidth > wrap.clientWidth + 4) {
+        tbl.classList.add('has-sticky-actions');
       }
 
       if (canBulkReassign) {
@@ -1515,7 +1482,6 @@
     function updateLifecycleBanner() {
       var bannerEl = container.querySelector('#res-lifecycle-banner');
       if (!bannerEl) return;
-      bannerEl.setAttribute('data-res-view', state.viewMode);
       if (state.viewMode === 'cancelled') {
         bannerEl.classList.remove('hidden');
         bannerEl.innerHTML =
@@ -1568,7 +1534,6 @@
     function paintTableRegion(data) {
       var region = container.querySelector('#res-table-region');
       if (!region) return;
-      region.setAttribute('data-res-view', state.viewMode);
       lastPaintedSearch = String(state.search || '').trim();
       lastPaintedResNumber = String(state.reservationNumber || '').trim();
       currentItems = data.items || [];
@@ -1736,15 +1701,13 @@
     async function refreshTableRegion(opts) {
       var o = opts || {};
       var seq = ++activeFetchSeq;
-      var targetViewMode = state.viewMode;
       var region = container.querySelector('#res-table-region');
       var curSearchClean = String(state.search || '').trim();
       var curResNumberClean = String(state.reservationNumber || '').trim();
       var searchChanged = (curSearchClean !== lastPaintedSearch) || (curResNumberClean !== lastPaintedResNumber);
       if (searchChanged && !o.silentRefresh) {
         preFilterVisibleItemsForSearch();
-      } else if (region && (o.showLoadingSkeleton || (!o.silentRefresh && currentItems.length === 0))) {
-        region.setAttribute('data-res-view', targetViewMode);
+      } else if (region && !o.silentRefresh && currentItems.length === 0) {
         region.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
       }
       var queryPayload = getQueryPayload({
@@ -1753,7 +1716,7 @@
         abortKey: 'res:list'
       });
       var resp = await root.RGApi.callApi('getReservations', queryPayload);
-      if (seq !== activeFetchSeq || targetViewMode !== state.viewMode || !container.isConnected) return;
+      if (seq !== activeFetchSeq || !container.isConnected) return;
       if (resp && resp.aborted) return;
       if (resp && resp.success && resp.data) {
         var nextTotalPages = Math.max(1, Number(resp.data.totalPages || 1));
@@ -1763,7 +1726,7 @@
           return refreshTableRegion(Object.assign({}, o, { _clampRetried: true, forceRefresh: true }));
         }
         paintTableRegion(resp.data);
-      } else if (searchChanged || o.showLoadingSkeleton || (!o.silentRefresh && currentItems.length === 0)) {
+      } else if (searchChanged || (!o.silentRefresh && currentItems.length === 0)) {
         currentItems = [];
         paintTableError((resp && resp.message) || 'تعذر تحميل الحجوزات.');
       } else if (!o.silentRefresh && ctx && ctx.toast) {
@@ -2060,16 +2023,8 @@
             ? 'Rejected'
             : (state.viewMode === 'cancelled' ? 'Cancelled' : 'Reservations');
           var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
-          var notRecordedExp = isEn ? 'Not recorded in source' : 'غير مسجل في المصدر';
           var exportRows = currentItems.map(function (row) {
             var copy = Object.assign({}, row);
-            if (state.viewMode === 'rejected' || state.viewMode === 'cancelled') {
-              var rawExpRef = String(copy.referenceNumber || '').trim();
-              var cleanExpRef = (rawExpRef && rawExpRef !== String(copy.reservationNumber || '').trim() && (!copy.sourceReservationId || rawExpRef !== String(copy.sourceReservationId).trim()))
-                ? rawExpRef
-                : '';
-              copy.referenceNumber = cleanExpRef || notRecordedExp;
-            }
             if (state.viewMode === 'rejected') {
               copy.rejectionReason = (core.sanitizeReasonText ? core.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
             } else if (state.viewMode === 'cancelled') {
@@ -3336,14 +3291,12 @@
     }
 
     function setViewMode(nextMode) {
-      var prevMode = state.viewMode;
       var targetMode = VALID_VIEW_MODES.indexOf(nextMode) !== -1 ? nextMode : 'all';
       if (targetMode === 'today' && !canViewTodayTab) targetMode = 'all';
       if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'all';
       if (targetMode === 'cancelled' && !canViewCancelledTab) targetMode = 'all';
       if (targetMode === 'rejected' && !canViewRejectedTab) targetMode = 'all';
-      var listModeChanged = isListViewMode(targetMode) && targetMode !== prevMode;
-      var involvesLifecycleTab = prevMode === 'rejected' || prevMode === 'cancelled' || targetMode === 'rejected' || targetMode === 'cancelled';
+      var listModeChanged = isListViewMode(targetMode) && targetMode !== state.viewMode;
       state.viewMode = targetMode;
       if (listModeChanged) state.page = 1;
       if (ctx.saveRouteFilters) ctx.saveRouteFilters();
@@ -3370,19 +3323,7 @@
         else paintTodayView();
       } else {
         updateLifecycleBanner();
-        if (listModeChanged && involvesLifecycleTab) {
-          currentItems = [];
-          var regionEl = container.querySelector('#res-table-region');
-          if (regionEl) {
-            var oldWrap = regionEl.querySelector('.table-wrap');
-            if (oldWrap) oldWrap.scrollLeft = 0;
-            regionEl.setAttribute('data-res-view', state.viewMode);
-            regionEl.innerHTML = '<div class="rg-skeleton-table"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
-          }
-          refreshTableRegion({ forceRefresh: true, silentRefresh: false, showLoadingSkeleton: true });
-        } else {
-          refreshTableRegion({ forceRefresh: Boolean(listModeChanged), silentRefresh: !listModeChanged });
-        }
+        refreshTableRegion({ forceRefresh: Boolean(listModeChanged), silentRefresh: !listModeChanged });
       }
     }
 
@@ -4132,15 +4073,7 @@
                 (Number(r.vatAmount || 0) > 0 ? ' · ضريبة ' + Number(r.vatAmount) : '') +
                 (Number(r.discountAmount || 0) > 0 ? ' · خصم ' + Number(r.discountAmount) : '') + '</span></div>' +
               '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Last Update' : 'آخر تحديث') + '</span><span class="detail-v">' + fmtMentionText(r.lastUpdateText || '-') + '</span></div>' +
-              ((r.referenceNumber || isCanRow || isRejRow) ? (function () {
-                var dRawRef = String(r.referenceNumber || '').trim();
-                var dCleanRef = (isRejRow || isCanRow)
-                  ? ((dRawRef && dRawRef !== String(r.reservationNumber || '').trim() && (!r.sourceReservationId || dRawRef !== String(r.sourceReservationId).trim())) ? dRawRef : '')
-                  : (dRawRef || String(r.sourceReservationId || '').trim());
-                return '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Reference #' : 'الرقم المرجعي') + '</span><span class="detail-v">' +
-                  (dCleanRef ? '<span class="mono" dir="ltr">' + esc(dCleanRef) + '</span>' : '<span style="color:var(--text-muted);">' + esc(isEn ? 'Not recorded in source' : 'غير مسجل في المصدر') + '</span>') +
-                '</span></div>';
-              }()) : '') +
+              ((r.referenceNumber || isCanRow) ? '<div class="detail-kv"><span class="detail-k">' + (isEn ? 'Reference #' : 'الرقم المرجعي') + '</span><span class="detail-v"><span class="mono" dir="ltr">' + esc(r.referenceNumber || r.sourceReservationId || (isEn ? 'Not recorded' : 'غير مسجل في المصدر')) + '</span></span></div>' : '') +
               ((Number(r.paidAmount || 0) > 0 || isCanRow) ? '<div class="detail-kv rg-ui-field-finance"><span class="detail-k">' + (isEn ? 'Paid Amount' : 'المبلغ المدفوع') + '</span><span class="detail-v tabular-nums">' + (Number(r.paidAmount || 0) > 0 ? (Number(r.paidAmount) + ' ر.س') : (isEn ? 'Not recorded / 0' : 'غير مسجل في المصدر')) + '</span></div>' : '') +
               (isRejRow ? (
                 (function () {
