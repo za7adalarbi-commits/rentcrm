@@ -8,6 +8,7 @@
     { key: 'reservationNumber', label: 'رقم الحجز' },
     { key: 'customerName', label: 'اسم العميل' },
     { key: 'customerPhone', label: 'الجوال' },
+    { key: 'customerIdNumber', label: 'رقم الهوية' },
     { key: 'companyName', label: 'الشركة' },
     { key: 'branchName', label: 'الفرع' },
     { key: 'carName', label: 'السيارة' },
@@ -217,7 +218,7 @@
       sortBy: 'sourceOrder', sortDir: 'asc', explicitSort: false, page: 1, pageSize: 20,
       visibleCols: defaultCols,
       selectedResIds: {},
-      viewMode: 'all',
+      viewMode: 'active',
       radarFilter: 'all',
       radarSearch: '',
       todayFilter: 'all',
@@ -232,26 +233,55 @@
       state.selectedResIds = {};
     }
     var selectedResIds = state.selectedResIds;
+    var canViewId = !root.RGCrmCore || !root.RGCrmCore.canUserViewCustomerId || root.RGCrmCore.canUserViewCustomerId(currentUser);
     var canViewTodayTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_today_tab');
     var canViewRadarTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_radar_tab');
-    var canViewRejectedTab = Boolean(
-      root.RGInactive &&
-      (!root.RGCrmCore || !root.RGCrmCore.canUserPerform || root.RGCrmCore.canUserPerform(currentUser, 'view_inactive_reservations')) &&
-      (!root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_rejected_tab'))
-    );
-    if (state.viewMode !== 'radar' && state.viewMode !== 'today' && state.viewMode !== 'rejected') state.viewMode = 'all';
-    if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'all';
-    if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'all';
-    if (state.viewMode === 'rejected' && !canViewRejectedTab) state.viewMode = 'all';
+    var canViewCancelledTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_cancelled_tab');
+    var canViewRejectedTab = !root.RGCrmCore || !root.RGCrmCore.canUserViewSubSection || root.RGCrmCore.canUserViewSubSection(currentUser, 'sub_view_rejected_tab');
+    var VALID_VIEW_MODES = ['active', 'cancelled', 'rejected', 'all', 'today', 'radar'];
+    if (VALID_VIEW_MODES.indexOf(state.viewMode) === -1) state.viewMode = 'active';
+    if (state.viewMode === 'today' && !canViewTodayTab) state.viewMode = 'active';
+    if (state.viewMode === 'radar' && !canViewRadarTab) state.viewMode = 'active';
+    if (state.viewMode === 'cancelled' && !canViewCancelledTab) state.viewMode = 'active';
+    if (state.viewMode === 'rejected' && !canViewRejectedTab) state.viewMode = 'active';
     ctx.state.reservations = state;
     if (ctx.saveRouteFilters) ctx.saveRouteFilters();
+
+    function getActiveLifecycleFilter() {
+      if (state.viewMode === 'cancelled' || state.viewMode === 'rejected' || state.viewMode === 'all') {
+        return state.viewMode;
+      }
+      return 'active';
+    }
+
+    function isListViewMode(vm) {
+      return vm === 'active' || vm === 'cancelled' || vm === 'rejected' || vm === 'all';
+    }
+
+    function doesResMatchViewLifecycle(rec, lifecycleMode) {
+      if (!rec) return false;
+      var life = String(lifecycleMode || 'active').toLowerCase();
+      if (life === 'all') return true;
+      var coreRef = root.RGCrmCore;
+      var cls = (coreRef && typeof coreRef.classifyReservationLifecycle === 'function')
+        ? coreRef.classifyReservationLifecycle(rec)
+        : ((coreRef && coreRef.isRejectedStatus && coreRef.isRejectedStatus(rec.internalStatus || rec.originalStatusAr || rec.originalStatusCode))
+            ? 'rejected'
+            : ((coreRef && coreRef.isCancelledStatus && coreRef.isCancelledStatus(rec.internalStatus || rec.originalStatusAr || rec.originalStatusCode))
+                ? 'cancelled'
+                : 'active'));
+      if (life === 'cancelled') return cls === 'cancelled';
+      if (life === 'rejected') return cls === 'rejected';
+      return cls === 'active';
+    }
 
     function getQueryPayload(extra) {
       var core = root.RGCrmCore;
       var base = (core && core.buildReservationQueryPayload)
         ? core.buildReservationQueryPayload(state)
         : Object.assign({ page: 1, pageSize: 20 }, state);
-      return extra ? Object.assign({ lifecycle: 'active' }, base, extra) : Object.assign({ lifecycle: 'active' }, base);
+      var life = getActiveLifecycleFilter();
+      return extra ? Object.assign({}, base, { lifecycle: life }, extra) : Object.assign({}, base, { lifecycle: life });
     }
 
     function checkHasActiveResFilters() {
@@ -297,16 +327,6 @@
     var canResColumns = canAction('act_res_columns');
     var canExportExcel = canAction('act_export_excel');
     var canClaimButtons = canAction('act_claim_reservation');
-    var canRejectBtn = Boolean(
-      root.RGInactive && currentUser && root.RGCrmCore &&
-      root.RGCrmCore.canUserPerform(currentUser, 'reject_reservation') &&
-      canAction('act_reject_reservation')
-    );
-    var canCancelBtn = Boolean(
-      root.RGInactive && currentUser && root.RGCrmCore &&
-      root.RGCrmCore.canUserPerform(currentUser, 'cancel_reservation') &&
-      canAction('act_cancel_reservation')
-    );
     var canLookupIdBtn = Boolean(
       root.RGInactive && currentUser && root.RGCrmCore &&
       (!root.RGCrmCore.canUserViewCustomerId || root.RGCrmCore.canUserViewCustomerId(currentUser)) &&
@@ -375,9 +395,26 @@
             (canExportExcel ? '<button type="button" class="btn btn-primary rg-ui-res-export-btn" id="res-export-xlsx">' + t('export_excel') + '</button>' : '') +
           '</div>' +
         '</div>' +
-        '<div class="res-view-tabs" role="tablist" aria-label="' + (isEn ? 'Reservations View' : 'عرض الحجوزات') + '">' +
+        '<div class="res-view-tabs" role="tablist" aria-label="' + (isEn ? 'Reservations View' : 'تبويبات الحجوزات') + '">' +
+          '<button type="button" class="res-view-tab' + (state.viewMode === 'active' ? ' is-active' : '') + '" data-res-view="active" role="tab" aria-selected="' + (state.viewMode === 'active') + '">' +
+            '<span>' + (isEn ? 'Active Reservations' : 'الحجوزات النشطة') + '</span>' +
+            '<span class="res-tab-count tabular-nums" data-testid="active-tab-count" id="res-active-tab-count">—</span>' +
+          '</button>' +
+          (canViewCancelledTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'cancelled' ? ' is-active' : '') + '" data-res-view="cancelled" role="tab" aria-selected="' + (state.viewMode === 'cancelled') + '">' +
+              '<span>' + (isEn ? 'Cancelled by Customer' : 'الحجوزات الملغاة') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="cancelled-tab-count" id="res-cancelled-tab-count">—</span>' +
+            '</button>'
+          ) : '') +
+          (canViewRejectedTab ? (
+            '<button type="button" class="res-view-tab' + (state.viewMode === 'rejected' ? ' is-active' : '') + '" data-res-view="rejected" role="tab" aria-selected="' + (state.viewMode === 'rejected') + '">' +
+              '<span>' + (isEn ? 'Rejected by Site' : 'الحجوزات المرفوضة') + '</span>' +
+              '<span class="res-tab-count tabular-nums" data-testid="rejected-tab-count" id="res-rejected-tab-count">—</span>' +
+            '</button>'
+          ) : '') +
           '<button type="button" class="res-view-tab' + (state.viewMode === 'all' ? ' is-active' : '') + '" data-res-view="all" role="tab" aria-selected="' + (state.viewMode === 'all') + '">' +
-            (isEn ? 'All Reservations' : 'كل الحجوزات') +
+            '<span>' + (isEn ? 'All Reservations' : 'جميع الحجوزات') + '</span>' +
+            '<span class="res-tab-count tabular-nums" data-testid="all-tab-count" id="res-all-tab-count">—</span>' +
           '</button>' +
           (canViewTodayTab ? (
             '<button type="button" class="res-view-tab' + (state.viewMode === 'today' ? ' is-active' : '') + '" data-res-view="today" role="tab" aria-selected="' + (state.viewMode === 'today') + '">' +
@@ -391,14 +428,8 @@
               '<span class="res-tab-count tabular-nums" data-testid="radar-tab-count" id="res-radar-tab-count"><span class="rg-tab-count-loading" aria-label="جاري التحميل"></span></span>' +
             '</button>'
           ) : '') +
-          (canViewRejectedTab ? (
-            '<button type="button" class="res-view-tab' + (state.viewMode === 'rejected' ? ' is-active' : '') + '" data-res-view="rejected" role="tab" aria-selected="' + (state.viewMode === 'rejected') + '">' +
-              '<span>' + (isEn ? 'Rejected Reservations' : 'الحجوزات المرفوضة') + '</span>' +
-              '<span class="res-tab-count tabular-nums" data-testid="rejected-tab-count" id="res-rejected-tab-count">—</span>' +
-            '</button>'
-          ) : '') +
         '</div>' +
-        '<div id="res-all-view"' + (state.viewMode !== 'all' ? ' class="hidden"' : '') + '>' +
+        '<div id="res-all-view"' + (!isListViewMode(state.viewMode) ? ' class="hidden"' : '') + '>' +
           (canPullReservations && isGeneralManager ? (
             '<div class="gm-pull-bar" id="res-gm-pull-bar">' +
               '<span class="gm-pull-label">تخصيص مدة سحب الحجوزات (المدير العام):</span>' +
@@ -481,24 +512,27 @@
               '<button type="button" class="btn btn-sm" id="res-cols-reset">استعادة العرض المرتب</button>' +
             '</div>' +
             '<div class="checkbox-grid">' +
-              ALL_COLUMNS.map(function (col) {
+              ALL_COLUMNS.filter(function (col) { return col.key !== 'customerIdNumber' || canViewId; }).map(function (col) {
                 var checked = state.visibleCols.indexOf(col.key) !== -1 ? 'checked' : '';
                 return '<label class="checkbox-item"><input type="checkbox" class="res-col-toggle" value="' + col.key + '" ' + checked + '> ' + col.label + '</label>';
               }).join('') +
             '</div>' +
           '</div>' +
+          '<div id="res-lifecycle-banner" class="hidden" style="margin-bottom:12px;"></div>' +
           '<div id="res-table-region"></div>' +
         '</div>' +
         '<div id="res-today-view"' + (state.viewMode === 'today' ? '' : ' class="hidden"') + '></div>' +
         '<div id="res-radar-view"' + (state.viewMode === 'radar' ? '' : ' class="hidden"') + '></div>' +
-        '<div id="res-rejected-view"' + (state.viewMode === 'rejected' ? '' : ' class="hidden"') + '></div>' +
       '</div>';
 
     var activeFetchSeq = 0;
 
     function buildTableRegionHtml(data) {
       var list = data.items || [];
-      var visibleCols = ALL_COLUMNS.filter(function (c) { return state.visibleCols.indexOf(c.key) !== -1; });
+      var visibleCols = ALL_COLUMNS.filter(function (c) {
+        if (c.key === 'customerIdNumber' && !canViewId) return false;
+        return state.visibleCols.indexOf(c.key) !== -1;
+      });
       var colVisible = {};
       visibleCols.forEach(function (c) { colVisible[c.key] = true; });
       var selectedIdsList = Object.keys(selectedResIds).filter(function (k) { return Boolean(selectedResIds[k]); });
@@ -574,13 +608,23 @@
                 }
                 if (c.key === 'customerName') {
                   var showSubPhone = !colVisible.customerPhone && r.customerPhone;
+                  var showSubId = !colVisible.customerIdNumber && canViewId && r.customerIdNumber;
                   return '<td class="cell-customer">' +
                     '<div class="cell-primary">' + esc(r.customerName || '-') + '</div>' +
-                    (showSubPhone ? '<div class="cell-sub"><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span></div>' : '') +
+                    ((showSubPhone || showSubId) ? (
+                      '<div class="cell-sub">' +
+                        (showSubPhone ? '<span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' : '') +
+                        (showSubPhone && showSubId ? ' <span>·</span> ' : '') +
+                        (showSubId ? '<span class="mono">' + (isEn ? 'ID: ' : 'هوية: ') + '<span dir="ltr">' + esc(String(r.customerIdNumber)) + '</span></span>' : '') +
+                      '</div>'
+                    ) : '') +
                   '</td>';
                 }
                 if (c.key === 'customerPhone') {
                   return '<td class="mono"><span class="cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></td>';
+                }
+                if (c.key === 'customerIdNumber') {
+                  return '<td class="mono" style="white-space:nowrap;"><span dir="ltr">' + esc(r.customerIdNumber ? String(r.customerIdNumber) : '-') + '</span></td>';
                 }
                 if (c.key === 'carName') {
                   var carLabel = formatCarNameDisplay(r.carName);
@@ -593,16 +637,35 @@
                   '</td>';
                 }
                 if (c.key === 'originalStatusAr') {
-                  return '<td><span class="status-tag ' + statusClass(r.originalStatusAr) + '">' + esc(r.originalStatusAr || '-') + '</span></td>';
+                  var rowLifeCls = (root.RGCrmCore && root.RGCrmCore.classifyReservationLifecycle)
+                    ? root.RGCrmCore.classifyReservationLifecycle(r)
+                    : 'active';
+                  var lifeSourceNote = rowLifeCls === 'rejected'
+                    ? ((isEn ? 'Site Rejected' : 'مرفوض من الموقع') + (r.rejectionReason ? (' · ' + r.rejectionReason) : ''))
+                    : (rowLifeCls === 'cancelled'
+                        ? ((isEn ? 'Customer Cancelled' : 'ملغي من العميل') + (r.cancellationReason ? (' · ' + r.cancellationReason) : ''))
+                        : '');
+                  return '<td><span class="status-tag ' + statusClass(r.originalStatusAr || (rowLifeCls === 'rejected' ? 'مرفوض' : (rowLifeCls === 'cancelled' ? 'ملغي' : ''))) + '">' +
+                    esc(r.originalStatusAr || (rowLifeCls === 'rejected' ? 'مرفوض' : (rowLifeCls === 'cancelled' ? 'ملغي' : '-'))) +
+                    '</span>' +
+                    (lifeSourceNote ? '<div class="cell-sub" title="' + esc(lifeSourceNote) + '">' + esc(lifeSourceNote) + '</div>' : '') +
+                  '</td>';
                 }
                 if (c.key === 'internalStatus') {
                   var subAssignee = !colVisible.assignedEmployeeNames
                     ? (assignedNames.length ? assignedNames.join('، ') : 'متاح للاستلام')
                     : '';
+                  var rowIsInactive = Boolean(root.RGCrmCore && root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(r));
+                  if (rowIsInactive) {
+                    return '<td>' +
+                      '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus || r.originalStatusAr || '-') + '</span>' +
+                      (subAssignee ? '<div class="cell-sub" title="' + esc(subAssignee) + '">' + esc(subAssignee) + '</div>' : '') +
+                    '</td>';
+                  }
                   var isStatusLocked = Boolean(root.RGApp && root.RGApp.isActionLocked && root.RGApp.isActionLocked('quickUpdateReservationStatus:' + r.id));
                   return '<td>' +
                     '<select class="quick-status-select tbl-quick-status" data-id="' + esc(r.id) + '" aria-label="تحديث حالة الحجز ' + esc(r.reservationNumber) + '"' + (isStatusLocked ? ' disabled aria-busy="true"' : '') + '>' +
-                      (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(r.internalStatus) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
+                      (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(r.internalStatus) : (root.RGCrmCore.MANUAL_WORKFLOW_STATUS_OPTIONS || root.RGCrmCore.FOLLOWUP_STATUSES)).map(function (s) {
                         return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                       }).join('') +
                     '</select>' +
@@ -709,8 +772,6 @@
                 '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">' +
                   claimBtnHtml +
                   '<button type="button" class="btn btn-sm btn-primary btn-open-res" data-id="' + esc(r.id) + '">التفاصيل</button>' +
-                  (canRejectBtn ? '<button type="button" class="btn btn-sm btn-danger btn-reject-res rg-ui-res-reject-btn" data-id="' + esc(r.id) + '">رفض</button>' : '') +
-                  (canCancelBtn ? '<button type="button" class="btn btn-sm btn-cancel-res rg-ui-res-cancel-btn" data-id="' + esc(r.id) + '">إلغاء</button>' : '') +
                 '</div></td>' +
               '</tr>';
             }).join('') +
@@ -1132,30 +1193,6 @@
         });
       });
 
-      region.querySelectorAll('.btn-reject-res').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          var rid = btn.getAttribute('data-id');
-          var match = currentItems.find(function (x) { return x && x.id === rid; });
-          if (match && root.RGInactive && root.RGInactive.openRejectModal) {
-            root.RGInactive.openRejectModal(match, ctx, function (updatedRes) {
-              syncLocalReservationSnapshot(updatedRes);
-            });
-          }
-        });
-      });
-
-      region.querySelectorAll('.btn-cancel-res').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          var rid = btn.getAttribute('data-id');
-          var match = currentItems.find(function (x) { return x && x.id === rid; });
-          if (match && root.RGInactive && root.RGInactive.openCancelModal) {
-            root.RGInactive.openCancelModal(match, ctx, function (updatedRes) {
-              syncLocalReservationSnapshot(updatedRes);
-            });
-          }
-        });
-      });
-
       var clearSearchEmptyBtn = region.querySelector('#res-empty-clear-search');
       if (clearSearchEmptyBtn) {
         clearSearchEmptyBtn.addEventListener('click', function () {
@@ -1256,6 +1293,57 @@
       }
     }
 
+    function updateLifecycleBanner() {
+      var bannerEl = container.querySelector('#res-lifecycle-banner');
+      if (!bannerEl) return;
+      if (state.viewMode === 'cancelled') {
+        bannerEl.classList.remove('hidden');
+        bannerEl.innerHTML =
+          '<div class="rg-error-banner" style="border-color:rgba(217,119,6,0.34);background:rgba(217,119,6,0.08);">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'Cancelled by Customer (Synced from Rental Gate)' : 'الحجوزات الملغاة من العميل (مزامنة تلقائياً من Rental Gate)') + '</div>' +
+              '<div class="rg-error-banner-msg">' + (isEn ? 'Showing bookings cancelled by customers on the external site. Status updates are controlled by Rental Gate sync.' : 'تعرض هذه القائمة الحجوزات التي ألغاها العميل في الموقع الخارجي، وتُحدَّث حالاتها تلقائياً عبر المزامنة بدون رفض أو إلغاء يدوي.') + '</div>' +
+            '</div>' +
+          '</div>';
+      } else if (state.viewMode === 'rejected') {
+        bannerEl.classList.remove('hidden');
+        bannerEl.innerHTML =
+          '<div class="rg-error-banner" style="border-color:rgba(217,31,43,0.32);background:rgba(217,31,43,0.07);">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'Rejected by Site (Synced from Rental Gate)' : 'الحجوزات المرفوضة من الموقع (مزامنة تلقائياً من Rental Gate)') + '</div>' +
+              '<div class="rg-error-banner-msg">' + (isEn ? 'Showing bookings rejected by Rental Gate / providers on the external site.' : 'تعرض هذه القائمة الحجوزات المرفوضة من الموقع الخارجي مع أسباب الرفض وبيانات العميل الكاملة.') + '</div>' +
+            '</div>' +
+          '</div>';
+      } else if (state.viewMode === 'all') {
+        bannerEl.classList.remove('hidden');
+        bannerEl.innerHTML =
+          '<div class="rg-error-banner" style="border-color:var(--border-hairline);background:var(--bg-surface-subtle);">' +
+            '<div class="rg-error-banner-body">' +
+              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'All Reservations (Active, Cancelled & Rejected)' : 'جميع الحجوزات (النشطة والملغاة والمرفوضة)') + '</div>' +
+              '<div class="rg-error-banner-msg">' + (isEn ? 'Unified view displaying every reservation pulled from Rental Gate across all statuses.' : 'عرض موحد لكافة الحجوزات المسحوبة من الموقع الخارجي بجميع حالاتها.') + '</div>' +
+            '</div>' +
+          '</div>';
+      } else {
+        bannerEl.classList.add('hidden');
+        bannerEl.innerHTML = '';
+      }
+    }
+
+    function updateLifecycleCountsUi(countsObj) {
+      if (!countsObj || typeof countsObj !== 'object') return;
+      var map = {
+        active: 'res-active-tab-count',
+        cancelled: 'res-cancelled-tab-count',
+        rejected: 'res-rejected-tab-count',
+        all: 'res-all-tab-count'
+      };
+      Object.keys(map).forEach(function (k) {
+        if (countsObj[k] === undefined || countsObj[k] === null) return;
+        var el = container.querySelector('#' + map[k]);
+        if (el) el.textContent = String(Number(countsObj[k] || 0));
+      });
+    }
+
     function paintTableRegion(data) {
       var region = container.querySelector('#res-table-region');
       if (!region) return;
@@ -1270,6 +1358,10 @@
       }
       var totalEl = container.querySelector('#res-total-count');
       if (totalEl) totalEl.textContent = String(data.total || 0);
+      if (data.lifecycleCounts) {
+        updateLifecycleCountsUi(data.lifecycleCounts);
+      }
+      updateLifecycleBanner();
       region.innerHTML = buildTableRegionHtml(data);
       bindTableRegionEvents(region);
     }
@@ -1291,6 +1383,7 @@
       var totalEl = container.querySelector('#res-total-count');
       var curTotal = Number((totalEl && totalEl.textContent) || currentItems.length);
       var delIdsList = Array.isArray(deletedIds) ? deletedIds : [];
+      var curLifeMode = getActiveLifecycleFilter();
       if (core && core.reapplyReservationDeltaToFilteredList && checkHasActiveResFilters()) {
         var filterPayload = getQueryPayload();
         var userCtx = {
@@ -1333,14 +1426,14 @@
         if (it && byIdChg[it.id]) {
           matchedAny = true;
           var mergedIt = Object.assign({}, it, byIdChg[it.id]);
-          if (core && core.isInactiveReservation && core.isInactiveReservation(mergedIt)) {
+          if (!doesResMatchViewLifecycle(mergedIt, curLifeMode)) {
             removedCount += 1;
             return;
           }
           nextList.push(mergedIt);
           return;
         }
-        if (it && core && core.isInactiveReservation && core.isInactiveReservation(it)) {
+        if (it && !doesResMatchViewLifecycle(it, curLifeMode)) {
           removedCount += 1;
           return;
         }
@@ -1382,26 +1475,8 @@
             paintTodayView();
           }
         }
-        if (canViewRejectedTab) {
-          refreshRejectedTabBadge();
-          if (state.viewMode === 'rejected') {
-            mountRejectedTab();
-          }
-        }
       } else {
         refreshTableRegion({ silentRefresh: true });
-        refreshRadarData(false);
-        if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
-          ensureTodayCalendarLoaded({ silentRefresh: true, forceRefresh: true });
-        } else {
-          calendarRawItems = null;
-        }
-        if (canViewRejectedTab) {
-          refreshRejectedTabBadge();
-          if (state.viewMode === 'rejected') {
-            mountRejectedTab();
-          }
-        }
       }
     }
 
@@ -1753,7 +1828,7 @@
         try {
           await root.RGReports.exportExcelWorkbook([{
             name: 'Reservations',
-            headers: ALL_COLUMNS.slice(),
+            headers: ALL_COLUMNS.filter(function (col) { return col.key !== 'customerIdNumber' || canViewId; }),
             rows: currentItems
           }], 'rental-gate-reservations.xlsx');
           ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
@@ -2998,34 +3073,6 @@
       }
     }
 
-    function refreshRejectedTabBadge() {
-      if (!canViewRejectedTab) return;
-      root.RGApi.callApi('getInactiveReservations', {
-        subTab: 'rejected',
-        page: 1,
-        pageSize: 1,
-        silentRefresh: true
-      }).then(function (resp) {
-        var el = document.getElementById('res-rejected-tab-count');
-        if (el && resp && resp.success && resp.data) {
-          el.textContent = String(resp.data.total || 0);
-        }
-      }).catch(function () {});
-    }
-
-    function mountRejectedTab() {
-      var rejHost = document.getElementById('res-rejected-view');
-      if (!rejHost || !root.RGInactive || !root.RGInactive.renderRejectedPanel) return;
-      root.RGInactive.renderRejectedPanel(rejHost, ctx, {
-        mode: 'rejected',
-        forceRefresh: true,
-        onCountChange: function (_m, totalCnt) {
-          var el = document.getElementById('res-rejected-tab-count');
-          if (el) el.textContent = String(totalCnt || 0);
-        }
-      });
-    }
-
     var idLookupTopBtn = document.getElementById('res-id-lookup-btn');
     if (idLookupTopBtn && root.RGInactive && root.RGInactive.openNationalIdLookupModal) {
       idLookupTopBtn.addEventListener('click', function () {
@@ -3034,22 +3081,21 @@
     }
 
     function setViewMode(nextMode) {
-      var targetMode = nextMode === 'radar'
-        ? 'radar'
-        : (nextMode === 'today' ? 'today' : (nextMode === 'rejected' ? 'rejected' : 'all'));
-      if (targetMode === 'today' && !canViewTodayTab) targetMode = 'all';
-      if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'all';
-      if (targetMode === 'rejected' && !canViewRejectedTab) targetMode = 'all';
+      var targetMode = VALID_VIEW_MODES.indexOf(nextMode) !== -1 ? nextMode : 'active';
+      if (targetMode === 'today' && !canViewTodayTab) targetMode = 'active';
+      if (targetMode === 'radar' && !canViewRadarTab) targetMode = 'active';
+      if (targetMode === 'cancelled' && !canViewCancelledTab) targetMode = 'active';
+      if (targetMode === 'rejected' && !canViewRejectedTab) targetMode = 'active';
+      var listModeChanged = isListViewMode(targetMode) && targetMode !== state.viewMode;
       state.viewMode = targetMode;
+      if (listModeChanged) state.page = 1;
       if (ctx.saveRouteFilters) ctx.saveRouteFilters();
       var allViewEl = document.getElementById('res-all-view');
       var todayViewEl = document.getElementById('res-today-view');
       var radarViewEl = document.getElementById('res-radar-view');
-      var rejectedViewEl = document.getElementById('res-rejected-view');
-      if (allViewEl) allViewEl.classList.toggle('hidden', state.viewMode !== 'all');
+      if (allViewEl) allViewEl.classList.toggle('hidden', !isListViewMode(state.viewMode));
       if (todayViewEl) todayViewEl.classList.toggle('hidden', state.viewMode !== 'today');
       if (radarViewEl) radarViewEl.classList.toggle('hidden', state.viewMode !== 'radar');
-      if (rejectedViewEl) rejectedViewEl.classList.toggle('hidden', state.viewMode !== 'rejected');
       container.querySelectorAll('[data-res-view]').forEach(function (tabBtn) {
         var isAct = tabBtn.getAttribute('data-res-view') === state.viewMode;
         tabBtn.classList.toggle('is-active', isAct);
@@ -3064,10 +3110,9 @@
         }
         if (radarRawReservations === null) refreshRadarData(false);
         else paintTodayView();
-      } else if (state.viewMode === 'rejected') {
-        mountRejectedTab();
       } else {
-        refreshTableRegion({ silentRefresh: true });
+        updateLifecycleBanner();
+        refreshTableRegion({ forceRefresh: Boolean(listModeChanged), silentRefresh: !listModeChanged });
       }
     }
 
@@ -3076,13 +3121,6 @@
         setViewMode(tabBtn.getAttribute('data-res-view'));
       });
     });
-
-    if (canViewRejectedTab) {
-      refreshRejectedTabBadge();
-      if (state.viewMode === 'rejected') {
-        mountRejectedTab();
-      }
-    }
 
     if (canViewTodayTab || canViewRadarTab) {
       if (!checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
@@ -3206,7 +3244,6 @@
                 paintTodayView();
               }
             }
-            if (canViewRejectedTab) refreshRejectedTabBadge();
           }
         }
         scheduleResRefreshWhenIdle({ silent: true, forceRefresh: true });
@@ -3674,11 +3711,10 @@
       var overdueInfo = core.isReservationOverdueUnpaid ? core.isReservationOverdueUnpaid(r, d.extensions) : null;
 
       var canViewId = !core.canUserViewCustomerId || core.canUserViewCustomerId(user);
-      var canRejectDrawer = Boolean(root.RGInactive && user && (!core.canUserPerform || core.canUserPerform(user, 'reject_reservation')) && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_reject_reservation')));
-      var canCancelDrawer = Boolean(root.RGInactive && user && (!core.canUserPerform || core.canUserPerform(user, 'cancel_reservation')) && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_cancel_reservation')));
-      var canRestoreDrawer = Boolean(user && (!core.canUserPerform || core.canUserPerform(user, 'reject_reservation') || core.canUserPerform(user, 'cancel_reservation') || core.canUserPerform(user, 'edit_reservation_details')));
       var isResInactiveNow = Boolean(core.isInactiveReservation && core.isInactiveReservation(r));
-      var lifecycleKindNow = core.getReservationLifecycleKind ? core.getReservationLifecycleKind(r) : 'active';
+      var lifecycleKindNow = core.classifyReservationLifecycle
+        ? core.classifyReservationLifecycle(r)
+        : (core.getReservationLifecycleKind ? core.getReservationLifecycleKind(r) : 'active');
 
       modalRoot.innerHTML =
         '<div class="drawer-backdrop" id="res-drawer-backdrop" data-res-id="' + esc(r.id) + '" role="dialog" aria-modal="true" aria-labelledby="drawer-res-title">' +
@@ -3692,7 +3728,7 @@
                 '<div class="meta-inline">' +
                   '<span>' + esc(r.customerName) + '</span><span>·</span><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' +
                   (r.customerEmail ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono" dir="ltr">' + esc(r.customerEmail) + '</span></span>' : '') +
-                  (canViewId && r.customerIdNumber ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono">' + (isEn ? 'ID: ' : 'هوية: ') + '<span dir="ltr">' + esc(r.customerIdNumber) + '</span></span></span>' : '') +
+                  (canViewId && r.customerIdNumber ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono">' + (isEn ? 'ID: ' : 'هوية: ') + '<span dir="ltr">' + esc(String(r.customerIdNumber)) + '</span></span></span>' : '') +
                 '</div>' +
               '</div>' +
               '<div class="toolbar-row" style="margin-bottom:0;">' +
@@ -3702,21 +3738,18 @@
                 (canPinNote ? '<button type="button" class="btn btn-sm btn-warning" id="drawer-header-pin-note-btn">📌 ' + (isEn ? 'Supervisor Pinned Note' : 'ملاحظة مشرف/مدير مثبتة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-ics-btn" title="' + (isEn ? 'Add pickup & return to Google Calendar (.ics)' : 'إضافة موعد الاستلام والتسليم للتقويم (.ics)') + '">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
                 (canEditReservation ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-edit-res-btn">' + (isEn ? 'Edit Booking' : 'تعديل تفاصيل الحجز') + '</button>' : '') +
-                (!isResInactiveNow && canRejectDrawer ? '<button type="button" class="btn btn-sm btn-danger rg-ui-res-reject-btn" id="drawer-reject-btn">' + (isEn ? 'Reject' : 'رفض الحجز') + '</button>' : '') +
-                (!isResInactiveNow && canCancelDrawer ? '<button type="button" class="btn btn-sm rg-ui-res-cancel-btn" id="drawer-cancel-btn">' + (isEn ? 'Cancel Booking' : 'إلغاء الحجز') + '</button>' : '') +
-                (isResInactiveNow && canRestoreDrawer ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-restore-btn">' + (isEn ? 'Restore to Active' : 'استعادة إلى النشط') + '</button>' : '') +
                 (canExportPdfBtn ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '') +
                 (canReportProblemBtn ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">' + (isEn ? 'Report Problem' : 'تحويل إلى مشكلة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-close-btn">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
               '</div>' +
             '</div>' +
             (isResInactiveNow ? (
-              '<div class="rg-error-banner" style="margin-bottom:10px;border-color:rgba(217,31,43,0.32);background:rgba(217,31,43,0.07);">' +
+              '<div class="rg-error-banner" style="margin-bottom:10px;border-color:' + (lifecycleKindNow === 'rejected' ? 'rgba(217,31,43,0.32)' : 'rgba(217,119,6,0.36)') + ';background:' + (lifecycleKindNow === 'rejected' ? 'rgba(217,31,43,0.07)' : 'rgba(217,119,6,0.08)') + ';">' +
                 '<div class="rg-error-banner-body">' +
                   '<div class="rg-error-banner-title" style="color:var(--text-primary);">' +
                     (lifecycleKindNow === 'rejected'
-                      ? (isEn ? 'Rejected Booking' : 'حجز مرفوض (خارج الدورة النشطة)')
-                      : (isEn ? 'Cancelled Booking' : 'حجز ملغي (خارج الدورة النشطة)')) +
+                      ? (isEn ? 'Rejected by Site (Synced from Rental Gate)' : 'حجز مرفوض من الموقع (مزامنة تلقائياً من Rental Gate)')
+                      : (isEn ? 'Cancelled by Customer (Synced from Rental Gate)' : 'حجز ملغي من العميل (مزامنة تلقائياً من Rental Gate)')) +
                   '</div>' +
                   '<div class="rg-error-banner-msg">' +
                     (lifecycleKindNow === 'rejected'
@@ -3784,13 +3817,13 @@
                 '</div>' +
               '</div>' +
               '<div class="quick-status-bar grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)_auto] gap-2 items-center">' +
-                '<select class="select" id="drawer-quick-status" aria-label="تحديث الحالة السريع">' +
-                  (core.getWorkflowStatusOptions ? core.getWorkflowStatusOptions(r.internalStatus) : core.FOLLOWUP_STATUSES).map(function (s) {
+                '<select class="select" id="drawer-quick-status" aria-label="تحديث الحالة السريع"' + (isResInactiveNow ? ' disabled' : '') + '>' +
+                  (core.getWorkflowStatusOptions ? core.getWorkflowStatusOptions(r.internalStatus) : (core.MANUAL_WORKFLOW_STATUS_OPTIONS || core.FOLLOWUP_STATUSES)).map(function (s) {
                     return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                   }).join('') +
                 '</select>' +
-                '<input class="input" id="drawer-quick-note" placeholder="ملاحظة سريعة اختيارية عند تغيير الحالة...">' +
-                '<button type="button" class="btn btn-charcoal" id="drawer-quick-status-btn">تحديث الحالة الآن</button>' +
+                '<input class="input" id="drawer-quick-note" placeholder="' + (isResInactiveNow ? 'الحجز مرفوض أو ملغي من الموقع — الحالة محمية من التعديل اليدوي' : 'ملاحظة سريعة اختيارية عند تغيير الحالة...') + '"' + (isResInactiveNow ? ' disabled' : '') + '>' +
+                '<button type="button" class="btn btn-charcoal" id="drawer-quick-status-btn"' + (isResInactiveNow ? ' disabled' : '') + '>تحديث الحالة الآن</button>' +
               '</div>' +
             '</div>' +
 
@@ -3878,8 +3911,8 @@
               '<h4 style="margin:0;font-size:14px;">إضافة متابعة جديدة (متاحة دون انتظار الإسناد)</h4>' +
               '<div class="form-grid-2">' +
                 '<div class="form-group"><label class="form-label" for="fu-status">حالة المتابعة</label>' +
-                  '<select class="select" id="fu-status">' +
-                    (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(r.internalStatus) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
+                  '<select class="select" id="fu-status"' + (isResInactiveNow ? ' disabled' : '') + '>' +
+                    (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(r.internalStatus) : (root.RGCrmCore.MANUAL_WORKFLOW_STATUS_OPTIONS || root.RGCrmCore.FOLLOWUP_STATUSES)).map(function (s) {
                       return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                     }).join('') +
                   '</select></div>' +
@@ -4179,6 +4212,10 @@
       if (quickBtn) {
         quickBtn.addEventListener('click', function () {
           var nextStatus = document.getElementById('drawer-quick-status').value;
+          if (isResInactiveNow || (root.RGCrmCore && root.RGCrmCore.isManualBlockedWorkflowStatus && root.RGCrmCore.isManualBlockedWorkflowStatus(nextStatus))) {
+            ctx.toast('الحالات المرفوضة والملغاة تتم مزامنتها من Rental Gate فقط ولا يمكن تعديلها يدوياً.', true);
+            return;
+          }
           var quickNote = String(document.getElementById('drawer-quick-note').value || '').trim();
           var expectedUpdatedAt = r.updatedAt || r.lastUpdatedAt || '';
           runWithLock(quickBtn, 'quickUpdateReservationStatus:' + r.id, function () {
@@ -4345,7 +4382,12 @@
         ev.preventDefault();
         var errEl = document.getElementById('fu-form-error');
         errEl.classList.add('hidden');
-        var fuStatus = document.getElementById('fu-status').value;
+        var fuStatus = isResInactiveNow ? r.internalStatus : document.getElementById('fu-status').value;
+        if (!isResInactiveNow && root.RGCrmCore && root.RGCrmCore.isManualBlockedWorkflowStatus && root.RGCrmCore.isManualBlockedWorkflowStatus(fuStatus)) {
+          errEl.textContent = 'الحالات المرفوضة والملغاة تتم مزامنتها من الموقع فقط ولا يمكن اختيارها يدوياً.';
+          errEl.classList.remove('hidden');
+          return;
+        }
         var fuAction = String(document.getElementById('fu-action').value || '').trim();
         var fuNotes = String(document.getElementById('fu-notes').value || '').trim();
         if (!fuAction) {
@@ -4671,56 +4713,6 @@
 
       var drawerCharts = renderDrawerCharts(d);
 
-      var drawerRejectBtn = document.getElementById('drawer-reject-btn');
-      if (drawerRejectBtn && root.RGInactive && root.RGInactive.openRejectModal) {
-        drawerRejectBtn.addEventListener('click', function () {
-          requestDrawerExit(function () {
-            cleanupDrawerLifecycle();
-            root.RGInactive.openRejectModal(r, ctx, function (updatedRes) {
-              notifyParentUpdated(updatedRes);
-            });
-          });
-        });
-      }
-
-      var drawerCancelBtn = document.getElementById('drawer-cancel-btn');
-      if (drawerCancelBtn && root.RGInactive && root.RGInactive.openCancelModal) {
-        drawerCancelBtn.addEventListener('click', function () {
-          requestDrawerExit(function () {
-            cleanupDrawerLifecycle();
-            root.RGInactive.openCancelModal(r, ctx, function (updatedRes) {
-              notifyParentUpdated(updatedRes);
-            });
-          });
-        });
-      }
-
-      var drawerRestoreBtn = document.getElementById('drawer-restore-btn');
-      if (drawerRestoreBtn) {
-        drawerRestoreBtn.addEventListener('click', function () {
-          runWithLock(drawerRestoreBtn, 'restoreReservation:' + r.id, async function () {
-            if (root.RGApi.applyOptimisticMutation) {
-              root.RGApi.applyOptimisticMutation('restoreReservation', { reservationId: r.id, targetStatus: 'بانتظار التأكيد' }, user);
-            }
-            var resp = await root.RGApi.callApi('restoreReservation', {
-              reservationId: r.id,
-              targetStatus: 'بانتظار التأكيد',
-              _keepOptimisticCache: true,
-              _spamChecked: true
-            });
-            if (!resp || !resp.success) {
-              ctx.toast((resp && resp.message) || 'تعذر استعادة الحجز.', true);
-              return;
-            }
-            var nextResObj = (resp.data && resp.data.reservation) || Object.assign({}, r, { internalStatus: 'بانتظار التأكيد', rejectedAt: '', cancelledAt: '' });
-            d.reservation = nextResObj;
-            ctx.toast('تمت استعادة الحجز إلى الحجوزات النشطة بنجاح.');
-            paintDrawer();
-            notifyParentUpdated(nextResObj);
-          }, { spamAction: 'restoreReservation', spamSig: r.id });
-        });
-      }
-
       var drawerPdfBtn = document.getElementById('drawer-pdf-btn');
       if (drawerPdfBtn) {
         drawerPdfBtn.addEventListener('click', function () {
@@ -4849,8 +4841,8 @@
             '<div class="form-group"><label class="form-label" for="re-pay-method">طريقة الدفع</label><input class="input" id="re-pay-method" value="' + esc(reservation.paymentMethod || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-pay-status">حالة الدفع</label><input class="input" id="re-pay-status" value="' + esc(reservation.paymentStatus || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="re-status">الحالة الداخلية</label>' +
-              '<select class="select" id="re-status">' +
-                (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(reservation.internalStatus) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
+              '<select class="select" id="re-status"' + ((root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(reservation)) ? ' disabled' : '') + '>' +
+                (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(reservation.internalStatus) : (root.RGCrmCore.MANUAL_WORKFLOW_STATUS_OPTIONS || root.RGCrmCore.FOLLOWUP_STATUSES)).map(function (s) {
                   return '<option value="' + esc(s) + '"' + (reservation.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                 }).join('') +
               '</select></div>' +
@@ -4952,6 +4944,17 @@
       }
       var editUser = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
       var payload = buildEditResPayload();
+      var isResCurrentlyInactive = Boolean(root.RGCrmCore && root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(reservation));
+      if (isResCurrentlyInactive) {
+        payload.internalStatus = reservation.internalStatus;
+      } else if (root.RGCrmCore && root.RGCrmCore.isManualBlockedWorkflowStatus && root.RGCrmCore.isManualBlockedWorkflowStatus(payload.internalStatus)) {
+        var errBoxBlocked = document.getElementById('res-edit-err');
+        if (errBoxBlocked) {
+          errBoxBlocked.textContent = 'لا يمكن تحويل الحجز يدوياً إلى مرفوض أو ملغي.';
+          errBoxBlocked.classList.remove('hidden');
+        }
+        return Promise.resolve(false);
+      }
       if (!String(payload.customerName || '').trim()) {
         var errBoxName = document.getElementById('res-edit-err');
         if (errBoxName) {
@@ -5057,8 +5060,8 @@
           '</div>' +
           '<div class="form-grid-2">' +
             '<div class="form-group"><label class="form-label" for="fue-status">الحالة</label>' +
-              '<select class="select" id="fue-status">' +
-                (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(followUp.status) : root.RGCrmCore.FOLLOWUP_STATUSES).map(function (s) {
+              '<select class="select" id="fue-status"' + ((root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(reservation)) ? ' disabled' : '') + '>' +
+                (root.RGCrmCore.getWorkflowStatusOptions ? root.RGCrmCore.getWorkflowStatusOptions(followUp.status) : (root.RGCrmCore.MANUAL_WORKFLOW_STATUS_OPTIONS || root.RGCrmCore.FOLLOWUP_STATUSES)).map(function (s) {
                   return '<option value="' + esc(s) + '"' + (followUp.status === s ? ' selected' : '') + '>' + esc(s) + '</option>';
                 }).join('') +
               '</select></div>' +
@@ -5090,10 +5093,19 @@
     var initialFuSnapshot = snapshotFuEdit();
 
     function executeFuEditSave(fromGuard) {
-      var stVal = document.getElementById('fue-status').value;
+      var isFuResInactive = Boolean(root.RGCrmCore && root.RGCrmCore.isInactiveReservation && root.RGCrmCore.isInactiveReservation(reservation));
+      var stVal = isFuResInactive ? followUp.status : document.getElementById('fue-status').value;
       var actVal = String(document.getElementById('fue-action').value || '').trim();
       var notesVal = document.getElementById('fue-notes').value;
-      var syncVal = document.getElementById('fue-sync').checked;
+      var syncVal = isFuResInactive ? false : document.getElementById('fue-sync').checked;
+      if (!isFuResInactive && root.RGCrmCore && root.RGCrmCore.isManualBlockedWorkflowStatus && root.RGCrmCore.isManualBlockedWorkflowStatus(stVal)) {
+        var errFuBlocked = document.getElementById('fu-edit-err');
+        if (errFuBlocked) {
+          errFuBlocked.textContent = 'لا يمكن تحويل الحالة يدوياً إلى مرفوض أو ملغي.';
+          errFuBlocked.classList.remove('hidden');
+        }
+        return Promise.resolve(false);
+      }
       if (!actVal) {
         var errFu = document.getElementById('fu-edit-err');
         if (errFu) {

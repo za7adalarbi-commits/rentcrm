@@ -1259,6 +1259,29 @@
     };
   }
 
+  function computeLifecycleCounts(list, userContext) {
+    var core = root.RGCrmCore;
+    var counts = { all: 0, active: 0, cancelled: 0, rejected: 0 };
+    if (!Array.isArray(list) || !core) return counts;
+    var u = userContext || {};
+    var restrictAgent = u.role === 'agent' && u.allowAgentViewAll === false &&
+      !(u.user && core.canUserPerform && core.canUserPerform(u.user, 'view_all_reservations'));
+    list.forEach(function (r) {
+      if (!r) return;
+      if (restrictAgent) {
+        if (!Array.isArray(r.assignedEmployeeIds) || r.assignedEmployeeIds.indexOf(u.employeeId) === -1) return;
+      }
+      counts.all += 1;
+      var life = core.classifyReservationLifecycle
+        ? core.classifyReservationLifecycle(r)
+        : (core.isRejectedStatus && core.isRejectedStatus(r) ? 'rejected' : (core.isCancelledStatus && core.isCancelledStatus(r) ? 'cancelled' : 'active'));
+      if (life === 'rejected') counts.rejected += 1;
+      else if (life === 'cancelled') counts.cancelled += 1;
+      else counts.active += 1;
+    });
+    return counts;
+  }
+
   function queryLocalReservationsFast(payload, userContext) {
     var ns = getCacheNamespace();
     var core = root.RGCrmCore;
@@ -1288,6 +1311,7 @@
     });
 
     var filtered = core.filterReservations(resBucket.list, fuList, qFilters, userContext);
+    var lifecycleCounts = computeLifecycleCounts(resBucket.list, userContext);
     var page = Math.max(1, Number(p.page || 1));
     var pageSize = Math.max(1, Number(p.pageSize || 25));
     var startIdx = (page - 1) * pageSize;
@@ -1303,6 +1327,7 @@
           page: page,
           pageSize: pageSize,
           totalPages: Math.max(1, Math.ceil(filtered.length / pageSize)),
+          lifecycleCounts: lifecycleCounts,
           facets: {
             companies: Object.keys(companies).sort(),
             branches: Object.keys(branches).sort()
@@ -1513,102 +1538,15 @@
     }
 
     if (action === 'rejectReservation' || action === 'cancelReservation' || action === 'restoreReservation') {
-      var resIdLife = String(p.reservationId || p.id || '').trim();
-      if (!resIdLife) return;
-      var isRejectAct = action === 'rejectReservation';
-      var isCancelAct = action === 'cancelReservation';
-      var lifeStatus = isRejectAct
-        ? 'مرفوض'
-        : (isCancelAct ? 'تم الإلغاء' : String(p.targetStatus || 'بانتظار التأكيد'));
-      var reasonText = String(isRejectAct ? (p.rejectionReason || p.reason || '') : (isCancelAct ? (p.cancellationReason || p.reason || p.note || 'تم الإلغاء') : (p.note || p.reason || 'إعادة تفعيل الحجز'))).trim();
-      var lifeLastTxt = isRejectAct
-        ? ('تم رفض الحجز: ' + reasonText + (p.newCompanyName ? (' ← التحويل إلى: ' + p.newCompanyName) : ''))
-        : (isCancelAct
-            ? ('تم إلغاء الحجز: ' + reasonText)
-            : ('تمت استعادة الحجز إلى النشط (' + lifeStatus + ')'));
-      var patchLifecycleRec = function (rec) {
-        if (!rec || rec.id !== resIdLife) return rec;
-        var nextHistL = (core && core.appendStatusStageEntry)
-          ? core.appendStatusStageEntry(rec.statusHistory || [], {
-              source: isRejectAct ? 'reject_action' : (isCancelAct ? 'cancel_action' : 'restore_action'),
-              previousStatus: rec.internalStatus || '',
-              newStatus: lifeStatus,
-              changedAt: nowIso,
-              changedById: actUser.id,
-              changedByName: actUser.name,
-              note: lifeLastTxt
-            })
-          : (rec.statusHistory || []);
-        var patchFields = {
-          internalStatus: lifeStatus,
-          lastUpdateText: lifeLastTxt,
-          lastUpdatedById: actUser.id || rec.lastUpdatedById,
-          lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
-          lastUpdatedAt: nowIso,
-          updatedAt: nowIso,
-          statusHistory: nextHistL,
-          isFollowed: true
-        };
-        if (isRejectAct) {
-          patchFields.rejectionReason = reasonText;
-          if (p.companyNumber) patchFields.companyNumber = String(p.companyNumber).trim();
-          patchFields.newCompanyName = String(p.newCompanyName || '').trim();
-          patchFields.carStatusAtRequest = String(p.carStatusAtRequest || '').trim();
-          patchFields.refundAmount = Math.max(0, Number(p.refundAmount || 0));
-          patchFields.rejectedById = actUser.id || '';
-          patchFields.rejectedByName = actUser.name || '';
-          patchFields.rejectedAt = nowIso;
-          patchFields.cancelledById = '';
-          patchFields.cancelledByName = '';
-          patchFields.cancelledAt = '';
-        } else if (isCancelAct) {
-          patchFields.cancellationReason = reasonText;
-          patchFields.cancelledById = actUser.id || '';
-          patchFields.cancelledByName = actUser.name || '';
-          patchFields.cancelledAt = nowIso;
-          patchFields.rejectedById = '';
-          patchFields.rejectedByName = '';
-          patchFields.rejectedAt = '';
-        } else {
-          patchFields.rejectedAt = '';
-          patchFields.cancelledAt = '';
-        }
-        return Object.assign({}, rec, patchFields);
-      };
-      var nsLife = getCacheNamespace();
-      var patchedLifeRes = null;
-      if (localReservationsByNs[nsLife] && localReservationsByNs[nsLife].byId[resIdLife]) {
-        patchedLifeRes = patchLifecycleRec(localReservationsByNs[nsLife].byId[resIdLife]);
-        setLocalReservationsState(nsLife, [patchedLifeRes], false);
-      }
-      if (localDetailsByNs[nsLife] && localDetailsByNs[nsLife][resIdLife] && localDetailsByNs[nsLife][resIdLife].reservation) {
-        var curDetL = localDetailsByNs[nsLife][resIdLife];
-        patchedLifeRes = patchLifecycleRec(curDetL.reservation);
-        setLocalDetailState(nsLife, Object.assign({}, curDetL, { reservation: patchedLifeRes }));
-      }
-      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
-        if ((actName === 'getReservations' || actName === 'getInactiveReservations') && Array.isArray(data.items)) {
-          var hitL = patchedLifeRes || data.items.find(function (x) { return x && x.id === resIdLife; });
-          return hitL
-            ? patchReservationCachedQuery(data, entryKey, [patchLifecycleRec(hitL)], [])
-            : Object.assign({}, data, { items: data.items.map(patchLifecycleRec) });
-        }
-        if (actName === 'getReservationDetails' && data.reservation && data.reservation.id === resIdLife) {
-          return Object.assign({}, data, { reservation: patchLifecycleRec(data.reservation) });
-        }
-        if (actName === 'getMyFollowUps' && Array.isArray(data.assignedReservations)) {
-          return Object.assign({}, data, { assignedReservations: data.assignedReservations.map(patchLifecycleRec) });
-        }
-        return undefined;
-      });
-      patchTodayRadarCaches(patchLifecycleRec);
-      emitOptimisticMutationEvent(action, { reservationId: resIdLife, lifecycle: isRejectAct ? 'rejected' : (isCancelAct ? 'cancelled' : 'active') });
       return;
     }
 
     if (action === 'quickUpdateReservationStatus' || action === 'addFollowUp') {
       var resIdFu = String(p.reservationId || '').trim();
       var nextSt = String(p.status || '').trim();
+      if (core && core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(nextSt)) {
+        return;
+      }
       var actionText = action === 'quickUpdateReservationStatus'
         ? ('تحديث سريع للحالة إلى: ' + nextSt)
         : String(p.action || '').trim();
@@ -1619,39 +1557,21 @@
 
       var patchResStatus = function (rec) {
         if (!rec || rec.id !== resIdFu) return rec;
-        var nextHistory = (core && core.appendStatusStageEntry)
+        var isInactiveRec = Boolean(core && core.isInactiveReservation && core.isInactiveReservation(rec));
+        var appliedStatus = isInactiveRec ? rec.internalStatus : (nextSt || rec.internalStatus);
+        var nextHistory = (core && core.appendStatusStageEntry && !isInactiveRec)
           ? core.appendStatusStageEntry(rec.statusHistory || [], {
               source: action === 'quickUpdateReservationStatus' ? 'quick_status' : 'followup',
               previousStatus: rec.internalStatus || '',
-              newStatus: nextSt || rec.internalStatus,
+              newStatus: appliedStatus,
               changedAt: nowIso,
               changedById: actUser.id,
               changedByName: actUser.name,
               note: lastTxt
             })
           : (rec.statusHistory || []);
-        var lifecyclePatch = {};
-        if (core && core.isRejectedStatus && nextSt && core.isRejectedStatus(nextSt)) {
-          lifecyclePatch = {
-            rejectedAt: rec.rejectedAt || nowIso,
-            rejectedById: rec.rejectedById || actUser.id || '',
-            rejectedByName: rec.rejectedByName || actUser.name || '',
-            rejectionReason: rec.rejectionReason || noteText || actionText || 'مرفوض',
-            cancelledAt: ''
-          };
-        } else if (core && core.isCancelledStatus && nextSt && core.isCancelledStatus(nextSt)) {
-          lifecyclePatch = {
-            cancelledAt: rec.cancelledAt || nowIso,
-            cancelledById: rec.cancelledById || actUser.id || '',
-            cancelledByName: rec.cancelledByName || actUser.name || '',
-            cancellationReason: rec.cancellationReason || noteText || actionText || 'تم الإلغاء',
-            rejectedAt: ''
-          };
-        } else if (nextSt) {
-          lifecyclePatch = { rejectedAt: '', cancelledAt: '' };
-        }
         return Object.assign({}, rec, {
-          internalStatus: nextSt || rec.internalStatus,
+          internalStatus: appliedStatus,
           lastUpdateText: lastTxt || rec.lastUpdateText,
           lastUpdatedById: actUser.id || rec.lastUpdatedById,
           lastUpdatedByName: actUser.name || rec.lastUpdatedByName,
@@ -1659,7 +1579,7 @@
           updatedAt: nowIso,
           statusHistory: nextHistory,
           isFollowed: true
-        }, lifecyclePatch);
+        });
       };
       var nsOptFu = getCacheNamespace();
       if (localDetailsByNs[nsOptFu] && localDetailsByNs[nsOptFu][resIdFu]) {
@@ -2092,9 +2012,13 @@
     if (action === 'updateReservationDetails') {
       var resIdDet = String(p.reservationId || '').trim();
       if (!resIdDet) return;
+      if (p.internalStatus && core && core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(p.internalStatus)) {
+        return;
+      }
       var patchDet = function (rec) {
         if (!rec || rec.id !== resIdDet) return rec;
-        var nextStatusVal = (p.internalStatus !== undefined && p.internalStatus !== '') ? String(p.internalStatus) : rec.internalStatus;
+        var isDetInactive = Boolean(core && core.isInactiveReservation && core.isInactiveReservation(rec));
+        var nextStatusVal = (!isDetInactive && p.internalStatus !== undefined && p.internalStatus !== '') ? String(p.internalStatus) : rec.internalStatus;
         var nextHist = rec.statusHistory || [];
         if (nextStatusVal && nextStatusVal !== rec.internalStatus && core && core.appendStatusStageEntry) {
           nextHist = core.appendStatusStageEntry(nextHist, {
@@ -2122,29 +2046,16 @@
           'extendedUntilDate', 'extendedUntilTime',
           'pickupTypeAr', 'returnTypeAr',
           'paymentMethod', 'paymentStatus',
-          'internalStatus', 'priority', 'notes', 'lastUpdateText',
+          'priority', 'notes', 'lastUpdateText',
           'rejectionReason', 'cancellationReason', 'carStatusAtRequest'
         ];
         strFields.forEach(function (fk) {
           if (p[fk] !== undefined) out[fk] = String(p[fk]);
         });
+        out.internalStatus = nextStatusVal;
         if (p.refundAmount !== undefined && p.refundAmount !== '') {
           var parsedRefund = Number(p.refundAmount);
           if (!isNaN(parsedRefund)) out.refundAmount = Math.max(0, parsedRefund);
-        }
-        if (core && core.isRejectedStatus && core.isRejectedStatus(out.internalStatus)) {
-          out.rejectedAt = out.rejectedAt || nowIso;
-          out.rejectedById = out.rejectedById || actUser.id || '';
-          out.rejectedByName = out.rejectedByName || actUser.name || '';
-          out.cancelledAt = '';
-        } else if (core && core.isCancelledStatus && core.isCancelledStatus(out.internalStatus)) {
-          out.cancelledAt = out.cancelledAt || nowIso;
-          out.cancelledById = out.cancelledById || actUser.id || '';
-          out.cancelledByName = out.cancelledByName || actUser.name || '';
-          out.rejectedAt = '';
-        } else if (p.internalStatus !== undefined && p.internalStatus !== '') {
-          out.rejectedAt = '';
-          out.cancelledAt = '';
         }
         var numFields = ['daysCount', 'extendedDaysCount', 'totalDaysCount', 'extensionsCount', 'baseAmount', 'extensionsAmount', 'totalAmount'];
         numFields.forEach(function (nf) {
@@ -2190,6 +2101,9 @@
       var fuIdOpt = String(p.followUpId || '').trim();
       var resIdFuEdit = String(p.reservationId || '').trim();
       if (!fuIdOpt) return;
+      if (p.status && core && core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(p.status)) {
+        return;
+      }
       var patchFuItem = function (f) {
         if (!f || f.id !== fuIdOpt) return f;
         var outF = Object.assign({}, f);
@@ -2201,7 +2115,8 @@
       var nsFuEdit = getCacheNamespace();
       var patchResFromFu = function (rec) {
         if (!rec || (resIdFuEdit && rec.id !== resIdFuEdit)) return rec;
-        var nextStF = p.status ? String(p.status) : rec.internalStatus;
+        var isFuParentInactive = Boolean(core && core.isInactiveReservation && core.isInactiveReservation(rec));
+        var nextStF = (!isFuParentInactive && p.status) ? String(p.status) : rec.internalStatus;
         var lastTxtF = String(p.action || '') + (p.notes ? (' — ' + String(p.notes)) : '');
         return Object.assign({}, rec, {
           internalStatus: nextStF,
@@ -2736,7 +2651,7 @@
         customerName: 'عبدالله بن محمد السبيعي',
         customerPhone: '0508877123',
         customerEmail: 'a.alsubaie@example.sa',
-        customerIdNumber: '1084523910',
+        customerIdNumber: '0098765432',
         companyName: 'ذيب لتأجير السيارات',
         branchName: 'مطار الملك خالد - الرياض',
         deliverBranchName: 'مطار الملك خالد - الرياض',
@@ -2944,7 +2859,7 @@
         customerName: 'تركي سالم العجمي',
         customerPhone: '0543322119',
         customerEmail: 't.alajmi@example.sa',
-        customerIdNumber: '1044318762',
+        customerIdNumber: '',
         companyName: 'لومي لتأجير السيارات',
         branchName: 'مطار الملك فهد - الدمام',
         deliverBranchName: 'مطار الملك فهد - الدمام',
@@ -4421,12 +4336,14 @@
           if (r.companyName) companies[r.companyName] = true;
           if (r.branchName) branches[r.branchName] = true;
         });
-        var filtered = core.filterReservations(db.reservations, db.followUps, resPayload, {
+        var resUserCtx = {
           employeeId: session.employeeId,
           role: session.role,
           user: session.user,
           allowAgentViewAll: db.settings.allow_agent_view_all
-        });
+        };
+        var filtered = core.filterReservations(db.reservations, db.followUps, resPayload, resUserCtx);
+        var resLifecycleCounts = computeLifecycleCounts(db.reservations, resUserCtx);
         var page = Math.max(1, Number(payload.page || 1));
         var pageSize = Math.max(1, Number(payload.pageSize || 25));
         var startIdx = (page - 1) * pageSize;
@@ -4439,6 +4356,7 @@
             page: page,
             pageSize: pageSize,
             totalPages: Math.max(1, Math.ceil(filtered.length / pageSize)),
+            lifecycleCounts: resLifecycleCounts,
             facets: {
               companies: Object.keys(companies).sort(),
               branches: Object.keys(branches).sort()
@@ -4616,6 +4534,12 @@
       case 'quickUpdateReservationStatus': {
         var rQst = db.reservations.find(function (r) { return r.id === payload.reservationId; });
         if (!rQst) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        if (core.isInactiveReservation && core.isInactiveReservation(rQst)) {
+          return { success: false, message: 'الحجوزات المرفوضة أو الملغاة محمية من تعديل الحالة يدوياً.', data: null, error: 'FORBIDDEN_MANUAL_ACTION' };
+        }
+        if (core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(payload.status)) {
+          return { success: false, message: 'تم إيقاف التحويل اليدوي إلى مرفوض أو ملغي — تتم مزامنة هذه الحالات تلقائياً من Rental Gate.', data: null, error: 'FORBIDDEN_MANUAL_ACTION' };
+        }
         if (!payload.status || !core.isValidWorkflowStatus(payload.status)) {
           return { success: false, message: 'حالة الحجز غير صالحة.', data: null, error: 'VALIDATION' };
         }
@@ -4660,22 +4584,6 @@
         rQst.lastUpdatedByName = session.user.name;
         rQst.lastUpdatedAt = fuQst.createdAt;
         rQst.updatedAt = fuQst.createdAt;
-        if (core.isRejectedStatus && core.isRejectedStatus(payload.status)) {
-          rQst.rejectedAt = rQst.rejectedAt || fuQst.createdAt;
-          rQst.rejectedById = rQst.rejectedById || session.employeeId;
-          rQst.rejectedByName = rQst.rejectedByName || session.user.name;
-          rQst.rejectionReason = rQst.rejectionReason || noteQst || 'مرفوض';
-          rQst.cancelledAt = '';
-        } else if (core.isCancelledStatus && core.isCancelledStatus(payload.status)) {
-          rQst.cancelledAt = rQst.cancelledAt || fuQst.createdAt;
-          rQst.cancelledById = rQst.cancelledById || session.employeeId;
-          rQst.cancelledByName = rQst.cancelledByName || session.user.name;
-          rQst.cancellationReason = rQst.cancellationReason || noteQst || 'تم الإلغاء';
-          rQst.rejectedAt = '';
-        } else {
-          rQst.rejectedAt = '';
-          rQst.cancelledAt = '';
-        }
         rQst.statusHistory = core.appendStatusStageEntry(rQst.statusHistory, {
           source: 'quick_status',
           previousStatus: prevQstStatus,
@@ -4710,6 +4618,12 @@
         }
         var rEdit = db.reservations.find(function (r) { return r.id === payload.reservationId; });
         if (!rEdit) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        var isEditResInactive = Boolean(core.isInactiveReservation && core.isInactiveReservation(rEdit));
+        if (payload.internalStatus !== undefined && payload.internalStatus !== '' && payload.internalStatus !== rEdit.internalStatus) {
+          if (isEditResInactive || (core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(payload.internalStatus))) {
+            return { success: false, message: 'لا يمكن تغيير حالة الحجوزات المرفوضة أو الملغاة يدوياً أو تحويل الحجوزات إليها يدوياً.', data: null, error: 'FORBIDDEN_MANUAL_ACTION' };
+          }
+        }
         var beforeEditSnap = Object.assign({}, rEdit);
         var prevEditStatus = rEdit.internalStatus || '';
         [
@@ -4737,7 +4651,7 @@
           rEdit.hasExtensions = rEdit.extensionsAmount > 0 || Number(rEdit.extensionsCount || 0) > 0;
         }
         if (payload.totalAmount !== undefined) rEdit.totalAmount = Number(payload.totalAmount || 0);
-        if (payload.internalStatus && core.isValidWorkflowStatus(payload.internalStatus)) {
+        if (!isEditResInactive && payload.internalStatus && core.isValidWorkflowStatus(payload.internalStatus)) {
           rEdit.internalStatus = payload.internalStatus;
         }
         if (payload.priority && core.PROBLEM_PRIORITIES.indexOf(payload.priority) !== -1) {
@@ -4748,20 +4662,6 @@
         rEdit.lastUpdatedByName = session.user.name;
         rEdit.lastUpdatedAt = nowEditIso;
         rEdit.updatedAt = nowEditIso;
-        if (core.isRejectedStatus && core.isRejectedStatus(rEdit.internalStatus)) {
-          rEdit.rejectedAt = rEdit.rejectedAt || nowEditIso;
-          rEdit.rejectedById = rEdit.rejectedById || session.employeeId;
-          rEdit.rejectedByName = rEdit.rejectedByName || session.user.name;
-          rEdit.cancelledAt = '';
-        } else if (core.isCancelledStatus && core.isCancelledStatus(rEdit.internalStatus)) {
-          rEdit.cancelledAt = rEdit.cancelledAt || nowEditIso;
-          rEdit.cancelledById = rEdit.cancelledById || session.employeeId;
-          rEdit.cancelledByName = rEdit.cancelledByName || session.user.name;
-          rEdit.rejectedAt = '';
-        } else if (payload.internalStatus) {
-          rEdit.rejectedAt = '';
-          rEdit.cancelledAt = '';
-        }
         if (rEdit.internalStatus && rEdit.internalStatus !== prevEditStatus) {
           rEdit.statusHistory = core.appendStatusStageEntry(rEdit.statusHistory, {
             source: 'supervisor_edit',
@@ -4944,7 +4844,15 @@
       case 'addFollowUp': {
         var rFu = db.reservations.find(function (r) { return r.id === payload.reservationId; });
         if (!rFu) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
-        if (!payload.status || !core.isValidWorkflowStatus(payload.status)) {
+        var isFuInactive = Boolean(core.isInactiveReservation && core.isInactiveReservation(rFu));
+        if (!isFuInactive && core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(payload.status)) {
+          return { success: false, message: 'تم إيقاف التحويل اليدوي إلى مرفوض أو ملغي — تتم مزامنة هذه الحالات تلقائياً من Rental Gate.', data: null, error: 'FORBIDDEN_MANUAL_ACTION' };
+        }
+        if (isFuInactive && payload.status && payload.status !== rFu.internalStatus) {
+          return { success: false, message: 'لا يمكن تغيير حالة الحجز المرفوض أو الملغي يدوياً.', data: null, error: 'FORBIDDEN_MANUAL_ACTION' };
+        }
+        var appliedFuStatus = isFuInactive ? rFu.internalStatus : payload.status;
+        if (!appliedFuStatus || !core.isValidWorkflowStatus(appliedFuStatus)) {
           return { success: false, message: 'يرجى اختيار حالة متابعة صالحة.', data: null, error: 'VALIDATION' };
         }
         if (!String(payload.action || '').trim()) {
@@ -4959,7 +4867,7 @@
           customerName: rFu.customerName,
           employeeId: session.employeeId,
           employeeName: session.user.name,
-          status: payload.status,
+          status: appliedFuStatus,
           action: String(payload.action).trim(),
           notes: String(payload.notes || '').trim(),
           followUpDate: nowFu.toISOString().substring(0, 10),
@@ -4983,34 +4891,18 @@
           newNotes: newFu.notes,
           changedAt: newFu.createdAt
         });
-        var changedStatus = prevFuResStatus !== newFu.status;
-        rFu.internalStatus = newFu.status;
+        var changedStatus = !isFuInactive && prevFuResStatus !== newFu.status;
+        if (!isFuInactive) rFu.internalStatus = newFu.status;
         rFu.lastUpdateText = newFu.action + (newFu.notes ? ' — ' + newFu.notes : '');
         rFu.lastUpdatedById = session.employeeId;
         rFu.lastUpdatedByName = session.user.name;
         rFu.lastUpdatedAt = newFu.createdAt;
         rFu.updatedAt = newFu.createdAt;
-        if (core.isRejectedStatus && core.isRejectedStatus(newFu.status)) {
-          rFu.rejectedAt = rFu.rejectedAt || newFu.createdAt;
-          rFu.rejectedById = rFu.rejectedById || session.employeeId;
-          rFu.rejectedByName = rFu.rejectedByName || session.user.name;
-          rFu.rejectionReason = rFu.rejectionReason || newFu.notes || newFu.action || 'مرفوض';
-          rFu.cancelledAt = '';
-        } else if (core.isCancelledStatus && core.isCancelledStatus(newFu.status)) {
-          rFu.cancelledAt = rFu.cancelledAt || newFu.createdAt;
-          rFu.cancelledById = rFu.cancelledById || session.employeeId;
-          rFu.cancelledByName = rFu.cancelledByName || session.user.name;
-          rFu.cancellationReason = rFu.cancellationReason || newFu.notes || newFu.action || 'تم الإلغاء';
-          rFu.rejectedAt = '';
-        } else {
-          rFu.rejectedAt = '';
-          rFu.cancelledAt = '';
-        }
         if (changedStatus || !Array.isArray(rFu.statusHistory) || rFu.statusHistory.length === 0) {
           rFu.statusHistory = core.appendStatusStageEntry(rFu.statusHistory, {
             source: 'followup',
             previousStatus: prevFuResStatus,
-            newStatus: newFu.status,
+            newStatus: rFu.internalStatus,
             changedAt: newFu.createdAt,
             changedById: session.employeeId,
             changedByName: session.user.name,
@@ -5021,7 +4913,7 @@
         var empSelf = db.employees.find(function (e) { return e.id === session.employeeId; });
         if (empSelf) empSelf.lastActivity = newFu.createdAt;
 
-        appendSandboxActivity(db, session.user, changedStatus ? 'تعديل حالة' : 'إضافة متابعة', 'Reservation', rFu.reservationNumber, 'الحالة: ' + newFu.status + ' | ' + newFu.action);
+        appendSandboxActivity(db, session.user, changedStatus ? 'تعديل حالة' : 'إضافة متابعة', 'Reservation', rFu.reservationNumber, 'الحالة: ' + rFu.internalStatus + ' | ' + newFu.action);
         if (newFu.notes) {
           appendSandboxActivity(db, session.user, 'إضافة ملاحظة', 'Reservation', rFu.reservationNumber, newFu.notes);
         }
@@ -5030,7 +4922,7 @@
             pushSandboxNotification(
               db, eid, '', changedStatus ? 'status_change' : 'reservation_update',
               changedStatus ? 'تغيير حالة حجز' : 'تحديث متابعة على حجز مشترك',
-              session.user.name + ' حدّث الحجز ' + rFu.reservationNumber + ' إلى: ' + newFu.status,
+              session.user.name + ' حدّث الحجز ' + rFu.reservationNumber + ' إلى: ' + rFu.internalStatus,
               'Reservation', rFu.id
             );
           }
@@ -5046,31 +4938,35 @@
         if (fuEdit.employeeId !== session.employeeId && !core.canUserPerform(session.user, 'edit_any_followup')) {
           return { success: false, message: 'FORBIDDEN: لا يمكنك تعديل متابعة موظف آخر.', data: null, error: 'FORBIDDEN' };
         }
-        if (payload.status && core.isValidWorkflowStatus(payload.status)) fuEdit.status = payload.status;
+        var parentResForFu = db.reservations.find(function (r) { return r.id === fuEdit.reservationId; });
+        var isParentResInactive = Boolean(parentResForFu && core.isInactiveReservation && core.isInactiveReservation(parentResForFu));
+        if (payload.status && payload.status !== fuEdit.status) {
+          if (isParentResInactive || (core.isManualBlockedWorkflowStatus && core.isManualBlockedWorkflowStatus(payload.status))) {
+            return { success: false, message: 'لا يمكن تغيير الحالة يدوياً إلى مرفوض أو ملغي أو تعديل حالة حجز غير فعال.', data: null, error: 'FORBIDDEN_MANUAL_ACTION' };
+          }
+        }
+        if (!isParentResInactive && payload.status && core.isValidWorkflowStatus(payload.status)) fuEdit.status = payload.status;
         if (payload.action && String(payload.action).trim()) fuEdit.action = String(payload.action).trim();
         if (payload.notes !== undefined) fuEdit.notes = String(payload.notes || '').trim();
-        if (payload.syncToReservation) {
-          var parentRes = db.reservations.find(function (r) { return r.id === fuEdit.reservationId; });
-          if (parentRes) {
-            var prevParentSt = parentRes.internalStatus || '';
-            var nowUpdIso = new Date().toISOString();
-            parentRes.internalStatus = fuEdit.status;
-            parentRes.lastUpdateText = fuEdit.action + (fuEdit.notes ? ' — ' + fuEdit.notes : '');
-            parentRes.lastUpdatedById = session.employeeId;
-            parentRes.lastUpdatedByName = session.user.name;
-            parentRes.lastUpdatedAt = nowUpdIso;
-            parentRes.updatedAt = nowUpdIso;
-            if (prevParentSt !== fuEdit.status) {
-              parentRes.statusHistory = core.appendStatusStageEntry(parentRes.statusHistory, {
-                source: 'followup',
-                previousStatus: prevParentSt,
-                newStatus: fuEdit.status,
-                changedAt: nowUpdIso,
-                changedById: session.employeeId,
-                changedByName: session.user.name,
-                note: parentRes.lastUpdateText
-              });
-            }
+        if (payload.syncToReservation && parentResForFu && !isParentResInactive) {
+          var prevParentSt = parentResForFu.internalStatus || '';
+          var nowUpdIso = new Date().toISOString();
+          parentResForFu.internalStatus = fuEdit.status;
+          parentResForFu.lastUpdateText = fuEdit.action + (fuEdit.notes ? ' — ' + fuEdit.notes : '');
+          parentResForFu.lastUpdatedById = session.employeeId;
+          parentResForFu.lastUpdatedByName = session.user.name;
+          parentResForFu.lastUpdatedAt = nowUpdIso;
+          parentResForFu.updatedAt = nowUpdIso;
+          if (prevParentSt !== fuEdit.status) {
+            parentResForFu.statusHistory = core.appendStatusStageEntry(parentResForFu.statusHistory, {
+              source: 'followup',
+              previousStatus: prevParentSt,
+              newStatus: fuEdit.status,
+              changedAt: nowUpdIso,
+              changedById: session.employeeId,
+              changedByName: session.user.name,
+              note: parentResForFu.lastUpdateText
+            });
           }
         }
         appendSandboxActivity(db, session.user, 'تحديث متابعة', 'FollowUp', fuEdit.id, 'تعديل متابعة الحجز ' + fuEdit.reservationNumber);
@@ -6258,7 +6154,11 @@
           settingDiffs.push({ field: 'company_name', label: 'اسم الشركة', before: db.settings.company_name || '-', after: String(payload.company_name) });
           db.settings.company_name = String(payload.company_name);
         }
-        if (Array.isArray(payload.excluded_statuses)) db.settings.excluded_statuses = payload.excluded_statuses;
+        if (Array.isArray(payload.excluded_statuses)) {
+          db.settings.excluded_statuses = (core.sanitizeExcludedStatusesList)
+            ? core.sanitizeExcludedStatusesList(payload.excluded_statuses)
+            : payload.excluded_statuses;
+        }
         if (payload.session_ttl_hours) db.settings.session_ttl_hours = Number(payload.session_ttl_hours);
         if (typeof payload.allow_agent_view_all === 'boolean') db.settings.allow_agent_view_all = payload.allow_agent_view_all;
         if (payload.default_language) db.settings.default_language = payload.default_language;
@@ -7026,174 +6926,20 @@
         };
       }
 
-      case 'rejectReservation': {
-        if (!core.canUserPerform(session.user, 'reject_reservation')) {
-          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية رفض الحجوزات.', data: null, error: 'FORBIDDEN' };
-        }
-        var rejTargetId = String(payload.reservationId || payload.id || '').trim();
-        var rejReason = String(payload.rejectionReason || payload.reason || '').trim();
-        var rejCompanyNumber = String(payload.companyNumber || '').trim();
-        var rejNewCompany = String(payload.newCompanyName || '').trim();
-        var rejCarStatus = String(payload.carStatusAtRequest || '').trim();
-        var rejRefund = Math.max(0, Number(payload.refundAmount || 0));
-        var rejNote = String(payload.note || payload.notes || '').trim();
-        if (!rejTargetId) return { success: false, message: 'معرف الحجز مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        if (!rejReason) return { success: false, message: 'يرجى تحديد سبب الرفض.', data: null, error: 'VALIDATION_ERROR' };
-        var rejRes = db.reservations.find(function (r) { return r.id === rejTargetId || r.reservationNumber === rejTargetId; });
-        if (!rejRes) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
-        var rejNowIso = new Date().toISOString();
-        var rejPrevSt = rejRes.internalStatus || '';
-        var rejLastTxt = 'تم رفض الحجز: ' + rejReason + (rejNewCompany ? (' ← التحويل إلى: ' + rejNewCompany) : '');
-        var rejFu = {
-          id: genId('FU'),
-          reservationId: rejRes.id,
-          reservationNumber: rejRes.reservationNumber,
-          customerName: rejRes.customerName,
-          employeeId: session.employeeId,
-          employeeName: session.user.name,
-          status: 'مرفوض',
-          action: 'رفض الحجز (' + rejReason + ')',
-          notes: rejNote || (rejNewCompany ? ('الشركة الجديدة: ' + rejNewCompany + ' — مبلغ الاسترداد: ' + rejRefund) : ''),
-          followUpDate: rejNowIso.substring(0, 10),
-          followUpTime: rejNowIso.substring(11, 19),
-          createdAt: rejNowIso
-        };
-        db.followUps.unshift(rejFu);
-        rejRes.internalStatus = 'مرفوض';
-        rejRes.rejectionReason = rejReason;
-        if (rejCompanyNumber) rejRes.companyNumber = rejCompanyNumber;
-        rejRes.newCompanyName = rejNewCompany;
-        rejRes.carStatusAtRequest = rejCarStatus;
-        rejRes.refundAmount = rejRefund;
-        rejRes.rejectedById = session.employeeId;
-        rejRes.rejectedByName = session.user.name;
-        rejRes.rejectedAt = rejNowIso;
-        rejRes.cancelledById = '';
-        rejRes.cancelledByName = '';
-        rejRes.cancelledAt = '';
-        rejRes.lastUpdateText = rejLastTxt;
-        rejRes.lastUpdatedById = session.employeeId;
-        rejRes.lastUpdatedByName = session.user.name;
-        rejRes.lastUpdatedAt = rejNowIso;
-        rejRes.updatedAt = rejNowIso;
-        rejRes.isFollowed = true;
-        rejRes.statusHistory = core.appendStatusStageEntry(rejRes.statusHistory || [], {
-          source: 'reject_action',
-          previousStatus: rejPrevSt,
-          newStatus: 'مرفوض',
-          changedAt: rejNowIso,
-          changedById: session.employeeId,
-          changedByName: session.user.name,
-          note: rejLastTxt
-        });
-        appendSandboxActivity(db, session.user, 'رفض حجز', 'Reservation', rejRes.reservationNumber, rejLastTxt, [{ field: 'internalStatus', label: 'حالة الحجز', before: rejPrevSt || '-', after: 'مرفوض' }]);
-        saveSandboxDb(db);
-        var rejOut = core.redactReservationSensitiveFields ? core.redactReservationSensitiveFields(rejRes, session.user) : rejRes;
-        return { success: true, message: 'تم رفض الحجز ونقله إلى الحجوزات المرفوضة.', data: { reservation: rejOut, followUp: rejFu }, error: null };
-      }
-
-      case 'cancelReservation': {
-        if (!core.canUserPerform(session.user, 'cancel_reservation')) {
-          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إلغاء الحجوزات.', data: null, error: 'FORBIDDEN' };
-        }
-        var canTargetId = String(payload.reservationId || payload.id || '').trim();
-        var canReason = String(payload.cancellationReason || payload.reason || payload.note || 'تم الإلغاء').trim();
-        var canNote = String(payload.note || payload.notes || '').trim();
-        if (!canTargetId) return { success: false, message: 'معرف الحجز مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        var canRes = db.reservations.find(function (r) { return r.id === canTargetId || r.reservationNumber === canTargetId; });
-        if (!canRes) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
-        var canNowIso = new Date().toISOString();
-        var canPrevSt = canRes.internalStatus || '';
-        var canLastTxt = 'تم إلغاء الحجز: ' + canReason + (canNote && canNote !== canReason ? (' — ' + canNote) : '');
-        var canFu = {
-          id: genId('FU'),
-          reservationId: canRes.id,
-          reservationNumber: canRes.reservationNumber,
-          customerName: canRes.customerName,
-          employeeId: session.employeeId,
-          employeeName: session.user.name,
-          status: 'تم الإلغاء',
-          action: 'إلغاء الحجز (' + canReason + ')',
-          notes: canNote,
-          followUpDate: canNowIso.substring(0, 10),
-          followUpTime: canNowIso.substring(11, 19),
-          createdAt: canNowIso
-        };
-        db.followUps.unshift(canFu);
-        canRes.internalStatus = 'تم الإلغاء';
-        canRes.cancellationReason = canReason;
-        canRes.cancelledById = session.employeeId;
-        canRes.cancelledByName = session.user.name;
-        canRes.cancelledAt = canNowIso;
-        canRes.rejectedById = '';
-        canRes.rejectedByName = '';
-        canRes.rejectedAt = '';
-        canRes.lastUpdateText = canLastTxt;
-        canRes.lastUpdatedById = session.employeeId;
-        canRes.lastUpdatedByName = session.user.name;
-        canRes.lastUpdatedAt = canNowIso;
-        canRes.updatedAt = canNowIso;
-        canRes.isFollowed = true;
-        canRes.statusHistory = core.appendStatusStageEntry(canRes.statusHistory || [], {
-          source: 'cancel_action',
-          previousStatus: canPrevSt,
-          newStatus: 'تم الإلغاء',
-          changedAt: canNowIso,
-          changedById: session.employeeId,
-          changedByName: session.user.name,
-          note: canLastTxt
-        });
-        appendSandboxActivity(db, session.user, 'إلغاء حجز', 'Reservation', canRes.reservationNumber, canLastTxt, [{ field: 'internalStatus', label: 'حالة الحجز', before: canPrevSt || '-', after: 'تم الإلغاء' }]);
-        saveSandboxDb(db);
-        var canOut = core.redactReservationSensitiveFields ? core.redactReservationSensitiveFields(canRes, session.user) : canRes;
-        return { success: true, message: 'تم إلغاء الحجز ونقله إلى الحجوزات الملغاة.', data: { reservation: canOut, followUp: canFu }, error: null };
-      }
-
+      case 'rejectReservation':
+      case 'cancelReservation':
       case 'restoreReservation': {
-        var canRestoreSb = core.canUserPerform(session.user, 'reject_reservation') ||
-          core.canUserPerform(session.user, 'cancel_reservation') ||
-          core.canUserPerform(session.user, 'edit_reservation_details');
-        if (!canRestoreSb) {
-          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية استعادة الحجوزات غير الفعالة.', data: null, error: 'FORBIDDEN' };
-        }
-        var rstTargetId = String(payload.reservationId || payload.id || '').trim();
-        var rstReqSt = String(payload.targetStatus || 'بانتظار التأكيد').trim();
-        var rstNextSt = (core.isValidWorkflowStatus(rstReqSt) && !(core.isInactiveReservation && core.isInactiveReservation({ internalStatus: rstReqSt })))
-          ? rstReqSt
-          : 'بانتظار التأكيد';
-        var rstNote = String(payload.note || payload.reason || 'إعادة تفعيل الحجز').trim();
-        if (!rstTargetId) return { success: false, message: 'معرف الحجز مطلوب.', data: null, error: 'VALIDATION_ERROR' };
-        var rstRes = db.reservations.find(function (r) { return r.id === rstTargetId || r.reservationNumber === rstTargetId; });
-        if (!rstRes) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
-        var rstNowIso = new Date().toISOString();
-        var rstPrevSt = rstRes.internalStatus || '';
-        var rstLastTxt = 'تمت استعادة الحجز إلى النشط (' + rstNextSt + ')' + (rstNote ? (' — ' + rstNote) : '');
-        rstRes.internalStatus = rstNextSt;
-        rstRes.rejectedAt = '';
-        rstRes.cancelledAt = '';
-        rstRes.lastUpdateText = rstLastTxt;
-        rstRes.lastUpdatedById = session.employeeId;
-        rstRes.lastUpdatedByName = session.user.name;
-        rstRes.lastUpdatedAt = rstNowIso;
-        rstRes.updatedAt = rstNowIso;
-        rstRes.statusHistory = core.appendStatusStageEntry(rstRes.statusHistory || [], {
-          source: 'restore_action',
-          previousStatus: rstPrevSt,
-          newStatus: rstNextSt,
-          changedAt: rstNowIso,
-          changedById: session.employeeId,
-          changedByName: session.user.name,
-          note: rstLastTxt
-        });
-        appendSandboxActivity(db, session.user, 'استعادة حجز', 'Reservation', rstRes.reservationNumber, rstLastTxt, [{ field: 'internalStatus', label: 'حالة الحجز', before: rstPrevSt || '-', after: rstNextSt }]);
-        saveSandboxDb(db);
-        var rstOut = core.redactReservationSensitiveFields ? core.redactReservationSensitiveFields(rstRes, session.user) : rstRes;
-        return { success: true, message: 'تمت استعادة الحجز إلى الحجوزات النشطة.', data: { reservation: rstOut }, error: null };
+        return {
+          success: false,
+          message: 'تم إيقاف الرفض أو الإلغاء أو الاستعادة اليدوية من داخل النظام — تتم مزامنة هذه الحالات تلقائياً من Rental Gate.',
+          data: null,
+          error: 'FORBIDDEN_MANUAL_ACTION'
+        };
       }
 
       case 'getInactiveReservations': {
-        if (!core.canUserPerform(session.user, 'view_inactive_reservations')) {
-          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية عرض الحجوزات غير الفعالة.', data: null, error: 'FORBIDDEN' };
+        if (!core.canUserPerform(session.user, 'view_reservations')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية عرض الحجوزات.', data: null, error: 'FORBIDDEN' };
         }
         var inSubTab = String(payload.subTab || payload.lifecycle || 'rejected').toLowerCase();
         if (inSubTab === 'rejected' && core.canUserViewSubSection && !core.canUserViewSubSection(session.user, 'sub_view_rejected_tab')) {

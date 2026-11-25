@@ -67,309 +67,32 @@
     return true;
   }
 
-  function canRejectBookings(user) {
-    var core = root.RGCrmCore;
-    if (!user || !core) return false;
-    return core.canUserPerform(user, 'reject_reservation') && canUseAction(user, 'act_reject_reservation');
+  function canRejectBookings(_user) {
+    return false;
   }
 
-  function canCancelBookings(user) {
-    var core = root.RGCrmCore;
-    if (!user || !core) return false;
-    return core.canUserPerform(user, 'cancel_reservation') && canUseAction(user, 'act_cancel_reservation');
+  function canCancelBookings(_user) {
+    return false;
   }
 
-  function canRestoreBookings(user) {
-    var core = root.RGCrmCore;
-    if (!user || !core) return false;
-    return core.canUserPerform(user, 'reject_reservation') ||
-      core.canUserPerform(user, 'cancel_reservation') ||
-      core.canUserPerform(user, 'edit_reservation_details');
+  function canRestoreBookings(_user) {
+    return false;
   }
 
-  function openRejectModal(reservation, ctx, onDone) {
-    var r = reservation || {};
-    var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
-    var core = root.RGCrmCore;
+  function openRejectModal(_reservation, ctx) {
     var isEn = ctx && ctx.lang === 'en';
-    if (!canRejectBookings(user)) {
-      if (ctx && ctx.toast) ctx.toast(isEn ? 'You do not have permission to reject reservations.' : 'ليس لديك صلاحية رفض الحجوزات.', true);
-      return;
+    if (ctx && ctx.toast) {
+      ctx.toast(isEn ? 'Manual booking rejection is disabled. Statuses are synced from Rental Gate.' : 'تم إيقاف الرفض اليدوي للحجوزات — تتم مزامنة الحالات المرفوضة تلقائياً من Rental Gate.', true);
     }
-
-    var reasons = (core && Array.isArray(core.REJECTION_REASONS_LIST) && core.REJECTION_REASONS_LIST.length)
-      ? core.REJECTION_REASONS_LIST
-      : ['السعر غير مناسب', 'عدم توفر السيارة', 'رفض من الشركة', 'رفض العميل للشروط', 'خطأ في الحجز', 'أخرى'];
-    var carStatuses = (core && Array.isArray(core.CAR_STATUS_AT_REQUEST_OPTIONS) && core.CAR_STATUS_AT_REQUEST_OPTIONS.length)
-      ? core.CAR_STATUS_AT_REQUEST_OPTIONS
-      : ['متاحة عند الطلب', 'غير متاحة', 'تحت الصيانة', 'تم تأجيرها لعميل آخر', 'بانتظار رد الشركة'];
-
-    var modalRoot = document.getElementById('modal-root');
-    if (!modalRoot) return;
-
-    modalRoot.innerHTML =
-      '<div class="modal-backdrop" id="rg-reject-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rg-reject-modal-title">' +
-        '<form class="modal-panel" id="rg-reject-modal-form" style="max-width:620px;">' +
-          '<div class="modal-header">' +
-            '<div>' +
-              '<h3 class="modal-title" id="rg-reject-modal-title">' + (isEn ? 'Reject Booking #' : 'رفض الحجز رقم ') + '<span class="mono" dir="ltr">' + esc(r.reservationNumber || r.id) + '</span></h3>' +
-              '<div class="meta-inline"><span>' + esc(r.customerName || '-') + '</span><span>·</span><span>' + esc(r.companyName || '-') + '</span></div>' +
-            '</div>' +
-            '<button type="button" class="btn btn-sm" id="rg-reject-cancel-btn" data-modal-close>' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
-          '</div>' +
-          '<div class="rg-error-banner" style="margin-bottom:12px;border-color:rgba(217,31,43,0.28);background:rgba(217,31,43,0.06);">' +
-            '<div class="rg-error-banner-body">' +
-              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'Move to Rejected Reservations' : 'نقل الحجز إلى قسم الحجوزات المرفوضة') + '</div>' +
-              '<div class="rg-error-banner-msg">' + (isEn ? 'All customer and booking details will remain saved and excluded from active operations and pickups/returns.' : 'سيتم الاحتفاظ بكامل بيانات العميل والحجز، ونقله فوراً من الحجوزات النشطة والتسليم والاستلام إلى الحجوزات المرفوضة.') + '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="form-grid-2">' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="rej-reason-sel">' + (isEn ? 'Rejection Reason *' : 'سبب الرفض *') + '</label>' +
-              '<select class="select" id="rej-reason-sel" required>' +
-                reasons.map(function (rs) {
-                  return '<option value="' + esc(rs) + '"' + (r.rejectionReason === rs ? ' selected' : '') + '>' + esc(rs) + '</option>';
-                }).join('') +
-              '</select>' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="rej-car-status">' + (isEn ? 'Car Status at Request' : 'حالة حجز السيارة عند الطلب') + '</label>' +
-              '<select class="select" id="rej-car-status">' +
-                '<option value="">' + (isEn ? '— Select status —' : '— اختر الحالة —') + '</option>' +
-                carStatuses.map(function (cs) {
-                  return '<option value="' + esc(cs) + '"' + (r.carStatusAtRequest === cs ? ' selected' : '') + '>' + esc(cs) + '</option>';
-                }).join('') +
-              '</select>' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="rej-company-num">' + (isEn ? 'Company Reference #' : 'رقم الشركة') + '</label>' +
-              '<input type="text" class="input mono" id="rej-company-num" value="' + esc(r.companyNumber || '') + '" placeholder="' + (isEn ? 'e.g. CMP-402' : 'مثال: RG-880') + '">' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="rej-new-company">' + (isEn ? 'New / Alternative Company' : 'الشركة الجديدة (البديلة)') + '</label>' +
-              '<input type="text" class="input" id="rej-new-company" value="' + esc(r.newCompanyName || '') + '" placeholder="' + (isEn ? 'Optional alternative company' : 'اسم الشركة الجديدة إن وجدت') + '">' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="rej-refund">' + (isEn ? 'Refund Amount (SAR)' : 'مبلغ الاسترداد (ر.س)') + '</label>' +
-              '<input type="number" min="0" step="0.01" class="input mono" id="rej-refund" value="' + Number(r.refundAmount || 0) + '">' +
-            '</div>' +
-            '<div class="form-group">' +
-              '<label class="form-label" for="rej-custom-reason">' + (isEn ? 'Custom Reason / Details' : 'تفاصيل أو سبب مخصص') + '</label>' +
-              '<input type="text" class="input" id="rej-custom-reason" placeholder="' + (isEn ? 'Clarify rejection reason if needed...' : 'تفصيل إضافي للسبب (اختياري)...') + '">' +
-            '</div>' +
-          '</div>' +
-          '<div class="form-group">' +
-            '<label class="form-label" for="rej-note">' + (isEn ? 'Additional Notes' : 'ملاحظات الرفض') + '</label>' +
-            '<textarea class="textarea" id="rej-note" rows="2" placeholder="' + (isEn ? 'Notes saved to booking timeline...' : 'توثيق الإجراء في سجل الحجز...') + '"></textarea>' +
-          '</div>' +
-          '<div id="rg-reject-err" class="form-error hidden"></div>' +
-          '<div class="modal-footer">' +
-            '<button type="button" class="btn" id="rg-reject-back-btn" data-modal-close>' + (isEn ? 'Cancel' : 'إلغاء') + '</button>' +
-            '<button type="submit" class="btn btn-danger" id="rg-reject-submit-btn">' + (isEn ? 'Confirm Rejection' : 'تأكيد الرفض ونقل الحجز') + '</button>' +
-          '</div>' +
-        '</form>' +
-      '</div>';
-
-    var closeMe = function () {
-      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') root.RGApp.clearUnsavedGuard();
-      modalRoot.innerHTML = '';
-    };
-
-    var backdrop = document.getElementById('rg-reject-modal-backdrop');
-    if (backdrop) {
-      backdrop.addEventListener('click', function (ev) {
-        if (ev.target === backdrop) closeMe();
-      });
-    }
-    var cancelBtn = document.getElementById('rg-reject-cancel-btn');
-    var backBtn = document.getElementById('rg-reject-back-btn');
-    if (cancelBtn) cancelBtn.addEventListener('click', closeMe);
-    if (backBtn) backBtn.addEventListener('click', closeMe);
-
-    var formEl = document.getElementById('rg-reject-modal-form');
-    if (formEl) {
-      formEl.addEventListener('submit', function (ev) {
-        ev.preventDefault();
-        var errEl = document.getElementById('rg-reject-err');
-        if (errEl) errEl.classList.add('hidden');
-        var selReason = String((document.getElementById('rej-reason-sel') || {}).value || '').trim();
-        var customReason = String((document.getElementById('rej-custom-reason') || {}).value || '').trim();
-        var finalReason = (selReason === 'أخرى' && customReason)
-          ? customReason
-          : (customReason && selReason ? (selReason + ' — ' + customReason) : (selReason || customReason));
-        if (!finalReason) {
-          if (errEl) {
-            errEl.textContent = isEn ? 'Please select or enter a rejection reason.' : 'يرجى تحديد سبب الرفض.';
-            errEl.classList.remove('hidden');
-          }
-          return;
-        }
-        var companyNumber = String((document.getElementById('rej-company-num') || {}).value || '').trim();
-        var newCompanyName = String((document.getElementById('rej-new-company') || {}).value || '').trim();
-        var carStatusAtRequest = String((document.getElementById('rej-car-status') || {}).value || '').trim();
-        var refundAmount = Math.max(0, Number((document.getElementById('rej-refund') || {}).value || 0));
-        var note = String((document.getElementById('rej-note') || {}).value || '').trim();
-        var submitBtn = document.getElementById('rg-reject-submit-btn');
-
-        var reqPayload = {
-          reservationId: r.id,
-          rejectionReason: finalReason,
-          companyNumber: companyNumber,
-          newCompanyName: newCompanyName,
-          carStatusAtRequest: carStatusAtRequest,
-          refundAmount: isFinite(refundAmount) ? refundAmount : 0,
-          note: note
-        };
-
-        getActionLock(submitBtn, 'rejectReservation:' + r.id, async function () {
-          if (root.RGApi && typeof root.RGApi.applyOptimisticMutation === 'function') {
-            root.RGApi.applyOptimisticMutation('rejectReservation', reqPayload, user);
-          }
-          var resp = await root.RGApi.callApi('rejectReservation', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, reqPayload));
-          if (!resp || !resp.success) {
-            if (errEl) {
-              errEl.textContent = (resp && resp.message) || (isEn ? 'Failed to reject booking.' : 'تعذر تنفيذ رفض الحجز.');
-              errEl.classList.remove('hidden');
-            }
-            return;
-          }
-          if (ctx && ctx.refreshNotifications) ctx.refreshNotifications();
-          if (ctx && ctx.toast) {
-            ctx.toast(isEn ? 'Booking rejected and moved to Rejected Reservations.' : 'تم رفض الحجز ونقله إلى الحجوزات المرفوضة.');
-          }
-          closeMe();
-          if (typeof onDone === 'function') {
-            onDone((resp.data && resp.data.reservation) || Object.assign({}, r, {
-              internalStatus: 'مرفوض',
-              rejectionReason: finalReason,
-              companyNumber: companyNumber || r.companyNumber,
-              newCompanyName: newCompanyName,
-              carStatusAtRequest: carStatusAtRequest,
-              refundAmount: isFinite(refundAmount) ? refundAmount : 0,
-              rejectedById: user ? user.id : '',
-              rejectedByName: user ? user.name : '',
-              rejectedAt: new Date().toISOString()
-            }));
-          }
-        }, { spamAction: 'rejectReservation', spamSig: r.id + ':' + finalReason });
-      });
-    }
+    return;
   }
 
-  function openCancelModal(reservation, ctx, onDone) {
-    var r = reservation || {};
-    var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
-    var core = root.RGCrmCore;
+  function openCancelModal(_reservation, ctx) {
     var isEn = ctx && ctx.lang === 'en';
-    if (!canCancelBookings(user)) {
-      if (ctx && ctx.toast) ctx.toast(isEn ? 'You do not have permission to cancel reservations.' : 'ليس لديك صلاحية إلغاء الحجوزات.', true);
-      return;
+    if (ctx && ctx.toast) {
+      ctx.toast(isEn ? 'Manual booking cancellation is disabled. Statuses are synced from Rental Gate.' : 'تم إيقاف الإلغاء اليدوي للحجوزات — تتم مزامنة الحجوزات الملغاة تلقائياً من Rental Gate.', true);
     }
-
-    var reasons = (core && Array.isArray(core.CANCELLATION_REASONS_LIST) && core.CANCELLATION_REASONS_LIST.length)
-      ? core.CANCELLATION_REASONS_LIST
-      : ['إلغاء بطلب العميل', 'تغيير خطة السفر', 'عدم استلام السيارة', 'مشكلة في الدفع / الهوية', 'تكرار الحجز', 'أخرى'];
-
-    var modalRoot = document.getElementById('modal-root');
-    if (!modalRoot) return;
-
-    modalRoot.innerHTML =
-      '<div class="modal-backdrop" id="rg-cancel-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rg-cancel-modal-title">' +
-        '<form class="modal-panel" id="rg-cancel-modal-form" style="max-width:560px;">' +
-          '<div class="modal-header">' +
-            '<div>' +
-              '<h3 class="modal-title" id="rg-cancel-modal-title">' + (isEn ? 'Cancel Booking #' : 'إلغاء الحجز رقم ') + '<span class="mono" dir="ltr">' + esc(r.reservationNumber || r.id) + '</span></h3>' +
-              '<div class="meta-inline"><span>' + esc(r.customerName || '-') + '</span><span>·</span><span>' + esc(r.companyName || '-') + '</span></div>' +
-            '</div>' +
-            '<button type="button" class="btn btn-sm" id="rg-cancel-close-btn" data-modal-close>' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
-          '</div>' +
-          '<div class="rg-error-banner" style="margin-bottom:12px;border-color:rgba(217,119,6,0.32);background:rgba(217,119,6,0.08);">' +
-            '<div class="rg-error-banner-body">' +
-              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'Move to Cancelled Reservations' : 'نقل الحجز إلى الحجوزات الملغاة') + '</div>' +
-              '<div class="rg-error-banner-msg">' + (isEn ? 'The booking will immediately disappear from Active Reservations and Pickups/Returns while keeping all data intact.' : 'سيختفي الحجز فوراً من الحجوزات النشطة وقائمة التسليم والاستلام، ويُنقل إلى الحجوزات الملغاة مع الاحتفاظ بكامل بياناته.') + '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="form-group">' +
-            '<label class="form-label" for="can-reason-sel">' + (isEn ? 'Cancellation Reason *' : 'سبب الإلغاء *') + '</label>' +
-            '<select class="select" id="can-reason-sel" required>' +
-              reasons.map(function (rs) {
-                return '<option value="' + esc(rs) + '"' + (r.cancellationReason === rs ? ' selected' : '') + '>' + esc(rs) + '</option>';
-              }).join('') +
-            '</select>' +
-          '</div>' +
-          '<div class="form-group">' +
-            '<label class="form-label" for="can-note">' + (isEn ? 'Cancellation Notes' : 'تفاصيل / ملاحظات الإلغاء') + '</label>' +
-            '<textarea class="textarea" id="can-note" rows="3" placeholder="' + (isEn ? 'Optional notes saved to activity & timeline...' : 'أدخل أي تفاصيل إضافية عن الإلغاء...') + '"></textarea>' +
-          '</div>' +
-          '<div id="rg-cancel-err" class="form-error hidden"></div>' +
-          '<div class="modal-footer">' +
-            '<button type="button" class="btn" id="rg-cancel-back-btn" data-modal-close>' + (isEn ? 'Back' : 'تراجع') + '</button>' +
-            '<button type="submit" class="btn btn-danger" id="rg-cancel-submit-btn">' + (isEn ? 'Confirm Cancellation' : 'تأكيد إلغاء الحجز') + '</button>' +
-          '</div>' +
-        '</form>' +
-      '</div>';
-
-    var closeMe = function () {
-      if (root.RGApp && typeof root.RGApp.clearUnsavedGuard === 'function') root.RGApp.clearUnsavedGuard();
-      modalRoot.innerHTML = '';
-    };
-    var backdrop = document.getElementById('rg-cancel-modal-backdrop');
-    if (backdrop) {
-      backdrop.addEventListener('click', function (ev) {
-        if (ev.target === backdrop) closeMe();
-      });
-    }
-    var closeBtn = document.getElementById('rg-cancel-close-btn');
-    var backBtn = document.getElementById('rg-cancel-back-btn');
-    if (closeBtn) closeBtn.addEventListener('click', closeMe);
-    if (backBtn) backBtn.addEventListener('click', closeMe);
-
-    var formEl = document.getElementById('rg-cancel-modal-form');
-    if (formEl) {
-      formEl.addEventListener('submit', function (ev) {
-        ev.preventDefault();
-        var errEl = document.getElementById('rg-cancel-err');
-        if (errEl) errEl.classList.add('hidden');
-        var selReason = String((document.getElementById('can-reason-sel') || {}).value || '').trim();
-        var note = String((document.getElementById('can-note') || {}).value || '').trim();
-        var finalReason = (selReason === 'أخرى' && note) ? note : (selReason || note || 'تم الإلغاء');
-        var submitBtn = document.getElementById('rg-cancel-submit-btn');
-
-        var reqPayload = {
-          reservationId: r.id,
-          cancellationReason: finalReason,
-          note: note
-        };
-
-        getActionLock(submitBtn, 'cancelReservation:' + r.id, async function () {
-          if (root.RGApi && typeof root.RGApi.applyOptimisticMutation === 'function') {
-            root.RGApi.applyOptimisticMutation('cancelReservation', reqPayload, user);
-          }
-          var resp = await root.RGApi.callApi('cancelReservation', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, reqPayload));
-          if (!resp || !resp.success) {
-            if (errEl) {
-              errEl.textContent = (resp && resp.message) || (isEn ? 'Failed to cancel booking.' : 'تعذر إلغاء الحجز.');
-              errEl.classList.remove('hidden');
-            }
-            return;
-          }
-          if (ctx && ctx.refreshNotifications) ctx.refreshNotifications();
-          if (ctx && ctx.toast) {
-            ctx.toast(isEn ? 'Booking cancelled and moved to Cancelled Reservations.' : 'تم إلغاء الحجز ونقله إلى الحجوزات الملغاة.');
-          }
-          closeMe();
-          if (typeof onDone === 'function') {
-            onDone((resp.data && resp.data.reservation) || Object.assign({}, r, {
-              internalStatus: 'تم الإلغاء',
-              cancellationReason: finalReason,
-              cancelledById: user ? user.id : '',
-              cancelledByName: user ? user.name : '',
-              cancelledAt: new Date().toISOString()
-            }));
-          }
-        }, { spamAction: 'cancelReservation', spamSig: r.id + ':' + finalReason });
-      });
-    }
+    return;
   }
 
   function openNationalIdLookupModal(ctx, initialQuery) {
@@ -615,7 +338,7 @@
     var searchDebounce = null;
 
     var canExport = canUseAction(user, 'act_export_excel');
-    var canRestore = canRestoreBookings(user);
+    var canRestore = false;
     var allowIdView = canViewIdNumber(user);
 
     var reasonOptionsBase = isCancelled
@@ -837,7 +560,6 @@
                 '<td class="mono tabular-nums" style="min-width:84px;line-height:1.35;">' + esc(formatDateTimeCell(actionAtVal, ctx && ctx.lang)) + '</td>' +
                 '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:4px;flex-wrap:nowrap;">' +
                   '<button type="button" class="btn btn-sm btn-primary inact-open-drawer" data-id="' + esc(r.id) + '">' + (isEn ? 'Details' : 'التفاصيل') + '</button>' +
-                  (canRestore ? '<button type="button" class="btn btn-sm inact-restore-btn" data-id="' + esc(r.id) + '">' + (isEn ? 'Restore' : 'استعادة') + '</button>' : '') +
                 '</div></td>' +
               '</tr>';
 
@@ -920,34 +642,6 @@
               loadData({ forceRefresh: true, silentRefresh: true });
             });
           }
-        });
-      });
-
-      tblHost.querySelectorAll('.inact-restore-btn').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          var id = btn.getAttribute('data-id');
-          if (!id) return;
-          getActionLock(btn, 'restoreReservation:' + id, async function () {
-            if (root.RGApi && typeof root.RGApi.applyOptimisticMutation === 'function') {
-              root.RGApi.applyOptimisticMutation('restoreReservation', { reservationId: id, targetStatus: 'بانتظار التأكيد' }, user);
-            }
-            var resp = await root.RGApi.callApi('restoreReservation', {
-              reservationId: id,
-              targetStatus: 'بانتظار التأكيد',
-              _keepOptimisticCache: true,
-              _spamChecked: true
-            });
-            if (!resp || !resp.success) {
-              if (ctx && ctx.toast) ctx.toast((resp && resp.message) || (isEn ? 'Failed to restore booking.' : 'تعذر استعادة الحجز.'), true);
-              await loadData({ forceRefresh: true });
-              return;
-            }
-            currentItems = currentItems.filter(function (x) { return x && x.id !== id; });
-            currentTotal = Math.max(0, currentTotal - 1);
-            if (ctx && ctx.toast) ctx.toast(isEn ? 'Booking restored to Active Reservations.' : 'تمت استعادة الحجز إلى الحجوزات النشطة بنجاح.');
-            paintTable();
-            loadData({ forceRefresh: true, silentRefresh: true });
-          }, { spamAction: 'restoreReservation', spamSig: id });
         });
       });
 
@@ -1162,10 +856,10 @@
     var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     var core = root.RGCrmCore;
 
-    if (!user || !core || !core.canUserPerform(user, 'view_inactive_reservations')) {
+    if (!user || !core || !core.canUserPerform(user, 'view_reservations')) {
       container.innerHTML =
         '<div class="surface-card"><div class="empty-state" style="padding:36px 18px;">' +
-          (isEn ? 'You do not have permission to view Inactive Reservations.' : 'ليس لديك صلاحية عرض قسم الحجوزات غير الفعالة.') +
+          (isEn ? 'You do not have permission to view Reservations.' : 'ليس لديك صلاحية عرض الحجوزات.') +
         '</div></div>';
       return;
     }
@@ -1193,7 +887,7 @@
         '<div class="section-header">' +
           '<div>' +
             '<h2 class="section-title">' + (isEn ? 'Inactive Reservations' : 'الحجوزات غير الفعالة') + '</h2>' +
-            '<p class="section-subtitle">' + (isEn ? 'Full archive for rejected and cancelled bookings with complete customer data, audit logs, and restore controls' : 'سجل متكامل للحجوزات المرفوضة والملغاة خارج دورة العمل النشطة مع حفظ كامل البيانات وسجل الإجراءات وإمكانية الاستعادة') + '</p>' +
+            '<p class="section-subtitle">' + (isEn ? 'Synced archive for rejected and cancelled bookings with complete customer data and audit logs' : 'سجل متكامل للحجوزات المرفوضة والملغاة المزامنة من الموقع الخارجي مع حفظ كامل البيانات وسجل الإجراءات') + '</p>' +
           '</div>' +
           '<div class="toolbar-row" style="margin-bottom:0;">' +
             (showLookupBtn

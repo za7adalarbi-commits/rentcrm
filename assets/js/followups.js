@@ -201,11 +201,13 @@
                     '<div class="cell-sub">' + esc(r.carName) + '</div>' +
                   '</td>' +
                   '<td>' +
-                    '<select class="quick-status-select myfu-quick-status" data-id="' + esc(r.id) + '" aria-label="تحديث حالة ' + esc(r.reservationNumber) + '">' +
-                      (core.getWorkflowStatusOptions ? core.getWorkflowStatusOptions(r.internalStatus) : core.FOLLOWUP_STATUSES).map(function (s) {
-                        return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
-                      }).join('') +
-                    '</select>' +
+                    ((core.isInactiveReservation && core.isInactiveReservation(r))
+                      ? ('<span class="status-tag status-danger">' + esc(r.internalStatus || r.originalStatusAr || '-') + '</span>')
+                      : ('<select class="quick-status-select myfu-quick-status" data-id="' + esc(r.id) + '" aria-label="تحديث حالة ' + esc(r.reservationNumber) + '">' +
+                          (core.getWorkflowStatusOptions ? core.getWorkflowStatusOptions(r.internalStatus) : (core.MANUAL_WORKFLOW_STATUS_OPTIONS || core.FOLLOWUP_STATUSES)).map(function (s) {
+                            return '<option value="' + esc(s) + '"' + (r.internalStatus === s ? ' selected' : '') + '>' + esc(s) + '</option>';
+                          }).join('') +
+                        '</select>')) +
                   '</td>' +
                   '<td class="myfu-last-update-cell"><div class="cell-clamp-2" title="' + esc(r.lastUpdateText || '') + '">' + esc(r.lastUpdateText || '-') + '</div></td>' +
                   '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +

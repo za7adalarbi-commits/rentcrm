@@ -282,6 +282,7 @@
       { key: 'reservationNumber', label: 'رقم الحجز' },
       { key: 'customerName', label: 'اسم العميل' },
       { key: 'customerPhone', label: 'الجوال' },
+      { key: 'customerIdNumber', label: 'رقم الهوية' },
       { key: 'companyName', label: 'الشركة' },
       { key: 'branchName', label: 'الفرع' },
       { key: 'carName', label: 'السيارة' },
@@ -546,7 +547,7 @@
             '<div class="form-grid-2">' +
               '<div class="form-group"><label class="form-label" for="set-company">اسم الشركة</label><input class="input" id="set-company" value="' + escapeHtml(settings.company_name || 'RENTAL GATE') + '"></div>' +
               '<div class="form-group"><label class="form-label" for="set-ttl">مدة صلاحية الجلسة (ساعات)</label><input class="input tabular-nums" type="number" min="1" max="168" id="set-ttl" value="' + (settings.session_ttl_hours || 24) + '"></div>' +
-              '<div class="form-group"><label class="form-label" for="set-excluded">الحالات المستبعدة أثناء السحب (مفصولة بفاصلة)</label><input class="input mono" id="set-excluded" value="' + escapeHtml(Array.isArray(settings.excluded_statuses) ? settings.excluded_statuses.join(', ') : 'draft, test, abandoned') + '"></div>' +
+              '<div class="form-group"><label class="form-label" for="set-excluded">الحالات المستبعدة أثناء السحب (مفصولة بفاصلة — لا يشمل الملغي أو المرفوض)</label><input class="input mono" id="set-excluded" value="' + escapeHtml(Array.isArray(settings.excluded_statuses) ? settings.excluded_statuses.filter(function (s) { return !(root.RGCrmCore && ((root.RGCrmCore.isRejectedStatus && root.RGCrmCore.isRejectedStatus(s)) || (root.RGCrmCore.isCancelledStatus && root.RGCrmCore.isCancelledStatus(s)))); }).join(', ') : 'draft, test, abandoned') + '"></div>' +
               '<div class="form-group" style="justify-content:center;"><label class="checkbox-item"><input type="checkbox" id="set-agent-all"' + (settings.allow_agent_view_all ? ' checked' : '') + '> السماح لموظف خدمة العملاء باستعراض جميع الحجوزات</label></div>' +
             '</div>' +
 
@@ -1665,7 +1666,13 @@
         ? root.RGCrmCore.normalizeAutoSyncInterval(rawHours, rawMinutes)
         : { hours: Math.max(0, Math.min(168, Math.round(rawHours || 0))), minutes: Math.max(0, Math.min(59, Math.round(rawMinutes || 0))) };
 
-      var excluded = (document.getElementById('set-excluded').value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+      var excluded = (document.getElementById('set-excluded').value || '').split(',').map(function (s) { return s.trim(); }).filter(function (s) {
+        if (!s) return false;
+        if (root.RGCrmCore && ((root.RGCrmCore.isRejectedStatus && root.RGCrmCore.isRejectedStatus(s)) || (root.RGCrmCore.isCancelledStatus && root.RGCrmCore.isCancelledStatus(s)))) {
+          return false;
+        }
+        return !/^(cancelled|canceled|rejected|declined|refused|ملغي|ملغى|تم الإلغاء|مرفوض)$/i.test(s);
+      });
 
       if (ctx.setRoleUiDefaults) ctx.setRoleUiDefaults(normRoleDefaults);
       else if (root.RGApp && root.RGApp.setRoleUiDefaults) root.RGApp.setRoleUiDefaults(normRoleDefaults);

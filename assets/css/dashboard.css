@@ -1242,12 +1242,9 @@ html.rg-ui-hide-set-role-defaults #set-role-ui-defaults-panel,
 html.rg-ui-hide-set-role-defaults #btn-preview-role-defaults,
 html.rg-ui-hide-set-diag .rg-ui-set-diag,
 html.rg-ui-hide-set-danger .rg-ui-set-danger,
-html.rg-ui-hide-nav-inactive-res .nav-item[data-route="inactive-reservations"],
-html.rg-ui-hide-nav-inactive-reservations .nav-item[data-route="inactive-reservations"],
+html.rg-ui-hide-res-cancelled-tab [data-res-view="cancelled"],
 html.rg-ui-hide-res-rejected-tab [data-res-view="rejected"],
-html.rg-ui-hide-res-id-lookup .rg-ui-res-id-lookup,
-html.rg-ui-hide-res-reject-btn .rg-ui-res-reject-btn,
-html.rg-ui-hide-res-cancel-btn .rg-ui-res-cancel-btn {
+html.rg-ui-hide-res-id-lookup .rg-ui-res-id-lookup {
   display: none !important;
 }
 
