@@ -42,6 +42,21 @@ function asDateStr(val) {
   return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 }
 
+function asUiOverridesJson(val) {
+  if (!val) return '{}';
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed) return '{}';
+    try {
+      const parsed = JSON.parse(trimmed);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? JSON.stringify(parsed) : '{}';
+    } catch {
+      return '{}';
+    }
+  }
+  return typeof val === 'object' && !Array.isArray(val) ? JSON.stringify(val) : '{}';
+}
+
 async function migrate() {
   const args = parseArgs(process.argv);
   const connectionString = String(process.env.DATABASE_URL || process.env.POSTGRES_URL || '').trim();
@@ -85,29 +100,31 @@ async function migrate() {
 
     for (const emp of data.Employees || data.employees || []) {
       if (!emp.id || !emp.username) continue;
+      const uiOvJson = asUiOverridesJson(emp.uiOverrides ?? emp.ui_overrides);
       await client.query(
-        `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13::timestamptz,$14::timestamptz)
+        `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14::timestamptz,$15::timestamptz)
          ON CONFLICT (id) DO UPDATE SET
            name = EXCLUDED.name, phone = EXCLUDED.phone, email = EXCLUDED.email,
            job_title = EXCLUDED.job_title, role = EXCLUDED.role, permissions = EXCLUDED.permissions,
+           ui_overrides = CASE WHEN employees.ui_overrides = '{}'::jsonb THEN EXCLUDED.ui_overrides ELSE employees.ui_overrides END,
            status = EXCLUDED.status, updated_at = EXCLUDED.updated_at`,
         [
           emp.id, emp.name || '', emp.username, emp.passwordHash || emp.password_hash || '',
           emp.salt || '', emp.phone || '', emp.email || '', emp.jobTitle || emp.job_title || '',
-          emp.role || 'agent', JSON.stringify(asArray(emp.permissions)), emp.status || 'active',
+          emp.role || 'agent', JSON.stringify(asArray(emp.permissions)), uiOvJson, emp.status || 'active',
           emp.lastActivity || emp.last_activity || '', asDateStr(emp.createdAt || emp.created_at),
           asDateStr(emp.updatedAt || emp.updated_at)
         ]
       );
       await client.query(
-        `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, status, last_activity, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11::timestamptz,$12::timestamptz)
+        `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12::timestamptz,$13::timestamptz)
          ON CONFLICT (id) DO NOTHING`,
         [
           emp.id, emp.name || '', emp.username, emp.phone || '', emp.email || '',
           emp.jobTitle || emp.job_title || '', emp.role || 'agent',
-          JSON.stringify(asArray(emp.permissions)), emp.status || 'active',
+          JSON.stringify(asArray(emp.permissions)), uiOvJson, emp.status || 'active',
           emp.lastActivity || emp.last_activity || '', asDateStr(emp.createdAt || emp.created_at),
           asDateStr(emp.updatedAt || emp.updated_at)
         ]

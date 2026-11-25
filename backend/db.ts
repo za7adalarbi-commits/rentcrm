@@ -160,6 +160,197 @@ function loadSchemaSql(): string {
   return SCHEMA_SQL;
 }
 
+interface ColumnMetaRow {
+  table_name: string;
+  column_name: string;
+  data_type: string;
+  udt_name: string;
+  is_nullable: string;
+}
+
+async function runOptionalDdl(executor: DbClient, sql: string): Promise<void> {
+  try {
+    await executor.query(sql);
+  } catch (err: any) {
+    console.warn('Non-fatal DDL migration warning:', String(err?.message || err).slice(0, 200));
+  }
+}
+
+export async function ensureUiOverridesColumns(executor: DbClient): Promise<{
+  employeesAdded: boolean;
+  usersAdded: boolean;
+}> {
+  let employeesAdded = false;
+  let usersAdded = false;
+
+  const metaRes = await executor.query<ColumnMetaRow>(
+    `SELECT table_name, column_name, data_type, udt_name, is_nullable
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name IN ('employees', 'users')
+       AND column_name = 'ui_overrides'`
+  );
+
+  const metaRows = Array.isArray(metaRes?.rows) ? metaRes.rows : [];
+  const byTable = new Map<string, ColumnMetaRow>();
+  for (const r of metaRows) {
+    if (r?.table_name) byTable.set(String(r.table_name), r);
+  }
+
+  // Ensure users table exists on legacy deployments before altering it
+  await runOptionalDdl(
+    executor,
+    `CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      username TEXT NOT NULL UNIQUE,
+      phone TEXT NOT NULL DEFAULT '',
+      email TEXT NOT NULL DEFAULT '',
+      job_title TEXT NOT NULL DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'agent',
+      permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'active',
+      last_activity TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+
+  for (const tbl of ['employees', 'users'] as const) {
+    const col = byTable.get(tbl);
+    if (!col) {
+      await executor.query(
+        `ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;`
+      );
+      if (tbl === 'employees') employeesAdded = true;
+      else usersAdded = true;
+      continue;
+    }
+
+    const udt = String(col.udt_name || col.data_type || '').toLowerCase();
+    if (udt && udt !== 'jsonb' && udt !== 'json') {
+      // Preserve valid JSON text values while migrating legacy text/varchar column to JSONB
+      await executor.query(
+        `ALTER TABLE ${tbl}
+         ALTER COLUMN ui_overrides TYPE JSONB
+         USING (
+           CASE
+             WHEN ui_overrides IS NULL OR BTRIM(ui_overrides::text) = '' THEN '{}'::jsonb
+             WHEN LEFT(BTRIM(ui_overrides::text), 1) = '{' THEN ui_overrides::jsonb
+             ELSE '{}'::jsonb
+           END
+         );`
+      );
+    }
+
+    if (String(col.is_nullable || '').toUpperCase() === 'YES') {
+      await executor.query(
+        `UPDATE ${tbl} SET ui_overrides = '{}'::jsonb WHERE ui_overrides IS NULL;`
+      );
+      await executor.query(
+        `ALTER TABLE ${tbl} ALTER COLUMN ui_overrides SET DEFAULT '{}'::jsonb;`
+      );
+      await executor.query(
+        `ALTER TABLE ${tbl} ALTER COLUMN ui_overrides SET NOT NULL;`
+      );
+    }
+  }
+
+  return { employeesAdded, usersAdded };
+}
+
+const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_id TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_name TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_updated_at TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS no_answer_count INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS source_order INTEGER;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS company_number TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS new_company_name TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejection_reason TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS car_status_at_request TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS refund_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejected_by_id TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejected_by_name TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rejected_at TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_reason TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_id TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_by_name TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_at TEXT NOT NULL DEFAULT '';`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_source_order ON reservations (source_order ASC NULLS LAST);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_new_company_name ON reservations (new_company_name) WHERE new_company_name <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_rejected_at ON reservations (rejected_at DESC) WHERE rejected_at <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancelled_at DESC) WHERE cancelled_at <> '';`,
+  `ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
+  `ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '[]'::jsonb;`,
+  `CREATE TABLE IF NOT EXISTS shift_announcements (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    tone TEXT NOT NULL DEFAULT 'warning',
+    is_pinned BOOLEAN NOT NULL DEFAULT TRUE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    starts_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    created_by_id TEXT NOT NULL DEFAULT '',
+    created_by_name TEXT NOT NULL DEFAULT '',
+    created_by_role TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`,
+  `CREATE TABLE IF NOT EXISTS employee_delegations (
+    id TEXT PRIMARY KEY,
+    delegate_employee_id TEXT NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    delegate_employee_name TEXT NOT NULL DEFAULT '',
+    delegated_role TEXT NOT NULL DEFAULT 'supervisor',
+    granted_by_id TEXT NOT NULL DEFAULT '',
+    granted_by_name TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    starts_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    revoked_at TEXT NOT NULL DEFAULT '',
+    revoked_by_id TEXT NOT NULL DEFAULT '',
+    revoked_by_name TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`,
+  `CREATE TABLE IF NOT EXISTS reservation_locks (
+    reservation_id TEXT PRIMARY KEY REFERENCES reservations(id) ON DELETE CASCADE,
+    locked_by_id TEXT NOT NULL DEFAULT '',
+    locked_by_name TEXT NOT NULL DEFAULT '',
+    locked_by_role TEXT NOT NULL DEFAULT '',
+    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '2 minutes')
+  );`,
+  `CREATE TABLE IF NOT EXISTS sync_tombstones (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL DEFAULT '',
+    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_company_updated ON reservations (company_name, updated_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_employee_id, is_read, created_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_shift_announcements_active ON shift_announcements (is_active, is_pinned, updated_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_employee_delegations_emp ON employee_delegations (delegate_employee_id, status);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservation_locks_expires ON reservation_locks (expires_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_start_status ON reservations (start_date, internal_status);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_end_status ON reservations (end_date, internal_status);`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_until_date) WHERE extended_until_date <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_follow_ups_updated_desc ON follow_ups (updated_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);`,
+  `CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`
+];
+
 export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {
   if (schemaInitialized) return;
   if (schemaInitPromise) return schemaInitPromise;
@@ -184,80 +375,10 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
         const schemaSql = loadSchemaSql();
         await executor.query(schemaSql);
       } else {
-        // Idempotent index & column migration for existing databases without altering mock tests
-        await executor.query(
-          `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note TEXT NOT NULL DEFAULT '';
-           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_id TEXT NOT NULL DEFAULT '';
-           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_by_name TEXT NOT NULL DEFAULT '';
-           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS pinned_note_updated_at TEXT NOT NULL DEFAULT '';
-           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS no_answer_count INTEGER NOT NULL DEFAULT 0;
-           ALTER TABLE reservations ADD COLUMN IF NOT EXISTS source_order INTEGER;
-           CREATE INDEX IF NOT EXISTS idx_reservations_source_order ON reservations (source_order ASC NULLS LAST);
-           ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-           ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '[]'::jsonb;
-           CREATE TABLE IF NOT EXISTS shift_announcements (
-             id TEXT PRIMARY KEY,
-             title TEXT NOT NULL DEFAULT '',
-             message TEXT NOT NULL DEFAULT '',
-             tone TEXT NOT NULL DEFAULT 'warning',
-             is_pinned BOOLEAN NOT NULL DEFAULT TRUE,
-             is_active BOOLEAN NOT NULL DEFAULT TRUE,
-             starts_at TEXT NOT NULL DEFAULT '',
-             expires_at TEXT NOT NULL DEFAULT '',
-             created_by_id TEXT NOT NULL DEFAULT '',
-             created_by_name TEXT NOT NULL DEFAULT '',
-             created_by_role TEXT NOT NULL DEFAULT '',
-             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-           );
-           CREATE TABLE IF NOT EXISTS employee_delegations (
-             id TEXT PRIMARY KEY,
-             delegate_employee_id TEXT NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-             delegate_employee_name TEXT NOT NULL DEFAULT '',
-             delegated_role TEXT NOT NULL DEFAULT 'supervisor',
-             granted_by_id TEXT NOT NULL DEFAULT '',
-             granted_by_name TEXT NOT NULL DEFAULT '',
-             reason TEXT NOT NULL DEFAULT '',
-             starts_at TEXT NOT NULL DEFAULT '',
-             expires_at TEXT NOT NULL DEFAULT '',
-             status TEXT NOT NULL DEFAULT 'active',
-             revoked_at TEXT NOT NULL DEFAULT '',
-             revoked_by_id TEXT NOT NULL DEFAULT '',
-             revoked_by_name TEXT NOT NULL DEFAULT '',
-             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-           );
-           CREATE TABLE IF NOT EXISTS reservation_locks (
-             reservation_id TEXT PRIMARY KEY REFERENCES reservations(id) ON DELETE CASCADE,
-             locked_by_id TEXT NOT NULL DEFAULT '',
-             locked_by_name TEXT NOT NULL DEFAULT '',
-             locked_by_role TEXT NOT NULL DEFAULT '',
-             locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-             expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '2 minutes')
-           );
-           CREATE TABLE IF NOT EXISTS sync_tombstones (
-             id TEXT PRIMARY KEY,
-             entity_type TEXT NOT NULL,
-             entity_id TEXT NOT NULL DEFAULT '',
-             meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-             deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-           );
-           CREATE INDEX IF NOT EXISTS idx_reservations_status_updated ON reservations (internal_status, updated_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_reservations_company_updated ON reservations (company_name, updated_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_employee_id, is_read, created_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_shift_announcements_active ON shift_announcements (is_active, is_pinned, updated_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_employee_delegations_emp ON employee_delegations (delegate_employee_id, status);
-           CREATE INDEX IF NOT EXISTS idx_reservation_locks_expires ON reservation_locks (expires_at);
-           CREATE INDEX IF NOT EXISTS idx_reservations_start_status ON reservations (start_date, internal_status);
-           CREATE INDEX IF NOT EXISTS idx_reservations_end_status ON reservations (end_date, internal_status);
-           CREATE INDEX IF NOT EXISTS idx_reservations_ext_until ON reservations (extended_until_date) WHERE extended_until_date <> '';
-           CREATE INDEX IF NOT EXISTS idx_follow_ups_created_desc ON follow_ups (created_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_follow_ups_updated_desc ON follow_ups (updated_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);
-           CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);
-           CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`
-        ).catch(() => undefined);
+        await ensureUiOverridesColumns(executor);
+        for (const ddl of INCREMENTAL_EXISTING_DB_MIGRATIONS) {
+          await runOptionalDdl(executor, ddl);
+        }
       }
       schemaInitialized = true;
     } finally {

@@ -1,4 +1,4 @@
-import { handleLogin, handleLogout, hashToken, invalidateAuthSessionCache, requireAuth, type AuthSession } from './auth.js';
+import { crmCore, handleLogin, handleLogout, hashToken, invalidateAuthSessionCache, requireAuth, type AuthSession } from './auth.js';
 import { checkMutationSpamLimit, getMutationSyncSpec, invalidateAndBumpVersion, runWithIdempotency } from './cache.js';
 import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
@@ -80,12 +80,22 @@ export async function dispatchCrmRequest(
       case 'logout':
         result = await handleLogout(executor, session);
         break;
-      case 'getMe':
+      case 'getMe': {
+        const meSettings = await queries.getSettingsMap(executor).catch(() => ({} as Record<string, any>));
+        const meRoleDefaults = typeof crmCore.normalizeRoleUiDefaults === 'function'
+          ? crmCore.normalizeRoleUiDefaults(meSettings.role_ui_defaults)
+          : {};
+        const meUiSimp = typeof crmCore.normalizeUiSimplificationSettings === 'function'
+          ? crmCore.normalizeUiSimplificationSettings(meSettings.ui_simplification)
+          : {};
         result = {
           user: session.user,
-          layoutPrefs: await queries.getUserLayoutPrefs(executor, session)
+          layoutPrefs: await queries.getUserLayoutPrefs(executor, session),
+          roleUiDefaults: meRoleDefaults,
+          uiSimplification: meUiSimp
         };
         break;
+      }
       case 'getAppBootstrap':
         result = await queries.getAppBootstrap(executor, session, payload);
         break;

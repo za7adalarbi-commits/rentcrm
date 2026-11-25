@@ -4,6 +4,26 @@ import type { DbClient, DbExecutor } from './db.js';
 
 export const crmCore: any = (crmCoreModule as any)?.default || crmCoreModule;
 
+export interface UiOverridesConfig {
+  hiddenKeys?: string[];
+  shownKeys?: string[];
+  flags?: Record<string, boolean>;
+  visibleCols?: string[] | null;
+  defaultRoute?: string;
+  updatedAt?: string;
+  updatedBy?: string;
+  [flagKey: string]: any;
+}
+
+export interface RoleUiDefaultConfig {
+  enabled: boolean;
+  uiSimplification: Record<string, any> | null;
+  visibleCols: string[];
+  forceForRole: boolean;
+}
+
+export type RoleUiDefaultsMap = Record<string, RoleUiDefaultConfig>;
+
 export interface AuthEmployee {
   id: string;
   name: string;
@@ -14,7 +34,7 @@ export interface AuthEmployee {
   role: string;
   baseRole?: string;
   permissions: string[];
-  uiOverrides?: Record<string, boolean>;
+  uiOverrides?: UiOverridesConfig;
   activeDelegation?: any;
   status: string;
   lastActivity: string;
