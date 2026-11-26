@@ -4518,6 +4518,22 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     startedAt: s.started_at instanceof Date ? s.started_at.toISOString() : str(s.started_at),
     finishedAt: s.finished_at instanceof Date ? s.finished_at.toISOString() : str(s.finished_at)
   }));
+  const checkpoints = ckRes.rows.map((ck: any) => {
+    let parsedMeta: any = null;
+    try {
+      parsedMeta = typeof ck.meta === 'string' ? JSON.parse(ck.meta) : (ck.meta || null);
+    } catch {
+      parsedMeta = null;
+    }
+    return {
+      ...ck,
+      meta: parsedMeta
+    };
+  });
+  const primaryCheckpoint =
+    checkpoints.find((c: any) => str(c.source) === 'rental_gate_direct') ||
+    checkpoints[0] ||
+    null;
   const syncInterval = crmCore.normalizeAutoSyncInterval(
     map.auto_sync_interval_hours,
     map.auto_sync_interval_minutes
@@ -4528,8 +4544,10 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     autoSyncIntervalHours: syncInterval.hours,
     autoSyncIntervalMinutes: syncInterval.minutes,
     lastSync: logs[0] || null,
+    lastReconciliation: (primaryCheckpoint && primaryCheckpoint.meta) || null,
+    lastCheckpointStatus: primaryCheckpoint ? str(primaryCheckpoint.last_status) : '',
     logs,
-    checkpoints: ckRes.rows
+    checkpoints
   };
 }
 

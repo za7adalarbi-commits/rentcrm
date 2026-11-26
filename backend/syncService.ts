@@ -11,6 +11,29 @@ export interface SyncActor {
   role?: string;
 }
 
+export interface SyncFailedRecord {
+  identifier: string;
+  sourceReservationId?: string;
+  reservationNumber?: string;
+  entityType: 'reservation' | 'extension' | 'backfill';
+  stage: 'normalize' | 'upsert' | 'backfill' | 'verify';
+  reason: string;
+}
+
+export interface SyncSourceBreakdown {
+  uniqueSourceTotal: number;
+  activeOrOtherCount: number;
+  cancelledListCount: number;
+  rejectedListCount: number;
+  grossAcrossThreeLists: number;
+  dualCancelledRejectedCount: number;
+  reassignedActiveCount: number;
+  overlapCount: number;
+  excludedFilteredCount: number;
+  rangeFilteredCount: number;
+  extensionsTotalCount: number;
+}
+
 export interface SyncBatchPayload {
   source?: string;
   actor?: Partial<SyncActor>;
@@ -27,11 +50,19 @@ export interface SyncBatchPayload {
   rejectedAuthoritativeSynced?: boolean;
   cancelledSourceIds?: string[];
   rejectedSourceIds?: string[];
+  totalInSource?: number;
+  incompleteEndpoints?: string[];
+  backfillFailedIds?: string[];
+  sourceBreakdown?: SyncSourceBreakdown;
+  excludedFilteredCount?: number;
+  rangeFilteredCount?: number;
+  duplicateSourceRowsSkipped?: number;
 }
 
 export interface SyncIngestResult {
   syncId: string;
-  status: 'success' | 'error';
+  status: 'success' | 'partial' | 'error';
+  syncComplete: boolean;
   importedCount: number;
   updatedCount: number;
   extensionsCount: number;
@@ -44,6 +75,16 @@ export interface SyncIngestResult {
   changedReservations: any[];
   mutatedReservations?: any[];
   fetchedCount?: number;
+  totalInSource: number;
+  savedOrUpdatedCount: number;
+  duplicateHandledCount: number;
+  failedCount: number;
+  failedRecords: SyncFailedRecord[];
+  missingLocalCount: number;
+  missingSourceIds: string[];
+  incompleteEndpoints: string[];
+  backfillFailedIds: string[];
+  sourceBreakdown?: SyncSourceBreakdown;
   excludedFilteredCount?: number;
   rangeFilteredCount?: number;
   missingNationalIdCount?: number;
@@ -570,6 +611,302 @@ function chunkList<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
+async function trySavepoint(tx: DbClient, name: string): Promise<void> {
+  try {
+    await tx.query(`SAVEPOINT ${name}`);
+  } catch {
+    // Ignore when executor does not support savepoints
+  }
+}
+
+async function tryReleaseSavepoint(tx: DbClient, name: string): Promise<void> {
+  try {
+    await tx.query(`RELEASE SAVEPOINT ${name}`);
+  } catch {
+    // Ignore when executor does not support savepoints
+  }
+}
+
+async function tryRollbackToSavepoint(tx: DbClient, name: string): Promise<void> {
+  try {
+    await tx.query(`ROLLBACK TO SAVEPOINT ${name}`);
+  } catch {
+    // Ignore when executor does not support savepoints
+  }
+}
+
+function execReservationUpsertBatch(tx: DbClient, chunk: Record<string, any>[]) {
+  return tx.query<{ inserted: boolean }>(
+    `INSERT INTO reservations (
+       id, source_reservation_id, reservation_number, source_created_at,
+       customer_name, customer_phone, customer_email, customer_id_number,
+       company_name, branch_name, deliver_branch_name, car_name, plate_number, car_category,
+       start_date, start_time, original_end_date, original_end_time, end_date, end_time,
+       extended_until_date, extended_until_time, days_count, extended_days_count, total_days_count,
+       original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
+       payment_method, payment_status, daily_price, discount_amount, vat_amount,
+       base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
+       internal_status, priority, assigned_employee_ids, assigned_employee_names,
+       last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
+       has_problem, created_at, updated_at, status_history, raw_json, source_order,
+       company_number, new_company_name, rejection_reason, car_status_at_request, refund_amount,
+       rejected_by_id, rejected_by_name, rejected_at,
+       cancellation_reason, cancelled_by_id, cancelled_by_name, cancelled_at,
+       reference_number, paid_amount, delivery_failure_reason, driver_notes,
+       is_source_cancelled, is_source_rejected, rcc_status, rcc_reason,
+       cancelled_from_decline, cancelled_from_hold, penalty_amount
+     )
+     SELECT * FROM unnest(
+       $1::text[], $2::text[], $3::text[], $4::text[],
+       $5::text[], $6::text[], $7::text[], $8::text[],
+       $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
+       $15::text[], $16::text[], $17::text[], $18::text[], $19::text[], $20::text[],
+       $21::text[], $22::text[], $23::int4[], $24::int4[], $25::int4[],
+       $26::text[], $27::text[], $28::text[], $29::text[],
+       $30::text[], $31::text[], $32::numeric[], $33::numeric[], $34::numeric[],
+       $35::numeric[], $36::int4[], $37::numeric[], $38::numeric[], $39::boolean[],
+       $40::text[], $41::text[], $42::jsonb[], $43::jsonb[],
+       $44::text[], $45::text[], $46::text[], $47::text[],
+       $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[], $53::int4[],
+       $54::text[], $55::text[], $56::text[], $57::text[], $58::numeric[],
+       $59::text[], $60::text[], $61::text[],
+       $62::text[], $63::text[], $64::text[], $65::text[],
+       $66::text[], $67::numeric[], $68::text[], $69::text[],
+       $70::boolean[], $71::boolean[], $72::text[], $73::text[],
+       $74::boolean[], $75::boolean[], $76::numeric[]
+     )
+     ON CONFLICT (reservation_number) DO UPDATE SET
+       source_reservation_id = EXCLUDED.source_reservation_id,
+       source_created_at = EXCLUDED.source_created_at,
+       customer_name = EXCLUDED.customer_name,
+       customer_phone = EXCLUDED.customer_phone,
+       customer_email = COALESCE(NULLIF(EXCLUDED.customer_email, ''), reservations.customer_email),
+       customer_id_number = COALESCE(NULLIF(EXCLUDED.customer_id_number, ''), CASE WHEN NULLIF(EXCLUDED.customer_phone, '') IS NOT NULL AND NULLIF(reservations.customer_phone, '') IS NOT NULL AND EXCLUDED.customer_phone <> reservations.customer_phone THEN '' ELSE reservations.customer_id_number END),
+       company_name = EXCLUDED.company_name,
+       branch_name = EXCLUDED.branch_name,
+       deliver_branch_name = EXCLUDED.deliver_branch_name,
+       car_name = EXCLUDED.car_name,
+       plate_number = EXCLUDED.plate_number,
+       car_category = EXCLUDED.car_category,
+       start_date = EXCLUDED.start_date,
+       start_time = EXCLUDED.start_time,
+       original_end_date = EXCLUDED.original_end_date,
+       original_end_time = EXCLUDED.original_end_time,
+       end_date = EXCLUDED.end_date,
+       end_time = EXCLUDED.end_time,
+       extended_until_date = EXCLUDED.extended_until_date,
+       extended_until_time = EXCLUDED.extended_until_time,
+       days_count = EXCLUDED.days_count,
+       extended_days_count = EXCLUDED.extended_days_count,
+       total_days_count = EXCLUDED.total_days_count,
+       original_status_code = EXCLUDED.original_status_code,
+       original_status_ar = EXCLUDED.original_status_ar,
+       pickup_type_ar = EXCLUDED.pickup_type_ar,
+       return_type_ar = EXCLUDED.return_type_ar,
+       payment_method = EXCLUDED.payment_method,
+       payment_status = EXCLUDED.payment_status,
+       daily_price = EXCLUDED.daily_price,
+       discount_amount = EXCLUDED.discount_amount,
+       vat_amount = EXCLUDED.vat_amount,
+       base_amount = EXCLUDED.base_amount,
+       extensions_count = EXCLUDED.extensions_count,
+       extensions_amount = EXCLUDED.extensions_amount,
+       total_amount = EXCLUDED.total_amount,
+       has_extensions = EXCLUDED.has_extensions,
+       internal_status = EXCLUDED.internal_status,
+       priority = EXCLUDED.priority,
+       assigned_employee_ids = EXCLUDED.assigned_employee_ids,
+       assigned_employee_names = EXCLUDED.assigned_employee_names,
+       last_update_text = EXCLUDED.last_update_text,
+       last_updated_by_id = EXCLUDED.last_updated_by_id,
+       last_updated_by_name = EXCLUDED.last_updated_by_name,
+       last_updated_at = EXCLUDED.last_updated_at,
+       has_problem = EXCLUDED.has_problem,
+       updated_at = EXCLUDED.updated_at,
+       status_history = EXCLUDED.status_history,
+       raw_json = EXCLUDED.raw_json,
+       source_order = COALESCE(EXCLUDED.source_order, reservations.source_order),
+       company_number = COALESCE(NULLIF(EXCLUDED.company_number, ''), reservations.company_number),
+       new_company_name = EXCLUDED.new_company_name,
+       rejection_reason = EXCLUDED.rejection_reason,
+       car_status_at_request = EXCLUDED.car_status_at_request,
+       refund_amount = EXCLUDED.refund_amount,
+       rejected_by_id = EXCLUDED.rejected_by_id,
+       rejected_by_name = EXCLUDED.rejected_by_name,
+       rejected_at = EXCLUDED.rejected_at,
+       cancellation_reason = EXCLUDED.cancellation_reason,
+       cancelled_by_id = EXCLUDED.cancelled_by_id,
+       cancelled_by_name = EXCLUDED.cancelled_by_name,
+       cancelled_at = EXCLUDED.cancelled_at,
+       reference_number = COALESCE(NULLIF(EXCLUDED.reference_number, ''), reservations.reference_number),
+       paid_amount = CASE WHEN EXCLUDED.paid_amount > 0 THEN EXCLUDED.paid_amount ELSE reservations.paid_amount END,
+       delivery_failure_reason = COALESCE(NULLIF(EXCLUDED.delivery_failure_reason, ''), reservations.delivery_failure_reason),
+       driver_notes = COALESCE(NULLIF(EXCLUDED.driver_notes, ''), reservations.driver_notes),
+       is_source_cancelled = COALESCE(EXCLUDED.is_source_cancelled, reservations.is_source_cancelled),
+       is_source_rejected = COALESCE(EXCLUDED.is_source_rejected, reservations.is_source_rejected),
+       rcc_status = COALESCE(NULLIF(EXCLUDED.rcc_status, ''), reservations.rcc_status),
+       rcc_reason = COALESCE(NULLIF(EXCLUDED.rcc_reason, ''), reservations.rcc_reason),
+       cancelled_from_decline = EXCLUDED.cancelled_from_decline,
+       cancelled_from_hold = EXCLUDED.cancelled_from_hold,
+       penalty_amount = CASE WHEN EXCLUDED.penalty_amount > 0 THEN EXCLUDED.penalty_amount ELSE reservations.penalty_amount END
+     RETURNING (xmax = 0) AS inserted`,
+    [
+      chunk.map((r) => r.id),
+      chunk.map((r) => r.sourceReservationId),
+      chunk.map((r) => r.reservationNumber),
+      chunk.map((r) => r.sourceCreatedAt),
+      chunk.map((r) => r.customerName),
+      chunk.map((r) => r.customerPhone),
+      chunk.map((r) => r.customerEmail),
+      chunk.map((r) => r.customerIdNumber),
+      chunk.map((r) => r.companyName),
+      chunk.map((r) => r.branchName),
+      chunk.map((r) => r.deliverBranchName),
+      chunk.map((r) => r.carName),
+      chunk.map((r) => r.plateNumber),
+      chunk.map((r) => r.carCategory),
+      chunk.map((r) => r.startDate),
+      chunk.map((r) => r.startTime),
+      chunk.map((r) => r.originalEndDate),
+      chunk.map((r) => r.originalEndTime),
+      chunk.map((r) => r.endDate),
+      chunk.map((r) => r.endTime),
+      chunk.map((r) => r.extendedUntilDate),
+      chunk.map((r) => r.extendedUntilTime),
+      chunk.map((r) => r.daysCount),
+      chunk.map((r) => r.extendedDaysCount),
+      chunk.map((r) => r.totalDaysCount),
+      chunk.map((r) => r.originalStatusCode),
+      chunk.map((r) => r.originalStatusAr),
+      chunk.map((r) => r.pickupTypeAr),
+      chunk.map((r) => r.returnTypeAr),
+      chunk.map((r) => r.paymentMethod),
+      chunk.map((r) => r.paymentStatus),
+      chunk.map((r) => r.dailyPrice),
+      chunk.map((r) => r.discountAmount),
+      chunk.map((r) => r.vatAmount),
+      chunk.map((r) => r.baseAmount),
+      chunk.map((r) => r.extensionsCount),
+      chunk.map((r) => r.extensionsAmount),
+      chunk.map((r) => r.totalAmount),
+      chunk.map((r) => r.hasExtensions),
+      chunk.map((r) => r.internalStatus),
+      chunk.map((r) => r.priority),
+      chunk.map((r) => JSON.stringify(r.assignedEmployeeIds)),
+      chunk.map((r) => JSON.stringify(r.assignedEmployeeNames)),
+      chunk.map((r) => r.lastUpdateText),
+      chunk.map((r) => r.lastUpdatedById),
+      chunk.map((r) => r.lastUpdatedByName),
+      chunk.map((r) => r.lastUpdatedAt),
+      chunk.map((r) => r.hasProblem),
+      chunk.map((r) => r.createdAt),
+      chunk.map((r) => r.updatedAt),
+      chunk.map((r) => JSON.stringify(r.statusHistory)),
+      chunk.map((r) => r.rawJson),
+      chunk.map((r) => (r.sourceOrder && Number(r.sourceOrder) > 0 ? Math.floor(Number(r.sourceOrder)) : null)),
+      chunk.map((r) => r.companyNumber || ''),
+      chunk.map((r) => r.newCompanyName || ''),
+      chunk.map((r) => r.rejectionReason || ''),
+      chunk.map((r) => r.carStatusAtRequest || ''),
+      chunk.map((r) => num(r.refundAmount, 0)),
+      chunk.map((r) => r.rejectedById || ''),
+      chunk.map((r) => r.rejectedByName || ''),
+      chunk.map((r) => r.rejectedAt || ''),
+      chunk.map((r) => r.cancellationReason || ''),
+      chunk.map((r) => r.cancelledById || ''),
+      chunk.map((r) => r.cancelledByName || ''),
+      chunk.map((r) => r.cancelledAt || ''),
+      chunk.map((r) => r.referenceNumber || ''),
+      chunk.map((r) => num(r.paidAmount, 0)),
+      chunk.map((r) => r.deliveryFailureReason || ''),
+      chunk.map((r) => r.driverNotes || ''),
+      chunk.map((r) => (typeof r.isSourceCancelled === 'boolean' ? r.isSourceCancelled : null)),
+      chunk.map((r) => (typeof r.isSourceRejected === 'boolean' ? r.isSourceRejected : null)),
+      chunk.map((r) => r.rccStatus || ''),
+      chunk.map((r) => r.rccReason || ''),
+      chunk.map((r) => Boolean(r.cancelledFromDecline)),
+      chunk.map((r) => Boolean(r.cancelledFromHold)),
+      chunk.map((r) => num(r.penaltyAmount, 0))
+    ]
+  );
+}
+
+function execExtensionUpsertBatch(
+  tx: DbClient,
+  extChunk: Record<string, any>[],
+  resIdByRef: Map<string, string>,
+  knownDbResIds: Set<string>
+) {
+  return tx.query(
+    `INSERT INTO extensions (
+       id, extension_number, sequence_number, reservation_id, reservation_number,
+       source_reservation_id, extension_type, extension_type_ar, status_code, status_ar,
+       payment_status, payment_date, payment_method, extend_days, start_date, start_time,
+       end_date, end_time, sub_total, vat_amount, amount, is_accepted_and_paid, synced_at
+     )
+     SELECT * FROM unnest(
+       $1::text[], $2::text[], $3::int4[], $4::text[], $5::text[],
+       $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+       $11::text[], $12::text[], $13::text[], $14::int4[], $15::text[], $16::text[],
+       $17::text[], $18::text[], $19::numeric[], $20::numeric[], $21::numeric[], $22::boolean[], $23::timestamptz[]
+     )
+     ON CONFLICT (extension_number) DO UPDATE SET
+       sequence_number = EXCLUDED.sequence_number,
+       reservation_id = COALESCE(EXCLUDED.reservation_id, extensions.reservation_id),
+       reservation_number = EXCLUDED.reservation_number,
+       source_reservation_id = EXCLUDED.source_reservation_id,
+       extension_type = EXCLUDED.extension_type,
+       extension_type_ar = EXCLUDED.extension_type_ar,
+       status_code = EXCLUDED.status_code,
+       status_ar = EXCLUDED.status_ar,
+       payment_status = EXCLUDED.payment_status,
+       payment_date = EXCLUDED.payment_date,
+       payment_method = EXCLUDED.payment_method,
+       extend_days = EXCLUDED.extend_days,
+       start_date = EXCLUDED.start_date,
+       start_time = EXCLUDED.start_time,
+       end_date = EXCLUDED.end_date,
+       end_time = EXCLUDED.end_time,
+       sub_total = EXCLUDED.sub_total,
+       vat_amount = EXCLUDED.vat_amount,
+       amount = EXCLUDED.amount,
+       is_accepted_and_paid = EXCLUDED.is_accepted_and_paid,
+       synced_at = EXCLUDED.synced_at`,
+    [
+      extChunk.map((ext) => ext.id),
+      extChunk.map((ext) => ext.extensionNumber),
+      extChunk.map((ext) => ext.sequenceNumber),
+      extChunk.map((ext) => {
+        const cand = str(
+          resIdByRef.get(ext.reservationNumber) ||
+          resIdByRef.get(ext.sourceReservationId) ||
+          ext.reservationId
+        );
+        return (cand && knownDbResIds.has(cand)) ? cand : null;
+      }),
+      extChunk.map((ext) => ext.reservationNumber),
+      extChunk.map((ext) => ext.sourceReservationId),
+      extChunk.map((ext) => ext.extensionType),
+      extChunk.map((ext) => ext.extensionTypeAr),
+      extChunk.map((ext) => ext.statusCode),
+      extChunk.map((ext) => ext.statusAr),
+      extChunk.map((ext) => ext.paymentStatus),
+      extChunk.map((ext) => ext.paymentDate),
+      extChunk.map((ext) => ext.paymentMethod),
+      extChunk.map((ext) => ext.extendDays),
+      extChunk.map((ext) => ext.startDate),
+      extChunk.map((ext) => ext.startTime),
+      extChunk.map((ext) => ext.endDate),
+      extChunk.map((ext) => ext.endTime),
+      extChunk.map((ext) => ext.subTotal),
+      extChunk.map((ext) => ext.vatAmount),
+      extChunk.map((ext) => ext.amount),
+      extChunk.map((ext) => ext.isAcceptedAndPaid),
+      extChunk.map((ext) => ext.syncedAt)
+    ]
+  );
+}
+
 export async function ingestIncrementalSyncBatch(
   executor: DbExecutor,
   payload: SyncBatchPayload
@@ -586,12 +923,27 @@ export async function ingestIncrementalSyncBatch(
   const incomingRes = Array.isArray(payload?.reservations) ? payload.reservations : [];
   const incomingExt = Array.isArray(payload?.extensions) ? payload.extensions : [];
   const pagesFetched = num(payload?.pagesFetched, 0);
+  const incompleteEndpoints = Array.isArray(payload?.incompleteEndpoints)
+    ? payload.incompleteEndpoints.map((s) => str(s)).filter(Boolean)
+    : [];
+  const backfillFailedIds = Array.isArray(payload?.backfillFailedIds)
+    ? Array.from(new Set(payload.backfillFailedIds.map((s) => str(s)).filter(Boolean)))
+    : [];
 
   let importedCount = 0;
   let updatedCount = 0;
   let extensionsCount = 0;
+  let duplicateHandledCount = num(payload?.duplicateSourceRowsSkipped, 0);
   const changedReservations: any[] = [];
   const mutatedReservations: any[] = [];
+  const failedRecords: SyncFailedRecord[] = backfillFailedIds.map((sid) => ({
+    identifier: sid,
+    sourceReservationId: sid,
+    entityType: 'backfill',
+    stage: 'backfill',
+    reason: 'BACKFILL_DETAIL_FETCH_FAILED'
+  }));
+  let missingSourceIds: string[] = [];
 
   try {
     await executor.withTransaction(async (tx) => {
@@ -648,272 +1000,157 @@ export async function ingestIncrementalSyncBatch(
 
       // Pre-resolve reservation IDs for incoming reservations before linking extensions
       for (const raw of incomingRes) {
-        const resNum = str(crmCore.extractReservationNumber(raw));
-        if (!resNum) continue;
-        const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
-        const existing = existingByNumber.get(resNum) || existingByNumber.get(normLookupKey(resNum)) || existingBySourceId.get(srcId) || existingById.get(str(raw.id));
-        const resId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
-        knownDbResIds.add(resId);
-        resIdByRef.set(resNum, resId);
-        if (srcId) resIdByRef.set(srcId, resId);
-        if (str(raw.id)) resIdByRef.set(str(raw.id), resId);
+        try {
+          const resNum = str(crmCore.extractReservationNumber(raw));
+          if (!resNum) continue;
+          const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
+          const existing = existingByNumber.get(resNum) || existingByNumber.get(normLookupKey(resNum)) || existingBySourceId.get(srcId) || existingById.get(str(raw.id));
+          const resId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
+          knownDbResIds.add(resId);
+          resIdByRef.set(resNum, resId);
+          if (srcId) resIdByRef.set(srcId, resId);
+          if (str(raw.id)) resIdByRef.set(str(raw.id), resId);
+        } catch {
+          // Recorded in normalization loop below
+        }
       }
 
       // Group extensions by reservation number / source ID and deduplicate by extensionNumber for safe batch upsert
       const extsByResKey = new Map<string, any[]>();
       const extDedupMap = new Map<string, Record<string, any>>();
-      for (const rawExt of incomingExt) {
-        const ext = normalizeIncomingExtension(rawExt, resIdByRef, startedAt);
-        if (!ext.extensionNumber) continue;
-        extDedupMap.set(ext.extensionNumber, ext);
-        if (ext.isAcceptedAndPaid) {
-          const keys = Array.from(new Set([ext.reservationNumber, ext.sourceReservationId].filter(Boolean)));
-          for (const k of keys) {
-            const list = extsByResKey.get(k) || [];
-            list.push(ext);
-            extsByResKey.set(k, list);
+      for (let extIdx = 0; extIdx < incomingExt.length; extIdx++) {
+        const rawExt = incomingExt[extIdx];
+        try {
+          const ext = normalizeIncomingExtension(rawExt, resIdByRef, startedAt);
+          if (!ext.extensionNumber) {
+            failedRecords.push({
+              identifier: str(rawExt?.id || rawExt?.extendId || `ext#${extIdx + 1}`),
+              entityType: 'extension',
+              stage: 'normalize',
+              reason: 'MISSING_EXTENSION_NUMBER'
+            });
+            continue;
           }
+          if (extDedupMap.has(ext.extensionNumber)) {
+            duplicateHandledCount++;
+          }
+          extDedupMap.set(ext.extensionNumber, ext);
+          if (ext.isAcceptedAndPaid) {
+            const keys = Array.from(new Set([ext.reservationNumber, ext.sourceReservationId].filter(Boolean)));
+            for (const k of keys) {
+              const list = extsByResKey.get(k) || [];
+              list.push(ext);
+              extsByResKey.set(k, list);
+            }
+          }
+        } catch (extErr: any) {
+          failedRecords.push({
+            identifier: str(rawExt?.extensionNumber || rawExt?.extendId || rawExt?.id || `ext#${extIdx + 1}`),
+            entityType: 'extension',
+            stage: 'normalize',
+            reason: String(extErr?.message || 'EXTENSION_NORMALIZE_ERROR').slice(0, 240)
+          });
         }
       }
       const normalizedExts = Array.from(extDedupMap.values());
 
-      // Normalize and deduplicate reservations by reservationNumber before batch SQL upsert
+      // Normalize and safely deduplicate reservations with per-record error isolation
       const resDedupMap = new Map<string, Record<string, any>>();
       const historyBatch: Record<string, any>[] = [];
 
       let seqIdx = 0;
       for (const raw of incomingRes) {
         seqIdx++;
-        const resNum = str(crmCore.extractReservationNumber(raw));
-        if (!resNum) continue;
-        const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
-        const existing = existingByNumber.get(resNum) || existingByNumber.get(normLookupKey(resNum)) || existingBySourceId.get(srcId) || existingById.get(str(raw.id)) || null;
-        if (existing && existing.reservationNumber && existing.reservationNumber !== resNum && !existingByNumber.has(resNum)) {
-          await tx.query(
-            `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
-            [existing.id, resNum]
-          ).catch(() => undefined);
-          existingByNumber.delete(existing.reservationNumber);
-          existing.reservationNumber = resNum;
-          existingByNumber.set(resNum, existing);
-        }
-        const seenExtNums = new Set<string>();
-        const relExts: any[] = [];
-        for (const candidate of [...(extsByResKey.get(resNum) || []), ...(srcId && srcId !== resNum ? (extsByResKey.get(srcId) || []) : [])]) {
-          if (candidate?.extensionNumber && !seenExtNums.has(candidate.extensionNumber)) {
-            seenExtNums.add(candidate.extensionNumber);
-            relExts.push(candidate);
+        const rawSrcId = str(crmCore.extractSourceReservationId(raw) || raw?.id);
+        let rawResNum = '';
+        try {
+          rawResNum = str(crmCore.extractReservationNumber(raw));
+          if (!rawResNum) {
+            failedRecords.push({
+              identifier: rawSrcId || `row#${seqIdx}`,
+              sourceReservationId: rawSrcId || undefined,
+              entityType: 'reservation',
+              stage: 'normalize',
+              reason: 'MISSING_RESERVATION_NUMBER'
+            });
+            continue;
           }
-        }
+          const srcId = str(rawSrcId || rawResNum);
+          const existing = existingByNumber.get(rawResNum) || existingByNumber.get(normLookupKey(rawResNum)) || existingBySourceId.get(srcId) || existingById.get(str(raw.id)) || null;
+          if (existing && existing.reservationNumber && existing.reservationNumber !== rawResNum && !existingByNumber.has(rawResNum)) {
+            await tx.query(
+              `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
+              [existing.id, rawResNum]
+            ).catch(() => undefined);
+            existingByNumber.delete(existing.reservationNumber);
+            existing.reservationNumber = rawResNum;
+            existingByNumber.set(rawResNum, existing);
+          }
+          const seenExtNums = new Set<string>();
+          const relExts: any[] = [];
+          for (const candidate of [...(extsByResKey.get(rawResNum) || []), ...(srcId && srcId !== rawResNum ? (extsByResKey.get(srcId) || []) : [])]) {
+            if (candidate?.extensionNumber && !seenExtNums.has(candidate.extensionNumber)) {
+              seenExtNums.add(candidate.extensionNumber);
+              relExts.push(candidate);
+            }
+          }
 
-        const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt, seqIdx);
-        resDedupMap.set(record.reservationNumber, record);
-        if (followUpHistoryEntry) historyBatch.push(followUpHistoryEntry);
+          const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt, seqIdx);
+          if (!record.reservationNumber) {
+            failedRecords.push({
+              identifier: srcId || `row#${seqIdx}`,
+              sourceReservationId: srcId || undefined,
+              entityType: 'reservation',
+              stage: 'normalize',
+              reason: 'NORMALIZED_EMPTY_RESERVATION_NUMBER'
+            });
+            continue;
+          }
+
+          const dupExisting = resDedupMap.get(record.reservationNumber);
+          if (dupExisting) {
+            const dupSrc = str(dupExisting.sourceReservationId);
+            const curSrc = str(record.sourceReservationId);
+            if (dupSrc && curSrc && dupSrc !== curSrc) {
+              // Two genuinely distinct source IDs collided on the same reservationNumber: disambiguate cleanly rather than dropping one!
+              const disambigNum = `${record.reservationNumber}-${curSrc}`;
+              record.reservationNumber = disambigNum;
+              record.id = `RES_${disambigNum.replace(/[^A-Za-z0-9_-]/g, '')}`;
+              knownDbResIds.add(record.id);
+              resIdByRef.set(curSrc, record.id);
+              resIdByRef.set(disambigNum, record.id);
+              resDedupMap.set(disambigNum, record);
+            } else {
+              duplicateHandledCount++;
+              resDedupMap.set(record.reservationNumber, record);
+            }
+          } else {
+            resDedupMap.set(record.reservationNumber, record);
+          }
+
+          if (followUpHistoryEntry) historyBatch.push(followUpHistoryEntry);
+        } catch (recErr: any) {
+          failedRecords.push({
+            identifier: rawSrcId || rawResNum || `row#${seqIdx}`,
+            sourceReservationId: rawSrcId || undefined,
+            reservationNumber: rawResNum || undefined,
+            entityType: 'reservation',
+            stage: 'normalize',
+            reason: String(recErr?.message || 'NORMALIZE_ERROR').slice(0, 240)
+          });
+        }
       }
 
       const reservationBatch = Array.from(resDedupMap.values());
+      const successfullyPersistedRes = new Set<string>();
 
-      // Chunked UNNEST upserts for Reservations (first so extensions FK references are valid)
-      for (const chunk of chunkList(reservationBatch, 200)) {
-        const upsertRes = await tx.query<{ inserted: boolean }>(
-          `INSERT INTO reservations (
-             id, source_reservation_id, reservation_number, source_created_at,
-             customer_name, customer_phone, customer_email, customer_id_number,
-             company_name, branch_name, deliver_branch_name, car_name, plate_number, car_category,
-             start_date, start_time, original_end_date, original_end_time, end_date, end_time,
-             extended_until_date, extended_until_time, days_count, extended_days_count, total_days_count,
-             original_status_code, original_status_ar, pickup_type_ar, return_type_ar,
-             payment_method, payment_status, daily_price, discount_amount, vat_amount,
-             base_amount, extensions_count, extensions_amount, total_amount, has_extensions,
-             internal_status, priority, assigned_employee_ids, assigned_employee_names,
-             last_update_text, last_updated_by_id, last_updated_by_name, last_updated_at,
-             has_problem, created_at, updated_at, status_history, raw_json, source_order,
-             company_number, new_company_name, rejection_reason, car_status_at_request, refund_amount,
-             rejected_by_id, rejected_by_name, rejected_at,
-             cancellation_reason, cancelled_by_id, cancelled_by_name, cancelled_at,
-             reference_number, paid_amount, delivery_failure_reason, driver_notes,
-             is_source_cancelled, is_source_rejected, rcc_status, rcc_reason,
-             cancelled_from_decline, cancelled_from_hold, penalty_amount
-           )
-           SELECT * FROM unnest(
-             $1::text[], $2::text[], $3::text[], $4::text[],
-             $5::text[], $6::text[], $7::text[], $8::text[],
-             $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
-             $15::text[], $16::text[], $17::text[], $18::text[], $19::text[], $20::text[],
-             $21::text[], $22::text[], $23::int4[], $24::int4[], $25::int4[],
-             $26::text[], $27::text[], $28::text[], $29::text[],
-             $30::text[], $31::text[], $32::numeric[], $33::numeric[], $34::numeric[],
-             $35::numeric[], $36::int4[], $37::numeric[], $38::numeric[], $39::boolean[],
-             $40::text[], $41::text[], $42::jsonb[], $43::jsonb[],
-             $44::text[], $45::text[], $46::text[], $47::text[],
-             $48::boolean[], $49::timestamptz[], $50::timestamptz[], $51::jsonb[], $52::text[], $53::int4[],
-             $54::text[], $55::text[], $56::text[], $57::text[], $58::numeric[],
-             $59::text[], $60::text[], $61::text[],
-             $62::text[], $63::text[], $64::text[], $65::text[],
-             $66::text[], $67::numeric[], $68::text[], $69::text[],
-             $70::boolean[], $71::boolean[], $72::text[], $73::text[],
-             $74::boolean[], $75::boolean[], $76::numeric[]
-           )
-           ON CONFLICT (reservation_number) DO UPDATE SET
-             source_reservation_id = EXCLUDED.source_reservation_id,
-             source_created_at = EXCLUDED.source_created_at,
-             customer_name = EXCLUDED.customer_name,
-             customer_phone = EXCLUDED.customer_phone,
-             customer_email = COALESCE(NULLIF(EXCLUDED.customer_email, ''), reservations.customer_email),
-             customer_id_number = COALESCE(NULLIF(EXCLUDED.customer_id_number, ''), CASE WHEN NULLIF(EXCLUDED.customer_phone, '') IS NOT NULL AND NULLIF(reservations.customer_phone, '') IS NOT NULL AND EXCLUDED.customer_phone <> reservations.customer_phone THEN '' ELSE reservations.customer_id_number END),
-             company_name = EXCLUDED.company_name,
-             branch_name = EXCLUDED.branch_name,
-             deliver_branch_name = EXCLUDED.deliver_branch_name,
-             car_name = EXCLUDED.car_name,
-             plate_number = EXCLUDED.plate_number,
-             car_category = EXCLUDED.car_category,
-             start_date = EXCLUDED.start_date,
-             start_time = EXCLUDED.start_time,
-             original_end_date = EXCLUDED.original_end_date,
-             original_end_time = EXCLUDED.original_end_time,
-             end_date = EXCLUDED.end_date,
-             end_time = EXCLUDED.end_time,
-             extended_until_date = EXCLUDED.extended_until_date,
-             extended_until_time = EXCLUDED.extended_until_time,
-             days_count = EXCLUDED.days_count,
-             extended_days_count = EXCLUDED.extended_days_count,
-             total_days_count = EXCLUDED.total_days_count,
-             original_status_code = EXCLUDED.original_status_code,
-             original_status_ar = EXCLUDED.original_status_ar,
-             pickup_type_ar = EXCLUDED.pickup_type_ar,
-             return_type_ar = EXCLUDED.return_type_ar,
-             payment_method = EXCLUDED.payment_method,
-             payment_status = EXCLUDED.payment_status,
-             daily_price = EXCLUDED.daily_price,
-             discount_amount = EXCLUDED.discount_amount,
-             vat_amount = EXCLUDED.vat_amount,
-             base_amount = EXCLUDED.base_amount,
-             extensions_count = EXCLUDED.extensions_count,
-             extensions_amount = EXCLUDED.extensions_amount,
-             total_amount = EXCLUDED.total_amount,
-             has_extensions = EXCLUDED.has_extensions,
-             internal_status = EXCLUDED.internal_status,
-             priority = EXCLUDED.priority,
-             assigned_employee_ids = EXCLUDED.assigned_employee_ids,
-             assigned_employee_names = EXCLUDED.assigned_employee_names,
-             last_update_text = EXCLUDED.last_update_text,
-             last_updated_by_id = EXCLUDED.last_updated_by_id,
-             last_updated_by_name = EXCLUDED.last_updated_by_name,
-             last_updated_at = EXCLUDED.last_updated_at,
-             has_problem = EXCLUDED.has_problem,
-             updated_at = EXCLUDED.updated_at,
-             status_history = EXCLUDED.status_history,
-             raw_json = EXCLUDED.raw_json,
-             source_order = COALESCE(EXCLUDED.source_order, reservations.source_order),
-             company_number = COALESCE(NULLIF(EXCLUDED.company_number, ''), reservations.company_number),
-             new_company_name = EXCLUDED.new_company_name,
-             rejection_reason = EXCLUDED.rejection_reason,
-             car_status_at_request = EXCLUDED.car_status_at_request,
-             refund_amount = EXCLUDED.refund_amount,
-             rejected_by_id = EXCLUDED.rejected_by_id,
-             rejected_by_name = EXCLUDED.rejected_by_name,
-             rejected_at = EXCLUDED.rejected_at,
-             cancellation_reason = EXCLUDED.cancellation_reason,
-             cancelled_by_id = EXCLUDED.cancelled_by_id,
-             cancelled_by_name = EXCLUDED.cancelled_by_name,
-             cancelled_at = EXCLUDED.cancelled_at,
-             reference_number = COALESCE(NULLIF(EXCLUDED.reference_number, ''), reservations.reference_number),
-             paid_amount = CASE WHEN EXCLUDED.paid_amount > 0 THEN EXCLUDED.paid_amount ELSE reservations.paid_amount END,
-             delivery_failure_reason = COALESCE(NULLIF(EXCLUDED.delivery_failure_reason, ''), reservations.delivery_failure_reason),
-             driver_notes = COALESCE(NULLIF(EXCLUDED.driver_notes, ''), reservations.driver_notes),
-             is_source_cancelled = COALESCE(EXCLUDED.is_source_cancelled, reservations.is_source_cancelled),
-             is_source_rejected = COALESCE(EXCLUDED.is_source_rejected, reservations.is_source_rejected),
-             rcc_status = COALESCE(NULLIF(EXCLUDED.rcc_status, ''), reservations.rcc_status),
-             rcc_reason = COALESCE(NULLIF(EXCLUDED.rcc_reason, ''), reservations.rcc_reason),
-             cancelled_from_decline = EXCLUDED.cancelled_from_decline,
-             cancelled_from_hold = EXCLUDED.cancelled_from_hold,
-             penalty_amount = CASE WHEN EXCLUDED.penalty_amount > 0 THEN EXCLUDED.penalty_amount ELSE reservations.penalty_amount END
-           RETURNING (xmax = 0) AS inserted`,
-          [
-            chunk.map((r) => r.id),
-            chunk.map((r) => r.sourceReservationId),
-            chunk.map((r) => r.reservationNumber),
-            chunk.map((r) => r.sourceCreatedAt),
-            chunk.map((r) => r.customerName),
-            chunk.map((r) => r.customerPhone),
-            chunk.map((r) => r.customerEmail),
-            chunk.map((r) => r.customerIdNumber),
-            chunk.map((r) => r.companyName),
-            chunk.map((r) => r.branchName),
-            chunk.map((r) => r.deliverBranchName),
-            chunk.map((r) => r.carName),
-            chunk.map((r) => r.plateNumber),
-            chunk.map((r) => r.carCategory),
-            chunk.map((r) => r.startDate),
-            chunk.map((r) => r.startTime),
-            chunk.map((r) => r.originalEndDate),
-            chunk.map((r) => r.originalEndTime),
-            chunk.map((r) => r.endDate),
-            chunk.map((r) => r.endTime),
-            chunk.map((r) => r.extendedUntilDate),
-            chunk.map((r) => r.extendedUntilTime),
-            chunk.map((r) => r.daysCount),
-            chunk.map((r) => r.extendedDaysCount),
-            chunk.map((r) => r.totalDaysCount),
-            chunk.map((r) => r.originalStatusCode),
-            chunk.map((r) => r.originalStatusAr),
-            chunk.map((r) => r.pickupTypeAr),
-            chunk.map((r) => r.returnTypeAr),
-            chunk.map((r) => r.paymentMethod),
-            chunk.map((r) => r.paymentStatus),
-            chunk.map((r) => r.dailyPrice),
-            chunk.map((r) => r.discountAmount),
-            chunk.map((r) => r.vatAmount),
-            chunk.map((r) => r.baseAmount),
-            chunk.map((r) => r.extensionsCount),
-            chunk.map((r) => r.extensionsAmount),
-            chunk.map((r) => r.totalAmount),
-            chunk.map((r) => r.hasExtensions),
-            chunk.map((r) => r.internalStatus),
-            chunk.map((r) => r.priority),
-            chunk.map((r) => JSON.stringify(r.assignedEmployeeIds)),
-            chunk.map((r) => JSON.stringify(r.assignedEmployeeNames)),
-            chunk.map((r) => r.lastUpdateText),
-            chunk.map((r) => r.lastUpdatedById),
-            chunk.map((r) => r.lastUpdatedByName),
-            chunk.map((r) => r.lastUpdatedAt),
-            chunk.map((r) => r.hasProblem),
-            chunk.map((r) => r.createdAt),
-            chunk.map((r) => r.updatedAt),
-            chunk.map((r) => JSON.stringify(r.statusHistory)),
-            chunk.map((r) => r.rawJson),
-            chunk.map((r) => (r.sourceOrder && Number(r.sourceOrder) > 0 ? Math.floor(Number(r.sourceOrder)) : null)),
-            chunk.map((r) => r.companyNumber || ''),
-            chunk.map((r) => r.newCompanyName || ''),
-            chunk.map((r) => r.rejectionReason || ''),
-            chunk.map((r) => r.carStatusAtRequest || ''),
-            chunk.map((r) => num(r.refundAmount, 0)),
-            chunk.map((r) => r.rejectedById || ''),
-            chunk.map((r) => r.rejectedByName || ''),
-            chunk.map((r) => r.rejectedAt || ''),
-            chunk.map((r) => r.cancellationReason || ''),
-            chunk.map((r) => r.cancelledById || ''),
-            chunk.map((r) => r.cancelledByName || ''),
-            chunk.map((r) => r.cancelledAt || ''),
-            chunk.map((r) => r.referenceNumber || ''),
-            chunk.map((r) => num(r.paidAmount, 0)),
-            chunk.map((r) => r.deliveryFailureReason || ''),
-            chunk.map((r) => r.driverNotes || ''),
-            chunk.map((r) => (typeof r.isSourceCancelled === 'boolean' ? r.isSourceCancelled : null)),
-            chunk.map((r) => (typeof r.isSourceRejected === 'boolean' ? r.isSourceRejected : null)),
-            chunk.map((r) => r.rccStatus || ''),
-            chunk.map((r) => r.rccReason || ''),
-            chunk.map((r) => Boolean(r.cancelledFromDecline)),
-            chunk.map((r) => Boolean(r.cancelledFromHold)),
-            chunk.map((r) => num(r.penaltyAmount, 0))
-          ]
-        );
-
-        for (const row of upsertRes.rows) {
+      const recordCommittedReservationChunk = (savedRows: Record<string, any>[], upsertRows: Array<{ inserted?: boolean }>) => {
+        for (const row of upsertRows) {
           if (row?.inserted) importedCount++;
           else updatedCount++;
         }
-        for (const r of chunk) {
+        for (const r of savedRows) {
+          successfullyPersistedRes.add(str(r.reservationNumber));
           const { rawJson: _omitRaw, ...clientRes } = r;
           changedReservations.push(clientRes);
           const prev = existingByNumber.get(r.reservationNumber);
@@ -930,9 +1167,44 @@ export async function ingestIncrementalSyncBatch(
             mutatedReservations.push(clientRes);
           }
         }
+      };
+
+      // Chunked UNNEST upserts for Reservations with SAVEPOINT + single-row fallback isolation
+      let resChunkIndex = 0;
+      for (const chunk of chunkList(reservationBatch, 200)) {
+        resChunkIndex++;
+        const spChunk = `rg_res_chunk_${resChunkIndex}`;
+        await trySavepoint(tx, spChunk);
+        try {
+          const upsertRes = await execReservationUpsertBatch(tx, chunk);
+          await tryReleaseSavepoint(tx, spChunk);
+          recordCommittedReservationChunk(chunk, upsertRes.rows);
+        } catch {
+          await tryRollbackToSavepoint(tx, spChunk);
+          for (let rowOffset = 0; rowOffset < chunk.length; rowOffset++) {
+            const singleRec = chunk[rowOffset];
+            const spRow = `rg_res_row_${resChunkIndex}_${rowOffset}`;
+            await trySavepoint(tx, spRow);
+            try {
+              const singleUpsertRes = await execReservationUpsertBatch(tx, [singleRec]);
+              await tryReleaseSavepoint(tx, spRow);
+              recordCommittedReservationChunk([singleRec], singleUpsertRes.rows);
+            } catch (rowErr: any) {
+              await tryRollbackToSavepoint(tx, spRow);
+              failedRecords.push({
+                identifier: str(singleRec.sourceReservationId || singleRec.reservationNumber || singleRec.id),
+                sourceReservationId: str(singleRec.sourceReservationId) || undefined,
+                reservationNumber: str(singleRec.reservationNumber) || undefined,
+                entityType: 'reservation',
+                stage: 'upsert',
+                reason: String(rowErr?.message || 'DB_UPSERT_ERROR').slice(0, 240)
+              });
+            }
+          }
+        }
       }
 
-      if (payload?.isFullSnapshot === true && reservationBatch.length > 0) {
+      if (payload?.isFullSnapshot === true && reservationBatch.length > 0 && failedRecords.length === 0 && incompleteEndpoints.length === 0) {
         const liveResNums = reservationBatch.map((r) => str(r.reservationNumber)).filter(Boolean);
         if (liveResNums.length > 0) {
           await tx.query(
@@ -1017,81 +1289,44 @@ export async function ingestIncrementalSyncBatch(
         }
       }
 
-      // Chunked UNNEST upserts for Extensions
+      // Chunked UNNEST upserts for Extensions with SAVEPOINT + single-row fallback
+      let extChunkIndex = 0;
       for (const extChunk of chunkList(normalizedExts, 250)) {
-        await tx.query(
-          `INSERT INTO extensions (
-             id, extension_number, sequence_number, reservation_id, reservation_number,
-             source_reservation_id, extension_type, extension_type_ar, status_code, status_ar,
-             payment_status, payment_date, payment_method, extend_days, start_date, start_time,
-             end_date, end_time, sub_total, vat_amount, amount, is_accepted_and_paid, synced_at
-           )
-           SELECT * FROM unnest(
-             $1::text[], $2::text[], $3::int4[], $4::text[], $5::text[],
-             $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
-             $11::text[], $12::text[], $13::text[], $14::int4[], $15::text[], $16::text[],
-             $17::text[], $18::text[], $19::numeric[], $20::numeric[], $21::numeric[], $22::boolean[], $23::timestamptz[]
-           )
-           ON CONFLICT (extension_number) DO UPDATE SET
-             sequence_number = EXCLUDED.sequence_number,
-             reservation_id = COALESCE(EXCLUDED.reservation_id, extensions.reservation_id),
-             reservation_number = EXCLUDED.reservation_number,
-             source_reservation_id = EXCLUDED.source_reservation_id,
-             extension_type = EXCLUDED.extension_type,
-             extension_type_ar = EXCLUDED.extension_type_ar,
-             status_code = EXCLUDED.status_code,
-             status_ar = EXCLUDED.status_ar,
-             payment_status = EXCLUDED.payment_status,
-             payment_date = EXCLUDED.payment_date,
-             payment_method = EXCLUDED.payment_method,
-             extend_days = EXCLUDED.extend_days,
-             start_date = EXCLUDED.start_date,
-             start_time = EXCLUDED.start_time,
-             end_date = EXCLUDED.end_date,
-             end_time = EXCLUDED.end_time,
-             sub_total = EXCLUDED.sub_total,
-             vat_amount = EXCLUDED.vat_amount,
-             amount = EXCLUDED.amount,
-             is_accepted_and_paid = EXCLUDED.is_accepted_and_paid,
-             synced_at = EXCLUDED.synced_at`,
-          [
-            extChunk.map((ext) => ext.id),
-            extChunk.map((ext) => ext.extensionNumber),
-            extChunk.map((ext) => ext.sequenceNumber),
-            extChunk.map((ext) => {
-              const cand = str(
-                resIdByRef.get(ext.reservationNumber) ||
-                resIdByRef.get(ext.sourceReservationId) ||
-                ext.reservationId
-              );
-              return (cand && knownDbResIds.has(cand)) ? cand : null;
-            }),
-            extChunk.map((ext) => ext.reservationNumber),
-            extChunk.map((ext) => ext.sourceReservationId),
-            extChunk.map((ext) => ext.extensionType),
-            extChunk.map((ext) => ext.extensionTypeAr),
-            extChunk.map((ext) => ext.statusCode),
-            extChunk.map((ext) => ext.statusAr),
-            extChunk.map((ext) => ext.paymentStatus),
-            extChunk.map((ext) => ext.paymentDate),
-            extChunk.map((ext) => ext.paymentMethod),
-            extChunk.map((ext) => ext.extendDays),
-            extChunk.map((ext) => ext.startDate),
-            extChunk.map((ext) => ext.startTime),
-            extChunk.map((ext) => ext.endDate),
-            extChunk.map((ext) => ext.endTime),
-            extChunk.map((ext) => ext.subTotal),
-            extChunk.map((ext) => ext.vatAmount),
-            extChunk.map((ext) => ext.amount),
-            extChunk.map((ext) => ext.isAcceptedAndPaid),
-            extChunk.map((ext) => ext.syncedAt)
-          ]
-        );
-        extensionsCount += extChunk.length;
+        extChunkIndex++;
+        const spExt = `rg_ext_chunk_${extChunkIndex}`;
+        await trySavepoint(tx, spExt);
+        try {
+          await execExtensionUpsertBatch(tx, extChunk, resIdByRef, knownDbResIds);
+          await tryReleaseSavepoint(tx, spExt);
+          extensionsCount += extChunk.length;
+        } catch {
+          await tryRollbackToSavepoint(tx, spExt);
+          for (let extOffset = 0; extOffset < extChunk.length; extOffset++) {
+            const singleExt = extChunk[extOffset];
+            const spExtRow = `rg_ext_row_${extChunkIndex}_${extOffset}`;
+            await trySavepoint(tx, spExtRow);
+            try {
+              await execExtensionUpsertBatch(tx, [singleExt], resIdByRef, knownDbResIds);
+              await tryReleaseSavepoint(tx, spExtRow);
+              extensionsCount++;
+            } catch (extRowErr: any) {
+              await tryRollbackToSavepoint(tx, spExtRow);
+              failedRecords.push({
+                identifier: str(singleExt.extensionNumber || singleExt.id),
+                sourceReservationId: str(singleExt.sourceReservationId) || undefined,
+                reservationNumber: str(singleExt.reservationNumber) || undefined,
+                entityType: 'extension',
+                stage: 'upsert',
+                reason: String(extRowErr?.message || 'EXT_UPSERT_ERROR').slice(0, 240)
+              });
+            }
+          }
+        }
       }
 
-      // Chunked UNNEST inserts for FollowUpHistory
-      for (const hChunk of chunkList(historyBatch, 250)) {
+      // Chunked UNNEST inserts for FollowUpHistory (only for reservations that actually succeeded)
+      const safeHistoryBatch = historyBatch.filter((h) => !h.reservationNumber || successfullyPersistedRes.has(str(h.reservationNumber)));
+      for (const hChunk of chunkList(safeHistoryBatch, 250)) {
         await tx.query(
           `INSERT INTO follow_up_history (
              id, follow_up_id, reservation_id, reservation_number, employee_id, employee_name,
@@ -1122,6 +1357,60 @@ export async function ingestIncrementalSyncBatch(
         );
       }
 
+      // Post-upsert DB reconciliation check across all expected source bookings
+      const verifyNums = Array.from(new Set(reservationBatch.map((r) => str(r.reservationNumber)).filter(Boolean)));
+      const verifySrcIds = Array.from(new Set([
+        ...reservationBatch.map((r) => str(r.sourceReservationId || r.reservationNumber)),
+        ...backfillFailedIds
+      ].filter(Boolean)));
+
+      const verifiedNums = new Set<string>();
+      const verifiedSrcIds = new Set<string>();
+      if (verifyNums.length > 0 || verifySrcIds.length > 0) {
+        const dbCheck = await tx.query<{ reservation_number: string; source_reservation_id: string }>(
+          `SELECT reservation_number, source_reservation_id
+           FROM reservations
+           WHERE reservation_number = ANY($1::text[])
+              OR source_reservation_id = ANY($2::text[])`,
+          [verifyNums, verifySrcIds]
+        );
+        for (const row of dbCheck.rows) {
+          if (str(row.reservation_number)) verifiedNums.add(str(row.reservation_number));
+          if (str(row.source_reservation_id)) verifiedSrcIds.add(str(row.source_reservation_id));
+        }
+      }
+
+      const missingSet = new Set<string>();
+      for (const r of reservationBatch) {
+        const rn = str(r.reservationNumber);
+        const sid = str(r.sourceReservationId || rn);
+        if (!verifiedNums.has(rn) && !verifiedSrcIds.has(sid)) {
+          missingSet.add(sid || rn);
+        }
+      }
+      for (const fr of failedRecords) {
+        if (fr.entityType === 'reservation' || fr.entityType === 'backfill') {
+          const sid = str(fr.sourceReservationId || fr.reservationNumber || fr.identifier);
+          if (sid && !verifiedSrcIds.has(sid) && !verifiedNums.has(str(fr.reservationNumber))) {
+            missingSet.add(sid);
+          }
+        }
+      }
+      missingSourceIds = Array.from(missingSet);
+
+      const syncComplete =
+        failedRecords.length === 0 &&
+        missingSourceIds.length === 0 &&
+        incompleteEndpoints.length === 0 &&
+        backfillFailedIds.length === 0;
+      const finalStatus: 'success' | 'partial' = syncComplete ? 'success' : 'partial';
+
+      const summaryParts: string[] = [];
+      if (failedRecords.length > 0) summaryParts.push(`فشل حفظ/معالجة ${failedRecords.length} سجل`);
+      if (missingSourceIds.length > 0) summaryParts.push(`سجلات مفقودة بعد التحقق: ${missingSourceIds.length} (${missingSourceIds.slice(0, 8).join(', ')})`);
+      if (incompleteEndpoints.length > 0) summaryParts.push(`واجهات غير مكتملة: ${incompleteEndpoints.join(' | ')}`);
+      const statusMessage = syncComplete ? '' : summaryParts.join(' · ').slice(0, 500);
+
       lastSyncBatchMutatedAt = Date.now();
 
       const finishedAt = new Date().toISOString();
@@ -1131,10 +1420,10 @@ export async function ingestIncrementalSyncBatch(
         `INSERT INTO sync_log (
            id, triggered_by_id, triggered_by_name, status, imported_count, updated_count,
            extensions_count, pages_fetched, error_message, duration_ms, started_at, finished_at
-         ) VALUES ($1,$2,$3,'success',$4,$5,$6,$7,'',$8,$9::timestamptz,$10::timestamptz)`,
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz,$12::timestamptz)`,
         [
-          syncId, actor.id, actor.name, importedCount, updatedCount,
-          extensionsCount, pagesFetched, durationMs, startedAt, finishedAt
+          syncId, actor.id, actor.name, finalStatus, importedCount, updatedCount,
+          extensionsCount, pagesFetched, statusMessage, durationMs, startedAt, finishedAt
         ]
       );
 
@@ -1144,38 +1433,54 @@ export async function ingestIncrementalSyncBatch(
         .filter(Boolean);
       const missingNationalIdCount = missingIdResNums.length;
       const missingNationalIdReservations = missingIdResNums.slice(0, 20);
+      const savedOrUpdatedCount = importedCount + updatedCount;
+      const totalInSource = num(payload?.totalInSource, reservationBatch.length + failedRecords.filter((f) => f.entityType !== 'extension').length);
 
       await tx.query(
         `INSERT INTO sync_checkpoints (
            source, last_sync_at, last_successful_at, last_cursor, last_batch_count,
            last_status, last_error, meta, updated_at
-         ) VALUES ($1,$2::timestamptz,$2::timestamptz,$3,$4,'success','',$5::jsonb,$2::timestamptz)
+         ) VALUES ($1,$2::timestamptz,$3::timestamptz,$4,$5,$6,$7,$8::jsonb,$2::timestamptz)
          ON CONFLICT (source) DO UPDATE SET
            last_sync_at = EXCLUDED.last_sync_at,
-           last_successful_at = EXCLUDED.last_successful_at,
+           last_successful_at = COALESCE(EXCLUDED.last_successful_at, sync_checkpoints.last_successful_at),
            last_cursor = COALESCE(NULLIF(EXCLUDED.last_cursor, ''), sync_checkpoints.last_cursor),
            last_batch_count = EXCLUDED.last_batch_count,
-           last_status = 'success',
-           last_error = '',
+           last_status = EXCLUDED.last_status,
+           last_error = EXCLUDED.last_error,
            meta = EXCLUDED.meta,
            updated_at = EXCLUDED.updated_at`,
         [
           sourceName,
           finishedAt,
+          syncComplete ? finishedAt : null,
           str(payload?.cursor || ''),
-          importedCount + updatedCount + extensionsCount,
+          savedOrUpdatedCount + extensionsCount,
+          finalStatus,
+          statusMessage,
           JSON.stringify({
             appliedRange: payload?.appliedRange || null,
             importedCount,
             updatedCount,
             extensionsCount,
+            totalInSource,
+            savedOrUpdatedCount,
+            duplicateHandledCount,
+            failedCount: failedRecords.length,
+            failedRecords: failedRecords.slice(0, 25),
+            missingLocalCount: missingSourceIds.length,
+            missingSourceIds: missingSourceIds.slice(0, 25),
+            incompleteEndpoints,
+            backfillFailedIds: backfillFailedIds.slice(0, 25),
+            syncComplete,
+            sourceBreakdown: payload?.sourceBreakdown || null,
             missingNationalIdCount,
             missingNationalIdReservations
           })
         ]
       );
 
-      if (actor.id !== 'SYSTEM' || (importedCount + updatedCount + extensionsCount) > 0) {
+      if (actor.id !== 'SYSTEM' || (savedOrUpdatedCount + extensionsCount) > 0 || !syncComplete) {
         await tx.query(
           `INSERT INTO activity_log (
              id, user_id, user_name, user_role, action_type, entity_type, entity_id,
@@ -1187,7 +1492,9 @@ export async function ingestIncrementalSyncBatch(
             actor.name,
             actor.role || 'system',
             syncId,
-            `استيراد ${importedCount}، تحديث ${updatedCount}، تمديدات ${extensionsCount}`,
+            syncComplete
+              ? `استيراد ${importedCount}، تحديث ${updatedCount}، تمديدات ${extensionsCount}`
+              : `مزامنة غير مكتملة: استيراد ${importedCount}، تحديث ${updatedCount}، مفقود ${missingSourceIds.length}، فاشل ${failedRecords.length}`,
             finishedAt.slice(0, 10),
             finishedAt.slice(11, 19),
             finishedAt
@@ -1224,9 +1531,22 @@ export async function ingestIncrementalSyncBatch(
         `[RG Sync] Missing customer National ID for ${missingIdResNumsOut.length} reservation(s): ${missingIdResNumsOut.slice(0, 10).join(', ')}`
       );
     }
+
+    const syncComplete =
+      failedRecords.length === 0 &&
+      missingSourceIds.length === 0 &&
+      incompleteEndpoints.length === 0 &&
+      backfillFailedIds.length === 0;
+    const savedOrUpdatedCount = importedCount + updatedCount;
+    const totalInSource = num(
+      payload?.totalInSource,
+      savedOrUpdatedCount + missingSourceIds.length
+    );
+
     return {
       syncId,
-      status: 'success',
+      status: syncComplete ? 'success' : 'partial',
+      syncComplete,
       importedCount,
       updatedCount,
       extensionsCount,
@@ -1238,6 +1558,18 @@ export async function ingestIncrementalSyncBatch(
       appliedRange: payload?.appliedRange,
       changedReservations,
       mutatedReservations,
+      totalInSource,
+      savedOrUpdatedCount,
+      duplicateHandledCount,
+      failedCount: failedRecords.length,
+      failedRecords,
+      missingLocalCount: missingSourceIds.length,
+      missingSourceIds,
+      incompleteEndpoints,
+      backfillFailedIds,
+      sourceBreakdown: payload?.sourceBreakdown,
+      excludedFilteredCount: num(payload?.excludedFilteredCount, 0),
+      rangeFilteredCount: num(payload?.rangeFilteredCount, 0),
       missingNationalIdCount: missingIdResNumsOut.length,
       missingNationalIdReservations: missingIdResNumsOut.slice(0, 20)
     };
@@ -1653,6 +1985,43 @@ export async function pullFromRentalGateDirect(
     const appliedRange = crmCore.resolvePullDateRange(payload || {});
     const pageSize = 100;
     const maxPages = Math.min(500, Math.max(1, num(payload?.maxPages, 500)));
+    const retryBaseDelayMs = Math.max(0, Math.min(2000, num(payload?.retryDelayMs, 150)));
+    const maxRetries = Math.max(1, Math.min(4, num(payload?.maxRetries, 3)));
+
+    const sleepMs = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+
+    const isRetryableHttpStatus = (status: number) =>
+      status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+
+    const fetchWithRetry = async (targetUrl: string): Promise<Response> => {
+      let lastErr: any = null;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 25000) : null;
+        try {
+          const resp = await fetchFn(targetUrl, {
+            method: 'GET',
+            signal: ctrl?.signal,
+            headers: {
+              Authorization: `Bearer ${rgToken}`,
+              Accept: 'application/json',
+              lang: 'ar'
+            }
+          });
+          if (timer) clearTimeout(timer);
+          if (resp.ok || !isRetryableHttpStatus(resp.status) || attempt === maxRetries) {
+            return resp;
+          }
+          await sleepMs(retryBaseDelayMs * attempt);
+        } catch (err: any) {
+          if (timer) clearTimeout(timer);
+          lastErr = err;
+          if (attempt === maxRetries) throw err;
+          await sleepMs(retryBaseDelayMs * attempt);
+        }
+      }
+      throw lastErr || new Error('FETCH_RETRY_EXHAUSTED');
+    };
 
     const resolveSafeNextUrl = (rawNext: string): string => {
       const cleaned = str(rawNext);
@@ -1689,6 +2058,12 @@ export async function pullFromRentalGateDirect(
       let explicitNextUrl = '';
       let consecutiveZeroAdded = 0;
       let succeeded = false;
+      let complete = true;
+      let errorMsg = '';
+      let latestReportedTotalElements: number | null = null;
+      let latestReportedTotalPages: number | null = null;
+      let duplicateRowsSkipped = 0;
+
       for (let step = 0; step < maxPages; step++) {
         const targetUrl = explicitNextUrl || `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
         if (visitedUrls.has(targetUrl)) break;
@@ -1697,29 +2072,70 @@ export async function pullFromRentalGateDirect(
         const usedExplicitNext = Boolean(explicitNextUrl);
         explicitNextUrl = '';
 
-        const resp = await fetchFn(targetUrl, {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${rgToken}`,
-            Accept: 'application/json',
-            lang: 'ar'
+        let resp: Response;
+        try {
+          resp = await fetchWithRetry(targetUrl);
+        } catch (netErr: any) {
+          errorMsg = String(netErr?.message || 'NETWORK_ERROR').slice(0, 200);
+          if (optional) {
+            complete = false;
+            return {
+              items,
+              pages,
+              ok: false,
+              complete: false,
+              error: errorMsg,
+              reportedTotalElements: latestReportedTotalElements,
+              duplicateRowsSkipped
+            };
           }
-        });
+          throw new Error(`RG_API_NETWORK_ERROR (${endpoint}): ${errorMsg}`);
+        }
+
         if (!resp.ok) {
           const errBody = await resp.text().catch(() => '');
+          errorMsg = `HTTP_${resp.status}: ${errBody.slice(0, 160)}`;
           if (optional && resp.status !== 401 && resp.status !== 403) {
-            return { items, pages, ok: succeeded };
+            complete = false;
+            return {
+              items,
+              pages,
+              ok: false,
+              complete: false,
+              error: errorMsg,
+              reportedTotalElements: latestReportedTotalElements,
+              duplicateRowsSkipped
+            };
           }
           throw new Error(`RG_API_HTTP_${resp.status}: ${errBody.slice(0, 200)}`);
         }
         const json: any = await resp.json();
         if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
-          if (optional) return { items, pages, ok: succeeded };
-          throw new Error(str(json.message || json.error || 'RG_API_ERROR: رفضت واجهة Rental Gate الطلب.'));
+          errorMsg = str(json.message || json.error || 'RG_API_ERROR');
+          if (optional) {
+            complete = false;
+            return {
+              items,
+              pages,
+              ok: false,
+              complete: false,
+              error: errorMsg,
+              reportedTotalElements: latestReportedTotalElements,
+              duplicateRowsSkipped
+            };
+          }
+          throw new Error(errorMsg || 'RG_API_ERROR: رفضت واجهة Rental Gate الطلب.');
         }
         succeeded = true;
         pages++;
         const parsedPage = extractRentalGatePagePayload(json, pageParam, pageSize);
+        if (parsedPage.totalElements > 0 || (parsedPage.totalElements === 0 && parsedPage.rows.length === 0)) {
+          latestReportedTotalElements = parsedPage.totalElements;
+        }
+        if (parsedPage.totalPages !== null) {
+          latestReportedTotalPages = parsedPage.totalPages;
+        }
+
         let added = 0;
         for (const row of parsedPage.rows) {
           const extKey = str(row?.extendId || row?.extensionNumber || row?.extension_number);
@@ -1727,7 +2143,10 @@ export async function pullFromRentalGateDirect(
           const srcId = str(crmCore.extractSourceReservationId(row));
           const rowKey = extKey || (srcId && resNum && resNum !== srcId ? `${srcId}::${resNum}` : (srcId || resNum));
           if (rowKey) {
-            if (seenKeys.has(rowKey)) continue;
+            if (seenKeys.has(rowKey)) {
+              duplicateRowsSkipped++;
+              continue;
+            }
             seenKeys.add(rowKey);
           }
           items.push(row);
@@ -1751,8 +2170,28 @@ export async function pullFromRentalGateDirect(
         if ((parsedPage.isLast && !hasMoreByTotal && !explicitNextUrl) || stopOnZeroAdded) {
           break;
         }
+        if (step + 1 >= maxPages) {
+          if (hasMoreByTotal || (latestReportedTotalPages !== null && pages < latestReportedTotalPages) || !parsedPage.isLast) {
+            complete = false;
+            errorMsg = `MAX_PAGES_REACHED (${pages}/${latestReportedTotalPages ?? maxPages})`;
+          }
+        }
       }
-      return { items, pages, ok: succeeded };
+
+      if (complete && latestReportedTotalElements !== null && latestReportedTotalElements > 0 && items.length < latestReportedTotalElements) {
+        complete = false;
+        errorMsg = errorMsg || `INCOMPLETE_COUNT (${items.length}/${latestReportedTotalElements})`;
+      }
+
+      return {
+        items,
+        pages,
+        ok: succeeded && complete,
+        complete,
+        error: errorMsg,
+        reportedTotalElements: latestReportedTotalElements,
+        duplicateRowsSkipped
+      };
     };
 
     const [resPaged, extPaged, canPaged, rccPaged] = await Promise.all([
@@ -1762,8 +2201,20 @@ export async function pullFromRentalGateDirect(
       fetchPaged('reservation-company-changes/admin/filter', true)
     ]);
 
+    const incompleteEndpoints: string[] = [];
+    for (const [epName, epRes] of [
+      ['reservations/filter', resPaged],
+      ['reservation-extends/filter', extPaged],
+      ['admin/cancelled-reservations', canPaged],
+      ['reservation-company-changes/admin/filter', rccPaged]
+    ] as Array<[string, Awaited<ReturnType<typeof fetchPaged>>]>) {
+      if (!epRes.complete) {
+        incompleteEndpoints.push(`${epName}${epRes.error ? ` (${epRes.error})` : ''}`);
+      }
+    }
+
     const cancelledBySrcId = new Map<string, any>();
-    if (canPaged.ok) {
+    if (canPaged.items.length > 0) {
       for (const cRow of canPaged.items) {
         const sid = str(cRow?.reservationId ?? cRow?.sourceReservationId);
         if (sid && !cancelledBySrcId.has(sid)) {
@@ -1773,7 +2224,7 @@ export async function pullFromRentalGateDirect(
     }
 
     const rccBySrcId = new Map<string, any>();
-    if (rccPaged.ok) {
+    if (rccPaged.items.length > 0) {
       for (const rRow of rccPaged.items) {
         const sid = str(rRow?.reservationId ?? rRow?.sourceReservationId);
         if (!sid) continue;
@@ -1784,7 +2235,7 @@ export async function pullFromRentalGateDirect(
       }
     }
 
-    // Backfill any cancelled/rejected booking ID missing from reservations/filter so none are lost
+    // Backfill ALL cancelled/rejected booking IDs missing from reservations/filter in bounded chunks (no arbitrary 100 cap)
     const presentSrcIds = new Set<string>(
       resPaged.items.map((it: any) => str(crmCore.extractSourceReservationId(it) || crmCore.extractReservationNumber(it))).filter(Boolean)
     );
@@ -1792,38 +2243,42 @@ export async function pullFromRentalGateDirect(
       ...cancelledBySrcId.keys(),
       ...rccBySrcId.keys()
     ])).filter((sid) => sid && !presentSrcIds.has(sid));
-    if (missingAuthoritativeIds.length > 0 && missingAuthoritativeIds.length <= 100) {
-      const missingFetched = await Promise.all(
-        missingAuthoritativeIds.map(async (sid) => {
-          try {
-            const resp = await fetchFn(`${baseApi}/reservations/${encodeURIComponent(sid)}`, {
-              method: 'GET',
-              headers: {
-                Authorization: `Bearer ${rgToken}`,
-                Accept: 'application/json',
-                lang: 'ar'
+
+    const backfillFailedIds: string[] = [];
+    if (missingAuthoritativeIds.length > 0) {
+      for (const idChunk of chunkList(missingAuthoritativeIds, 10)) {
+        const missingFetched = await Promise.all(
+          idChunk.map(async (sid) => {
+            try {
+              const resp = await fetchWithRetry(`${baseApi}/reservations/${encodeURIComponent(sid)}`);
+              if (!resp.ok) {
+                backfillFailedIds.push(sid);
+                return null;
               }
-            });
-            if (!resp.ok) return null;
-            const detail: any = await resp.json().catch(() => null);
-            if (!detail || typeof detail !== 'object') return null;
-            return {
-              ...detail,
-              reservationId: detail.reservationId ?? sid,
-              clientName: detail.client?.name ?? detail.clientName,
-              clientMobile: detail.client?.mobile ?? detail.client?.phone ?? detail.clientMobile,
-              companyArName: detail.companyCar?.company?.arabicName ?? detail.companyCar?.company?.name ?? detail.companyArName,
-              companyEnName: detail.companyCar?.company?.englishName ?? detail.companyEnName,
-              carNameEn: detail.companyCar?.car?.carNameEn ?? detail.carNameEn,
-              carNameAr: detail.companyCar?.car?.carNameAr ?? detail.carNameAr
-            };
-          } catch {
-            return null;
-          }
-        })
-      );
-      for (const mf of missingFetched) {
-        if (mf) resPaged.items.push(mf);
+              const detail: any = await resp.json().catch(() => null);
+              if (!detail || typeof detail !== 'object') {
+                backfillFailedIds.push(sid);
+                return null;
+              }
+              return {
+                ...detail,
+                reservationId: detail.reservationId ?? sid,
+                clientName: detail.client?.name ?? detail.clientName,
+                clientMobile: detail.client?.mobile ?? detail.client?.phone ?? detail.clientMobile,
+                companyArName: detail.companyCar?.company?.arabicName ?? detail.companyCar?.company?.name ?? detail.companyArName,
+                companyEnName: detail.companyCar?.company?.englishName ?? detail.companyEnName,
+                carNameEn: detail.companyCar?.car?.carNameEn ?? detail.carNameEn,
+                carNameAr: detail.companyCar?.car?.carNameAr ?? detail.carNameAr
+              };
+            } catch {
+              backfillFailedIds.push(sid);
+              return null;
+            }
+          })
+        );
+        for (const mf of missingFetched) {
+          if (mf) resPaged.items.push(mf);
+        }
       }
     }
 
@@ -1843,9 +2298,13 @@ export async function pullFromRentalGateDirect(
       const copy: Record<string, any> = { ...rawItem };
       if (canAuthoritative) {
         copy.isSourceCancelled = Boolean(canRec);
+      } else if (canRec) {
+        copy.isSourceCancelled = true;
       }
       if (rccAuthoritative) {
         copy.isSourceRejected = Boolean(rccRec);
+      } else if (rccRec) {
+        copy.isSourceRejected = true;
       }
       if (canRec) {
         if (canRec.reservationNumber) copy.referenceNumber = str(canRec.reservationNumber);
@@ -1950,6 +2409,41 @@ export async function pullFromRentalGateDirect(
 
     const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.items);
 
+    const isPrimaryActiveStatus = (item: any) => {
+      const code = crmCore.extractReservationStatusCode(item, false);
+      return crmCore.classifyReservationLifecycle({ originalStatusCode: code }) === 'active';
+    };
+    const activeOrOtherCount = dedupedAllRes.filter((item: any) => isPrimaryActiveStatus(item)).length;
+    const cancelledListCount = canAuthoritative
+      ? cancelledBySrcId.size
+      : dedupedAllRes.filter((item: any) => crmCore.isCancelledStatus(item) || item.isSourceCancelled === true).length;
+    const rejectedListCount = rccAuthoritative
+      ? rccBySrcId.size
+      : dedupedAllRes.filter((item: any) => crmCore.isRejectedStatus(item) || item.isSourceRejected === true).length;
+    const dualCancelledRejectedCount = dedupedAllRes.filter((item: any) => item.isSourceCancelled === true && item.isSourceRejected === true).length;
+    const reassignedActiveCount = dedupedAllRes.filter(
+      (item: any) => isPrimaryActiveStatus(item) && item.isSourceRejected === true
+    ).length;
+    const grossAcrossThreeLists = activeOrOtherCount + cancelledListCount + rejectedListCount;
+    const sourceBreakdown: SyncSourceBreakdown = {
+      uniqueSourceTotal: dedupedAllRes.length,
+      activeOrOtherCount,
+      cancelledListCount,
+      rejectedListCount,
+      grossAcrossThreeLists,
+      dualCancelledRejectedCount,
+      reassignedActiveCount,
+      overlapCount: Math.max(0, grossAcrossThreeLists - dedupedAllRes.length),
+      excludedFilteredCount,
+      rangeFilteredCount,
+      extensionsTotalCount: dedupedExt.length
+    };
+
+    const totalInSource = Math.max(
+      dedupedAllRes.length + backfillFailedIds.length,
+      num(resPaged.reportedTotalElements, 0)
+    );
+
     const syncResult = await ingestIncrementalSyncBatch(executor, {
       source: 'rental_gate_direct',
       actor,
@@ -1960,6 +2454,14 @@ export async function pullFromRentalGateDirect(
       rejectedAuthoritativeSynced: rccAuthoritative && !appliedRange?.hasCustomRange,
       cancelledSourceIds: canAuthoritative ? Array.from(cancelledBySrcId.keys()) : undefined,
       rejectedSourceIds: rccAuthoritative ? Array.from(rccBySrcId.keys()) : undefined,
+      totalInSource,
+      incompleteEndpoints,
+      backfillFailedIds,
+      sourceBreakdown,
+      excludedFilteredCount,
+      rangeFilteredCount,
+      duplicateSourceRowsSkipped:
+        resPaged.duplicateRowsSkipped + extPaged.duplicateRowsSkipped + canPaged.duplicateRowsSkipped + rccPaged.duplicateRowsSkipped,
       reservations: filteredRes,
       extensions: dedupedExt
     });

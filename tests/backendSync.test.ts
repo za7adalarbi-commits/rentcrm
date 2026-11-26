@@ -24,7 +24,7 @@ import {
 } from '../backend/syncService';
 import { buildVercelEnvChecklist, syncEnvVarsToVercel } from '../backend/vercelEnv';
 
-function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[]> } {
+function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<string, any>) => boolean } = {}): DbExecutor & { state: Record<string, any[]> } {
   const state: Record<string, any[]> = {
     employees: [],
     users: [],
@@ -47,6 +47,7 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     sheets_mirror_outbox: [],
     error_logs: []
   };
+  const savepointSnapshots = new Map<string, string>();
 
   function mockRowLifecycle(r: any): 'active' | 'rejected' | 'cancelled' {
     return crmCore.classifyReservationLifecycle({
@@ -243,6 +244,34 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
 
   async function runQuery<T extends Record<string, any> = any>(sqlRaw: string, params: any[] = []): Promise<QueryResult<T>> {
     const sql = sqlRaw.replace(/\s+/g, ' ').trim();
+
+    if (sql.startsWith('SAVEPOINT ')) {
+      const spName = sql.slice('SAVEPOINT '.length).trim();
+      savepointSnapshots.set(spName, JSON.stringify({
+        reservations: state.reservations,
+        extensions: state.extensions,
+        follow_up_history: state.follow_up_history
+      }));
+      return { rows: [], rowCount: 0 };
+    }
+
+    if (sql.startsWith('RELEASE SAVEPOINT ')) {
+      const spName = sql.slice('RELEASE SAVEPOINT '.length).trim();
+      savepointSnapshots.delete(spName);
+      return { rows: [], rowCount: 0 };
+    }
+
+    if (sql.startsWith('ROLLBACK TO SAVEPOINT ')) {
+      const spName = sql.slice('ROLLBACK TO SAVEPOINT '.length).trim();
+      const rawSnap = savepointSnapshots.get(spName);
+      if (rawSnap) {
+        const snap = JSON.parse(rawSnap);
+        state.reservations = snap.reservations || [];
+        state.extensions = snap.extensions || [];
+        state.follow_up_history = snap.follow_up_history || [];
+      }
+      return { rows: [], rowCount: 0 };
+    }
 
     if (sql.startsWith('CREATE INDEX IF NOT EXISTS')) {
       return { rows: [], rowCount: 0 };
@@ -597,6 +626,9 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
           cancelled_from_hold: Array.isArray(params[74]) ? Boolean(params[74][i]) : false,
           penalty_amount: Array.isArray(params[75]) ? (params[75][i] ?? 0) : 0
         };
+        if (opts.injectUpsertFailFor && opts.injectUpsertFailFor(rec)) {
+          throw new Error(`MOCK_DB_CONSTRAINT_FAIL_${rec.reservation_number}`);
+        }
         const idx = state.reservations.findIndex((r) => r.reservation_number === rec.reservation_number);
         if (idx === -1) {
           state.reservations.push(rec);
@@ -845,17 +877,43 @@ function createInMemoryMockExecutor(): DbExecutor & { state: Record<string, any[
     }
 
     if (sql.startsWith('INSERT INTO sync_log')) {
-      state.sync_log.push({
-        id: params[0], triggered_by_id: params[1], triggered_by_name: params[2], status: 'success',
-        imported_count: params[3], updated_count: params[4], extensions_count: params[5],
-        pages_fetched: params[6], duration_ms: params[7], started_at: new Date(params[8]), finished_at: new Date(params[9])
-      });
+      const hasDynamicStatus = sql.includes('error_message') && params.length >= 12;
+      if (hasDynamicStatus) {
+        state.sync_log.push({
+          id: params[0], triggered_by_id: params[1], triggered_by_name: params[2], status: params[3] || 'success',
+          imported_count: params[4], updated_count: params[5], extensions_count: params[6],
+          pages_fetched: params[7], error_message: params[8] || '', duration_ms: params[9],
+          started_at: new Date(params[10]), finished_at: new Date(params[11])
+        });
+      } else {
+        state.sync_log.push({
+          id: params[0], triggered_by_id: params[1], triggered_by_name: params[2], status: 'success',
+          imported_count: params[3], updated_count: params[4], extensions_count: params[5],
+          pages_fetched: params[6], duration_ms: params[7], started_at: new Date(params[8]), finished_at: new Date(params[9])
+        });
+      }
       return { rows: [], rowCount: 1 };
     }
 
     if (sql.startsWith('INSERT INTO sync_checkpoints')) {
-      state.sync_checkpoints = [{ source: params[0], last_status: 'success', last_batch_count: params[3] }];
+      state.sync_checkpoints = [{
+        source: params[0],
+        last_successful_at: params[2] || null,
+        last_status: params[5] || 'success',
+        last_batch_count: params[4] ?? params[3],
+        last_error: params[6] || '',
+        meta: params[7] ? (typeof params[7] === 'string' ? JSON.parse(params[7]) : params[7]) : {}
+      }];
       return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('SELECT reservation_number, source_reservation_id FROM reservations')) {
+      const nums: string[] = Array.isArray(params[0]) ? params[0] : [];
+      const srcIds: string[] = Array.isArray(params[1]) ? params[1] : [];
+      const rows = state.reservations
+        .filter((r) => nums.includes(r.reservation_number) || srcIds.includes(r.source_reservation_id))
+        .map((r) => ({ reservation_number: r.reservation_number, source_reservation_id: r.source_reservation_id }));
+      return { rows: rows as any[], rowCount: rows.length };
     }
 
     if (sql.startsWith('SELECT COUNT(*)::text AS total_cnt')) {
@@ -4238,11 +4296,157 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
     assert.equal(finChangedRow?.is_source_cancelled, false);
     assert.equal(finChangedRow?.is_source_rejected, true);
     assert.equal(finChangedRow?.rcc_status, 'COMPANY_CHANGED');
+
+    // Verify sourceBreakdown & reconciliation counts match exact 102 unique vs 113 across 3 source screens (11 overlaps: 6 dual + 5 reassigned)
+    const pullInfo = await pullFromRentalGateDirect(db, { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' }, { maxPages: 5 }, mockFetch);
+    assert.equal(pullInfo.syncComplete, true);
+    assert.equal(pullInfo.status, 'success');
+    assert.equal(pullInfo.totalInSource, 102);
+    assert.equal(pullInfo.savedOrUpdatedCount, 102);
+    assert.equal(pullInfo.importedCount, 0);
+    assert.equal(pullInfo.missingLocalCount, 0);
+    assert.equal(pullInfo.failedCount, 0);
+    assert.equal(pullInfo.sourceBreakdown?.uniqueSourceTotal, 102);
+    assert.equal(pullInfo.sourceBreakdown?.activeOrOtherCount, 15);
+    assert.equal(pullInfo.sourceBreakdown?.cancelledListCount, 40);
+    assert.equal(pullInfo.sourceBreakdown?.rejectedListCount, 58);
+    assert.equal(pullInfo.sourceBreakdown?.grossAcrossThreeLists, 113);
+    assert.equal(pullInfo.sourceBreakdown?.dualCancelledRejectedCount, 6);
+    assert.equal(pullInfo.sourceBreakdown?.reassignedActiveCount, 5);
+    assert.equal(pullInfo.sourceBreakdown?.overlapCount, 11);
   } finally {
     if (prevRgToken === undefined) delete process.env.RG_TOKEN;
     else process.env.RG_TOKEN = prevRgToken;
   }
 });
+
+test('Sync retries transient 503 errors, flags partial optional endpoint failures honestly, and handles >100 backfill IDs without silent cap', async () => {
+  const db = createInMemoryMockExecutor();
+  const prevRgToken = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_test_token_hardening_retry_backfill';
+
+  // Seed 115 cancelled bookings that are NOT returned in reservations/filter (>100 cap test!)
+  const cancelledList = Array.from({ length: 115 }, (_, i) => ({
+    reservationId: 70000 + i,
+    reservationNumber: `RG-BF-${70000 + i}`,
+    cancelledFromDecline: false,
+    cancellationReasonArabic: `سبب ${i}`,
+    paid: 100
+  }));
+
+  let transientFilterAttempts = 0;
+  let simulatePartialCancelled = true;
+
+  const mockFetch = (async (url: any) => {
+    const u = new URL(String(url));
+    if (u.pathname.includes('/reservations/filter')) {
+      const page = Number(u.searchParams.get('page') || '0');
+      if (page === 0 && transientFilterAttempts === 0) {
+        transientFilterAttempts++;
+        return { ok: false, status: 503, text: async () => 'upstream busy' } as any;
+      }
+      const items = page === 0 ? [{ reservationId: 90001, clientName: 'Base 1', reservationStatus: 'CONFIRMED', startDate: '2026-11-20' }] : [];
+      const bodyObj = { content: items, totalElements: 1, totalPages: 1, last: true };
+      return { ok: true, status: 200, json: async () => bodyObj, text: async () => JSON.stringify(bodyObj) } as any;
+    }
+    if (u.pathname.includes('/admin/cancelled-reservations')) {
+      const page = Number(u.searchParams.get('page') || '0');
+      if (simulatePartialCancelled && page === 1) {
+        // Fails permanently after retries -> page 0 succeeded, page 1 failed -> MUST flag incompleteEndpoints!
+        return { ok: false, status: 500, text: async () => 'internal error page 1' } as any;
+      }
+      const chunk = cancelledList.slice(page * 100, (page + 1) * 100);
+      const bodyObj = { content: chunk, totalElements: cancelledList.length, totalPages: 2, last: page >= 1 };
+      return { ok: true, status: 200, json: async () => bodyObj, text: async () => JSON.stringify(bodyObj) } as any;
+    }
+    if (/\/reservations\/\d+$/.test(u.pathname)) {
+      const sid = u.pathname.split('/').pop()!;
+      if (sid === '70114') {
+        return { ok: false, status: 404, text: async () => 'not found' } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          reservationId: Number(sid),
+          clientName: `Backfilled ${sid}`,
+          reservationStatus: 'CANCELLED',
+          startDate: '2026-11-20'
+        })
+      } as any;
+    }
+    const emptyObj = { content: [], totalElements: 0, totalPages: 1, last: true };
+    return { ok: true, status: 200, json: async () => emptyObj, text: async () => JSON.stringify(emptyObj) } as any;
+  }) as any;
+
+  try {
+    // Pass 1: reservations/filter recovers from 503 retry, cancelled page 1 fails permanently -> syncComplete MUST be false & status 'partial'
+    const partialRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { retryDelayMs: 0, maxRetries: 2 },
+      mockFetch
+    );
+    assert.equal(transientFilterAttempts, 1);
+    assert.equal(partialRes.status, 'partial');
+    assert.equal(partialRes.syncComplete, false);
+    assert.ok(partialRes.incompleteEndpoints.some((e) => e.includes('admin/cancelled-reservations')));
+    assert.equal(db.state.sync_log[0].status, 'partial');
+    assert.equal(db.state.sync_checkpoints[0].last_status, 'partial');
+
+    // Pass 2: Fix cancelled page 1 -> all 115 IDs trigger chunked backfill (>100 cap removed!), 70114 404 fails backfill honestly
+    simulatePartialCancelled = false;
+    const backfillRes = await pullFromRentalGateDirect(
+      db,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { retryDelayMs: 0, maxRetries: 1 },
+      mockFetch
+    );
+    // 1 base + 114 backfilled = 115 saved; 1 failed backfill (70114) tracked explicitly
+    assert.equal(db.state.reservations.length, 115);
+    assert.deepEqual(backfillRes.backfillFailedIds, ['70114']);
+    assert.equal(backfillRes.missingLocalCount, 1);
+    assert.deepEqual(backfillRes.missingSourceIds, ['70114']);
+    assert.equal(backfillRes.failedCount, 1);
+    assert.equal(backfillRes.syncComplete, false);
+    assert.equal(backfillRes.status, 'partial');
+  } finally {
+    if (prevRgToken === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRgToken;
+  }
+});
+
+test('Per-record normalization isolation, SAVEPOINT chunk fallback, and collision protection never drop sibling records silently', async () => {
+  const db = createInMemoryMockExecutor({
+    injectUpsertFailFor: (rec) => rec.reservation_number === '7702'
+  });
+
+  const res = await ingestIncrementalSyncBatch(db, {
+    source: 'rental_gate_direct',
+    reservations: [
+      { reservationId: 7701, clientName: 'Valid One', reservationStatus: 'CONFIRMED', startDate: '2026-11-20' },
+      { reservationId: 7702, clientName: 'DB Fail Row', reservationStatus: 'CONFIRMED', startDate: '2026-11-20' },
+      { reservationId: 7703, clientName: 'Valid Three', reservationStatus: 'CONFIRMED', startDate: '2026-11-20' },
+      // Invalid row missing reservationNumber & id -> should isolate into failedRecords instead of throwing or silently vanishing
+      { clientName: 'Broken No ID', reservationStatus: 'CONFIRMED' },
+      // Two distinct sourceReservationIds sharing reservationNumber '7701' -> collision disambiguation saves BOTH!
+      { reservationId: 7799, reservationNumber: '7701', clientName: 'Distinct Source Collision', reservationStatus: 'CONFIRMED', startDate: '2026-11-20' }
+    ]
+  });
+
+  // 7701, 7703, and disambiguated 7701-7799 MUST all be saved despite 7702 failing in the chunk and Broken No ID failing normalize!
+  assert.equal(res.importedCount, 3);
+  assert.equal(res.savedOrUpdatedCount, 3);
+  assert.equal(res.failedCount, 2);
+  assert.equal(res.syncComplete, false);
+  assert.equal(res.status, 'partial');
+  assert.equal(res.missingLocalCount, 2); // '7702' (DB upsert failure) + Broken No ID
+  assert.ok(res.missingSourceIds.includes('7702'));
+  assert.ok(db.state.reservations.some((r) => r.reservation_number === '7701'));
+  assert.ok(db.state.reservations.some((r) => r.reservation_number === '7703'));
+  assert.ok(db.state.reservations.some((r) => r.reservation_number === '7701-7799'));
+});
+
 
 
 

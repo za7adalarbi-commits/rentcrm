@@ -471,6 +471,26 @@
             '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono" dir="ltr">' + (lastSync ? escapeHtml(formatSettingDateTime(lastSync.finishedAt, ctx)) : 'لم يتم السحب بعد') + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">الحجوزات المستوردة / المحدثة / التمديدات</span><span class="detail-v tabular-nums">' + (lastSync ? (lastSync.importedCount + ' مستورد · ' + lastSync.updatedCount + ' محدث · ' + lastSync.extensionsCount + ' تمديد') : '0 / 0 / 0') + '</span></div>' +
           '</div>' +
+          (function () {
+            var rec = syncData.lastReconciliation;
+            if (!rec || typeof rec !== 'object') return '';
+            var recIncomplete = rec.syncComplete === false || Number(rec.failedCount || 0) > 0 || Number(rec.missingLocalCount || 0) > 0 || (Array.isArray(rec.incompleteEndpoints) && rec.incompleteEndpoints.length > 0);
+            var sb = rec.sourceBreakdown || null;
+            var parts = [];
+            if (sb && Number(sb.uniqueSourceTotal || 0) > 0) {
+              parts.push('المطابقة الكلية: <strong>' + Number(sb.uniqueSourceTotal) + '</strong> حجز فريد محفوظ ومطابق');
+              if (Number(sb.grossAcrossThreeLists || 0) > Number(sb.uniqueSourceTotal || 0)) {
+                parts.push('مجموع تبويبات المصدر الثلاثة: <strong>' + Number(sb.grossAcrossThreeLists) + '</strong> (' + Number(sb.activeOrOtherCount || 0) + ' نشط/منتهي + ' + Number(sb.cancelledListCount || 0) + ' ملغي + ' + Number(sb.rejectedListCount || 0) + ' مرفوض/محوّل) بفارق <strong>' + Number(sb.overlapCount || 0) + '</strong> سجل مشترك (' + Number(sb.dualCancelledRejectedCount || 0) + ' ملغي+مرفوض · ' + Number(sb.reassignedActiveCount || 0) + ' محوّل منتهي)');
+              }
+            } else if (Number(rec.totalInSource || 0) > 0) {
+              parts.push('إجمالي المصدر: <strong>' + Number(rec.totalInSource) + '</strong> · تم حفظه/تحديثه: <strong>' + Number(rec.savedOrUpdatedCount || 0) + '</strong>');
+            }
+            if (recIncomplete) {
+              parts.push('<span style="color:var(--danger,#ef4444);font-weight:600;">تحذير عدم اكتمال: فشل ' + Number(rec.failedCount || 0) + ' · ناقص ' + Number(rec.missingLocalCount || 0) + (Array.isArray(rec.incompleteEndpoints) && rec.incompleteEndpoints.length ? (' · واجهات ناقصة: ' + escapeHtml(rec.incompleteEndpoints.join(' | '))) : '') + '</span>');
+            }
+            if (!parts.length) return '';
+            return '<div id="sync-reconciliation-summary" style="margin-bottom:14px;padding:10px 12px;border:1px solid ' + (recIncomplete ? 'var(--danger,#ef4444)' : 'var(--border-hairline)') + ';border-radius:var(--radius-sm);background:var(--bg-surface-subtle);font-size:12.5px;color:var(--text-secondary);line-height:1.65;">' + parts.join(' · ') + '</div>';
+          })() +
           '<div id="sync-action-msg" class="hidden" style="margin-bottom:14px;"></div>' +
           '<h3 style="margin:0 0 10px;font-size:14.5px;">سجل عمليات السحب (SyncLog)</h3>' +
           (syncData.logs.length === 0
@@ -479,15 +499,17 @@
                 '<th>المعرف</th><th>المنفذ</th><th>الحالة</th><th>مستورد</th><th>محدث</th><th>تمديدات</th><th>الصفحات</th><th>الرسالة</th><th>التوقيت</th>' +
               '</tr></thead><tbody>' +
                 syncData.logs.map(function (l) {
+                  var stCls = l.status === 'success' ? 'status-success' : (l.status === 'partial' ? 'status-warning' : 'status-danger');
+                  var stText = l.status === 'success' ? 'ناجح' : (l.status === 'partial' ? 'غير مكتمل' : 'فشل');
                   return '<tr>' +
                     '<td class="mono">' + l.id + '</td>' +
-                    '<td>' + l.triggeredByName + '</td>' +
-                    '<td><span class="status-tag ' + (l.status === 'success' ? 'status-success' : 'status-danger') + '">' + (l.status === 'success' ? 'ناجح' : 'فشل') + '</span></td>' +
+                    '<td>' + escapeHtml(l.triggeredByName || '') + '</td>' +
+                    '<td><span class="status-tag ' + stCls + '">' + stText + '</span></td>' +
                     '<td class="tabular-nums">' + l.importedCount + '</td>' +
                     '<td class="tabular-nums">' + l.updatedCount + '</td>' +
                     '<td class="tabular-nums">' + l.extensionsCount + '</td>' +
                     '<td class="tabular-nums">' + l.pagesFetched + '</td>' +
-                    '<td>' + (l.errorMessage || '-') + '</td>' +
+                    '<td>' + escapeHtml(l.errorMessage || '-') + '</td>' +
                     '<td class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(l.finishedAt, ctx)) + '</td>' +
                   '</tr>';
                 }).join('') +
@@ -1173,8 +1195,13 @@
             var imported = d.importedCount || 0;
             var updated = d.updatedCount || 0;
             var exts = d.extensionsCount || 0;
+            var failedCount = Number(d.failedCount || 0);
+            var missingCount = Number(d.missingLocalCount || 0);
+            var incompleteEps = Array.isArray(d.incompleteEndpoints) ? d.incompleteEndpoints : [];
+            var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || incompleteEps.length > 0;
+            var sb = d.sourceBreakdown || null;
             var diagHint = '';
-            if (imported === 0 && updated === 0) {
+            if (imported === 0 && updated === 0 && !isIncomplete) {
               var fetched = d.fetchedCount || 0;
               if (fetched > 0 && d.excludedFilteredCount === fetched) {
                 diagHint = ' — تم جلب ' + fetched + ' سجل ولكن استُبعدت جميعها حسب الحالات المستبعدة';
@@ -1184,12 +1211,25 @@
                 diagHint = ' — أرجعت الواجهة 0 حجز لهذا الحساب/الفترة';
               }
             }
-            ctx.toast('اكتملت المزامنة بنجاح: ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + diagHint);
+            if (isIncomplete) {
+              var warnParts = [];
+              if (failedCount > 0) warnParts.push('فشل: ' + failedCount);
+              if (missingCount > 0) warnParts.push('ناقص بالتحقق: ' + missingCount);
+              if (incompleteEps.length > 0) warnParts.push('واجهات غير مكتملة: ' + incompleteEps.join(', '));
+              ctx.toast('تحذير: المزامنة غير مكتملة (' + warnParts.join(' · ') + ') — تم حفظ ' + (imported + updated) + ' سجل', true);
+            } else {
+              var overlapHint = (sb && Number(sb.overlapCount || 0) > 0)
+                ? (' · تطابق ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' فريد (' + sb.grossAcrossThreeLists + ' بقوائم المصدر مع ' + sb.overlapCount + ' مشترك)')
+                : '';
+              ctx.toast('اكتملت المزامنة بنجاح: ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + overlapHint + diagHint);
+            }
             render(container, ctx);
           } else {
             var msg = document.getElementById('sync-action-msg');
-            msg.className = 'form-error';
-            msg.textContent = res.message;
+            if (msg) {
+              msg.className = 'form-error';
+              msg.textContent = res.message;
+            }
             if (syncNowBtn.isConnected !== false) syncNowBtn.textContent = prevText;
           }
         });

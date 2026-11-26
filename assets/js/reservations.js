@@ -660,7 +660,7 @@
                   : ('لا توجد نتائج مطابقة للبحث «' + esc(cleanSearchEmpty) + '». <button type="button" class="btn btn-sm" id="res-empty-clear-search">مسح البحث</button>'))
               : (isEn ? 'No bookings match the current filters.' : 'لا توجد حجوزات مطابقة للفلاتر الحالية.')) +
           '</div>'
-        : '<div class="table-wrap' + (isDedicatedSchema ? ' rg-lifecycle-table-wrap' : '') + '"><table class="data-table' + (isDedicatedSchema ? ' rg-lifecycle-table' : '') + '"><thead><tr>' +
+        : '<div class="table-wrap"><table class="data-table' + (isDedicatedSchema ? ' rg-lifecycle-table' : '') + '"><thead><tr>' +
             (showBulkCol ? '<th class="res-bulk-th rg-ui-res-bulk"><input type="checkbox" id="res-bulk-select-all" aria-label="' + (isEn ? 'Select all on page' : 'تحديد كل الحجوزات في الصفحة') + '"' + (allPageSelected ? ' checked' : '') + '></th>' : '') +
             visibleCols.map(function (c) {
               var isSortable = c.sortable !== false;
@@ -879,7 +879,7 @@
                 }
                 if (c.key === 'startDate') {
                   if (isDedicatedSchema && !r.startDate) {
-                    return '<td class="tabular-nums" style="white-space:nowrap;"><span style="color:var(--text-muted);">' + esc(notRecordedLabel) + '</span></td>';
+                    return '<td class="tabular-nums" style="white-space:nowrap;"><span style="color:var(--text-muted);">-</span></td>';
                   }
                   var totStartDays = Number(r.totalDaysCount || r.daysCount || 1);
                   var periodParts = [];
@@ -946,7 +946,7 @@
                 if (c.key === 'lastUpdatedAt') {
                   return '<td class="mono tabular-nums" style="white-space:nowrap;">' + esc(formatTimestamp(r.lastUpdatedAt)) + '</td>';
                 }
-                return '<td class="tabular-nums">' + esc(r[c.key] || (isDedicatedSchema ? notRecordedLabel : '-')) + '</td>';
+                return '<td class="tabular-nums">' + esc(r[c.key] || '-') + '</td>';
               }).join('');
 
               var isClaimLocked = Boolean(
@@ -1496,27 +1496,27 @@
       if (state.viewMode === 'cancelled') {
         bannerEl.classList.remove('hidden');
         bannerEl.innerHTML =
-          '<div class="rg-error-banner rg-lifecycle-banner-card is-cancelled">' +
+          '<div class="rg-error-banner rg-lifecycle-banner-card" style="border-color:rgba(217,119,6,0.34);background:rgba(217,119,6,0.08);">' +
             '<div class="rg-error-banner-body">' +
-              '<div class="rg-error-banner-title">' + (isEn ? 'Cancelled by Customer (Synced from Rental Gate)' : 'الحجوزات الملغاة من العميل (مزامنة تلقائياً من Rental Gate)') + '</div>' +
+              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'Cancelled by Customer (Synced from Rental Gate)' : 'الحجوزات الملغاة من العميل (مزامنة تلقائياً من Rental Gate)') + '</div>' +
               '<div class="rg-error-banner-msg">' + (isEn ? 'Showing bookings cancelled by customers on the external site. Status updates are controlled by Rental Gate sync.' : 'تعرض هذه القائمة الحجوزات التي ألغاها العميل في الموقع الخارجي، وتُحدَّث حالاتها تلقائياً عبر المزامنة بدون رفض أو إلغاء يدوي.') + '</div>' +
             '</div>' +
           '</div>';
       } else if (state.viewMode === 'rejected') {
         bannerEl.classList.remove('hidden');
         bannerEl.innerHTML =
-          '<div class="rg-error-banner rg-lifecycle-banner-card is-rejected">' +
+          '<div class="rg-error-banner rg-lifecycle-banner-card" style="border-color:rgba(217,31,43,0.32);background:rgba(217,31,43,0.07);">' +
             '<div class="rg-error-banner-body">' +
-              '<div class="rg-error-banner-title">' + (isEn ? 'Rejected by Site (Synced from Rental Gate)' : 'الحجوزات المرفوضة من الموقع (مزامنة تلقائياً من Rental Gate)') + '</div>' +
+              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'Rejected by Site (Synced from Rental Gate)' : 'الحجوزات المرفوضة من الموقع (مزامنة تلقائياً من Rental Gate)') + '</div>' +
               '<div class="rg-error-banner-msg">' + (isEn ? 'Showing bookings rejected by Rental Gate / providers on the external site.' : 'تعرض هذه القائمة الحجوزات المرفوضة من الموقع الخارجي مع أسباب الرفض وبيانات العميل الكاملة.') + '</div>' +
             '</div>' +
           '</div>';
       } else if (state.viewMode === 'all') {
         bannerEl.classList.remove('hidden');
         bannerEl.innerHTML =
-          '<div class="rg-error-banner rg-lifecycle-banner-card is-all">' +
+          '<div class="rg-error-banner rg-lifecycle-banner-card" style="border-color:var(--border-hairline);background:var(--bg-surface-subtle);">' +
             '<div class="rg-error-banner-body">' +
-              '<div class="rg-error-banner-title">' + (isEn ? 'All Reservations (Active, Cancelled & Rejected)' : 'جميع الحجوزات (النشطة والملغاة والمرفوضة)') + '</div>' +
+              '<div class="rg-error-banner-title" style="color:var(--text-primary);">' + (isEn ? 'All Reservations (Active, Cancelled & Rejected)' : 'جميع الحجوزات (النشطة والملغاة والمرفوضة)') + '</div>' +
               '<div class="rg-error-banner-msg">' + (isEn ? 'Unified view displaying every reservation pulled from Rental Gate across all statuses.' : 'عرض موحد لكافة الحجوزات المسحوبة من الموقع الخارجي بجميع حالاتها.') + '</div>' +
             '</div>' +
           '</div>';
@@ -1987,8 +1987,13 @@
               var imported = d.importedCount || 0;
               var updated = d.updatedCount || 0;
               var exts = d.extensionsCount || 0;
+              var failedCount = Number(d.failedCount || 0);
+              var missingCount = Number(d.missingLocalCount || 0);
+              var incompleteEps = Array.isArray(d.incompleteEndpoints) ? d.incompleteEndpoints : [];
+              var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || incompleteEps.length > 0;
+              var sb = d.sourceBreakdown || null;
               var diagHint = '';
-              if (imported === 0 && updated === 0) {
+              if (imported === 0 && updated === 0 && !isIncomplete) {
                 var fetched = d.fetchedCount || 0;
                 if (fetched > 0 && d.excludedFilteredCount === fetched) {
                   diagHint = ' — تم جلب ' + fetched + ' سجل ولكن استُبعدت جميعها حسب الحالات المستبعدة في الإعدادات';
@@ -1998,10 +2003,26 @@
                   diagHint = ' — أرجعت الواجهة 0 حجز لهذا الحساب/الفترة';
                 }
               }
-              var msg = ctx.lang === 'en'
-                ? ('Pulled reservations' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + exts + ' extensions')
-                : ('تم سحب الحجوزات بنجاح' + rangeNote + ': ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + diagHint);
-              ctx.toast(msg);
+              if (isIncomplete) {
+                var warnParts = [];
+                if (failedCount > 0) warnParts.push('فشل ' + failedCount);
+                if (missingCount > 0) warnParts.push('ناقص ' + missingCount);
+                if (incompleteEps.length > 0) warnParts.push('واجهات غير مكتملة: ' + incompleteEps.length);
+                var warnMsg = ctx.lang === 'en'
+                  ? ('Incomplete pull' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + warnParts.join(' · '))
+                  : ('تحذير: السحب غير مكتمل' + rangeNote + ' (' + warnParts.join(' · ') + ') — تم حفظ ' + (imported + updated) + ' سجل');
+                ctx.toast(warnMsg, true);
+              } else {
+                var overlapHint = (sb && Number(sb.overlapCount || 0) > 0)
+                  ? (ctx.lang === 'en'
+                      ? (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' unique (' + sb.grossAcrossThreeLists + ' across source lists, ' + sb.overlapCount + ' overlap)')
+                      : (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' حجز فريد مكتمل (' + sb.grossAcrossThreeLists + ' بقوائم المصدر مع ' + sb.overlapCount + ' مشترك)'))
+                  : '';
+                var msg = ctx.lang === 'en'
+                  ? ('Pulled reservations' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + exts + ' extensions' + overlapHint)
+                  : ('تم سحب الحجوزات والتحقق بنجاح' + rangeNote + ': ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + overlapHint + diagHint);
+                ctx.toast(msg);
+              }
               ctx.refreshNotifications();
               refreshTableRegion({ forceRefresh: true });
               refreshRadarData();
