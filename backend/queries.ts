@@ -162,7 +162,7 @@ function redactReservationsList<T extends Record<string, any>>(items: T[], user:
 
 async function recordSyncTombstone(
   client: DbClient,
-  entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement' | 'problem',
+  entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement' | 'problem' | 'follow_up',
   entityIds: string[],
   meta: Record<string, any> = {}
 ): Promise<void> {
@@ -2703,6 +2703,97 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
   return out;
 }
 
+export async function deleteFollowUp(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const followUpId = str(payload.followUpId || payload.id);
+  if (!followUpId) throw new Error('VALIDATION_ERROR: معرف المتابعة مطلوب.');
+
+  return runWithIdempotency(executor, session.user.id, 'deleteFollowUp', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const fuRes = await tx.query(`SELECT * FROM follow_ups WHERE id = $1 FOR UPDATE`, [followUpId]);
+      if (!fuRes.rows[0]) throw new Error('NOT_FOUND: المتابعة غير موجودة.');
+      const existing = formatFollowUpRow(fuRes.rows[0]);
+
+      const canEditAny = crmCore.canUserPerform(session.user, 'edit_any_followup');
+      if (existing.employeeId !== session.user.id && !canEditAny) {
+        throw new Error('FORBIDDEN: لا يمكنك حذف متابعة موظف آخر.');
+      }
+
+      await tx.query(`DELETE FROM follow_up_history WHERE follow_up_id = $1`, [followUpId]).catch(() => undefined);
+      await tx.query(`DELETE FROM follow_ups WHERE id = $1`, [followUpId]);
+
+      const nowIso = new Date().toISOString();
+      let remainingCount = 0;
+      let latestFollowUp: any = null;
+      if (existing.reservationId) {
+        const cntRes = await tx.query<{ cnt: string }>(
+          `SELECT COUNT(*)::text AS cnt FROM follow_ups WHERE reservation_id = $1`,
+          [existing.reservationId]
+        );
+        remainingCount = Number(cntRes.rows[0]?.cnt || 0);
+        const latestRes = await tx.query(
+          `SELECT * FROM follow_ups WHERE reservation_id = $1 ORDER BY created_at DESC LIMIT 1`,
+          [existing.reservationId]
+        );
+        latestFollowUp = latestRes.rows[0] ? formatFollowUpRow(latestRes.rows[0]) : null;
+
+        const parentRes = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [existing.reservationId]);
+        if (parentRes.rows[0]) {
+          const rObj = mapReservationRowToClient(parentRes.rows[0], remainingCount > 0);
+          const nextLastText = latestFollowUp
+            ? (latestFollowUp.action + (latestFollowUp.notes ? ` — ${latestFollowUp.notes}` : ''))
+            : '';
+          const nextStatus = crmCore.isInactiveReservation(rObj)
+            ? rObj.internalStatus
+            : (latestFollowUp && latestFollowUp.status ? latestFollowUp.status : 'بانتظار المتابعة');
+          const nextUpdatedById = latestFollowUp ? latestFollowUp.employeeId : '';
+          const nextUpdatedByName = latestFollowUp ? latestFollowUp.employeeName : '';
+          const nextUpdatedAt = latestFollowUp ? latestFollowUp.createdAt : '';
+          await tx.query(
+            `UPDATE reservations
+             SET internal_status = $2, last_update_text = $3, last_updated_by_id = $4,
+                 last_updated_by_name = $5, last_updated_at = $6, updated_at = $7::timestamptz
+             WHERE id = $1`,
+            [rObj.id, nextStatus, nextLastText, nextUpdatedById, nextUpdatedByName, nextUpdatedAt, nowIso]
+          );
+        }
+      }
+
+      await recordSyncTombstone(tx, 'follow_up', [followUpId], {
+        reservationId: existing.reservationId,
+        reservationNumber: existing.reservationNumber
+      });
+
+      await logActivity(
+        tx,
+        session.user,
+        'حذف متابعة',
+        'FollowUp',
+        existing.reservationNumber || followUpId,
+        `${existing.employeeName || '-'} | ${existing.status || '-'} | ${String(existing.action || '').slice(0, 80)}`
+      );
+
+      await enqueueSheetsMirror(tx, 'FollowUp', followUpId, 'deleteFollowUp', {
+        id: followUpId,
+        reservationId: existing.reservationId,
+        reservationNumber: existing.reservationNumber
+      });
+
+      return {
+        id: followUpId,
+        deleted: true,
+        reservationId: existing.reservationId,
+        reservationNumber: existing.reservationNumber,
+        remainingFollowUpsCount: remainingCount,
+        latestFollowUp,
+        isFollowed: remainingCount > 0
+      };
+    });
+
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
+  });
+}
+
 export async function getFollowUpHistory(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
   const resId = str(payload.reservationId);
   const fuhRes = resId
@@ -3926,6 +4017,44 @@ export async function markNotificationRead(executor: DbExecutor, session: AuthSe
     );
   }
   return { updated: true };
+}
+
+export async function deleteNotification(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const deleteAll = toBool(payload.deleteAll);
+  const notifId = str(payload.notificationId || payload.id);
+  if (!deleteAll && !notifId) {
+    throw new Error('VALIDATION_ERROR: معرف الإشعار مطلوب.');
+  }
+
+  let deletedCount = 0;
+  if (deleteAll) {
+    const delRes = await executor.query(
+      `DELETE FROM notifications
+       WHERE recipient_employee_id = $1
+          OR (recipient_employee_id = '' AND (recipient_role = $2 OR recipient_role = 'all'))`,
+      [session.user.id, session.user.role]
+    );
+    deletedCount = Number(delRes.rowCount || 0);
+  } else {
+    const delRes = await executor.query(
+      `DELETE FROM notifications
+       WHERE id = $1
+         AND (
+           recipient_employee_id = $2
+           OR (recipient_employee_id = '' AND (recipient_role = $3 OR recipient_role = 'all'))
+         )`,
+      [notifId, session.user.id, session.user.role]
+    );
+    deletedCount = Number(delRes.rowCount || 0);
+  }
+
+  const fresh = await getNotifications(executor, session);
+  return {
+    deleted: true,
+    deletedCount,
+    items: fresh.items,
+    unreadCount: fresh.unreadCount
+  };
 }
 
 export async function getSettings(executor: DbExecutor, session: AuthSession) {
@@ -5394,6 +5523,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
   ]);
 
   const deletedReservationIds: string[] = [];
+  const deletedFollowUpIds: string[] = [];
   const deletedEmployeeIds: string[] = [];
   const deletedAnnouncementIds: string[] = [];
   const deletedProblemIds: string[] = [];
@@ -5404,6 +5534,8 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     const eid = str(row?.entity_id);
     if (et === 'reservation' && eid) {
       deletedReservationIds.push(eid);
+    } else if (et === 'follow_up' && eid) {
+      deletedFollowUpIds.push(eid);
     } else if (et === 'employee' && eid) {
       deletedEmployeeIds.push(eid);
     } else if (et === 'announcement' && eid) {
@@ -5448,6 +5580,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     changedProblems: prbRows.rows.map((p) => formatProblemRow(p)),
     changedEmployees: empRows.rows.map((e) => mapEmployeeRow(e)),
     deletedReservationIds: Array.from(new Set(deletedReservationIds)),
+    deletedFollowUpIds: Array.from(new Set(deletedFollowUpIds)),
     deletedEmployeeIds: Array.from(new Set(deletedEmployeeIds)),
     deletedAnnouncementIds: Array.from(new Set(deletedAnnouncementIds)),
     deletedProblemIds: Array.from(new Set(deletedProblemIds)),

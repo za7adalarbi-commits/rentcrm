@@ -422,6 +422,65 @@ function updateFollowUp(session, payload) {
   });
 }
 
+function deleteFollowUp(session, payload) {
+  var p = payload || {};
+  var followUpId = normalizeStr(p.followUpId || p.id);
+  if (!followUpId) throw new Error('معرف المتابعة مطلوب.');
+
+  return withScriptLock(function () {
+    var existing = findRecordById(RG_SHEETS.FOLLOWUPS, 'id', followUpId);
+    if (!existing) throw new Error('سجل المتابعة غير موجود.');
+
+    if (existing.employeeId !== session.employeeId && !hasPermission(session, 'edit_any_followup')) {
+      throw new Error('FORBIDDEN: لا يمكنك حذف متابعة موظف آخر.');
+    }
+
+    if (typeof deleteRecordsWhere_ === 'function') {
+      deleteRecordsWhere_(RG_SHEETS.FOLLOWUP_HISTORY, function (h) {
+        return normalizeStr(h.followUpId) === followUpId;
+      });
+    }
+    deleteRecordByKey(RG_SHEETS.FOLLOWUPS, 'id', followUpId);
+
+    var remaining = readAllRecords(RG_SHEETS.FOLLOWUPS, false)
+      .filter(function (f) { return normalizeStr(f.reservationId) === normalizeStr(existing.reservationId); })
+      .sort(function (a, b) { return String(b.createdAt || '').localeCompare(String(a.createdAt || '')); });
+    var latestFu = remaining.length > 0 ? remaining[0] : null;
+
+    if (existing.reservationId) {
+      var resObj = findRecordById(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId);
+      if (resObj) {
+        var nextLastText = latestFu ? (String(latestFu.action || '') + (latestFu.notes ? ' — ' + latestFu.notes : '')) : '';
+        var isInactive = classifyReservationLifecycleGs_(resObj) !== 'active';
+        var resPatch = {
+          lastUpdateText: nextLastText,
+          lastUpdatedById: latestFu ? (latestFu.employeeId || '') : '',
+          lastUpdatedByName: latestFu ? (latestFu.employeeName || '') : '',
+          lastUpdatedAt: latestFu ? (latestFu.createdAt || '') : '',
+          updatedAt: nowIso()
+        };
+        if (!isInactive) {
+          resPatch.internalStatus = (latestFu && latestFu.status && !isManualBlockedWorkflowStatusGs_(latestFu.status))
+            ? latestFu.status
+            : 'بانتظار المتابعة';
+        }
+        updateRecordByKey(RG_SHEETS.RESERVATIONS, 'id', existing.reservationId, resPatch);
+      }
+    }
+
+    logActivity(session.user, 'حذف متابعة', 'FollowUp', existing.reservationNumber || followUpId, 'حذف سجل متابعة الحجز ' + (existing.reservationNumber || ''));
+    return {
+      id: followUpId,
+      deleted: true,
+      reservationId: existing.reservationId || '',
+      reservationNumber: existing.reservationNumber || '',
+      remainingFollowUpsCount: remaining.length,
+      latestFollowUp: latestFu,
+      isFollowed: remaining.length > 0
+    };
+  });
+}
+
 function getUserPinnedCriticalIds_(employeeId) {
   var map = getSettingsMap_(false);
   var raw = safeJsonParse(map['pinned_res_u_' + normalizeStr(employeeId)], []);

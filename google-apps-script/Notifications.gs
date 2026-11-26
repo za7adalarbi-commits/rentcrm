@@ -122,3 +122,42 @@ function markNotificationRead(session, payload) {
     return { updated: true };
   });
 }
+
+function deleteNotification(session, payload) {
+  return withScriptLock(function () {
+    var p = payload || {};
+    var deleteAll = toBool(p.deleteAll);
+    var targetId = normalizeStr(p.notificationId || p.id);
+    if (!deleteAll && !targetId) {
+      throw new Error('معرف الإشعار مطلوب.');
+    }
+
+    var deletedCount = 0;
+    if (typeof deleteRecordsWhere_ === 'function') {
+      deletedCount = deleteRecordsWhere_(RG_SHEETS.NOTIFICATIONS, function (n) {
+        var isMine = n.recipientEmployeeId === session.employeeId ||
+          (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
+        if (!isMine) return false;
+        return deleteAll || normalizeStr(n.id) === targetId;
+      });
+    } else if (!deleteAll && targetId) {
+      var existing = findRecordById(RG_SHEETS.NOTIFICATIONS, 'id', targetId);
+      if (existing) {
+        var isOwner = existing.recipientEmployeeId === session.employeeId ||
+          (!existing.recipientEmployeeId && (existing.recipientRole === session.role || existing.recipientRole === 'all'));
+        if (isOwner && deleteRecordByKey(RG_SHEETS.NOTIFICATIONS, 'id', targetId)) {
+          deletedCount = 1;
+        }
+      }
+    }
+
+    bumpCacheVersion_('NTF');
+    var fresh = getNotifications(session);
+    return {
+      deleted: true,
+      deletedCount: deletedCount,
+      items: fresh.items || [],
+      unreadCount: fresh.unreadCount || 0
+    };
+  });
+}

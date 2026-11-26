@@ -141,6 +141,9 @@ export async function dispatchCrmRequest(
       case 'updateFollowUp':
         result = await queries.updateFollowUp(executor, session, payload);
         break;
+      case 'deleteFollowUp':
+        result = await queries.deleteFollowUp(executor, session, payload);
+        break;
       case 'getFollowUpHistory':
         result = await queries.getFollowUpHistory(executor, session, payload);
         break;
@@ -212,6 +215,9 @@ export async function dispatchCrmRequest(
         break;
       case 'markNotificationRead':
         result = await queries.markNotificationRead(executor, session, payload);
+        break;
+      case 'deleteNotification':
+        result = await queries.deleteNotification(executor, session, payload);
         break;
       case 'pullReservations':
         result = await queries.pullOrSyncReservations(executor, session, 'pullReservations', payload);

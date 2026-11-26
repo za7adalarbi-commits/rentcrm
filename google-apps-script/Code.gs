@@ -151,6 +151,9 @@ function handleApiRequest(e, method) {
       case 'updateFollowUp':
         result = updateFollowUp(session, payload);
         break;
+      case 'deleteFollowUp':
+        result = deleteFollowUp(session, payload);
+        break;
       case 'getFollowUpHistory':
         result = getFollowUpHistory(session, payload);
         break;
@@ -222,6 +225,9 @@ function handleApiRequest(e, method) {
         break;
       case 'markNotificationRead':
         result = markNotificationRead(session, payload);
+        break;
+      case 'deleteNotification':
+        result = deleteNotification(session, payload);
         break;
       case 'pullReservations':
         result = pullReservations(session, payload);
