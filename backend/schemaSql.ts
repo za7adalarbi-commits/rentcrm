@@ -561,7 +561,7 @@ CREATE INDEX IF NOT EXISTS idx_reservations_reference_number ON reservations (re
 CREATE INDEX IF NOT EXISTS idx_reservations_is_source_cancelled ON reservations (is_source_cancelled) WHERE is_source_cancelled = TRUE;
 CREATE INDEX IF NOT EXISTS idx_reservations_is_source_rejected ON reservations (is_source_rejected) WHERE is_source_rejected = TRUE;
 CREATE INDEX IF NOT EXISTS idx_notifications_active_emp ON notifications (recipient_employee_id, created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE COALESCE(recipient_employee_id, '') = '' AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE BTRIM(COALESCE(recipient_employee_id, '')) = '' AND deleted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifications (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '';
 CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));

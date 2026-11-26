@@ -486,19 +486,52 @@ function handleNeonMirrorSync_(payload) {
     } else if (action === 'deleteNotification') {
       var ntfDelAt = normalizeStr(data.deletedAt) || nowIso();
       var ntfDelBy = normalizeStr(data.deletedById || data.recipientEmployeeId);
-      var ntfDelIds = Array.isArray(data.deletedIds) ? data.deletedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
+      var ntfRole = normalizeStr(data.userRole);
+      var isDelAllNtf = Boolean(data.deleteAll);
+      var ntfPersonalIds = Array.isArray(data.deletedIds) ? data.deletedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
+      var ntfSharedIds = Array.isArray(data.dismissedSharedIds) ? data.dismissedSharedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
       var ntfIdSingle = normalizeStr(data.id);
-      if (ntfIdSingle && ntfDelIds.indexOf(ntfIdSingle) === -1) ntfDelIds.push(ntfIdSingle);
-      var ntfDelMap = {};
-      for (var ni = 0; ni < ntfDelIds.length; ni++) ntfDelMap[ntfDelIds[ni]] = true;
+      var ntfPersonalMap = {};
+      var ntfSharedMap = {};
+      for (var ni = 0; ni < ntfPersonalIds.length; ni++) ntfPersonalMap[ntfPersonalIds[ni]] = true;
+      for (var si = 0; si < ntfSharedIds.length; si++) ntfSharedMap[ntfSharedIds[si]] = true;
       if (typeof updateRecordsWhere_ === 'function') {
         updateRecordsWhere_(RG_SHEETS.NOTIFICATIONS, function (n) {
           if (!n || normalizeStr(n.deletedAt)) return false;
-          if (ntfDelIds.length > 0) return Boolean(ntfDelMap[normalizeStr(n.id)]);
-          return Boolean(data.deleteAll && ntfDelBy && normalizeStr(n.recipientEmployeeId) === ntfDelBy);
-        }, {
-          deletedAt: ntfDelAt,
-          deletedById: ntfDelBy
+          var nid = normalizeStr(n.id);
+          var recEmp = normalizeStr(n.recipientEmployeeId);
+          var recRole = normalizeStr(n.recipientRole);
+          if (recEmp) {
+            if (ntfPersonalMap[nid] || (ntfIdSingle && nid === ntfIdSingle && (!ntfDelBy || recEmp === ntfDelBy))) return true;
+            return Boolean(isDelAllNtf && ntfDelBy && recEmp === ntfDelBy);
+          }
+          if (ntfDelBy) {
+            var curDismiss = {};
+            try {
+              curDismiss = typeof parseNotificationDismissals_ === 'function'
+                ? parseNotificationDismissals_(n.dismissedByJson)
+                : (n.dismissedByJson ? JSON.parse(String(n.dismissedByJson)) : {});
+            } catch (_eParse) { curDismiss = {}; }
+            if (curDismiss && curDismiss[ntfDelBy]) return false;
+          }
+          if (ntfSharedMap[nid] || (ntfIdSingle && nid === ntfIdSingle && ntfDelBy && (!ntfRole || recRole === ntfRole || recRole === 'all'))) {
+            return true;
+          }
+          return Boolean(isDelAllNtf && ntfDelBy && (recRole === ntfRole || recRole === 'all'));
+        }, function (n) {
+          var recEmp = normalizeStr(n.recipientEmployeeId);
+          if (recEmp) {
+            return { deletedAt: ntfDelAt, deletedById: ntfDelBy };
+          }
+          var dMap = {};
+          try {
+            dMap = typeof parseNotificationDismissals_ === 'function'
+              ? parseNotificationDismissals_(n.dismissedByJson)
+              : (n.dismissedByJson ? JSON.parse(String(n.dismissedByJson)) : {});
+          } catch (_eParse2) { dMap = {}; }
+          if (!dMap || typeof dMap !== 'object') dMap = {};
+          if (ntfDelBy) dMap[ntfDelBy] = ntfDelAt;
+          return { dismissedByJson: JSON.stringify(dMap) };
         });
       }
       if (typeof bumpCacheVersion_ === 'function') bumpCacheVersion_('NTF');

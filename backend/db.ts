@@ -378,12 +378,150 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
     PRIMARY KEY (notification_id, employee_id)
   );`,
   `CREATE INDEX IF NOT EXISTS idx_notifications_active_emp ON notifications (recipient_employee_id, created_at DESC) WHERE deleted_at IS NULL;`,
-  `CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE COALESCE(recipient_employee_id, '') = '' AND deleted_at IS NULL;`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE BTRIM(COALESCE(recipient_employee_id, '')) = '' AND deleted_at IS NULL;`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifications (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));`
 ];
+
+export async function ensureNotificationsSchemaAndIndexes(executor: DbClient): Promise<{
+  deduplicatedGroups: number;
+  removedDuplicateRows: number;
+}> {
+  let deduplicatedGroups = 0;
+  let removedDuplicateRows = 0;
+
+  await runOptionalDdl(executor, `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS event_key TEXT NOT NULL DEFAULT '';`);
+  await runOptionalDdl(executor, `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`);
+  await runOptionalDdl(executor, `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS deleted_by_id TEXT NOT NULL DEFAULT '';`);
+  await runOptionalDdl(executor, `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+  await runOptionalDdl(
+    executor,
+    `CREATE TABLE IF NOT EXISTS notification_dismissals (
+      notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+      employee_id TEXT NOT NULL,
+      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (notification_id, employee_id)
+    );`
+  );
+
+  // Normalize padded whitespace in key recipient/event columns so lookups and unique indexes stay consistent
+  await runOptionalDdl(
+    executor,
+    `UPDATE notifications
+     SET recipient_employee_id = BTRIM(COALESCE(recipient_employee_id, '')),
+         recipient_role = CASE
+           WHEN BTRIM(COALESCE(recipient_employee_id, '')) <> '' THEN ''
+           ELSE BTRIM(COALESCE(recipient_role, ''))
+         END,
+         event_key = BTRIM(COALESCE(event_key, ''))
+     WHERE recipient_employee_id IS DISTINCT FROM BTRIM(COALESCE(recipient_employee_id, ''))
+        OR recipient_role IS DISTINCT FROM (CASE WHEN BTRIM(COALESCE(recipient_employee_id, '')) <> '' THEN '' ELSE BTRIM(COALESCE(recipient_role, '')) END)
+        OR event_key IS DISTINCT FROM BTRIM(COALESCE(event_key, ''));`
+  );
+
+  // Safely merge any pre-existing duplicate (event_key, recipient_employee_id, recipient_role) groups before creating unique index
+  try {
+    const dupGroupsRes = await executor.query<{
+      event_key: string;
+      recipient_employee_id: string;
+      recipient_role: string;
+    }>(
+      `SELECT event_key, recipient_employee_id, recipient_role
+       FROM notifications
+       WHERE event_key <> ''
+       GROUP BY event_key, recipient_employee_id, recipient_role
+       HAVING COUNT(*) > 1`
+    );
+
+    for (const grp of dupGroupsRes?.rows || []) {
+      const evKey = String(grp?.event_key || '');
+      const recEmp = String(grp?.recipient_employee_id || '');
+      const recRole = String(grp?.recipient_role || '');
+      if (!evKey) continue;
+
+      const rowsRes = await executor.query<{
+        id: string;
+        deleted_at: any;
+        deleted_by_id: string;
+        is_read: boolean;
+      }>(
+        `SELECT id, deleted_at, deleted_by_id, is_read
+         FROM notifications
+         WHERE event_key = $1
+           AND recipient_employee_id = $2
+           AND recipient_role = $3
+         ORDER BY (deleted_at IS NOT NULL) DESC, created_at DESC, id DESC`,
+        [evKey, recEmp, recRole]
+      );
+      const grpRows = rowsRes?.rows || [];
+      if (grpRows.length <= 1) continue;
+
+      const keepId = String(grpRows[0].id);
+      const loseIds = grpRows.slice(1).map((r) => String(r.id)).filter(Boolean);
+      if (!keepId || loseIds.length === 0) continue;
+
+      const firstDeleted = grpRows.find((r) => r.deleted_at != null);
+      const anyRead = grpRows.some((r) => Boolean(r.is_read));
+
+      if (firstDeleted && !grpRows[0].deleted_at) {
+        await executor.query(
+          `UPDATE notifications
+           SET deleted_at = $2,
+               deleted_by_id = COALESCE(NULLIF(deleted_by_id, ''), $3),
+               is_read = CASE WHEN $4 THEN TRUE ELSE is_read END,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [keepId, firstDeleted.deleted_at, String(firstDeleted.deleted_by_id || ''), anyRead]
+        );
+      } else if (anyRead && !grpRows[0].is_read) {
+        await executor.query(
+          `UPDATE notifications SET is_read = TRUE, updated_at = NOW() WHERE id = $1`,
+          [keepId]
+        );
+      }
+
+      await runOptionalDdl(
+        executor,
+        `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
+         SELECT '${keepId.replace(/'/g, "''")}', employee_id, deleted_at
+         FROM notification_dismissals
+         WHERE notification_id IN (${loseIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(',')})
+         ON CONFLICT (notification_id, employee_id) DO UPDATE
+           SET deleted_at = LEAST(notification_dismissals.deleted_at, EXCLUDED.deleted_at);`
+      );
+
+      const delRes = await executor.query(
+        `DELETE FROM notifications WHERE id = ANY($1::text[])`,
+        [loseIds]
+      );
+      deduplicatedGroups += 1;
+      removedDuplicateRows += Number((delRes as any)?.rowCount ?? loseIds.length);
+    }
+  } catch (err: any) {
+    console.warn('Notification deduplication migration warning:', String(err?.message || err).slice(0, 200));
+  }
+
+  await runOptionalDdl(
+    executor,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_active_emp ON notifications (recipient_employee_id, created_at DESC) WHERE deleted_at IS NULL;`
+  );
+  await runOptionalDdl(
+    executor,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE BTRIM(COALESCE(recipient_employee_id, '')) = '' AND deleted_at IS NULL;`
+  );
+  await runOptionalDdl(
+    executor,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifications (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '';`
+  );
+  await runOptionalDdl(
+    executor,
+    `CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);`
+  );
+
+  return { deduplicatedGroups, removedDuplicateRows };
+}
 
 export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {
   if (schemaInitialized) return;
@@ -414,6 +552,7 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
           await runOptionalDdl(executor, ddl);
         }
       }
+      await ensureNotificationsSchemaAndIndexes(executor);
       await runLifecycleAndNationalIdMaintenance(executor);
       schemaInitialized = true;
     } finally {

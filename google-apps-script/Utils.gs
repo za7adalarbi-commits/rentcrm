@@ -1145,7 +1145,8 @@ function dispatchMentionNotifications_(texts, sender, entityType, entityId, labe
       title: titlePrefix + ' (@' + senderName + ')',
       message: senderName + ' أشار إليك: "' + snippet + '"',
       entityType: entityType,
-      entityId: entityId
+      entityId: entityId,
+      eventKey: 'mention|' + entityType + '|' + entityId + '|' + senderId + '|' + mentioned[m].id + '|' + snippet.slice(0, 40)
     });
   }
   if (batch.length > 0) createNotificationsBatch_(batch);

@@ -1840,7 +1840,8 @@ function saveDelegation(session, payload) {
       'تم منحك صلاحية مشرف مؤقتة',
       'منحك ' + session.user.name + ' صلاحية المشرف مؤقتًا حتى ' + formatDateTimeDisplay_(expiresAt) + ' (' + reason + ').',
       'Employee',
-      targetEmp.id
+      targetEmp.id,
+      'delegation|' + (normalizeStr(p.clientRequestId) || delRec.id) + '|' + targetEmp.id
     );
     logActivity(session.user, 'تفويض صلاحيات مؤقت', 'Employee', targetEmp.name,
       'تفويض ' + targetEmp.name + ' بصلاحية مشرف مؤقت حتى ' + formatDateTimeDisplay_(expiresAt));
@@ -2007,6 +2008,20 @@ function getDeltaSync(session, params) {
 
   var trSummary = getTodayAndRadar(session, { summaryOnly: true, todayDate: normalizeStr(p.todayDate) });
   var notifications = getNotifications(session);
+  var deletedNotificationIds = [];
+  var recentNotifs = readRecentRecords_(RG_SHEETS.NOTIFICATIONS, 300);
+  for (var ni = 0; ni < recentNotifs.length; ni++) {
+    var nr = recentNotifs[ni];
+    if (!nr || !isNotificationOwnedBySession_(nr, session)) continue;
+    var delTs = normalizeStr(nr.deletedAt);
+    if (!delTs && nr.dismissedByJson) {
+      var dMap = parseNotificationDismissals_(nr.dismissedByJson);
+      delTs = normalizeStr(dMap && dMap[session.employeeId]);
+    }
+    if (delTs && delTs > sinceIso && nr.id) {
+      deletedNotificationIds.push(normalizeStr(nr.id));
+    }
+  }
   var announcementsData = getAnnouncements(session);
   var locksData = getReservationLocks(session);
 
@@ -2017,6 +2032,8 @@ function getDeltaSync(session, params) {
     changedFollowUps: changedFollowUps.slice(0, 200),
     changedProblems: changedProblems.slice(0, 100),
     changedEmployees: changedEmployees.slice(0, 50),
+    deletedNotificationIds: deletedNotificationIds,
+    deletedAllNotificationsBefore: '',
     todayRadarCounts: trSummary && trSummary.counts ? trSummary.counts : null,
     notifications: notifications,
     announcements: announcementsData.activeItems || [],
@@ -2122,7 +2139,8 @@ function bulkReassignEmployeeReservations(session, payload) {
         'استلام وردية: ' + transferredCount + ' حجز نشط',
         'تم تحويل ' + transferredCount + ' حجزًا نشطًا من ' + fromEmp.name + ' إليك بواسطة ' + session.user.name + '.',
         'Reservation',
-        transferredNumbers[0] || ''
+        transferredNumbers[0] || '',
+        'bulk_shift|' + (normalizeStr(p.clientRequestId) || (fromEmployeeId + '->' + toEmp.id + ':' + transferredNumbers.slice(0, 5).join(',')))
       );
     }
 

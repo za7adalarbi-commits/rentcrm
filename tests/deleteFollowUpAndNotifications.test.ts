@@ -8,7 +8,9 @@ import core from '../backend/coreBridge.cjs';
 import { dispatchCrmRequest } from '../backend/router.js';
 import { hashPassword, hashToken } from '../backend/auth.js';
 
-function createMockExecutor() {
+import { ensureNotificationsSchemaAndIndexes } from '../backend/db.js';
+
+function createMockExecutor(opts: { failNotificationDismissals?: boolean } = {}) {
   const state = {
     reservations: [
       {
@@ -257,10 +259,79 @@ function createMockExecutor() {
     });
   }
 
+  let txSnapshot: any = null;
+  let txAborted = false;
+  const savepoints = new Map<string, { snapshot: any; aborted: boolean }>();
+
+  const cloneState = () => ({
+    reservations: structuredClone(state.reservations),
+    follow_ups: structuredClone(state.follow_ups),
+    follow_up_history: structuredClone(state.follow_up_history),
+    notifications: structuredClone(state.notifications),
+    notification_dismissals: structuredClone(state.notification_dismissals),
+    activity_log: structuredClone(state.activity_log),
+    sync_tombstones: structuredClone(state.sync_tombstones),
+    sheets_mirror_outbox: structuredClone(state.sheets_mirror_outbox),
+    settings: structuredClone(state.settings),
+    problems: structuredClone(state.problems)
+  });
+
+  const restoreState = (snap: any) => {
+    if (!snap) return;
+    state.reservations = snap.reservations;
+    state.follow_ups = snap.follow_ups;
+    state.follow_up_history = snap.follow_up_history;
+    state.notifications = snap.notifications;
+    state.notification_dismissals = snap.notification_dismissals;
+    state.activity_log = snap.activity_log;
+    state.sync_tombstones = snap.sync_tombstones;
+    state.sheets_mirror_outbox = snap.sheets_mirror_outbox;
+    state.settings = snap.settings;
+    state.problems = snap.problems;
+  };
+
   const query = async (rawSql: string, params: any[] = []) => {
     const sql = String(rawSql || '').trim().replace(/\s+/g, ' ');
-    if (sql.startsWith('BEGIN') || sql.startsWith('COMMIT') || sql.startsWith('ROLLBACK')) {
+    if (sql.startsWith('ROLLBACK TO SAVEPOINT ')) {
+      const spName = sql.replace('ROLLBACK TO SAVEPOINT ', '').trim();
+      const saved = savepoints.get(spName);
+      if (saved) {
+        restoreState(saved.snapshot);
+        txAborted = saved.aborted;
+      }
       return { rows: [], rowCount: 0 };
+    }
+    if (sql.startsWith('RELEASE SAVEPOINT ')) {
+      const spName = sql.replace('RELEASE SAVEPOINT ', '').trim();
+      savepoints.delete(spName);
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql.startsWith('SAVEPOINT ')) {
+      const spName = sql.replace('SAVEPOINT ', '').trim();
+      savepoints.set(spName, { snapshot: cloneState(), aborted: txAborted });
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql === 'BEGIN') {
+      txSnapshot = cloneState();
+      txAborted = false;
+      savepoints.clear();
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql === 'COMMIT') {
+      if (txAborted) throw Object.assign(new Error('current transaction is aborted'), { code: '25P02' });
+      txSnapshot = null;
+      savepoints.clear();
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql === 'ROLLBACK') {
+      if (txSnapshot) restoreState(txSnapshot);
+      txSnapshot = null;
+      txAborted = false;
+      savepoints.clear();
+      return { rows: [], rowCount: 0 };
+    }
+    if (txAborted) {
+      throw Object.assign(new Error('current transaction is aborted, commands ignored until end of transaction block'), { code: '25P02' });
     }
     if (sql.includes('FROM sessions s JOIN employees e')) {
       const ses = state.sessions.find((s) => s.token_hash === params[0] && !s.is_revoked);
@@ -364,12 +435,12 @@ function createMockExecutor() {
       });
       return { rows: [], rowCount: 1 };
     }
-    if (sql.startsWith('UPDATE notifications SET deleted_at = NOW(), deleted_by_id = $1') && sql.includes('WHERE recipient_employee_id = $1')) {
-      const userId = params[0];
+    if (sql.startsWith('UPDATE notifications SET deleted_at = NOW(), deleted_by_id = $1') && sql.includes('WHERE BTRIM(COALESCE(recipient_employee_id')) {
+      const userId = String(params[0] || '').trim();
       const now = new Date();
       const updated: Array<{ id: string }> = [];
       for (const n of state.notifications) {
-        if (n.recipient_employee_id === userId && !n.deleted_at) {
+        if (String(n.recipient_employee_id || '').trim() === userId && !n.deleted_at) {
           n.deleted_at = now;
           n.deleted_by_id = userId;
           n.updated_at = now;
@@ -379,11 +450,12 @@ function createMockExecutor() {
       return { rows: updated, rowCount: updated.length };
     }
     if (sql.startsWith('UPDATE notifications SET deleted_at = NOW(), deleted_by_id = $2') && sql.includes('WHERE id = $1')) {
-      const [nid, userId] = params;
+      const [nid, rawUserId] = params;
+      const userId = String(rawUserId || '').trim();
       const now = new Date();
       const updated: Array<{ id: string }> = [];
       for (const n of state.notifications) {
-        if (n.id === nid && n.recipient_employee_id === userId && !n.deleted_at) {
+        if (n.id === nid && String(n.recipient_employee_id || '').trim() === userId && !n.deleted_at) {
           n.deleted_at = now;
           n.deleted_by_id = userId;
           n.updated_at = now;
@@ -392,68 +464,87 @@ function createMockExecutor() {
       }
       return { rows: updated, rowCount: updated.length };
     }
-    if (sql.startsWith('INSERT INTO notification_dismissals') && sql.includes('WHERE COALESCE(n.recipient_employee_id')) {
-      const userId = params[0];
-      const role = params[1];
-      const now = new Date();
-      const inserted: Array<{ id: string }> = [];
-      for (const n of state.notifications) {
-        const isSharedForUser = String(n.recipient_employee_id || '') === '' && (n.recipient_role === role || n.recipient_role === 'all');
-        const alreadyDismissed = state.notification_dismissals.some((d) => d.notification_id === n.id && d.employee_id === userId && d.deleted_at);
-        if (isSharedForUser && !n.deleted_at && !alreadyDismissed) {
-          const existing = state.notification_dismissals.find((d) => d.notification_id === n.id && d.employee_id === userId);
-          if (existing) existing.deleted_at = now;
-          else state.notification_dismissals.push({ notification_id: n.id, employee_id: userId, deleted_at: now });
-          inserted.push({ id: n.id });
-        }
+    if (sql.startsWith('INSERT INTO notification_dismissals')) {
+      if (opts.failNotificationDismissals) {
+        txAborted = true;
+        throw Object.assign(new Error('relation "notification_dismissals" does not exist'), { code: '42P01' });
       }
-      return { rows: inserted, rowCount: inserted.length };
-    }
-    if (sql.startsWith('INSERT INTO notification_dismissals') && sql.includes('WHERE n.id = $1')) {
-      const [nid, userId, role] = params;
-      const now = new Date();
-      const inserted: Array<{ id: string }> = [];
-      for (const n of state.notifications) {
-        const isSharedForUser = String(n.recipient_employee_id || '') === '' && (n.recipient_role === role || n.recipient_role === 'all');
-        const alreadyDismissed = state.notification_dismissals.some((d) => d.notification_id === n.id && d.employee_id === userId && d.deleted_at);
-        if (n.id === nid && isSharedForUser && !n.deleted_at && !alreadyDismissed) {
-          const existing = state.notification_dismissals.find((d) => d.notification_id === n.id && d.employee_id === userId);
-          if (existing) existing.deleted_at = now;
-          else state.notification_dismissals.push({ notification_id: n.id, employee_id: userId, deleted_at: now });
-          inserted.push({ id: n.id });
+      if (sql.includes("BTRIM(COALESCE(n.recipient_employee_id, '')) = ''") && !sql.includes('WHERE n.id = $1')) {
+        const userId = String(params[0] || '').trim();
+        const role = String(params[1] || '').trim();
+        const now = new Date();
+        const inserted: Array<{ id: string }> = [];
+        for (const n of state.notifications) {
+          const recRole = String(n.recipient_role || '').trim();
+          const isSharedForUser = String(n.recipient_employee_id || '').trim() === '' && (recRole === role || recRole === 'all');
+          const alreadyDismissed = state.notification_dismissals.some((d) => d.notification_id === n.id && d.employee_id === userId && d.deleted_at);
+          if (isSharedForUser && !n.deleted_at && !alreadyDismissed) {
+            const existing = state.notification_dismissals.find((d) => d.notification_id === n.id && d.employee_id === userId);
+            if (existing) existing.deleted_at = now;
+            else state.notification_dismissals.push({ notification_id: n.id, employee_id: userId, deleted_at: now });
+            inserted.push({ id: n.id });
+          }
         }
+        return { rows: inserted, rowCount: inserted.length };
       }
-      return { rows: inserted, rowCount: inserted.length };
+      if (sql.includes('WHERE n.id = $1')) {
+        const [nid, rawUserId, rawRole] = params;
+        const userId = String(rawUserId || '').trim();
+        const role = String(rawRole || '').trim();
+        const now = new Date();
+        const inserted: Array<{ id: string }> = [];
+        for (const n of state.notifications) {
+          const recRole = String(n.recipient_role || '').trim();
+          const isSharedForUser = String(n.recipient_employee_id || '').trim() === '' && (recRole === role || recRole === 'all');
+          const alreadyDismissed = state.notification_dismissals.some((d) => d.notification_id === n.id && d.employee_id === userId && d.deleted_at);
+          if (n.id === nid && isSharedForUser && !n.deleted_at && !alreadyDismissed) {
+            const existing = state.notification_dismissals.find((d) => d.notification_id === n.id && d.employee_id === userId);
+            if (existing) existing.deleted_at = now;
+            else state.notification_dismissals.push({ notification_id: n.id, employee_id: userId, deleted_at: now });
+            inserted.push({ id: n.id });
+          }
+        }
+        return { rows: inserted, rowCount: inserted.length };
+      }
     }
     if (sql.startsWith('SELECT id FROM notifications WHERE deleted_at IS NOT NULL')) {
       const sinceMs = Date.parse(String(params[0] || ''));
-      const empId = params[1];
-      const role = params[2];
+      const empId = String(params[1] || '').trim();
+      const role = String(params[2] || '').trim();
       const rows = state.notifications
-        .filter((n) => n.deleted_at && Date.parse(n.deleted_at.toISOString()) > sinceMs &&
-          (n.recipient_employee_id === empId || (String(n.recipient_employee_id || '') === '' && (n.recipient_role === role || n.recipient_role === 'all'))))
+        .filter((n) => {
+          if (!n.deleted_at || Date.parse(n.deleted_at.toISOString()) <= sinceMs) return false;
+          const recEmp = String(n.recipient_employee_id || '').trim();
+          const recRole = String(n.recipient_role || '').trim();
+          return recEmp === empId || (recEmp === '' && (recRole === role || recRole === 'all'));
+        })
         .map((n) => ({ id: n.id }));
       return { rows, rowCount: rows.length };
     }
     if (sql.startsWith('SELECT notification_id AS id FROM notification_dismissals')) {
-      const empId = params[0];
+      if (opts.failNotificationDismissals) {
+        txAborted = true;
+        throw Object.assign(new Error('relation "notification_dismissals" does not exist'), { code: '42P01' });
+      }
+      const empId = String(params[0] || '').trim();
       const sinceMs = Date.parse(String(params[1] || ''));
       const rows = state.notification_dismissals
-        .filter((d) => d.employee_id === empId && d.deleted_at && Date.parse(d.deleted_at.toISOString()) > sinceMs)
+        .filter((d) => String(d.employee_id || '').trim() === empId && d.deleted_at && Date.parse(d.deleted_at.toISOString()) > sinceMs)
         .map((d) => ({ id: d.notification_id }));
       return { rows, rowCount: rows.length };
     }
     if (sql.includes('FROM notifications') && sql.includes('deleted_at IS NULL')) {
-      const empId = params[0];
-      const role = params[1];
+      const empId = String(params[0] || '').trim();
+      const role = String(params[1] || '').trim();
       const rows = state.notifications
         .filter((n) => {
           if (n.deleted_at) return false;
-          const owned = n.recipient_employee_id === empId ||
-            (String(n.recipient_employee_id || '') === '' && (n.recipient_role === role || n.recipient_role === 'all'));
+          const recEmp = String(n.recipient_employee_id || '').trim();
+          const recRole = String(n.recipient_role || '').trim();
+          const owned = recEmp === empId || (recEmp === '' && (recRole === role || recRole === 'all'));
           if (!owned) return false;
           const dismissed = state.notification_dismissals.some(
-            (d) => d.notification_id === n.id && d.employee_id === empId && d.deleted_at
+            (d) => d.notification_id === n.id && String(d.employee_id || '').trim() === empId && d.deleted_at
           );
           return !dismissed;
         })
@@ -500,7 +591,17 @@ function createMockExecutor() {
 
   const executor: any = {
     query,
-    withTransaction: async (fn: (client: any) => Promise<any>) => fn({ query })
+    withTransaction: async (fn: (client: any) => Promise<any>) => {
+      await query('BEGIN');
+      try {
+        const res = await fn({ query });
+        await query('COMMIT');
+        return res;
+      } catch (err) {
+        await query('ROLLBACK');
+        throw err;
+      }
+    }
   };
 
   return { executor, state };
@@ -866,7 +967,7 @@ test('core & frontend reload/race protection: filterDeletedNotificationsPayload,
   // Neither the resolved stale response nor cache nor delta sync may resurrect RACE_N1
   assert.equal(staleResolved.data.items.some((n: any) => n.id === 'RACE_N1'), false);
   const finalCache = apiRace.getCachedData('getNotifications', {}, true);
-  assert.deepEqual(finalCache.items.map((n: any) => n.id), ['RACE_N2']);
+  assert.deepEqual(Array.from(finalCache.items, (n: any) => n.id), ['RACE_N2']);
 
   apiRace.applyDeltaSyncToCache({
     syncVersion: Date.now(),
@@ -874,7 +975,7 @@ test('core & frontend reload/race protection: filterDeletedNotificationsPayload,
     deletedNotificationIds: ['RACE_N1']
   });
   const afterDeltaCache = apiRace.getCachedData('getNotifications', {}, true);
-  assert.deepEqual(afterDeltaCache.items.map((n: any) => n.id), ['RACE_N2']);
+  assert.deepEqual(Array.from(afterDeltaCache.items, (n: any) => n.id), ['RACE_N2']);
 });
 
 test('frontend sandbox & UI check: deleteFollowUp & deleteNotification in api.js and delete controls across UI modules', async () => {
@@ -906,4 +1007,245 @@ test('frontend sandbox & UI check: deleteFollowUp & deleteNotification in api.js
   assert.match(appJs, /notif-delete-btn/);
   assert.match(appJs, /class="notif-item-wrap/);
   assert.match(appJs, /class="notif-item-main"/);
+});
+
+test('deleteNotification PG savepoint resilience: personal delete commits cleanly even if notification_dismissals fails inside TX', async () => {
+  const { executor, state } = createMockExecutor({ failNotificationDismissals: true });
+
+  const delRes = await dispatchCrmRequest(executor, {
+    action: 'deleteNotification',
+    token: 'tok_EMP_AGENT_A',
+    payload: { notificationId: 'NTF_A1' }
+  });
+  assert.equal(delRes.success, true, delRes.message);
+  assert.equal(delRes.data.deletedCount, 1);
+
+  const rowA1 = state.notifications.find((n) => n.id === 'NTF_A1');
+  assert.ok(rowA1 && rowA1.deleted_at, 'NTF_A1 must stay soft-deleted after COMMIT when optional dismissal query fails inside SAVEPOINT');
+
+  const refetch = await dispatchCrmRequest(executor, {
+    action: 'getNotifications',
+    token: 'tok_EMP_AGENT_A',
+    payload: {}
+  });
+  assert.equal(refetch.success, true);
+  assert.equal(refetch.data.items.some((n: any) => n.id === 'NTF_A1'), false);
+});
+
+test('ensureNotificationsSchemaAndIndexes: safely deduplicates pre-existing duplicate event_key rows and preserves deleted state', async () => {
+  const rows = [
+    {
+      id: 'DUP_DEL',
+      recipient_employee_id: ' EMP_AGENT_A ',
+      recipient_role: '',
+      event_key: ' ev_dup ',
+      deleted_at: new Date('2026-11-25T10:00:00Z'),
+      deleted_by_id: 'EMP_AGENT_A',
+      is_read: true,
+      created_at: new Date('2026-11-25T09:00:00Z')
+    },
+    {
+      id: 'DUP_ACTIVE',
+      recipient_employee_id: 'EMP_AGENT_A',
+      recipient_role: '',
+      event_key: 'ev_dup',
+      deleted_at: null,
+      deleted_by_id: '',
+      is_read: false,
+      created_at: new Date('2026-11-25T11:00:00Z')
+    }
+  ];
+  const executedDdls: string[] = [];
+  const mockDb: any = {
+    query: async (rawSql: string, params: any[] = []) => {
+      const sql = String(rawSql || '').trim().replace(/\s+/g, ' ');
+      executedDdls.push(sql);
+      if (sql.startsWith('UPDATE notifications SET recipient_employee_id = BTRIM')) {
+        for (const r of rows) {
+          r.recipient_employee_id = String(r.recipient_employee_id || '').trim();
+          r.recipient_role = r.recipient_employee_id ? '' : String(r.recipient_role || '').trim();
+          r.event_key = String(r.event_key || '').trim();
+        }
+        return { rows: [], rowCount: rows.length };
+      }
+      if (sql.startsWith('SELECT event_key, recipient_employee_id, recipient_role FROM notifications')) {
+        return { rows: [{ event_key: 'ev_dup', recipient_employee_id: 'EMP_AGENT_A', recipient_role: '' }], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT id, deleted_at, deleted_by_id, is_read FROM notifications')) {
+        const ordered = rows
+          .filter((r) => r.event_key === params[0] && r.recipient_employee_id === params[1] && r.recipient_role === params[2])
+          .sort((a, b) => Number(Boolean(b.deleted_at)) - Number(Boolean(a.deleted_at)));
+        return { rows: ordered, rowCount: ordered.length };
+      }
+      if (sql.startsWith('DELETE FROM notifications WHERE id = ANY')) {
+        const ids: string[] = params[0] || [];
+        for (let i = rows.length - 1; i >= 0; i--) {
+          if (ids.includes(rows[i].id)) rows.splice(i, 1);
+        }
+        return { rows: [], rowCount: ids.length };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+  };
+
+  const result = await ensureNotificationsSchemaAndIndexes(mockDb);
+  assert.equal(result.deduplicatedGroups, 1);
+  assert.equal(result.removedDuplicateRows, 1);
+  assert.equal(rows.length, 1);
+  assert.ok(rows[0].deleted_at, 'Preserved surviving duplicate row must keep deleted_at');
+  assert.ok(executedDdls.some((s) => s.includes('CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique')));
+});
+
+test('frontend swrValidInPage reload guard: stale pre-delete notifications in sessionStorage never serve across reload in Neon mode', async () => {
+  const n1 = { id: 'REL_N1', isRead: false, createdAt: '2026-11-25T10:00:00Z' };
+  const n2 = { id: 'REL_N2', isRead: false, createdAt: '2026-11-25T11:00:00Z' };
+  let deletedOnServer = false;
+
+  const mockResp = (obj: any) => ({
+    ok: true,
+    status: 200,
+    headers: { get: (k: string) => (String(k || '').toLowerCase() === 'content-type' ? 'application/json' : '') },
+    text: async () => JSON.stringify(obj),
+    json: async () => obj
+  });
+
+  const sharedLocalStore: Record<string, string> = {
+    rg_crm_backend_mode_v1: 'neon',
+    rg_crm_backend_url: '/api/crm',
+    rg_crm_session_token: 'tok_reload_test'
+  };
+  const sharedSessionStore: Record<string, string> = {};
+
+  const fetchImpl = async (url: any, init: any) => {
+    const urlStr = String(url || '');
+    if (urlStr.includes('/api/health') || urlStr.includes('serverCapabilities')) {
+      return mockResp({ ok: true, databaseConfigured: true, mode: 'neon', backendApiUrl: '/api/crm' });
+    }
+    const body = JSON.parse(String(init?.body || '{}'));
+    if (body.action === 'deleteNotification') {
+      deletedOnServer = true;
+      return mockResp({
+        success: true,
+        data: { deleted: true, deletedCount: 1, deletedIds: ['REL_N1'], items: [n2], unreadCount: 1 }
+      });
+    }
+    if (body.action === 'getNotifications') {
+      const items = deletedOnServer ? [n2] : [n1, n2];
+      return mockResp({ success: true, data: { items, unreadCount: items.length } });
+    }
+    return mockResp({ success: true, data: {} });
+  };
+
+  // First page load: prime notifications, mark notifications scope stale (which sets swrValidInPage=true in memory), persist
+  const page1 = loadApiSandbox({ mode: 'neon', localStore: sharedLocalStore, sessionStore: sharedSessionStore, fetchImpl });
+  await page1.ctx.RGApi.callApi('getNotifications', {});
+  await page1.ctx.RGApi.markScopesStale(['notifications']);
+  await page1.ctx.RGApi.flushPersistApiCache?.();
+
+  // Verify persisted sessionStorage NEVER contains swrValidInPage: true
+  const rawSwr = sharedSessionStore.rg_crm_swr_v1 || '{}';
+  assert.equal(rawSwr.includes('"swrValidInPage":true'), false, 'Persisted cache must strip swrValidInPage');
+
+  // Inject a poisoned swrValidInPage + stale [n1, n2] entry in sessionStorage to simulate legacy browser storage before upgrade
+  const parsedSwr = JSON.parse(rawSwr);
+  for (const k of Object.keys(parsedSwr)) {
+    parsedSwr[k].swrValidInPage = true;
+    parsedSwr[k].response.data = { items: [n1, n2], unreadCount: 2 };
+  }
+  sharedSessionStore.rg_crm_swr_v1 = JSON.stringify(parsedSwr);
+  deletedOnServer = true;
+
+  // Fresh page load must NOT serve stale [n1, n2]; it must revalidate and exclude deleted REL_N1
+  const page2 = loadApiSandbox({ mode: 'neon', localStore: sharedLocalStore, sessionStore: sharedSessionStore, fetchImpl });
+  const reloadedNotifs = await page2.ctx.RGApi.callApi('getNotifications', {});
+  assert.equal(reloadedNotifs.success, true);
+  assert.deepEqual(Array.from(reloadedNotifs.data.items, (n: any) => n.id), ['REL_N2']);
+});
+
+test('GAS NeonSync.gs mirror sync: deleteNotification handles personal soft-deletes, shared dismissals, and deleteAll across sheets', () => {
+  const notificationsSheet: any[] = [
+    { id: 'NTF_P1', recipientEmployeeId: 'EMP_A', recipientRole: '', title: 'Personal', deletedAt: '', deletedById: '', dismissedByJson: '' },
+    { id: 'NTF_P2', recipientEmployeeId: 'EMP_A', recipientRole: '', title: 'Personal 2', deletedAt: '', deletedById: '', dismissedByJson: '' },
+    { id: 'NTF_SH', recipientEmployeeId: '', recipientRole: 'agent', title: 'Shared Agent', deletedAt: '', deletedById: '', dismissedByJson: '' },
+    { id: 'NTF_ALL', recipientEmployeeId: '', recipientRole: 'all', title: 'Shared All', deletedAt: '', deletedById: '', dismissedByJson: '' },
+    { id: 'NTF_OTHER', recipientEmployeeId: 'EMP_B', recipientRole: '', title: 'Other Emp', deletedAt: '', deletedById: '', dismissedByJson: '' }
+  ];
+
+  const gasCtx: any = {
+    console, Date, JSON, Object, Array, String, Number, Boolean,
+    RG_SHEETS: { NOTIFICATIONS: 'Notifications' },
+    CacheService: { getScriptCache: () => ({ get: () => null, put: () => {} }) },
+    PropertiesService: { getScriptProperties: () => ({ getProperty: (k: string) => (k === 'SYNC_API_SECRET' ? 'test-secret' : ''), setProperties: () => {} }) },
+    normalizeStr: (v: any) => (v === null || v === undefined ? '' : String(v).trim()),
+    toBool: (v: any) => v === true || String(v).toLowerCase() === 'true',
+    nowIso: () => '2026-11-26T12:00:00.000Z',
+    generateId: (p: string) => `${p}_1`,
+    getCacheVersion_: () => '1',
+    bumpCacheVersion_: () => {},
+    readRecentRecords_: () => notificationsSheet,
+    updateRecordsWhere_: (_sheet: string, pred: (r: any) => boolean, patchOrFn: any) => {
+      const updated: any[] = [];
+      for (const row of notificationsSheet) {
+        if (pred(row)) {
+          const patch = typeof patchOrFn === 'function' ? patchOrFn(row) : patchOrFn;
+          Object.assign(row, patch);
+          updated.push(row);
+        }
+      }
+      return updated;
+    },
+    withScriptLock: (fn: () => any) => fn(),
+    batchUpsertRecords: () => {},
+    clearSheetRecords: () => {}
+  };
+
+  vm.runInNewContext(fs.readFileSync(path.resolve(process.cwd(), 'google-apps-script/Notifications.gs'), 'utf8'), gasCtx);
+  vm.runInNewContext(fs.readFileSync(path.resolve(process.cwd(), 'google-apps-script/NeonSync.gs'), 'utf8'), gasCtx);
+
+  // 1) Mirror single shared + personal deletion for EMP_A
+  gasCtx.handleNeonMirrorSync_({
+    syncSecret: 'test-secret',
+    items: [{
+      action: 'deleteNotification',
+      payload: {
+        id: 'NTF_P1',
+        deletedIds: ['NTF_P1'],
+        dismissedSharedIds: ['NTF_SH'],
+        deleteAll: false,
+        recipientEmployeeId: 'EMP_A',
+        userRole: 'agent',
+        deletedById: 'EMP_A',
+        deletedAt: '2026-11-26T12:00:00.000Z'
+      }
+    }]
+  });
+
+  const aAfterSingle = gasCtx.getNotifications({ employeeId: 'EMP_A', role: 'agent' });
+  assert.deepEqual(Array.from(aAfterSingle.items, (x: any) => x.id).sort(), ['NTF_ALL', 'NTF_P2']);
+  // Agent B must still see shared NTF_SH!
+  const bAfterSingle = gasCtx.getNotifications({ employeeId: 'EMP_B', role: 'agent' });
+  assert.deepEqual(Array.from(bAfterSingle.items, (x: any) => x.id).sort(), ['NTF_ALL', 'NTF_OTHER', 'NTF_SH']);
+
+  // 2) Mirror deleteAll for EMP_A -> dismisses NTF_ALL for EMP_A and deletes NTF_P2, leaving EMP_B untouched
+  gasCtx.handleNeonMirrorSync_({
+    syncSecret: 'test-secret',
+    items: [{
+      action: 'deleteNotification',
+      payload: {
+        id: '',
+        deletedIds: ['NTF_P2'],
+        dismissedSharedIds: ['NTF_ALL'],
+        deleteAll: true,
+        recipientEmployeeId: 'EMP_A',
+        userRole: 'agent',
+        deletedById: 'EMP_A',
+        deletedAt: '2026-11-26T12:01:00.000Z'
+      }
+    }]
+  });
+
+  const aAfterAll = gasCtx.getNotifications({ employeeId: 'EMP_A', role: 'agent' });
+  assert.equal(aAfterAll.items.length, 0);
+  const bAfterAll = gasCtx.getNotifications({ employeeId: 'EMP_B', role: 'agent' });
+  assert.deepEqual(Array.from(bAfterAll.items, (x: any) => x.id).sort(), ['NTF_ALL', 'NTF_OTHER', 'NTF_SH']);
 });

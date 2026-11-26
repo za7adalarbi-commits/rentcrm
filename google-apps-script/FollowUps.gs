@@ -55,6 +55,7 @@ function assignEmployees(session, payload) {
         updatedAt: nowStr
       });
 
+      var asnRecId = newAssignments[newAssignments.length - 1].id;
       var isReassign = previousIds.length > 0 && previousIds.indexOf(empId) === -1;
       newNotifications.push({
         recipientEmployeeId: emp.id,
@@ -63,7 +64,8 @@ function assignEmployees(session, payload) {
         title: isReassign ? 'إعادة توزيع حجز' : 'إسناد حجز جديد',
         message: 'تم إسناد الحجز رقم ' + reservation.reservationNumber + ' (' + reservation.customerName + ') إليك.',
         entityType: 'Reservation',
-        entityId: reservation.id
+        entityId: reservation.id,
+        eventKey: 'asn|' + (normalizeStr(p.clientRequestId) || asnRecId) + '|' + emp.id
       });
     }
 
@@ -317,7 +319,8 @@ function addFollowUp(session, payload) {
           title: statusChanged ? 'تغيير حالة حجز' : 'متابعة جديدة على حجز مشترك',
           message: session.user.name + ' حدّث الحجز ' + reservation.reservationNumber + ' إلى: ' + status,
           entityType: 'Reservation',
-          entityId: reservation.id
+          entityId: reservation.id,
+          eventKey: 'fu_notif|' + followUp.id + '|' + assignedIds[i]
         });
       }
     }

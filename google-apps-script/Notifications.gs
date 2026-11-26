@@ -233,6 +233,7 @@ function deleteNotification(session, payload) {
       deletedCount: deletedIds.length,
       deletedIds: deletedIds,
       deletedAllBefore: deleteAll ? now : '',
+      deletedAllNotificationsBefore: deleteAll ? now : '',
       items: fresh.items || [],
       unreadCount: fresh.unreadCount || 0
     };

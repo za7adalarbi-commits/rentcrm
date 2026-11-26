@@ -101,7 +101,8 @@ function createProblem(session, payload) {
           title: 'مشكلة جديدة مسندة إليك',
           message: 'مشكلة على الحجز ' + reservation.reservationNumber + ': ' + description,
           entityType: 'Problem',
-          entityId: problem.id
+          entityId: problem.id,
+          eventKey: 'new_problem|' + problem.id + '|' + validIds[k]
         });
       }
     }
@@ -117,7 +118,8 @@ function createProblem(session, payload) {
             title: 'تنبيه: مشكلة بأولوية مرتفعة',
             message: 'تم فتح مشكلة مرتفعة الأولوية للحجز ' + reservation.reservationNumber + ' (' + reservation.customerName + ') بواسطة ' + session.user.name,
             entityType: 'Problem',
-            entityId: problem.id
+            entityId: problem.id,
+            eventKey: 'high_priority_problem|' + problem.id + '|' + emp.id
           });
         }
       }
@@ -274,7 +276,8 @@ function updateProblem(session, payload) {
           title: 'تم حل مشكلة على حجز مسند إليك',
           message: 'تم تغيير حالة المشكلة ' + existing.problemNumber + ' (الحجز ' + (existing.reservationNumber || '-') + ') إلى "تم الحل" بواسطة ' + session.user.name + '.',
           entityType: 'Problem',
-          entityId: problemId
+          entityId: problemId,
+          eventKey: 'problem_resolved|' + problemId + '|' + existing.status + '|' + newStatus + '|' + (normalizeStr(existing.updatedAt) || now) + '|' + rKeys[nIdx]
         });
       }
       if (resolvedBatch.length > 0) createNotificationsBatch_(resolvedBatch);

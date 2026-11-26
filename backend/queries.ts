@@ -160,26 +160,66 @@ function redactReservationsList<T extends Record<string, any>>(items: T[], user:
   return items.map((item) => redactReservationForUser(item, user));
 }
 
+async function runTxOptional<T>(
+  tx: DbClient,
+  savepointLabel: string,
+  fn: () => Promise<T>,
+  fallback: T
+): Promise<T> {
+  const safeSp = `sp_${savepointLabel.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+  let hasSavepoint = false;
+  try {
+    await tx.query(`SAVEPOINT ${safeSp}`);
+    hasSavepoint = true;
+  } catch {
+    hasSavepoint = false;
+  }
+  try {
+    const res = await fn();
+    if (hasSavepoint) {
+      await tx.query(`RELEASE SAVEPOINT ${safeSp}`).catch(() => undefined);
+    }
+    return res;
+  } catch {
+    if (hasSavepoint) {
+      await tx.query(`ROLLBACK TO SAVEPOINT ${safeSp}`).catch(() => undefined);
+    }
+    return fallback;
+  }
+}
+
 async function recordSyncTombstone(
   client: DbClient,
-  entityType: 'reservation' | 'reservation_clear_all' | 'employee' | 'announcement' | 'problem' | 'follow_up',
+  entityType:
+    | 'reservation'
+    | 'reservation_clear_all'
+    | 'employee'
+    | 'announcement'
+    | 'problem'
+    | 'follow_up'
+    | 'notification'
+    | 'notification_clear_all'
+    | string,
   entityIds: string[],
   meta: Record<string, any> = {}
 ): Promise<void> {
   const cleanIds = Array.from(new Set(entityIds.map((x) => str(x)).filter(Boolean))).slice(0, 800);
   if (!cleanIds.length) return;
   const metaJson = JSON.stringify(meta || {});
-  try {
-    const ids = cleanIds.map(() => generateId('TMB'));
-    await client.query(
-      `INSERT INTO sync_tombstones (id, entity_type, entity_id, meta, deleted_at)
-       SELECT u.id, $2, u.entity_id, $3::jsonb, NOW()
-       FROM unnest($1::text[], $4::text[]) AS u(id, entity_id)`,
-      [ids, entityType, metaJson, cleanIds]
-    );
-  } catch {
-    // Graceful no-op on mock executors that don't support unnest tombstones
-  }
+  await runTxOptional(
+    client,
+    'record_tombstone',
+    async () => {
+      const ids = cleanIds.map(() => generateId('TMB'));
+      await client.query(
+        `INSERT INTO sync_tombstones (id, entity_type, entity_id, meta, deleted_at)
+         SELECT u.id, $2, u.entity_id, $3::jsonb, NOW()
+         FROM unnest($1::text[], $4::text[]) AS u(id, entity_id)`,
+        [ids, entityType, metaJson, cleanIds]
+      );
+    },
+    undefined
+  );
 }
 
 function num(v: unknown, fallback = 0): number {
@@ -1164,22 +1204,27 @@ export async function getDashboard(
 }
 
 async function fetchNotificationsForSession(client: DbClient, session: AuthSession) {
+  const userId = str(session.user.id);
+  const userRole = str(session.user.role);
   const res = await client.query(
     `SELECT * FROM notifications
      WHERE (
-       recipient_employee_id = $1
-       OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $2 OR recipient_role = 'all'))
+       BTRIM(COALESCE(recipient_employee_id, '')) = $1
+       OR (
+         BTRIM(COALESCE(recipient_employee_id, '')) = ''
+         AND (BTRIM(COALESCE(recipient_role, '')) = $2 OR BTRIM(COALESCE(recipient_role, '')) = 'all')
+       )
      )
        AND deleted_at IS NULL
        AND NOT EXISTS (
          SELECT 1 FROM notification_dismissals nd
          WHERE nd.notification_id = notifications.id
-           AND nd.employee_id = $1
+           AND BTRIM(COALESCE(nd.employee_id, '')) = $1
            AND nd.deleted_at IS NOT NULL
        )
      ORDER BY created_at DESC
      LIMIT 60`,
-    [session.user.id, session.user.role]
+    [userId, userRole]
   );
   const items = res.rows.map((n) => ({
     id: str(n.id),
@@ -2857,79 +2902,81 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
     throw new Error('VALIDATION_ERROR: يجب تحديد الحجز وموظف واحد على الأقل.');
   }
 
-  const out = await executor.withTransaction(async (tx) => {
-    const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
-    if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
-    const resObj = mapReservationRowToClient(resQuery.rows[0], false);
+  return runWithIdempotency(executor, session.user.id, 'assignEmployees', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const resQuery = await tx.query(`SELECT * FROM reservations WHERE id = $1 FOR UPDATE`, [resId]);
+      if (!resQuery.rows[0]) throw new Error('NOT_FOUND: الحجز غير موجود.');
+      const resObj = mapReservationRowToClient(resQuery.rows[0], false);
 
-    const empRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[]) AND status = 'active'`, [targetIds]);
-    const empMap = new Map(empRes.rows.map((e) => [str(e.id), str(e.name)]));
-    const validIds = targetIds.filter((id) => empMap.has(id));
-    const validNames = validIds.map((id) => empMap.get(id)!);
-    if (validIds.length === 0) throw new Error('VALIDATION_ERROR: لم يتم العثور على موظفين نشطين.');
+      const empRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[]) AND status = 'active'`, [targetIds]);
+      const empMap = new Map(empRes.rows.map((e) => [str(e.id), str(e.name)]));
+      const validIds = targetIds.filter((id) => empMap.has(id));
+      const validNames = validIds.map((id) => empMap.get(id)!);
+      if (validIds.length === 0) throw new Error('VALIDATION_ERROR: لم يتم العثور على موظفين نشطين.');
 
-    const nowIso = new Date().toISOString();
-    const existingActive = await tx.query(
-      `SELECT employee_id FROM assignments WHERE reservation_id = $1 AND status = 'active'`,
-      [resId]
-    );
-    const alreadySet = new Set(existingActive.rows.map((r) => str(r.employee_id)));
+      const nowIso = new Date().toISOString();
+      const existingActive = await tx.query(
+        `SELECT employee_id FROM assignments WHERE reservation_id = $1 AND status = 'active'`,
+        [resId]
+      );
+      const alreadySet = new Set(existingActive.rows.map((r) => str(r.employee_id)));
 
-    for (const eid of validIds) {
-      if (!alreadySet.has(eid)) {
-        const asnId = generateId('ASN');
-        await tx.query(
-          `INSERT INTO assignments (id, reservation_id, reservation_number, employee_id, employee_name, assigned_by_id, assigned_by_name, role_type, status, assigned_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9::timestamptz,$9::timestamptz)`,
-          [asnId, resId, resObj.reservationNumber, eid, empMap.get(eid)!, session.user.id, session.user.name, roleType, nowIso]
-        );
-        await createNotification(tx, {
-          recipientEmployeeId: eid,
-          type: 'new_assignment',
-          title: 'إسناد حجز جديد',
-          message: `تم إسناد الحجز رقم ${resObj.reservationNumber} (${resObj.customerName}) إليك.`,
-          entityType: 'Reservation',
-          entityId: resObj.id,
-          eventKey: str(payload.clientRequestId)
-            ? buildNotificationEventKey(['asn_req', str(payload.clientRequestId), eid])
-            : buildNotificationEventKey(['asn', asnId, eid])
-        });
+      for (const eid of validIds) {
+        if (!alreadySet.has(eid)) {
+          const asnId = generateId('ASN');
+          await tx.query(
+            `INSERT INTO assignments (id, reservation_id, reservation_number, employee_id, employee_name, assigned_by_id, assigned_by_name, role_type, status, assigned_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9::timestamptz,$9::timestamptz)`,
+            [asnId, resId, resObj.reservationNumber, eid, empMap.get(eid)!, session.user.id, session.user.name, roleType, nowIso]
+          );
+          await createNotification(tx, {
+            recipientEmployeeId: eid,
+            type: 'new_assignment',
+            title: 'إسناد حجز جديد',
+            message: `تم إسناد الحجز رقم ${resObj.reservationNumber} (${resObj.customerName}) إليك.`,
+            entityType: 'Reservation',
+            entityId: resObj.id,
+            eventKey: str(payload.clientRequestId)
+              ? buildNotificationEventKey(['asn_req', str(payload.clientRequestId), eid])
+              : buildNotificationEventKey(['asn', asnId, eid])
+          });
+        }
       }
-    }
 
-    const mergedIds = Array.from(new Set([...resObj.assignedEmployeeIds, ...validIds]));
-    const empAllRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[])`, [mergedIds]);
-    const allMap = new Map(empAllRes.rows.map((e) => [str(e.id), str(e.name)]));
-    const mergedNames = mergedIds.map((id) => allMap.get(id) || id);
-    const lastText = `إسناد الحجز إلى: ${validNames.join('، ')}`;
+      const mergedIds = Array.from(new Set([...resObj.assignedEmployeeIds, ...validIds]));
+      const empAllRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[])`, [mergedIds]);
+      const allMap = new Map(empAllRes.rows.map((e) => [str(e.id), str(e.name)]));
+      const mergedNames = mergedIds.map((id) => allMap.get(id) || id);
+      const lastText = `إسناد الحجز إلى: ${validNames.join('، ')}`;
 
-    await tx.query(
-      `UPDATE reservations
-       SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb,
-           last_update_text = $4, last_updated_by_id = $5, last_updated_by_name = $6,
-           last_updated_at = $7, updated_at = $8::timestamptz
-       WHERE id = $1`,
-      [resId, JSON.stringify(mergedIds), JSON.stringify(mergedNames), lastText, session.user.id, session.user.name, nowIso, nowIso]
-    );
+      await tx.query(
+        `UPDATE reservations
+         SET assigned_employee_ids = $2::jsonb, assigned_employee_names = $3::jsonb,
+             last_update_text = $4, last_updated_by_id = $5, last_updated_by_name = $6,
+             last_updated_at = $7, updated_at = $8::timestamptz
+         WHERE id = $1`,
+        [resId, JSON.stringify(mergedIds), JSON.stringify(mergedNames), lastText, session.user.id, session.user.name, nowIso, nowIso]
+      );
 
-    await logActivity(tx, session.user, 'إسناد موظفين', 'Reservation', resObj.reservationNumber, lastText);
+      await logActivity(tx, session.user, 'إسناد موظفين', 'Reservation', resObj.reservationNumber, lastText);
 
-    const updatedRes: Record<string, any> = {
-      ...resObj,
-      assignedEmployeeIds: mergedIds,
-      assignedEmployeeNames: mergedNames,
-      lastUpdateText: lastText,
-      lastUpdatedById: session.user.id,
-      lastUpdatedByName: session.user.name,
-      lastUpdatedAt: nowIso,
-      updatedAt: nowIso
-    };
-    await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
-    return updatedRes;
+      const updatedRes: Record<string, any> = {
+        ...resObj,
+        assignedEmployeeIds: mergedIds,
+        assignedEmployeeNames: mergedNames,
+        lastUpdateText: lastText,
+        lastUpdatedById: session.user.id,
+        lastUpdatedByName: session.user.name,
+        lastUpdatedAt: nowIso,
+        updatedAt: nowIso
+      };
+      await enqueueSheetsMirror(tx, 'Reservation', updatedRes.id, 'upsertReservation', updatedRes);
+      return updatedRes;
+    });
+
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
   });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
 }
 
 export async function removeAssignment(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -3156,135 +3203,142 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
   const problemId = str(payload.problemId);
   if (!problemId) throw new Error('VALIDATION_ERROR: معرف المشكلة مطلوب.');
 
-  const out = await executor.withTransaction(async (tx) => {
-    const pRes = await tx.query(`SELECT * FROM problems WHERE id = $1 FOR UPDATE`, [problemId]);
-    if (!pRes.rows[0]) throw new Error('NOT_FOUND: المشكلة غير موجودة.');
-    const existing = formatProblemRow(pRes.rows[0]);
-    assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
+  return runWithIdempotency(executor, session.user.id, 'updateProblem', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const pRes = await tx.query(`SELECT * FROM problems WHERE id = $1 FOR UPDATE`, [problemId]);
+      if (!pRes.rows[0]) throw new Error('NOT_FOUND: المشكلة غير موجودة.');
+      const existing = formatProblemRow(pRes.rows[0]);
+      assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
-    const nextStatus = payload.status !== undefined ? str(payload.status) : existing.status;
-    const nextPrio = payload.priority !== undefined ? str(payload.priority) : existing.priority;
-    const nextDesc = payload.description !== undefined && str(payload.description) ? str(payload.description) : existing.description;
-    const nextCust = payload.customerName !== undefined && str(payload.customerName) ? str(payload.customerName) : existing.customerName;
+      const nextStatus = payload.status !== undefined ? str(payload.status) : existing.status;
+      const nextPrio = payload.priority !== undefined ? str(payload.priority) : existing.priority;
+      const nextDesc = payload.description !== undefined && str(payload.description) ? str(payload.description) : existing.description;
+      const nextCust = payload.customerName !== undefined && str(payload.customerName) ? str(payload.customerName) : existing.customerName;
 
-    let nextEmpIds = existing.assignedEmployeeIds;
-    let nextEmpNames = existing.assignedEmployeeNames;
-    if (Array.isArray(payload.assignedEmployeeIds)) {
-      nextEmpIds = payload.assignedEmployeeIds.map((x: any) => str(x)).filter(Boolean);
-      const empRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[])`, [nextEmpIds]);
-      const eMap = new Map(empRes.rows.map((e) => [str(e.id), str(e.name)]));
-      nextEmpNames = nextEmpIds.map((id: string) => eMap.get(id) || id);
-    }
+      let nextEmpIds = existing.assignedEmployeeIds;
+      let nextEmpNames = existing.assignedEmployeeNames;
+      if (Array.isArray(payload.assignedEmployeeIds)) {
+        nextEmpIds = payload.assignedEmployeeIds.map((x: any) => str(x)).filter(Boolean);
+        const empRes = await tx.query(`SELECT id, name FROM employees WHERE id = ANY($1::text[])`, [nextEmpIds]);
+        const eMap = new Map(empRes.rows.map((e) => [str(e.id), str(e.name)]));
+        nextEmpNames = nextEmpIds.map((id: string) => eMap.get(id) || id);
+      }
 
-    const nowIso = new Date().toISOString();
-    const updSql = `
-      UPDATE %TABLE%
-      SET status = $2, priority = $3, description = $4, customer_name = $5,
-          assigned_employee_ids = $6::jsonb, assigned_employee_names = $7::jsonb,
-          updated_at = $8::timestamptz
-      WHERE id = $1
-    `;
-    const updParams = [problemId, nextStatus, nextPrio, nextDesc, nextCust, JSON.stringify(nextEmpIds), JSON.stringify(nextEmpNames), nowIso];
-    await tx.query(updSql.replace('%TABLE%', 'problems'), updParams);
-    await tx.query(updSql.replace('%TABLE%', 'issues'), updParams);
-
-    const note = str(payload.note) || (nextStatus === 'مغلقة' ? 'تم إغلاق المشكلة' : `تحديث الحالة إلى ${nextStatus}`);
-    const prbuId = generateId('PRBU');
-    await tx.query(
-      `INSERT INTO problem_updates (id, problem_id, reservation_number, employee_id, employee_name, previous_status, new_status, previous_priority, new_priority, note, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
-      [prbuId, problemId, existing.reservationNumber, session.user.id, session.user.name, existing.status, nextStatus, existing.priority, nextPrio, note, nowIso]
-    );
-
-    if (existing.reservationId) {
-      const openCheck = await tx.query<{ cnt: string }>(
-        `SELECT COUNT(*)::text AS cnt FROM problems WHERE reservation_id = $1 AND status NOT IN ('مغلقة', 'تم الحل')`,
-        [existing.reservationId]
+      const nowIso = new Date().toISOString();
+      const updSql = `
+        UPDATE %TABLE%
+        SET status = $2, priority = $3, description = $4, customer_name = $5,
+            assigned_employee_ids = $6::jsonb, assigned_employee_names = $7::jsonb,
+            updated_at = $8::timestamptz
+        WHERE id = $1
+      `;
+      const updParams = [problemId, nextStatus, nextPrio, nextDesc, nextCust, JSON.stringify(nextEmpIds), JSON.stringify(nextEmpNames), nowIso];
+      await tx.query(updSql.replace('%TABLE%', 'problems'), updParams);
+      await runTxOptional(
+        tx,
+        'upd_issues_tbl',
+        () => tx.query(updSql.replace('%TABLE%', 'issues'), updParams),
+        undefined
       );
-      const hasOpen = Number(openCheck.rows[0]?.cnt || 0) > 0;
+
+      const note = str(payload.note) || (nextStatus === 'مغلقة' ? 'تم إغلاق المشكلة' : `تحديث الحالة إلى ${nextStatus}`);
+      const prbuId = generateId('PRBU');
       await tx.query(
-        `UPDATE reservations SET has_problem = $2, updated_at = $3::timestamptz WHERE id = $1`,
-        [existing.reservationId, hasOpen, nowIso]
+        `INSERT INTO problem_updates (id, problem_id, reservation_number, employee_id, employee_name, previous_status, new_status, previous_priority, new_priority, note, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
+        [prbuId, problemId, existing.reservationNumber, session.user.id, session.user.name, existing.status, nextStatus, existing.priority, nextPrio, note, nowIso]
       );
-    }
 
-    if (nextStatus === 'تم الحل' && existing.status !== 'تم الحل') {
-      const recipientIds = new Set<string>();
       if (existing.reservationId) {
-        const resAssignQ = await tx.query<{ assigned_employee_ids: any }>(
-          `SELECT assigned_employee_ids FROM reservations WHERE id = $1 LIMIT 1`,
+        const openCheck = await tx.query<{ cnt: string }>(
+          `SELECT COUNT(*)::text AS cnt FROM problems WHERE reservation_id = $1 AND status NOT IN ('مغلقة', 'تم الحل')`,
           [existing.reservationId]
         );
-        if (resAssignQ.rows[0]) {
-          for (const eid of parseJsonArray<string>(resAssignQ.rows[0].assigned_employee_ids)) {
-            const cleanId = str(eid);
-            if (cleanId) recipientIds.add(cleanId);
+        const hasOpen = Number(openCheck.rows[0]?.cnt || 0) > 0;
+        await tx.query(
+          `UPDATE reservations SET has_problem = $2, updated_at = $3::timestamptz WHERE id = $1`,
+          [existing.reservationId, hasOpen, nowIso]
+        );
+      }
+
+      if (nextStatus === 'تم الحل' && existing.status !== 'تم الحل') {
+        const recipientIds = new Set<string>();
+        if (existing.reservationId) {
+          const resAssignQ = await tx.query<{ assigned_employee_ids: any }>(
+            `SELECT assigned_employee_ids FROM reservations WHERE id = $1 LIMIT 1`,
+            [existing.reservationId]
+          );
+          if (resAssignQ.rows[0]) {
+            for (const eid of parseJsonArray<string>(resAssignQ.rows[0].assigned_employee_ids)) {
+              const cleanId = str(eid);
+              if (cleanId) recipientIds.add(cleanId);
+            }
           }
         }
-      }
-      for (const peid of nextEmpIds) {
-        const cleanPid = str(peid);
-        if (cleanPid) recipientIds.add(cleanPid);
-      }
-      if (existing.createdById) recipientIds.add(str(existing.createdById));
-      recipientIds.delete(session.user.id);
+        for (const peid of nextEmpIds) {
+          const cleanPid = str(peid);
+          if (cleanPid) recipientIds.add(cleanPid);
+        }
+        if (existing.createdById) recipientIds.add(str(existing.createdById));
+        recipientIds.delete(session.user.id);
 
-      for (const targetEmpId of recipientIds) {
-        await createNotification(tx, {
-          recipientEmployeeId: targetEmpId,
-          type: 'problem_resolved',
-          title: 'تم حل مشكلة على حجز مسند إليك',
-          message: `تم تغيير حالة المشكلة ${existing.problemNumber} (الحجز ${existing.reservationNumber || '-'}) إلى "تم الحل" بواسطة ${session.user.name}.`,
-          entityType: 'Problem',
-          entityId: problemId,
-          eventKey: str(payload.clientRequestId)
-            ? buildNotificationEventKey(['problem_resolved_req', str(payload.clientRequestId), problemId, targetEmpId])
-            : buildNotificationEventKey(['problem_resolved', problemId, existing.status, nextStatus, existing.updatedAt, targetEmpId])
-        });
+        for (const targetEmpId of recipientIds) {
+          await createNotification(tx, {
+            recipientEmployeeId: targetEmpId,
+            type: 'problem_resolved',
+            title: 'تم حل مشكلة على حجز مسند إليك',
+            message: `تم تغيير حالة المشكلة ${existing.problemNumber} (الحجز ${existing.reservationNumber || '-'}) إلى "تم الحل" بواسطة ${session.user.name}.`,
+            entityType: 'Problem',
+            entityId: problemId,
+            eventKey: str(payload.clientRequestId)
+              ? buildNotificationEventKey(['problem_resolved_req', str(payload.clientRequestId), problemId, targetEmpId])
+              : buildNotificationEventKey(['problem_resolved', problemId, existing.status, nextStatus, existing.updatedAt, targetEmpId])
+          });
+        }
       }
-    }
 
-    const updatesRes = await tx.query(
-      `SELECT * FROM problem_updates WHERE problem_id = $1 ORDER BY created_at DESC`,
-      [problemId]
-    );
-    await dispatchMentionNotifications(tx, {
-      texts: [note, nextDesc !== existing.description ? nextDesc : ''],
-      sender: session.user,
-      entityType: 'Problem',
-      entityId: problemId,
-      label: existing.problemNumber,
-      sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `prbu:${prbuId}`
+      const updatesRes = await tx.query(
+        `SELECT * FROM problem_updates WHERE problem_id = $1 ORDER BY created_at DESC`,
+        [problemId]
+      );
+      await dispatchMentionNotifications(tx, {
+        texts: [note, nextDesc !== existing.description ? nextDesc : ''],
+        sender: session.user,
+        entityType: 'Problem',
+        entityId: problemId,
+        label: existing.problemNumber,
+        sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `prbu:${prbuId}`
+      });
+      const prbDiffs = crmCore.computeAuditFieldDiffs(
+        { status: existing.status, priority: existing.priority, description: existing.description, customerName: existing.customerName },
+        { status: nextStatus, priority: nextPrio, description: nextDesc, customerName: nextCust },
+        [
+          { field: 'status', label: 'حالة المشكلة' },
+          { field: 'priority', label: 'الأولوية' },
+          { field: 'customerName', label: 'اسم العميل' },
+          { field: 'description', label: 'الوصف' }
+        ]
+      );
+      await logActivity(tx, session.user, 'تحديث مشكلة', 'Problem', existing.problemNumber, `${existing.status} → ${nextStatus}`, prbDiffs);
+
+      const updatedProblem: Record<string, any> = {
+        ...existing,
+        status: nextStatus,
+        priority: nextPrio,
+        description: nextDesc,
+        customerName: nextCust,
+        assignedEmployeeIds: nextEmpIds,
+        assignedEmployeeNames: nextEmpNames,
+        updatedAt: nowIso,
+        updates: updatesRes.rows.map(formatProblemUpdateRow)
+      };
+      await enqueueSheetsMirror(tx, 'Problem', updatedProblem.id, 'upsertProblem', updatedProblem);
+      return updatedProblem;
     });
-    const prbDiffs = crmCore.computeAuditFieldDiffs(
-      { status: existing.status, priority: existing.priority, description: existing.description, customerName: existing.customerName },
-      { status: nextStatus, priority: nextPrio, description: nextDesc, customerName: nextCust },
-      [
-        { field: 'status', label: 'حالة المشكلة' },
-        { field: 'priority', label: 'الأولوية' },
-        { field: 'customerName', label: 'اسم العميل' },
-        { field: 'description', label: 'الوصف' }
-      ]
-    );
-    await logActivity(tx, session.user, 'تحديث مشكلة', 'Problem', existing.problemNumber, `${existing.status} → ${nextStatus}`, prbDiffs);
 
-    const updatedProblem: Record<string, any> = {
-      ...existing,
-      status: nextStatus,
-      priority: nextPrio,
-      description: nextDesc,
-      customerName: nextCust,
-      assignedEmployeeIds: nextEmpIds,
-      assignedEmployeeNames: nextEmpNames,
-      updatedAt: nowIso,
-      updates: updatesRes.rows.map(formatProblemUpdateRow)
-    };
-    await enqueueSheetsMirror(tx, 'Problem', updatedProblem.id, 'upsertProblem', updatedProblem);
-    return updatedProblem;
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
   });
-
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
 }
 
 export async function deleteProblem(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -3302,22 +3356,38 @@ export async function deleteProblem(executor: DbExecutor, session: AuthSession, 
       const existing = formatProblemRow(pRes.rows[0]);
       assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
-      await tx.query(`DELETE FROM problem_updates WHERE problem_id = $1`, [problemId]).catch(() => undefined);
-      const softNtfRes = await tx.query<{ id: string }>(
-        `UPDATE notifications
-         SET deleted_at = COALESCE(deleted_at, NOW()),
-             deleted_by_id = $3,
-             updated_at = NOW()
-         WHERE entity_type = $1 AND entity_id = $2 AND deleted_at IS NULL
-         RETURNING id`,
-        ['Problem', problemId, session.user.id]
-      ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+      await runTxOptional(
+        tx,
+        'del_problem_updates',
+        () => tx.query(`DELETE FROM problem_updates WHERE problem_id = $1`, [problemId]),
+        undefined
+      );
+      const softNtfRes = await runTxOptional(
+        tx,
+        'soft_del_problem_notifs',
+        () =>
+          tx.query<{ id: string }>(
+            `UPDATE notifications
+             SET deleted_at = COALESCE(deleted_at, NOW()),
+                 deleted_by_id = $3,
+                 updated_at = NOW()
+             WHERE entity_type = $1 AND entity_id = $2 AND deleted_at IS NULL
+             RETURNING id`,
+            ['Problem', problemId, session.user.id]
+          ),
+        { rows: [] as Array<{ id: string }>, rowCount: 0 }
+      );
       const softNtfIds = (softNtfRes?.rows || []).map((r) => str(r?.id)).filter(Boolean);
       if (softNtfIds.length > 0) {
         await recordSyncTombstone(tx, 'notification', softNtfIds, { entityType: 'Problem', entityId: problemId });
       }
       await tx.query(`DELETE FROM problems WHERE id = $1`, [problemId]);
-      await tx.query(`DELETE FROM issues WHERE id = $1`, [problemId]).catch(() => undefined);
+      await runTxOptional(
+        tx,
+        'del_issues_row',
+        () => tx.query(`DELETE FROM issues WHERE id = $1`, [problemId]),
+        undefined
+      );
 
       let hasOpen = false;
       const nowIso = new Date().toISOString();
@@ -4070,18 +4140,20 @@ export async function getActivityLogs(executor: DbExecutor, session: AuthSession
 }
 
 export async function markNotificationRead(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  const userId = str(session.user.id);
+  const userRole = str(session.user.role);
   if (payload.markAll) {
     await executor.query(
-      `UPDATE notifications SET is_read = TRUE
-       WHERE (recipient_employee_id = $1 OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $2 OR recipient_role = 'all')))
+      `UPDATE notifications SET is_read = TRUE, updated_at = NOW()
+       WHERE (BTRIM(COALESCE(recipient_employee_id, '')) = $1 OR (BTRIM(COALESCE(recipient_employee_id, '')) = '' AND (BTRIM(COALESCE(recipient_role, '')) = $2 OR BTRIM(COALESCE(recipient_role, '')) = 'all')))
          AND deleted_at IS NULL
          AND is_read = FALSE`,
-      [session.user.id, session.user.role]
+      [userId, userRole]
     );
   } else if (payload.notificationId) {
     await executor.query(
-      `UPDATE notifications SET is_read = TRUE WHERE id = $1 AND (recipient_employee_id = $2 OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $3 OR recipient_role = 'all'))) AND deleted_at IS NULL`,
-      [str(payload.notificationId), session.user.id, session.user.role]
+      `UPDATE notifications SET is_read = TRUE, updated_at = NOW() WHERE id = $1 AND (BTRIM(COALESCE(recipient_employee_id, '')) = $2 OR (BTRIM(COALESCE(recipient_employee_id, '')) = '' AND (BTRIM(COALESCE(recipient_role, '')) = $3 OR BTRIM(COALESCE(recipient_role, '')) = 'all'))) AND deleted_at IS NULL`,
+      [str(payload.notificationId), userId, userRole]
     );
   }
   return { updated: true };
@@ -4100,6 +4172,7 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
       const dismissedSharedIds: string[] = [];
       const userId = str(session.user.id);
       const userRole = str(session.user.role);
+      const delNowIso = new Date().toISOString();
 
       if (deleteAll) {
         const personalRes = await tx.query<{ id: string }>(
@@ -4107,7 +4180,7 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
            SET deleted_at = NOW(),
                deleted_by_id = $1,
                updated_at = NOW()
-           WHERE recipient_employee_id = $1
+           WHERE BTRIM(COALESCE(recipient_employee_id, '')) = $1
              AND deleted_at IS NULL
            RETURNING id`,
           [userId]
@@ -4116,23 +4189,29 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
           if (r?.id) personalDeletedIds.push(str(r.id));
         }
 
-        const sharedRes = await tx.query<{ id: string }>(
-          `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
-           SELECT n.id, $1, NOW()
-           FROM notifications n
-           WHERE COALESCE(n.recipient_employee_id, '') = ''
-             AND (n.recipient_role = $2 OR n.recipient_role = 'all')
-             AND n.deleted_at IS NULL
-             AND NOT EXISTS (
-               SELECT 1 FROM notification_dismissals nd
-               WHERE nd.notification_id = n.id
-                 AND nd.employee_id = $1
-                 AND nd.deleted_at IS NOT NULL
-             )
-           ON CONFLICT (notification_id, employee_id) DO UPDATE SET deleted_at = NOW()
-           RETURNING notification_id AS id`,
-          [userId, userRole]
-        ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+        const sharedRes = await runTxOptional(
+          tx,
+          'notif_dismiss_all',
+          () =>
+            tx.query<{ id: string }>(
+              `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
+               SELECT n.id, $1, NOW()
+               FROM notifications n
+               WHERE BTRIM(COALESCE(n.recipient_employee_id, '')) = ''
+                 AND (BTRIM(COALESCE(n.recipient_role, '')) = $2 OR BTRIM(COALESCE(n.recipient_role, '')) = 'all')
+                 AND n.deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM notification_dismissals nd
+                   WHERE nd.notification_id = n.id
+                     AND BTRIM(COALESCE(nd.employee_id, '')) = $1
+                     AND nd.deleted_at IS NOT NULL
+                 )
+               ON CONFLICT (notification_id, employee_id) DO UPDATE SET deleted_at = NOW()
+               RETURNING notification_id AS id`,
+              [userId, userRole]
+            ),
+          { rows: [] as Array<{ id: string }>, rowCount: 0 }
+        );
         for (const r of sharedRes?.rows || []) {
           if (r?.id) dismissedSharedIds.push(str(r.id));
         }
@@ -4143,7 +4222,7 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
                deleted_by_id = $2,
                updated_at = NOW()
            WHERE id = $1
-             AND recipient_employee_id = $2
+             AND BTRIM(COALESCE(recipient_employee_id, '')) = $2
              AND deleted_at IS NULL
            RETURNING id`,
           [notifId, userId]
@@ -4152,24 +4231,30 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
           if (r?.id) personalDeletedIds.push(str(r.id));
         }
 
-        const sharedRes = await tx.query<{ id: string }>(
-          `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
-           SELECT n.id, $2, NOW()
-           FROM notifications n
-           WHERE n.id = $1
-             AND COALESCE(n.recipient_employee_id, '') = ''
-             AND (n.recipient_role = $3 OR n.recipient_role = 'all')
-             AND n.deleted_at IS NULL
-             AND NOT EXISTS (
-               SELECT 1 FROM notification_dismissals nd
-               WHERE nd.notification_id = n.id
-                 AND nd.employee_id = $2
-                 AND nd.deleted_at IS NOT NULL
-             )
-           ON CONFLICT (notification_id, employee_id) DO UPDATE SET deleted_at = NOW()
-           RETURNING notification_id AS id`,
-          [notifId, userId, userRole]
-        ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+        const sharedRes = await runTxOptional(
+          tx,
+          'notif_dismiss_one',
+          () =>
+            tx.query<{ id: string }>(
+              `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
+               SELECT n.id, $2, NOW()
+               FROM notifications n
+               WHERE n.id = $1
+                 AND BTRIM(COALESCE(n.recipient_employee_id, '')) = ''
+                 AND (BTRIM(COALESCE(n.recipient_role, '')) = $3 OR BTRIM(COALESCE(n.recipient_role, '')) = 'all')
+                 AND n.deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM notification_dismissals nd
+                   WHERE nd.notification_id = n.id
+                     AND BTRIM(COALESCE(nd.employee_id, '')) = $2
+                     AND nd.deleted_at IS NOT NULL
+                 )
+               ON CONFLICT (notification_id, employee_id) DO UPDATE SET deleted_at = NOW()
+               RETURNING notification_id AS id`,
+              [notifId, userId, userRole]
+            ),
+          { rows: [] as Array<{ id: string }>, rowCount: 0 }
+        );
         for (const r of sharedRes?.rows || []) {
           if (r?.id) dismissedSharedIds.push(str(r.id));
         }
@@ -4187,15 +4272,23 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
           employeeId: userId
         });
       }
-      if (personalDeletedIds.length > 0 || (deleteAll && deletedIds.length > 0)) {
-        await enqueueSheetsMirror(tx, 'Notification', deleteAll ? `ALL:${userId}` : notifId, 'deleteNotification', {
-          id: deleteAll ? '' : notifId,
-          deletedIds: personalDeletedIds,
-          deleteAll,
-          recipientEmployeeId: userId,
-          deletedById: userId,
-          deletedAt: new Date().toISOString()
-        });
+      if (deletedIds.length > 0 || deleteAll) {
+        await runTxOptional(
+          tx,
+          'notif_sheets_mirror',
+          () =>
+            enqueueSheetsMirror(tx, 'Notification', deleteAll ? `ALL:${userId}` : notifId, 'deleteNotification', {
+              id: deleteAll ? '' : notifId,
+              deletedIds: personalDeletedIds,
+              dismissedSharedIds,
+              deleteAll,
+              recipientEmployeeId: userId,
+              userRole,
+              deletedById: userId,
+              deletedAt: delNowIso
+            }),
+          undefined
+        );
       }
 
       const fresh = await fetchNotificationsForSession(tx, session);
@@ -4203,7 +4296,8 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
         deleted: true,
         deletedCount: deletedIds.length,
         deletedIds,
-        deletedAllBefore: deleteAll ? new Date().toISOString() : '',
+        deletedAllBefore: deleteAll ? delNowIso : '',
+        deletedAllNotificationsBefore: deleteAll ? delNowIso : '',
         items: fresh.items,
         unreadCount: fresh.unreadCount
       };
@@ -5464,47 +5558,49 @@ export async function saveDelegation(executor: DbExecutor, session: AuthSession,
     throw new Error('VALIDATION_ERROR: يجب أن يكون موعد انتهاء التفويض بعد موعد البداية.');
   }
 
-  const out = await executor.withTransaction(async (tx) => {
-    const empRes = await tx.query(`SELECT id, name, role, status FROM employees WHERE id = $1 LIMIT 1`, [empId]);
-    const targetEmp = empRes.rows[0];
-    if (!targetEmp) throw new Error('NOT_FOUND: الموظف المحدد غير موجود.');
-    if (str(targetEmp.status || 'active') !== 'active') {
-      throw new Error('VALIDATION_ERROR: لا يمكن تفويض حساب موقوف.');
-    }
+  return runWithIdempotency(executor, session.user.id, 'saveDelegation', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const empRes = await tx.query(`SELECT id, name, role, status FROM employees WHERE id = $1 LIMIT 1`, [empId]);
+      const targetEmp = empRes.rows[0];
+      if (!targetEmp) throw new Error('NOT_FOUND: الموظف المحدد غير موجود.');
+      if (str(targetEmp.status || 'active') !== 'active') {
+        throw new Error('VALIDATION_ERROR: لا يمكن تفويض حساب موقوف.');
+      }
 
-    const delId = generateId('DEL');
-    await tx.query(
-      `INSERT INTO employee_delegations (id, delegate_employee_id, delegate_employee_name, delegated_role, granted_by_id, granted_by_name, reason, starts_at, expires_at, status, revoked_at, created_at, updated_at)
-       VALUES ($1,$2,$3,'supervisor',$4,$5,$6,$7,$8,'active','',NOW(),NOW())`,
-      [delId, targetEmp.id, targetEmp.name, session.user.id, session.user.name, reason, startsAt, expiresAt]
-    );
+      const delId = generateId('DEL');
+      await tx.query(
+        `INSERT INTO employee_delegations (id, delegate_employee_id, delegate_employee_name, delegated_role, granted_by_id, granted_by_name, reason, starts_at, expires_at, status, revoked_at, created_at, updated_at)
+         VALUES ($1,$2,$3,'supervisor',$4,$5,$6,$7,$8,'active','',NOW(),NOW())`,
+        [delId, targetEmp.id, targetEmp.name, session.user.id, session.user.name, reason, startsAt, expiresAt]
+      );
 
-    await createNotification(tx, {
-      recipientEmployeeId: targetEmp.id,
-      type: 'delegation',
-      title: 'تم منحك صلاحية مشرف مؤقتة',
-      message: `منحك ${session.user.name} صلاحية المشرف مؤقتًا حتى ${crmCore.formatDisplayDateTime(expiresAt)} (${reason}).`,
-      entityType: 'Employee',
-      entityId: targetEmp.id,
-      eventKey: buildNotificationEventKey(['delegation', str(payload.clientRequestId) || delId, targetEmp.id])
+      await createNotification(tx, {
+        recipientEmployeeId: targetEmp.id,
+        type: 'delegation',
+        title: 'تم منحك صلاحية مشرف مؤقتة',
+        message: `منحك ${session.user.name} صلاحية المشرف مؤقتًا حتى ${crmCore.formatDisplayDateTime(expiresAt)} (${reason}).`,
+        entityType: 'Employee',
+        entityId: targetEmp.id,
+        eventKey: buildNotificationEventKey(['delegation', str(payload.clientRequestId) || delId, targetEmp.id])
+      });
+
+      await logActivity(
+        tx,
+        session.user,
+        'تفويض صلاحيات مؤقت',
+        'Employee',
+        targetEmp.name,
+        `تفويض ${targetEmp.name} بصلاحية مشرف مؤقت حتى ${crmCore.formatDisplayDateTime(expiresAt)}`,
+        [{ field: 'delegation', label: 'الصلاحية', before: str(targetEmp.role || 'agent'), after: `supervisor (حتى ${crmCore.formatDisplayDateTime(expiresAt)})` }]
+      );
+
+      const rowRes = await tx.query(`SELECT * FROM employee_delegations WHERE id = $1 LIMIT 1`, [delId]);
+      return formatDelegationRow(rowRes.rows[0]);
     });
 
-    await logActivity(
-      tx,
-      session.user,
-      'تفويض صلاحيات مؤقت',
-      'Employee',
-      targetEmp.name,
-      `تفويض ${targetEmp.name} بصلاحية مشرف مؤقت حتى ${crmCore.formatDisplayDateTime(expiresAt)}`,
-      [{ field: 'delegation', label: 'الصلاحية', before: str(targetEmp.role || 'agent'), after: `supervisor (حتى ${crmCore.formatDisplayDateTime(expiresAt)})` }]
-    );
-
-    const rowRes = await tx.query(`SELECT * FROM employee_delegations WHERE id = $1 LIMIT 1`, [delId]);
-    return formatDelegationRow(rowRes.rows[0]);
+    invalidateAuthSessionCache(executor, { employeeId: empId });
+    return { delegation: out };
   });
-
-  invalidateAuthSessionCache(executor, { employeeId: empId });
-  return { delegation: out };
 }
 
 export async function revokeDelegation(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -5659,10 +5755,10 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       `SELECT id FROM notifications
        WHERE deleted_at IS NOT NULL
          AND deleted_at > $1::timestamptz
-         AND (recipient_employee_id = $2 OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $3 OR recipient_role = 'all')))
+         AND (BTRIM(COALESCE(recipient_employee_id, '')) = $2 OR (BTRIM(COALESCE(recipient_employee_id, '')) = '' AND (BTRIM(COALESCE(recipient_role, '')) = $3 OR BTRIM(COALESCE(recipient_role, '')) = 'all')))
        ORDER BY deleted_at DESC
        LIMIT 300`,
-      [sinceDate, session.user.id, session.user.role]
+      [sinceDate, str(session.user.id), str(session.user.role)]
     ).catch(() => ({ rows: [] as Array<{ id: string }> })),
     executor.query<{ id: string }>(
       `SELECT notification_id AS id FROM notification_dismissals
@@ -5814,126 +5910,128 @@ export async function bulkReassignEmployeeReservations(
     throw new Error('VALIDATION_ERROR: لا يمكن التحويل إلى نفس الموظف.');
   }
 
-  const out = await executor.withTransaction(async (tx) => {
-    const empRes = await tx.query(
-      `SELECT id, name, status FROM employees WHERE id = ANY($1::text[])`,
-      [[fromEmployeeId, toEmployeeId]]
-    );
-    const eMap = new Map(empRes.rows.map((r) => [str(r.id), r]));
-    const fromEmp = eMap.get(fromEmployeeId);
-    const toEmp = eMap.get(toEmployeeId);
-    if (!fromEmp || !toEmp) {
-      throw new Error('NOT_FOUND: أحد الموظفين المحددين غير موجود.');
-    }
-    if (str(toEmp.status || 'active') !== 'active') {
-      throw new Error('VALIDATION_ERROR: الموظف المستلم للوردية غير نشط.');
-    }
-
-    const resRows = await tx.query(
-      `SELECT * FROM reservations WHERE assigned_employee_ids @> $1::jsonb FOR UPDATE`,
-      [JSON.stringify([fromEmployeeId])]
-    );
-
-    const nowIso = new Date().toISOString();
-    let transferredCount = 0;
-    const transferredNumbers: string[] = [];
-
-    for (const rawRow of resRows.rows) {
-      const mapped = mapReservationRowToClient(rawRow, false);
-      if (onlyActive && crmCore.isReservationClosedStatus(mapped)) {
-        continue;
+  return runWithIdempotency(executor, session.user.id, 'bulkReassignEmployeeReservations', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const empRes = await tx.query(
+        `SELECT id, name, status FROM employees WHERE id = ANY($1::text[])`,
+        [[fromEmployeeId, toEmployeeId]]
+      );
+      const eMap = new Map(empRes.rows.map((r) => [str(r.id), r]));
+      const fromEmp = eMap.get(fromEmployeeId);
+      const toEmp = eMap.get(toEmployeeId);
+      if (!fromEmp || !toEmp) {
+        throw new Error('NOT_FOUND: أحد الموظفين المحددين غير موجود.');
+      }
+      if (str(toEmp.status || 'active') !== 'active') {
+        throw new Error('VALIDATION_ERROR: الموظف المستلم للوردية غير نشط.');
       }
 
-      const curIds: string[] = Array.isArray(mapped.assignedEmployeeIds) ? [...mapped.assignedEmployeeIds] : [];
-      const curNames: string[] = Array.isArray(mapped.assignedEmployeeNames) ? [...mapped.assignedEmployeeNames] : [];
+      const resRows = await tx.query(
+        `SELECT * FROM reservations WHERE assigned_employee_ids @> $1::jsonb FOR UPDATE`,
+        [JSON.stringify([fromEmployeeId])]
+      );
 
-      const nextIds: string[] = [];
-      const nextNames: string[] = [];
-      const seen = new Set<string>();
+      const nowIso = new Date().toISOString();
+      let transferredCount = 0;
+      const transferredNumbers: string[] = [];
 
-      for (let i = 0; i < curIds.length; i++) {
-        const eid = str(curIds[i]);
-        if (!eid || eid === fromEmployeeId || seen.has(eid)) continue;
-        seen.add(eid);
-        nextIds.push(eid);
-        nextNames.push(str(curNames[i]) || eid);
+      for (const rawRow of resRows.rows) {
+        const mapped = mapReservationRowToClient(rawRow, false);
+        if (onlyActive && crmCore.isReservationClosedStatus(mapped)) {
+          continue;
+        }
+
+        const curIds: string[] = Array.isArray(mapped.assignedEmployeeIds) ? [...mapped.assignedEmployeeIds] : [];
+        const curNames: string[] = Array.isArray(mapped.assignedEmployeeNames) ? [...mapped.assignedEmployeeNames] : [];
+
+        const nextIds: string[] = [];
+        const nextNames: string[] = [];
+        const seen = new Set<string>();
+
+        for (let i = 0; i < curIds.length; i++) {
+          const eid = str(curIds[i]);
+          if (!eid || eid === fromEmployeeId || seen.has(eid)) continue;
+          seen.add(eid);
+          nextIds.push(eid);
+          nextNames.push(str(curNames[i]) || eid);
+        }
+        if (!seen.has(toEmployeeId)) {
+          seen.add(toEmployeeId);
+          nextIds.push(toEmployeeId);
+          nextNames.push(str(toEmp.name));
+        }
+
+        await tx.query(
+          `UPDATE reservations
+           SET assigned_employee_ids = $2::jsonb,
+               assigned_employee_names = $3::jsonb,
+               last_update_text = $4,
+               last_updated_by_id = $5,
+               last_updated_by_name = $6,
+               last_updated_at = $7,
+               updated_at = $8::timestamptz
+           WHERE id = $1`,
+          [
+            mapped.id,
+            JSON.stringify(nextIds),
+            JSON.stringify(nextNames),
+            `تحويل وردية جماعي: من ${fromEmp.name} إلى ${toEmp.name}`,
+            session.user.id,
+            session.user.name,
+            nowIso,
+            nowIso
+          ]
+        );
+
+        await tx.query(
+          `UPDATE assignments SET status = 'transferred', updated_at = $3::timestamptz
+           WHERE reservation_id = $1 AND employee_id = $2 AND status = 'active'`,
+          [mapped.id, fromEmployeeId, nowIso]
+        );
+        await tx.query(
+          `INSERT INTO assignments (id, reservation_id, reservation_number, employee_id, employee_name, assigned_by_id, assigned_by_name, role_type, status, assigned_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'shift_handover','active',$8::timestamptz,$8::timestamptz)`,
+          [generateId('ASN'), mapped.id, mapped.reservationNumber, toEmp.id, toEmp.name, session.user.id, session.user.name, nowIso]
+        );
+
+        transferredCount += 1;
+        transferredNumbers.push(mapped.reservationNumber);
       }
-      if (!seen.has(toEmployeeId)) {
-        seen.add(toEmployeeId);
-        nextIds.push(toEmployeeId);
-        nextNames.push(str(toEmp.name));
+
+      if (transferredCount > 0) {
+        await createNotification(tx, {
+          recipientEmployeeId: toEmp.id,
+          type: 'assignment',
+          title: `استلام وردية: ${transferredCount} حجز نشط`,
+          message: `تم تحويل ${transferredCount} حجزًا نشطًا من ${fromEmp.name} إليك بواسطة ${session.user.name}.`,
+          entityType: 'Reservation',
+          entityId: transferredNumbers[0] || '',
+          eventKey: buildNotificationEventKey(['bulk_shift', str(payload.clientRequestId) || `${fromEmployeeId}->${toEmp.id}:${transferredNumbers.slice(0, 5).join(',')}`])
+        });
       }
 
-      await tx.query(
-        `UPDATE reservations
-         SET assigned_employee_ids = $2::jsonb,
-             assigned_employee_names = $3::jsonb,
-             last_update_text = $4,
-             last_updated_by_id = $5,
-             last_updated_by_name = $6,
-             last_updated_at = $7,
-             updated_at = $8::timestamptz
-         WHERE id = $1`,
-        [
-          mapped.id,
-          JSON.stringify(nextIds),
-          JSON.stringify(nextNames),
-          `تحويل وردية جماعي: من ${fromEmp.name} إلى ${toEmp.name}`,
-          session.user.id,
-          session.user.name,
-          nowIso,
-          nowIso
-        ]
+      await logActivity(
+        tx,
+        session.user,
+        'تحويل جماعي للوردية',
+        'Reservation',
+        `${fromEmp.name} -> ${toEmp.name}`,
+        `تحويل ${transferredCount} حجز نشط من ${fromEmp.name} إلى ${toEmp.name}`,
+        [{ field: 'shiftTransfer', label: 'نقل الحجوزات النشطة', before: str(fromEmp.name), after: `${str(toEmp.name)} (${transferredCount} حجز)` }]
       );
 
-      await tx.query(
-        `UPDATE assignments SET status = 'transferred', updated_at = $3::timestamptz
-         WHERE reservation_id = $1 AND employee_id = $2 AND status = 'active'`,
-        [mapped.id, fromEmployeeId, nowIso]
-      );
-      await tx.query(
-        `INSERT INTO assignments (id, reservation_id, reservation_number, employee_id, employee_name, assigned_by_id, assigned_by_name, role_type, status, assigned_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'shift_handover','active',$8::timestamptz,$8::timestamptz)`,
-        [generateId('ASN'), mapped.id, mapped.reservationNumber, toEmp.id, toEmp.name, session.user.id, session.user.name, nowIso]
-      );
+      return {
+        fromEmployeeId,
+        fromEmployeeName: str(fromEmp.name),
+        toEmployeeId,
+        toEmployeeName: str(toEmp.name),
+        transferredCount,
+        reservationNumbers: transferredNumbers
+      };
+    });
 
-      transferredCount += 1;
-      transferredNumbers.push(mapped.reservationNumber);
-    }
-
-    if (transferredCount > 0) {
-      await createNotification(tx, {
-        recipientEmployeeId: toEmp.id,
-        type: 'assignment',
-        title: `استلام وردية: ${transferredCount} حجز نشط`,
-        message: `تم تحويل ${transferredCount} حجزًا نشطًا من ${fromEmp.name} إليك بواسطة ${session.user.name}.`,
-        entityType: 'Reservation',
-        entityId: transferredNumbers[0] || '',
-        eventKey: buildNotificationEventKey(['bulk_shift', str(payload.clientRequestId) || `${fromEmployeeId}->${toEmp.id}:${transferredNumbers.slice(0, 5).join(',')}`])
-      });
-    }
-
-    await logActivity(
-      tx,
-      session.user,
-      'تحويل جماعي للوردية',
-      'Reservation',
-      `${fromEmp.name} -> ${toEmp.name}`,
-      `تحويل ${transferredCount} حجز نشط من ${fromEmp.name} إلى ${toEmp.name}`,
-      [{ field: 'shiftTransfer', label: 'نقل الحجوزات النشطة', before: str(fromEmp.name), after: `${str(toEmp.name)} (${transferredCount} حجز)` }]
-    );
-
-    return {
-      fromEmployeeId,
-      fromEmployeeName: str(fromEmp.name),
-      toEmployeeId,
-      toEmployeeName: str(toEmp.name),
-      transferredCount,
-      reservationNumbers: transferredNumbers
-    };
+    return out;
   });
-
-  return out;
 }
 
 export async function bulkReassignSelectedReservations(
