@@ -2985,7 +2985,6 @@
             '<div class="auth-form-container">' +
               '<header class="auth-panel-topbar">' +
                 '<div class="auth-panel-brand">' +
-                  '<div class="auth-panel-logo-wrap"><img src="' + assetUrl('assets/images/logo.png') + '" alt="RENTAL GATE" class="auth-panel-logo"></div>' +
                   '<div class="auth-panel-brand-copy">' +
                     '<span class="auth-panel-brand-name" dir="ltr">RENTAL GATE</span>' +
                     '<span class="auth-panel-brand-sub" dir="ltr">Rental Gate CRM</span>' +
