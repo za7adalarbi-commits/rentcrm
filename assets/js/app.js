@@ -3037,7 +3037,7 @@
               '<div class="auth-visual-wordmark">' +
                 '<div class="auth-visual-brand-title" dir="ltr">RENTAL GATE</div>' +
                 '<div class="auth-visual-brand-rule" aria-hidden="true"></div>' +
-                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'نظام إدارة الحجوزات وخدمة العملاء') + '</p>' +
+                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'من أول حجز لآخر مشوار.. بوابة التأجير معك في كل دار.') + '</p>' +
               '</div>' +
             '</div>' +
             '<div class="auth-visual-pillars" aria-label="System Capabilities">' +
