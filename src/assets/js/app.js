@@ -2335,12 +2335,39 @@
     }, 2600);
   }
 
+  var notifUiEpoch = 0;
+
+  function getCombinedNotifEpoch() {
+    var apiEp = (root.RGApi && typeof root.RGApi.getNotificationMutationEpoch === 'function')
+      ? Number(root.RGApi.getNotificationMutationEpoch() || 0)
+      : 0;
+    return notifUiEpoch + apiEp;
+  }
+
+  function sanitizeClientNotifs(data) {
+    if (!data || typeof data !== 'object') return data;
+    if (root.RGApi && typeof root.RGApi.filterActiveNotifications === 'function') {
+      return root.RGApi.filterActiveNotifications(data);
+    }
+    return data;
+  }
+
   async function refreshNotifications(opts) {
     if (!root.RGAuth.getUser()) return;
-    var payload = (opts && opts.silent) ? { silentRefresh: true } : {};
+    var startEpoch = getCombinedNotifEpoch();
+    var payload = {};
+    if (opts && opts.silent) payload.silentRefresh = true;
+    if (opts && opts.forceRefresh) payload.forceRefresh = true;
     var res = await root.RGApi.callApi('getNotifications', payload);
+    if (!root.RGAuth || !root.RGAuth.getUser()) return;
+    if (getCombinedNotifEpoch() !== startEpoch) return;
+    if (root.RGApi && typeof root.RGApi.isNotificationMutationInFlight === 'function' && root.RGApi.isNotificationMutationInFlight()) return;
     if (res && res.success && res.data) {
       applyNotificationsState(res.data);
+      var openPop = document.getElementById('notif-popover');
+      if (openPop && typeof openPop._rgRerender === 'function') {
+        openPop._rgRerender();
+      }
     }
   }
 
@@ -2693,7 +2720,6 @@
     pop.className = 'notif-popover';
     pop.setAttribute('role', 'dialog');
     pop.setAttribute('aria-label', state.prefs.lang === 'en' ? 'Notifications' : 'الإشعارات');
-    var items = state.notifications.items || [];
     var escNotif = function (val) {
       return String(val === null || val === undefined ? '' : val)
         .replace(/&/g, '&amp;')
@@ -2701,95 +2727,197 @@
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
     };
-    pop.innerHTML =
-      '<div class="notif-popover-head">' +
-        '<div style="display:flex;align-items:center;gap:8px;">' +
-          '<strong>' + (state.prefs.lang === 'en' ? 'Notifications' : 'الإشعارات') + '</strong>' +
-          '<span class="status-tag status-danger tabular-nums">' + (state.notifications.unreadCount || 0) + '</span>' +
+
+    function renderNotifPopoverHtml() {
+      var isEnNotif = state.prefs.lang === 'en';
+      var curItems = (state.notifications && state.notifications.items) || [];
+      return (
+        '<div class="notif-popover-head">' +
+          '<div style="display:flex;align-items:center;gap:8px;">' +
+            '<strong>' + (isEnNotif ? 'Notifications' : 'الإشعارات') + '</strong>' +
+            '<span class="status-tag status-danger tabular-nums" id="notif-popover-unread-tag">' + (state.notifications.unreadCount || 0) + '</span>' +
+          '</div>' +
+          '<div class="notif-head-actions">' +
+            '<button type="button" class="btn btn-sm" id="notif-mark-all">' + (isEnNotif ? 'Mark all read' : 'تحديد الكل كمقروء') + '</button>' +
+            (curItems.length > 0
+              ? '<button type="button" class="btn btn-sm btn-danger" id="notif-delete-all" data-confirm="0">' + (isEnNotif ? 'Delete all' : 'حذف الكل') + '</button>'
+              : '') +
+          '</div>' +
         '</div>' +
-        '<button type="button" class="btn btn-sm" id="notif-mark-all">' + (state.prefs.lang === 'en' ? 'Mark all read' : 'تحديد الكل كمقروء') + '</button>' +
-      '</div>' +
-      (items.length === 0
-        ? '<div class="empty-state" style="padding:20px;">' + (state.prefs.lang === 'en' ? 'No notifications right now.' : 'لا توجد إشعارات حاليًا.') + '</div>'
-        : items.map(function (n) {
-            var target = (root.RGCrmCore && root.RGCrmCore.resolveNotificationTarget)
-              ? root.RGCrmCore.resolveNotificationTarget(n)
-              : { kind: 'none', entityId: '' };
-            var isMention = n.type === 'mention';
-            var actionHint = target.kind === 'problem'
-              ? ('<span style="font-size:11px;color:var(--brand-primary);font-weight:700;">' + (state.prefs.lang === 'en' ? 'View problem →' : 'اضغط لاستعراض المشكلة ←') + '</span>')
-              : (target.kind === 'reservation' ? ('<span style="font-size:11px;color:var(--brand-primary);font-weight:700;">' + (state.prefs.lang === 'en' ? 'Open booking →' : 'اضغط لفتح الحجز ←') + '</span>') : '');
-            return '<button type="button" class="notif-item' + (n.isRead ? '' : ' unread') + (isMention ? ' is-mention' : '') + '" data-nid="' + escNotif(n.id) + '" style="text-align:start;font-family:inherit;">' +
-              '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;">' +
-                '<strong>' + escNotif(n.title) + '</strong>' +
-                (isMention ? '<span class="rg-mention-badge">@</span>' : '') +
-              '</div>' +
-              '<span style="font-size:12.5px;color:var(--text-secondary);">' + escNotif(n.message) + '</span>' +
-              '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;">' +
-                '<span class="mono" style="font-size:11px;color:var(--text-muted);">' + escNotif(formatDateTimePref(n.createdAt)) + '</span>' +
-                actionHint +
-              '</div>' +
-            '</button>';
-          }).join(''));
+        (curItems.length === 0
+          ? '<div class="empty-state" style="padding:20px;">' + (isEnNotif ? 'No notifications right now.' : 'لا توجد إشعارات حاليًا.') + '</div>'
+          : curItems.map(function (n) {
+              var target = (root.RGCrmCore && root.RGCrmCore.resolveNotificationTarget)
+                ? root.RGCrmCore.resolveNotificationTarget(n)
+                : { kind: 'none', entityId: '' };
+              var isMention = n.type === 'mention';
+              var actionHint = target.kind === 'problem'
+                ? ('<span style="font-size:11px;color:var(--brand-primary);font-weight:700;">' + (isEnNotif ? 'View problem →' : 'اضغط لاستعراض المشكلة ←') + '</span>')
+                : (target.kind === 'reservation' ? ('<span style="font-size:11px;color:var(--brand-primary);font-weight:700;">' + (isEnNotif ? 'Open booking →' : 'اضغط لفتح الحجز ←') + '</span>') : '');
+              return '<div class="notif-item-wrap' + (n.isRead ? '' : ' unread') + (isMention ? ' is-mention' : '') + '" data-nid-wrap="' + escNotif(n.id) + '">' +
+                '<button type="button" class="notif-item-main" data-nid="' + escNotif(n.id) + '" style="text-align:start;font-family:inherit;">' +
+                  '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;">' +
+                    '<strong>' + escNotif(n.title) + '</strong>' +
+                    (isMention ? '<span class="rg-mention-badge">@</span>' : '') +
+                  '</div>' +
+                  '<span style="font-size:12.5px;color:var(--text-secondary);">' + escNotif(n.message) + '</span>' +
+                  '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;">' +
+                    '<span class="mono" style="font-size:11px;color:var(--text-muted);">' + escNotif(formatDateTimePref(n.createdAt)) + '</span>' +
+                    actionHint +
+                  '</div>' +
+                '</button>' +
+                '<button type="button" class="btn btn-sm btn-danger notif-delete-btn" data-del-nid="' + escNotif(n.id) + '" title="' + (isEnNotif ? 'Delete notification' : 'حذف الإشعار') + '" aria-label="' + (isEnNotif ? 'Delete notification' : 'حذف الإشعار') + '">✕</button>' +
+              '</div>';
+            }).join(''))
+      );
+    }
 
-    document.body.appendChild(pop);
-
-    document.getElementById('notif-mark-all').addEventListener('click', function () {
-      var markBtn = document.getElementById('notif-mark-all');
-      withActionLock(markBtn, 'markNotificationRead:ALL', function () {
-        var nextItems = (state.notifications.items || []).map(function (n) {
-          return Object.assign({}, n, { isRead: true });
+    function bindNotifPopoverEvents() {
+      var isEnNotif = state.prefs.lang === 'en';
+      var markAllBtn = pop.querySelector('#notif-mark-all');
+      if (markAllBtn) {
+        markAllBtn.addEventListener('click', function () {
+          withActionLock(markAllBtn, 'markNotificationRead:ALL', function () {
+            var nextItems = (state.notifications.items || []).map(function (n) {
+              return Object.assign({}, n, { isRead: true });
+            });
+            applyNotificationsState({ items: nextItems, unreadCount: 0 });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('markNotificationRead', { markAll: true });
+            }
+            closeNotificationsPopover();
+            return root.RGApi.callApi('markNotificationRead', { markAll: true, _keepOptimisticCache: true });
+          });
         });
-        applyNotificationsState({ items: nextItems, unreadCount: 0 });
-        if (root.RGApi.applyOptimisticMutation) {
-          root.RGApi.applyOptimisticMutation('markNotificationRead', { markAll: true });
-        }
-        closeNotificationsPopover();
-        return root.RGApi.callApi('markNotificationRead', { markAll: true, _keepOptimisticCache: true });
-      });
-    });
+      }
 
-    pop.querySelectorAll('[data-nid]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var nid = btn.getAttribute('data-nid');
-        var notif = items.find(function (x) { return x.id === nid; }) || null;
-        closeNotificationsPopover();
-
-        if (notif && !notif.isRead) {
-          var nextItems = (state.notifications.items || []).map(function (n) {
-            return n.id === nid ? Object.assign({}, n, { isRead: true }) : n;
-          });
-          var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
-          applyNotificationsState({ items: nextItems, unreadCount: nextUnread });
-          if (root.RGApi.applyOptimisticMutation) {
-            root.RGApi.applyOptimisticMutation('markNotificationRead', { notificationId: nid });
+      var delAllBtn = pop.querySelector('#notif-delete-all');
+      if (delAllBtn) {
+        delAllBtn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          if (delAllBtn.getAttribute('data-confirm') !== '1') {
+            delAllBtn.setAttribute('data-confirm', '1');
+            delAllBtn.textContent = isEnNotif ? 'Confirm delete all?' : 'تأكيد حذف الكل؟';
+            setTimeout(function () {
+              if (document.body.contains(delAllBtn)) {
+                delAllBtn.setAttribute('data-confirm', '0');
+                delAllBtn.textContent = isEnNotif ? 'Delete all' : 'حذف الكل';
+              }
+            }, 4000);
+            return;
           }
-          root.RGApi.callApi('markNotificationRead', { notificationId: nid, _keepOptimisticCache: true }).catch(function () {});
-        }
-
-        if (!notif) return;
-        var target = (root.RGCrmCore && root.RGCrmCore.resolveNotificationTarget)
-          ? root.RGCrmCore.resolveNotificationTarget(notif)
-          : { kind: 'none', entityId: '' };
-
-        var ctx = buildAppCtx();
-        if (target.kind === 'problem' && root.RGProblems && root.RGProblems.openProblemById) {
-          if (state.route !== 'problems') {
-            state.route = 'problems';
-            renderRoute();
-          }
-          root.RGProblems.openProblemById(target.entityId, ctx, function () {
-            if (state.route === 'problems') renderRoute();
+          withActionLock(delAllBtn, 'deleteNotification:ALL', function () {
+            notifUiEpoch += 1;
+            var opEpoch = notifUiEpoch;
+            applyNotificationsState({ items: [], unreadCount: 0 });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteNotification', { deleteAll: true });
+            }
+            pop._rgRerender();
+            showToast(isEnNotif ? 'All notifications deleted.' : 'تم حذف جميع الإشعارات.');
+            return root.RGApi.callApi('deleteNotification', { deleteAll: true, _keepOptimisticCache: true }).then(function (resp) {
+              if (!resp || !resp.success) {
+                showToast((resp && resp.message) || (isEnNotif ? 'Failed to delete notifications.' : 'تعذر حذف الإشعارات.'), true);
+                notifUiEpoch += 1;
+                refreshNotifications({ forceRefresh: true });
+              } else if (opEpoch === notifUiEpoch && resp.data && Array.isArray(resp.data.items)) {
+                applyNotificationsState({ items: resp.data.items, unreadCount: Number(resp.data.unreadCount || 0) });
+                if (document.body.contains(pop)) pop._rgRerender();
+              }
+            }).catch(function () {
+              showToast(isEnNotif ? 'Network error deleting notifications.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعارات.', true);
+              notifUiEpoch += 1;
+              refreshNotifications({ forceRefresh: true });
+            });
           });
-        } else if (target.kind === 'reservation' && root.RGReservations && root.RGReservations.openReservationDrawer) {
-          var empCached = root.RGApi.getCachedData ? root.RGApi.getCachedData('getEmployees', {}, true) : null;
-          var emps = (empCached && empCached.items) || [];
-          root.RGReservations.openReservationDrawer(target.entityId, ctx, emps, function () {
-            renderRoute();
+        });
+      }
+
+      pop.querySelectorAll('.notif-delete-btn').forEach(function (delBtn) {
+        delBtn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          var delId = delBtn.getAttribute('data-del-nid');
+          if (!delId) return;
+          withActionLock(delBtn, 'deleteNotification:' + delId, function () {
+            notifUiEpoch += 1;
+            var opEpoch = notifUiEpoch;
+            var nextItems = (state.notifications.items || []).filter(function (n) { return n && n.id !== delId; });
+            var nextUnread = nextItems.filter(function (n) { return n && !n.isRead; }).length;
+            applyNotificationsState({ items: nextItems, unreadCount: nextUnread });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteNotification', { notificationId: delId });
+            }
+            pop._rgRerender();
+            showToast(isEnNotif ? 'Notification deleted.' : 'تم حذف الإشعار.');
+            return root.RGApi.callApi('deleteNotification', { notificationId: delId, _keepOptimisticCache: true }).then(function (resp) {
+              if (!resp || !resp.success) {
+                showToast((resp && resp.message) || (isEnNotif ? 'Failed to delete notification.' : 'تعذر حذف الإشعار.'), true);
+                notifUiEpoch += 1;
+                refreshNotifications({ forceRefresh: true });
+              } else if (opEpoch === notifUiEpoch && resp.data && Array.isArray(resp.data.items)) {
+                applyNotificationsState({ items: resp.data.items, unreadCount: Number(resp.data.unreadCount || 0) });
+                if (document.body.contains(pop)) pop._rgRerender();
+              }
+            }).catch(function () {
+              showToast(isEnNotif ? 'Network error deleting notification.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعار.', true);
+              notifUiEpoch += 1;
+              refreshNotifications({ forceRefresh: true });
+            });
           });
-        }
+        });
       });
-    });
+
+      pop.querySelectorAll('[data-nid]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var nid = btn.getAttribute('data-nid');
+          var curItems = (state.notifications && state.notifications.items) || [];
+          var notif = curItems.find(function (x) { return x && x.id === nid; }) || null;
+          closeNotificationsPopover();
+
+          if (notif && !notif.isRead) {
+            var nextItems = (state.notifications.items || []).map(function (n) {
+              return n.id === nid ? Object.assign({}, n, { isRead: true }) : n;
+            });
+            var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
+            applyNotificationsState({ items: nextItems, unreadCount: nextUnread });
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('markNotificationRead', { notificationId: nid });
+            }
+            root.RGApi.callApi('markNotificationRead', { notificationId: nid, _keepOptimisticCache: true }).catch(function () {});
+          }
+
+          if (!notif) return;
+          var target = (root.RGCrmCore && root.RGCrmCore.resolveNotificationTarget)
+            ? root.RGCrmCore.resolveNotificationTarget(notif)
+            : { kind: 'none', entityId: '' };
+
+          var ctx = buildAppCtx();
+          if (target.kind === 'problem' && root.RGProblems && root.RGProblems.openProblemById) {
+            if (state.route !== 'problems') {
+              state.route = 'problems';
+              renderRoute();
+            }
+            root.RGProblems.openProblemById(target.entityId, ctx, function () {
+              if (state.route === 'problems') renderRoute();
+            });
+          } else if (target.kind === 'reservation' && root.RGReservations && root.RGReservations.openReservationDrawer) {
+            var empCached = root.RGApi.getCachedData ? root.RGApi.getCachedData('getEmployees', {}, true) : null;
+            var emps = (empCached && empCached.items) || [];
+            root.RGReservations.openReservationDrawer(target.entityId, ctx, emps, function () {
+              renderRoute();
+            });
+          }
+        });
+      });
+    }
+
+    pop._rgRerender = function () {
+      pop.innerHTML = renderNotifPopoverHtml();
+      bindNotifPopoverEvents();
+    };
+    pop.innerHTML = renderNotifPopoverHtml();
+    document.body.appendChild(pop);
+    bindNotifPopoverEvents();
   }
 
   async function renderActivityLog(container, ctx) {
@@ -2896,7 +3024,6 @@
             '<div class="auth-form-container">' +
               '<header class="auth-panel-topbar">' +
                 '<div class="auth-panel-brand">' +
-                  '<div class="auth-panel-logo-wrap"><img src="' + assetUrl('assets/images/logo.png') + '" alt="RENTAL GATE" class="auth-panel-logo"></div>' +
                   '<div class="auth-panel-brand-copy">' +
                     '<span class="auth-panel-brand-name" dir="ltr">RENTAL GATE</span>' +
                     '<span class="auth-panel-brand-sub" dir="ltr">Rental Gate CRM</span>' +
@@ -2949,7 +3076,7 @@
               '<div class="auth-visual-wordmark">' +
                 '<div class="auth-visual-brand-title" dir="ltr">RENTAL GATE</div>' +
                 '<div class="auth-visual-brand-rule" aria-hidden="true"></div>' +
-                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'نظام إدارة الحجوزات وخدمة العملاء') + '</p>' +
+                '<p class="auth-visual-brand-sub">' + (isEn ? 'Reservations & Customer Operations CRM' : 'من أول حجز لآخر مشوار.. بوابة التأجير معك في كل دار.') + '</p>' +
               '</div>' +
             '</div>' +
             '<div class="auth-visual-pillars" aria-label="System Capabilities">' +
@@ -4654,11 +4781,12 @@
 
   function applyNotificationsState(data) {
     if (!data) return;
-    state.notifications = data;
-    lastFingerprints.notifications = computeFingerprintSafe(data);
+    var cleanData = sanitizeClientNotifs(data);
+    state.notifications = cleanData;
+    lastFingerprints.notifications = computeFingerprintSafe(cleanData);
     var badge = document.getElementById('notif-badge');
     if (badge) {
-      var count = data.unreadCount || 0;
+      var count = cleanData.unreadCount || 0;
       badge.textContent = String(count);
       badge.classList.toggle('hidden', count === 0);
     }
@@ -4691,6 +4819,7 @@
     if (!options.manual && isAutoRefreshInFlight) return;
 
     isAutoRefreshInFlight = true;
+    var startNotifEpoch = getCombinedNotifEpoch();
     try {
       var activeRoute = state.route;
       var req = getRoutePrimaryRequest(activeRoute);
@@ -4705,10 +4834,13 @@
       if (!root.RGAuth || !root.RGAuth.getUser()) return;
       if (!options.manual && !canRunSilentAutoRefreshNow()) return;
 
-      if (notifRes && notifRes.success && notifRes.data) {
-        var nextNotifFp = computeFingerprintSafe(notifRes.data);
+      var canApplyNotif = getCombinedNotifEpoch() === startNotifEpoch &&
+        !(root.RGApi && typeof root.RGApi.isNotificationMutationInFlight === 'function' && root.RGApi.isNotificationMutationInFlight());
+      if (canApplyNotif && notifRes && notifRes.success && notifRes.data) {
+        var cleanNotif = sanitizeClientNotifs(notifRes.data);
+        var nextNotifFp = computeFingerprintSafe(cleanNotif);
         if (nextNotifFp !== lastFingerprints.notifications) {
-          applyNotificationsState(notifRes.data);
+          applyNotificationsState(cleanNotif);
         }
       }
 
@@ -5087,6 +5219,7 @@
     if (isDeltaSyncInFlight) return;
 
     isDeltaSyncInFlight = true;
+    var deltaStartNotifEpoch = getCombinedNotifEpoch();
     try {
       var res = await root.RGApi.callApi('getDeltaSync', {
         updatedAfter: state.lastDeltaSyncAt || '',
@@ -5118,10 +5251,19 @@
         root.RGApi.applyDeltaSyncToCache(d);
       }
 
-      if (d.notifications) {
-        var nextNotifFp = computeFingerprintSafe(d.notifications);
+      var hasNotifTombstones = Boolean((Array.isArray(d.deletedNotificationIds) && d.deletedNotificationIds.length > 0) || d.deletedAllNotificationsBefore);
+      var canApplyDeltaNotif = !d._staleNotificationsSkipped &&
+        !(root.RGApi && typeof root.RGApi.isNotificationMutationInFlight === 'function' && root.RGApi.isNotificationMutationInFlight()) &&
+        (getCombinedNotifEpoch() === deltaStartNotifEpoch || hasNotifTombstones);
+      if (canApplyDeltaNotif && d.notifications) {
+        var cleanDeltaNotifs = sanitizeClientNotifs(d.notifications);
+        var nextNotifFp = computeFingerprintSafe(cleanDeltaNotifs);
         if (nextNotifFp !== lastFingerprints.notifications) {
-          applyNotificationsState(d.notifications);
+          applyNotificationsState(cleanDeltaNotifs);
+          var openPopDelta = document.getElementById('notif-popover');
+          if (openPopDelta && typeof openPopDelta._rgRerender === 'function') {
+            openPopDelta._rgRerender();
+          }
         }
       }
       if (Array.isArray(d.announcements)) {
@@ -5223,6 +5365,7 @@
             (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
             (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
             (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+            (Array.isArray(d.deletedFollowUpIds) && d.deletedFollowUpIds.length > 0) ||
             (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
             (Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0) ||
             hasEmployeeChanges ||

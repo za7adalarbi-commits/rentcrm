@@ -111,8 +111,9 @@ function createDeleteProblemMockExecutor() {
       { id: 'PRBU_2', problem_id: 'PRB_2', note: 'initial 2', created_at: new Date('2026-11-23T09:10:00Z') }
     ] as any[],
     notifications: [
-      { id: 'NTF_1', recipient_employee_id: 'EMP_ADMIN', entity_type: 'Problem', entity_id: 'PRB_1', is_read: false, created_at: new Date() }
+      { id: 'NTF_1', recipient_employee_id: 'EMP_ADMIN', recipient_role: '', entity_type: 'Problem', entity_id: 'PRB_1', is_read: false, event_key: '', deleted_at: null, deleted_by_id: '', created_at: new Date(), updated_at: new Date() }
     ] as any[],
+    notification_dismissals: [] as any[],
     activity_log: [] as any[],
     sync_tombstones: [] as any[],
     sheets_mirror_outbox: [] as any[],
@@ -179,9 +180,19 @@ function createDeleteProblemMockExecutor() {
       state.problem_updates = state.problem_updates.filter((u) => u.problem_id !== params[0]);
       return { rows: [], rowCount: 1 };
     }
-    if (sql.startsWith('DELETE FROM notifications WHERE entity_type = $1 AND entity_id = $2')) {
-      state.notifications = state.notifications.filter((n) => !(n.entity_type === params[0] && n.entity_id === params[1]));
-      return { rows: [], rowCount: 1 };
+    if (sql.startsWith('UPDATE notifications SET deleted_at = COALESCE(deleted_at, NOW())')) {
+      const [entityType, entityId, deletedById] = params;
+      const now = new Date();
+      const updated: Array<{ id: string }> = [];
+      for (const n of state.notifications) {
+        if (n.entity_type === entityType && n.entity_id === entityId && !n.deleted_at) {
+          n.deleted_at = now;
+          n.deleted_by_id = deletedById || '';
+          n.updated_at = now;
+          updated.push({ id: n.id });
+        }
+      }
+      return { rows: updated, rowCount: updated.length };
     }
     if (sql.startsWith('DELETE FROM problems WHERE id = $1')) {
       const before = state.problems.length;
@@ -235,7 +246,23 @@ function createDeleteProblemMockExecutor() {
     if (sql.startsWith('SELECT * FROM follow_ups')) return { rows: [], rowCount: 0 };
     if (sql.startsWith('SELECT * FROM problems WHERE updated_at >')) return { rows: [], rowCount: 0 };
     if (sql.includes('FROM employees WHERE updated_at >')) return { rows: [], rowCount: 0 };
-    if (sql.includes('FROM notifications')) return { rows: state.notifications, rowCount: state.notifications.length };
+    if (sql.startsWith('SELECT id FROM notifications WHERE deleted_at IS NOT NULL')) {
+      const sinceMs = Date.parse(String(params[0] || ''));
+      const empId = params[1];
+      const role = params[2];
+      const rows = state.notifications
+        .filter((n) => n.deleted_at && Date.parse(n.deleted_at.toISOString()) > sinceMs &&
+          (n.recipient_employee_id === empId || (String(n.recipient_employee_id || '') === '' && (n.recipient_role === role || n.recipient_role === 'all'))))
+        .map((n) => ({ id: n.id }));
+      return { rows, rowCount: rows.length };
+    }
+    if (sql.startsWith('SELECT notification_id AS id FROM notification_dismissals')) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql.includes('FROM notifications')) {
+      const rows = state.notifications.filter((n) => !n.deleted_at);
+      return { rows, rowCount: rows.length };
+    }
     if (sql.includes('FROM announcements')) return { rows: [], rowCount: 0 };
     if (sql.includes('FROM reservation_locks')) return { rows: [], rowCount: 0 };
     if (sql.startsWith('SELECT id, updated_at FROM settings')) return { rows: [], rowCount: 0 };
@@ -293,7 +320,8 @@ test('backend deleteProblem enforces permissions, cascades cleanly, updates rese
   assert.equal(state.problems.map((p) => p.id).join(','), 'PRB_2');
   assert.equal(state.issues.map((i) => i.id).join(','), 'PRB_2');
   assert.equal(state.problem_updates.some((u) => u.problem_id === 'PRB_1'), false);
-  assert.equal(state.notifications.some((n) => n.entity_id === 'PRB_1'), false);
+  assert.ok(state.notifications.find((n) => n.entity_id === 'PRB_1')?.deleted_at);
+  assert.ok(state.sync_tombstones.some((t) => t.entity_type === 'notification' && t.entity_id === 'NTF_1'));
   assert.equal(state.reservations[0].has_problem, true);
   assert.equal(state.sheets_mirror_outbox.some((m) => m.action === 'deleteProblem' && m.entity_id === 'PRB_1'), true);
   assert.equal(state.activity_log.some((a) => a.action_type === 'حذف مشكلة' && a.entity_id === 'PRB-1001'), true);
@@ -316,6 +344,7 @@ test('backend deleteProblem enforces permissions, cascades cleanly, updates rese
   });
   assert.equal(delta.success, true);
   assert.deepEqual(delta.data.deletedProblemIds.sort(), ['PRB_1', 'PRB_2']);
+  assert.ok(delta.data.deletedNotificationIds.includes('NTF_1'));
 });
 
 test('frontend sandbox deleteProblem & UI modules render delete buttons next to each problem', async () => {

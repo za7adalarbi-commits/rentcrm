@@ -335,6 +335,14 @@ export async function logActivity(
   }
 }
 
+function buildNotificationEventKey(parts: unknown[]): string {
+  const raw = parts.map((p) => str(p)).join('|').replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  if (raw.length <= 160 && /^[A-Za-z0-9_.:|-]+$/.test(raw)) return raw;
+  const digest = crypto.createHash('sha1').update(raw).digest('hex').slice(0, 20);
+  return `evt_${digest}`;
+}
+
 async function createNotification(
   client: DbClient,
   opts: {
@@ -345,20 +353,26 @@ async function createNotification(
     message: string;
     entityType?: string;
     entityId?: string;
+    eventKey?: string;
   }
 ): Promise<void> {
+  const recEmpId = str(opts.recipientEmployeeId);
+  const recRole = recEmpId ? '' : str(opts.recipientRole);
+  const eventKey = str(opts.eventKey).slice(0, 220);
   await client.query(
-    `INSERT INTO notifications (id, recipient_employee_id, recipient_role, type, title, message, entity_type, entity_id, is_read, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW())`,
+    `INSERT INTO notifications (id, recipient_employee_id, recipient_role, type, title, message, entity_type, entity_id, is_read, created_at, updated_at, event_key)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW(),NOW(),$9)
+     ON CONFLICT (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '' DO NOTHING`,
     [
       generateId('NTF'),
-      str(opts.recipientEmployeeId),
-      str(opts.recipientRole),
+      recEmpId,
+      recRole,
       str(opts.type || 'info'),
       str(opts.title),
       str(opts.message),
       str(opts.entityType),
-      str(opts.entityId)
+      str(opts.entityId),
+      eventKey
     ]
   );
 }
@@ -371,6 +385,7 @@ async function dispatchMentionNotifications(
     entityType: 'Reservation' | 'Problem';
     entityId: string;
     label: string;
+    sourceKey?: string;
   }
 ): Promise<any[]> {
   const combined = (opts.texts || []).map((t) => str(t)).filter(Boolean).join('\n');
@@ -388,10 +403,18 @@ async function dispatchMentionNotifications(
   });
   if (!mentioned.length) return [];
 
-  const snippet = combined.replace(/\s+/g, ' ').trim().slice(0, 120);
+  const normSnippet = combined.replace(/\s+/g, ' ').trim();
+  const snippet = normSnippet.slice(0, 120);
   const titlePrefix = opts.entityType === 'Problem'
     ? `إشارة لك في المشكلة ${opts.label || ''}`.trim()
     : `إشارة لك في الحجز ${opts.label || ''}`.trim();
+  const mentionBaseKey = str(opts.sourceKey) || buildNotificationEventKey([
+    'mention',
+    opts.entityType,
+    opts.entityId,
+    opts.sender?.id || '',
+    normSnippet
+  ]);
   for (const target of mentioned) {
     await createNotification(client, {
       recipientEmployeeId: target.id,
@@ -399,7 +422,8 @@ async function dispatchMentionNotifications(
       title: `${titlePrefix} (@${opts.sender?.name || 'موظف'})`,
       message: `${opts.sender?.name || 'موظف'} أشار إليك: "${snippet}"`,
       entityType: opts.entityType,
-      entityId: opts.entityId
+      entityId: opts.entityId,
+      eventKey: buildNotificationEventKey(['mention', mentionBaseKey, target.id])
     });
   }
   return mentioned;
@@ -1139,10 +1163,20 @@ export async function getDashboard(
   );
 }
 
-export async function getNotifications(executor: DbExecutor, session: AuthSession) {
-  const res = await executor.query(
+async function fetchNotificationsForSession(client: DbClient, session: AuthSession) {
+  const res = await client.query(
     `SELECT * FROM notifications
-     WHERE recipient_employee_id = $1 OR recipient_role = $2 OR recipient_role = 'all'
+     WHERE (
+       recipient_employee_id = $1
+       OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $2 OR recipient_role = 'all'))
+     )
+       AND deleted_at IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM notification_dismissals nd
+         WHERE nd.notification_id = notifications.id
+           AND nd.employee_id = $1
+           AND nd.deleted_at IS NOT NULL
+       )
      ORDER BY created_at DESC
      LIMIT 60`,
     [session.user.id, session.user.role]
@@ -1163,6 +1197,10 @@ export async function getNotifications(executor: DbExecutor, session: AuthSessio
     items,
     unreadCount: items.filter((n) => !n.isRead).length
   };
+}
+
+export async function getNotifications(executor: DbExecutor, session: AuthSession) {
+  return fetchNotificationsForSession(executor, session);
 }
 
 export async function getAppBootstrap(
@@ -2043,7 +2081,10 @@ export async function quickUpdateReservationStatus(
       sender: session.user,
       entityType: 'Reservation',
       entityId: resObj.id,
-      label: resObj.reservationNumber
+      label: resObj.reservationNumber,
+      sourceKey: str(payload.clientRequestId)
+        ? `req:${str(payload.clientRequestId)}`
+        : buildNotificationEventKey(['quick_status', resObj.id, prevStatus, newStatus, note])
     });
 
     const updatedRes: Record<string, any> = {
@@ -2404,7 +2445,8 @@ export async function recordNoAnswerFollowUp(
         sender: session.user,
         entityType: 'Reservation',
         entityId: resObj.id,
-        label: resObj.reservationNumber
+        label: resObj.reservationNumber,
+        sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `fu:${fuObj.id}`
       });
     }
 
@@ -2576,7 +2618,8 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
         sender: session.user,
         entityType: 'Reservation',
         entityId: resObj.id,
-        label: resObj.reservationNumber
+        label: resObj.reservationNumber,
+        sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `fu:${fuObj.id}`
       });
 
       const updatedRes: Record<string, any> = {
@@ -2695,7 +2738,8 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
       sender: session.user,
       entityType: 'Reservation',
       entityId: existing.reservationId,
-      label: existing.reservationNumber
+      label: existing.reservationNumber,
+      sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `fuh:${hist.id}`
     });
     return { followUp: { ...existing, status: newStatus, action: newAction, notes: newNotes, updatedAt: nowIso }, history: hist };
   });
@@ -2833,10 +2877,11 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
 
     for (const eid of validIds) {
       if (!alreadySet.has(eid)) {
+        const asnId = generateId('ASN');
         await tx.query(
           `INSERT INTO assignments (id, reservation_id, reservation_number, employee_id, employee_name, assigned_by_id, assigned_by_name, role_type, status, assigned_at, updated_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9::timestamptz,$9::timestamptz)`,
-          [generateId('ASN'), resId, resObj.reservationNumber, eid, empMap.get(eid)!, session.user.id, session.user.name, roleType, nowIso]
+          [asnId, resId, resObj.reservationNumber, eid, empMap.get(eid)!, session.user.id, session.user.name, roleType, nowIso]
         );
         await createNotification(tx, {
           recipientEmployeeId: eid,
@@ -2844,7 +2889,10 @@ export async function assignEmployees(executor: DbExecutor, session: AuthSession
           title: 'إسناد حجز جديد',
           message: `تم إسناد الحجز رقم ${resObj.reservationNumber} (${resObj.customerName}) إليك.`,
           entityType: 'Reservation',
-          entityId: resObj.id
+          entityId: resObj.id,
+          eventKey: str(payload.clientRequestId)
+            ? buildNotificationEventKey(['asn_req', str(payload.clientRequestId), eid])
+            : buildNotificationEventKey(['asn', asnId, eid])
         });
       }
     }
@@ -3079,7 +3127,8 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
           title: `مشكلة عالية الأولوية (${prb.problemNumber})`,
           message: `${prb.customerName || prb.reservationNumber}: ${prb.description.slice(0, 80)}`,
           entityType: 'Problem',
-          entityId: prb.id
+          entityId: prb.id,
+          eventKey: buildNotificationEventKey(['high_priority_problem', str(payload.clientRequestId) || prb.id])
         });
       }
 
@@ -3088,7 +3137,8 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
         sender: session.user,
         entityType: 'Problem',
         entityId: prb.id,
-        label: prb.problemNumber
+        label: prb.problemNumber,
+        sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `prb:${prb.id}`
       });
 
       await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
@@ -3139,10 +3189,11 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
     await tx.query(updSql.replace('%TABLE%', 'issues'), updParams);
 
     const note = str(payload.note) || (nextStatus === 'مغلقة' ? 'تم إغلاق المشكلة' : `تحديث الحالة إلى ${nextStatus}`);
+    const prbuId = generateId('PRBU');
     await tx.query(
       `INSERT INTO problem_updates (id, problem_id, reservation_number, employee_id, employee_name, previous_status, new_status, previous_priority, new_priority, note, created_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
-      [generateId('PRBU'), problemId, existing.reservationNumber, session.user.id, session.user.name, existing.status, nextStatus, existing.priority, nextPrio, note, nowIso]
+      [prbuId, problemId, existing.reservationNumber, session.user.id, session.user.name, existing.status, nextStatus, existing.priority, nextPrio, note, nowIso]
     );
 
     if (existing.reservationId) {
@@ -3185,7 +3236,10 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
           title: 'تم حل مشكلة على حجز مسند إليك',
           message: `تم تغيير حالة المشكلة ${existing.problemNumber} (الحجز ${existing.reservationNumber || '-'}) إلى "تم الحل" بواسطة ${session.user.name}.`,
           entityType: 'Problem',
-          entityId: problemId
+          entityId: problemId,
+          eventKey: str(payload.clientRequestId)
+            ? buildNotificationEventKey(['problem_resolved_req', str(payload.clientRequestId), problemId, targetEmpId])
+            : buildNotificationEventKey(['problem_resolved', problemId, existing.status, nextStatus, existing.updatedAt, targetEmpId])
         });
       }
     }
@@ -3199,7 +3253,8 @@ export async function updateProblem(executor: DbExecutor, session: AuthSession, 
       sender: session.user,
       entityType: 'Problem',
       entityId: problemId,
-      label: existing.problemNumber
+      label: existing.problemNumber,
+      sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `prbu:${prbuId}`
     });
     const prbDiffs = crmCore.computeAuditFieldDiffs(
       { status: existing.status, priority: existing.priority, description: existing.description, customerName: existing.customerName },
@@ -3248,7 +3303,19 @@ export async function deleteProblem(executor: DbExecutor, session: AuthSession, 
       assertOptimisticLock(existing.updatedAt, payload.expectedUpdatedAt);
 
       await tx.query(`DELETE FROM problem_updates WHERE problem_id = $1`, [problemId]).catch(() => undefined);
-      await tx.query(`DELETE FROM notifications WHERE entity_type = $1 AND entity_id = $2`, ['Problem', problemId]).catch(() => undefined);
+      const softNtfRes = await tx.query<{ id: string }>(
+        `UPDATE notifications
+         SET deleted_at = COALESCE(deleted_at, NOW()),
+             deleted_by_id = $3,
+             updated_at = NOW()
+         WHERE entity_type = $1 AND entity_id = $2 AND deleted_at IS NULL
+         RETURNING id`,
+        ['Problem', problemId, session.user.id]
+      ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+      const softNtfIds = (softNtfRes?.rows || []).map((r) => str(r?.id)).filter(Boolean);
+      if (softNtfIds.length > 0) {
+        await recordSyncTombstone(tx, 'notification', softNtfIds, { entityType: 'Problem', entityId: problemId });
+      }
       await tx.query(`DELETE FROM problems WHERE id = $1`, [problemId]);
       await tx.query(`DELETE FROM issues WHERE id = $1`, [problemId]).catch(() => undefined);
 
@@ -4006,13 +4073,14 @@ export async function markNotificationRead(executor: DbExecutor, session: AuthSe
   if (payload.markAll) {
     await executor.query(
       `UPDATE notifications SET is_read = TRUE
-       WHERE (recipient_employee_id = $1 OR recipient_role = $2 OR recipient_role = 'all') AND is_read = FALSE`,
+       WHERE (recipient_employee_id = $1 OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $2 OR recipient_role = 'all')))
+         AND deleted_at IS NULL
+         AND is_read = FALSE`,
       [session.user.id, session.user.role]
     );
   } else if (payload.notificationId) {
     await executor.query(
-      `UPDATE notifications SET is_read = TRUE
-       WHERE id = $1 AND (recipient_employee_id = $2 OR recipient_role = $3 OR recipient_role = 'all')`,
+      `UPDATE notifications SET is_read = TRUE WHERE id = $1 AND (recipient_employee_id = $2 OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $3 OR recipient_role = 'all'))) AND deleted_at IS NULL`,
       [str(payload.notificationId), session.user.id, session.user.role]
     );
   }
@@ -4026,35 +4094,124 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
     throw new Error('VALIDATION_ERROR: معرف الإشعار مطلوب.');
   }
 
-  let deletedCount = 0;
-  if (deleteAll) {
-    const delRes = await executor.query(
-      `DELETE FROM notifications
-       WHERE recipient_employee_id = $1
-          OR (recipient_employee_id = '' AND (recipient_role = $2 OR recipient_role = 'all'))`,
-      [session.user.id, session.user.role]
-    );
-    deletedCount = Number(delRes.rowCount || 0);
-  } else {
-    const delRes = await executor.query(
-      `DELETE FROM notifications
-       WHERE id = $1
-         AND (
-           recipient_employee_id = $2
-           OR (recipient_employee_id = '' AND (recipient_role = $3 OR recipient_role = 'all'))
-         )`,
-      [notifId, session.user.id, session.user.role]
-    );
-    deletedCount = Number(delRes.rowCount || 0);
-  }
+  return runWithIdempotency(executor, session.user.id, 'deleteNotification', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const personalDeletedIds: string[] = [];
+      const dismissedSharedIds: string[] = [];
+      const userId = str(session.user.id);
+      const userRole = str(session.user.role);
 
-  const fresh = await getNotifications(executor, session);
-  return {
-    deleted: true,
-    deletedCount,
-    items: fresh.items,
-    unreadCount: fresh.unreadCount
-  };
+      if (deleteAll) {
+        const personalRes = await tx.query<{ id: string }>(
+          `UPDATE notifications
+           SET deleted_at = NOW(),
+               deleted_by_id = $1,
+               updated_at = NOW()
+           WHERE recipient_employee_id = $1
+             AND deleted_at IS NULL
+           RETURNING id`,
+          [userId]
+        );
+        for (const r of personalRes?.rows || []) {
+          if (r?.id) personalDeletedIds.push(str(r.id));
+        }
+
+        const sharedRes = await tx.query<{ id: string }>(
+          `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
+           SELECT n.id, $1, NOW()
+           FROM notifications n
+           WHERE COALESCE(n.recipient_employee_id, '') = ''
+             AND (n.recipient_role = $2 OR n.recipient_role = 'all')
+             AND n.deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM notification_dismissals nd
+               WHERE nd.notification_id = n.id
+                 AND nd.employee_id = $1
+                 AND nd.deleted_at IS NOT NULL
+             )
+           ON CONFLICT (notification_id, employee_id) DO UPDATE SET deleted_at = NOW()
+           RETURNING notification_id AS id`,
+          [userId, userRole]
+        ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+        for (const r of sharedRes?.rows || []) {
+          if (r?.id) dismissedSharedIds.push(str(r.id));
+        }
+      } else {
+        const personalRes = await tx.query<{ id: string }>(
+          `UPDATE notifications
+           SET deleted_at = NOW(),
+               deleted_by_id = $2,
+               updated_at = NOW()
+           WHERE id = $1
+             AND recipient_employee_id = $2
+             AND deleted_at IS NULL
+           RETURNING id`,
+          [notifId, userId]
+        );
+        for (const r of personalRes?.rows || []) {
+          if (r?.id) personalDeletedIds.push(str(r.id));
+        }
+
+        const sharedRes = await tx.query<{ id: string }>(
+          `INSERT INTO notification_dismissals (notification_id, employee_id, deleted_at)
+           SELECT n.id, $2, NOW()
+           FROM notifications n
+           WHERE n.id = $1
+             AND COALESCE(n.recipient_employee_id, '') = ''
+             AND (n.recipient_role = $3 OR n.recipient_role = 'all')
+             AND n.deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM notification_dismissals nd
+               WHERE nd.notification_id = n.id
+                 AND nd.employee_id = $2
+                 AND nd.deleted_at IS NOT NULL
+             )
+           ON CONFLICT (notification_id, employee_id) DO UPDATE SET deleted_at = NOW()
+           RETURNING notification_id AS id`,
+          [notifId, userId, userRole]
+        ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+        for (const r of sharedRes?.rows || []) {
+          if (r?.id) dismissedSharedIds.push(str(r.id));
+        }
+      }
+
+      const deletedIds = Array.from(new Set([...personalDeletedIds, ...dismissedSharedIds]));
+      if (deletedIds.length > 0) {
+        await recordSyncTombstone(tx, `notification:${userId}`, deletedIds, {
+          employeeId: userId,
+          deleteAll
+        });
+      }
+      if (deleteAll) {
+        await recordSyncTombstone(tx, 'notification_clear_all', [`ALL:${userId}`], {
+          employeeId: userId
+        });
+      }
+      if (personalDeletedIds.length > 0 || (deleteAll && deletedIds.length > 0)) {
+        await enqueueSheetsMirror(tx, 'Notification', deleteAll ? `ALL:${userId}` : notifId, 'deleteNotification', {
+          id: deleteAll ? '' : notifId,
+          deletedIds: personalDeletedIds,
+          deleteAll,
+          recipientEmployeeId: userId,
+          deletedById: userId,
+          deletedAt: new Date().toISOString()
+        });
+      }
+
+      const fresh = await fetchNotificationsForSession(tx, session);
+      return {
+        deleted: true,
+        deletedCount: deletedIds.length,
+        deletedIds,
+        deletedAllBefore: deleteAll ? new Date().toISOString() : '',
+        items: fresh.items,
+        unreadCount: fresh.unreadCount
+      };
+    });
+
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
+  });
 }
 
 export async function getSettings(executor: DbExecutor, session: AuthSession) {
@@ -5328,7 +5485,8 @@ export async function saveDelegation(executor: DbExecutor, session: AuthSession,
       title: 'تم منحك صلاحية مشرف مؤقتة',
       message: `منحك ${session.user.name} صلاحية المشرف مؤقتًا حتى ${crmCore.formatDisplayDateTime(expiresAt)} (${reason}).`,
       entityType: 'Employee',
-      entityId: targetEmp.id
+      entityId: targetEmp.id,
+      eventKey: buildNotificationEventKey(['delegation', str(payload.clientRequestId) || delId, targetEmp.id])
     });
 
     await logActivity(
@@ -5464,7 +5622,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     ? new Date(Date.parse(rawSince) - 2000).toISOString()
     : new Date(Date.now() - 120000).toISOString();
 
-  const [resRows, fuRows, prbRows, empRows, tombstoneRows, settingsUpdRes, delUpdRes, rolesActRes, freshSyncVer, notifData, annData, locksData, todayRadarSummary] = await Promise.all([
+  const [resRows, fuRows, prbRows, empRows, tombstoneRows, delNtfRows, dismissedNtfRows, settingsUpdRes, delUpdRes, rolesActRes, freshSyncVer, notifData, annData, locksData, todayRadarSummary] = await Promise.all([
     executor.query(
       `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
@@ -5497,6 +5655,22 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
        LIMIT 800`,
       [sinceDate]
     ).catch(() => ({ rows: [] as any[] })),
+    executor.query<{ id: string }>(
+      `SELECT id FROM notifications
+       WHERE deleted_at IS NOT NULL
+         AND deleted_at > $1::timestamptz
+         AND (recipient_employee_id = $2 OR (COALESCE(recipient_employee_id, '') = '' AND (recipient_role = $3 OR recipient_role = 'all')))
+       ORDER BY deleted_at DESC
+       LIMIT 300`,
+      [sinceDate, session.user.id, session.user.role]
+    ).catch(() => ({ rows: [] as Array<{ id: string }> })),
+    executor.query<{ id: string }>(
+      `SELECT notification_id AS id FROM notification_dismissals
+       WHERE employee_id = $1 AND deleted_at > $2::timestamptz
+       ORDER BY deleted_at DESC
+       LIMIT 300`,
+      [session.user.id, sinceDate]
+    ).catch(() => ({ rows: [] as Array<{ id: string }> })),
     executor.query<{ max_upd: any }>(
       `SELECT MAX(updated_at) AS max_upd
        FROM settings
@@ -5527,7 +5701,11 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
   const deletedEmployeeIds: string[] = [];
   const deletedAnnouncementIds: string[] = [];
   const deletedProblemIds: string[] = [];
+  const deletedNotificationIds: string[] = [];
   let deletedAllReservationsBefore = '';
+  let deletedAllNotificationsBefore = '';
+  const userNotifTombstoneType = `notification:${str(session.user.id)}`;
+  const userNotifAllEntityId = `ALL:${str(session.user.id)}`;
 
   for (const row of tombstoneRows.rows || []) {
     const et = str(row?.entity_type);
@@ -5542,12 +5720,25 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       deletedAnnouncementIds.push(eid);
     } else if (et === 'problem' && eid) {
       deletedProblemIds.push(eid);
+    } else if ((et === 'notification' || et === userNotifTombstoneType) && eid) {
+      deletedNotificationIds.push(eid);
+    } else if (et === 'notification_clear_all' && (!eid || eid === userNotifAllEntityId)) {
+      const dIso = row?.deleted_at instanceof Date ? row.deleted_at.toISOString() : str(row?.deleted_at);
+      if (dIso && (!deletedAllNotificationsBefore || dIso > deletedAllNotificationsBefore)) {
+        deletedAllNotificationsBefore = dIso;
+      }
     } else if (et === 'reservation_clear_all') {
       const dIso = row?.deleted_at instanceof Date ? row.deleted_at.toISOString() : str(row?.deleted_at);
       if (dIso && (!deletedAllReservationsBefore || dIso > deletedAllReservationsBefore)) {
         deletedAllReservationsBefore = dIso;
       }
     }
+  }
+  for (const r of delNtfRows?.rows || []) {
+    if (r?.id) deletedNotificationIds.push(str(r.id));
+  }
+  for (const r of dismissedNtfRows?.rows || []) {
+    if (r?.id) deletedNotificationIds.push(str(r.id));
   }
 
   const maxSetUpdRaw = settingsUpdRes.rows?.[0]?.max_upd;
@@ -5584,7 +5775,9 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     deletedEmployeeIds: Array.from(new Set(deletedEmployeeIds)),
     deletedAnnouncementIds: Array.from(new Set(deletedAnnouncementIds)),
     deletedProblemIds: Array.from(new Set(deletedProblemIds)),
+    deletedNotificationIds: Array.from(new Set(deletedNotificationIds)),
     deletedAllReservationsBefore,
+    deletedAllNotificationsBefore,
     changedSettings: Boolean(settingsUpdatedAt),
     settingsUpdatedAt,
     ...(callWrapupShortcuts !== undefined ? { callWrapupShortcuts } : {}),
@@ -5715,7 +5908,8 @@ export async function bulkReassignEmployeeReservations(
         title: `استلام وردية: ${transferredCount} حجز نشط`,
         message: `تم تحويل ${transferredCount} حجزًا نشطًا من ${fromEmp.name} إليك بواسطة ${session.user.name}.`,
         entityType: 'Reservation',
-        entityId: transferredNumbers[0] || ''
+        entityId: transferredNumbers[0] || '',
+        eventKey: buildNotificationEventKey(['bulk_shift', str(payload.clientRequestId) || `${fromEmployeeId}->${toEmp.id}:${transferredNumbers.slice(0, 5).join(',')}`])
       });
     }
 
@@ -5875,7 +6069,8 @@ export async function bulkReassignSelectedReservations(
         title: `إسناد جماعي: ${updatedReservations.length} حجز`,
         message: `تم إسناد ${updatedReservations.length} حجزًا إليك بواسطة ${session.user.name} (${mode === 'add' ? 'إضافة للمشاركين' : 'استبدال الإسناد'}).`,
         entityType: 'Reservation',
-        entityId: updatedNumbers[0] || ''
+        entityId: updatedNumbers[0] || '',
+        eventKey: buildNotificationEventKey(['bulk_select', str(payload.clientRequestId) || `${targetEmployeeId}:${updatedNumbers.slice(0, 5).join(',')}`])
       });
 
       await logActivity(

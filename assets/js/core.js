@@ -10369,6 +10369,35 @@
     return next;
   }
 
+  function filterDeletedNotificationsPayload(payload, deletedIdsMap, deletedAllBeforeMs) {
+    var src = (payload && typeof payload === 'object') ? payload : {};
+    var items = Array.isArray(src.items) ? src.items : [];
+    var delMap = (deletedIdsMap && typeof deletedIdsMap === 'object') ? deletedIdsMap : null;
+    var clearMs = (typeof deletedAllBeforeMs === 'number' && isFinite(deletedAllBeforeMs) && deletedAllBeforeMs > 0)
+      ? deletedAllBeforeMs
+      : 0;
+    var filtered = [];
+    var unread = 0;
+    for (var i = 0; i < items.length; i++) {
+      var n = items[i];
+      if (!n || typeof n !== 'object') continue;
+      if (n.deletedAt) continue;
+      var nid = normalizeStr(n.id);
+      if (!nid) continue;
+      if (delMap && delMap[nid]) continue;
+      if (clearMs > 0 && n.createdAt) {
+        var createdMs = Date.parse(String(n.createdAt));
+        if (!isNaN(createdMs) && createdMs <= clearMs) continue;
+      }
+      filtered.push(n);
+      if (!n.isRead) unread++;
+    }
+    return Object.assign({}, src, {
+      items: filtered,
+      unreadCount: unread
+    });
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -10657,6 +10686,7 @@
     dedupeEmployeesList: dedupeEmployeesList,
     normalizeEmployeePhone: normalizeEmployeePhone,
     normalizeEmployeeEmail: normalizeEmployeeEmail,
-    extractDayAndHourFromDateValue: extractDayAndHourFromDateValue
+    extractDayAndHourFromDateValue: extractDayAndHourFromDateValue,
+    filterDeletedNotificationsPayload: filterDeletedNotificationsPayload
   };
 }));

@@ -2335,12 +2335,39 @@
     }, 2600);
   }
 
+  var notifUiEpoch = 0;
+
+  function getCombinedNotifEpoch() {
+    var apiEp = (root.RGApi && typeof root.RGApi.getNotificationMutationEpoch === 'function')
+      ? Number(root.RGApi.getNotificationMutationEpoch() || 0)
+      : 0;
+    return notifUiEpoch + apiEp;
+  }
+
+  function sanitizeClientNotifs(data) {
+    if (!data || typeof data !== 'object') return data;
+    if (root.RGApi && typeof root.RGApi.filterActiveNotifications === 'function') {
+      return root.RGApi.filterActiveNotifications(data);
+    }
+    return data;
+  }
+
   async function refreshNotifications(opts) {
     if (!root.RGAuth.getUser()) return;
-    var payload = (opts && opts.silent) ? { silentRefresh: true } : {};
+    var startEpoch = getCombinedNotifEpoch();
+    var payload = {};
+    if (opts && opts.silent) payload.silentRefresh = true;
+    if (opts && opts.forceRefresh) payload.forceRefresh = true;
     var res = await root.RGApi.callApi('getNotifications', payload);
+    if (!root.RGAuth || !root.RGAuth.getUser()) return;
+    if (getCombinedNotifEpoch() !== startEpoch) return;
+    if (root.RGApi && typeof root.RGApi.isNotificationMutationInFlight === 'function' && root.RGApi.isNotificationMutationInFlight()) return;
     if (res && res.success && res.data) {
       applyNotificationsState(res.data);
+      var openPop = document.getElementById('notif-popover');
+      if (openPop && typeof openPop._rgRerender === 'function') {
+        openPop._rgRerender();
+      }
     }
   }
 
@@ -2780,23 +2807,27 @@
             return;
           }
           withActionLock(delAllBtn, 'deleteNotification:ALL', function () {
+            notifUiEpoch += 1;
+            var opEpoch = notifUiEpoch;
             applyNotificationsState({ items: [], unreadCount: 0 });
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('deleteNotification', { deleteAll: true });
             }
-            pop.innerHTML = renderNotifPopoverHtml();
-            bindNotifPopoverEvents();
+            pop._rgRerender();
             showToast(isEnNotif ? 'All notifications deleted.' : 'تم حذف جميع الإشعارات.');
             return root.RGApi.callApi('deleteNotification', { deleteAll: true, _keepOptimisticCache: true }).then(function (resp) {
               if (!resp || !resp.success) {
                 showToast((resp && resp.message) || (isEnNotif ? 'Failed to delete notifications.' : 'تعذر حذف الإشعارات.'), true);
-                refreshNotifications();
-              } else if (resp.data && Array.isArray(resp.data.items)) {
+                notifUiEpoch += 1;
+                refreshNotifications({ forceRefresh: true });
+              } else if (opEpoch === notifUiEpoch && resp.data && Array.isArray(resp.data.items)) {
                 applyNotificationsState({ items: resp.data.items, unreadCount: Number(resp.data.unreadCount || 0) });
+                if (document.body.contains(pop)) pop._rgRerender();
               }
             }).catch(function () {
               showToast(isEnNotif ? 'Network error deleting notifications.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعارات.', true);
-              refreshNotifications();
+              notifUiEpoch += 1;
+              refreshNotifications({ forceRefresh: true });
             });
           });
         });
@@ -2808,25 +2839,29 @@
           var delId = delBtn.getAttribute('data-del-nid');
           if (!delId) return;
           withActionLock(delBtn, 'deleteNotification:' + delId, function () {
+            notifUiEpoch += 1;
+            var opEpoch = notifUiEpoch;
             var nextItems = (state.notifications.items || []).filter(function (n) { return n && n.id !== delId; });
             var nextUnread = nextItems.filter(function (n) { return n && !n.isRead; }).length;
             applyNotificationsState({ items: nextItems, unreadCount: nextUnread });
             if (root.RGApi.applyOptimisticMutation) {
               root.RGApi.applyOptimisticMutation('deleteNotification', { notificationId: delId });
             }
-            pop.innerHTML = renderNotifPopoverHtml();
-            bindNotifPopoverEvents();
+            pop._rgRerender();
             showToast(isEnNotif ? 'Notification deleted.' : 'تم حذف الإشعار.');
             return root.RGApi.callApi('deleteNotification', { notificationId: delId, _keepOptimisticCache: true }).then(function (resp) {
               if (!resp || !resp.success) {
                 showToast((resp && resp.message) || (isEnNotif ? 'Failed to delete notification.' : 'تعذر حذف الإشعار.'), true);
-                refreshNotifications();
-              } else if (resp.data && Array.isArray(resp.data.items)) {
+                notifUiEpoch += 1;
+                refreshNotifications({ forceRefresh: true });
+              } else if (opEpoch === notifUiEpoch && resp.data && Array.isArray(resp.data.items)) {
                 applyNotificationsState({ items: resp.data.items, unreadCount: Number(resp.data.unreadCount || 0) });
+                if (document.body.contains(pop)) pop._rgRerender();
               }
             }).catch(function () {
               showToast(isEnNotif ? 'Network error deleting notification.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعار.', true);
-              refreshNotifications();
+              notifUiEpoch += 1;
+              refreshNotifications({ forceRefresh: true });
             });
           });
         });
@@ -2876,6 +2911,10 @@
       });
     }
 
+    pop._rgRerender = function () {
+      pop.innerHTML = renderNotifPopoverHtml();
+      bindNotifPopoverEvents();
+    };
     pop.innerHTML = renderNotifPopoverHtml();
     document.body.appendChild(pop);
     bindNotifPopoverEvents();
@@ -4742,11 +4781,12 @@
 
   function applyNotificationsState(data) {
     if (!data) return;
-    state.notifications = data;
-    lastFingerprints.notifications = computeFingerprintSafe(data);
+    var cleanData = sanitizeClientNotifs(data);
+    state.notifications = cleanData;
+    lastFingerprints.notifications = computeFingerprintSafe(cleanData);
     var badge = document.getElementById('notif-badge');
     if (badge) {
-      var count = data.unreadCount || 0;
+      var count = cleanData.unreadCount || 0;
       badge.textContent = String(count);
       badge.classList.toggle('hidden', count === 0);
     }
@@ -4779,6 +4819,7 @@
     if (!options.manual && isAutoRefreshInFlight) return;
 
     isAutoRefreshInFlight = true;
+    var startNotifEpoch = getCombinedNotifEpoch();
     try {
       var activeRoute = state.route;
       var req = getRoutePrimaryRequest(activeRoute);
@@ -4793,10 +4834,13 @@
       if (!root.RGAuth || !root.RGAuth.getUser()) return;
       if (!options.manual && !canRunSilentAutoRefreshNow()) return;
 
-      if (notifRes && notifRes.success && notifRes.data) {
-        var nextNotifFp = computeFingerprintSafe(notifRes.data);
+      var canApplyNotif = getCombinedNotifEpoch() === startNotifEpoch &&
+        !(root.RGApi && typeof root.RGApi.isNotificationMutationInFlight === 'function' && root.RGApi.isNotificationMutationInFlight());
+      if (canApplyNotif && notifRes && notifRes.success && notifRes.data) {
+        var cleanNotif = sanitizeClientNotifs(notifRes.data);
+        var nextNotifFp = computeFingerprintSafe(cleanNotif);
         if (nextNotifFp !== lastFingerprints.notifications) {
-          applyNotificationsState(notifRes.data);
+          applyNotificationsState(cleanNotif);
         }
       }
 
@@ -5175,6 +5219,7 @@
     if (isDeltaSyncInFlight) return;
 
     isDeltaSyncInFlight = true;
+    var deltaStartNotifEpoch = getCombinedNotifEpoch();
     try {
       var res = await root.RGApi.callApi('getDeltaSync', {
         updatedAfter: state.lastDeltaSyncAt || '',
@@ -5206,10 +5251,19 @@
         root.RGApi.applyDeltaSyncToCache(d);
       }
 
-      if (d.notifications) {
-        var nextNotifFp = computeFingerprintSafe(d.notifications);
+      var hasNotifTombstones = Boolean((Array.isArray(d.deletedNotificationIds) && d.deletedNotificationIds.length > 0) || d.deletedAllNotificationsBefore);
+      var canApplyDeltaNotif = !d._staleNotificationsSkipped &&
+        !(root.RGApi && typeof root.RGApi.isNotificationMutationInFlight === 'function' && root.RGApi.isNotificationMutationInFlight()) &&
+        (getCombinedNotifEpoch() === deltaStartNotifEpoch || hasNotifTombstones);
+      if (canApplyDeltaNotif && d.notifications) {
+        var cleanDeltaNotifs = sanitizeClientNotifs(d.notifications);
+        var nextNotifFp = computeFingerprintSafe(cleanDeltaNotifs);
         if (nextNotifFp !== lastFingerprints.notifications) {
-          applyNotificationsState(d.notifications);
+          applyNotificationsState(cleanDeltaNotifs);
+          var openPopDelta = document.getElementById('notif-popover');
+          if (openPopDelta && typeof openPopDelta._rgRerender === 'function') {
+            openPopDelta._rgRerender();
+          }
         }
       }
       if (Array.isArray(d.announcements)) {

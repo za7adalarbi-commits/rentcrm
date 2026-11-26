@@ -274,20 +274,162 @@
   var localExtensionsByResNs = {};
   var localMetaByNs = {};
   var optimisticRollbackStack = [];
+  var notifMutationStateByNs = {};
+  var NOTIF_TOMBSTONE_SESSION_KEY = 'rg_crm_ntf_tombstones_v1';
 
   function cloneForRollback(val) {
     try { return JSON.parse(JSON.stringify(val)); } catch (_e) { return val; }
   }
 
+  function loadPersistedNotifTombstones(ns) {
+    try {
+      if (typeof sessionStorage === 'undefined') return null;
+      var raw = sessionStorage.getItem(NOTIF_TOMBSTONE_SESSION_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === 'object' && parsed[ns]) ? parsed[ns] : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function persistNotifTombstones(ns, st) {
+    try {
+      if (typeof sessionStorage === 'undefined') return;
+      var all = {};
+      var raw = sessionStorage.getItem(NOTIF_TOMBSTONE_SESSION_KEY);
+      if (raw) {
+        try {
+          var prev = JSON.parse(raw);
+          if (prev && typeof prev === 'object') all = prev;
+        } catch (_eParse) {}
+      }
+      var ids = Object.keys(st.confirmedDeletedIds || {});
+      if (ids.length > 400) {
+        ids.sort(function (a, b) {
+          return Number(st.confirmedDeletedIds[b] || 0) - Number(st.confirmedDeletedIds[a] || 0);
+        });
+        var trimmed = {};
+        ids.slice(0, 400).forEach(function (id) { trimmed[id] = st.confirmedDeletedIds[id]; });
+        st.confirmedDeletedIds = trimmed;
+      }
+      all[ns] = {
+        deletedIds: st.confirmedDeletedIds || {},
+        deletedAllBeforeMs: Number(st.confirmedDeletedAllBeforeMs || 0)
+      };
+      sessionStorage.setItem(NOTIF_TOMBSTONE_SESSION_KEY, JSON.stringify(all));
+    } catch (_e) {}
+  }
+
+  function clearPersistedNotifTombstones(ns) {
+    try {
+      if (typeof sessionStorage === 'undefined') return;
+      if (!ns) {
+        sessionStorage.removeItem(NOTIF_TOMBSTONE_SESSION_KEY);
+        return;
+      }
+      var raw = sessionStorage.getItem(NOTIF_TOMBSTONE_SESSION_KEY);
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && parsed[ns]) {
+        delete parsed[ns];
+        sessionStorage.setItem(NOTIF_TOMBSTONE_SESSION_KEY, JSON.stringify(parsed));
+      }
+    } catch (_e) {}
+  }
+
+  function getNotifMutationState(ns) {
+    var key = ns || getCacheNamespace();
+    if (!notifMutationStateByNs[key]) {
+      var persisted = loadPersistedNotifTombstones(key);
+      var confIds = (persisted && persisted.deletedIds && typeof persisted.deletedIds === 'object')
+        ? cloneForRollback(persisted.deletedIds)
+        : {};
+      var confClearMs = Number((persisted && persisted.deletedAllBeforeMs) || 0) || 0;
+      notifMutationStateByNs[key] = {
+        epoch: 0,
+        inFlightCount: 0,
+        deletedIds: cloneForRollback(confIds) || {},
+        deletedAllBeforeMs: confClearMs,
+        confirmedDeletedIds: confIds || {},
+        confirmedDeletedAllBeforeMs: confClearMs
+      };
+    }
+    return notifMutationStateByNs[key];
+  }
+
+  function recordNotifTombstones(ns, ids, deletedAllBefore, opts) {
+    var st = getNotifMutationState(ns);
+    var cfg = opts || {};
+    var nowMs = Date.now();
+    var changed = false;
+    (Array.isArray(ids) ? ids : []).forEach(function (id) {
+      var cleanId = String(id || '').trim();
+      if (!cleanId) return;
+      if (!st.deletedIds[cleanId]) changed = true;
+      st.deletedIds[cleanId] = nowMs;
+      if (cfg.confirmed) {
+        st.confirmedDeletedIds[cleanId] = nowMs;
+      }
+    });
+    if (deletedAllBefore) {
+      var ms = typeof deletedAllBefore === 'number' ? deletedAllBefore : Date.parse(String(deletedAllBefore));
+      if (!isNaN(ms) && ms > 0) {
+        if (ms > st.deletedAllBeforeMs) changed = true;
+        st.deletedAllBeforeMs = Math.max(st.deletedAllBeforeMs, ms);
+        if (cfg.confirmed) {
+          st.confirmedDeletedAllBeforeMs = Math.max(st.confirmedDeletedAllBeforeMs, ms);
+        }
+      }
+    }
+    if (changed || cfg.bumpEpoch !== false) {
+      st.epoch += 1;
+    }
+    if (cfg.confirmed) {
+      persistNotifTombstones(ns || getCacheNamespace(), st);
+    }
+    return st.epoch;
+  }
+
+  function sanitizeNotificationsForNs(ns, payload) {
+    if (!payload || typeof payload !== 'object') return payload;
+    var st = getNotifMutationState(ns);
+    var core = root.RGCrmCore;
+    if (core && typeof core.filterDeletedNotificationsPayload === 'function') {
+      return core.filterDeletedNotificationsPayload(payload, st.deletedIds, st.deletedAllBeforeMs);
+    }
+    var srcItems = Array.isArray(payload.items) ? payload.items : [];
+    var clearMs = Number(st.deletedAllBeforeMs || 0);
+    var filtered = srcItems.filter(function (n) {
+      if (!n || typeof n !== 'object' || n.deletedAt) return false;
+      var nid = String(n.id || '').trim();
+      if (!nid || st.deletedIds[nid]) return false;
+      if (clearMs > 0 && n.createdAt) {
+        var cms = Date.parse(String(n.createdAt));
+        if (!isNaN(cms) && cms <= clearMs) return false;
+      }
+      return true;
+    });
+    return Object.assign({}, payload, {
+      items: filtered,
+      unreadCount: filtered.filter(function (n) { return !n.isRead; }).length
+    });
+  }
+
   function captureOptimisticSnapshot(action) {
     var ns = getCacheNamespace();
+    var curNotifSt = action === 'deleteNotification' ? getNotifMutationState(ns) : null;
     var snap = {
       id: 'SNAP_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
       action: String(action || ''),
       ns: ns,
       apiCache: cloneForRollback(apiResponseCache),
       localRes: localReservationsByNs[ns] ? cloneForRollback(localReservationsByNs[ns]) : null,
-      localDet: localDetailsByNs[ns] ? cloneForRollback(localDetailsByNs[ns]) : null
+      localDet: localDetailsByNs[ns] ? cloneForRollback(localDetailsByNs[ns]) : null,
+      notifTombstones: curNotifSt ? {
+        deletedIds: cloneForRollback(curNotifSt.deletedIds),
+        deletedAllBeforeMs: Number(curNotifSt.deletedAllBeforeMs || 0)
+      } : null
     };
     optimisticRollbackStack.push(snap);
     if (optimisticRollbackStack.length > 6) optimisticRollbackStack.shift();
@@ -303,8 +445,17 @@
         if (snap && snap.ns) {
           if (snap.localRes) localReservationsByNs[snap.ns] = snap.localRes;
           if (snap.localDet) localDetailsByNs[snap.ns] = snap.localDet;
+          if (snap.notifTombstones) {
+            var curNtf = getNotifMutationState(snap.ns);
+            curNtf.deletedIds = snap.notifTombstones.deletedIds || cloneForRollback(curNtf.confirmedDeletedIds) || {};
+            curNtf.deletedAllBeforeMs = Math.max(
+              Number(snap.notifTombstones.deletedAllBeforeMs || 0),
+              Number(curNtf.confirmedDeletedAllBeforeMs || 0)
+            );
+            curNtf.epoch += 1;
+          }
         }
-        schedulePersistApiCache(false);
+        schedulePersistApiCache(true);
         return true;
       }
     }
@@ -734,6 +885,7 @@
   }
 
   function flushPersistApiCache() {
+    var idbWritePromise = Promise.resolve();
     try {
       var now = Date.now();
       var currentNs = getCacheNamespace();
@@ -745,10 +897,10 @@
         }
       });
       if (root.RGIdbCache && idbEntries.length > 0) {
-        root.RGIdbCache.putKvEntries(idbEntries).catch(function () {});
+        idbWritePromise = root.RGIdbCache.putKvEntries(idbEntries).catch(function () {});
       }
 
-      if (typeof sessionStorage === 'undefined') return;
+      if (typeof sessionStorage === 'undefined') return idbWritePromise;
       var keys = idbEntries.map(function (e) { return e.key; }).filter(function (k) {
         try {
           var s = JSON.stringify(apiResponseCache[k]);
@@ -770,6 +922,7 @@
         sessionStorage.setItem(SESSION_CACHE_KEY, serialized);
       }
     } catch (e) {}
+    return idbWritePromise;
   }
 
   function schedulePersistApiCache(immediate) {
@@ -808,6 +961,8 @@
       apiResponseCache = {};
       revalidatedInPage = {};
       localReservationsFreshInPage = {};
+      delete notifMutationStateByNs[ns];
+      clearPersistedNotifTombstones(ns);
       try { if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(SESSION_CACHE_KEY); } catch (e) {}
       if (root.RGIdbCache && Array.isArray(scopes) && scopes.indexOf('*') !== -1) {
         delete localReservationsByNs[ns];
@@ -887,6 +1042,14 @@
     if (!policy.cacheable) return;
     var now = Date.now();
     var ns = getCacheNamespace();
+    var cacheData = data;
+    if (action === 'getNotifications' && cacheData && typeof cacheData === 'object') {
+      cacheData = sanitizeNotificationsForNs(ns, cacheData);
+    } else if (action === 'getAppBootstrap' && cacheData && cacheData.notifications) {
+      cacheData = Object.assign({}, cacheData, {
+        notifications: sanitizeNotificationsForNs(ns, cacheData.notifications)
+      });
+    }
     var key = core.buildApiCacheKey(getTransportUrl(), getToken(), action, payload || {});
     revalidatedInPage[key] = true;
     apiResponseCache[key] = {
@@ -896,14 +1059,14 @@
       storedAt: now,
       expiresAt: now + policy.ttlMs,
       staleUntil: now + Math.max(policy.ttlMs, IDB_KV_MAX_AGE_MS),
-      response: { success: true, message: '', data: data, error: null }
+      response: { success: true, message: '', data: cacheData, error: null }
     };
-    if (action === 'getReservationDetails' && data && data.reservation) {
-      setLocalDetailState(ns, data);
-    } else if (action === 'getReservations' && data && Array.isArray(data.items) && data.items.length > 0) {
-      setLocalReservationsState(ns, data.items, false);
+    if (action === 'getReservationDetails' && cacheData && cacheData.reservation) {
+      setLocalDetailState(ns, cacheData);
+    } else if (action === 'getReservations' && cacheData && Array.isArray(cacheData.items) && cacheData.items.length > 0) {
+      setLocalReservationsState(ns, cacheData.items, false);
     }
-    schedulePersistApiCache(false);
+    schedulePersistApiCache(action === 'getNotifications');
   }
 
   function hasCached(action, payload) {
@@ -926,6 +1089,9 @@
     if (!entry || !entry.response || !entry.response.success) return null;
     var limit = allowStale !== false ? (entry.staleUntil || entry.expiresAt || 0) : (entry.expiresAt || 0);
     if (Date.now() >= limit) return null;
+    if (action === 'getNotifications' && entry.response.data) {
+      return sanitizeNotificationsForNs(getCacheNamespace(), entry.response.data);
+    }
     return entry.response.data;
   }
 
@@ -2415,16 +2581,24 @@
     }
 
     if (action === 'deleteNotification') {
+      var delNsOpt = getCacheNamespace();
+      var delNidOpt = String(p.notificationId || p.id || '').trim();
+      var delAllOpt = Boolean(p.deleteAll);
+      if (delAllOpt) {
+        recordNotifTombstones(delNsOpt, [], Date.now(), { confirmed: false });
+      } else if (delNidOpt) {
+        recordNotifTombstones(delNsOpt, [delNidOpt], 0, { confirmed: false });
+      }
       patchCachedScopes(['notifications'], function (data, actName) {
         if (actName !== 'getNotifications' || !Array.isArray(data.items)) return undefined;
-        var delNid = String(p.notificationId || p.id || '').trim();
-        var nextItems = p.deleteAll
+        var nextItems = delAllOpt
           ? []
-          : data.items.filter(function (n) { return n && n.id !== delNid; });
+          : data.items.filter(function (n) { return n && n.id !== delNidOpt; });
         var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
         return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
       });
-      emitOptimisticMutationEvent(action, { notificationId: p.notificationId || p.id || '', deleteAll: Boolean(p.deleteAll) });
+      schedulePersistApiCache(true);
+      emitOptimisticMutationEvent(action, { notificationId: delNidOpt, deleteAll: delAllOpt });
       return;
     }
 
@@ -4020,17 +4194,32 @@
     return db.locks;
   }
 
-  function pushSandboxNotification(db, recipientEmployeeId, recipientRole, type, title, message, entityType, entityId) {
+  function pushSandboxNotification(db, recipientEmployeeId, recipientRole, type, title, message, entityType, entityId, eventKey) {
+    var cleanEmp = String(recipientEmployeeId || '').trim();
+    var cleanRole = cleanEmp ? '' : String(recipientRole || '').trim();
+    var cleanEventKey = String(eventKey || '').trim();
+    if (cleanEventKey && Array.isArray(db.notifications)) {
+      var existsDup = db.notifications.some(function (n) {
+        return n && n.eventKey === cleanEventKey &&
+          String(n.recipientEmployeeId || '') === cleanEmp &&
+          String(n.recipientRole || '') === cleanRole;
+      });
+      if (existsDup) return;
+    }
     db.notifications.unshift({
       id: genId('NTF'),
-      recipientEmployeeId: recipientEmployeeId || '',
-      recipientRole: recipientRole || '',
+      recipientEmployeeId: cleanEmp,
+      recipientRole: cleanRole,
       type: type,
       title: title,
       message: message,
       entityType: entityType || '',
       entityId: entityId || '',
+      eventKey: cleanEventKey,
       isRead: false,
+      dismissedBy: {},
+      deletedAt: '',
+      deletedById: '',
       createdAt: new Date().toISOString()
     });
   }
@@ -5270,8 +5459,12 @@
         db.problems = db.problems.filter(function (p) { return p.id !== delPrbIdSb; });
         db.problemUpdates = (db.problemUpdates || []).filter(function (u) { return u.problemId !== delPrbIdSb; });
         if (Array.isArray(db.notifications)) {
-          db.notifications = db.notifications.filter(function (n) {
-            return !(n && n.entityType === 'Problem' && n.entityId === delPrbIdSb);
+          var prbDelNowIso = new Date().toISOString();
+          db.notifications.forEach(function (n) {
+            if (n && n.entityType === 'Problem' && n.entityId === delPrbIdSb && !n.deletedAt) {
+              n.deletedAt = prbDelNowIso;
+              n.deletedById = session.employeeId;
+            }
           });
         }
         var stillOpenDel = false;
@@ -5842,16 +6035,22 @@
       }
 
       case 'getNotifications': {
-        var myNotifs = db.notifications.filter(function (n) {
-          return n.recipientEmployeeId === session.employeeId || (!n.recipientEmployeeId && n.recipientRole === session.role);
+        var myNotifs = (db.notifications || []).filter(function (n) {
+          if (!n || n.deletedAt) return false;
+          if (n.dismissedBy && n.dismissedBy[session.employeeId]) return false;
+          return n.recipientEmployeeId === session.employeeId ||
+            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
         });
         var unread = myNotifs.filter(function (n) { return !n.isRead; }).length;
-        return { success: true, message: '', data: { items: myNotifs.slice(0, 50), unreadCount: unread }, error: null };
+        return { success: true, message: '', data: { items: myNotifs.slice(0, 60), unreadCount: unread }, error: null };
       }
 
       case 'markNotificationRead': {
-        db.notifications.forEach(function (n) {
-          var mine = n.recipientEmployeeId === session.employeeId || (!n.recipientEmployeeId && n.recipientRole === session.role);
+        (db.notifications || []).forEach(function (n) {
+          if (!n || n.deletedAt) return;
+          if (n.dismissedBy && n.dismissedBy[session.employeeId]) return;
+          var mine = n.recipientEmployeeId === session.employeeId ||
+            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
           if (mine && (payload.markAll || n.id === payload.notificationId)) n.isRead = true;
         });
         saveSandboxDb(db);
@@ -5864,28 +6063,37 @@
         if (!delAllNtf && !delNtfId) {
           return { success: false, message: 'VALIDATION_ERROR: معرف الإشعار مطلوب.', data: null, error: 'VALIDATION_ERROR' };
         }
-        var beforeNtfCount = db.notifications.length;
-        db.notifications = db.notifications.filter(function (n) {
-          var mine = n.recipientEmployeeId === session.employeeId ||
-            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
-          if (!mine) return true;
-          if (delAllNtf) return false;
-          return n.id !== delNtfId;
+        var delNowIso = new Date().toISOString();
+        var deletedNtfIdsSb = [];
+        (db.notifications || []).forEach(function (n) {
+          if (!n || n.deletedAt) return;
+          if (n.dismissedBy && n.dismissedBy[session.employeeId]) return;
+          var isPersonal = n.recipientEmployeeId === session.employeeId;
+          var isShared = !n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all');
+          if (!isPersonal && !isShared) return;
+          if (!delAllNtf && n.id !== delNtfId) return;
+          if (isPersonal) {
+            n.deletedAt = delNowIso;
+            n.deletedById = session.employeeId;
+          } else {
+            n.dismissedBy = n.dismissedBy || {};
+            n.dismissedBy[session.employeeId] = delNowIso;
+          }
+          deletedNtfIdsSb.push(n.id);
         });
-        var deletedNtfCount = beforeNtfCount - db.notifications.length;
         saveSandboxDb(db);
-        var freshMyNotifs = db.notifications.filter(function (n) {
-          return n.recipientEmployeeId === session.employeeId ||
-            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
-        });
-        var freshUnread = freshMyNotifs.filter(function (n) { return !n.isRead; }).length;
+        var freshNotifRes = sandboxExecute('getNotifications', token, {});
+        var freshMyNotifs = (freshNotifRes && freshNotifRes.success && freshNotifRes.data && freshNotifRes.data.items) || [];
+        var freshUnread = (freshNotifRes && freshNotifRes.success && freshNotifRes.data && Number(freshNotifRes.data.unreadCount || 0)) || 0;
         return {
           success: true,
           message: '',
           data: {
             deleted: true,
-            deletedCount: deletedNtfCount,
-            items: freshMyNotifs.slice(0, 50),
+            deletedCount: deletedNtfIdsSb.length,
+            deletedIds: deletedNtfIdsSb,
+            deletedAllBefore: delAllNtf ? delNowIso : '',
+            items: freshMyNotifs.slice(0, 60),
             unreadCount: freshUnread
           },
           error: null
@@ -6981,6 +7189,17 @@
           return copy;
         });
         var myNotifDelta = sandboxExecute('getNotifications', token, {});
+        var delNtfIdsDelta = [];
+        (db.notifications || []).forEach(function (n) {
+          if (!n) return;
+          var mine = n.recipientEmployeeId === session.employeeId ||
+            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
+          if (!mine) return;
+          var dIso = n.deletedAt || (n.dismissedBy && n.dismissedBy[session.employeeId]) || '';
+          if (dIso && Date.parse(dIso) > sinceMs) {
+            delNtfIdsDelta.push(n.id);
+          }
+        });
         var activeAnnsDelta = (db.announcements || []).filter(function (a) { return isSandboxAnnouncementActive(a); });
         var activeLocksDelta = pruneSandboxLocks(db);
         var deltaTodayRadar = sandboxExecute('getTodayAndRadar', token, { summaryOnly: true, todayDate: todayIso(0) });
@@ -6999,6 +7218,8 @@
             changedFollowUps: changedFu,
             changedProblems: changedPrb,
             changedEmployees: changedEmps,
+            deletedNotificationIds: delNtfIdsDelta,
+            deletedAllNotificationsBefore: '',
             changedSettings: settingsChangedDelta,
             settingsUpdatedAt: settingsChangedDelta ? setUpdAt : '',
             todayRadarCounts: (deltaTodayRadar && deltaTodayRadar.success && deltaTodayRadar.data) ? deltaTodayRadar.data.counts : null,
@@ -7651,9 +7872,23 @@
       }
     }
 
-    if (delta.notifications && Array.isArray(delta.notifications.items)) {
+    var delNtfIds = Array.isArray(delta.deletedNotificationIds) ? delta.deletedNotificationIds : [];
+    var delAllNtfBefore = delta.deletedAllNotificationsBefore || '';
+    if (delNtfIds.length > 0 || delAllNtfBefore) {
+      recordNotifTombstones(ns, delNtfIds, delAllNtfBefore, { confirmed: true });
       touchedScopes.notifications = true;
-      primeCache('getNotifications', {}, delta.notifications);
+    }
+
+    var notifStDelta = getNotifMutationState(ns);
+    if (!delta._staleNotificationsSkipped && notifStDelta.inFlightCount === 0 && delta.notifications && Array.isArray(delta.notifications.items)) {
+      touchedScopes.notifications = true;
+      primeCache('getNotifications', {}, sanitizeNotificationsForNs(ns, delta.notifications));
+    } else if (delNtfIds.length > 0 || delAllNtfBefore) {
+      patchCachedScopes(['notifications'], function (data, actName) {
+        if (actName !== 'getNotifications' || !Array.isArray(data.items)) return undefined;
+        return sanitizeNotificationsForNs(ns, data);
+      });
+      schedulePersistApiCache(true);
     }
 
     if (Array.isArray(delta.announcements)) {
@@ -8023,6 +8258,9 @@
       }
     }
 
+    var callNotifSt = getNotifMutationState(ns);
+    var callStartNotifEpoch = callNotifSt.epoch;
+
     async function runExecuteCall() {
       if (isCallerAborted()) {
         return { success: false, aborted: true, message: '', data: null, error: 'ABORTED' };
@@ -8030,6 +8268,9 @@
       if (OFFLINE_QUEUEABLE[action] && isOfflineNow() && !(payload && payload._replayingOfflineQueue)) {
         return enqueueAndApplyOffline('offline');
       }
+      var isNotifMutAction = action === 'deleteNotification' || action === 'markNotificationRead';
+      if (isNotifMutAction) callNotifSt.inFlightCount += 1;
+      try {
       var parsed = null;
       var networkFailed = false;
       var maxAttempts = (policy.cacheable && transportUrl) ? 3 : 1;
@@ -8314,6 +8555,26 @@
         } else if (action === 'logout') {
           setToken('');
         }
+        var postMutNs = getCacheNamespace();
+        var postMutSt = getNotifMutationState(postMutNs);
+        var staleNotifSnapshot = Boolean(postMutSt.inFlightCount > 0 || postMutSt.epoch !== callStartNotifEpoch);
+        if (action === 'getNotifications' && parsed.data) {
+          parsed = Object.assign({}, parsed, { data: sanitizeNotificationsForNs(postMutNs, parsed.data) });
+        } else if (action === 'getDeltaSync' && parsed.data && parsed.data.notifications) {
+          var nextDeltaNotifs = sanitizeNotificationsForNs(postMutNs, parsed.data.notifications);
+          parsed = Object.assign({}, parsed, {
+            data: Object.assign({}, parsed.data, {
+              notifications: nextDeltaNotifs,
+              _staleNotificationsSkipped: staleNotifSnapshot
+            })
+          });
+        } else if (action === 'getAppBootstrap' && parsed.data && parsed.data.notifications) {
+          parsed = Object.assign({}, parsed, {
+            data: Object.assign({}, parsed.data, {
+              notifications: sanitizeNotificationsForNs(postMutNs, parsed.data.notifications)
+            })
+          });
+        }
         var pendingIdbOps = [];
         if (action === 'getDashboard' && parsed.data && parsed.data.kpis && root.RGIdbCache && typeof root.RGIdbCache.recordServerSyncState === 'function') {
           var dashSyncAt = (parsed.data.lastSync && parsed.data.lastSync.finishedAt) || (detectedServerSyncMeta && detectedServerSyncMeta.lastSyncAt) || '';
@@ -8406,7 +8667,7 @@
           syncSandboxSnapshotToIdb(ns);
         }
 
-        if (shouldWriteCache && cacheKey) {
+        if (shouldWriteCache && cacheKey && !(action === 'getNotifications' && staleNotifSnapshot)) {
           var wasRevalidated = Boolean(revalidatedInPage[cacheKey]);
           revalidatedInPage[cacheKey] = true;
           var writeTs = Date.now();
@@ -8419,11 +8680,22 @@
             staleUntil: writeTs + Math.max(policy.ttlMs, IDB_KV_MAX_AGE_MS),
             response: parsed
           };
-          schedulePersistApiCache(!wasRevalidated || action === 'getReservations' || action === 'getDashboard' || action === 'getEmployees' || action === 'getTodayAndRadar');
+          schedulePersistApiCache(!wasRevalidated || action === 'getReservations' || action === 'getDashboard' || action === 'getEmployees' || action === 'getTodayAndRadar' || action === 'getNotifications');
         } else if (core && core.getCacheInvalidationScopes) {
           var invScopes = core.getCacheInvalidationScopes(action);
           var skipOptimisticClear = payload && payload._keepOptimisticCache;
-          if (skipOptimisticClear) {
+          if (action === 'deleteNotification') {
+            var confIds = (parsed.data && Array.isArray(parsed.data.deletedIds))
+              ? parsed.data.deletedIds
+              : (payload && (payload.notificationId || payload.id) ? [payload.notificationId || payload.id] : []);
+            var confDelAll = (parsed.data && parsed.data.deletedAllBefore) || (payload && payload.deleteAll ? Date.now() : 0);
+            recordNotifTombstones(ns, confIds, confDelAll, { confirmed: true });
+            var confirmedNotifs = (parsed.data && Array.isArray(parsed.data.items))
+              ? sanitizeNotificationsForNs(ns, { items: parsed.data.items, unreadCount: Number(parsed.data.unreadCount || 0) })
+              : sanitizeNotificationsForNs(ns, getCachedData('getNotifications', {}, true) || { items: [], unreadCount: 0 });
+            primeCache('getNotifications', {}, confirmedNotifs);
+            pendingIdbOps.push(flushPersistApiCache());
+          } else if (skipOptimisticClear) {
             var secondaryOnly = invScopes.filter(function (s) {
               return s === 'dashboard' || s === 'todayRadar' || s === 'reports' || s === 'activity' || s === 'employees' || (action === 'deleteProblem' && s === 'notifications');
             });
@@ -8509,6 +8781,11 @@
         }
       }
       return parsed;
+      } finally {
+        if (isNotifMutAction && callNotifSt.inFlightCount > 0) {
+          callNotifSt.inFlightCount -= 1;
+        }
+      }
     }
 
     if (policy.cacheable && cacheKey) {
@@ -9007,6 +9284,9 @@
     getLocalCacheStats: getLocalCacheStats,
     applyOptimisticMutation: applyOptimisticMutation,
     restoreLatestOptimisticSnapshot: restoreLatestOptimisticSnapshot,
+    getNotificationMutationEpoch: function () { return getNotifMutationState(getCacheNamespace()).epoch; },
+    isNotificationMutationInFlight: function () { return getNotifMutationState(getCacheNamespace()).inFlightCount > 0; },
+    filterActiveNotifications: function (payload) { return sanitizeNotificationsForNs(getCacheNamespace(), payload); },
     hasInFlightMutations: function () { return Object.keys(inFlightMutations).length > 0; },
     isOfflineQueueableAction: isOfflineQueueableAction,
     getOfflineQueueStatus: getOfflineQueueStatus,

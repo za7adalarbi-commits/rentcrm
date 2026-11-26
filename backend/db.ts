@@ -367,6 +367,20 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);`,
   `CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS event_key TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS deleted_by_id TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
+  `CREATE TABLE IF NOT EXISTS notification_dismissals (
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    employee_id TEXT NOT NULL,
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (notification_id, employee_id)
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_active_emp ON notifications (recipient_employee_id, created_at DESC) WHERE deleted_at IS NULL;`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE COALESCE(recipient_employee_id, '') = '' AND deleted_at IS NULL;`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifications (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '';`,
+  `CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));`
 ];

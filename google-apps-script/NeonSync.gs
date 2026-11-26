@@ -483,6 +483,26 @@ function handleNeonMirrorSync_(payload) {
         updatedBy: normalizeStr(data.updatedBy || 'NEON_MIRROR'),
         updatedAt: nowIso()
       });
+    } else if (action === 'deleteNotification') {
+      var ntfDelAt = normalizeStr(data.deletedAt) || nowIso();
+      var ntfDelBy = normalizeStr(data.deletedById || data.recipientEmployeeId);
+      var ntfDelIds = Array.isArray(data.deletedIds) ? data.deletedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
+      var ntfIdSingle = normalizeStr(data.id);
+      if (ntfIdSingle && ntfDelIds.indexOf(ntfIdSingle) === -1) ntfDelIds.push(ntfIdSingle);
+      var ntfDelMap = {};
+      for (var ni = 0; ni < ntfDelIds.length; ni++) ntfDelMap[ntfDelIds[ni]] = true;
+      if (typeof updateRecordsWhere_ === 'function') {
+        updateRecordsWhere_(RG_SHEETS.NOTIFICATIONS, function (n) {
+          if (!n || normalizeStr(n.deletedAt)) return false;
+          if (ntfDelIds.length > 0) return Boolean(ntfDelMap[normalizeStr(n.id)]);
+          return Boolean(data.deleteAll && ntfDelBy && normalizeStr(n.recipientEmployeeId) === ntfDelBy);
+        }, {
+          deletedAt: ntfDelAt,
+          deletedById: ntfDelBy
+        });
+      }
+      if (typeof bumpCacheVersion_ === 'function') bumpCacheVersion_('NTF');
+      applied++;
     } else if (action === 'saveRgToken' && data.rgToken) {
       var cleanTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
       if (cleanTok) {

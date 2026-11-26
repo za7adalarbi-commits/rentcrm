@@ -73,7 +73,8 @@ var RG_SHEETS_SCHEMA = {
   ],
   Notifications: [
     'id', 'recipientEmployeeId', 'recipientRole', 'type', 'title',
-    'message', 'entityType', 'entityId', 'isRead', 'createdAt'
+    'message', 'entityType', 'entityId', 'isRead', 'createdAt',
+    'eventKey', 'deletedAt', 'deletedById', 'dismissedByJson'
   ],
   Settings: [
     'key', 'value', 'updatedBy', 'updatedAt'

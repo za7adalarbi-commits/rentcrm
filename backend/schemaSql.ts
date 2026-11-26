@@ -283,8 +283,20 @@ CREATE TABLE IF NOT EXISTS notifications (
   message TEXT NOT NULL DEFAULT '',
   entity_type TEXT NOT NULL DEFAULT '',
   entity_id TEXT NOT NULL DEFAULT '',
+  event_key TEXT NOT NULL DEFAULT '',
   is_read BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  deleted_by_id TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 12b. Per-recipient dismissals for shared/role-wide notifications
+CREATE TABLE IF NOT EXISTS notification_dismissals (
+  notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  employee_id TEXT NOT NULL,
+  deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (notification_id, employee_id)
 );
 
 -- 13. Settings (mirrors RG_SHEETS.SETTINGS)
@@ -535,6 +547,10 @@ ALTER TABLE reservations ADD COLUMN IF NOT EXISTS rcc_reason TEXT NOT NULL DEFAU
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_from_decline BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancelled_from_hold BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS penalty_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS event_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS deleted_by_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_number ON reservations (customer_id_number) WHERE customer_id_number <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_company_number ON reservations (company_number) WHERE company_number <> '';
@@ -544,6 +560,10 @@ CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancel
 CREATE INDEX IF NOT EXISTS idx_reservations_reference_number ON reservations (reference_number) WHERE reference_number <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_is_source_cancelled ON reservations (is_source_cancelled) WHERE is_source_cancelled = TRUE;
 CREATE INDEX IF NOT EXISTS idx_reservations_is_source_rejected ON reservations (is_source_rejected) WHERE is_source_rejected = TRUE;
+CREATE INDEX IF NOT EXISTS idx_notifications_active_emp ON notifications (recipient_employee_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_notifications_active_role ON notifications (recipient_role, created_at DESC) WHERE COALESCE(recipient_employee_id, '') = '' AND deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifications (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '';
+CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));
 `;
