@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import {
   crmCore,
   generateId,
+  getRiyadhDateTimeParts,
   hashPassword,
   invalidateAuthSessionCache,
   mapEmployeeRow,
@@ -289,7 +290,9 @@ export async function logActivity(
   details: string,
   changes: Array<{ field: string; label: string; before: string; after: string }> = []
 ): Promise<void> {
-  const nowIso = new Date().toISOString();
+  const nowDate = new Date();
+  const nowIso = nowDate.toISOString();
+  const riyadhNow = getRiyadhDateTimeParts(nowDate);
   const safeChanges = Array.isArray(changes) ? changes : [];
   try {
     await client.query(
@@ -305,8 +308,8 @@ export async function logActivity(
         entityId,
         details,
         JSON.stringify(safeChanges),
-        nowIso.slice(0, 10),
-        nowIso.slice(11, 19),
+        riyadhNow.date,
+        riyadhNow.time,
         nowIso
       ]
     );
@@ -323,8 +326,8 @@ export async function logActivity(
         entityType,
         entityId,
         details,
-        nowIso.slice(0, 10),
-        nowIso.slice(11, 19),
+        riyadhNow.date,
+        riyadhNow.time,
         nowIso
       ]
     );
@@ -701,9 +704,9 @@ export async function getTodayAndRadar(
         `SELECT r.*
          FROM reservations r
          WHERE ${agentSql}${SQL_ACTIVE_CONDITION} AND (
-           r.start_date = $1
-           OR (r.end_date >= $2 AND r.end_date <= $3)
-           OR (r.extended_until_date >= $2 AND r.extended_until_date <= $3)
+           LEFT(COALESCE(NULLIF(r.start_date, ''), ''), 10) = $1
+           OR (LEFT(COALESCE(NULLIF(r.end_date, ''), NULLIF(r.original_end_date, '')), 10) >= $2 AND LEFT(COALESCE(NULLIF(r.end_date, ''), NULLIF(r.original_end_date, '')), 10) <= $3)
+           OR (r.extended_until_date <> '' AND LEFT(r.extended_until_date, 10) >= $2 AND LEFT(r.extended_until_date, 10) <= $3)
          )
          ORDER BY r.start_date ASC, r.end_date ASC
          LIMIT 2500`,
@@ -797,10 +800,10 @@ export async function getDashboard(
       dateFrom = today;
       dateTo = today;
     } else if (range === '7d') {
-      dateFrom = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+      dateFrom = shiftIsoDateDays(today, -6);
       dateTo = today;
     } else if (range === '30d') {
-      dateFrom = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+      dateFrom = shiftIsoDateDays(today, -29);
       dateTo = today;
     } else if (range === 'month') {
       dateFrom = `${today.slice(0, 7)}-01`;
@@ -829,11 +832,11 @@ export async function getDashboard(
       }
       if (dateFrom) {
         resParams.push(dateFrom);
-        resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) >= $${resParams.length}`);
+        resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD')) >= $${resParams.length}`);
       }
       if (dateTo) {
         resParams.push(dateTo);
-        resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) <= $${resParams.length}`);
+        resClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD')) <= $${resParams.length}`);
       }
       const resWhere = resClauses.length ? `WHERE ${resClauses.join(' AND ')}` : '';
       const resAliasedClauses = resClauses.map((c) =>
@@ -858,15 +861,23 @@ export async function getDashboard(
       }
       const fuWhere = fuClauses.length ? `WHERE ${fuClauses.join(' AND ')}` : '';
 
+      const fuTodayParams: any[] = [today];
+      const fuTodayClauses: string[] = [`follow_up_date = $1`];
+      if (restrictAgent) {
+        fuTodayParams.push(session.user.id);
+        fuTodayClauses.push(`employee_id = $${fuTodayParams.length}`);
+      }
+      const fuTodayWhere = `WHERE ${fuTodayClauses.join(' AND ')}`;
+
       const lbResParams: any[] = [];
       const lbResClauses: string[] = [];
       if (dateFrom) {
         lbResParams.push(dateFrom);
-        lbResClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) >= $${lbResParams.length}`);
+        lbResClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD')) >= $${lbResParams.length}`);
       }
       if (dateTo) {
         lbResParams.push(dateTo);
-        lbResClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')) <= $${lbResParams.length}`);
+        lbResClauses.push(`COALESCE(NULLIF(start_date, ''), to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD')) <= $${lbResParams.length}`);
       }
       const lbResWhere = lbResClauses.length ? `WHERE ${lbResClauses.join(' AND ')}` : '';
 
@@ -874,13 +885,24 @@ export async function getDashboard(
       const lbPrbClauses: string[] = [];
       if (dateFrom) {
         lbPrbParams.push(dateFrom);
-        lbPrbClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= $${lbPrbParams.length}`);
+        lbPrbClauses.push(`to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD') >= $${lbPrbParams.length}`);
       }
       if (dateTo) {
         lbPrbParams.push(dateTo);
-        lbPrbClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= $${lbPrbParams.length}`);
+        lbPrbClauses.push(`to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD') <= $${lbPrbParams.length}`);
       }
       const lbPrbWhere = lbPrbClauses.length ? `WHERE ${lbPrbClauses.join(' AND ')}` : '';
+
+      const prbAggParams = [...lbPrbParams];
+      const prbAggClauses = [...lbPrbClauses];
+      if (restrictAgent) {
+        prbAggParams.push(JSON.stringify([session.user.id]));
+        const pAssignIdx = prbAggParams.length;
+        prbAggParams.push(session.user.id);
+        const pCreatorIdx = prbAggParams.length;
+        prbAggClauses.push(`(assigned_employee_ids @> $${pAssignIdx}::jsonb OR created_by_id = $${pCreatorIdx})`);
+      }
+      const prbAggWhere = prbAggClauses.length ? `WHERE ${prbAggClauses.join(' AND ')}` : '';
 
       const [
         resTotalsQuery,
@@ -900,7 +922,7 @@ export async function getDashboard(
       ] = await Promise.all([
         executor.query<{ total_cnt: number; today_cnt: number; cancelled_cnt?: number; rejected_cnt?: number }>(
           `SELECT COUNT(*)::int AS total_cnt,
-                  COUNT(*) FILTER (WHERE r.start_date = $${todayParamIdx}::text OR (r.created_at >= ($${todayParamIdx}::text || 'T00:00:00Z')::timestamptz AND r.created_at < (($${todayParamIdx}::text || 'T00:00:00Z')::timestamptz + INTERVAL '1 day')))::int AS today_cnt,
+                  COUNT(*) FILTER (WHERE LEFT(COALESCE(NULLIF(r.start_date, ''), ''), 10) = $${todayParamIdx}::text OR (r.created_at >= (($${todayParamIdx}::text || ' 00:00:00')::timestamp AT TIME ZONE 'Asia/Riyadh') AND r.created_at < ((($${todayParamIdx}::text || ' 00:00:00')::timestamp AT TIME ZONE 'Asia/Riyadh') + INTERVAL '1 day')))::int AS today_cnt,
                   COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::int AS cancelled_cnt,
                   COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::int AS rejected_cnt
            FROM reservations r ${resAliasedWhere}`,
@@ -933,11 +955,12 @@ export async function getDashboard(
           fuParams
         ),
         executor.query<{ today_cnt: number }>(
-          `SELECT COUNT(*)::int AS today_cnt FROM follow_ups WHERE follow_up_date = $1`,
-          [today]
+          `SELECT COUNT(*)::int AS today_cnt FROM follow_ups ${fuTodayWhere}`,
+          fuTodayParams
         ),
         executor.query<{ status: string; priority: string; cnt: number }>(
-          `SELECT status, priority, COUNT(*)::int AS cnt FROM problems GROUP BY status, priority`
+          `SELECT status, priority, COUNT(*)::int AS cnt FROM problems ${prbAggWhere} GROUP BY status, priority`,
+          prbAggParams
         ),
         executor.query(`SELECT id, name, username, role, job_title, status FROM employees WHERE status = 'active'`),
         executor.query(`SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 8`),
@@ -1310,6 +1333,22 @@ export async function getReservations(
     clauses.push(`r.branch_name = $${params.length}`);
   }
 
+  const isCalendarMode = toBool(payload.calendarMode);
+  const isExportMode = toBool(payload.exportMode);
+  const calFrom = str(payload.calendarFrom).slice(0, 10);
+  const calTo = str(payload.calendarTo).slice(0, 10);
+  if (isCalendarMode && /^\d{4}-\d{2}-\d{2}$/.test(calFrom) && /^\d{4}-\d{2}-\d{2}$/.test(calTo)) {
+    params.push(calFrom);
+    const cfIdx = params.length;
+    params.push(calTo);
+    const ctIdx = params.length;
+    clauses.push(`(
+      (LEFT(COALESCE(NULLIF(r.start_date, ''), ''), 10) >= $${cfIdx} AND LEFT(COALESCE(NULLIF(r.start_date, ''), ''), 10) <= $${ctIdx})
+      OR (LEFT(COALESCE(NULLIF(r.end_date, ''), NULLIF(r.original_end_date, '')), 10) >= $${cfIdx} AND LEFT(COALESCE(NULLIF(r.end_date, ''), NULLIF(r.original_end_date, '')), 10) <= $${ctIdx})
+      OR (r.extended_until_date <> '' AND LEFT(r.extended_until_date, 10) >= $${cfIdx} AND LEFT(r.extended_until_date, 10) <= $${ctIdx})
+    )`);
+  }
+
   const dateFrom = str(payload.dateFrom).slice(0, 10);
   const dateTo = str(payload.dateTo).slice(0, 10);
   if (dateFrom && dateTo) {
@@ -1422,7 +1461,9 @@ export async function getReservations(
   }
 
   const page = Math.max(1, num(payload.page, 1));
-  const pageSize = Math.min(200, Math.max(1, num(payload.pageSize, 25)));
+  const maxAllowedPageSize = (isCalendarMode || isExportMode) ? 2500 : 200;
+  const defaultPageSize = isCalendarMode ? 2500 : 25;
+  const pageSize = Math.min(maxAllowedPageSize, Math.max(1, num(payload.pageSize, defaultPageSize)));
   const offset = (page - 1) * pageSize;
 
   const hasTimeFilter = Boolean(str(payload.timeFrom) || str(payload.timeTo));
@@ -1553,10 +1594,58 @@ export async function getReservations(
     loadLifecycleCounts()
   ]);
 
+  const mappedMain = rowsRes.rows.map((r) => mapReservationRowToClient(r, false));
+  if (isCalendarMode && mappedMain.length > 0) {
+    const resIds = mappedMain.map((m) => str(m.id)).filter(Boolean);
+    const resNums = mappedMain.map((m) => str(m.reservationNumber)).filter(Boolean);
+    const extRes = await executor.query(
+      `SELECT * FROM extensions WHERE reservation_id = ANY($1::text[]) OR reservation_number = ANY($2::text[])`,
+      [resIds, resNums]
+    ).catch(() => ({ rows: [] as any[] }));
+    const extByResId: Record<string, any[]> = {};
+    const extByResNum: Record<string, any[]> = {};
+    const extBySourceId: Record<string, any[]> = {};
+    for (const exRow of extRes.rows || []) {
+      const ex = mapExtensionRowToClient(exRow);
+      if (ex.reservationId) {
+        if (!extByResId[ex.reservationId]) extByResId[ex.reservationId] = [];
+        extByResId[ex.reservationId].push(ex);
+      }
+      if (ex.reservationNumber) {
+        if (!extByResNum[ex.reservationNumber]) extByResNum[ex.reservationNumber] = [];
+        extByResNum[ex.reservationNumber].push(ex);
+      }
+      if (ex.sourceReservationId) {
+        if (!extBySourceId[ex.sourceReservationId]) extBySourceId[ex.sourceReservationId] = [];
+        extBySourceId[ex.sourceReservationId].push(ex);
+      }
+    }
+    for (const item of mappedMain) {
+      const seenExt = new Set<string>();
+      const collected: any[] = [];
+      const pools = [
+        extByResId[item.id] || [],
+        extByResNum[item.reservationNumber] || [],
+        item.sourceReservationId ? (extBySourceId[item.sourceReservationId] || []) : []
+      ];
+      for (const pool of pools) {
+        for (const ex of pool) {
+          const k = str(ex.id || ex.extensionNumber);
+          if (k && seenExt.has(k)) continue;
+          if (k) seenExt.add(k);
+          collected.push(ex);
+        }
+      }
+      if (collected.length > 0) {
+        item.extensions = collected;
+      }
+    }
+  }
+
   const total = Number(countRes.rows[0]?.cnt || 0);
 
   return {
-    items: redactReservationsList(rowsRes.rows.map((r) => mapReservationRowToClient(r, false)), session.user),
+    items: redactReservationsList(mappedMain, session.user),
     total,
     page,
     pageSize,
@@ -1864,7 +1953,9 @@ export async function quickUpdateReservationStatus(
     }
     assertOptimisticLock(resObj.updatedAt, payload.expectedUpdatedAt);
     const prevStatus = str(resObj.internalStatus);
-    const nowIso = new Date().toISOString();
+    const nowDateQ = new Date();
+    const nowIso = nowDateQ.toISOString();
+    const riyadhQ = getRiyadhDateTimeParts(nowDateQ);
     const actionLabel = `تحديث سريع للحالة إلى: ${newStatus}`;
     const lastText = note ? `${actionLabel} — ${note}` : actionLabel;
 
@@ -1878,8 +1969,8 @@ export async function quickUpdateReservationStatus(
       status: newStatus,
       action: actionLabel,
       notes: note,
-      followUpDate: nowIso.slice(0, 10),
-      followUpTime: nowIso.slice(11, 19),
+      followUpDate: riyadhQ.date,
+      followUpTime: riyadhQ.time,
       createdAt: nowIso
     };
 
@@ -2259,7 +2350,9 @@ export async function recordNoAnswerFollowUp(
     const resObj = mapReservationRowToClient(resQuery.rows[0], false);
 
     const nextCount = Math.max(0, Math.floor(num(resObj.noAnswerCount, 0))) + 1;
-    const nowIso = new Date().toISOString();
+    const nowDateNa = new Date();
+    const nowIso = nowDateNa.toISOString();
+    const riyadhNa = getRiyadhDateTimeParts(nowDateNa);
     const status = str(resObj.internalStatus) || 'تم الإنشاء';
     const action = crmCore.buildNoAnswerActionText(nextCount, 'ar');
 
@@ -2273,8 +2366,8 @@ export async function recordNoAnswerFollowUp(
       status,
       action,
       notes,
-      followUpDate: nowIso.slice(0, 10),
-      followUpTime: nowIso.slice(11, 19),
+      followUpDate: riyadhNa.date,
+      followUpTime: riyadhNa.time,
       createdAt: nowIso
     };
 
@@ -2420,7 +2513,9 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
       const resObj = mapReservationRowToClient(resQuery.rows[0], false);
       const effectiveNextInternalStatus = crmCore.isInactiveReservation(resObj) ? resObj.internalStatus : status;
 
-      const nowIso = new Date().toISOString();
+      const nowDateFu = new Date();
+      const nowIso = nowDateFu.toISOString();
+      const riyadhFu = getRiyadhDateTimeParts(nowDateFu);
       const fuObj = {
         id: generateId('FU'),
         reservationId: resObj.id,
@@ -2431,8 +2526,8 @@ export async function addFollowUp(executor: DbExecutor, session: AuthSession, pa
         status: effectiveNextInternalStatus,
         action,
         notes,
-        followUpDate: nowIso.slice(0, 10),
-        followUpTime: nowIso.slice(11, 19),
+        followUpDate: riyadhFu.date,
+        followUpTime: riyadhFu.time,
         createdAt: nowIso,
         updatedAt: nowIso
       };
@@ -3343,55 +3438,91 @@ export async function getEmployeeDetails(executor: DbExecutor, session: AuthSess
   };
 }
 
+function normEmpEmail(raw: unknown): string {
+  return typeof crmCore.normalizeEmployeeEmail === 'function'
+    ? crmCore.normalizeEmployeeEmail(raw)
+    : str(raw).toLowerCase();
+}
+
+function normEmpPhone(raw: unknown): string {
+  if (typeof crmCore.normalizeEmployeePhone === 'function') {
+    return crmCore.normalizeEmployeePhone(raw);
+  }
+  let digits = str(raw).replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('00966') && digits.length >= 14) digits = '0' + digits.slice(5);
+  else if (digits.startsWith('966') && digits.length >= 12) digits = '0' + digits.slice(3);
+  else if (digits.length === 9 && digits.startsWith('5')) digits = '0' + digits;
+  return digits;
+}
+
 export async function createEmployee(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
   requirePermission(session, 'manage_employees');
   const name = str(payload.name);
   const username = normalizeLoginUsername(payload.username);
   const password = String(payload.password || '');
   const role = str(payload.role || 'agent');
+  if (role === 'developer' && session.user.role !== 'developer') {
+    throw new Error('FORBIDDEN: إنشاء حساب مبرمج متاح للمبرمج فقط.');
+  }
+  const email = str(payload.email);
+  const phone = str(payload.phone);
+  const normEmail = normEmpEmail(email);
+  const normPhone = normEmpPhone(phone);
   if (!name || !username || !password) {
     throw new Error('VALIDATION_ERROR: الاسم واسم المستخدم وكلمة المرور مطلوبة.');
   }
 
-  const out = await executor.withTransaction(async (tx) => {
-    const dupCheck = await tx.query(`SELECT id FROM employees WHERE LOWER(username) = $1 LIMIT 1`, [username]);
-    if (dupCheck.rows.length > 0) {
-      throw new Error('DUPLICATE_USERNAME: اسم المستخدم مسجل بالفعل.');
-    }
+  return runWithIdempotency(executor, session.user.id, 'createEmployee', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const existingAll = await tx.query(`SELECT * FROM employees`);
+      for (const row of existingAll.rows || []) {
+        if (normalizeLoginUsername(row.username) === username) {
+          throw new Error('DUPLICATE_USERNAME: اسم المستخدم مسجل بالفعل.');
+        }
+        if (normEmail && normEmpEmail(row.email) === normEmail) {
+          throw new Error('DUPLICATE_EMAIL: البريد الإلكتروني مسجل بالفعل لموظف آخر.');
+        }
+        if (normPhone && normEmpPhone(row.phone) === normPhone) {
+          throw new Error('DUPLICATE_PHONE: رقم الجوال مسجل بالفعل لموظف آخر.');
+        }
+      }
 
-    const salt = crypto.randomBytes(8).toString('hex').toUpperCase();
-    const pHash = hashPassword(password, salt);
-    const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : [role];
-    const effectivePerms = crmCore.resolveEffectivePermissions(role, rawPerms);
-    const uiOverrides = typeof crmCore.normalizeUiOverrides === 'function'
-      ? crmCore.normalizeUiOverrides(payload.uiOverrides)
-      : {};
-    const nowIso = new Date().toISOString();
-    const id = generateId('EMP');
+      const salt = crypto.randomBytes(8).toString('hex').toUpperCase();
+      const pHash = hashPassword(password, salt);
+      const rawPerms = Array.isArray(payload.permissions) ? payload.permissions : [role];
+      const effectivePerms = crmCore.resolveEffectivePermissions(role, rawPerms);
+      const uiOverrides = typeof crmCore.normalizeUiOverrides === 'function'
+        ? crmCore.normalizeUiOverrides(payload.uiOverrides)
+        : {};
+      const nowIso = new Date().toISOString();
+      const id = generateId('EMP');
 
-    await tx.query(
-      `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,'active',$12::text,$13::timestamptz,$13::timestamptz)`,
-      [id, name, username, pHash, salt, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), JSON.stringify(uiOverrides), nowIso, nowIso]
-    );
-    await tx.query(
-      `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,'active',$10,$11::timestamptz,$11::timestamptz)`,
-      [id, name, username, str(payload.phone), str(payload.email), str(payload.jobTitle), role, JSON.stringify(effectivePerms), JSON.stringify(uiOverrides), nowIso, nowIso]
-    );
+      await tx.query(
+        `INSERT INTO employees (id, name, username, password_hash, salt, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,'active',$12::text,$13::timestamptz,$13::timestamptz)`,
+        [id, name, username, pHash, salt, phone, email, str(payload.jobTitle), role, JSON.stringify(effectivePerms), JSON.stringify(uiOverrides), nowIso, nowIso]
+      );
+      await tx.query(
+        `INSERT INTO users (id, name, username, phone, email, job_title, role, permissions, ui_overrides, status, last_activity, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,'active',$10,$11::timestamptz,$11::timestamptz)`,
+        [id, name, username, phone, email, str(payload.jobTitle), role, JSON.stringify(effectivePerms), JSON.stringify(uiOverrides), nowIso, nowIso]
+      );
 
-    await logActivity(tx, session.user, 'إضافة موظف', 'Employee', username, `إضافة ${name} بدور ${role}`);
-    const emp = mapEmployeeRow({
-      id, name, username, phone: str(payload.phone), email: str(payload.email),
-      job_title: str(payload.jobTitle), role, permissions: effectivePerms, ui_overrides: uiOverrides,
-      status: 'active', last_activity: nowIso, created_at: nowIso, updated_at: nowIso
+      await logActivity(tx, session.user, 'إضافة موظف', 'Employee', username, `إضافة ${name} بدور ${role}`);
+      const emp = mapEmployeeRow({
+        id, name, username, phone, email,
+        job_title: str(payload.jobTitle), role, permissions: effectivePerms, ui_overrides: uiOverrides,
+        status: 'active', last_activity: nowIso, created_at: nowIso, updated_at: nowIso
+      });
+      await enqueueSheetsMirror(tx, 'Employee', id, 'upsertEmployee', { ...emp, passwordHash: pHash, salt });
+      return emp;
     });
-    await enqueueSheetsMirror(tx, 'Employee', id, 'upsertEmployee', { ...emp, passwordHash: pHash, salt });
-    return emp;
-  });
 
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
-  return out;
+    invalidateScopes(executor, ['employees', 'dashboard', 'reports']);
+    void flushSheetsMirrorOutbox(executor).catch(() => undefined);
+    return out;
+  });
 }
 
 export async function updateEmployee(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
@@ -3424,22 +3555,49 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
       ? crmCore.normalizeUiOverrides(payload.uiOverrides)
       : (typeof crmCore.normalizeUiOverrides === 'function' ? crmCore.normalizeUiOverrides(parseJsonValue(cur.ui_overrides, {})) : {});
 
-    let nextUsername = str(cur.username);
+    let nextUsername = normalizeLoginUsername(cur.username) || str(cur.username);
     if (payload.username !== undefined) {
-      const requestedUsername = str(payload.username).trim().toLowerCase();
+      const requestedUsername = normalizeLoginUsername(payload.username);
       if (!requestedUsername) {
         throw new Error('VALIDATION_ERROR: اسم المستخدم مطلوب.');
       }
-      if (requestedUsername !== nextUsername.toLowerCase()) {
-        const dupRes = await tx.query(
-          `SELECT id FROM employees WHERE LOWER(username) = LOWER($1) AND id <> $2 LIMIT 1`,
-          [requestedUsername, empId]
-        );
-        if (dupRes.rows[0]) {
-          throw new Error('CONFLICT: اسم المستخدم مسجل بالفعل لموظف آخر.');
+      nextUsername = requestedUsername;
+    }
+
+    const nextName = payload.name !== undefined ? str(payload.name) : str(cur.name);
+    const nextPhone = payload.phone !== undefined ? str(payload.phone) : str(cur.phone);
+    const nextEmail = payload.email !== undefined ? str(payload.email) : str(cur.email);
+    const nextJob = payload.jobTitle !== undefined ? str(payload.jobTitle) : str(cur.job_title);
+    const nextStatus = payload.status !== undefined ? str(payload.status) : str(cur.status);
+
+    const normEmail = normEmpEmail(nextEmail);
+    const normPhone = normEmpPhone(nextPhone);
+    const allEmpsRes = await tx.query(`SELECT * FROM employees`);
+    const otherEmps = (allEmpsRes.rows || []).filter((r: any) => str(r.id) !== empId);
+    for (const other of otherEmps) {
+      if (normalizeLoginUsername(other.username) === nextUsername) {
+        throw new Error('CONFLICT: اسم المستخدم مسجل بالفعل لموظف آخر.');
+      }
+      if (normEmail && normEmpEmail(other.email) === normEmail) {
+        throw new Error('CONFLICT: البريد الإلكتروني مسجل بالفعل لموظف آخر.');
+      }
+      if (normPhone && normEmpPhone(other.phone) === normPhone) {
+        throw new Error('CONFLICT: رقم الجوال مسجل بالفعل لموظف آخر.');
+      }
+    }
+
+    if (str(cur.status) === 'active' && (nextRole !== str(cur.role) || nextStatus !== 'active')) {
+      if (str(cur.role) === 'developer') {
+        const activeDevs = otherEmps.filter((r: any) => str(r.role) === 'developer' && str(r.status || 'active') === 'active').length;
+        if (activeDevs < 1) {
+          throw new Error('FORBIDDEN: لا يمكن إيقاف أو تغيير دور آخر حساب مبرمج نشط في النظام.');
+        }
+      } else if (str(cur.role) === 'general_manager') {
+        const activeGms = otherEmps.filter((r: any) => str(r.role) === 'general_manager' && str(r.status || 'active') === 'active').length;
+        if (activeGms < 1) {
+          throw new Error('FORBIDDEN: لا يمكن إيقاف أو تغيير دور آخر مدير عام نشط في النظام.');
         }
       }
-      nextUsername = requestedUsername;
     }
 
     let nextSalt = str(cur.salt);
@@ -3458,11 +3616,6 @@ export async function updateEmployee(executor: DbExecutor, session: AuthSession,
     }
 
     const nowIso = new Date().toISOString();
-    const nextName = payload.name !== undefined ? str(payload.name) : str(cur.name);
-    const nextPhone = payload.phone !== undefined ? str(payload.phone) : str(cur.phone);
-    const nextEmail = payload.email !== undefined ? str(payload.email) : str(cur.email);
-    const nextJob = payload.jobTitle !== undefined ? str(payload.jobTitle) : str(cur.job_title);
-    const nextStatus = payload.status !== undefined ? str(payload.status) : str(cur.status);
 
     await tx.query(
       `UPDATE employees
@@ -3517,6 +3670,13 @@ export async function disableEmployee(executor: DbExecutor, session: AuthSession
   if (!empId) throw new Error('VALIDATION_ERROR: معرف الموظف مطلوب.');
   if (empId === session.user.id) throw new Error('FORBIDDEN: لا يمكن إيقاف حسابك الشخصي.');
 
+  const targetRes = await executor.query(`SELECT * FROM employees WHERE id = $1`, [empId]);
+  const target = targetRes.rows[0];
+  if (!target) throw new Error('NOT_FOUND: الموظف غير موجود.');
+  if (str(target.role) === 'developer' && session.user.role !== 'developer') {
+    throw new Error('FORBIDDEN: إيقاف أو تشغيل حساب المبرمج متاح للمبرمج فقط.');
+  }
+
   const status = payload.status === 'active' ? 'active' : 'disabled';
   return updateEmployee(executor, session, { employeeId: empId, status });
 }
@@ -3536,6 +3696,16 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
 
     if (str(cur.role) === 'developer' && session.user.role !== 'developer') {
       throw new Error('FORBIDDEN: حذف حساب المبرمج متاح للمبرمج فقط.');
+    }
+
+    if (str(cur.role) === 'developer' && str(cur.status || 'active') === 'active') {
+      const allEmps = await tx.query(`SELECT * FROM employees`);
+      const remainingActiveDevs = (allEmps.rows || []).filter(
+        (e: any) => str(e.id) !== empId && str(e.role) === 'developer' && str(e.status || 'active') === 'active'
+      ).length;
+      if (remainingActiveDevs < 1) {
+        throw new Error('FORBIDDEN: لا يمكن حذف آخر حساب مبرمج نشط في النظام.');
+      }
     }
 
     if (str(cur.role) === 'general_manager' && str(cur.status) === 'active') {
@@ -3986,7 +4156,7 @@ function buildScopeDatePreFilterSql(scopeInfo: any): { whereSql: string; params:
       COALESCE(
         NULLIF(start_date, ''),
         NULLIF(source_created_at, ''),
-        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')
+        to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD')
       ) LIKE $1
       OR COALESCE(NULLIF(start_date, ''), NULLIF(source_created_at, ''), '') !~ '^[0-9]{4}-'
     )`,
@@ -4469,8 +4639,8 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
         if (payload.priority) { pParams.push(str(payload.priority)); pClauses.push(`priority = $${pParams.length}`); }
         if (payload.status) { pParams.push(str(payload.status)); pClauses.push(`status = $${pParams.length}`); }
         if (payload.employeeId) { pParams.push(JSON.stringify([str(payload.employeeId)])); pClauses.push(`assigned_employee_ids @> $${pParams.length}::jsonb`); }
-        if (payload.dateFrom) { pParams.push(str(payload.dateFrom)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= $${pParams.length}`); }
-        if (payload.dateTo) { pParams.push(str(payload.dateTo)); pClauses.push(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= $${pParams.length}`); }
+        if (payload.dateFrom) { pParams.push(str(payload.dateFrom)); pClauses.push(`to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD') >= $${pParams.length}`); }
+        if (payload.dateTo) { pParams.push(str(payload.dateTo)); pClauses.push(`to_char(created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD') <= $${pParams.length}`); }
         const pWhere = pClauses.length ? `WHERE ${pClauses.join(' AND ')}` : '';
         const prbRes = await executor.query(`SELECT * FROM problems ${pWhere} ORDER BY updated_at DESC LIMIT 1000`, pParams);
         return { reportType: rType, rows: prbRes.rows.map((p) => formatProblemRow(p)), facets };

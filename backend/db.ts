@@ -366,7 +366,9 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_follow_ups_updated_desc ON follow_ups (updated_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_problems_created_desc ON problems (created_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_employees_status_role ON employees (status, role);`,
-  `CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`
+  `CREATE INDEX IF NOT EXISTS idx_sync_tombstones_type_deleted ON sync_tombstones (entity_type, deleted_at DESC);`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));`
 ];
 
 export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {

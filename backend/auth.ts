@@ -70,6 +70,45 @@ export function hashToken(rawToken: string): string {
   return sha256Hex(`TOKEN::${String(rawToken)}`);
 }
 
+export function getRiyadhDateTimeParts(input?: Date | number | string): { date: string; time: string; iso: string } {
+  const dt = input instanceof Date ? input : (input !== undefined ? new Date(input) : new Date());
+  const validDt = isNaN(dt.getTime()) ? new Date() : dt;
+  const iso = validDt.toISOString();
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Riyadh',
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+    const parts = fmt.formatToParts(validDt);
+    const map: Record<string, string> = {};
+    for (const p of parts) {
+      if (p.type !== 'literal') map[p.type] = p.value;
+    }
+    if (map.year && map.month && map.day && map.hour && map.minute && map.second) {
+      return {
+        date: `${map.year}-${map.month}-${map.day}`,
+        time: `${map.hour}:${map.minute}:${map.second}`,
+        iso
+      };
+    }
+  } catch {
+    // Fallback to fixed UTC+3 arithmetic below
+  }
+  const shifted = new Date(validDt.getTime() + 3 * 3600000);
+  const shiftedIso = shifted.toISOString();
+  return {
+    date: shiftedIso.slice(0, 10),
+    time: shiftedIso.slice(11, 19),
+    iso
+  };
+}
+
 export function normalizeLoginUsername(val: unknown): string {
   if (crmCore && typeof crmCore.normalizeLoginUsername === 'function') {
     return crmCore.normalizeLoginUsername(val);
@@ -270,7 +309,8 @@ export async function handleLogin(
   const now = new Date();
   const ttlHours = await getSessionTtlHours(executor);
   const expiresAt = new Date(now.getTime() + ttlHours * 3600000).toISOString();
-  const nowIso = now.toISOString();
+  const riyadhNow = getRiyadhDateTimeParts(now);
+  const nowIso = riyadhNow.iso;
 
   await executor.withTransaction(async (tx) => {
     await tx.query(
@@ -289,7 +329,7 @@ export async function handleLogin(
     await tx.query(
       `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, log_date, log_time, created_at)
        VALUES ($1, $2, $3, $4, 'تسجيل دخول', 'Auth', $2, 'تسجيل دخول إلى النظام عبر قاعدة البيانات السحابية', $5, $6, $7::timestamptz)`,
-      [generateId('ACT'), row.id, row.name, row.role, nowIso.slice(0, 10), nowIso.slice(11, 19), nowIso]
+      [generateId('ACT'), row.id, row.name, row.role, riyadhNow.date, riyadhNow.time, nowIso]
     );
   });
 
@@ -443,11 +483,11 @@ export async function requireAuth(executor: DbExecutor, rawToken: string): Promi
 export async function handleLogout(executor: DbExecutor, session: AuthSession): Promise<{ loggedOut: boolean }> {
   invalidateAuthSessionCache(executor, { tokenHash: session.tokenHash });
   await executor.query(`UPDATE sessions SET is_revoked = TRUE WHERE token_hash = $1`, [session.tokenHash]);
-  const nowIso = new Date().toISOString();
+  const riyadhNow = getRiyadhDateTimeParts();
   await executor.query(
     `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, log_date, log_time, created_at)
      VALUES ($1, $2, $3, $4, 'تسجيل خروج', 'Auth', $2, 'تسجيل خروج من النظام', $5, $6, $7::timestamptz)`,
-    [generateId('ACT'), session.user.id, session.user.name, session.user.role, nowIso.slice(0, 10), nowIso.slice(11, 19), nowIso]
+    [generateId('ACT'), session.user.id, session.user.name, session.user.role, riyadhNow.date, riyadhNow.time, riyadhNow.iso]
   );
   return { loggedOut: true };
 }

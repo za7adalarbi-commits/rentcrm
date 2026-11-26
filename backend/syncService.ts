@@ -462,23 +462,11 @@ function normalizeIncomingReservation(
     id: resId,
     sourceReservationId: srcResId,
     reservationNumber: resNumber,
-    referenceNumber: (isRejectedRes || isCancelledRes)
-      ? (typeof crmCore.extractExplicitReferenceNumber === 'function'
-          ? crmCore.extractExplicitReferenceNumber(
-              { ...raw, referenceNumber: merged.referenceNumber ?? raw.referenceNumber },
-              existingClient,
-              [resNumber, srcResId]
-            )
-          : str(
-              merged.referenceNumber || raw.referenceNumber || raw.reference_number ||
-              raw.refNumber || raw.ref_number || raw.sourceReference || raw.externalReference ||
-              raw.orderRef || existingClient?.referenceNumber || ''
-            ))
-      : str(
-          merged.referenceNumber || raw.referenceNumber || raw.reference_number ||
-          raw.refNumber || raw.ref_number || raw.sourceReference || raw.externalReference ||
-          raw.orderRef || existingClient?.referenceNumber || srcResId || ''
-        ),
+    referenceNumber: str(
+      merged.referenceNumber || raw.referenceNumber || raw.reference_number ||
+      raw.refNumber || raw.ref_number || raw.sourceReference || raw.externalReference ||
+      raw.orderRef || existingClient?.referenceNumber || srcResId || ''
+    ),
     sourceCreatedAt: str(merged.sourceCreatedAt),
     customerName: str(merged.customerName || 'عميل'),
     customerPhone: str(merged.customerPhone),
@@ -705,16 +693,6 @@ export async function ingestIncrementalSyncBatch(
             `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
             [existing.id, resNum]
           ).catch(() => undefined);
-          for (const tbl of ['extensions', 'assignments', 'follow_ups', 'follow_up_history', 'problems']) {
-            await tx.query(
-              `UPDATE ${tbl} SET reservation_number = $2 WHERE reservation_id = $1`,
-              [existing.id, resNum]
-            ).catch(() => undefined);
-          }
-          await tx.query(
-            `UPDATE problem_updates SET reservation_number = $2 WHERE problem_id IN (SELECT id FROM problems WHERE reservation_id = $1)`,
-            [existing.id, resNum]
-          ).catch(() => undefined);
           existingByNumber.delete(existing.reservationNumber);
           existing.reservationNumber = resNum;
           existingByNumber.set(resNum, existing);
@@ -839,16 +817,7 @@ export async function ingestIncrementalSyncBatch(
              cancelled_by_id = EXCLUDED.cancelled_by_id,
              cancelled_by_name = EXCLUDED.cancelled_by_name,
              cancelled_at = EXCLUDED.cancelled_at,
-             reference_number = CASE
-               WHEN NULLIF(EXCLUDED.reference_number, '') IS NOT NULL THEN EXCLUDED.reference_number
-               WHEN (COALESCE(EXCLUDED.is_source_rejected, FALSE) = TRUE OR COALESCE(EXCLUDED.is_source_cancelled, FALSE) = TRUE)
-                 AND (
-                   reservations.reference_number = EXCLUDED.reservation_number
-                   OR reservations.reference_number = EXCLUDED.source_reservation_id
-                 )
-               THEN ''
-               ELSE reservations.reference_number
-             END,
+             reference_number = COALESCE(NULLIF(EXCLUDED.reference_number, ''), reservations.reference_number),
              paid_amount = CASE WHEN EXCLUDED.paid_amount > 0 THEN EXCLUDED.paid_amount ELSE reservations.paid_amount END,
              delivery_failure_reason = COALESCE(NULLIF(EXCLUDED.delivery_failure_reason, ''), reservations.delivery_failure_reason),
              driver_notes = COALESCE(NULLIF(EXCLUDED.driver_notes, ''), reservations.driver_notes),
@@ -1878,60 +1847,8 @@ export async function pullFromRentalGateDirect(
       if (rccAuthoritative) {
         copy.isSourceRejected = Boolean(rccRec);
       }
-
-      const isLifecycleProtected = Boolean(
-        copy.isSourceCancelled === true ||
-        copy.isSourceRejected === true ||
-        crmCore.isRejectedStatus(copy) ||
-        crmCore.isCancelledStatus(copy)
-      );
-
-      if (isLifecycleProtected) {
-        const rawNested = (rawItem?.reservation && typeof rawItem.reservation === 'object') ? rawItem.reservation : {};
-        const rawExplicitBooking = str(
-          rawItem?.reservationNumber ?? rawItem?.reservation_number ??
-          rawItem?.reservationNo ?? rawItem?.reservation_no ??
-          rawItem?.reservationCode ?? rawItem?.reservation_code ??
-          rawItem?.bookingNumber ?? rawItem?.booking_number ??
-          rawItem?.bookingCode ?? rawItem?.booking_code ??
-          rawItem?.contractNumber ?? rawItem?.contract_number ??
-          rawItem?.orderNumber ?? rawItem?.order_number ??
-          rawItem?.code ?? rawItem?.serialNumber ?? rawItem?.serial_number ?? rawItem?.number ??
-          rawNested?.reservationNumber ?? rawNested?.reservation_number ??
-          rawNested?.reservationCode ?? rawNested?.code
-        );
-        const rawExplicitRef = str(
-          rawItem?.referenceNumber ?? rawItem?.reference_number ??
-          rawItem?.refNumber ?? rawItem?.ref_number ??
-          rawItem?.sourceReference ?? rawItem?.externalReference ??
-          rawItem?.orderRef ?? rawItem?.reference ??
-          rawNested?.referenceNumber ?? rawNested?.reference_number ??
-          rawNested?.refNumber ?? rawNested?.ref_number ?? rawNested?.reference
-        );
-        const pinnedBookingNum = (rawExplicitBooking && (!rawExplicitRef || rawExplicitBooking !== rawExplicitRef || !sid))
-          ? rawExplicitBooking
-          : (sid || rawExplicitBooking);
-        if (pinnedBookingNum) {
-          copy.reservationNumber = pinnedBookingNum;
-        }
-        const refCandidates = [
-          canRec?.referenceNumber, canRec?.reference_number, canRec?.refNumber, canRec?.ref_number,
-          rccRec?.referenceNumber, rccRec?.reference_number, rccRec?.refNumber, rccRec?.ref_number,
-          rawExplicitRef,
-          canRec?.reservationNumber, canRec?.reservation_number,
-          rccRec?.reservationNumber, rccRec?.reservation_number
-        ]
-          .map((x) => str(x))
-          .filter((val) => val && val !== pinnedBookingNum && val !== sid);
-        if (refCandidates.length > 0) {
-          copy.referenceNumber = refCandidates[0];
-        } else {
-          delete copy.referenceNumber;
-        }
-      }
-
       if (canRec) {
-        if (!isLifecycleProtected && canRec.reservationNumber) copy.referenceNumber = str(canRec.reservationNumber);
+        if (canRec.reservationNumber) copy.referenceNumber = str(canRec.reservationNumber);
         if (canRec.paid !== undefined && canRec.paid !== null) copy.paidAmount = num(canRec.paid, 0);
         if (canRec.cancelledFromDecline !== undefined) copy.cancelledFromDecline = Boolean(canRec.cancelledFromDecline);
         if (canRec.cancelledFromHold !== undefined) copy.cancelledFromHold = Boolean(canRec.cancelledFromHold);
@@ -1952,7 +1869,7 @@ export async function pullFromRentalGateDirect(
         }
       }
       if (rccRec) {
-        if (!isLifecycleProtected && rccRec.reservationNumber && !copy.referenceNumber) copy.referenceNumber = str(rccRec.reservationNumber);
+        if (rccRec.reservationNumber && !copy.referenceNumber) copy.referenceNumber = str(rccRec.reservationNumber);
         copy.rccStatus = str(rccRec.status);
         copy.rccReason = str(rccRec.reason);
         if (rccRec.companyId !== undefined && rccRec.companyId !== null && !copy.companyNumber) {

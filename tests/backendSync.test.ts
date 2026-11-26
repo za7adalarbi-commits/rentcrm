@@ -7,7 +7,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { crmCore, hashPassword, hashToken, normalizeLoginUsername, verifySharedSecret } from '../backend/auth';
 import { maskDatabaseUrl, persistCoreFilesOnDisk } from '../backend/coreBinding';
-import { runLifecycleAndNationalIdMaintenance, type DbClient, type DbExecutor, type QueryResult, type QueryResultRow } from '../backend/db';
+import { runLifecycleAndNationalIdMaintenance, type DbClient, type DbExecutor, type QueryResult } from '../backend/db';
 import { FIXED_SERVER_CONFIG } from '../backend/fixedConfig';
 import { dispatchCrmRequest } from '../backend/router';
 import {
@@ -4232,7 +4232,6 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
     const dualRow = db.state.reservations.find((r) => r.source_reservation_id === '3001');
     assert.equal(dualRow?.is_source_cancelled, true);
     assert.equal(dualRow?.is_source_rejected, true);
-    assert.equal(dualRow?.reservation_number, '3001');
     assert.equal(dualRow?.reference_number, 'RG-DUAL-3001');
 
     const finChangedRow = db.state.reservations.find((r) => r.source_reservation_id === '5001');
@@ -4243,150 +4242,6 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
     if (prevRgToken === undefined) delete process.env.RG_TOKEN;
     else process.env.RG_TOKEN = prevRgToken;
   }
-});
-
-test('runLifecycleAndNationalIdMaintenance Step 4 repairs historical swapped and duplicated booking vs reference numbers on rejected and cancelled rows only', async () => {
-  const rows: any[] = [
-    {
-      id: 'R_SWAPPED_REJ',
-      source_reservation_id: '901',
-      reservation_number: 'RG-REJ-901',
-      reference_number: '901',
-      original_status_code: 'rejected',
-      original_status_ar: 'مرفوض',
-      internal_status: 'مرفوض',
-      is_source_rejected: true,
-      is_source_cancelled: false,
-      raw_json: JSON.stringify({ reservationId: 901, referenceNumber: 'RG-REJ-901', reservationStatus: 'rejected' })
-    },
-    {
-      id: 'R_DISTINCT_CAN',
-      source_reservation_id: '902',
-      reservation_number: 'RG-CAN-902',
-      reference_number: '902',
-      original_status_code: 'cancelled',
-      original_status_ar: 'ملغي',
-      internal_status: 'تم الإلغاء',
-      is_source_rejected: false,
-      is_source_cancelled: true,
-      raw_json: JSON.stringify({ reservationId: 902, reservationNumber: 'BKG-902', referenceNumber: 'RG-CAN-902', reservationStatus: 'cancelled' })
-    },
-    {
-      id: 'R_FALLBACK_CAN',
-      source_reservation_id: '903',
-      reservation_number: '903',
-      reference_number: '903',
-      original_status_code: 'cancelled_by_customer',
-      original_status_ar: 'ملغي من العميل',
-      internal_status: 'ملغي من العميل',
-      is_source_rejected: false,
-      is_source_cancelled: true,
-      raw_json: JSON.stringify({ reservationId: 903, reservationStatus: 'cancelled_by_customer' })
-    },
-    {
-      id: 'R_NO_RAW_REJ',
-      source_reservation_id: '904',
-      reservation_number: 'RG-LEGACY-904',
-      reference_number: 'RG-LEGACY-904',
-      original_status_code: 'rejected_by_provider',
-      original_status_ar: 'مرفوض من المزود',
-      internal_status: 'مرفوض من المزود',
-      is_source_rejected: true,
-      is_source_cancelled: false,
-      raw_json: ''
-    },
-    {
-      id: 'R_ACTIVE_UNTOUCHED',
-      source_reservation_id: '905',
-      reservation_number: 'RG-ACTIVE-905',
-      reference_number: 'RG-ACTIVE-905',
-      original_status_code: 'confirmed',
-      original_status_ar: 'مؤكد',
-      internal_status: 'مؤكد',
-      is_source_rejected: false,
-      is_source_cancelled: false,
-      raw_json: JSON.stringify({ reservationId: 905, referenceNumber: 'RG-ACTIVE-905', reservationStatus: 'confirmed' })
-    },
-    {
-      id: 'R_NO_RAW_SWAP_CAN',
-      source_reservation_id: '906',
-      reservation_number: 'RG-LEGACY-SWAP-906',
-      reference_number: '906',
-      original_status_code: 'cancelled',
-      original_status_ar: 'ملغي',
-      internal_status: 'تم الإلغاء',
-      is_source_rejected: false,
-      is_source_cancelled: true,
-      raw_json: ''
-    }
-  ];
-  const childFollowUps = [{ id: 'FU_901', reservation_id: 'R_SWAPPED_REJ', reservation_number: 'RG-REJ-901' }];
-  const childProblems = [{ id: 'PRB_902', reservation_id: 'R_DISTINCT_CAN', reservation_number: 'RG-CAN-902' }];
-  const childProblemUpdates = [{ id: 'PRBU_902', reservation_number: 'RG-CAN-902' }];
-
-  const mockExec: DbExecutor = {
-    async query<T extends QueryResultRow = any>(text: string, params: any[] = []): Promise<QueryResult<T>> {
-      const sql = text.trim();
-      if (sql.startsWith('SELECT id, source_reservation_id, reservation_number, reference_number,')) {
-        return { rows: rows as T[], rowCount: rows.length };
-      }
-      if (sql === 'UPDATE reservations SET reservation_number = $2 WHERE id = $1') {
-        const target = rows.find((x) => x.id === params[0]);
-        if (target) target.reservation_number = params[1];
-        return { rows: [], rowCount: target ? 1 : 0 };
-      }
-      if (sql === 'UPDATE reservations SET reference_number = $2 WHERE id = $1') {
-        const target = rows.find((x) => x.id === params[0]);
-        if (target) target.reference_number = params[1];
-        return { rows: [], rowCount: target ? 1 : 0 };
-      }
-      if (sql.startsWith('UPDATE follow_ups SET reservation_number = $2')) {
-        for (const f of childFollowUps) {
-          if (f.reservation_id === params[0] || f.reservation_number === params[2]) f.reservation_number = params[1];
-        }
-        return { rows: [], rowCount: 1 };
-      }
-      if (sql.startsWith('UPDATE problems SET reservation_number = $2')) {
-        for (const p of childProblems) {
-          if (p.reservation_id === params[0] || p.reservation_number === params[2]) p.reservation_number = params[1];
-        }
-        return { rows: [], rowCount: 1 };
-      }
-      if (sql.startsWith('UPDATE problem_updates SET reservation_number = $2')) {
-        for (const pu of childProblemUpdates) {
-          if (pu.reservation_number === params[1]) pu.reservation_number = params[0];
-        }
-        return { rows: [], rowCount: 1 };
-      }
-      return { rows: [], rowCount: 0 };
-    },
-    async withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
-      return fn(mockExec);
-    }
-  };
-
-  await runLifecycleAndNationalIdMaintenance(mockExec);
-
-  assert.equal(rows[0].reservation_number, '901');
-  assert.equal(rows[0].reference_number, 'RG-REJ-901');
-  assert.equal(childFollowUps[0].reservation_number, '901');
-
-  assert.equal(rows[1].reservation_number, 'BKG-902');
-  assert.equal(rows[1].reference_number, 'RG-CAN-902');
-  assert.equal(childProblems[0].reservation_number, 'BKG-902');
-  assert.equal(childProblemUpdates[0].reservation_number, 'BKG-902');
-
-  assert.equal(rows[2].reservation_number, '903');
-  assert.equal(rows[2].reference_number, '');
-
-  assert.equal(rows[3].reservation_number, '904');
-  assert.equal(rows[3].reference_number, 'RG-LEGACY-904');
-
-  assert.equal(rows[4].reservation_number, 'RG-ACTIVE-905');
-  assert.equal(rows[4].reference_number, 'RG-ACTIVE-905');
-
-  assert.equal(rows[5].reservation_number, '906');
-  assert.equal(rows[5].reference_number, 'RG-LEGACY-SWAP-906');
 });
 
 

@@ -544,4 +544,6 @@ CREATE INDEX IF NOT EXISTS idx_reservations_cancelled_at ON reservations (cancel
 CREATE INDEX IF NOT EXISTS idx_reservations_reference_number ON reservations (reference_number) WHERE reference_number <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_is_source_cancelled ON reservations (is_source_cancelled) WHERE is_source_cancelled = TRUE;
 CREATE INDEX IF NOT EXISTS idx_reservations_is_source_rejected ON reservations (is_source_rejected) WHERE is_source_rejected = TRUE;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));
 `;
