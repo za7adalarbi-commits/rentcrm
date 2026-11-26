@@ -798,7 +798,7 @@
           var now = Date.now();
           (snap.kvEntries || []).forEach(function (entry) {
             if (entry && entry.key && entry.response && entry.staleUntil && now < entry.staleUntil && !apiResponseCache[entry.key]) {
-              apiResponseCache[entry.key] = entry;
+              apiResponseCache[entry.key] = sanitizePersistedCacheEntry(entry, entry.ns || ns);
             }
           });
           if (Array.isArray(snap.reservations) && snap.reservations.length > 0) {
@@ -867,6 +867,27 @@
     return readyPromisesByNs[ns];
   }
 
+  function sanitizePersistedCacheEntry(entry, fallbackNs) {
+    if (!entry || typeof entry !== 'object') return entry;
+    var copy = Object.assign({}, entry);
+    delete copy.swrValidInPage;
+    var entryNs = copy.ns || fallbackNs || getCacheNamespace();
+    if (copy.response && copy.response.success && copy.response.data && typeof copy.response.data === 'object') {
+      if (copy.scope === 'notifications' && Array.isArray(copy.response.data.items)) {
+        copy.response = Object.assign({}, copy.response, {
+          data: sanitizeNotificationsForNs(entryNs, copy.response.data)
+        });
+      } else if (copy.response.data.notifications && typeof copy.response.data.notifications === 'object') {
+        copy.response = Object.assign({}, copy.response, {
+          data: Object.assign({}, copy.response.data, {
+            notifications: sanitizeNotificationsForNs(entryNs, copy.response.data.notifications)
+          })
+        });
+      }
+    }
+    return copy;
+  }
+
   function hydrateApiCache() {
     try {
       if (typeof sessionStorage === 'undefined') return;
@@ -875,10 +896,11 @@
       var parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object') return;
       var now = Date.now();
+      var fallbackNs = getCacheNamespace();
       Object.keys(parsed).forEach(function (k) {
         var entry = parsed[k];
         if (entry && entry.response && entry.staleUntil && now < entry.staleUntil) {
-          apiResponseCache[k] = entry;
+          apiResponseCache[k] = sanitizePersistedCacheEntry(entry, fallbackNs);
         }
       });
     } catch (e) {}
@@ -890,10 +912,13 @@
       var now = Date.now();
       var currentNs = getCacheNamespace();
       var idbEntries = [];
+      var cleanSnapshotByKey = {};
       Object.keys(apiResponseCache).forEach(function (k) {
         var entry = apiResponseCache[k];
         if (entry && entry.response && entry.response.success && now < (entry.staleUntil || entry.expiresAt || 0)) {
-          idbEntries.push(Object.assign({}, entry, { key: k, ns: entry.ns || currentNs }));
+          var cleanEntry = sanitizePersistedCacheEntry(Object.assign({}, entry, { key: k, ns: entry.ns || currentNs }), currentNs);
+          idbEntries.push(cleanEntry);
+          cleanSnapshotByKey[k] = cleanEntry;
         }
       });
       if (root.RGIdbCache && idbEntries.length > 0) {
@@ -903,7 +928,7 @@
       if (typeof sessionStorage === 'undefined') return idbWritePromise;
       var keys = idbEntries.map(function (e) { return e.key; }).filter(function (k) {
         try {
-          var s = JSON.stringify(apiResponseCache[k]);
+          var s = JSON.stringify(cleanSnapshotByKey[k]);
           return !s || s.length <= 200000;
         } catch (_e) {
           return false;
@@ -911,12 +936,12 @@
       });
       if (keys.length > 35) {
         keys.sort(function (a, b) {
-          return (apiResponseCache[b].storedAt || 0) - (apiResponseCache[a].storedAt || 0);
+          return (cleanSnapshotByKey[b].storedAt || 0) - (cleanSnapshotByKey[a].storedAt || 0);
         });
         keys = keys.slice(0, 35);
       }
       var snapshot = {};
-      keys.forEach(function (k) { snapshot[k] = apiResponseCache[k]; });
+      keys.forEach(function (k) { snapshot[k] = cleanSnapshotByKey[k]; });
       var serialized = JSON.stringify(snapshot);
       if (serialized.length <= 1200000) {
         sessionStorage.setItem(SESSION_CACHE_KEY, serialized);
@@ -4247,7 +4272,8 @@
         titlePrefix + ' (@' + senderName + ')',
         senderName + ' أشار إليك: "' + snippet + '"',
         entityType,
-        entityId
+        entityId,
+        'mention|' + entityType + '|' + entityId + '|' + ((senderUser && senderUser.id) || '') + '|' + target.id + '|' + snippet.slice(0, 40)
       );
     });
     return mentioned;
@@ -6035,9 +6061,15 @@
       }
 
       case 'getNotifications': {
+        var clearBeforeRaw = db.settings && db.settings['notif_deleted_all_before_' + session.employeeId];
+        var clearBeforeMs = clearBeforeRaw ? Date.parse(String(clearBeforeRaw)) : NaN;
         var myNotifs = (db.notifications || []).filter(function (n) {
           if (!n || n.deletedAt) return false;
           if (n.dismissedBy && n.dismissedBy[session.employeeId]) return false;
+          if (!isNaN(clearBeforeMs) && clearBeforeMs > 0 && n.createdAt) {
+            var cMs = Date.parse(String(n.createdAt));
+            if (!isNaN(cMs) && cMs <= clearBeforeMs) return false;
+          }
           return n.recipientEmployeeId === session.employeeId ||
             (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
         });
@@ -6081,6 +6113,10 @@
           }
           deletedNtfIdsSb.push(n.id);
         });
+        if (delAllNtf) {
+          db.settings = db.settings || {};
+          db.settings['notif_deleted_all_before_' + session.employeeId] = delNowIso;
+        }
         saveSandboxDb(db);
         var freshNotifRes = sandboxExecute('getNotifications', token, {});
         var freshMyNotifs = (freshNotifRes && freshNotifRes.success && freshNotifRes.data && freshNotifRes.data.items) || [];
@@ -6093,6 +6129,7 @@
             deletedCount: deletedNtfIdsSb.length,
             deletedIds: deletedNtfIdsSb,
             deletedAllBefore: delAllNtf ? delNowIso : '',
+            deletedAllNotificationsBefore: delAllNtf ? delNowIso : '',
             items: freshMyNotifs.slice(0, 60),
             unreadCount: freshUnread
           },
@@ -7208,6 +7245,8 @@
         var callShortcutsDelta = (settingsChangedDelta && core && core.normalizeCallWrapupShortcutsConfig)
           ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts)
           : undefined;
+        var clearAllDeltaIso = String((db.settings && db.settings['notif_deleted_all_before_' + session.employeeId]) || '');
+        var clearAllDeltaBefore = (clearAllDeltaIso && Date.parse(clearAllDeltaIso) > sinceMs) ? clearAllDeltaIso : '';
         return {
           success: true,
           message: '',
@@ -7219,7 +7258,7 @@
             changedProblems: changedPrb,
             changedEmployees: changedEmps,
             deletedNotificationIds: delNtfIdsDelta,
-            deletedAllNotificationsBefore: '',
+            deletedAllNotificationsBefore: clearAllDeltaBefore,
             changedSettings: settingsChangedDelta,
             settingsUpdatedAt: settingsChangedDelta ? setUpdAt : '',
             todayRadarCounts: (deltaTodayRadar && deltaTodayRadar.success && deltaTodayRadar.data) ? deltaTodayRadar.data.counts : null,
@@ -8143,10 +8182,11 @@
       var cachedEntry = apiResponseCache[cacheKey];
       var nowTs = Date.now();
       var isPageValidated = !transportUrl || Boolean(revalidatedInPage[cacheKey]);
+      var forceFreshNotifReload = Boolean(transportUrl && action === 'getNotifications' && !isPageValidated);
       if (isPageValidated && nowTs < cachedEntry.expiresAt) {
         return cachedEntry.response;
       }
-      if ((isPageValidated || cachedEntry.swrValidInPage) && nowTs < (cachedEntry.staleUntil || 0)) {
+      if (!forceFreshNotifReload && (isPageValidated || cachedEntry.swrValidInPage) && nowTs < (cachedEntry.staleUntil || 0)) {
         if (!inFlightRequests[cacheKey]) {
           startNetworkOrSandbox().catch(function () {});
         }
@@ -8688,7 +8728,7 @@
             var confIds = (parsed.data && Array.isArray(parsed.data.deletedIds))
               ? parsed.data.deletedIds
               : (payload && (payload.notificationId || payload.id) ? [payload.notificationId || payload.id] : []);
-            var confDelAll = (parsed.data && parsed.data.deletedAllBefore) || (payload && payload.deleteAll ? Date.now() : 0);
+            var confDelAll = (parsed.data && (parsed.data.deletedAllNotificationsBefore || parsed.data.deletedAllBefore)) || (payload && payload.deleteAll ? Date.now() : 0);
             recordNotifTombstones(ns, confIds, confDelAll, { confirmed: true });
             var confirmedNotifs = (parsed.data && Array.isArray(parsed.data.items))
               ? sanitizeNotificationsForNs(ns, { items: parsed.data.items, unreadCount: Number(parsed.data.unreadCount || 0) })

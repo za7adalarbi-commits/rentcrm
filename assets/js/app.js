@@ -2814,10 +2814,10 @@
               root.RGApi.applyOptimisticMutation('deleteNotification', { deleteAll: true });
             }
             pop._rgRerender();
-            showToast(isEnNotif ? 'All notifications deleted.' : 'تم حذف جميع الإشعارات.');
+            toast(isEnNotif ? 'All notifications deleted.' : 'تم حذف جميع الإشعارات.');
             return root.RGApi.callApi('deleteNotification', { deleteAll: true, _keepOptimisticCache: true }).then(function (resp) {
               if (!resp || !resp.success) {
-                showToast((resp && resp.message) || (isEnNotif ? 'Failed to delete notifications.' : 'تعذر حذف الإشعارات.'), true);
+                toast((resp && resp.message) || (isEnNotif ? 'Failed to delete notifications.' : 'تعذر حذف الإشعارات.'), true);
                 notifUiEpoch += 1;
                 refreshNotifications({ forceRefresh: true });
               } else if (opEpoch === notifUiEpoch && resp.data && Array.isArray(resp.data.items)) {
@@ -2825,7 +2825,7 @@
                 if (document.body.contains(pop)) pop._rgRerender();
               }
             }).catch(function () {
-              showToast(isEnNotif ? 'Network error deleting notifications.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعارات.', true);
+              toast(isEnNotif ? 'Network error deleting notifications.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعارات.', true);
               notifUiEpoch += 1;
               refreshNotifications({ forceRefresh: true });
             });
@@ -2848,10 +2848,10 @@
               root.RGApi.applyOptimisticMutation('deleteNotification', { notificationId: delId });
             }
             pop._rgRerender();
-            showToast(isEnNotif ? 'Notification deleted.' : 'تم حذف الإشعار.');
+            toast(isEnNotif ? 'Notification deleted.' : 'تم حذف الإشعار.');
             return root.RGApi.callApi('deleteNotification', { notificationId: delId, _keepOptimisticCache: true }).then(function (resp) {
               if (!resp || !resp.success) {
-                showToast((resp && resp.message) || (isEnNotif ? 'Failed to delete notification.' : 'تعذر حذف الإشعار.'), true);
+                toast((resp && resp.message) || (isEnNotif ? 'Failed to delete notification.' : 'تعذر حذف الإشعار.'), true);
                 notifUiEpoch += 1;
                 refreshNotifications({ forceRefresh: true });
               } else if (opEpoch === notifUiEpoch && resp.data && Array.isArray(resp.data.items)) {
@@ -2859,7 +2859,7 @@
                 if (document.body.contains(pop)) pop._rgRerender();
               }
             }).catch(function () {
-              showToast(isEnNotif ? 'Network error deleting notification.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعار.', true);
+              toast(isEnNotif ? 'Network error deleting notification.' : 'تعذر الاتصال بالخادم أثناء حذف الإشعار.', true);
               notifUiEpoch += 1;
               refreshNotifications({ forceRefresh: true });
             });
@@ -4764,7 +4764,9 @@
         delete state.myFollowUps;
         delete state.dashboard;
         clearRouteFiltersStorage();
+        notifUiEpoch += 1;
         state.notifications = { items: [], unreadCount: 0 };
+        lastFingerprints.notifications = '';
         resetEmployeesState();
         state.roleUiDefaults = {};
         state.statsControlConfig = { excludedFromStatsEmployeeIds: [] };
