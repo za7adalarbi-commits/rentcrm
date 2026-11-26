@@ -1,8 +1,13 @@
 import { crmCore, generateId, parseJsonArray } from './auth.js';
+import {
+  computeNextScheduledRunAt,
+  deriveWorkerStatus,
+  normalizeAutoSyncConfig
+} from './autoSyncLogic.js';
 import { invalidateAndBumpVersion } from './cache.js';
 import type { DbClient, DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
-import { broadcastCrmEvent } from './realtime.js';
+import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
 import { resolveServerConfig } from './serverConfig.js';
 
 export interface SyncActor {
@@ -1734,18 +1739,20 @@ export async function ingestIncrementalSyncBatch(
     if (importedCount > 0 || updatedCount > 0 || extensionsCount > 0) {
       const version = await invalidateAndBumpVersion(
         executor,
-        ['reservations', 'todayRadar', 'dashboard', 'reports', 'activity', 'sync'],
+        ['reservations', 'todayRadar', 'dashboard', 'reports', 'employees', 'activity', 'sync'],
         true
       ).catch(() => 0);
-      broadcastCrmEvent({
-        type: 'delta',
+      const syncRtEvent = {
+        type: 'delta' as const,
         action: 'ingestSyncBatch',
-        scopes: ['reservations', 'todayRadar', 'dashboard', 'reports', 'sync'],
+        scopes: ['reservations', 'todayRadar', 'dashboard', 'reports', 'employees', 'sync'],
         entityIds: changedReservations.map((r: any) => str(r?.id)).filter(Boolean).slice(0, 50),
         actorId: actor.id,
         version: version || undefined,
         at: finishedAt
-      });
+      };
+      broadcastCrmEvent(syncRtEvent);
+      await publishPgNotify(executor, syncRtEvent).catch(() => undefined);
     }
     const missingIdResNumsOut = changedReservations
       .filter((r) => !str(r.customerIdNumber))
@@ -2316,16 +2323,227 @@ export function sanitizeExcludedStatusesList(rawList: unknown): string[] {
 
 let activePullInFlight = false;
 
+export async function ensureWorkerStateRow(executor: DbExecutor): Promise<void> {
+  try {
+    await executor.query(
+      `INSERT INTO sync_worker_state (id) VALUES ('primary') ON CONFLICT (id) DO NOTHING`
+    );
+  } catch {
+    // Ignore when running against legacy test mock executors without sync_worker_state
+  }
+}
+
+export async function readWorkerStateRow(executor: DbExecutor): Promise<Record<string, any> | null> {
+  try {
+    await ensureWorkerStateRow(executor);
+    const res = await executor.query(`SELECT * FROM sync_worker_state WHERE id = 'primary' LIMIT 1`);
+    return res.rows[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function readNormalizedSyncSettings(executor: DbExecutor) {
+  try {
+    const res = await executor.query<{ key: string; value: string }>(
+      `SELECT key, value FROM settings WHERE key IN (
+        'auto_sync_enabled',
+        'auto_sync_interval_seconds',
+        'auto_sync_interval_value',
+        'auto_sync_interval_unit',
+        'auto_sync_interval_hours',
+        'auto_sync_interval_minutes'
+      )`
+    );
+    const map: Record<string, any> = {};
+    for (const r of res.rows || []) {
+      let v: any = r.value;
+      if (v === 'true') v = true;
+      else if (v === 'false') v = false;
+      map[r.key] = v;
+    }
+    return normalizeAutoSyncConfig(map);
+  } catch {
+    return normalizeAutoSyncConfig({});
+  }
+}
+
+export async function emitSyncWorkerStatusRealtime(
+  executor: DbExecutor,
+  action = 'syncWorkerStatus',
+  actorId = 'SYSTEM_AUTO_SYNC'
+): Promise<void> {
+  const evt = {
+    type: 'delta' as const,
+    action,
+    scopes: ['sync'],
+    actorId,
+    at: new Date().toISOString()
+  };
+  broadcastCrmEvent(evt);
+  await publishPgNotify(executor, evt).catch(() => undefined);
+}
+
+export async function acquireSyncDistributedLock(
+  executor: DbExecutor,
+  lockOwner: string,
+  leaseSeconds = 300
+): Promise<boolean> {
+  if (activePullInFlight) return false;
+  await ensureWorkerStateRow(executor);
+  try {
+    const res = await executor.query(
+      `UPDATE sync_worker_state
+       SET is_syncing = TRUE,
+           locked_by = $1,
+           lock_expires_at = NOW() + ($2::text || ' seconds')::interval,
+           updated_at = NOW()
+       WHERE id = 'primary' AND (is_syncing = FALSE OR lock_expires_at IS NULL OR lock_expires_at < NOW())
+       RETURNING id`,
+      [lockOwner, String(Math.max(30, Math.round(leaseSeconds)))]
+    );
+    if (Array.isArray(res.rows) && res.rows.length === 0) {
+      const verifyRow = await executor.query(
+        `SELECT is_syncing, lock_expires_at FROM sync_worker_state WHERE id = 'primary' LIMIT 1`
+      ).catch(() => ({ rows: [] as any[] }));
+      if (!Array.isArray(verifyRow.rows) || verifyRow.rows.length === 0) {
+        return !activePullInFlight;
+      }
+      return false;
+    }
+    return true;
+  } catch {
+    // Mock executor fallback: rely on activePullInFlight
+    return !activePullInFlight;
+  }
+}
+
+export async function releaseSyncDistributedLock(
+  executor: DbExecutor,
+  lockOwner: string
+): Promise<void> {
+  try {
+    await executor.query(
+      `UPDATE sync_worker_state
+       SET is_syncing = FALSE,
+           locked_by = '',
+           lock_expires_at = NULL,
+           updated_at = NOW()
+       WHERE id = 'primary' AND (locked_by = $1 OR locked_by = '')`,
+      [lockOwner]
+    );
+  } catch {
+    // Ignore on legacy mock executors
+  }
+}
+
+export async function recordWorkerSyncOutcome(
+  executor: DbExecutor,
+  params: {
+    triggerType: 'auto' | 'manual';
+    startedAt: string;
+    finishedAt: string;
+    durationMs: number;
+    ok: boolean;
+    importedCount?: number;
+    updatedCount?: number;
+    extensionsCount?: number;
+    errorMessage?: string;
+  }
+): Promise<void> {
+  try {
+    const [cfg, prevRow] = await Promise.all([
+      readNormalizedSyncSettings(executor),
+      readWorkerStateRow(executor)
+    ]);
+    const prevConsec = num(prevRow?.consecutive_errors, 0);
+    const nextConsec = params.ok ? 0 : prevConsec + 1;
+    const nextErrMsg = params.ok ? '' : str(params.errorMessage).slice(0, 500);
+    const nextStatus = deriveWorkerStatus({
+      enabled: cfg.enabled,
+      isSyncing: false,
+      consecutiveErrors: nextConsec,
+      lastError: nextErrMsg
+    });
+    const nextRunAt = computeNextScheduledRunAt({
+      enabled: cfg.enabled,
+      intervalSeconds: cfg.intervalSeconds,
+      nowMs: Date.parse(params.finishedAt) || Date.now(),
+      currentNextRunAt: prevRow?.next_run_at || null,
+      lastRunAt: params.startedAt,
+      consecutiveErrors: nextConsec,
+      reason:
+        params.triggerType === 'manual'
+          ? 'manual_completed'
+          : params.ok
+            ? 'auto_completed'
+            : 'auto_error'
+    });
+
+    await executor.query(
+      `UPDATE sync_worker_state
+       SET status = $1,
+           is_syncing = FALSE,
+           locked_by = '',
+           lock_expires_at = NULL,
+           auto_sync_enabled = $2,
+           interval_seconds = $3,
+           interval_value = $4,
+           interval_unit = $5,
+           last_run_at = $6::timestamptz,
+           last_success_at = COALESCE($7::timestamptz, last_success_at),
+           next_run_at = $8::timestamptz,
+           last_duration_ms = $9,
+           last_imported_count = CASE WHEN $10 THEN $11 ELSE last_imported_count END,
+           last_updated_count = CASE WHEN $10 THEN $12 ELSE last_updated_count END,
+           last_extensions_count = CASE WHEN $10 THEN $13 ELSE last_extensions_count END,
+           error_count = error_count + $14,
+           consecutive_errors = $15,
+           last_error = $16,
+           last_trigger_type = $17,
+           updated_at = NOW()
+       WHERE id = 'primary'`,
+      [
+        nextStatus,
+        cfg.enabled,
+        cfg.intervalSeconds,
+        cfg.value,
+        cfg.unit,
+        params.startedAt,
+        params.ok ? params.finishedAt : null,
+        nextRunAt,
+        Math.max(0, Math.round(params.durationMs)),
+        params.ok,
+        num(params.importedCount, 0),
+        num(params.updatedCount, 0),
+        num(params.extensionsCount, 0),
+        params.ok ? 0 : 1,
+        nextConsec,
+        nextErrMsg,
+        params.triggerType
+      ]
+    );
+  } catch {
+    // Non-fatal on mock executors
+  }
+}
+
 export async function pullFromRentalGateDirect(
   executor: DbExecutor,
   actor: SyncActor,
   payload: Record<string, any> = {},
   fetchFn: typeof fetch = fetch
 ): Promise<SyncIngestResult> {
-  if (activePullInFlight) {
+  const triggerType: 'auto' | 'manual' = payload?.triggerType === 'auto' ? 'auto' : 'manual';
+  const lockOwner = `${triggerType}_${actor?.id || 'system'}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const acquired = await acquireSyncDistributedLock(executor, lockOwner, 300);
+  if (!acquired) {
     throw new Error('SYNC_IN_PROGRESS: عملية المزامنة قيد التنفيذ بالفعل، يرجى الانتظار حتى اكتمال السحب الحالي.');
   }
   activePullInFlight = true;
+  const pullStartedMs = Date.now();
+  const pullStartedIso = new Date(pullStartedMs).toISOString();
+  void emitSyncWorkerStatusRealtime(executor, 'syncWorkerStarted', actor?.id || 'SYSTEM_AUTO_SYNC').catch(() => undefined);
   try {
     const serverCfg = await resolveServerConfig(executor);
     const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
@@ -2953,14 +3171,58 @@ export async function pullFromRentalGateDirect(
       void flushSheetsMirrorOutbox(executor, fetchFn).catch(() => undefined);
     }
 
+    const finishedIso = new Date().toISOString();
+    await recordWorkerSyncOutcome(executor, {
+      triggerType,
+      startedAt: pullStartedIso,
+      finishedAt: finishedIso,
+      durationMs: Date.now() - pullStartedMs,
+      ok: true,
+      importedCount: syncResult.importedCount,
+      updatedCount: syncResult.updatedCount,
+      extensionsCount: syncResult.extensionsCount
+    });
+    await emitSyncWorkerStatusRealtime(executor, 'syncWorkerCompleted', actor?.id || 'SYSTEM_AUTO_SYNC').catch(() => undefined);
+
     return {
       ...syncResult,
       fetchedCount: resPaged.items.length,
       excludedFilteredCount,
       rangeFilteredCount
     };
+  } catch (err: any) {
+    const errIso = new Date().toISOString();
+    const errMsg = String(err?.message || 'فشلت عملية السحب من Rental Gate API.');
+    const durationMs = Math.max(1, Date.now() - pullStartedMs);
+    await executor.query(
+      `INSERT INTO sync_log (
+        id, triggered_by_id, triggered_by_name, status, imported_count, updated_count,
+        extensions_count, pages_fetched, error_message, duration_ms, started_at, finished_at
+      ) VALUES ($1,$2,$3,'error',0,0,0,0,$4,$5,$6::timestamptz,$7::timestamptz)`,
+      [
+        generateId('SYNC'),
+        str(actor?.id || 'SYSTEM_AUTO_SYNC'),
+        str(actor?.name || 'المزامنة التلقائية'),
+        errMsg.slice(0, 500),
+        durationMs,
+        pullStartedIso,
+        errIso
+      ]
+    ).catch(() => undefined);
+    await logBackendError(executor, 'syncService', `pullFromRentalGateDirect:${triggerType}`, err).catch(() => undefined);
+    await recordWorkerSyncOutcome(executor, {
+      triggerType,
+      startedAt: pullStartedIso,
+      finishedAt: errIso,
+      durationMs,
+      ok: false,
+      errorMessage: errMsg
+    });
+    await emitSyncWorkerStatusRealtime(executor, 'syncWorkerError', actor?.id || 'SYSTEM_AUTO_SYNC').catch(() => undefined);
+    throw err;
   } finally {
     activePullInFlight = false;
+    await releaseSyncDistributedLock(executor, lockOwner).catch(() => undefined);
   }
 }
 

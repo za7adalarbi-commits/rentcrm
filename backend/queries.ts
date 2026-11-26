@@ -33,6 +33,17 @@ import {
   getSetupCapabilities as readSetupCapabilities
 } from './setupService.js';
 import {
+  computeNextScheduledRunAt,
+  deriveWorkerStatus,
+  normalizeAutoSyncConfig,
+  validateAutoSyncSettingsInput
+} from './autoSyncLogic.js';
+import {
+  getAutoSyncWorkerRuntimeStatus,
+  notifyAutoSyncConfigChanged
+} from './autoSyncWorker.js';
+import {
+  emitSyncWorkerStatusRealtime,
   enqueueSheetsMirror,
   extractRentalGatePagePayload,
   flushSheetsMirrorOutbox,
@@ -41,6 +52,7 @@ import {
   mapExtensionRowToClient,
   mapReservationRowToClient,
   pullFromRentalGateDirect,
+  readWorkerStateRow,
   retryFailedSyncRecords,
   sanitizeExcludedStatusesList
 } from './syncService.js';
@@ -4310,15 +4322,18 @@ export async function deleteNotification(executor: DbExecutor, session: AuthSess
 
 export async function getSettings(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const [map, serverCfg] = await Promise.all([
+  const [map, serverCfg, workerRow] = await Promise.all([
     getSettingsMap(executor),
-    resolveServerConfig(executor)
+    resolveServerConfig(executor),
+    readWorkerStateRow(executor)
   ]);
   const dbUrl = getDatabaseUrl();
+  const syncCfg = normalizeAutoSyncConfig(map);
   const syncInterval = crmCore.normalizeAutoSyncInterval(
     map.auto_sync_interval_hours,
     map.auto_sync_interval_minutes
   );
+  const syncWorkerState = buildWorkerTelemetrySummary(workerRow, syncCfg, []);
   return {
     ...map,
     excluded_statuses: sanitizeExcludedStatusesList(map.excluded_statuses),
@@ -4330,9 +4345,13 @@ export async function getSettings(executor: DbExecutor, session: AuthSession) {
     connection_mode: serverCfg.mode || 'neon',
     gas_webapp_url: serverCfg.gasWebAppUrl,
     rg_api_base_url: serverCfg.rgApiBaseUrl,
-    auto_sync_enabled: map.auto_sync_enabled !== false,
+    auto_sync_enabled: syncCfg.enabled,
+    auto_sync_interval_seconds: syncCfg.intervalSeconds,
+    auto_sync_interval_value: syncCfg.value,
+    auto_sync_interval_unit: syncCfg.unit,
     auto_sync_interval_hours: syncInterval.hours,
     auto_sync_interval_minutes: syncInterval.minutes,
+    syncWorkerState,
     hasRgToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
     hasDirectToken: Boolean(serverCfg.rgToken),
     hasSyncSecret: Boolean(serverCfg.syncApiSecret),
@@ -4379,6 +4398,9 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     payload.role_ui_defaults !== undefined ||
     payload.stats_control_config !== undefined ||
     payload.call_wrapup_shortcuts !== undefined ||
+    payload.auto_sync_interval_seconds !== undefined ||
+    payload.auto_sync_interval_value !== undefined ||
+    payload.auto_sync_interval_unit !== undefined ||
     payload.auto_sync_interval_hours !== undefined ||
     payload.auto_sync_interval_minutes !== undefined
   );
@@ -4444,13 +4466,36 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
       handoverChangedDiff = { field: 'handover_settings', label: 'إعدادات تسليم الوردية', before: bSummary, after: aSummary };
     }
   }
-  if (payload.auto_sync_interval_hours !== undefined || payload.auto_sync_interval_minutes !== undefined) {
-    const interval = crmCore.normalizeAutoSyncInterval(
-      payload.auto_sync_interval_hours !== undefined ? payload.auto_sync_interval_hours : prevMap.auto_sync_interval_hours,
-      payload.auto_sync_interval_minutes !== undefined ? payload.auto_sync_interval_minutes : prevMap.auto_sync_interval_minutes
-    );
-    updates.push(['auto_sync_interval_hours', String(interval.hours)]);
-    updates.push(['auto_sync_interval_minutes', String(interval.minutes)]);
+
+  const hasAutoSyncIntervalChange = Boolean(
+    payload.auto_sync_interval_seconds !== undefined ||
+    payload.auto_sync_interval_value !== undefined ||
+    payload.auto_sync_interval_unit !== undefined ||
+    payload.auto_sync_interval_hours !== undefined ||
+    payload.auto_sync_interval_minutes !== undefined
+  );
+  const nextAutoEnabled =
+    typeof payload.auto_sync_enabled === 'boolean'
+      ? payload.auto_sync_enabled
+      : prevMap.auto_sync_enabled !== false;
+
+  if (hasAutoSyncIntervalChange) {
+    const valRes = validateAutoSyncSettingsInput({
+      enabled: nextAutoEnabled,
+      value: payload.auto_sync_interval_value,
+      unit: payload.auto_sync_interval_unit,
+      intervalSeconds: payload.auto_sync_interval_seconds,
+      hours: payload.auto_sync_interval_hours,
+      minutes: payload.auto_sync_interval_minutes
+    });
+    if (!valRes.valid) {
+      throw new Error(valRes.error);
+    }
+    updates.push(['auto_sync_interval_seconds', String(valRes.intervalSeconds)]);
+    updates.push(['auto_sync_interval_value', String(valRes.value)]);
+    updates.push(['auto_sync_interval_unit', String(valRes.unit)]);
+    updates.push(['auto_sync_interval_hours', String(valRes.legacyHours)]);
+    updates.push(['auto_sync_interval_minutes', String(valRes.legacyMinutes)]);
   }
 
   const settingDiffs = updates
@@ -4478,7 +4523,52 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     await logActivity(tx, session.user, 'تحديث الإعدادات', 'Settings', 'system', 'تحديث إعدادات النظام في قاعدة البيانات', settingDiffs);
   });
 
-  invalidateScopes(executor, ['settings', 'dashboard', 'reports']);
+  if (typeof payload.auto_sync_enabled === 'boolean' || hasAutoSyncIntervalChange) {
+    try {
+      const [freshMap, prevWorker] = await Promise.all([
+        getSettingsMap(executor),
+        readWorkerStateRow(executor)
+      ]);
+      const finalCfg = normalizeAutoSyncConfig(freshMap);
+      const nextRunAt = computeNextScheduledRunAt({
+        enabled: finalCfg.enabled,
+        intervalSeconds: finalCfg.intervalSeconds,
+        nowMs: Date.now(),
+        currentNextRunAt: prevWorker?.next_run_at || null,
+        lastRunAt: prevWorker?.last_run_at || null,
+        consecutiveErrors: finalCfg.enabled ? num(prevWorker?.consecutive_errors, 0) : 0,
+        reason: 'config_changed'
+      });
+      const nextStatus = deriveWorkerStatus({
+        enabled: finalCfg.enabled,
+        isSyncing: Boolean(prevWorker?.is_syncing),
+        consecutiveErrors: finalCfg.enabled ? num(prevWorker?.consecutive_errors, 0) : 0,
+        lastError: finalCfg.enabled ? str(prevWorker?.last_error || '') : ''
+      });
+      await executor.query(
+        `INSERT INTO sync_worker_state (id) VALUES ('primary') ON CONFLICT (id) DO NOTHING`
+      ).catch(() => undefined);
+      await executor.query(
+        `UPDATE sync_worker_state
+         SET status = $1,
+             auto_sync_enabled = $2,
+             interval_seconds = $3,
+             interval_value = $4,
+             interval_unit = $5,
+             next_run_at = $6::timestamptz,
+             consecutive_errors = CASE WHEN $2 THEN consecutive_errors ELSE 0 END,
+             updated_at = NOW()
+         WHERE id = 'primary'`,
+        [nextStatus, finalCfg.enabled, finalCfg.intervalSeconds, finalCfg.value, finalCfg.unit, nextRunAt]
+      ).catch(() => undefined);
+      notifyAutoSyncConfigChanged();
+      void emitSyncWorkerStatusRealtime(executor, 'syncWorkerConfigUpdated', session.user.id).catch(() => undefined);
+    } catch {
+      // Non-fatal in mock executors
+    }
+  }
+
+  invalidateScopes(executor, ['settings', 'dashboard', 'reports', 'sync']);
   void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return getSettings(executor, session);
 }
@@ -4877,13 +4967,77 @@ export async function importReservationsFromExcel(
   return out;
 }
 
+function buildWorkerTelemetrySummary(
+  workerRow: Record<string, any> | null,
+  syncCfg: ReturnType<typeof normalizeAutoSyncConfig>,
+  logs: Array<Record<string, any>>
+) {
+  const isoOrEmpty = (v: unknown): string => {
+    if (!v) return '';
+    if (v instanceof Date) return v.toISOString();
+    const s = str(v);
+    return s;
+  };
+  const latestLog = logs[0] || null;
+  const lastSuccessLog = logs.find((l) => l.status === 'success' || l.status === 'partial') || null;
+  const isSyncing = Boolean(
+    workerRow?.is_syncing &&
+    (!workerRow?.lock_expires_at || Date.parse(String(workerRow.lock_expires_at)) > Date.now())
+  );
+  const consecutiveErrors = num(workerRow?.consecutive_errors, 0);
+  const lastError = str(workerRow?.last_error || (latestLog?.status === 'error' ? latestLog?.errorMessage : ''));
+  const status = deriveWorkerStatus({
+    enabled: syncCfg.enabled,
+    isSyncing,
+    consecutiveErrors,
+    lastError
+  });
+  const lastRunAt = isoOrEmpty(workerRow?.last_run_at) || isoOrEmpty(latestLog?.startedAt || latestLog?.finishedAt);
+  const lastSuccessAt = isoOrEmpty(workerRow?.last_success_at) || isoOrEmpty(lastSuccessLog?.finishedAt);
+  const nextRunAtRaw = syncCfg.enabled
+    ? (isoOrEmpty(workerRow?.next_run_at) ||
+        computeNextScheduledRunAt({
+          enabled: true,
+          intervalSeconds: syncCfg.intervalSeconds,
+          nowMs: Date.now(),
+          lastRunAt: lastRunAt || null,
+          consecutiveErrors,
+          reason: 'startup'
+        }))
+    : null;
+
+  return {
+    status,
+    isSyncing,
+    autoSyncEnabled: syncCfg.enabled,
+    intervalSeconds: syncCfg.intervalSeconds,
+    intervalValue: syncCfg.value,
+    intervalUnit: syncCfg.unit,
+    lastRunAt,
+    lastSuccessAt,
+    nextRunAt: nextRunAtRaw,
+    lastDurationMs: num(workerRow?.last_duration_ms, latestLog ? num(latestLog.durationMs, 0) : 0),
+    importedCount: workerRow?.last_run_at ? num(workerRow?.last_imported_count, 0) : num(latestLog?.importedCount, 0),
+    updatedCount: workerRow?.last_run_at ? num(workerRow?.last_updated_count, 0) : num(latestLog?.updatedCount, 0),
+    extensionsCount: workerRow?.last_run_at ? num(workerRow?.last_extensions_count, 0) : num(latestLog?.extensionsCount, 0),
+    errorCount: num(workerRow?.error_count, logs.filter((l) => l.status === 'error').length),
+    consecutiveErrors,
+    lastError,
+    lastTriggerType: str(workerRow?.last_trigger_type || ''),
+    workerHeartbeatAt: isoOrEmpty(workerRow?.worker_heartbeat_at),
+    updatedAt: isoOrEmpty(workerRow?.updated_at),
+    runtimeWorkerActive: getAutoSyncWorkerRuntimeStatus().running
+  };
+}
+
 export async function getSyncStatus(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const [logRes, ckRes, map, serverCfg] = await Promise.all([
+  const [logRes, ckRes, map, serverCfg, workerRow] = await Promise.all([
     executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 20`),
     executor.query(`SELECT * FROM sync_checkpoints ORDER BY updated_at DESC LIMIT 5`),
     getSettingsMap(executor),
-    resolveServerConfig(executor)
+    resolveServerConfig(executor),
+    readWorkerStateRow(executor)
   ]);
   const logs = logRes.rows.map((s) => ({
     id: str(s.id),
@@ -4896,8 +5050,8 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     pagesFetched: num(s.pages_fetched),
     errorMessage: str(s.error_message),
     durationMs: num(s.duration_ms),
-    startedAt: s.started_at instanceof Date ? s.started_at.toISOString() : str(s.started_at),
-    finishedAt: s.finished_at instanceof Date ? s.finished_at.toISOString() : str(s.finished_at)
+    startedAt: s.started_at instanceof Date ? (isNaN(s.started_at.getTime()) ? '' : s.started_at.toISOString()) : str(s.started_at),
+    finishedAt: s.finished_at instanceof Date ? (isNaN(s.finished_at.getTime()) ? '' : s.finished_at.toISOString()) : str(s.finished_at)
   }));
   const checkpoints = ckRes.rows.map((ck: any) => {
     let parsedMeta: any = null;
@@ -4915,15 +5069,30 @@ export async function getSyncStatus(executor: DbExecutor, session: AuthSession) 
     checkpoints.find((c: any) => str(c.source) === 'rental_gate_direct') ||
     checkpoints[0] ||
     null;
+  const syncCfg = normalizeAutoSyncConfig(map);
   const syncInterval = crmCore.normalizeAutoSyncInterval(
     map.auto_sync_interval_hours,
     map.auto_sync_interval_minutes
   );
+  const worker = buildWorkerTelemetrySummary(workerRow, syncCfg, logs);
   return {
     hasToken: Boolean(serverCfg.rgToken || serverCfg.gasWebAppUrl),
-    autoSyncEnabled: map.auto_sync_enabled !== false,
+    autoSyncEnabled: syncCfg.enabled,
+    autoSyncIntervalSeconds: syncCfg.intervalSeconds,
+    autoSyncIntervalValue: syncCfg.value,
+    autoSyncIntervalUnit: syncCfg.unit,
     autoSyncIntervalHours: syncInterval.hours,
     autoSyncIntervalMinutes: syncInterval.minutes,
+    workerStatus: worker.status,
+    isSyncing: worker.isSyncing,
+    lastRunAt: worker.lastRunAt,
+    lastSuccessAt: worker.lastSuccessAt,
+    nextRunAt: worker.nextRunAt,
+    lastDurationMs: worker.lastDurationMs,
+    errorCount: worker.errorCount,
+    consecutiveErrors: worker.consecutiveErrors,
+    lastError: worker.lastError,
+    worker,
     lastSync: logs[0] || null,
     lastReconciliation: (primaryCheckpoint && primaryCheckpoint.meta) || null,
     lastCheckpointStatus: primaryCheckpoint ? str(primaryCheckpoint.last_status) : '',
@@ -5132,7 +5301,10 @@ export async function pullOrSyncReservations(
 
   const serverCfg = await resolveServerConfig(executor);
   if (serverCfg.rgToken) {
-    const result = await pullFromRentalGateDirect(executor, session.user, rangePayload);
+    const result = await pullFromRentalGateDirect(executor, session.user, {
+      ...rangePayload,
+      triggerType: 'manual'
+    });
     return {
       ...result,
       id: result.syncId,
@@ -5718,7 +5890,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     ? new Date(Date.parse(rawSince) - 2000).toISOString()
     : new Date(Date.now() - 120000).toISOString();
 
-  const [resRows, fuRows, prbRows, empRows, tombstoneRows, delNtfRows, dismissedNtfRows, settingsUpdRes, delUpdRes, rolesActRes, freshSyncVer, notifData, annData, locksData, todayRadarSummary] = await Promise.all([
+  const [resRows, fuRows, prbRows, empRows, tombstoneRows, delNtfRows, dismissedNtfRows, settingsUpdRes, delUpdRes, rolesActRes, freshSyncVer, notifData, annData, locksData, todayRadarSummary, workerStateRes] = await Promise.all([
     executor.query(
       `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
        FROM reservations r
@@ -5789,7 +5961,8 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     getNotifications(executor, session),
     getAnnouncements(executor, session).catch(() => ({ items: [], activeItems: [] })),
     getReservationLocks(executor, session).catch(() => ({ items: [] })),
-    getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: str(payload.todayDate) }).catch(() => ({ counts: null }))
+    getTodayAndRadar(executor, session, { summaryOnly: true, todayDate: str(payload.todayDate) }).catch(() => ({ counts: null })),
+    executor.query(`SELECT * FROM sync_worker_state WHERE id = 'primary' LIMIT 1`).catch(() => ({ rows: [] as any[] }))
   ]);
 
   const deletedReservationIds: string[] = [];
@@ -5859,6 +6032,41 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     };
   }
 
+  const rawWorkerRow = (workerStateRes as any)?.rows?.[0] || null;
+  let syncWorkerState: any = null;
+  let syncStatusChanged = false;
+  if (rawWorkerRow) {
+    const wUpdIso = rawWorkerRow.updated_at instanceof Date ? rawWorkerRow.updated_at.toISOString() : str(rawWorkerRow.updated_at);
+    syncStatusChanged = Boolean(wUpdIso && wUpdIso > sinceDate);
+    const wEnabled = rawWorkerRow.auto_sync_enabled !== false;
+    const wIsSyncing = Boolean(
+      rawWorkerRow.is_syncing &&
+      (!rawWorkerRow.lock_expires_at || Date.parse(String(rawWorkerRow.lock_expires_at)) > Date.now())
+    );
+    const wConsecErr = num(rawWorkerRow.consecutive_errors, 0);
+    const wLastErr = str(rawWorkerRow.last_error || '');
+    syncWorkerState = {
+      status: deriveWorkerStatus({ enabled: wEnabled, isSyncing: wIsSyncing, consecutiveErrors: wConsecErr, lastError: wLastErr }),
+      isSyncing: wIsSyncing,
+      autoSyncEnabled: wEnabled,
+      intervalSeconds: num(rawWorkerRow.interval_seconds, 43200),
+      intervalValue: num(rawWorkerRow.interval_value, 12),
+      intervalUnit: str(rawWorkerRow.interval_unit || 'hours'),
+      lastRunAt: rawWorkerRow.last_run_at instanceof Date ? rawWorkerRow.last_run_at.toISOString() : str(rawWorkerRow.last_run_at),
+      lastSuccessAt: rawWorkerRow.last_success_at instanceof Date ? rawWorkerRow.last_success_at.toISOString() : str(rawWorkerRow.last_success_at),
+      nextRunAt: rawWorkerRow.next_run_at instanceof Date ? rawWorkerRow.next_run_at.toISOString() : str(rawWorkerRow.next_run_at),
+      lastDurationMs: num(rawWorkerRow.last_duration_ms, 0),
+      importedCount: num(rawWorkerRow.last_imported_count, 0),
+      updatedCount: num(rawWorkerRow.last_updated_count, 0),
+      extensionsCount: num(rawWorkerRow.last_extensions_count, 0),
+      errorCount: num(rawWorkerRow.error_count, 0),
+      consecutiveErrors: wConsecErr,
+      lastError: wLastErr,
+      lastTriggerType: str(rawWorkerRow.last_trigger_type || ''),
+      updatedAt: wUpdIso
+    };
+  }
+
   return {
     serverTime: new Date().toISOString(),
     syncVersion,
@@ -5880,6 +6088,8 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     ...(clientUiConfig !== undefined ? { clientUiConfig } : {}),
     changedDelegations: Boolean(maxDelUpdRaw),
     changedRoles: Boolean(maxRoleUpdRaw),
+    syncStatusChanged,
+    ...(syncWorkerState ? { syncWorkerState } : {}),
     hasMoreReservations: resRows.rows.length >= 200,
     hasMoreFollowUps: fuRows.rows.length >= 200,
     hasMoreProblems: prbRows.rows.length >= 100,

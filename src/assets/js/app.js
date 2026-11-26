@@ -5379,19 +5379,24 @@
         lastDeltaRadarCountsSnap = Object.assign({}, d.todayRadarCounts);
       }
 
+      if (d.syncStatusChanged && root.RGApi) {
+        if (typeof root.RGApi.markScopesStale === 'function') root.RGApi.markScopesStale(['sync']);
+        else if (root.RGApi.invalidateScopes) root.RGApi.invalidateScopes(['sync']);
+      }
+
       if (hasChanges && root.RGApi) {
-        var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps'];
+        var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps', 'sync'];
+        if ((Array.isArray(d.changedReservations) && d.changedReservations.length > 0) || (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) || d.deletedAllReservationsBefore) {
+          scopesToInvalidate.push('employees', 'reservations', 'followUps', 'problems');
+        }
         if ((Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0)) {
           scopesToInvalidate.push('problems', 'reservations', 'notifications');
-        }
-        if ((Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) || d.deletedAllReservationsBefore) {
-          scopesToInvalidate.push('reservations', 'followUps', 'problems');
         }
         if ((Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) || d.changedDelegations || d.changedRoles) {
           scopesToInvalidate.push('employees');
         }
         if (d.changedSettings) {
-          scopesToInvalidate.push('settings', 'employees');
+          scopesToInvalidate.push('settings', 'employees', 'sync');
         }
         if (d.deletedAllReservationsBefore && root.RGApi.clearCache) {
           root.RGApi.clearCache(scopesToInvalidate);

@@ -504,6 +504,32 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
   deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 25. Background Auto-Sync Worker State, Distributed Lease Lock & Telemetry
+CREATE TABLE IF NOT EXISTS sync_worker_state (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'stopped',
+  is_syncing BOOLEAN NOT NULL DEFAULT FALSE,
+  locked_by TEXT NOT NULL DEFAULT '',
+  lock_expires_at TIMESTAMPTZ,
+  auto_sync_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  interval_seconds INTEGER NOT NULL DEFAULT 43200,
+  interval_value INTEGER NOT NULL DEFAULT 12,
+  interval_unit TEXT NOT NULL DEFAULT 'hours',
+  last_run_at TIMESTAMPTZ,
+  last_success_at TIMESTAMPTZ,
+  next_run_at TIMESTAMPTZ,
+  last_duration_ms INTEGER NOT NULL DEFAULT 0,
+  last_imported_count INTEGER NOT NULL DEFAULT 0,
+  last_updated_count INTEGER NOT NULL DEFAULT 0,
+  last_extensions_count INTEGER NOT NULL DEFAULT 0,
+  error_count INTEGER NOT NULL DEFAULT 0,
+  consecutive_errors INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  last_trigger_type TEXT NOT NULL DEFAULT '',
+  worker_heartbeat_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_notifications_role_read ON notifications (recipient_role, is_read, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_employee_active ON sessions (employee_id, is_revoked, expires_at);
 CREATE INDEX IF NOT EXISTS idx_sync_log_started_at ON sync_log (started_at DESC);

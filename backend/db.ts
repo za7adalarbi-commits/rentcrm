@@ -382,7 +382,31 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifications (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));`
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));`,
+  `CREATE TABLE IF NOT EXISTS sync_worker_state (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'stopped',
+    is_syncing BOOLEAN NOT NULL DEFAULT FALSE,
+    locked_by TEXT NOT NULL DEFAULT '',
+    lock_expires_at TIMESTAMPTZ,
+    auto_sync_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    interval_seconds INTEGER NOT NULL DEFAULT 43200,
+    interval_value INTEGER NOT NULL DEFAULT 12,
+    interval_unit TEXT NOT NULL DEFAULT 'hours',
+    last_run_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    next_run_at TIMESTAMPTZ,
+    last_duration_ms INTEGER NOT NULL DEFAULT 0,
+    last_imported_count INTEGER NOT NULL DEFAULT 0,
+    last_updated_count INTEGER NOT NULL DEFAULT 0,
+    last_extensions_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    last_trigger_type TEXT NOT NULL DEFAULT '',
+    worker_heartbeat_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`
 ];
 
 export async function ensureNotificationsSchemaAndIndexes(executor: DbClient): Promise<{

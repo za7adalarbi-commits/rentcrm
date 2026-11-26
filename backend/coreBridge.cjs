@@ -4757,6 +4757,213 @@
     return 'كل ' + mText;
   }
 
+  var MIN_AUTO_SYNC_SECONDS = 1;
+  var MAX_AUTO_SYNC_SECONDS = 43200; // 12 hours
+
+  function normalizeAutoSyncUnitCore(rawUnit) {
+    var u = normalizeStr(rawUnit).toLowerCase();
+    if (u === 'seconds' || u === 'second' || u === 's' || u === 'sec') return 'seconds';
+    if (u === 'minutes' || u === 'minute' || u === 'm' || u === 'min') return 'minutes';
+    if (u === 'hours' || u === 'hour' || u === 'h' || u === 'hr') return 'hours';
+    return 'seconds';
+  }
+
+  function unitSecondsMultiplierCore(unit) {
+    if (unit === 'hours') return 3600;
+    if (unit === 'minutes') return 60;
+    return 1;
+  }
+
+  function deriveBestSyncValueUnitCore(intervalSeconds) {
+    var sec = Math.max(MIN_AUTO_SYNC_SECONDS, Math.min(MAX_AUTO_SYNC_SECONDS, Math.round(Number(intervalSeconds) || 43200)));
+    if (sec % 3600 === 0) return { value: sec / 3600, unit: 'hours' };
+    if (sec % 60 === 0) return { value: sec / 60, unit: 'minutes' };
+    return { value: sec, unit: 'seconds' };
+  }
+
+  function validateAutoSyncInterval(input) {
+    var obj = (input && typeof input === 'object') ? input : {};
+    var hasValue = obj.value !== undefined && obj.value !== null && convertEasternDigitsToAscii(String(obj.value)).trim() !== '';
+    var hasSec = obj.intervalSeconds !== undefined && obj.intervalSeconds !== null && convertEasternDigitsToAscii(String(obj.intervalSeconds)).trim() !== '';
+    var unit = normalizeAutoSyncUnitCore(obj.unit || 'seconds');
+    var intervalSeconds = 43200;
+    var value = 12;
+
+    if (hasValue) {
+      var strVal = convertEasternDigitsToAscii(String(obj.value)).trim();
+      var numVal = Number(strVal);
+      if (!strVal || !isFinite(numVal)) {
+        return {
+          valid: false,
+          error: 'يرجى إدخال قيمة رقمية صحيحة لفترة المزامنة التلقائية.',
+          intervalSeconds: 43200,
+          value: 12,
+          unit: 'hours',
+          hours: 12,
+          minutes: 0
+        };
+      }
+      var exactSec = numVal * unitSecondsMultiplierCore(unit);
+      if (exactSec < MIN_AUTO_SYNC_SECONDS) {
+        return {
+          valid: false,
+          error: 'الحد الأدنى للفترة الزمنية للمزامنة التلقائية هو ثانية واحدة (1 ثانية).',
+          intervalSeconds: MIN_AUTO_SYNC_SECONDS,
+          value: numVal,
+          unit: unit,
+          hours: 0,
+          minutes: 1
+        };
+      }
+      if (exactSec > MAX_AUTO_SYNC_SECONDS) {
+        return {
+          valid: false,
+          error: 'الحد الأقصى للفترة الزمنية للمزامنة التلقائية هو 12 ساعة (43,200 ثانية).',
+          intervalSeconds: MAX_AUTO_SYNC_SECONDS,
+          value: numVal,
+          unit: unit,
+          hours: 12,
+          minutes: 0
+        };
+      }
+      intervalSeconds = Math.round(exactSec);
+      if (Math.floor(numVal) === numVal) {
+        value = numVal;
+      } else {
+        var best = deriveBestSyncValueUnitCore(intervalSeconds);
+        value = best.value;
+        unit = best.unit;
+      }
+    } else if (hasSec) {
+      var secNum = Number(convertEasternDigitsToAscii(String(obj.intervalSeconds)).trim());
+      if (!isFinite(secNum) || secNum < MIN_AUTO_SYNC_SECONDS) {
+        return {
+          valid: false,
+          error: 'الحد الأدنى للفترة الزمنية للمزامنة التلقائية هو ثانية واحدة (1 ثانية).',
+          intervalSeconds: MIN_AUTO_SYNC_SECONDS,
+          value: secNum,
+          unit: 'seconds',
+          hours: 0,
+          minutes: 1
+        };
+      }
+      if (secNum > MAX_AUTO_SYNC_SECONDS) {
+        return {
+          valid: false,
+          error: 'الحد الأقصى للفترة الزمنية للمزامنة التلقائية هو 12 ساعة (43,200 ثانية).',
+          intervalSeconds: MAX_AUTO_SYNC_SECONDS,
+          value: secNum,
+          unit: 'seconds',
+          hours: 12,
+          minutes: 0
+        };
+      }
+      intervalSeconds = Math.round(secNum);
+      var bestFromSec = deriveBestSyncValueUnitCore(intervalSeconds);
+      value = bestFromSec.value;
+      unit = bestFromSec.unit;
+    } else {
+      var h = Number(convertEasternDigitsToAscii(String(obj.hours !== undefined ? obj.hours : 12)).trim() || '0');
+      var m = Number(convertEasternDigitsToAscii(String(obj.minutes !== undefined ? obj.minutes : 0)).trim() || '0');
+      var totalSec = Math.round((isFinite(h) ? h : 0) * 3600 + (isFinite(m) ? m : 0) * 60);
+      if (totalSec < MIN_AUTO_SYNC_SECONDS || totalSec > MAX_AUTO_SYNC_SECONDS) {
+        return {
+          valid: false,
+          error: totalSec < MIN_AUTO_SYNC_SECONDS
+            ? 'الحد الأدنى للفترة الزمنية للمزامنة التلقائية هو ثانية واحدة (1 ثانية).'
+            : 'الحد الأقصى للفترة الزمنية للمزامنة التلقائية هو 12 ساعة (43,200 ثانية).',
+          intervalSeconds: Math.max(MIN_AUTO_SYNC_SECONDS, Math.min(MAX_AUTO_SYNC_SECONDS, totalSec || 1)),
+          value: 12,
+          unit: 'hours',
+          hours: 12,
+          minutes: 0
+        };
+      }
+      intervalSeconds = totalSec;
+      var bestLegacy = deriveBestSyncValueUnitCore(intervalSeconds);
+      value = bestLegacy.value;
+      unit = bestLegacy.unit;
+    }
+
+    var totalMinLegacy = Math.max(1, Math.round(intervalSeconds / 60));
+    return {
+      valid: true,
+      error: '',
+      intervalSeconds: intervalSeconds,
+      value: value,
+      unit: unit,
+      hours: Math.floor(totalMinLegacy / 60),
+      minutes: totalMinLegacy % 60
+    };
+  }
+
+  function normalizeAutoSyncIntervalSeconds(settingsOrInput) {
+    var s = (settingsOrInput && typeof settingsOrInput === 'object') ? settingsOrInput : { intervalSeconds: settingsOrInput };
+    var hasSec = s.auto_sync_interval_seconds !== undefined || s.intervalSeconds !== undefined;
+    var hasValueUnit = s.value !== undefined || s.auto_sync_interval_value !== undefined;
+    var rawSec = s.auto_sync_interval_seconds !== undefined ? s.auto_sync_interval_seconds : s.intervalSeconds;
+    var rawVal = s.auto_sync_interval_value !== undefined ? s.auto_sync_interval_value : s.value;
+    var rawUnit = s.auto_sync_interval_unit !== undefined ? s.auto_sync_interval_unit : s.unit;
+
+    var sec = 43200;
+    if (hasSec && rawSec !== null && String(rawSec).trim() !== '') {
+      var pSec = Number(convertEasternDigitsToAscii(String(rawSec)).trim());
+      if (isFinite(pSec) && pSec > 0) {
+        sec = Math.max(MIN_AUTO_SYNC_SECONDS, Math.min(MAX_AUTO_SYNC_SECONDS, Math.round(pSec)));
+      }
+    } else if (hasValueUnit && rawVal !== null && String(rawVal).trim() !== '') {
+      var vCheck = validateAutoSyncInterval({ value: rawVal, unit: rawUnit || 'seconds' });
+      sec = Math.max(MIN_AUTO_SYNC_SECONDS, Math.min(MAX_AUTO_SYNC_SECONDS, vCheck.intervalSeconds));
+    } else if (s.auto_sync_interval_hours !== undefined || s.auto_sync_interval_minutes !== undefined || s.hours !== undefined || s.minutes !== undefined) {
+      var hVal = Number(s.auto_sync_interval_hours !== undefined ? s.auto_sync_interval_hours : (s.hours || 0));
+      var mVal = Number(s.auto_sync_interval_minutes !== undefined ? s.auto_sync_interval_minutes : (s.minutes || 0));
+      var calcSec = Math.round(Math.max(0, isFinite(hVal) ? hVal : 0) * 3600 + Math.max(0, isFinite(mVal) ? mVal : 0) * 60);
+      if (calcSec > 0) sec = Math.max(MIN_AUTO_SYNC_SECONDS, Math.min(MAX_AUTO_SYNC_SECONDS, calcSec));
+    }
+
+    var best = deriveBestSyncValueUnitCore(sec);
+    var value = best.value;
+    var unit = best.unit;
+    if (rawUnit && rawVal !== undefined && rawVal !== null && String(rawVal).trim() !== '') {
+      var uClean = normalizeAutoSyncUnitCore(rawUnit);
+      var vClean = Number(convertEasternDigitsToAscii(String(rawVal)).trim());
+      if (isFinite(vClean) && vClean >= 1 && Math.round(vClean * unitSecondsMultiplierCore(uClean)) === sec) {
+        value = Math.round(vClean);
+        unit = uClean;
+      }
+    }
+    var legacyMin = Math.max(1, Math.round(sec / 60));
+    return {
+      intervalSeconds: sec,
+      value: value,
+      unit: unit,
+      hours: Math.floor(legacyMin / 60),
+      minutes: legacyMin % 60
+    };
+  }
+
+  function formatAutoSyncIntervalSecondsAr(secondsOrObj) {
+    var sec = (secondsOrObj && typeof secondsOrObj === 'object')
+      ? normalizeAutoSyncIntervalSeconds(secondsOrObj).intervalSeconds
+      : Math.max(MIN_AUTO_SYNC_SECONDS, Math.min(MAX_AUTO_SYNC_SECONDS, Math.round(Number(secondsOrObj) || 43200)));
+    var h = Math.floor(sec / 3600);
+    var rem = sec % 3600;
+    var m = Math.floor(rem / 60);
+    var s = rem % 60;
+    var parts = [];
+    if (h > 0) {
+      parts.push(h === 1 ? 'ساعة واحدة' : (h === 2 ? 'ساعتين' : (h <= 10 ? (h + ' ساعات') : (h + ' ساعة'))));
+    }
+    if (m > 0) {
+      parts.push(m === 1 ? 'دقيقة واحدة' : (m === 2 ? 'دقيقتين' : (m <= 10 ? (m + ' دقائق') : (m + ' دقيقة'))));
+    }
+    if (s > 0) {
+      parts.push(s === 1 ? 'ثانية واحدة' : (s === 2 ? 'ثانيتين' : (s <= 10 ? (s + ' ثوانٍ') : (s + ' ثانية'))));
+    }
+    if (!parts.length) return 'كل 12 ساعة';
+    return 'كل ' + parts.join(' و');
+  }
+
   function normalizeDeleteReservationsScope(payload) {
     var p = (payload && typeof payload === 'object') ? payload : {};
     var rawScope = normalizeStr(p.scope).toLowerCase();
@@ -10687,6 +10894,11 @@
     normalizeEmployeePhone: normalizeEmployeePhone,
     normalizeEmployeeEmail: normalizeEmployeeEmail,
     extractDayAndHourFromDateValue: extractDayAndHourFromDateValue,
-    filterDeletedNotificationsPayload: filterDeletedNotificationsPayload
+    filterDeletedNotificationsPayload: filterDeletedNotificationsPayload,
+    MIN_AUTO_SYNC_SECONDS: MIN_AUTO_SYNC_SECONDS,
+    MAX_AUTO_SYNC_SECONDS: MAX_AUTO_SYNC_SECONDS,
+    validateAutoSyncInterval: validateAutoSyncInterval,
+    normalizeAutoSyncIntervalSeconds: normalizeAutoSyncIntervalSeconds,
+    formatAutoSyncIntervalSecondsAr: formatAutoSyncIntervalSecondsAr
   };
 }));

@@ -401,7 +401,7 @@ export async function dispatchCrmRequest(
   } catch (err: any) {
     const msg = String(err?.message || 'حدث خطأ غير متوقع.');
     const errorCode = msg.includes(':') ? msg.split(':')[0].trim() : 'SERVER_ERROR';
-    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA|RATE_LIMITED|DUPLICATE_SUBMISSION)/.test(errorCode);
+    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA|RATE_LIMITED|DUPLICATE_SUBMISSION|SYNC_IN_PROGRESS)/.test(errorCode);
     if (!isExpectedClientErr) {
       await logBackendError(executor, 'router', action, err, { payload });
     }
