@@ -168,7 +168,7 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
 
   for (var i = 0; i < (reservations || []).length; i++) {
     var r = reservations[i];
-    var rKey = 'R:' + normalizeStr(r.reservationNumber || r.id);
+    var rKey = 'R:' + normalizeStr(r.sourceReservationId || r.reservationNumber || r.id);
     if (!rKey || rKey === 'R:') continue;
     var rDigest = computeShortDigest_(r);
     if (hashMap[rKey] !== rDigest) {
@@ -188,7 +188,14 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
     }
   }
 
-  if (deltaRes.length === 0 && deltaExt.length === 0) {
+  var hasMetaGaps = Boolean(
+    meta && (
+      (Array.isArray(meta.incompleteEndpoints) && meta.incompleteEndpoints.length > 0) ||
+      (Array.isArray(meta.backfillFailedIds) && meta.backfillFailedIds.length > 0)
+    )
+  );
+
+  if (deltaRes.length === 0 && deltaExt.length === 0 && !hasMetaGaps) {
     PropertiesService.getScriptProperties().setProperties({
       NEON_LAST_SYNC_AT: nowIso(),
       NEON_LAST_SYNC_STATUS: 'no_changes',
@@ -200,15 +207,32 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
 
   var totalSentRes = 0;
   var totalSentExt = 0;
+  var totalChunks = Math.max(1, Math.ceil(deltaRes.length / NEON_BATCH_SIZE));
+
+  function buildMetaFields_(isFinalChunk) {
+    if (!isFinalChunk) return {};
+    return {
+      totalInSource: (meta && meta.totalInSource !== undefined) ? meta.totalInSource : undefined,
+      incompleteEndpoints: (meta && meta.incompleteEndpoints) || [],
+      backfillFailedIds: (meta && meta.backfillFailedIds) || [],
+      sourceBreakdown: (meta && meta.sourceBreakdown) || undefined,
+      excludedFilteredCount: (meta && meta.excludedFilteredCount !== undefined) ? meta.excludedFilteredCount : 0,
+      rangeFilteredCount: (meta && meta.rangeFilteredCount !== undefined) ? meta.rangeFilteredCount : 0,
+      excludedSourceIds: (meta && meta.excludedSourceIds) || [],
+      expectedSourceIds: (meta && meta.expectedSourceIds) || []
+    };
+  }
 
   for (var resOff = 0; resOff < deltaRes.length; resOff += NEON_BATCH_SIZE) {
     var resChunk = deltaRes.slice(resOff, resOff + NEON_BATCH_SIZE);
     if (resChunk.length === 0) continue;
-    var pairedExtChunk = (resOff + NEON_BATCH_SIZE >= deltaRes.length && deltaExt.length <= NEON_BATCH_SIZE)
+    var isLastResChunk = (resOff + NEON_BATCH_SIZE >= deltaRes.length);
+    var pairedExtChunk = (isLastResChunk && deltaExt.length <= NEON_BATCH_SIZE)
       ? deltaExt
       : [];
+    var isTrulyFinal = isLastResChunk && (pairedExtChunk.length === deltaExt.length);
 
-    fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, {
+    fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, Object.assign({
       source: 'google_apps_script',
       triggeredById: (meta && meta.triggeredById) || 'GAS_SYNC',
       triggeredByName: (meta && meta.triggeredByName) || 'Google Apps Script Incremental Sync',
@@ -216,7 +240,7 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
       appliedRange: (meta && meta.appliedRange) || null,
       reservations: resChunk,
       extensions: pairedExtChunk
-    });
+    }, buildMetaFields_(isTrulyFinal)));
 
     totalSentRes += resChunk.length;
     totalSentExt += pairedExtChunk.length;
@@ -225,8 +249,9 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
   for (var extOff = totalSentExt; extOff < deltaExt.length; extOff += NEON_BATCH_SIZE) {
     var extChunk = deltaExt.slice(extOff, extOff + NEON_BATCH_SIZE);
     if (extChunk.length === 0) continue;
+    var isLastExtChunk = (extOff + NEON_BATCH_SIZE >= deltaExt.length);
 
-    fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, {
+    fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, Object.assign({
       source: 'google_apps_script',
       triggeredById: (meta && meta.triggeredById) || 'GAS_SYNC',
       triggeredByName: (meta && meta.triggeredByName) || 'Google Apps Script Incremental Sync',
@@ -234,15 +259,27 @@ function pushIncrementalSyncToNeon_(reservations, extensions, meta) {
       appliedRange: (meta && meta.appliedRange) || null,
       reservations: [],
       extensions: extChunk
-    });
+    }, buildMetaFields_(isLastExtChunk)));
 
     totalSentExt += extChunk.length;
+  }
+
+  if (deltaRes.length === 0 && deltaExt.length === 0 && hasMetaGaps) {
+    fetchNeonEndpointWithRetry_(cfg.syncUrl, cfg.syncSecret, Object.assign({
+      source: 'google_apps_script',
+      triggeredById: (meta && meta.triggeredById) || 'GAS_SYNC',
+      triggeredByName: (meta && meta.triggeredByName) || 'Google Apps Script Incremental Sync',
+      pagesFetched: (meta && meta.pagesFetched) || 0,
+      appliedRange: (meta && meta.appliedRange) || null,
+      reservations: [],
+      extensions: []
+    }, buildMetaFields_(true)));
   }
 
   saveNeonHashMap_(hashMap);
   PropertiesService.getScriptProperties().setProperties({
     NEON_LAST_SYNC_AT: nowIso(),
-    NEON_LAST_SYNC_STATUS: 'success',
+    NEON_LAST_SYNC_STATUS: hasMetaGaps ? 'partial' : 'success',
     NEON_LAST_SYNC_COUNT: String(totalSentRes + totalSentExt),
     NEON_LAST_SYNC_ERROR: ''
   });

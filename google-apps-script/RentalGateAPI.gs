@@ -5,18 +5,38 @@
 
 var RG_RESERVATIONS_API = 'https://api.rentalgate.net/api/reservations/filter';
 var RG_EXTENDS_API = 'https://api.rentalgate.net/api/reservation-extends/filter';
+var RG_CANCELLED_API = 'https://api.rentalgate.net/api/admin/cancelled-reservations';
+var RG_COMPANY_CHANGES_API = 'https://api.rentalgate.net/api/reservation-company-changes/admin/filter';
+var RG_RESERVATION_DETAIL_BASE = 'https://api.rentalgate.net/api/reservations/';
 
 function getRgToken() {
   var props = PropertiesService.getScriptProperties();
   return normalizeStr(props.getProperty('RG_TOKEN') || props.getProperty('RENTAL_TOKEN'));
 }
 
-function buildRentalGateRequest_(url, token, pageZeroBased, size) {
+function buildRentalGateRequest_(url, token, pageZeroBased, size, extraQuery) {
   var pageNum = pageZeroBased !== undefined && pageZeroBased !== null ? Math.max(0, Number(pageZeroBased) || 0) : 0;
   var pageSize = size ? Math.max(1, Number(size) || 100) : 100;
-  var sep = url.indexOf('?') === -1 ? '?' : '&';
+  var reqUrl;
+  if (extraQuery && extraQuery.directUrl) {
+    reqUrl = extraQuery.directUrl;
+  } else {
+    var sep = url.indexOf('?') === -1 ? '?' : '&';
+    var qParts = [];
+    if (extraQuery && extraQuery.cursor) {
+      qParts.push('cursor=' + encodeURIComponent(extraQuery.cursor));
+      qParts.push('size=' + encodeURIComponent(pageSize));
+    } else if (extraQuery && extraQuery.useOffset) {
+      qParts.push('offset=' + encodeURIComponent(extraQuery.offset || 0));
+      qParts.push('limit=' + encodeURIComponent(pageSize));
+    } else {
+      qParts.push('page=' + encodeURIComponent(pageNum));
+      qParts.push('size=' + encodeURIComponent(pageSize));
+    }
+    reqUrl = url + sep + qParts.join('&');
+  }
   return {
-    url: url + sep + 'page=' + encodeURIComponent(pageNum) + '&size=' + encodeURIComponent(pageSize),
+    url: reqUrl,
     method: 'get',
     headers: {
       Authorization: 'Bearer ' + token,
@@ -111,14 +131,22 @@ function extractPagePayload_(body, pageIndex, pageSize) {
 
   var rawTotalElements =
     (metaHolder && metaHolder.totalElements !== undefined) ? metaHolder.totalElements :
+    ((metaHolder && metaHolder.totalItems !== undefined) ? metaHolder.totalItems :
+    ((metaHolder && metaHolder.total_items !== undefined) ? metaHolder.total_items :
+    ((metaHolder && metaHolder.totalRecords !== undefined) ? metaHolder.totalRecords :
+    ((metaHolder && metaHolder.total_records !== undefined) ? metaHolder.total_records :
     ((metaHolder && metaHolder.total !== undefined) ? metaHolder.total :
     ((metaHolder && metaHolder.total_count !== undefined) ? metaHolder.total_count :
+    ((metaHolder && metaHolder.count !== undefined) ? metaHolder.count :
     ((metaHolder && metaHolder.meta && metaHolder.meta.total !== undefined) ? metaHolder.meta.total :
+    ((metaHolder && metaHolder.pagination && metaHolder.pagination.total !== undefined) ? metaHolder.pagination.total :
     (body.totalElements !== undefined ? body.totalElements :
-    (body.total !== undefined ? body.total : body.total_count)))));
-  var totalElements = (rawTotalElements !== undefined && rawTotalElements !== null && !isNaN(Number(rawTotalElements)))
-    ? Number(rawTotalElements)
-    : safeRows.length;
+    (body.totalItems !== undefined ? body.totalItems :
+    (body.total_items !== undefined ? body.total_items :
+    (body.total !== undefined ? body.total :
+    (body.total_count !== undefined ? body.total_count : body.count))))))))))))));
+  var hasTotalElements = rawTotalElements !== undefined && rawTotalElements !== null && rawTotalElements !== '' && !isNaN(Number(rawTotalElements));
+  var totalElements = hasTotalElements ? Number(rawTotalElements) : safeRows.length;
 
   var explicitLast = (metaHolder && metaHolder.last !== undefined) ? metaHolder.last : body.last;
   var explicitHasMore = (metaHolder && metaHolder.hasMore !== undefined)
@@ -126,30 +154,47 @@ function extractPagePayload_(body, pageIndex, pageSize) {
     : ((metaHolder && metaHolder.has_more !== undefined) ? metaHolder.has_more : (body.hasMore !== undefined ? body.hasMore : body.has_more));
 
   var nextPageUrl = normalizeStr(
-    (metaHolder && (metaHolder.next_page_url || (metaHolder.meta && metaHolder.meta.next_page_url) || (metaHolder.links && metaHolder.links.next))) ||
-    body.next_page_url || (body.meta && body.meta.next_page_url) || (body.links && body.links.next) || ''
+    (metaHolder && (metaHolder.next_page_url || metaHolder.nextPageUrl || (metaHolder.meta && metaHolder.meta.next_page_url) || (metaHolder.links && metaHolder.links.next))) ||
+    body.next_page_url || body.nextPageUrl || (body.meta && body.meta.next_page_url) || (body.links && body.links.next) || ''
   );
+  var nextCursor = normalizeStr(
+    (metaHolder && (metaHolder.nextCursor || metaHolder.next_cursor || metaHolder.nextToken || metaHolder.after || (metaHolder.meta && (metaHolder.meta.nextCursor || metaHolder.meta.next_cursor)))) ||
+    body.nextCursor || body.next_cursor || body.nextToken || body.after || (body.meta && (body.meta.nextCursor || body.meta.next_cursor)) || ''
+  );
+
+  var rawNextPageNum =
+    (metaHolder && (metaHolder.nextPage !== undefined ? metaHolder.nextPage : metaHolder.next_page)) !== undefined
+      ? (metaHolder.nextPage !== undefined ? metaHolder.nextPage : metaHolder.next_page)
+      : (body.nextPage !== undefined ? body.nextPage : body.next_page);
+  var nextPageNum = (rawNextPageNum !== undefined && rawNextPageNum !== null && rawNextPageNum !== '' && !isNaN(Number(rawNextPageNum)))
+    ? Number(rawNextPageNum)
+    : null;
 
   var rawCurrentPage =
     (metaHolder && metaHolder.current_page !== undefined) ? metaHolder.current_page :
     ((metaHolder && metaHolder.meta && metaHolder.meta.current_page !== undefined) ? metaHolder.meta.current_page :
     ((metaHolder && metaHolder.pageNumber !== undefined) ? metaHolder.pageNumber :
+    ((metaHolder && metaHolder.page !== undefined) ? metaHolder.page :
     ((metaHolder && metaHolder.number !== undefined) ? metaHolder.number :
     (body.current_page !== undefined ? body.current_page :
     ((body.meta && body.meta.current_page !== undefined) ? body.meta.current_page :
-    (body.pageNumber !== undefined ? body.pageNumber : body.number))))));
+    (body.pageNumber !== undefined ? body.pageNumber : (body.page !== undefined ? body.page : body.number))))))));
   var hasCurrentPage = rawCurrentPage !== undefined && rawCurrentPage !== null && rawCurrentPage !== '' && !isNaN(Number(rawCurrentPage));
   var currentPageNum = hasCurrentPage ? Number(rawCurrentPage) : null;
 
   var serverPageSize = Number(
-    (metaHolder && (metaHolder.size || metaHolder.per_page || metaHolder.pageSize || (metaHolder.meta && metaHolder.meta.per_page))) ||
-    body.size || body.per_page || body.pageSize || size
+    (metaHolder && (metaHolder.size || metaHolder.per_page || metaHolder.pageSize || metaHolder.page_size || metaHolder.limit || (metaHolder.meta && metaHolder.meta.per_page))) ||
+    body.size || body.per_page || body.pageSize || body.page_size || body.limit || size
   );
   var effectivePageSize = (!isNaN(serverPageSize) && serverPageSize > 0) ? serverPageSize : size;
+  if (!hasTotalPages && hasTotalElements && effectivePageSize > 0 && totalElements > 0) {
+    totalPages = Math.max(1, Math.ceil(totalElements / effectivePageSize));
+    hasTotalPages = true;
+  }
 
   var hasOneBasedMeta = Boolean(
-    (metaHolder && (metaHolder.current_page !== undefined || metaHolder.last_page !== undefined)) ||
-    body.current_page !== undefined || body.last_page !== undefined
+    (metaHolder && (metaHolder.current_page !== undefined || metaHolder.last_page !== undefined || metaHolder.pageNumber !== undefined)) ||
+    body.current_page !== undefined || body.last_page !== undefined || body.pageNumber !== undefined
   );
 
   var isLast;
@@ -157,7 +202,7 @@ function extractPagePayload_(body, pageIndex, pageSize) {
     isLast = true;
   } else if (explicitLast === true || explicitHasMore === false) {
     isLast = true;
-  } else if (nextPageUrl) {
+  } else if (nextPageUrl || nextCursor || (nextPageNum !== null && nextPageNum > pageIndex)) {
     isLast = false;
   } else if (hasTotalPages) {
     if (currentPageNum !== null && currentPageNum >= 1 && (pageIndex === 0 ? currentPageNum === 1 : true) && hasOneBasedMeta) {
@@ -167,8 +212,8 @@ function extractPagePayload_(body, pageIndex, pageSize) {
     }
   } else if (explicitLast === false || explicitHasMore === true) {
     isLast = false;
-  } else if (rawTotalElements !== undefined && rawTotalElements !== null && Number(rawTotalElements) > effectivePageSize) {
-    isLast = (pageIndex + 1) * effectivePageSize >= Number(rawTotalElements);
+  } else if (hasTotalElements && Number(totalElements) > effectivePageSize) {
+    isLast = (pageIndex + 1) * effectivePageSize >= Number(totalElements);
   } else {
     isLast = safeRows.length < effectivePageSize;
   }
@@ -178,14 +223,18 @@ function extractPagePayload_(body, pageIndex, pageSize) {
     totalPages: totalPages,
     totalElements: totalElements,
     hasTotalPages: hasTotalPages,
+    hasTotalElements: hasTotalElements,
     currentPageNum: currentPageNum,
+    nextPageNum: nextPageNum,
     nextPageUrl: nextPageUrl,
+    nextCursor: nextCursor,
+    effectivePageSize: effectivePageSize,
     isLast: isLast
   };
 }
 
-function callRentalGateEndpoint(url, token, pageZeroBased, size) {
-  var req = buildRentalGateRequest_(url, token, pageZeroBased, size);
+function callRentalGateEndpoint(url, token, pageZeroBased, size, extraQuery) {
+  var req = buildRentalGateRequest_(url, token, pageZeroBased, size, extraQuery);
   var res = UrlFetchApp.fetch(req.url, {
     method: req.method,
     headers: req.headers,
@@ -199,10 +248,10 @@ function rowPageDedupKey_(row, kind) {
   if (kind === 'ext') {
     return normalizeStr(row.extendId || row.extensionNumber || row.extension_number || row.id || row.code);
   }
-  var resNum = extractReservationNumber_(row).replace(/^#+/, '').trim();
   var srcId = extractSourceReservationId_(row);
-  if (resNum && srcId && resNum !== srcId) return resNum + '::' + srcId;
-  return resNum || srcId;
+  var resNum = extractReservationNumber_(row).replace(/^#+/, '').trim();
+  if (srcId) return 'ID:' + srcId;
+  return resNum ? ('NUM:' + resNum) : '';
 }
 
 function appendUniquePageRows_(targetArr, seenMap, rows, kind) {
@@ -220,187 +269,328 @@ function appendUniquePageRows_(targetArr, seenMap, rows, kind) {
   return added;
 }
 
-function fetchAllRentalGatePages(url, token) {
+function fetchAllRentalGatePages(url, token, kind) {
+  var rowKind = kind || 'res';
   var allItems = [];
   var seenMap = {};
-  var maxPages = 150;
+  var visitedCursors = {};
+  var visitedUrls = {};
+  var maxPages = 200;
   var pageSize = 100;
+  var pagesFetched = 0;
+  var totalElements = 0;
+  var complete = true;
+  var errorNote = '';
 
-  var firstBody = callRentalGateEndpoint(url, token, 0, pageSize);
-  var pagesFetched = 1;
-  var firstInfo = extractPagePayload_(firstBody, 0, pageSize);
-  appendUniquePageRows_(allItems, seenMap, firstInfo.rows, 'res');
-
-  var firstHasMoreByTotal = firstInfo.totalElements > 0 && allItems.length < firstInfo.totalElements && firstInfo.rows.length > 0;
-  if ((firstInfo.isLast && !firstHasMoreByTotal) || firstInfo.rows.length === 0) {
-    return { items: allItems, pagesFetched: pagesFetched };
-  }
-
-  // Probe page=1 explicitly before inferring 1-based clamping so 0-based APIs with current_page=1 never skip page=1
-  var probeBody = callRentalGateEndpoint(url, token, 1, pageSize);
-  pagesFetched++;
-  var probeInfo = extractPagePayload_(probeBody, 1, pageSize);
-  var probeAdded = appendUniquePageRows_(allItems, seenMap, probeInfo.rows, 'res');
-  var oneBasedClamped = (probeInfo.rows.length > 0 && probeAdded === 0) ? 1 : 0;
-  var probeHasMore = probeInfo.totalElements > 0 && allItems.length < probeInfo.totalElements && probeInfo.rows.length > 0;
-  if ((probeInfo.isLast && !probeHasMore && !oneBasedClamped) || probeInfo.rows.length === 0) {
-    return { items: allItems, pagesFetched: pagesFetched };
-  }
-
-  var knownTotalPages = Math.max(firstInfo.hasTotalPages ? firstInfo.totalPages : 0, probeInfo.hasTotalPages ? probeInfo.totalPages : 0);
-  if (knownTotalPages > 1) {
-    var startIdx = 2;
-    var lastPageIdx = Math.min(knownTotalPages - (oneBasedClamped ? 0 : 1), maxPages - 1);
-    var batchSize = 10;
-    for (var startPage = startIdx; startPage <= lastPageIdx; startPage += batchSize) {
-      var endPage = Math.min(startPage + batchSize - 1, lastPageIdx);
-      var reqs = [];
-      for (var p = startPage; p <= endPage; p++) {
-        reqs.push(buildRentalGateRequest_(url, token, p, pageSize));
-      }
-      var responses = UrlFetchApp.fetchAll(reqs);
-      pagesFetched += responses.length;
-      var stopEarly = false;
-      for (var r = 0; r < responses.length; r++) {
-        var info = extractPagePayload_(parseRentalGateResponse_(responses[r]), startPage + r, pageSize);
-        var added = appendUniquePageRows_(allItems, seenMap, info.rows, 'res');
-        var batchHasMoreByTotal = info.totalElements > 0 && allItems.length < info.totalElements && info.rows.length > 0;
-        if ((info.isLast && !batchHasMoreByTotal) || info.rows.length === 0 || (info.rows.length > 0 && added === 0)) {
-          stopEarly = true;
-        }
-      }
-      if (stopEarly) break;
-    }
-    return { items: allItems, pagesFetched: pagesFetched };
-  }
-
-  // Fallback when totalPages is omitted by upstream API: page until isLast / empty / duplicate page
-  for (var page = 2; page < maxPages; page++) {
-    var pageBody = callRentalGateEndpoint(url, token, page, pageSize);
+  try {
+    var firstBody = callRentalGateEndpoint(url, token, 0, pageSize);
     pagesFetched++;
-    var pageInfo = extractPagePayload_(pageBody, page, pageSize);
-    var pageAdded = appendUniquePageRows_(allItems, seenMap, pageInfo.rows, 'res');
-    var loopHasMoreByTotal = pageInfo.totalElements > 0 && allItems.length < pageInfo.totalElements && pageInfo.rows.length > 0;
-    if ((pageInfo.isLast && !loopHasMoreByTotal) || pageInfo.rows.length === 0 || pageAdded === 0) break;
-  }
+    var firstInfo = extractPagePayload_(firstBody, 0, pageSize);
+    if (firstInfo.hasTotalElements) totalElements = firstInfo.totalElements;
+    appendUniquePageRows_(allItems, seenMap, firstInfo.rows, rowKind);
 
-  return { items: allItems, pagesFetched: pagesFetched };
+    if (firstInfo.rows.length === 0) {
+      return { items: allItems, pagesFetched: pagesFetched, totalElements: totalElements, complete: true, errorNote: '' };
+    }
+
+    var firstHasMoreByTotal = firstInfo.hasTotalElements && allItems.length < firstInfo.totalElements && firstInfo.rows.length > 0;
+    if (firstInfo.isLast && !firstHasMoreByTotal && !firstInfo.nextCursor && !firstInfo.nextPageUrl) {
+      return { items: allItems, pagesFetched: pagesFetched, totalElements: totalElements || allItems.length, complete: true, errorNote: '' };
+    }
+
+    // Cursor / next_page_url mode if upstream provides explicit continuation links
+    if (firstInfo.nextCursor || firstInfo.nextPageUrl) {
+      var curCursor = firstInfo.nextCursor;
+      var curNextUrl = firstInfo.nextPageUrl;
+      var cStep = 1;
+      while ((curCursor || curNextUrl) && cStep < maxPages) {
+        if (curCursor) {
+          if (visitedCursors[curCursor]) { complete = false; break; }
+          visitedCursors[curCursor] = true;
+        }
+        if (curNextUrl) {
+          if (visitedUrls[curNextUrl]) { complete = false; break; }
+          visitedUrls[curNextUrl] = true;
+        }
+        var cBody = callRentalGateEndpoint(url, token, cStep, firstInfo.effectivePageSize || pageSize, {
+          cursor: curCursor,
+          directUrl: curCursor ? '' : curNextUrl
+        });
+        pagesFetched++;
+        var cInfo = extractPagePayload_(cBody, cStep, firstInfo.effectivePageSize || pageSize);
+        if (cInfo.hasTotalElements && cInfo.totalElements > totalElements) totalElements = cInfo.totalElements;
+        var cAdded = appendUniquePageRows_(allItems, seenMap, cInfo.rows, rowKind);
+        curCursor = cInfo.nextCursor;
+        curNextUrl = cInfo.nextPageUrl;
+        if (cInfo.rows.length === 0 || cAdded === 0) {
+          if (totalElements > 0 && allItems.length < totalElements) complete = false;
+          break;
+        }
+        cStep++;
+      }
+      if ((curCursor || curNextUrl) && cStep >= maxPages) complete = false;
+      if (totalElements > 0 && allItems.length < totalElements) complete = false;
+      return { items: allItems, pagesFetched: pagesFetched, totalElements: totalElements || allItems.length, complete: complete, errorNote: errorNote };
+    }
+
+    // Probe page=1 explicitly before inferring 1-based clamping
+    var probeBody = callRentalGateEndpoint(url, token, 1, pageSize);
+    pagesFetched++;
+    var probeInfo = extractPagePayload_(probeBody, 1, pageSize);
+    if (probeInfo.hasTotalElements && probeInfo.totalElements > totalElements) totalElements = probeInfo.totalElements;
+    var probeAdded = appendUniquePageRows_(allItems, seenMap, probeInfo.rows, rowKind);
+    var oneBasedClamped = (probeInfo.rows.length > 0 && probeAdded === 0) ? 1 : 0;
+    var probeHasMore = (totalElements > 0 && allItems.length < totalElements && probeInfo.rows.length > 0);
+
+    var knownTotalPages = Math.max(firstInfo.hasTotalPages ? firstInfo.totalPages : 0, probeInfo.hasTotalPages ? probeInfo.totalPages : 0);
+    if (probeInfo.rows.length === 0 && knownTotalPages <= 1 && !probeHasMore) {
+      return { items: allItems, pagesFetched: pagesFetched, totalElements: totalElements || allItems.length, complete: true, errorNote: '' };
+    }
+
+    if (knownTotalPages > 1) {
+      var startIdx = 2;
+      var lastTarget = knownTotalPages - (oneBasedClamped ? 0 : 1);
+      var lastPageIdx = Math.min(lastTarget, maxPages - 1);
+      if (lastTarget > lastPageIdx) complete = false;
+      var batchSize = 10;
+      for (var startPage = startIdx; startPage <= lastPageIdx; startPage += batchSize) {
+        var endPage = Math.min(startPage + batchSize - 1, lastPageIdx);
+        var reqs = [];
+        for (var p = startPage; p <= endPage; p++) {
+          reqs.push(buildRentalGateRequest_(url, token, p, pageSize));
+        }
+        var responses = UrlFetchApp.fetchAll(reqs);
+        pagesFetched += responses.length;
+        var stopEarly = false;
+        for (var r = 0; r < responses.length; r++) {
+          var info = extractPagePayload_(parseRentalGateResponse_(responses[r]), startPage + r, pageSize);
+          if (info.hasTotalElements && info.totalElements > totalElements) totalElements = info.totalElements;
+          var added = appendUniquePageRows_(allItems, seenMap, info.rows, rowKind);
+          var batchHasMoreByTotal = totalElements > 0 && allItems.length < totalElements && info.rows.length > 0;
+          if ((info.isLast && !batchHasMoreByTotal && (startPage + r) >= lastPageIdx) || info.rows.length === 0) {
+            stopEarly = true;
+          } else if (info.rows.length > 0 && added === 0 && !batchHasMoreByTotal) {
+            stopEarly = true;
+          }
+        }
+        if (stopEarly) break;
+      }
+      if (totalElements > 0 && allItems.length < totalElements) complete = false;
+      return { items: allItems, pagesFetched: pagesFetched, totalElements: totalElements || allItems.length, complete: complete, errorNote: '' };
+    }
+
+    // Sequential fallback when totalPages is omitted
+    var seqStoppedCleanly = false;
+    for (var page = 2; page < maxPages; page++) {
+      var pageBody = callRentalGateEndpoint(url, token, page, pageSize);
+      pagesFetched++;
+      var pageInfo = extractPagePayload_(pageBody, page, pageSize);
+      if (pageInfo.hasTotalElements && pageInfo.totalElements > totalElements) totalElements = pageInfo.totalElements;
+      var pageAdded = appendUniquePageRows_(allItems, seenMap, pageInfo.rows, rowKind);
+      var loopHasMoreByTotal = totalElements > 0 && allItems.length < totalElements && pageInfo.rows.length > 0;
+      if ((pageInfo.isLast && !loopHasMoreByTotal) || pageInfo.rows.length === 0 || pageAdded === 0) {
+        if (totalElements > 0 && allItems.length < totalElements) complete = false;
+        seqStoppedCleanly = true;
+        break;
+      }
+    }
+    if (!seqStoppedCleanly) complete = false;
+    if (totalElements > 0 && allItems.length < totalElements) complete = false;
+    return { items: allItems, pagesFetched: pagesFetched, totalElements: totalElements || allItems.length, complete: complete, errorNote: '' };
+  } catch (err) {
+    return {
+      items: allItems,
+      pagesFetched: pagesFetched,
+      totalElements: totalElements,
+      complete: false,
+      errorNote: String(err && err.message ? err.message : err)
+    };
+  }
+}
+
+function extractLinkSrcIdGs_(row) {
+  if (!row || typeof row !== 'object') return '';
+  return normalizeStr(
+    row.reservationId ||
+    row.reservation_id ||
+    row.sourceReservationId ||
+    (row.reservation && (row.reservation.id || row.reservation.reservationId || row.reservation.reservation_id)) ||
+    row.id ||
+    ''
+  );
+}
+
+function fetchReservationDetailByIdGs_(token, srcId) {
+  try {
+    var res = UrlFetchApp.fetch(RG_RESERVATION_DETAIL_BASE + encodeURIComponent(srcId), {
+      method: 'get',
+      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json', lang: 'ar' },
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) return null;
+    var body = safeJsonParse(res.getContentText(), null);
+    if (!body || typeof body !== 'object') return null;
+    var inner = (body.data && body.data.reservation && typeof body.data.reservation === 'object') ? body.data.reservation
+      : ((body.reservation && typeof body.reservation === 'object') ? body.reservation
+      : ((body.data && typeof body.data === 'object' && !Array.isArray(body.data)) ? body.data
+      : ((body.result && typeof body.result === 'object' && !Array.isArray(body.result)) ? body.result : body)));
+    if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return null;
+    return Object.assign({}, inner, {
+      reservationId: inner.reservationId || inner.reservation_id || inner.id || srcId,
+      clientName: (inner.client && inner.client.name) || (inner.customer && inner.customer.name) || inner.clientName || inner.customer_name || '',
+      clientMobile: (inner.client && (inner.client.mobile || inner.client.phone)) || (inner.customer && (inner.customer.mobile || inner.customer.phone)) || inner.clientMobile || inner.customer_phone || '',
+      companyArName: (inner.companyCar && inner.companyCar.company && (inner.companyCar.company.arabicName || inner.companyCar.company.name)) || (inner.company && (inner.company.arabicName || inner.company.name)) || inner.companyArName || '',
+      carNameAr: (inner.companyCar && inner.companyCar.car && inner.companyCar.car.carNameAr) || (inner.car && inner.car.carNameAr) || inner.carNameAr || ''
+    });
+  } catch (_e) {
+    return null;
+  }
 }
 
 function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
-  var maxPages = 150;
-  var pageSize = 100;
+  // Authoritatively pull all pages across primary reservations, extensions, cancelled, and company-changes endpoints
+  var resPull = fetchAllRentalGatePages(resUrl, token, 'res');
+  var extPull = fetchAllRentalGatePages(extUrl, token, 'ext');
+  var canPull = fetchAllRentalGatePages(RG_CANCELLED_API, token, 'res');
+  var rccPull = fetchAllRentalGatePages(RG_COMPANY_CHANGES_API, token, 'res');
 
-  // Round 1: fetch page 0 of both reservations and extensions in parallel
-  var firstBatch = UrlFetchApp.fetchAll([
-    buildRentalGateRequest_(extUrl, token, 0, pageSize),
-    buildRentalGateRequest_(resUrl, token, 0, pageSize)
-  ]);
+  var pagesFetched = (resPull.pagesFetched || 0) + (extPull.pagesFetched || 0) + (canPull.pagesFetched || 0) + (rccPull.pagesFetched || 0);
+  var incompleteEndpoints = [];
+  if (!resPull.complete) incompleteEndpoints.push('reservations/filter' + (resPull.errorNote ? ': ' + resPull.errorNote : ''));
+  if (!extPull.complete) incompleteEndpoints.push('reservation-extends/filter' + (extPull.errorNote ? ': ' + extPull.errorNote : ''));
+  if (!canPull.complete) incompleteEndpoints.push('admin/cancelled-reservations' + (canPull.errorNote ? ': ' + canPull.errorNote : ''));
+  if (!rccPull.complete) incompleteEndpoints.push('reservation-company-changes/admin/filter' + (rccPull.errorNote ? ': ' + rccPull.errorNote : ''));
 
-  var extInfo0 = extractPagePayload_(parseRentalGateResponse_(firstBatch[0]), 0, pageSize);
-  var resInfo0 = extractPagePayload_(parseRentalGateResponse_(firstBatch[1]), 0, pageSize);
+  var bySrcId = {};
+  var mergedRes = [];
+  var canMetaById = {};
+  var rccMetaById = {};
+  var presentSrcIds = {};
+  var missingIdsMap = {};
+  var rawMainCount = resPull.items.length;
 
-  var extItems = [];
-  var resItems = [];
-  var extSeen = {};
-  var resSeen = {};
-  appendUniquePageRows_(extItems, extSeen, extInfo0.rows, 'ext');
-  appendUniquePageRows_(resItems, resSeen, resInfo0.rows, 'res');
-  var pagesFetched = 2;
-
-  // Probe page=1 for any non-finished endpoint before assuming 1-based clamping (never skip page=1)
-  var probeReqs = [];
-  var probeKinds = [];
-  if ((!extInfo0.isLast || extHasMoreByTotal0) && extInfo0.rows.length > 0) {
-    probeReqs.push(buildRentalGateRequest_(extUrl, token, 1, pageSize));
-    probeKinds.push('ext');
+  for (var i = 0; i < resPull.items.length; i++) {
+    var rItem = resPull.items[i];
+    var sid = extractSourceReservationId_(rItem) || extractReservationNumber_(rItem);
+    if (sid) {
+      bySrcId[sid] = rItem;
+      presentSrcIds[sid] = true;
+    }
+    var rNumMain = extractReservationNumber_(rItem);
+    if (rNumMain) presentSrcIds[rNumMain] = true;
+    mergedRes.push(rItem);
   }
-  if ((!resInfo0.isLast || resHasMoreByTotal0) && resInfo0.rows.length > 0) {
-    probeReqs.push(buildRentalGateRequest_(resUrl, token, 1, pageSize));
-    probeKinds.push('res');
+
+  for (var ci = 0; ci < canPull.items.length; ci++) {
+    var cRow = canPull.items[ci];
+    var cSid = extractLinkSrcIdGs_(cRow);
+    if (!cSid) continue;
+    canMetaById[cSid] = {
+      isSourceCancelled: true,
+      cancellationReason: normalizeStr(cRow.cancellationReason || cRow.reason || ''),
+      cancelledAt: normalizeStr(cRow.cancelledAt || cRow.canceledAt || cRow.createdAt || ''),
+      referenceNumber: normalizeStr(cRow.referenceNumber || cRow.reference_number || '')
+    };
+    if (bySrcId[cSid]) {
+      bySrcId[cSid].isSourceCancelled = true;
+      if (canMetaById[cSid].cancellationReason && !bySrcId[cSid].cancellationReason) bySrcId[cSid].cancellationReason = canMetaById[cSid].cancellationReason;
+      if (canMetaById[cSid].cancelledAt && !bySrcId[cSid].cancelledAt) bySrcId[cSid].cancelledAt = canMetaById[cSid].cancelledAt;
+    } else if (cRow.clientName || cRow.customer_name || cRow.carNameAr || cRow.reservationNumber || cRow.startDate) {
+      var inlineCan = Object.assign({}, cRow, {
+        reservationId: cSid,
+        isSourceCancelled: true,
+        reservationStatus: cRow.reservationStatus || cRow.status || 'cancelled'
+      });
+      bySrcId[cSid] = inlineCan;
+      presentSrcIds[cSid] = true;
+      mergedRes.push(inlineCan);
+    } else if (!presentSrcIds[cSid]) {
+      missingIdsMap[cSid] = true;
+    }
   }
 
-  var extOneBasedOffset = 0;
-  var resOneBasedOffset = 0;
-  var extInfo1 = null;
-  var resInfo1 = null;
-  if (probeReqs.length > 0) {
-    var probeResponses = UrlFetchApp.fetchAll(probeReqs);
-    pagesFetched += probeResponses.length;
-    for (var pi = 0; pi < probeResponses.length; pi++) {
-      var pKind = probeKinds[pi];
-      var pInfo = extractPagePayload_(parseRentalGateResponse_(probeResponses[pi]), 1, pageSize);
-      var pAdded = appendUniquePageRows_(pKind === 'ext' ? extItems : resItems, pKind === 'ext' ? extSeen : resSeen, pInfo.rows, pKind);
-      if (pKind === 'ext') {
-        extInfo1 = pInfo;
-        if (pInfo.rows.length > 0 && pAdded === 0) extOneBasedOffset = 1;
-      } else {
-        resInfo1 = pInfo;
-        if (pInfo.rows.length > 0 && pAdded === 0) resOneBasedOffset = 1;
+  for (var ri = 0; ri < rccPull.items.length; ri++) {
+    var rRow = rccPull.items[ri];
+    var rSid = extractLinkSrcIdGs_(rRow);
+    if (!rSid) continue;
+    var rccSt = normalizeStr(rRow.status || '').toUpperCase();
+    var isCompChanged = rccSt === 'COMPANY_CHANGED';
+    rccMetaById[rSid] = {
+      isSourceRejected: isCompChanged || rccSt === 'REJECTED' || rccSt === 'TIMEOUT',
+      rccStatus: rccSt,
+      rccReason: normalizeStr(rRow.reason || rRow.rejectionReason || ''),
+      newCompanyName: normalizeStr(rRow.newCompanyName || rRow.alternativeCompanyName || '')
+    };
+    if (bySrcId[rSid]) {
+      if (rccMetaById[rSid].isSourceRejected) bySrcId[rSid].isSourceRejected = true;
+      bySrcId[rSid].rccStatus = rccSt;
+      if (rccMetaById[rSid].rccReason && !bySrcId[rSid].rejectionReason) bySrcId[rSid].rejectionReason = rccMetaById[rSid].rccReason;
+      if (rccMetaById[rSid].newCompanyName && !bySrcId[rSid].newCompanyName) bySrcId[rSid].newCompanyName = rccMetaById[rSid].newCompanyName;
+    } else if (rRow.clientName || rRow.customer_name || rRow.carNameAr || rRow.reservationNumber || rRow.startDate) {
+      var inlineRcc = Object.assign({}, rRow, {
+        reservationId: rSid,
+        isSourceRejected: rccMetaById[rSid].isSourceRejected,
+        rccStatus: rccSt,
+        reservationStatus: rccMetaById[rSid].isSourceRejected ? (rRow.reservationStatus || rRow.status || 'rejected') : (rRow.reservationStatus || rRow.status || '')
+      });
+      bySrcId[rSid] = inlineRcc;
+      presentSrcIds[rSid] = true;
+      mergedRes.push(inlineRcc);
+    } else if (!presentSrcIds[rSid]) {
+      missingIdsMap[rSid] = true;
+    }
+  }
+
+  var backfillIds = Object.keys(missingIdsMap);
+  var backfillFailedIds = [];
+  for (var bi = 0; bi < backfillIds.length; bi++) {
+    var bSid = backfillIds[bi];
+    var det = fetchReservationDetailByIdGs_(token, bSid);
+    pagesFetched++;
+    if (!det) {
+      det = fetchReservationDetailByIdGs_(token, bSid); // targeted retry pass
+      pagesFetched++;
+    }
+    if (det) {
+      if (canMetaById[bSid]) {
+        det.isSourceCancelled = true;
+        if (canMetaById[bSid].cancellationReason && !det.cancellationReason) det.cancellationReason = canMetaById[bSid].cancellationReason;
+        if (canMetaById[bSid].cancelledAt && !det.cancelledAt) det.cancelledAt = canMetaById[bSid].cancelledAt;
       }
+      if (rccMetaById[bSid]) {
+        if (rccMetaById[bSid].isSourceRejected) det.isSourceRejected = true;
+        det.rccStatus = rccMetaById[bSid].rccStatus;
+        if (rccMetaById[bSid].rccReason && !det.rejectionReason) det.rejectionReason = rccMetaById[bSid].rccReason;
+        if (rccMetaById[bSid].newCompanyName && !det.newCompanyName) det.newCompanyName = rccMetaById[bSid].newCompanyName;
+      }
+      bySrcId[bSid] = det;
+      mergedRes.push(det);
+    } else {
+      backfillFailedIds.push(bSid);
     }
   }
 
-  var remainingReqs = [];
-  var remainingMeta = [];
-  var extHasMore1 = extInfo1 && ((!extInfo1.isLast) || (extInfo1.totalElements > 0 && extItems.length < extInfo1.totalElements && extInfo1.rows.length > 0) || extOneBasedOffset === 1);
-  var resHasMore1 = resInfo1 && ((!resInfo1.isLast) || (resInfo1.totalElements > 0 && resItems.length < resInfo1.totalElements && resInfo1.rows.length > 0) || resOneBasedOffset === 1);
-
-  if (extHasMore1 && extInfo0.hasTotalPages && extInfo0.totalPages > 1) {
-    var extLast = Math.min(extInfo0.totalPages - (extOneBasedOffset ? 0 : 1), maxPages - 1);
-    for (var ep = 2; ep <= extLast; ep++) {
-      remainingReqs.push(buildRentalGateRequest_(extUrl, token, ep, pageSize));
-      remainingMeta.push({ kind: 'ext', page: ep });
-    }
-  }
-  if (resHasMore1 && resInfo0.hasTotalPages && resInfo0.totalPages > 1) {
-    var resLast = Math.min(resInfo0.totalPages - (resOneBasedOffset ? 0 : 1), maxPages - 1);
-    for (var rp = 2; rp <= resLast; rp++) {
-      remainingReqs.push(buildRentalGateRequest_(resUrl, token, rp, pageSize));
-      remainingMeta.push({ kind: 'res', page: rp });
-    }
-  }
-
-  // Round 2+: fetch known remaining pages in parallel batches of 20
-  var batchSize = 20;
-  for (var start = 0; start < remainingReqs.length; start += batchSize) {
-    var reqChunk = remainingReqs.slice(start, start + batchSize);
-    var metaChunk = remainingMeta.slice(start, start + batchSize);
-    var responses = UrlFetchApp.fetchAll(reqChunk);
-    pagesFetched += responses.length;
-    for (var i = 0; i < responses.length; i++) {
-      var kind = metaChunk[i].kind;
-      var info = extractPagePayload_(parseRentalGateResponse_(responses[i]), metaChunk[i].page, pageSize);
-      appendUniquePageRows_(kind === 'ext' ? extItems : resItems, kind === 'ext' ? extSeen : resSeen, info.rows, kind);
-    }
-  }
-
-  // Fallback for endpoints that return hasMore / last:false / total without totalPages
-  if (resHasMore1 && !resInfo0.hasTotalPages && resInfo1.rows.length > 0) {
-    for (var rPage = 2; rPage < maxPages; rPage++) {
-      var rBody = callRentalGateEndpoint(resUrl, token, rPage, pageSize);
-      pagesFetched++;
-      var rInfo = extractPagePayload_(rBody, rPage, pageSize);
-      var rAdded = appendUniquePageRows_(resItems, resSeen, rInfo.rows, 'res');
-      var rHasMore = rInfo.totalElements > 0 && resItems.length < rInfo.totalElements && rInfo.rows.length > 0;
-      if ((rInfo.isLast && !rHasMore) || rInfo.rows.length === 0 || rAdded === 0) break;
-    }
-  }
-  if (extHasMore1 && !extInfo0.hasTotalPages && extInfo1.rows.length > 0) {
-    for (var ePage = 2; ePage < maxPages; ePage++) {
-      var eBody = callRentalGateEndpoint(extUrl, token, ePage, pageSize);
-      pagesFetched++;
-      var eInfo = extractPagePayload_(eBody, ePage, pageSize);
-      var eAdded = appendUniquePageRows_(extItems, extSeen, eInfo.rows, 'ext');
-      var eHasMore = eInfo.totalElements > 0 && extItems.length < eInfo.totalElements && eInfo.rows.length > 0;
-      if ((eInfo.isLast && !eHasMore) || eInfo.rows.length === 0 || eAdded === 0) break;
-    }
-  }
+  var uniqueTotal = Math.max(mergedRes.length + backfillFailedIds.length, resPull.totalElements || 0);
+  var grossThreeLists = rawMainCount + canPull.items.length + rccPull.items.length;
+  var sourceBreakdown = {
+    uniqueSourceTotal: uniqueTotal,
+    grossAcrossThreeLists: grossThreeLists,
+    activeOrOtherCount: rawMainCount,
+    cancelledListCount: canPull.items.length,
+    rejectedListCount: rccPull.items.length,
+    overlapCount: Math.max(0, grossThreeLists - uniqueTotal),
+    dualCancelledRejectedCount: 0,
+    reassignedActiveCount: 0
+  };
 
   return {
-    extensions: extItems,
-    reservations: resItems,
-    pagesFetched: pagesFetched
+    extensions: extPull.items,
+    reservations: mergedRes,
+    pagesFetched: pagesFetched,
+    totalInSource: uniqueTotal,
+    incompleteEndpoints: incompleteEndpoints,
+    backfillFailedIds: backfillFailedIds,
+    sourceBreakdown: sourceBreakdown
   };
 }
 
@@ -600,6 +790,17 @@ function pullReservations(session, payload) {
     fetchedCount: syncResult.fetchedCount || 0,
     excludedFilteredCount: syncResult.excludedFilteredCount || 0,
     rangeFilteredCount: syncResult.rangeFilteredCount || 0,
+    totalInSource: syncResult.totalInSource || 0,
+    failedCount: syncResult.failedCount || 0,
+    missingLocalCount: syncResult.missingLocalCount || 0,
+    missingSourceIds: syncResult.missingSourceIds || [],
+    failedRecords: syncResult.failedRecords || [],
+    incompleteEndpoints: syncResult.incompleteEndpoints || [],
+    backfillFailedIds: syncResult.backfillFailedIds || [],
+    unfetchedSourceGap: syncResult.unfetchedSourceGap || 0,
+    syncComplete: syncResult.syncComplete !== false,
+    sourceBreakdown: syncResult.sourceBreakdown || null,
+    reconciliation: syncResult.reconciliation || null,
     durationMs: syncResult.durationMs || 0,
     finishedAt: syncResult.finishedAt || nowIso(),
     appliedRange: syncResult.appliedRange || { preset: 'all', dateFrom: '', dateTo: '', hasCustomRange: false },
@@ -764,63 +965,122 @@ function runRentalGateSyncInternal(actor, options) {
         if (sKey) existingBySourceId[sKey] = existingReservations[r];
       }
 
-      var resSeenMap = {};
+      var resSeenBySrcKey = {};
+      var resUsedNums = {};
       var resRecordsToUpsert = [];
       var statusChangeHistoryBatch = [];
       var changedReservations = [];
+      var failedRecords = [];
+      var excludedSourceIds = [];
+      var expectedSourceIds = [];
+      var duplicateHandledCount = 0;
       var nowStr = nowIso();
+
+      for (var biFail = 0; biFail < (parallelFetch.backfillFailedIds || []).length; biFail++) {
+        var bFailId = normalizeStr(parallelFetch.backfillFailedIds[biFail]);
+        if (bFailId) {
+          failedRecords.push({
+            identifier: bFailId,
+            sourceReservationId: bFailId,
+            entityType: 'backfill',
+            stage: 'backfill',
+            reason: 'DETAIL_FETCH_FAILED'
+          });
+        }
+      }
 
       for (var i = 0; i < resItems.length; i++) {
         var item = resItems[i];
-        var resApiId = extractSourceReservationId_(item);
-        var statusCode = extractReservationStatusCode_(item, false);
-        var prelimStatusAr = resolveSourceWorkflowStatus_(item);
-        var prelimLc = (typeof classifyReservationLifecycleGs_ === 'function')
-          ? classifyReservationLifecycleGs_({
-              originalStatusCode: statusCode,
-              originalStatusAr: prelimStatusAr,
-              isSourceRejected: item.isSourceRejected === true,
-              isSourceCancelled: item.isSourceCancelled === true
-            })
-          : 'active';
-        var resNumber;
-        if (prelimLc === 'rejected' || prelimLc === 'cancelled') {
-          var explicitRefPre = normalizeStr(item.referenceNumber || item.reference_number || item.refNumber || item.ref_number || item.sourceReference || item.externalReference || item.orderRef || item.reference || '');
-          var explicitBookPre = normalizeStr(
-            item.reservationNumber || item.reservation_number || item.reservationNo || item.reservation_no ||
-            item.reservationCode || item.reservation_code || item.bookingNumber || item.booking_number ||
-            item.bookingCode || item.booking_code || item.contractNumber || item.contract_number ||
-            item.orderNumber || item.order_number || item.code || item.serialNumber || item.serial_number || item.number || ''
-          );
-          resNumber = (explicitBookPre && (!explicitRefPre || explicitBookPre !== explicitRefPre || !resApiId))
-            ? explicitBookPre
-            : (resApiId || explicitBookPre);
-        } else {
-          resNumber = extractReservationNumber_(item) || resApiId;
-        }
-        if (!resNumber || resSeenMap[resNumber]) continue;
-        resSeenMap[resNumber] = true;
-
-        if (excludedSet[statusCode]) {
-          excludedFilteredCount++;
-          continue;
-        }
-
-        var combinedExts = [];
-        var extSeenForRes = {};
-        var byNumList = extByResNumber[resNumber] || [];
-        var byIdList = resApiId ? (extByResId[resApiId] || []) : [];
-        var mergedLists = byNumList.concat(byIdList);
-        for (var m = 0; m < mergedLists.length; m++) {
-          var candExt = mergedLists[m];
-          if (!extSeenForRes[candExt.extensionNumber]) {
-            extSeenForRes[candExt.extensionNumber] = true;
-            combinedExts.push(candExt);
+        try {
+          var resApiId = extractSourceReservationId_(item);
+          var statusCode = extractReservationStatusCode_(item, false);
+          var prelimStatusAr = resolveSourceWorkflowStatus_(item);
+          var prelimLc = (typeof classifyReservationLifecycleGs_ === 'function')
+            ? classifyReservationLifecycleGs_({
+                originalStatusCode: statusCode,
+                originalStatusAr: prelimStatusAr,
+                isSourceRejected: item.isSourceRejected === true,
+                isSourceCancelled: item.isSourceCancelled === true
+              })
+            : 'active';
+          var resNumber;
+          if (prelimLc === 'rejected' || prelimLc === 'cancelled') {
+            var explicitRefPre = normalizeStr(item.referenceNumber || item.reference_number || item.refNumber || item.ref_number || item.sourceReference || item.externalReference || item.orderRef || item.reference || '');
+            var explicitBookPre = normalizeStr(
+              item.reservationNumber || item.reservation_number || item.reservationNo || item.reservation_no ||
+              item.reservationCode || item.reservation_code || item.bookingNumber || item.booking_number ||
+              item.bookingCode || item.booking_code || item.contractNumber || item.contract_number ||
+              item.orderNumber || item.order_number || item.code || item.serialNumber || item.serial_number || item.number || ''
+            );
+            resNumber = (explicitBookPre && (!explicitRefPre || explicitBookPre !== explicitRefPre || !resApiId))
+              ? explicitBookPre
+              : (resApiId || explicitBookPre);
+          } else {
+            resNumber = extractReservationNumber_(item) || resApiId;
           }
-        }
+          if (!resNumber) {
+            failedRecords.push({
+              identifier: resApiId || ('row#' + (i + 1)),
+              sourceReservationId: resApiId || '',
+              entityType: 'reservation',
+              stage: 'normalize',
+              reason: 'MISSING_RESERVATION_NUMBER'
+            });
+            continue;
+          }
 
-        var existing = existingByNumber[resNumber] || (resApiId ? existingBySourceId[resApiId] : null);
-        var resId = existing ? existing.id : generateId('RES');
+          var srcUniqueKey = resApiId ? ('ID:' + resApiId) : ('NUM:' + resNumber);
+          if (resSeenBySrcKey[srcUniqueKey]) {
+            duplicateHandledCount++;
+            continue;
+          }
+          resSeenBySrcKey[srcUniqueKey] = true;
+
+          // Only apply excludedSet when booking is NOT rejected/cancelled and NOT explicitly included
+          if (prelimLc !== 'rejected' && prelimLc !== 'cancelled' && statusCode && excludedSet[statusCode]) {
+            excludedFilteredCount++;
+            excludedSourceIds.push(resApiId || resNumber);
+            continue;
+          }
+
+          if (resApiId) expectedSourceIds.push(resApiId);
+          else expectedSourceIds.push(resNumber);
+
+          var existing = (resApiId ? existingBySourceId[resApiId] : null) || null;
+          if (!existing) {
+            var numCand = existingByNumber[resNumber];
+            if (numCand) {
+              var candSrc = normalizeStr(numCand.sourceReservationId);
+              if (candSrc && resApiId && candSrc !== resApiId) {
+                existing = null;
+              } else {
+                existing = numCand;
+              }
+            }
+          }
+
+          // If another distinct booking already claimed resNumber in this batch or existing sheet, disambiguate instead of dropping or overwriting!
+          if (resUsedNums[resNumber] && resUsedNums[resNumber] !== srcUniqueKey) {
+            resNumber = resApiId ? (resNumber + '-' + resApiId.replace(/[^A-Za-z0-9_-]/g, '')) : (resNumber + '-R' + (i + 1));
+          } else if (existing === null && existingByNumber[resNumber] && normalizeStr(existingByNumber[resNumber].sourceReservationId) && resApiId && normalizeStr(existingByNumber[resNumber].sourceReservationId) !== resApiId) {
+            resNumber = resNumber + '-' + resApiId.replace(/[^A-Za-z0-9_-]/g, '');
+          }
+          resUsedNums[resNumber] = srcUniqueKey;
+
+          var combinedExts = [];
+          var extSeenForRes = {};
+          var byNumList = extByResNumber[resNumber] || [];
+          var byIdList = resApiId ? (extByResId[resApiId] || []) : [];
+          var mergedLists = byNumList.concat(byIdList);
+          for (var m = 0; m < mergedLists.length; m++) {
+            var candExt = mergedLists[m];
+            if (!extSeenForRes[candExt.extensionNumber]) {
+              extSeenForRes[candExt.extensionNumber] = true;
+              combinedExts.push(candExt);
+            }
+          }
+
+          var resId = existing ? existing.id : generateId('RES');
 
         var rawStart = item.startDate || item.start_date || item.pickup_date;
         var rawOrigEnd = item.endDate || item.end_date || item.return_date || item.actualEndDate;
@@ -1091,8 +1351,18 @@ function runRentalGateSyncInternal(actor, options) {
             : ((existing && existing.sourceOrder && Number(existing.sourceOrder) > 0) ? Math.floor(Number(existing.sourceOrder)) : (i + 1))
         };
 
-        resRecordsToUpsert.push(resPayload);
-        changedReservations.push(serializeReservationForClient_(resPayload, false));
+          resRecordsToUpsert.push(resPayload);
+          changedReservations.push(serializeReservationForClient_(resPayload, false));
+        } catch (rowErr) {
+          failedRecords.push({
+            identifier: normalizeStr(extractSourceReservationId_(item) || extractReservationNumber_(item) || ('row#' + (i + 1))),
+            sourceReservationId: extractSourceReservationId_(item) || '',
+            reservationNumber: extractReservationNumber_(item) || '',
+            entityType: 'reservation',
+            stage: 'normalize',
+            reason: String(rowErr && rowErr.message ? rowErr.message : rowErr).substring(0, 240)
+          });
+        }
       }
 
       var diffOpts = { ignoreDiffKeys: { updatedAt: true, syncedAt: true, rawJson: true } };
@@ -1111,27 +1381,86 @@ function runRentalGateSyncInternal(actor, options) {
         batchAppendRecords(RG_SHEETS.FOLLOWUP_HISTORY, statusChangeHistoryBatch);
       }
 
+      // Post-upsert verification against RG_SHEETS.RESERVATIONS
+      var verifySheetRows = readAllRecords(RG_SHEETS.RESERVATIONS, true);
+      var verifiedSrcMap = {};
+      var verifiedNumMap = {};
+      for (var vsi = 0; vsi < verifySheetRows.length; vsi++) {
+        var vRow = verifySheetRows[vsi];
+        var vNum = normalizeStr(vRow.reservationNumber);
+        var vSid = normalizeStr(vRow.sourceReservationId);
+        if (vNum) verifiedNumMap[vNum] = true;
+        if (vSid) verifiedSrcMap[vSid] = true;
+      }
+      var missingSourceIds = [];
+      for (var ei = 0; ei < expectedSourceIds.length; ei++) {
+        var eid = expectedSourceIds[ei];
+        if (!verifiedSrcMap[eid] && !verifiedNumMap[eid]) {
+          missingSourceIds.push(eid);
+        }
+      }
+
+      var incompleteEndpoints = parallelFetch.incompleteEndpoints || [];
+      var backfillFailedIds = parallelFetch.backfillFailedIds || [];
+      var totalInSource = toNumber(parallelFetch.totalInSource, resItems.length + backfillFailedIds.length);
+      var unfetchedSourceGap = Math.max(0, totalInSource - (resRecordsToUpsert.length + backfillFailedIds.length + excludedFilteredCount + rangeFilteredCount));
+      var syncComplete =
+        failedRecords.length === 0 &&
+        missingSourceIds.length === 0 &&
+        incompleteEndpoints.length === 0 &&
+        backfillFailedIds.length === 0 &&
+        unfetchedSourceGap === 0;
+      var syncStatusVal = syncComplete ? 'success' : 'partial';
+      var syncWarnParts = [];
+      if (failedRecords.length > 0) syncWarnParts.push('فشل ' + failedRecords.length + ' سجل');
+      if (missingSourceIds.length > 0) syncWarnParts.push('ناقص بعد التحقق: ' + missingSourceIds.length);
+      if (unfetchedSourceGap > 0) syncWarnParts.push('فجوة مصدر: ' + unfetchedSourceGap);
+      if (incompleteEndpoints.length > 0) syncWarnParts.push('واجهات ناقصة: ' + incompleteEndpoints.join(' | '));
+      var syncErrMsg = syncComplete ? '' : syncWarnParts.join(' · ').substring(0, 500);
+
+      var reconciliation = {
+        totalInSource: totalInSource,
+        fetchedCount: rawFetchedCount,
+        normalizedCount: resRecordsToUpsert.length,
+        savedOrUpdatedCount: importedCount + updatedCount,
+        dbTotalReservations: verifySheetRows.length,
+        duplicateHandledCount: duplicateHandledCount,
+        excludedFilteredCount: excludedFilteredCount,
+        rangeFilteredCount: rangeFilteredCount,
+        failedCount: failedRecords.length,
+        missingLocalCount: missingSourceIds.length,
+        unfetchedSourceGap: unfetchedSourceGap,
+        syncComplete: syncComplete,
+        missingSourceIds: missingSourceIds,
+        failedRecords: failedRecords,
+        excludedSourceIds: excludedSourceIds,
+        incompleteEndpoints: incompleteEndpoints,
+        backfillFailedIds: backfillFailedIds,
+        sourceBreakdown: parallelFetch.sourceBreakdown || null
+      };
+
       var syncRecord = {
         id: generateId('SYNC'),
         triggeredById: actorId,
         triggeredByName: actorName,
-        status: 'success',
+        status: syncStatusVal,
         importedCount: importedCount,
         updatedCount: updatedCount,
         extensionsCount: extensionsCount,
         pagesFetched: pagesFetched,
-        errorMessage: '',
+        errorMessage: syncErrMsg,
         durationMs: Date.now() - startMs,
         startedAt: startedAt,
         finishedAt: nowIso()
       };
       appendRecord(RG_SHEETS.SYNC_LOG, syncRecord);
-      if (actorId !== 'SYSTEM' || (importedCount + updatedCount + extensionsCount) > 0) {
+      if (actorId !== 'SYSTEM' || (importedCount + updatedCount + extensionsCount) > 0 || !syncComplete) {
         var rangeDesc = appliedRange.hasCustomRange
           ? (' | النطاق: ' + (appliedRange.dateFrom || '-') + ' → ' + (appliedRange.dateTo || '-'))
           : '';
         logActivity(actorObj, 'سحب بيانات', 'Sync', syncRecord.id,
-          'استيراد ' + importedCount + '، تحديث ' + updatedCount + '، تمديدات ' + extensionsCount + rangeDesc);
+          'استيراد ' + importedCount + '، تحديث ' + updatedCount + '، تمديدات ' + extensionsCount +
+          ' | مطابقة ' + resRecordsToUpsert.length + '/' + totalInSource + (syncComplete ? '' : (' (ناقص/فاشل: ' + (missingSourceIds.length + failedRecords.length + unfetchedSourceGap) + ')')) + rangeDesc);
       }
 
       return {
@@ -1141,7 +1470,10 @@ function runRentalGateSyncInternal(actor, options) {
         rangeFilteredCount: rangeFilteredCount,
         changedReservations: changedReservations,
         resRecordsToUpsert: resRecordsToUpsert,
-        extRecordsToUpsert: extRecordsToUpsert
+        extRecordsToUpsert: extRecordsToUpsert,
+        reconciliation: reconciliation,
+        excludedSourceIds: excludedSourceIds,
+        expectedSourceIds: expectedSourceIds
       };
     } catch (err) {
       var errRecord = {
@@ -1163,12 +1495,21 @@ function runRentalGateSyncInternal(actor, options) {
     }
   });
 
+  var recOut = syncOut.reconciliation || {};
   var neonSyncMeta = (typeof pushIncrementalSyncToNeonSafe_ === 'function')
     ? pushIncrementalSyncToNeonSafe_(syncOut.resRecordsToUpsert, syncOut.extRecordsToUpsert, {
         triggeredById: actorId,
         triggeredByName: actorName,
         pagesFetched: syncOut.syncRecord.pagesFetched,
-        appliedRange: appliedRange
+        appliedRange: appliedRange,
+        totalInSource: recOut.totalInSource,
+        incompleteEndpoints: recOut.incompleteEndpoints,
+        backfillFailedIds: recOut.backfillFailedIds,
+        sourceBreakdown: recOut.sourceBreakdown,
+        excludedFilteredCount: syncOut.excludedFilteredCount,
+        rangeFilteredCount: syncOut.rangeFilteredCount,
+        excludedSourceIds: syncOut.excludedSourceIds,
+        expectedSourceIds: syncOut.expectedSourceIds
       })
     : { skipped: true };
 
@@ -1184,6 +1525,17 @@ function runRentalGateSyncInternal(actor, options) {
     fetchedCount: syncOut.rawFetchedCount,
     excludedFilteredCount: syncOut.excludedFilteredCount,
     rangeFilteredCount: syncOut.rangeFilteredCount,
+    totalInSource: recOut.totalInSource || 0,
+    failedCount: recOut.failedCount || 0,
+    missingLocalCount: recOut.missingLocalCount || 0,
+    missingSourceIds: recOut.missingSourceIds || [],
+    failedRecords: recOut.failedRecords || [],
+    incompleteEndpoints: recOut.incompleteEndpoints || [],
+    backfillFailedIds: recOut.backfillFailedIds || [],
+    unfetchedSourceGap: recOut.unfetchedSourceGap || 0,
+    syncComplete: recOut.syncComplete !== false,
+    sourceBreakdown: recOut.sourceBreakdown || null,
+    reconciliation: recOut,
     errorMessage: syncOut.syncRecord.errorMessage,
     durationMs: syncOut.syncRecord.durationMs,
     startedAt: syncOut.syncRecord.startedAt,

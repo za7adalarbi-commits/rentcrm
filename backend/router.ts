@@ -219,6 +219,9 @@ export async function dispatchCrmRequest(
       case 'syncRentalGate':
         result = await queries.pullOrSyncReservations(executor, session, 'syncRentalGate', payload);
         break;
+      case 'retryFailedSyncRecords':
+        result = await queries.retryFailedSyncRecordsAction(executor, session, payload);
+        break;
       case 'testConnection':
         result = await queries.testRentalGateConnection(executor, session);
         break;

@@ -318,6 +318,7 @@ const ACTION_SCOPE_MAP: Record<string, { eventType: 'delta' | 'announcement' | '
   markNotificationRead: { eventType: 'delta', scopes: ['notifications'], persistVersion: false },
   pullReservations: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'dashboard', 'employees', 'reports', 'activity', 'sync'], persistVersion: true },
   syncRentalGate: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'dashboard', 'employees', 'reports', 'activity', 'sync'], persistVersion: true },
+  retryFailedSyncRecords: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'dashboard', 'employees', 'reports', 'activity', 'sync'], persistVersion: true },
   importReservationsFromExcel: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'reports', 'activity'], persistVersion: true },
   deleteAllReservations: { eventType: 'delta', scopes: ['reservations', 'todayRadar', 'followUps', 'problems', 'dashboard', 'employees', 'reports', 'activity', 'sync'], persistVersion: true },
   updateSettings: { eventType: 'settings', scopes: ['settings', 'reservations', 'todayRadar', 'dashboard', 'reports', 'activity', 'sync'], persistVersion: true },

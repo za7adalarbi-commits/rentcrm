@@ -41,6 +41,7 @@ import {
   mapExtensionRowToClient,
   mapReservationRowToClient,
   pullFromRentalGateDirect,
+  retryFailedSyncRecords,
   sanitizeExcludedStatusesList
 } from './syncService.js';
 
@@ -4789,6 +4790,27 @@ export async function pullOrSyncReservations(
   }
 
   throw new Error('NO_RG_TOKEN: يرجى ضبط متغير RG_TOKEN أو GAS_WEBAPP_URL في إعدادات بيئة الخادم (.env / Vercel).');
+}
+
+export async function retryFailedSyncRecordsAction(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  if (!crmCore.canUserPerform(session.user, 'pull_reservations') && !crmCore.canUserPerform(session.user, 'sync_data')) {
+    requirePermission(session, 'pull_reservations');
+  }
+  const serverCfg = await resolveServerConfig(executor);
+  if (!serverCfg.rgToken) {
+    throw new Error('NO_RG_TOKEN: يتطلب إعادة معالجة السجلات الفاشلة/الناقصة وجود توكن Rental Gate مباشر على الخادم (RG_TOKEN).');
+  }
+  const result = await retryFailedSyncRecords(executor, session.user, payload);
+  return {
+    ...result,
+    id: result.syncId,
+    triggeredById: session.user.id,
+    triggeredByName: session.user.name
+  };
 }
 
 export async function saveGlobalConnectionSettings(

@@ -911,7 +911,7 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
       const nums: string[] = Array.isArray(params[0]) ? params[0] : [];
       const srcIds: string[] = Array.isArray(params[1]) ? params[1] : [];
       const rows = state.reservations
-        .filter((r) => nums.includes(r.reservation_number) || srcIds.includes(r.source_reservation_id))
+        .filter((r) => nums.includes(r.reservation_number) || srcIds.includes(r.source_reservation_id) || srcIds.includes(r.reservation_number))
         .map((r) => ({ reservation_number: r.reservation_number, source_reservation_id: r.source_reservation_id }));
       return { rows: rows as any[], rowCount: rows.length };
     }

@@ -34,6 +34,29 @@ export interface SyncSourceBreakdown {
   extensionsTotalCount: number;
 }
 
+export interface SyncReconciliationReport {
+  totalInSource: number;
+  fetchedCount: number;
+  uniqueSourceCount: number;
+  savedOrUpdatedCount: number;
+  importedCount: number;
+  updatedCount: number;
+  dbTotalReservations: number;
+  duplicateHandledCount: number;
+  excludedFilteredCount: number;
+  excludedSourceIds: string[];
+  rangeFilteredCount: number;
+  failedCount: number;
+  failedRecords: SyncFailedRecord[];
+  missingLocalCount: number;
+  missingSourceIds: string[];
+  incompleteEndpoints: string[];
+  backfillFailedIds: string[];
+  unfetchedSourceGap: number;
+  syncComplete: boolean;
+  verifiedAt: string;
+}
+
 export interface SyncBatchPayload {
   source?: string;
   actor?: Partial<SyncActor>;
@@ -46,10 +69,13 @@ export interface SyncBatchPayload {
   deletedReservationNumbers?: string[];
   appliedRange?: Record<string, any>;
   isFullSnapshot?: boolean;
+  isRetryPass?: boolean;
   cancelledAuthoritativeSynced?: boolean;
   rejectedAuthoritativeSynced?: boolean;
   cancelledSourceIds?: string[];
   rejectedSourceIds?: string[];
+  expectedSourceIds?: string[];
+  excludedSourceIds?: string[];
   totalInSource?: number;
   incompleteEndpoints?: string[];
   backfillFailedIds?: string[];
@@ -77,6 +103,7 @@ export interface SyncIngestResult {
   fetchedCount?: number;
   totalInSource: number;
   savedOrUpdatedCount: number;
+  dbTotalReservations: number;
   duplicateHandledCount: number;
   failedCount: number;
   failedRecords: SyncFailedRecord[];
@@ -84,6 +111,9 @@ export interface SyncIngestResult {
   missingSourceIds: string[];
   incompleteEndpoints: string[];
   backfillFailedIds: string[];
+  unfetchedSourceGap: number;
+  excludedSourceIds?: string[];
+  reconciliation: SyncReconciliationReport;
   sourceBreakdown?: SyncSourceBreakdown;
   excludedFilteredCount?: number;
   rangeFilteredCount?: number;
@@ -934,6 +964,10 @@ export async function ingestIncrementalSyncBatch(
   let updatedCount = 0;
   let extensionsCount = 0;
   let duplicateHandledCount = num(payload?.duplicateSourceRowsSkipped, 0);
+  let dbTotalReservations = 0;
+  let unfetchedSourceGap = 0;
+  let syncCompleteOut = false;
+  let reconciliationOut: SyncReconciliationReport | null = null;
   const changedReservations: any[] = [];
   const mutatedReservations: any[] = [];
   const failedRecords: SyncFailedRecord[] = backfillFailedIds.map((sid) => ({
@@ -944,6 +978,12 @@ export async function ingestIncrementalSyncBatch(
     reason: 'BACKFILL_DETAIL_FETCH_FAILED'
   }));
   let missingSourceIds: string[] = [];
+  const excludedSourceIds = Array.isArray(payload?.excludedSourceIds)
+    ? Array.from(new Set(payload.excludedSourceIds.map((s) => str(s)).filter(Boolean)))
+    : [];
+  const expectedSourceIds = Array.isArray(payload?.expectedSourceIds)
+    ? Array.from(new Set(payload.expectedSourceIds.map((s) => str(s)).filter(Boolean)))
+    : [];
 
   try {
     await executor.withTransaction(async (tx) => {
@@ -956,6 +996,7 @@ export async function ingestIncrementalSyncBatch(
           return clean ? `#${clean}` : '';
         }),
         ...incomingRes.map((r) => str(crmCore.extractSourceReservationId(r))),
+        ...incomingRes.map((r) => normLookupKey(crmCore.extractSourceReservationId(r))),
         ...incomingExt.map((e) => str(e.reservationNumber || e.reservation_number || e.reservationId)),
         ...incomingExt.map((e) => str(e.sourceReservationId || e.reservationId))
       ].filter(Boolean)));
@@ -991,23 +1032,91 @@ export async function ingestIncrementalSyncBatch(
           const cleanResNum = normLookupKey(clientObj.reservationNumber);
           if (cleanResNum && !existingByNumber.has(cleanResNum)) existingByNumber.set(cleanResNum, clientObj);
           resIdByRef.set(clientObj.reservationNumber, clientObj.id);
+          if (cleanResNum) resIdByRef.set(cleanResNum, clientObj.id);
         }
         if (clientObj.sourceReservationId) {
           existingBySourceId.set(clientObj.sourceReservationId, clientObj);
+          const cleanSrcId = normLookupKey(clientObj.sourceReservationId);
+          if (cleanSrcId && !existingBySourceId.has(cleanSrcId)) existingBySourceId.set(cleanSrcId, clientObj);
           resIdByRef.set(clientObj.sourceReservationId, clientObj.id);
+          if (cleanSrcId) resIdByRef.set(cleanSrcId, clientObj.id);
         }
       }
+
+      const resolveExistingAndTargetNum = (raw: any) => {
+        const extractedNum = str(crmCore.extractReservationNumber(raw));
+        const rawSrcId = str(crmCore.extractSourceReservationId(raw));
+        const srcId = rawSrcId || extractedNum;
+        const cleanSrc = normLookupKey(srcId);
+        const cleanNum = normLookupKey(extractedNum);
+        const idCand = str(raw?.id);
+
+        // 1) Primary match MUST be by unique sourceReservationId to prevent silent cross-booking overwrites
+        let existing: Record<string, any> | null =
+          (srcId && existingBySourceId.get(srcId)) ||
+          (cleanSrc && existingBySourceId.get(cleanSrc)) ||
+          null;
+        let targetResNum = extractedNum;
+
+        if (existing) {
+          // If rawResNum collides with a different DB row, keep existing/disambiguated number instead of crashing or overwriting
+          const numConflict = existingByNumber.get(targetResNum) || (cleanNum ? existingByNumber.get(cleanNum) : null) || null;
+          if (numConflict && numConflict.id !== existing.id) {
+            const exNum = str(existing.reservationNumber);
+            const disambig = `${cleanNum || targetResNum}-${cleanSrc || srcId}`;
+            targetResNum = (exNum && (!existingByNumber.has(exNum) || existingByNumber.get(exNum)?.id === existing.id))
+              ? exNum
+              : disambig;
+          }
+        } else {
+          // 2) Fallback match by reservationNumber or primary key id, strictly checking sourceReservationId compatibility
+          const numMatch =
+            existingByNumber.get(extractedNum) ||
+            (cleanNum ? existingByNumber.get(cleanNum) : null) ||
+            (idCand ? existingById.get(idCand) : null) ||
+            null;
+          if (numMatch) {
+            const existingSrc = normLookupKey(numMatch.sourceReservationId);
+            if (existingSrc && cleanSrc && existingSrc !== cleanSrc) {
+              // Two distinct source bookings share the same display number -> do NOT overwrite! Disambiguate cleanly.
+              existing = null;
+              const baseNum = cleanNum || extractedNum;
+              targetResNum = baseNum.endsWith(`-${cleanSrc}`) ? baseNum : `${baseNum}-${cleanSrc}`;
+            } else {
+              existing = numMatch;
+            }
+          }
+        }
+
+        return { existing, targetResNum, srcId, rawSrcId };
+      };
+
+      const ensureUniqueResId = (candidateId: string, existingId?: string | null, salt?: string): string => {
+        if (existingId) return existingId;
+        if (candidateId && !knownDbResIds.has(candidateId)) return candidateId;
+        const base = candidateId || 'RES_ROW';
+        const suffix = str(salt).replace(/[^A-Za-z0-9_-]/g, '');
+        if (suffix && !knownDbResIds.has(`${base}_${suffix}`)) {
+          return `${base}_${suffix}`;
+        }
+        let unique = generateId('RES');
+        while (knownDbResIds.has(unique)) {
+          unique = generateId('RES');
+        }
+        return unique;
+      };
 
       // Pre-resolve reservation IDs for incoming reservations before linking extensions
       for (const raw of incomingRes) {
         try {
           const resNum = str(crmCore.extractReservationNumber(raw));
           if (!resNum) continue;
-          const srcId = str(crmCore.extractSourceReservationId(raw) || resNum);
-          const existing = existingByNumber.get(resNum) || existingByNumber.get(normLookupKey(resNum)) || existingBySourceId.get(srcId) || existingById.get(str(raw.id));
-          const resId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
+          const { existing, targetResNum, srcId } = resolveExistingAndTargetNum(raw);
+          const candidateId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${targetResNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
+          const resId = existing?.id || candidateId;
           knownDbResIds.add(resId);
           resIdByRef.set(resNum, resId);
+          resIdByRef.set(targetResNum, resId);
           if (srcId) resIdByRef.set(srcId, resId);
           if (str(raw.id)) resIdByRef.set(str(raw.id), resId);
         } catch {
@@ -1075,20 +1184,29 @@ export async function ingestIncrementalSyncBatch(
             });
             continue;
           }
-          const srcId = str(rawSrcId || rawResNum);
-          const existing = existingByNumber.get(rawResNum) || existingByNumber.get(normLookupKey(rawResNum)) || existingBySourceId.get(srcId) || existingById.get(str(raw.id)) || null;
-          if (existing && existing.reservationNumber && existing.reservationNumber !== rawResNum && !existingByNumber.has(rawResNum)) {
+          const resolved = resolveExistingAndTargetNum(raw);
+          const srcId = resolved.srcId;
+          const existing = resolved.existing;
+          const targetResNum = resolved.targetResNum;
+
+          if (existing && existing.reservationNumber && existing.reservationNumber !== targetResNum && !existingByNumber.has(targetResNum) && !existingByNumber.has(normLookupKey(targetResNum))) {
             await tx.query(
               `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
-              [existing.id, rawResNum]
+              [existing.id, targetResNum]
             ).catch(() => undefined);
             existingByNumber.delete(existing.reservationNumber);
-            existing.reservationNumber = rawResNum;
-            existingByNumber.set(rawResNum, existing);
+            existingByNumber.delete(normLookupKey(existing.reservationNumber));
+            existing.reservationNumber = targetResNum;
+            existingByNumber.set(targetResNum, existing);
+            existingByNumber.set(normLookupKey(targetResNum), existing);
           }
           const seenExtNums = new Set<string>();
           const relExts: any[] = [];
-          for (const candidate of [...(extsByResKey.get(rawResNum) || []), ...(srcId && srcId !== rawResNum ? (extsByResKey.get(srcId) || []) : [])]) {
+          for (const candidate of [
+            ...(extsByResKey.get(rawResNum) || []),
+            ...(targetResNum !== rawResNum ? (extsByResKey.get(targetResNum) || []) : []),
+            ...(srcId && srcId !== rawResNum ? (extsByResKey.get(srcId) || []) : [])
+          ]) {
             if (candidate?.extensionNumber && !seenExtNums.has(candidate.extensionNumber)) {
               seenExtNums.add(candidate.extensionNumber);
               relExts.push(candidate);
@@ -1096,6 +1214,21 @@ export async function ingestIncrementalSyncBatch(
           }
 
           const { record, followUpHistoryEntry } = normalizeIncomingReservation(raw, existing, relExts, actor, startedAt, seqIdx);
+          if (targetResNum && targetResNum !== record.reservationNumber) {
+            record.reservationNumber = targetResNum;
+            if (!existing) {
+              record.id = ensureUniqueResId(`RES_${targetResNum.replace(/[^A-Za-z0-9_-]/g, '')}`, null, srcId);
+            }
+          } else if (!existing) {
+            const ownerOfId = existingById.get(record.id);
+            if ((ownerOfId && normLookupKey(ownerOfId.sourceReservationId) !== normLookupKey(srcId)) || knownDbResIds.has(record.id)) {
+              const dupOwnerInBatch = Array.from(resDedupMap.values()).find((x) => x.id === record.id && normLookupKey(x.sourceReservationId) !== normLookupKey(srcId));
+              if (ownerOfId || dupOwnerInBatch) {
+                record.id = ensureUniqueResId(record.id, null, srcId);
+              }
+            }
+          }
+
           if (!record.reservationNumber) {
             failedRecords.push({
               identifier: srcId || `row#${seqIdx}`,
@@ -1109,26 +1242,38 @@ export async function ingestIncrementalSyncBatch(
 
           const dupExisting = resDedupMap.get(record.reservationNumber);
           if (dupExisting) {
-            const dupSrc = str(dupExisting.sourceReservationId);
-            const curSrc = str(record.sourceReservationId);
+            const dupSrc = normLookupKey(dupExisting.sourceReservationId);
+            const curSrc = normLookupKey(record.sourceReservationId);
             if (dupSrc && curSrc && dupSrc !== curSrc) {
               // Two genuinely distinct source IDs collided on the same reservationNumber: disambiguate cleanly rather than dropping one!
-              const disambigNum = `${record.reservationNumber}-${curSrc}`;
+              let disambigNum = `${record.reservationNumber}-${curSrc}`;
+              let attemptIdx = 1;
+              while (resDedupMap.has(disambigNum) && normLookupKey(resDedupMap.get(disambigNum)?.sourceReservationId) !== curSrc) {
+                attemptIdx++;
+                disambigNum = `${record.reservationNumber}-${curSrc}-${attemptIdx}`;
+              }
               record.reservationNumber = disambigNum;
-              record.id = `RES_${disambigNum.replace(/[^A-Za-z0-9_-]/g, '')}`;
+              record.id = ensureUniqueResId(`RES_${disambigNum.replace(/[^A-Za-z0-9_-]/g, '')}`, existing?.id, curSrc);
               knownDbResIds.add(record.id);
               resIdByRef.set(curSrc, record.id);
               resIdByRef.set(disambigNum, record.id);
               resDedupMap.set(disambigNum, record);
             } else {
               duplicateHandledCount++;
+              if (dupExisting.isSourceCancelled === true) record.isSourceCancelled = true;
+              if (dupExisting.isSourceRejected === true) record.isSourceRejected = true;
               resDedupMap.set(record.reservationNumber, record);
             }
           } else {
+            knownDbResIds.add(record.id);
             resDedupMap.set(record.reservationNumber, record);
           }
 
-          if (followUpHistoryEntry) historyBatch.push(followUpHistoryEntry);
+          if (followUpHistoryEntry) {
+            followUpHistoryEntry.reservationId = record.id;
+            followUpHistoryEntry.reservationNumber = record.reservationNumber;
+            historyBatch.push(followUpHistoryEntry);
+          }
         } catch (recErr: any) {
           failedRecords.push({
             identifier: rawSrcId || rawResNum || `row#${seqIdx}`,
@@ -1153,7 +1298,7 @@ export async function ingestIncrementalSyncBatch(
           successfullyPersistedRes.add(str(r.reservationNumber));
           const { rawJson: _omitRaw, ...clientRes } = r;
           changedReservations.push(clientRes);
-          const prev = existingByNumber.get(r.reservationNumber);
+          const prev = existingByNumber.get(r.reservationNumber) || (r.sourceReservationId ? existingBySourceId.get(r.sourceReservationId) : undefined);
           const genuinelyChanged =
             !prev ||
             str(prev.originalStatusCode) !== str(r.originalStatusCode) ||
@@ -1169,7 +1314,7 @@ export async function ingestIncrementalSyncBatch(
         }
       };
 
-      // Chunked UNNEST upserts for Reservations with SAVEPOINT + single-row fallback isolation
+      // Chunked UNNEST upserts for Reservations with SAVEPOINT + single-row fallback isolation + safe PK collision retry
       let resChunkIndex = 0;
       for (const chunk of chunkList(reservationBatch, 200)) {
         resChunkIndex++;
@@ -1191,14 +1336,31 @@ export async function ingestIncrementalSyncBatch(
               recordCommittedReservationChunk([singleRec], singleUpsertRes.rows);
             } catch (rowErr: any) {
               await tryRollbackToSavepoint(tx, spRow);
-              failedRecords.push({
-                identifier: str(singleRec.sourceReservationId || singleRec.reservationNumber || singleRec.id),
-                sourceReservationId: str(singleRec.sourceReservationId) || undefined,
-                reservationNumber: str(singleRec.reservationNumber) || undefined,
-                entityType: 'reservation',
-                stage: 'upsert',
-                reason: String(rowErr?.message || 'DB_UPSERT_ERROR').slice(0, 240)
-              });
+              const errMsg = String(rowErr?.message || 'DB_UPSERT_ERROR');
+              let recovered = false;
+              if (/reservations_pkey|duplicate key value.*id/i.test(errMsg)) {
+                const spRetry = `rg_res_row_retry_${resChunkIndex}_${rowOffset}`;
+                await trySavepoint(tx, spRetry);
+                try {
+                  singleRec.id = generateId('RES');
+                  const retryUpsertRes = await execReservationUpsertBatch(tx, [singleRec]);
+                  await tryReleaseSavepoint(tx, spRetry);
+                  recordCommittedReservationChunk([singleRec], retryUpsertRes.rows);
+                  recovered = true;
+                } catch {
+                  await tryRollbackToSavepoint(tx, spRetry);
+                }
+              }
+              if (!recovered) {
+                failedRecords.push({
+                  identifier: str(singleRec.sourceReservationId || singleRec.reservationNumber || singleRec.id),
+                  sourceReservationId: str(singleRec.sourceReservationId) || undefined,
+                  reservationNumber: str(singleRec.reservationNumber) || undefined,
+                  entityType: 'reservation',
+                  stage: 'upsert',
+                  reason: errMsg.slice(0, 240)
+                });
+              }
             }
           }
         }
@@ -1361,7 +1523,8 @@ export async function ingestIncrementalSyncBatch(
       const verifyNums = Array.from(new Set(reservationBatch.map((r) => str(r.reservationNumber)).filter(Boolean)));
       const verifySrcIds = Array.from(new Set([
         ...reservationBatch.map((r) => str(r.sourceReservationId || r.reservationNumber)),
-        ...backfillFailedIds
+        ...backfillFailedIds,
+        ...expectedSourceIds
       ].filter(Boolean)));
 
       const verifiedNums = new Set<string>();
@@ -1371,43 +1534,78 @@ export async function ingestIncrementalSyncBatch(
           `SELECT reservation_number, source_reservation_id
            FROM reservations
            WHERE reservation_number = ANY($1::text[])
-              OR source_reservation_id = ANY($2::text[])`,
+              OR source_reservation_id = ANY($2::text[])
+              OR reservation_number = ANY($2::text[])`,
           [verifyNums, verifySrcIds]
         );
         for (const row of dbCheck.rows) {
-          if (str(row.reservation_number)) verifiedNums.add(str(row.reservation_number));
-          if (str(row.source_reservation_id)) verifiedSrcIds.add(str(row.source_reservation_id));
+          const rn = str(row.reservation_number);
+          const sid = str(row.source_reservation_id);
+          if (rn) {
+            verifiedNums.add(rn);
+            verifiedNums.add(normLookupKey(rn));
+          }
+          if (sid) {
+            verifiedSrcIds.add(sid);
+            verifiedSrcIds.add(normLookupKey(sid));
+          }
         }
       }
 
+      const dbCountRes = await tx.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM reservations`).catch(() => ({ rows: [{ cnt: verifiedNums.size }] }));
+      dbTotalReservations = num(dbCountRes.rows?.[0]?.cnt, verifiedNums.size);
+
       const missingSet = new Set<string>();
+      const excludedSrcSet = new Set(excludedSourceIds.map((id) => normLookupKey(id)));
       for (const r of reservationBatch) {
         const rn = str(r.reservationNumber);
         const sid = str(r.sourceReservationId || rn);
-        if (!verifiedNums.has(rn) && !verifiedSrcIds.has(sid)) {
+        if (!verifiedNums.has(rn) && !verifiedSrcIds.has(sid) && !verifiedSrcIds.has(normLookupKey(sid))) {
           missingSet.add(sid || rn);
+        }
+      }
+      for (const esid of expectedSourceIds) {
+        const cleanEsid = normLookupKey(esid);
+        if (excludedSrcSet.has(cleanEsid)) continue;
+        if (!verifiedSrcIds.has(esid) && !verifiedSrcIds.has(cleanEsid) && !verifiedNums.has(esid) && !verifiedNums.has(cleanEsid)) {
+          missingSet.add(esid);
         }
       }
       for (const fr of failedRecords) {
         if (fr.entityType === 'reservation' || fr.entityType === 'backfill') {
           const sid = str(fr.sourceReservationId || fr.reservationNumber || fr.identifier);
-          if (sid && !verifiedSrcIds.has(sid) && !verifiedNums.has(str(fr.reservationNumber))) {
+          const rn = str(fr.reservationNumber);
+          if (sid && !verifiedSrcIds.has(sid) && !verifiedSrcIds.has(normLookupKey(sid)) && (!rn || !verifiedNums.has(rn))) {
             missingSet.add(sid);
           }
         }
       }
       missingSourceIds = Array.from(missingSet);
 
+      const savedOrUpdatedCount = importedCount + updatedCount;
+      const excludedCnt = num(payload?.excludedFilteredCount, excludedSourceIds.length);
+      const rangeCnt = num(payload?.rangeFilteredCount, 0);
+      const totalInSource = num(
+        payload?.totalInSource,
+        reservationBatch.length + failedRecords.filter((f) => f.entityType !== 'extension').length
+      );
+      unfetchedSourceGap = (!payload?.isRetryPass && payload?.totalInSource !== undefined)
+        ? Math.max(0, totalInSource - (reservationBatch.length + backfillFailedIds.length + excludedCnt + rangeCnt))
+        : 0;
+
       const syncComplete =
         failedRecords.length === 0 &&
         missingSourceIds.length === 0 &&
         incompleteEndpoints.length === 0 &&
-        backfillFailedIds.length === 0;
+        backfillFailedIds.length === 0 &&
+        unfetchedSourceGap === 0;
+      syncCompleteOut = syncComplete;
       const finalStatus: 'success' | 'partial' = syncComplete ? 'success' : 'partial';
 
       const summaryParts: string[] = [];
       if (failedRecords.length > 0) summaryParts.push(`فشل حفظ/معالجة ${failedRecords.length} سجل`);
       if (missingSourceIds.length > 0) summaryParts.push(`سجلات مفقودة بعد التحقق: ${missingSourceIds.length} (${missingSourceIds.slice(0, 8).join(', ')})`);
+      if (unfetchedSourceGap > 0) summaryParts.push(`نقص غير مجلوب من المصدر: ${unfetchedSourceGap}`);
       if (incompleteEndpoints.length > 0) summaryParts.push(`واجهات غير مكتملة: ${incompleteEndpoints.join(' | ')}`);
       const statusMessage = syncComplete ? '' : summaryParts.join(' · ').slice(0, 500);
 
@@ -1433,8 +1631,29 @@ export async function ingestIncrementalSyncBatch(
         .filter(Boolean);
       const missingNationalIdCount = missingIdResNums.length;
       const missingNationalIdReservations = missingIdResNums.slice(0, 20);
-      const savedOrUpdatedCount = importedCount + updatedCount;
-      const totalInSource = num(payload?.totalInSource, reservationBatch.length + failedRecords.filter((f) => f.entityType !== 'extension').length);
+
+      reconciliationOut = {
+        totalInSource,
+        fetchedCount: incomingRes.length,
+        uniqueSourceCount: reservationBatch.length,
+        savedOrUpdatedCount,
+        importedCount,
+        updatedCount,
+        dbTotalReservations,
+        duplicateHandledCount,
+        excludedFilteredCount: excludedCnt,
+        excludedSourceIds: excludedSourceIds.slice(0, 100),
+        rangeFilteredCount: rangeCnt,
+        failedCount: failedRecords.length,
+        failedRecords: failedRecords.slice(0, 100),
+        missingLocalCount: missingSourceIds.length,
+        missingSourceIds: missingSourceIds.slice(0, 100),
+        incompleteEndpoints,
+        backfillFailedIds: backfillFailedIds.slice(0, 100),
+        unfetchedSourceGap,
+        syncComplete,
+        verifiedAt: finishedAt
+      };
 
       await tx.query(
         `INSERT INTO sync_checkpoints (
@@ -1464,14 +1683,20 @@ export async function ingestIncrementalSyncBatch(
             updatedCount,
             extensionsCount,
             totalInSource,
+            fetchedCount: incomingRes.length,
             savedOrUpdatedCount,
+            dbTotalReservations,
             duplicateHandledCount,
+            excludedFilteredCount: excludedCnt,
+            excludedSourceIds: excludedSourceIds.slice(0, 100),
+            rangeFilteredCount: rangeCnt,
             failedCount: failedRecords.length,
-            failedRecords: failedRecords.slice(0, 25),
+            failedRecords: failedRecords.slice(0, 100),
             missingLocalCount: missingSourceIds.length,
-            missingSourceIds: missingSourceIds.slice(0, 25),
+            missingSourceIds: missingSourceIds.slice(0, 100),
             incompleteEndpoints,
-            backfillFailedIds: backfillFailedIds.slice(0, 25),
+            backfillFailedIds: backfillFailedIds.slice(0, 100),
+            unfetchedSourceGap,
             syncComplete,
             sourceBreakdown: payload?.sourceBreakdown || null,
             missingNationalIdCount,
@@ -1494,7 +1719,7 @@ export async function ingestIncrementalSyncBatch(
             syncId,
             syncComplete
               ? `استيراد ${importedCount}، تحديث ${updatedCount}، تمديدات ${extensionsCount}`
-              : `مزامنة غير مكتملة: استيراد ${importedCount}، تحديث ${updatedCount}، مفقود ${missingSourceIds.length}، فاشل ${failedRecords.length}`,
+              : `مزامنة غير مكتملة: استيراد ${importedCount}، تحديث ${updatedCount}، مفقود ${missingSourceIds.length}، فاشل ${failedRecords.length}${unfetchedSourceGap ? `، فجوة مصدر ${unfetchedSourceGap}` : ''}`,
             finishedAt.slice(0, 10),
             finishedAt.slice(11, 19),
             finishedAt
@@ -1532,16 +1757,35 @@ export async function ingestIncrementalSyncBatch(
       );
     }
 
-    const syncComplete =
-      failedRecords.length === 0 &&
-      missingSourceIds.length === 0 &&
-      incompleteEndpoints.length === 0 &&
-      backfillFailedIds.length === 0;
+    const syncComplete = syncCompleteOut;
     const savedOrUpdatedCount = importedCount + updatedCount;
     const totalInSource = num(
       payload?.totalInSource,
       savedOrUpdatedCount + missingSourceIds.length
     );
+
+    const finalReconciliation: SyncReconciliationReport = reconciliationOut || {
+      totalInSource,
+      fetchedCount: incomingRes.length,
+      uniqueSourceCount: savedOrUpdatedCount,
+      savedOrUpdatedCount,
+      importedCount,
+      updatedCount,
+      dbTotalReservations,
+      duplicateHandledCount,
+      excludedFilteredCount: num(payload?.excludedFilteredCount, excludedSourceIds.length),
+      excludedSourceIds,
+      rangeFilteredCount: num(payload?.rangeFilteredCount, 0),
+      failedCount: failedRecords.length,
+      failedRecords,
+      missingLocalCount: missingSourceIds.length,
+      missingSourceIds,
+      incompleteEndpoints,
+      backfillFailedIds,
+      unfetchedSourceGap,
+      syncComplete,
+      verifiedAt: finishedAt
+    };
 
     return {
       syncId,
@@ -1558,8 +1802,10 @@ export async function ingestIncrementalSyncBatch(
       appliedRange: payload?.appliedRange,
       changedReservations,
       mutatedReservations,
+      fetchedCount: incomingRes.length,
       totalInSource,
       savedOrUpdatedCount,
+      dbTotalReservations,
       duplicateHandledCount,
       failedCount: failedRecords.length,
       failedRecords,
@@ -1567,8 +1813,11 @@ export async function ingestIncrementalSyncBatch(
       missingSourceIds,
       incompleteEndpoints,
       backfillFailedIds,
+      unfetchedSourceGap,
+      excludedSourceIds,
+      reconciliation: finalReconciliation,
       sourceBreakdown: payload?.sourceBreakdown,
-      excludedFilteredCount: num(payload?.excludedFilteredCount, 0),
+      excludedFilteredCount: num(payload?.excludedFilteredCount, excludedSourceIds.length),
       rangeFilteredCount: num(payload?.rangeFilteredCount, 0),
       missingNationalIdCount: missingIdResNumsOut.length,
       missingNationalIdReservations: missingIdResNumsOut.slice(0, 20)
@@ -1715,9 +1964,33 @@ export function extractRentalGatePagePayload(
   json: any,
   pageIndex = 0,
   pageSize = 100
-): { rows: any[]; totalPages: number | null; totalElements: number; isLast: boolean; currentPageNum: number | null; nextPageUrl: string } {
+): {
+  rows: any[];
+  totalPages: number | null;
+  totalElements: number;
+  isLast: boolean;
+  currentPageNum: number | null;
+  nextPageUrl: string;
+  nextCursor: string;
+  nextPageNum: number | null;
+  offset: number | null;
+  effectivePageSize: number;
+  hasExplicitTotalElements: boolean;
+} {
   if (!json || typeof json !== 'object') {
-    return { rows: [], totalPages: null, totalElements: 0, isLast: true, currentPageNum: null, nextPageUrl: '' };
+    return {
+      rows: [],
+      totalPages: null,
+      totalElements: 0,
+      isLast: true,
+      currentPageNum: null,
+      nextPageUrl: '',
+      nextCursor: '',
+      nextPageNum: null,
+      offset: null,
+      effectivePageSize: pageSize,
+      hasExplicitTotalElements: false
+    };
   }
 
   if (Array.isArray(json)) {
@@ -1727,7 +2000,12 @@ export function extractRentalGatePagePayload(
       totalElements: json.length,
       isLast: json.length < pageSize,
       currentPageNum: null,
-      nextPageUrl: ''
+      nextPageUrl: '',
+      nextCursor: '',
+      nextPageNum: null,
+      offset: null,
+      effectivePageSize: pageSize,
+      hasExplicitTotalElements: false
     };
   }
 
@@ -1771,72 +2049,147 @@ export function extractRentalGatePagePayload(
     metaHolder?.totalPages ??
     metaHolder?.total_pages ??
     metaHolder?.last_page ??
+    metaHolder?.lastPage ??
+    metaHolder?.meta?.totalPages ??
+    metaHolder?.meta?.total_pages ??
     metaHolder?.meta?.last_page ??
+    metaHolder?.pagination?.totalPages ??
+    metaHolder?.pagination?.total_pages ??
     metaHolder?.pagination?.last_page ??
     json?.totalPages ??
     json?.total_pages ??
     json?.last_page ??
+    json?.lastPage ??
+    json?.meta?.totalPages ??
+    json?.meta?.total_pages ??
     json?.meta?.last_page ??
+    json?.pagination?.totalPages ??
+    json?.pagination?.total_pages ??
     json?.pagination?.last_page;
 
   const hasTotalPages = rawTotalPages !== undefined && rawTotalPages !== null && rawTotalPages !== '' && !isNaN(Number(rawTotalPages)) && Number(rawTotalPages) > 0;
-  const totalPages: number | null = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : null;
+  let totalPages: number | null = hasTotalPages ? Math.max(1, Number(rawTotalPages)) : null;
 
   const rawTotalElements =
     metaHolder?.totalElements ??
+    metaHolder?.totalItems ??
+    metaHolder?.total_items ??
+    metaHolder?.totalRecords ??
+    metaHolder?.total_records ??
     metaHolder?.total ??
     metaHolder?.total_count ??
+    metaHolder?.count ??
+    metaHolder?.meta?.totalElements ??
+    metaHolder?.meta?.totalItems ??
+    metaHolder?.meta?.total_items ??
+    metaHolder?.meta?.totalRecords ??
     metaHolder?.meta?.total ??
+    metaHolder?.meta?.total_count ??
+    metaHolder?.pagination?.totalElements ??
+    metaHolder?.pagination?.totalItems ??
+    metaHolder?.pagination?.total_items ??
+    metaHolder?.pagination?.total ??
     json?.totalElements ??
+    json?.totalItems ??
+    json?.total_items ??
+    json?.totalRecords ??
+    json?.total_records ??
     json?.total ??
-    json?.total_count;
-  const totalElements =
-    rawTotalElements !== undefined && rawTotalElements !== null && !isNaN(Number(rawTotalElements))
-      ? Number(rawTotalElements)
-      : safeRows.length;
+    json?.total_count ??
+    json?.count ??
+    json?.meta?.totalElements ??
+    json?.meta?.totalItems ??
+    json?.meta?.total_items ??
+    json?.meta?.total ??
+    json?.meta?.total_count ??
+    json?.pagination?.total ??
+    json?.pagination?.totalItems;
+  const hasExplicitTotalElements =
+    rawTotalElements !== undefined && rawTotalElements !== null && rawTotalElements !== '' && !isNaN(Number(rawTotalElements));
+  const totalElements = hasExplicitTotalElements ? Number(rawTotalElements) : safeRows.length;
 
   const explicitLast =
     metaHolder?.last !== undefined
       ? metaHolder.last
-      : (json?.last !== undefined ? json.last : undefined);
+      : (metaHolder?.pagination?.last !== undefined ? metaHolder.pagination.last : (json?.last !== undefined ? json.last : undefined));
   const explicitHasMore =
     metaHolder?.hasMore !== undefined
       ? metaHolder.hasMore
-      : (metaHolder?.has_more !== undefined ? metaHolder.has_more : (json?.hasMore ?? json?.has_more));
+      : (metaHolder?.has_more !== undefined
+          ? metaHolder.has_more
+          : (metaHolder?.pagination?.hasMore ?? metaHolder?.pagination?.has_more ?? metaHolder?.meta?.hasMore ?? metaHolder?.meta?.has_more ?? json?.hasMore ?? json?.has_more));
   const nextPageUrl = str(
-    metaHolder?.next_page_url ?? metaHolder?.meta?.next_page_url ?? metaHolder?.links?.next ??
-    json?.next_page_url ?? json?.meta?.next_page_url ?? json?.links?.next ?? ''
+    metaHolder?.next_page_url ?? metaHolder?.nextPageUrl ?? metaHolder?.meta?.next_page_url ?? metaHolder?.links?.next ?? metaHolder?.pagination?.next_page_url ??
+    json?.next_page_url ?? json?.nextPageUrl ?? json?.meta?.next_page_url ?? json?.links?.next ?? json?.pagination?.next_page_url ?? ''
   );
+  const nextCursor = str(
+    metaHolder?.nextCursor ?? metaHolder?.next_cursor ?? metaHolder?.nextToken ?? metaHolder?.next_token ?? metaHolder?.after ??
+    metaHolder?.meta?.nextCursor ?? metaHolder?.meta?.next_cursor ?? metaHolder?.pagination?.nextCursor ?? metaHolder?.pagination?.next_cursor ??
+    json?.nextCursor ?? json?.next_cursor ?? json?.nextToken ?? json?.next_token ?? json?.after ??
+    json?.meta?.nextCursor ?? json?.meta?.next_cursor ?? json?.pagination?.nextCursor ?? json?.pagination?.next_cursor ?? ''
+  );
+  const rawNextPageNum =
+    metaHolder?.nextPage ?? metaHolder?.next_page ?? metaHolder?.pagination?.nextPage ?? metaHolder?.pagination?.next_page ??
+    json?.nextPage ?? json?.next_page ?? json?.pagination?.nextPage ?? json?.pagination?.next_page;
+  const nextPageNum =
+    rawNextPageNum !== undefined && rawNextPageNum !== null && rawNextPageNum !== '' && !isNaN(Number(rawNextPageNum))
+      ? Number(rawNextPageNum)
+      : null;
+
+  const rawOffset = metaHolder?.offset ?? metaHolder?.pagination?.offset ?? json?.offset ?? json?.pagination?.offset;
+  const offset =
+    rawOffset !== undefined && rawOffset !== null && rawOffset !== '' && !isNaN(Number(rawOffset))
+      ? Number(rawOffset)
+      : null;
+
   const rawCurrentPage =
-    metaHolder?.current_page ?? metaHolder?.meta?.current_page ?? metaHolder?.pageNumber ?? metaHolder?.number ??
-    json?.current_page ?? json?.meta?.current_page ?? json?.pageNumber ?? json?.number;
+    metaHolder?.current_page ?? metaHolder?.currentPage ?? metaHolder?.meta?.current_page ?? metaHolder?.meta?.currentPage ??
+    metaHolder?.pagination?.current_page ?? metaHolder?.pagination?.currentPage ?? metaHolder?.pageNumber ?? metaHolder?.page ?? metaHolder?.number ??
+    json?.current_page ?? json?.currentPage ?? json?.meta?.current_page ?? json?.meta?.currentPage ??
+    json?.pagination?.current_page ?? json?.pagination?.currentPage ?? json?.pageNumber ?? json?.page ?? json?.number;
   const hasCurrentPage = rawCurrentPage !== undefined && rawCurrentPage !== null && rawCurrentPage !== '' && !isNaN(Number(rawCurrentPage));
   const currentPageNum = hasCurrentPage ? Number(rawCurrentPage) : null;
   const serverPageSize = Number(
-    metaHolder?.size ?? metaHolder?.per_page ?? metaHolder?.pageSize ?? metaHolder?.meta?.per_page ??
-    json?.size ?? json?.per_page ?? json?.pageSize ?? pageSize
+    metaHolder?.size ?? metaHolder?.per_page ?? metaHolder?.pageSize ?? metaHolder?.page_size ?? metaHolder?.limit ??
+    metaHolder?.meta?.per_page ?? metaHolder?.meta?.size ?? metaHolder?.pagination?.per_page ?? metaHolder?.pagination?.limit ??
+    json?.size ?? json?.per_page ?? json?.pageSize ?? json?.page_size ?? json?.limit ?? pageSize
   );
   const effectivePageSize = isFinite(serverPageSize) && serverPageSize > 0 ? serverPageSize : pageSize;
+  if (totalPages === null && hasExplicitTotalElements && effectivePageSize > 0 && Number(rawTotalElements) > 0) {
+    totalPages = Math.max(1, Math.ceil(Number(rawTotalElements) / effectivePageSize));
+  }
 
   let isLast: boolean;
   if (safeRows.length === 0) {
     isLast = true;
   } else if (explicitLast === true || explicitHasMore === false) {
     isLast = true;
-  } else if (nextPageUrl) {
+  } else if (nextPageUrl || nextCursor || (nextPageNum !== null && (currentPageNum === null || nextPageNum > currentPageNum))) {
     isLast = false;
   } else if (totalPages !== null) {
-    const isOneBasedCurrent = currentPageNum !== null && currentPageNum >= 1 && (pageIndex === 0 ? currentPageNum === 1 : true) &&
-      (metaHolder?.current_page !== undefined || metaHolder?.last_page !== undefined || json?.current_page !== undefined || json?.last_page !== undefined);
+    const hasOneBasedField = Boolean(
+      metaHolder?.current_page !== undefined || metaHolder?.currentPage !== undefined || metaHolder?.last_page !== undefined ||
+      metaHolder?.meta?.current_page !== undefined || metaHolder?.pagination?.current_page !== undefined ||
+      json?.current_page !== undefined || json?.currentPage !== undefined || json?.last_page !== undefined ||
+      json?.meta?.current_page !== undefined || json?.pagination?.current_page !== undefined ||
+      (pageIndex === 0 && currentPageNum === 1)
+    );
+    const isOneBasedCurrent = currentPageNum !== null && currentPageNum >= 1 && (pageIndex === 0 ? currentPageNum === 1 : true) && hasOneBasedField;
     if (isOneBasedCurrent) {
+      isLast = currentPageNum >= totalPages;
+    } else if (currentPageNum !== null && currentPageNum >= 0 && pageIndex > 0 && currentPageNum < totalPages && currentPageNum <= pageIndex) {
       isLast = currentPageNum >= totalPages;
     } else {
       isLast = pageIndex + 1 >= totalPages;
     }
   } else if (explicitLast === false || explicitHasMore === true) {
     isLast = false;
-  } else if (rawTotalElements !== undefined && rawTotalElements !== null && Number(rawTotalElements) > effectivePageSize) {
+  } else if (hasExplicitTotalElements && offset !== null) {
+    isLast = offset + safeRows.length >= Number(rawTotalElements);
+  } else if (hasExplicitTotalElements && Number(rawTotalElements) > effectivePageSize) {
     isLast = (pageIndex + 1) * effectivePageSize >= Number(rawTotalElements);
+  } else if (hasExplicitTotalElements && Number(rawTotalElements) > safeRows.length && pageIndex === 0) {
+    isLast = false;
   } else {
     isLast = safeRows.length < effectivePageSize;
   }
@@ -1847,7 +2200,12 @@ export function extractRentalGatePagePayload(
     totalElements,
     isLast,
     currentPageNum,
-    nextPageUrl
+    nextPageUrl,
+    nextCursor,
+    nextPageNum,
+    offset,
+    effectivePageSize,
+    hasExplicitTotalElements
   };
 }
 
@@ -2054,8 +2412,12 @@ export async function pullFromRentalGateDirect(
       const items: any[] = [];
       const seenKeys = new Set<string>();
       const visitedUrls = new Set<string>();
+      const visitedCursors = new Set<string>();
       let pages = 0;
       let explicitNextUrl = '';
+      let nextCursorUrl = '';
+      let nextOffsetUrl = '';
+      let oneBasedClamped = false;
       let consecutiveZeroAdded = 0;
       let succeeded = false;
       let complete = true;
@@ -2065,12 +2427,26 @@ export async function pullFromRentalGateDirect(
       let duplicateRowsSkipped = 0;
 
       for (let step = 0; step < maxPages; step++) {
-        const targetUrl = explicitNextUrl || `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
-        if (visitedUrls.has(targetUrl)) break;
+        const targetUrl =
+          explicitNextUrl ||
+          nextCursorUrl ||
+          nextOffsetUrl ||
+          `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
+        if (visitedUrls.has(targetUrl)) {
+          if (latestReportedTotalElements !== null && latestReportedTotalElements > 0 && items.length < latestReportedTotalElements) {
+            complete = false;
+            errorMsg = `PAGINATION_URL_LOOP (${items.length}/${latestReportedTotalElements})`;
+          }
+          break;
+        }
         visitedUrls.add(targetUrl);
         const pageParam = extractUrlPageIndex(targetUrl, step);
         const usedExplicitNext = Boolean(explicitNextUrl);
+        const usedCursor = Boolean(nextCursorUrl);
+        const usedOffset = Boolean(nextOffsetUrl);
         explicitNextUrl = '';
+        nextCursorUrl = '';
+        nextOffsetUrl = '';
 
         let resp: Response;
         try {
@@ -2129,18 +2505,18 @@ export async function pullFromRentalGateDirect(
         succeeded = true;
         pages++;
         const parsedPage = extractRentalGatePagePayload(json, pageParam, pageSize);
-        if (parsedPage.totalElements > 0 || (parsedPage.totalElements === 0 && parsedPage.rows.length === 0)) {
-          latestReportedTotalElements = parsedPage.totalElements;
+        if (parsedPage.hasExplicitTotalElements && (parsedPage.totalElements > 0 || (parsedPage.totalElements === 0 && parsedPage.rows.length === 0))) {
+          latestReportedTotalElements = Math.max(latestReportedTotalElements ?? 0, parsedPage.totalElements);
         }
         if (parsedPage.totalPages !== null) {
-          latestReportedTotalPages = parsedPage.totalPages;
+          latestReportedTotalPages = Math.max(latestReportedTotalPages ?? 0, parsedPage.totalPages);
         }
 
         let added = 0;
         for (const row of parsedPage.rows) {
           const extKey = str(row?.extendId || row?.extensionNumber || row?.extension_number);
           const resNum = str(crmCore.extractReservationNumber(row)).replace(/^#+/, '').trim();
-          const srcId = str(crmCore.extractSourceReservationId(row));
+          const srcId = str(crmCore.extractSourceReservationId(row)).replace(/^#+/, '').trim();
           const rowKey = extKey || (srcId && resNum && resNum !== srcId ? `${srcId}::${resNum}` : (srcId || resNum));
           if (rowKey) {
             if (seenKeys.has(rowKey)) {
@@ -2152,26 +2528,69 @@ export async function pullFromRentalGateDirect(
           items.push(row);
           added++;
         }
-        if (parsedPage.rows.length > 0 && added === 0) {
+
+        // Detect 1-based clamping (?page=0 returned page 1, so ?page=1 returned page 1 again with added=0)
+        const isFirstProbeDuplicate = step === 1 && !usedExplicitNext && !usedCursor && !usedOffset && parsedPage.rows.length > 0 && added === 0;
+        if (isFirstProbeDuplicate) {
+          oneBasedClamped = true;
+          consecutiveZeroAdded = 0;
+        } else if (parsedPage.rows.length > 0 && added === 0) {
           consecutiveZeroAdded++;
         } else {
           consecutiveZeroAdded = 0;
         }
+
         if (parsedPage.nextPageUrl) {
           const safeNext = resolveSafeNextUrl(parsedPage.nextPageUrl);
           if (safeNext && !visitedUrls.has(safeNext)) {
             explicitNextUrl = safeNext;
           }
         }
-        const hasMoreByTotal = parsedPage.totalElements > 0 && items.length < parsedPage.totalElements && parsedPage.rows.length > 0;
-        // Never treat a clamped 1-based duplicate on step=1 (?page=1 duplicating ?page=0) as end-of-list when next pages remain
-        const isFirstProbeDuplicate = step === 1 && !usedExplicitNext && parsedPage.rows.length > 0 && added === 0;
-        const stopOnZeroAdded = parsedPage.rows.length > 0 && added === 0 && !isFirstProbeDuplicate && !explicitNextUrl && (!hasMoreByTotal || consecutiveZeroAdded >= 2);
-        if ((parsedPage.isLast && !hasMoreByTotal && !explicitNextUrl) || stopOnZeroAdded) {
+        if (!explicitNextUrl && parsedPage.nextCursor && !visitedCursors.has(parsedPage.nextCursor)) {
+          visitedCursors.add(parsedPage.nextCursor);
+          const curUrl = new URL(`${baseApi}/${endpoint}`);
+          curUrl.searchParams.set('cursor', parsedPage.nextCursor);
+          curUrl.searchParams.set('size', String(pageSize));
+          if (!visitedUrls.has(curUrl.toString())) {
+            nextCursorUrl = curUrl.toString();
+          }
+        }
+        if (!explicitNextUrl && !nextCursorUrl && parsedPage.nextPageNum !== null && (parsedPage.currentPageNum === null || parsedPage.nextPageNum > parsedPage.currentPageNum)) {
+          const npUrl = `${baseApi}/${endpoint}?page=${encodeURIComponent(String(parsedPage.nextPageNum))}&size=${pageSize}`;
+          if (!visitedUrls.has(npUrl)) {
+            explicitNextUrl = npUrl;
+          }
+        }
+        if (!explicitNextUrl && !nextCursorUrl && parsedPage.offset !== null && parsedPage.rows.length > 0) {
+          const nextOffset = parsedPage.offset + parsedPage.rows.length;
+          const totalTarget = latestReportedTotalElements ?? parsedPage.totalElements;
+          if ((parsedPage.hasExplicitTotalElements && nextOffset < totalTarget) || (!parsedPage.isLast && parsedPage.rows.length >= parsedPage.effectivePageSize)) {
+            const offUrl = `${baseApi}/${endpoint}?offset=${nextOffset}&limit=${parsedPage.effectivePageSize}`;
+            if (!visitedUrls.has(offUrl)) {
+              nextOffsetUrl = offUrl;
+            }
+          }
+        }
+
+        const effectiveTotalElements = latestReportedTotalElements ?? (parsedPage.hasExplicitTotalElements ? parsedPage.totalElements : 0);
+        const hasMoreByTotal = effectiveTotalElements > 0 && items.length < effectiveTotalElements && parsedPage.rows.length > 0;
+        const hasMoreByTotalPages = Boolean(
+          oneBasedClamped &&
+          latestReportedTotalPages !== null &&
+          pageParam < latestReportedTotalPages &&
+          parsedPage.rows.length > 0
+        );
+        const hasNextNav = Boolean(explicitNextUrl || nextCursorUrl || nextOffsetUrl);
+        const stopOnZeroAdded = parsedPage.rows.length > 0 && added === 0 && !isFirstProbeDuplicate && !hasNextNav && (!hasMoreByTotal || consecutiveZeroAdded >= 2);
+        if ((parsedPage.isLast && !hasMoreByTotal && !hasMoreByTotalPages && !hasNextNav) || stopOnZeroAdded) {
+          if (hasMoreByTotal && stopOnZeroAdded) {
+            complete = false;
+            errorMsg = `STOPPED_ON_DUPLICATE_PAGES (${items.length}/${effectiveTotalElements})`;
+          }
           break;
         }
         if (step + 1 >= maxPages) {
-          if (hasMoreByTotal || (latestReportedTotalPages !== null && pages < latestReportedTotalPages) || !parsedPage.isLast) {
+          if (hasMoreByTotal || hasMoreByTotalPages || (latestReportedTotalPages !== null && pages < latestReportedTotalPages) || !parsedPage.isLast) {
             complete = false;
             errorMsg = `MAX_PAGES_REACHED (${pages}/${latestReportedTotalPages ?? maxPages})`;
           }
@@ -2213,10 +2632,21 @@ export async function pullFromRentalGateDirect(
       }
     }
 
+    const extractLinkSrcId = (row: any) =>
+      str(
+        row?.reservationId ??
+        row?.reservation_id ??
+        row?.sourceReservationId ??
+        row?.source_reservation_id ??
+        row?.reservation?.reservationId ??
+        row?.reservation?.id ??
+        row?.id
+      );
+
     const cancelledBySrcId = new Map<string, any>();
     if (canPaged.items.length > 0) {
       for (const cRow of canPaged.items) {
-        const sid = str(cRow?.reservationId ?? cRow?.sourceReservationId);
+        const sid = extractLinkSrcId(cRow);
         if (sid && !cancelledBySrcId.has(sid)) {
           cancelledBySrcId.set(sid, cRow);
         }
@@ -2226,7 +2656,7 @@ export async function pullFromRentalGateDirect(
     const rccBySrcId = new Map<string, any>();
     if (rccPaged.items.length > 0) {
       for (const rRow of rccPaged.items) {
-        const sid = str(rRow?.reservationId ?? rRow?.sourceReservationId);
+        const sid = extractLinkSrcId(rRow);
         if (!sid) continue;
         const prev = rccBySrcId.get(sid);
         if (!prev || num(rRow?.id, 0) >= num(prev?.id, 0)) {
@@ -2235,49 +2665,88 @@ export async function pullFromRentalGateDirect(
       }
     }
 
-    // Backfill ALL cancelled/rejected booking IDs missing from reservations/filter in bounded chunks (no arbitrary 100 cap)
-    const presentSrcIds = new Set<string>(
-      resPaged.items.map((it: any) => str(crmCore.extractSourceReservationId(it) || crmCore.extractReservationNumber(it))).filter(Boolean)
-    );
+    // Backfill ALL cancelled/rejected booking IDs missing from reservations/filter using all ID/number aliases
+    const presentSrcIds = new Set<string>();
+    for (const it of resPaged.items) {
+      const s1 = str(crmCore.extractSourceReservationId(it));
+      const s2 = str(crmCore.extractReservationNumber(it)).replace(/^#+/, '').trim();
+      const s3 = str(it?.id);
+      const s4 = str(it?.reservation?.id);
+      for (const cand of [s1, s2, s3, s4]) {
+        if (cand) {
+          presentSrcIds.add(cand);
+          presentSrcIds.add(cand.replace(/^#+/, '').trim());
+        }
+      }
+    }
     const missingAuthoritativeIds = Array.from(new Set([
       ...cancelledBySrcId.keys(),
       ...rccBySrcId.keys()
-    ])).filter((sid) => sid && !presentSrcIds.has(sid));
+    ])).filter((sid) => sid && !presentSrcIds.has(sid) && !presentSrcIds.has(sid.replace(/^#+/, '').trim()));
+
+    const fetchReservationDetailById = async (sid: string): Promise<Record<string, any> | null> => {
+      try {
+        const resp = await fetchWithRetry(`${baseApi}/reservations/${encodeURIComponent(sid)}`);
+        if (!resp.ok) return null;
+        const rawJson: any = await resp.json().catch(() => null);
+        if (!rawJson || typeof rawJson !== 'object') return null;
+        const inner =
+          (rawJson.data?.reservation && typeof rawJson.data.reservation === 'object' && !Array.isArray(rawJson.data.reservation) ? rawJson.data.reservation : null) ||
+          (rawJson.reservation && typeof rawJson.reservation === 'object' && !Array.isArray(rawJson.reservation) ? rawJson.reservation : null) ||
+          (rawJson.data && typeof rawJson.data === 'object' && !Array.isArray(rawJson.data) ? rawJson.data : null) ||
+          (rawJson.result && typeof rawJson.result === 'object' && !Array.isArray(rawJson.result) ? rawJson.result : null) ||
+          rawJson;
+        if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return null;
+        return {
+          ...inner,
+          reservationId: inner.reservationId ?? inner.reservation_id ?? inner.id ?? sid,
+          clientName: inner.client?.name ?? inner.customer?.name ?? inner.clientName ?? inner.customer_name,
+          clientMobile: inner.client?.mobile ?? inner.client?.phone ?? inner.customer?.mobile ?? inner.customer?.phone ?? inner.clientMobile ?? inner.customer_phone,
+          companyArName: inner.companyCar?.company?.arabicName ?? inner.companyCar?.company?.name ?? inner.company?.arabicName ?? inner.company?.name ?? inner.companyArName,
+          companyEnName: inner.companyCar?.company?.englishName ?? inner.company?.englishName ?? inner.companyEnName,
+          carNameEn: inner.companyCar?.car?.carNameEn ?? inner.car?.carNameEn ?? inner.carNameEn,
+          carNameAr: inner.companyCar?.car?.carNameAr ?? inner.car?.carNameAr ?? inner.carNameAr
+        };
+      } catch {
+        return null;
+      }
+    };
 
     const backfillFailedIds: string[] = [];
     if (missingAuthoritativeIds.length > 0) {
+      let pendingRetryIds: string[] = [];
       for (const idChunk of chunkList(missingAuthoritativeIds, 10)) {
         const missingFetched = await Promise.all(
           idChunk.map(async (sid) => {
-            try {
-              const resp = await fetchWithRetry(`${baseApi}/reservations/${encodeURIComponent(sid)}`);
-              if (!resp.ok) {
-                backfillFailedIds.push(sid);
-                return null;
-              }
-              const detail: any = await resp.json().catch(() => null);
-              if (!detail || typeof detail !== 'object') {
-                backfillFailedIds.push(sid);
-                return null;
-              }
-              return {
-                ...detail,
-                reservationId: detail.reservationId ?? sid,
-                clientName: detail.client?.name ?? detail.clientName,
-                clientMobile: detail.client?.mobile ?? detail.client?.phone ?? detail.clientMobile,
-                companyArName: detail.companyCar?.company?.arabicName ?? detail.companyCar?.company?.name ?? detail.companyArName,
-                companyEnName: detail.companyCar?.company?.englishName ?? detail.companyEnName,
-                carNameEn: detail.companyCar?.car?.carNameEn ?? detail.carNameEn,
-                carNameAr: detail.companyCar?.car?.carNameAr ?? detail.carNameAr
-              };
-            } catch {
-              backfillFailedIds.push(sid);
+            const detail = await fetchReservationDetailById(sid);
+            if (!detail) {
+              pendingRetryIds.push(sid);
               return null;
             }
+            return detail;
           })
         );
         for (const mf of missingFetched) {
           if (mf) resPaged.items.push(mf);
+        }
+      }
+      // Safe targeted retry pass for any backfill IDs that failed during concurrent batching
+      if (pendingRetryIds.length > 0) {
+        await sleepMs(retryBaseDelayMs);
+        for (const retryChunk of chunkList(pendingRetryIds, 3)) {
+          const retried = await Promise.all(
+            retryChunk.map(async (sid) => {
+              const detail = await fetchReservationDetailById(sid);
+              if (!detail) {
+                backfillFailedIds.push(sid);
+                return null;
+              }
+              return detail;
+            })
+          );
+          for (const rf of retried) {
+            if (rf) resPaged.items.push(rf);
+          }
         }
       }
     }
@@ -2293,8 +2762,9 @@ export async function pullFromRentalGateDirect(
 
     const enrichedResItems = resPaged.items.map((rawItem: any) => {
       const sid = str(crmCore.extractSourceReservationId(rawItem) || crmCore.extractReservationNumber(rawItem));
-      const canRec = sid ? cancelledBySrcId.get(sid) : null;
-      const rccRec = sid ? rccBySrcId.get(sid) : null;
+      const cleanSid = sid.replace(/^#+/, '').trim();
+      const canRec = (sid ? cancelledBySrcId.get(sid) : null) || (cleanSid ? cancelledBySrcId.get(cleanSid) : null);
+      const rccRec = (sid ? rccBySrcId.get(sid) : null) || (cleanSid ? rccBySrcId.get(cleanSid) : null);
       const copy: Record<string, any> = { ...rawItem };
       if (canAuthoritative) {
         copy.isSourceCancelled = Boolean(canRec);
@@ -2393,12 +2863,16 @@ export async function pullFromRentalGateDirect(
       ).catch(() => ({ rows: [] }));
       existingNumsSet = new Set((existRows.rows || []).map((r: any) => str(r.reservation_number)).filter(Boolean));
     }
+    const excludedSourceIds: string[] = [];
     const afterExcludedRes = dedupedAllRes.filter((item: any) => {
       if (item.isSourceCancelled || item.isSourceRejected) return true;
       const code = crmCore.extractReservationStatusCode(item, false);
       if (!excludedSet.has(code)) return true;
       const numKey = str(crmCore.extractReservationNumber(item));
-      return existingNumsSet.has(numKey);
+      if (existingNumsSet.has(numKey)) return true;
+      const exId = str(crmCore.extractSourceReservationId(item) || numKey);
+      if (exId) excludedSourceIds.push(exId);
+      return false;
     });
     const excludedFilteredCount = dedupedAllRes.length - afterExcludedRes.length;
 
@@ -2443,6 +2917,9 @@ export async function pullFromRentalGateDirect(
       dedupedAllRes.length + backfillFailedIds.length,
       num(resPaged.reportedTotalElements, 0)
     );
+    const expectedSourceIds = filteredRes
+      .map((item: any) => str(crmCore.extractSourceReservationId(item) || crmCore.extractReservationNumber(item)))
+      .filter(Boolean);
 
     const syncResult = await ingestIncrementalSyncBatch(executor, {
       source: 'rental_gate_direct',
@@ -2454,6 +2931,8 @@ export async function pullFromRentalGateDirect(
       rejectedAuthoritativeSynced: rccAuthoritative && !appliedRange?.hasCustomRange,
       cancelledSourceIds: canAuthoritative ? Array.from(cancelledBySrcId.keys()) : undefined,
       rejectedSourceIds: rccAuthoritative ? Array.from(rccBySrcId.keys()) : undefined,
+      expectedSourceIds,
+      excludedSourceIds,
       totalInSource,
       incompleteEndpoints,
       backfillFailedIds,
@@ -2480,6 +2959,121 @@ export async function pullFromRentalGateDirect(
       excludedFilteredCount,
       rangeFilteredCount
     };
+  } finally {
+    activePullInFlight = false;
+  }
+}
+
+export async function retryFailedSyncRecords(
+  executor: DbExecutor,
+  actor: SyncActor,
+  payload: Record<string, any> = {},
+  fetchFn: typeof fetch = fetch
+): Promise<SyncIngestResult> {
+  if (activePullInFlight) {
+    throw new Error('SYNC_IN_PROGRESS: عملية المزامنة قيد التنفيذ بالفعل، يرجى الانتظار حتى اكتمال السحب الحالي.');
+  }
+
+  const ckRes = await executor.query(
+    `SELECT * FROM sync_checkpoints ORDER BY updated_at DESC LIMIT 5`
+  ).catch(() => ({ rows: [] as any[] }));
+  const primaryCk = ckRes.rows.find((c: any) => str(c.source) === 'rental_gate_direct') || ckRes.rows[0] || null;
+  let ckMeta: any = null;
+  if (primaryCk?.meta) {
+    try {
+      ckMeta = typeof primaryCk.meta === 'string' ? JSON.parse(primaryCk.meta) : primaryCk.meta;
+    } catch {
+      ckMeta = null;
+    }
+  }
+
+  const requestedIds = Array.isArray(payload?.recordIds)
+    ? payload.recordIds.map((x: any) => str(x)).filter(Boolean)
+    : [];
+  const metaFailedIds = Array.isArray(ckMeta?.failedRecords)
+    ? ckMeta.failedRecords.map((f: any) => str(f?.sourceReservationId || f?.reservationNumber || f?.identifier)).filter(Boolean)
+    : [];
+  const metaMissingIds = Array.isArray(ckMeta?.missingSourceIds)
+    ? ckMeta.missingSourceIds.map((x: any) => str(x)).filter(Boolean)
+    : [];
+  const metaBackfillIds = Array.isArray(ckMeta?.backfillFailedIds)
+    ? ckMeta.backfillFailedIds.map((x: any) => str(x)).filter(Boolean)
+    : [];
+
+  const targetIds = Array.from(new Set([...requestedIds, ...metaMissingIds, ...metaBackfillIds, ...metaFailedIds].filter(Boolean)));
+  const hasEndpointGap = Array.isArray(ckMeta?.incompleteEndpoints) && ckMeta.incompleteEndpoints.length > 0;
+  const hasUnfetchedGap = num(ckMeta?.unfetchedSourceGap, 0) > 0;
+
+  // If endpoints were truncated or IDs aren't enumerable individually, re-run full authoritative pull cleanly
+  if (hasEndpointGap || hasUnfetchedGap || targetIds.length === 0) {
+    return pullFromRentalGateDirect(executor, actor, payload, fetchFn);
+  }
+
+  const serverCfg = await resolveServerConfig(executor);
+  const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
+  if (!rgToken) {
+    throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم).');
+  }
+
+  activePullInFlight = true;
+  try {
+    const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
+    const recoveredItems: any[] = [];
+    const stillFailedIds: string[] = [];
+
+    for (const idChunk of chunkList(targetIds, 5)) {
+      const batch = await Promise.all(
+        idChunk.map(async (sid) => {
+          try {
+            const resp = await fetchFn(`${baseApi}/reservations/${encodeURIComponent(sid)}`, {
+              method: 'GET',
+              headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }
+            });
+            if (!resp.ok) return { sid, detail: null };
+            const rawJson: any = await resp.json().catch(() => null);
+            const inner =
+              (rawJson?.data?.reservation && typeof rawJson.data.reservation === 'object' ? rawJson.data.reservation : null) ||
+              (rawJson?.reservation && typeof rawJson.reservation === 'object' ? rawJson.reservation : null) ||
+              (rawJson?.data && typeof rawJson.data === 'object' && !Array.isArray(rawJson.data) ? rawJson.data : null) ||
+              (rawJson?.result && typeof rawJson.result === 'object' && !Array.isArray(rawJson.result) ? rawJson.result : null) ||
+              rawJson;
+            if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
+              return { sid, detail: null };
+            }
+            return {
+              sid,
+              detail: {
+                ...inner,
+                reservationId: inner.reservationId ?? inner.reservation_id ?? inner.id ?? sid,
+                clientName: inner.client?.name ?? inner.customer?.name ?? inner.clientName ?? inner.customer_name,
+                clientMobile: inner.client?.mobile ?? inner.client?.phone ?? inner.customer?.mobile ?? inner.customer?.phone ?? inner.clientMobile ?? inner.customer_phone,
+                companyArName: inner.companyCar?.company?.arabicName ?? inner.companyCar?.company?.name ?? inner.company?.arabicName ?? inner.company?.name ?? inner.companyArName,
+                carNameAr: inner.companyCar?.car?.carNameAr ?? inner.car?.carNameAr ?? inner.carNameAr
+              }
+            };
+          } catch {
+            return { sid, detail: null };
+          }
+        })
+      );
+      for (const entry of batch) {
+        if (entry.detail) recoveredItems.push(entry.detail);
+        else stillFailedIds.push(entry.sid);
+      }
+    }
+
+    return await ingestIncrementalSyncBatch(executor, {
+      source: 'rental_gate_direct',
+      actor,
+      isFullSnapshot: false,
+      isRetryPass: true,
+      pagesFetched: targetIds.length,
+      expectedSourceIds: targetIds,
+      backfillFailedIds: stillFailedIds,
+      totalInSource: num(ckMeta?.totalInSource, targetIds.length),
+      reservations: recoveredItems,
+      extensions: []
+    });
   } finally {
     activePullInFlight = false;
   }
