@@ -1724,8 +1724,10 @@
       (existing && isSameBookingContext(apiItem, existing) ? sanitizeReasonText(existing.driverNotes) : '') ||
       '';
 
+    var safeResIdToken = (resNumber || resApiId).replace(/[^A-Za-z0-9_-]/g, '') || resApiId.replace(/[^A-Za-z0-9_-]/g, '') || 'ROW';
+
     return {
-      id: existing ? existing.id : ('RES_' + resNumber),
+      id: existing ? existing.id : ('RES_' + safeResIdToken),
       sourceReservationId: resApiId || resNumber,
       reservationNumber: resNumber,
       referenceNumber: resolvedReferenceNumber,
@@ -3502,26 +3504,53 @@
   function dedupeReservationsByNumber(items) {
     var map = {};
     var order = [];
-    var seenSrcByResNum = {};
+    var seenSrcByBaseKey = {};
+    var seenNoSrcBaseKey = {};
     var seenKeyBySrcId = {};
     var list = Array.isArray(items) ? items : [];
     for (var i = 0; i < list.length; i++) {
       var item = list[i];
       if (!item || typeof item !== 'object') continue;
       var rawNum = extractReservationNumber(item);
-      var srcId = extractSourceReservationId(item);
+      var srcId = extractSourceReservationId(item).replace(/^#+/, '').trim();
       var normNum = rawNum.replace(/^#+/, '').trim();
       if (!normNum && !srcId) continue;
       var baseKey = normNum || srcId;
-      var finalKey = (srcId && Object.prototype.hasOwnProperty.call(seenKeyBySrcId, srcId))
-        ? seenKeyBySrcId[srcId]
-        : baseKey;
-      if (finalKey === baseKey && srcId && Object.prototype.hasOwnProperty.call(seenSrcByResNum, baseKey) && seenSrcByResNum[baseKey] && seenSrcByResNum[baseKey] !== srcId) {
-        finalKey = baseKey + '::' + srcId;
-      }
-      if (srcId) {
-        if (!seenKeyBySrcId[srcId]) seenKeyBySrcId[srcId] = finalKey;
-        if (!seenSrcByResNum[baseKey]) seenSrcByResNum[baseKey] = srcId;
+      var itemPhone = normalizeStr(item.clientMobile || item.customerPhone || item.customer_phone || (item.customer && (item.customer.mobile || item.customer.phone)) || '').replace(/\D+/g, '');
+      var finalKey = '';
+      if (srcId && Object.prototype.hasOwnProperty.call(seenKeyBySrcId, srcId)) {
+        finalKey = seenKeyBySrcId[srcId];
+      } else if (srcId) {
+        if (Object.prototype.hasOwnProperty.call(seenSrcByBaseKey, baseKey) && seenSrcByBaseKey[baseKey] && seenSrcByBaseKey[baseKey] !== srcId) {
+          finalKey = baseKey + '::' + srcId;
+        } else if (seenNoSrcBaseKey[baseKey]) {
+          var prevNoSrc = map[baseKey];
+          var prevNoSrcPhone = normalizeStr(prevNoSrc && (prevNoSrc.clientMobile || prevNoSrc.customerPhone || prevNoSrc.customer_phone || (prevNoSrc.customer && (prevNoSrc.customer.mobile || prevNoSrc.customer.phone)))).replace(/\D+/g, '');
+          if (itemPhone && prevNoSrcPhone && itemPhone !== prevNoSrcPhone) {
+            finalKey = baseKey + '::' + srcId;
+          } else {
+            finalKey = baseKey;
+            seenSrcByBaseKey[baseKey] = srcId;
+            delete seenNoSrcBaseKey[baseKey];
+          }
+        } else {
+          finalKey = baseKey;
+          seenSrcByBaseKey[baseKey] = srcId;
+        }
+        seenKeyBySrcId[srcId] = finalKey;
+      } else {
+        if (Object.prototype.hasOwnProperty.call(seenSrcByBaseKey, baseKey)) {
+          var prevWithSrc = map[baseKey];
+          var prevWithSrcPhone = normalizeStr(prevWithSrc && (prevWithSrc.clientMobile || prevWithSrc.customerPhone || prevWithSrc.customer_phone || (prevWithSrc.customer && (prevWithSrc.customer.mobile || prevWithSrc.customer.phone)))).replace(/\D+/g, '');
+          if (itemPhone && prevWithSrcPhone && itemPhone !== prevWithSrcPhone) {
+            finalKey = baseKey + '::row_' + i;
+          } else {
+            finalKey = baseKey;
+          }
+        } else {
+          finalKey = baseKey;
+          seenNoSrcBaseKey[baseKey] = true;
+        }
       }
       if (!Object.prototype.hasOwnProperty.call(map, finalKey)) {
         order.push(finalKey);
@@ -3537,6 +3566,12 @@
           if (nextEmpty && prevHas) {
             merged[k] = prev[k];
           }
+        }
+        if (prev.isSourceCancelled === true || item.isSourceCancelled === true) {
+          merged.isSourceCancelled = true;
+        }
+        if (prev.isSourceRejected === true || item.isSourceRejected === true) {
+          merged.isSourceRejected = true;
         }
         map[finalKey] = merged;
       }
@@ -3761,7 +3796,7 @@
 
   function getGasActionTimeoutMs(action) {
     var key = normalizeStr(action);
-    if (key === 'pullReservations' || key === 'syncRentalGate' || key === 'exportReportData' || key === 'getReports') {
+    if (key === 'pullReservations' || key === 'syncRentalGate' || key === 'retryFailedSyncRecords' || key === 'exportReportData' || key === 'getReports') {
       return 90000;
     }
     return 35000;
@@ -3986,6 +4021,7 @@
     pullReservations: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     importReservationsFromExcel: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     syncRentalGate: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    retryFailedSyncRecords: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     saveApiToken: ['settings', 'sync', 'activity'],
     saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
     applyUnifiedConnectionSetup: ['*'],

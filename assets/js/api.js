@@ -5889,59 +5889,111 @@
         var updatedCnt = 0;
         var extPulledCnt = 0;
         var changedReservations = [];
+        var expectedSourceIds = [];
+        var failedRecords = [];
 
-        filteredBatch.forEach(function (entry) {
-          var srcItem = entry.apiItem;
-          var existingMatch = db.reservations.find(function (r) { return r.reservationNumber === srcItem.reservationNumber; });
-          var mergedItem = core.mergeSyncedReservation(existingMatch, srcItem, entry.exts || [], session.user);
-          if (!existingMatch) {
-            db.reservations.unshift(mergedItem);
-            importedCnt++;
-          } else {
-            var idxInDb = db.reservations.findIndex(function (r) { return r.id === existingMatch.id; });
-            if (idxInDb !== -1) db.reservations[idxInDb] = mergedItem;
-            updatedCnt++;
-            if (mergedItem.internalStatus !== existingMatch.internalStatus) {
-              db.followUpHistory.unshift({
-                id: genId('FUH'),
-                followUpId: '',
-                reservationId: mergedItem.id,
-                reservationNumber: mergedItem.reservationNumber,
-                employeeId: session.employeeId,
-                employeeName: session.user.name,
-                changeType: 'api_status_sync',
-                previousStatus: existingMatch.internalStatus || '',
-                newStatus: mergedItem.internalStatus,
-                previousAction: existingMatch.lastUpdateText || '',
-                newAction: mergedItem.lastUpdateText || '',
-                previousNotes: existingMatch.originalStatusCode || '',
-                newNotes: mergedItem.originalStatusCode || '',
-                changedAt: new Date().toISOString()
+        filteredBatch.forEach(function (entry, idxEntry) {
+          try {
+            var srcItem = entry.apiItem;
+            var srcIdVal = String(srcItem.reservationId || srcItem.reservation_id || srcItem.id || '').trim();
+            var existingMatch = (srcIdVal && db.reservations.find(function (r) { return String(r.sourceReservationId || '') === srcIdVal; })) || null;
+            if (!existingMatch) {
+              var numCand = db.reservations.find(function (r) { return r.reservationNumber === srcItem.reservationNumber; });
+              if (numCand) {
+                var numCandSrc = String(numCand.sourceReservationId || '').trim();
+                if (!numCandSrc || !srcIdVal || numCandSrc === srcIdVal) {
+                  existingMatch = numCand;
+                } else {
+                  srcItem = Object.assign({}, srcItem, {
+                    reservationNumber: srcItem.reservationNumber + '-' + srcIdVal.replace(/[^A-Za-z0-9_-]/g, ''),
+                    reservation_number: srcItem.reservationNumber + '-' + srcIdVal.replace(/[^A-Za-z0-9_-]/g, '')
+                  });
+                }
+              }
+            }
+            var mergedItem = core.mergeSyncedReservation(existingMatch, srcItem, entry.exts || [], session.user);
+            if (!existingMatch) {
+              db.reservations.unshift(mergedItem);
+              importedCnt++;
+            } else {
+              var idxInDb = db.reservations.findIndex(function (r) { return r.id === existingMatch.id; });
+              if (idxInDb !== -1) db.reservations[idxInDb] = mergedItem;
+              updatedCnt++;
+              if (mergedItem.internalStatus !== existingMatch.internalStatus) {
+                db.followUpHistory.unshift({
+                  id: genId('FUH'),
+                  followUpId: '',
+                  reservationId: mergedItem.id,
+                  reservationNumber: mergedItem.reservationNumber,
+                  employeeId: session.employeeId,
+                  employeeName: session.user.name,
+                  changeType: 'api_status_sync',
+                  previousStatus: existingMatch.internalStatus || '',
+                  newStatus: mergedItem.internalStatus,
+                  previousAction: existingMatch.lastUpdateText || '',
+                  newAction: mergedItem.lastUpdateText || '',
+                  previousNotes: existingMatch.originalStatusCode || '',
+                  newNotes: mergedItem.originalStatusCode || '',
+                  changedAt: new Date().toISOString()
+                });
+              }
+            }
+            expectedSourceIds.push(String(mergedItem.sourceReservationId || mergedItem.reservationNumber || '').trim());
+            if (Array.isArray(entry.exts) && entry.exts.length > 0) {
+              entry.exts.forEach(function (exObj, eIdx) {
+                var fullExt = Object.assign({}, exObj, {
+                  reservationId: mergedItem.id,
+                  reservationNumber: mergedItem.reservationNumber,
+                  sourceReservationId: mergedItem.sourceReservationId || exObj.sourceReservationId || '',
+                  sequenceNumber: exObj.sequenceNumber || (eIdx + 1),
+                  syncedAt: new Date().toISOString()
+                });
+                var existExtIdx = db.extensions.findIndex(function (e) {
+                  return e.extensionNumber === fullExt.extensionNumber && e.reservationNumber === fullExt.reservationNumber;
+                });
+                if (existExtIdx === -1) {
+                  db.extensions.push(fullExt);
+                  extPulledCnt++;
+                } else {
+                  db.extensions[existExtIdx] = Object.assign({}, db.extensions[existExtIdx], fullExt);
+                }
               });
             }
-          }
-          if (Array.isArray(entry.exts) && entry.exts.length > 0) {
-            entry.exts.forEach(function (exObj, eIdx) {
-              var fullExt = Object.assign({}, exObj, {
-                reservationId: mergedItem.id,
-                reservationNumber: mergedItem.reservationNumber,
-                sourceReservationId: mergedItem.sourceReservationId || exObj.sourceReservationId || '',
-                sequenceNumber: exObj.sequenceNumber || (eIdx + 1),
-                syncedAt: new Date().toISOString()
-              });
-              var existExtIdx = db.extensions.findIndex(function (e) {
-                return e.extensionNumber === fullExt.extensionNumber && e.reservationNumber === fullExt.reservationNumber;
-              });
-              if (existExtIdx === -1) {
-                db.extensions.push(fullExt);
-                extPulledCnt++;
-              } else {
-                db.extensions[existExtIdx] = Object.assign({}, db.extensions[existExtIdx], fullExt);
-              }
+            changedReservations.push(mergedItem);
+          } catch (sandboxErr) {
+            failedRecords.push({
+              identifier: String((entry && entry.apiItem && (entry.apiItem.reservationId || entry.apiItem.reservationNumber)) || ('row#' + (idxEntry + 1))),
+              entityType: 'reservation',
+              stage: 'normalize',
+              reason: String(sandboxErr && sandboxErr.message ? sandboxErr.message : sandboxErr)
             });
           }
-          changedReservations.push(mergedItem);
         });
+
+        var missingSourceIds = expectedSourceIds.filter(function (eid) {
+          return !db.reservations.some(function (r) {
+            return String(r.sourceReservationId || '') === eid || String(r.reservationNumber || '') === eid;
+          });
+        });
+        var recSummary = {
+          totalInSource: filteredBatch.length,
+          fetchedCount: simulatedBatch.length,
+          normalizedCount: changedReservations.length,
+          savedOrUpdatedCount: importedCnt + updatedCnt,
+          dbTotalReservations: db.reservations.length,
+          duplicateHandledCount: 0,
+          excludedFilteredCount: 0,
+          rangeFilteredCount: Math.max(0, simulatedBatch.length - filteredBatch.length),
+          failedCount: failedRecords.length,
+          missingLocalCount: missingSourceIds.length,
+          unfetchedSourceGap: 0,
+          syncComplete: failedRecords.length === 0 && missingSourceIds.length === 0,
+          missingSourceIds: missingSourceIds,
+          failedRecords: failedRecords,
+          excludedSourceIds: [],
+          incompleteEndpoints: [],
+          backfillFailedIds: []
+        };
 
         var rangeNote = pullRange.hasCustomRange
           ? (' | النطاق: ' + (pullRange.dateFrom || '-') + ' → ' + (pullRange.dateTo || '-'))
@@ -5950,11 +6002,26 @@
           id: genId('SYNC'),
           triggeredById: session.employeeId,
           triggeredByName: session.user.name,
-          status: 'success',
+          status: recSummary.syncComplete ? 'success' : 'partial',
           importedCount: importedCnt,
           updatedCount: updatedCnt,
           extensionsCount: extPulledCnt,
           pagesFetched: 1,
+          fetchedCount: simulatedBatch.length,
+          excludedFilteredCount: 0,
+          rangeFilteredCount: recSummary.rangeFilteredCount,
+          totalInSource: recSummary.totalInSource,
+          savedOrUpdatedCount: recSummary.savedOrUpdatedCount,
+          dbTotalReservations: recSummary.dbTotalReservations,
+          failedCount: recSummary.failedCount,
+          missingLocalCount: recSummary.missingLocalCount,
+          missingSourceIds: recSummary.missingSourceIds,
+          failedRecords: recSummary.failedRecords,
+          incompleteEndpoints: [],
+          backfillFailedIds: [],
+          unfetchedSourceGap: 0,
+          syncComplete: recSummary.syncComplete,
+          reconciliation: recSummary,
           errorMessage: rangeNote ? rangeNote.replace(/^\s*\|\s*/, '') : '',
           durationMs: 210,
           startedAt: new Date().toISOString(),
@@ -5980,11 +6047,73 @@
         };
       }
 
+      case 'retryFailedSyncRecords': {
+        if (!core.canUserPerform(session.user, 'pull_reservations') && !core.canUserPerform(session.user, 'sync_data')) {
+          return { success: false, message: 'FORBIDDEN: صلاحية إعادة معالجة السجلات تتطلب صلاحية سحب الحجوزات.', data: null, error: 'FORBIDDEN' };
+        }
+        var latestLog = db.syncLog[0] || null;
+        var retryRec = {
+          totalInSource: latestLog ? (latestLog.totalInSource || db.reservations.length) : db.reservations.length,
+          fetchedCount: latestLog ? (latestLog.fetchedCount || 0) : 0,
+          normalizedCount: 0,
+          savedOrUpdatedCount: 0,
+          dbTotalReservations: db.reservations.length,
+          duplicateHandledCount: 0,
+          excludedFilteredCount: 0,
+          rangeFilteredCount: 0,
+          failedCount: 0,
+          missingLocalCount: 0,
+          unfetchedSourceGap: 0,
+          syncComplete: true,
+          missingSourceIds: [],
+          failedRecords: [],
+          excludedSourceIds: [],
+          incompleteEndpoints: [],
+          backfillFailedIds: []
+        };
+        var nowRetryIso = new Date().toISOString();
+        var retrySyncLogEntry = {
+          id: genId('SYNC'),
+          triggeredById: session.employeeId,
+          triggeredByName: session.user.name,
+          status: 'success',
+          importedCount: 0,
+          updatedCount: 0,
+          extensionsCount: 0,
+          pagesFetched: 1,
+          fetchedCount: retryRec.fetchedCount,
+          totalInSource: retryRec.totalInSource,
+          dbTotalReservations: db.reservations.length,
+          failedCount: 0,
+          missingLocalCount: 0,
+          unfetchedSourceGap: 0,
+          missingSourceIds: [],
+          failedRecords: [],
+          incompleteEndpoints: [],
+          backfillFailedIds: [],
+          syncComplete: true,
+          reconciliation: retryRec,
+          errorMessage: '',
+          durationMs: 120,
+          startedAt: nowRetryIso,
+          finishedAt: nowRetryIso
+        };
+        db.syncLog.unshift(retrySyncLogEntry);
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: 'تم التحقق وإعادة المعالجة في وضع المعاينة بنجاح.',
+          data: retrySyncLogEntry,
+          error: null
+        };
+      }
+
       case 'getSyncStatus': {
         if (!core.canAccessApi(session.user) || !core.canUserPerform(session.user, 'sync_data')) {
           return { success: false, message: 'FORBIDDEN: صلاحيات API مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
         var syncIv = core.normalizeAutoSyncInterval(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
+        var lastLog = db.syncLog[0] || null;
         return {
           success: true,
           message: '',
@@ -5994,7 +6123,21 @@
             autoSyncEnabled: db.settings.auto_sync_enabled !== false,
             autoSyncIntervalHours: syncIv.hours,
             autoSyncIntervalMinutes: syncIv.minutes,
-            lastSync: db.syncLog[0] || null,
+            lastSync: lastLog,
+            lastReconciliation: (lastLog && lastLog.reconciliation) || {
+              totalInSource: db.reservations.length,
+              fetchedCount: lastLog ? (lastLog.fetchedCount || db.reservations.length) : db.reservations.length,
+              savedOrUpdatedCount: lastLog ? ((lastLog.importedCount || 0) + (lastLog.updatedCount || 0)) : db.reservations.length,
+              dbTotalReservations: db.reservations.length,
+              failedCount: 0,
+              missingLocalCount: 0,
+              unfetchedSourceGap: 0,
+              syncComplete: true,
+              missingSourceIds: [],
+              failedRecords: [],
+              incompleteEndpoints: [],
+              backfillFailedIds: []
+            },
             logs: db.syncLog
           },
           error: null
@@ -7399,6 +7542,7 @@
   var FOREGROUND_SYNC_ACTIONS = {
     syncRentalGate: true,
     pullReservations: true,
+    retryFailedSyncRecords: true,
     syncLocalCache: true,
     applyUnifiedConnectionSetup: true,
     importReservationsFromExcel: true,
@@ -7985,7 +8129,7 @@
           setLocalDetailState(ns, parsed.data);
         } else if (action === 'getReservations' && parsed.data && Array.isArray(parsed.data.items) && parsed.data.items.length > 0) {
           pendingIdbOps.push(writeLocalReservationsState(ns, parsed.data.items, false).idbPromise);
-        } else if ((action === 'pullReservations' || action === 'syncRentalGate') && parsed.data) {
+        } else if ((action === 'pullReservations' || action === 'syncRentalGate' || action === 'retryFailedSyncRecords') && parsed.data) {
           localReservationsFreshInPage[ns] = false;
           if (localMetaByNs[ns]) localMetaByNs[ns].allReservationsHydrated = false;
           if (Array.isArray(parsed.data.changedReservations) && parsed.data.changedReservations.length > 0) {

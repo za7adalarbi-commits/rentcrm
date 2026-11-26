@@ -561,6 +561,7 @@
               }).join('') +
             '</div>' +
           '</div>' +
+          '<div id="res-sync-warning-banner" class="hidden" style="margin-bottom:12px;"></div>' +
           '<div id="res-lifecycle-banner" class="hidden" style="margin-bottom:12px;"></div>' +
           '<div id="res-table-region"></div>' +
         '</div>' +
@@ -1989,8 +1990,11 @@
               var exts = d.extensionsCount || 0;
               var failedCount = Number(d.failedCount || 0);
               var missingCount = Number(d.missingLocalCount || 0);
+              var unfetchedGap = Number(d.unfetchedSourceGap || 0);
               var incompleteEps = Array.isArray(d.incompleteEndpoints) ? d.incompleteEndpoints : [];
-              var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || incompleteEps.length > 0;
+              var backfillFailed = Array.isArray(d.backfillFailedIds) ? d.backfillFailedIds : [];
+              var missingIdsList = Array.isArray(d.missingSourceIds) ? d.missingSourceIds : [];
+              var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || unfetchedGap > 0 || incompleteEps.length > 0 || backfillFailed.length > 0;
               var sb = d.sourceBreakdown || null;
               var diagHint = '';
               if (imported === 0 && updated === 0 && !isIncomplete) {
@@ -2003,16 +2007,64 @@
                   diagHint = ' — أرجعت الواجهة 0 حجز لهذا الحساب/الفترة';
                 }
               }
+              var syncWarnBanner = container.querySelector('#res-sync-warning-banner');
               if (isIncomplete) {
                 var warnParts = [];
                 if (failedCount > 0) warnParts.push('فشل ' + failedCount);
                 if (missingCount > 0) warnParts.push('ناقص ' + missingCount);
+                if (unfetchedGap > 0) warnParts.push('فجوة مصدر ' + unfetchedGap);
+                if (backfillFailed.length > 0) warnParts.push('فشل جلب ' + backfillFailed.length);
                 if (incompleteEps.length > 0) warnParts.push('واجهات غير مكتملة: ' + incompleteEps.length);
+                var combinedMissingIds = Array.from(new Set(missingIdsList.concat(backfillFailed)));
+                var idPreview = combinedMissingIds.length
+                  ? (' · المعرفات: ' + combinedMissingIds.slice(0, 8).join(', ') + (combinedMissingIds.length > 8 ? (' (+' + (combinedMissingIds.length - 8) + ')') : ''))
+                  : '';
                 var warnMsg = ctx.lang === 'en'
-                  ? ('Incomplete pull' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + warnParts.join(' · '))
-                  : ('تحذير: السحب غير مكتمل' + rangeNote + ' (' + warnParts.join(' · ') + ') — تم حفظ ' + (imported + updated) + ' سجل');
+                  ? ('Incomplete pull' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + warnParts.join(' · ') + idPreview)
+                  : ('تحذير: السحب غير مكتمل' + rangeNote + ' (' + warnParts.join(' · ') + ') — تم حفظ ' + (imported + updated) + ' سجل' + idPreview);
                 ctx.toast(warnMsg, true);
+                if (syncWarnBanner) {
+                  syncWarnBanner.classList.remove('hidden');
+                  syncWarnBanner.innerHTML =
+                    '<div class="rg-error-banner" role="alert" style="border-color:rgba(217,31,43,0.38);background:rgba(217,31,43,0.06);">' +
+                      '<div class="rg-error-banner-body">' +
+                        '<div class="rg-error-banner-title">' + (ctx.lang === 'en' ? 'Sync Reconciliation Mismatch' : 'تحذير عدم تطابق أعداد السحب مع المصدر') + '</div>' +
+                        '<div class="rg-error-banner-msg">' + esc(warnParts.join(' · ') + idPreview) + '</div>' +
+                      '</div>' +
+                      '<button type="button" class="btn btn-sm btn-primary" id="res-retry-failed-sync-btn">' + (ctx.lang === 'en' ? 'Retry Missing Records' : 'إعادة معالجة السجلات الناقصة') + '</button>' +
+                    '</div>';
+                  var resRetryBtn = syncWarnBanner.querySelector('#res-retry-failed-sync-btn');
+                  if (resRetryBtn) {
+                    resRetryBtn.addEventListener('click', function () {
+                      runWithLock(resRetryBtn, 'retryFailedSyncRecords', async function () {
+                        var rPrev = resRetryBtn.textContent;
+                        resRetryBtn.textContent = ctx.lang === 'en' ? 'Retrying...' : 'جاري إعادة المعالجة...';
+                        var rResp = await root.RGApi.callApi('retryFailedSyncRecords', {});
+                        if (rResp && rResp.success && rResp.data) {
+                          var rd = rResp.data;
+                          var stillGap = rd.syncComplete === false || Number(rd.failedCount || 0) > 0 || Number(rd.missingLocalCount || 0) > 0 || Number(rd.unfetchedSourceGap || 0) > 0;
+                          if (!stillGap) {
+                            syncWarnBanner.classList.add('hidden');
+                            syncWarnBanner.innerHTML = '';
+                            ctx.toast(ctx.lang === 'en' ? 'Missing records recovered successfully.' : 'تمت إعادة معالجة السجلات الناقصة واكتمل التطابق بنجاح.');
+                          } else {
+                            ctx.toast(ctx.lang === 'en' ? 'Some records still missing after retry.' : 'ما زال هناك نقص بعد إعادة المحاولة.', true);
+                            if (resRetryBtn.isConnected !== false) resRetryBtn.textContent = rPrev;
+                          }
+                          refreshTableRegion({ forceRefresh: true });
+                        } else {
+                          ctx.toast((rResp && rResp.message) || 'تعذر إعادة معالجة السجلات الفاشلة.', true);
+                          if (resRetryBtn.isConnected !== false) resRetryBtn.textContent = rPrev;
+                        }
+                      });
+                    });
+                  }
+                }
               } else {
+                if (syncWarnBanner) {
+                  syncWarnBanner.classList.add('hidden');
+                  syncWarnBanner.innerHTML = '';
+                }
                 var overlapHint = (sb && Number(sb.overlapCount || 0) > 0)
                   ? (ctx.lang === 'en'
                       ? (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' unique (' + sb.grossAcrossThreeLists + ' across source lists, ' + sb.overlapCount + ' overlap)')
