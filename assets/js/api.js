@@ -1005,12 +1005,12 @@
     });
   }
 
-  function patchFollowUpCachedQuery(data, entryKey, changedFollowUps, deletedResIds) {
+  function patchFollowUpCachedQuery(data, entryKey, changedFollowUps, deletedResIds, deletedFollowUpIds) {
     if (!data || !Array.isArray(data.items)) return undefined;
     var core = root.RGCrmCore;
     if (!core || !core.reapplyFollowUpDeltaToFilteredList) return undefined;
     var filters = parseCachedPayload(entryKey);
-    var nextItems = core.reapplyFollowUpDeltaToFilteredList(data.items, changedFollowUps || [], deletedResIds || [], filters);
+    var nextItems = core.reapplyFollowUpDeltaToFilteredList(data.items, changedFollowUps || [], deletedResIds || [], filters, deletedFollowUpIds || []);
     return Object.assign({}, data, {
       items: nextItems,
       total: nextItems.length
@@ -2157,6 +2157,86 @@
       return;
     }
 
+    if (action === 'deleteFollowUp') {
+      var delFuId = String(p.followUpId || p.id || '').trim();
+      var delFuResId = String(p.reservationId || '').trim();
+      if (!delFuId) return;
+      var nsFuDel = getCacheNamespace();
+      var remainingFollowUpCountOpt = null;
+      var nextLatestFuOpt = null;
+
+      if (delFuResId && localDetailsByNs[nsFuDel] && localDetailsByNs[nsFuDel][delFuResId]) {
+        var detFuDelCur = localDetailsByNs[nsFuDel][delFuResId];
+        var remDetFus = (Array.isArray(detFuDelCur.followUps) ? detFuDelCur.followUps : []).filter(function (f) {
+          return f && f.id !== delFuId;
+        });
+        remainingFollowUpCountOpt = remDetFus.length;
+        nextLatestFuOpt = remDetFus[0] || null;
+        var nextDetRes = detFuDelCur.reservation ? Object.assign({}, detFuDelCur.reservation, {
+          isFollowed: remDetFus.length > 0,
+          lastUpdateText: nextLatestFuOpt ? (String(nextLatestFuOpt.action || '') + (nextLatestFuOpt.notes ? (' — ' + String(nextLatestFuOpt.notes)) : '')) : ''
+        }) : detFuDelCur.reservation;
+        setLocalDetailState(nsFuDel, Object.assign({}, detFuDelCur, {
+          reservation: nextDetRes,
+          followUps: remDetFus
+        }));
+      }
+
+      patchCachedScopes(['reservations', 'followUps'], function (data, actName, entryKey) {
+        if (actName === 'getTeamFollowUps' && Array.isArray(data.items)) {
+          return patchFollowUpCachedQuery(data, entryKey, [], [], [delFuId]);
+        }
+        if (actName === 'getMyFollowUps') {
+          var nextMyFus = Array.isArray(data.followUps) ? data.followUps.filter(function (f) { return f && f.id !== delFuId; }) : data.followUps;
+          var nextMentions = Array.isArray(data.mentionFollowUps) ? data.mentionFollowUps.filter(function (f) { return f && f.id !== delFuId; }) : data.mentionFollowUps;
+          return Object.assign({}, data, {
+            followUps: nextMyFus,
+            mentionFollowUps: nextMentions
+          });
+        }
+        if (actName === 'getReservationDetails' && Array.isArray(data.followUps)) {
+          if (!data.followUps.some(function (f) { return f && f.id === delFuId; })) return undefined;
+          delFuResId = delFuResId || (data.reservation && data.reservation.id) || '';
+          var filteredResFus = data.followUps.filter(function (f) { return f && f.id !== delFuId; });
+          remainingFollowUpCountOpt = filteredResFus.length;
+          nextLatestFuOpt = filteredResFus[0] || null;
+          return Object.assign({}, data, {
+            followUps: filteredResFus,
+            reservation: data.reservation ? Object.assign({}, data.reservation, {
+              isFollowed: filteredResFus.length > 0,
+              lastUpdateText: nextLatestFuOpt ? (String(nextLatestFuOpt.action || '') + (nextLatestFuOpt.notes ? (' — ' + String(nextLatestFuOpt.notes)) : '')) : ''
+            }) : data.reservation
+          });
+        }
+        return undefined;
+      });
+
+      if (delFuResId && remainingFollowUpCountOpt !== null) {
+        var patchResAfterFuDel = function (rec) {
+          if (!rec || rec.id !== delFuResId) return rec;
+          return Object.assign({}, rec, {
+            isFollowed: remainingFollowUpCountOpt > 0,
+            lastUpdateText: nextLatestFuOpt ? (String(nextLatestFuOpt.action || '') + (nextLatestFuOpt.notes ? (' — ' + String(nextLatestFuOpt.notes)) : '')) : ''
+          });
+        };
+        if (localReservationsByNs[nsFuDel] && localReservationsByNs[nsFuDel].byId[delFuResId]) {
+          setLocalReservationsState(nsFuDel, [patchResAfterFuDel(localReservationsByNs[nsFuDel].byId[delFuResId])], false);
+        }
+        patchCachedScopes(['reservations'], function (data, actName, entryKey) {
+          if (actName === 'getReservations' && Array.isArray(data.items)) {
+            var hitRec = (localReservationsByNs[nsFuDel] && localReservationsByNs[nsFuDel].byId[delFuResId]) ||
+              data.items.find(function (r) { return r && r.id === delFuResId; });
+            return hitRec ? patchReservationCachedQuery(data, entryKey, [patchResAfterFuDel(hitRec)], []) : undefined;
+          }
+          return undefined;
+        });
+        patchTodayRadarCaches(patchResAfterFuDel);
+      }
+
+      emitOptimisticMutationEvent(action, { followUpId: delFuId, reservationId: delFuResId });
+      return;
+    }
+
     if (action === 'assignEmployees' || action === 'removeAssignment') {
       var resIdAs = String(p.reservationId || '').trim();
       if (!resIdAs) return;
@@ -2331,6 +2411,20 @@
         return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
       });
       emitOptimisticMutationEvent(action, {});
+      return;
+    }
+
+    if (action === 'deleteNotification') {
+      patchCachedScopes(['notifications'], function (data, actName) {
+        if (actName !== 'getNotifications' || !Array.isArray(data.items)) return undefined;
+        var delNid = String(p.notificationId || p.id || '').trim();
+        var nextItems = p.deleteAll
+          ? []
+          : data.items.filter(function (n) { return n && n.id !== delNid; });
+        var nextUnread = nextItems.filter(function (n) { return !n.isRead; }).length;
+        return Object.assign({}, data, { items: nextItems, unreadCount: nextUnread });
+      });
+      emitOptimisticMutationEvent(action, { notificationId: p.notificationId || p.id || '', deleteAll: Boolean(p.deleteAll) });
       return;
     }
 
@@ -4916,6 +5010,53 @@
         return { success: true, message: 'تم تعديل المتابعة بنجاح.', data: fuEdit, error: null };
       }
 
+      case 'deleteFollowUp': {
+        var delFuIdSb = String(payload.followUpId || payload.id || '').trim();
+        if (!delFuIdSb) return { success: false, message: 'معرف المتابعة مطلوب.', data: null, error: 'VALIDATION_ERROR' };
+        var fuIdx = db.followUps.findIndex(function (f) { return f.id === delFuIdSb; });
+        if (fuIdx === -1) return { success: false, message: 'سجل المتابعة غير موجود.', data: null, error: 'NOT_FOUND' };
+        var targetFu = db.followUps[fuIdx];
+        if (targetFu.employeeId !== session.employeeId && !core.canUserPerform(session.user, 'edit_any_followup')) {
+          return { success: false, message: 'FORBIDDEN: لا يمكنك حذف متابعة موظف آخر.', data: null, error: 'FORBIDDEN' };
+        }
+        db.followUps.splice(fuIdx, 1);
+        if (Array.isArray(db.followUpHistory)) {
+          db.followUpHistory = db.followUpHistory.filter(function (h) { return h && h.followUpId !== delFuIdSb; });
+        }
+        var remResFusSb = db.followUps
+          .filter(function (f) { return f && f.reservationId === targetFu.reservationId; })
+          .sort(function (a, b) { return String(b.createdAt || '').localeCompare(String(a.createdAt || '')); });
+        var latestRemFuSb = remResFusSb[0] || null;
+        var parentResDel = db.reservations.find(function (r) { return r && r.id === targetFu.reservationId; });
+        if (parentResDel) {
+          var nowDelFuIso = new Date().toISOString();
+          parentResDel.lastUpdateText = latestRemFuSb ? (String(latestRemFuSb.action || '') + (latestRemFuSb.notes ? (' — ' + latestRemFuSb.notes) : '')) : '';
+          parentResDel.lastUpdatedById = latestRemFuSb ? latestRemFuSb.employeeId : '';
+          parentResDel.lastUpdatedByName = latestRemFuSb ? latestRemFuSb.employeeName : '';
+          parentResDel.lastUpdatedAt = latestRemFuSb ? latestRemFuSb.createdAt : '';
+          parentResDel.updatedAt = nowDelFuIso;
+          if (!core.isInactiveReservation || !core.isInactiveReservation(parentResDel)) {
+            parentResDel.internalStatus = (latestRemFuSb && latestRemFuSb.status) ? latestRemFuSb.status : 'بانتظار المتابعة';
+          }
+        }
+        appendSandboxActivity(db, session.user, 'حذف متابعة', 'FollowUp', targetFu.reservationNumber || delFuIdSb, (targetFu.employeeName || '-') + ' | ' + String(targetFu.action || '').slice(0, 80));
+        saveSandboxDb(db);
+        return {
+          success: true,
+          message: 'تم حذف المتابعة بنجاح.',
+          data: {
+            id: delFuIdSb,
+            deleted: true,
+            reservationId: targetFu.reservationId || '',
+            reservationNumber: targetFu.reservationNumber || '',
+            remainingFollowUpsCount: remResFusSb.length,
+            latestFollowUp: latestRemFuSb,
+            isFollowed: remResFusSb.length > 0
+          },
+          error: null
+        };
+      }
+
       case 'getMyFollowUps': {
         var myMentionFus = (core && core.filterMentionFollowUps)
           ? core.filterMentionFollowUps(db.followUps, session.user, db.employees)
@@ -5715,6 +5856,40 @@
         });
         saveSandboxDb(db);
         return { success: true, message: '', data: { updated: true }, error: null };
+      }
+
+      case 'deleteNotification': {
+        var delAllNtf = Boolean(payload && payload.deleteAll);
+        var delNtfId = String((payload && (payload.notificationId || payload.id)) || '').trim();
+        if (!delAllNtf && !delNtfId) {
+          return { success: false, message: 'VALIDATION_ERROR: معرف الإشعار مطلوب.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var beforeNtfCount = db.notifications.length;
+        db.notifications = db.notifications.filter(function (n) {
+          var mine = n.recipientEmployeeId === session.employeeId ||
+            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
+          if (!mine) return true;
+          if (delAllNtf) return false;
+          return n.id !== delNtfId;
+        });
+        var deletedNtfCount = beforeNtfCount - db.notifications.length;
+        saveSandboxDb(db);
+        var freshMyNotifs = db.notifications.filter(function (n) {
+          return n.recipientEmployeeId === session.employeeId ||
+            (!n.recipientEmployeeId && (n.recipientRole === session.role || n.recipientRole === 'all'));
+        });
+        var freshUnread = freshMyNotifs.filter(function (n) { return !n.isRead; }).length;
+        return {
+          success: true,
+          message: '',
+          data: {
+            deleted: true,
+            deletedCount: deletedNtfCount,
+            items: freshMyNotifs.slice(0, 50),
+            unreadCount: freshUnread
+          },
+          error: null
+        };
       }
 
       case 'saveApiToken': {
@@ -7257,14 +7432,17 @@
     }
 
     var chFu = Array.isArray(delta.changedFollowUps) ? delta.changedFollowUps : [];
-    if (chFu.length > 0) {
+    var delFuIds = Array.isArray(delta.deletedFollowUpIds) ? delta.deletedFollowUpIds : [];
+    if (chFu.length > 0 || delFuIds.length > 0) {
+      var delFuMap = {};
+      delFuIds.forEach(function (id) { if (id) delFuMap[String(id)] = true; });
       touchedScopes.followUps = true;
       touchedScopes.dashboard = true;
       touchedScopes.todayRadar = true;
       if (localReservationsByNs[ns] && localReservationsByNs[ns].byId) {
         var fuResPatch = [];
         chFu.forEach(function (f) {
-          if (f && f.reservationId && localReservationsByNs[ns].byId[f.reservationId]) {
+          if (f && f.reservationId && !delFuMap[String(f.id)] && localReservationsByNs[ns].byId[f.reservationId]) {
             fuResPatch.push(Object.assign({}, localReservationsByNs[ns].byId[f.reservationId], { isFollowed: true }));
           }
         });
@@ -7273,15 +7451,17 @@
       if (localDetailsByNs[ns] && core && core.mergeDeltaRecords) {
         var fuByRes = {};
         chFu.forEach(function (f) {
-          if (!f || !f.reservationId) return;
+          if (!f || !f.reservationId || delFuMap[String(f.id)]) return;
           if (!fuByRes[f.reservationId]) fuByRes[f.reservationId] = [];
           fuByRes[f.reservationId].push(f);
         });
+        var touchedFuDetailIds = {};
         Object.keys(fuByRes).forEach(function (rid) {
+          touchedFuDetailIds[rid] = true;
           var detEntry = localDetailsByNs[ns][rid];
           if (detEntry) {
             var cleanExisting = (Array.isArray(detEntry.followUps) ? detEntry.followUps : []).filter(function (f) {
-              return f && String(f.id || '').indexOf('FU_OPT_') !== 0;
+              return f && String(f.id || '').indexOf('FU_OPT_') !== 0 && !delFuMap[String(f.id)];
             });
             detEntry.followUps = core.mergeDeltaRecords(cleanExisting, fuByRes[rid], 'id');
             detEntry.cachedAt = Date.now();
@@ -7290,32 +7470,58 @@
             }
           }
         });
+        if (delFuIds.length > 0) {
+          Object.keys(localDetailsByNs[ns]).forEach(function (rid) {
+            var detEntry = localDetailsByNs[ns][rid];
+            if (!detEntry || !Array.isArray(detEntry.followUps)) return;
+            var hadRemoved = detEntry.followUps.some(function (f) { return f && delFuMap[String(f.id)]; });
+            if (!hadRemoved) return;
+            detEntry.followUps = detEntry.followUps.filter(function (f) { return f && !delFuMap[String(f.id)]; });
+            detEntry.cachedAt = Date.now();
+            if (!touchedFuDetailIds[rid] && root.RGIdbCache) {
+              root.RGIdbCache.upsertReservationDetail(ns, detEntry).catch(function () {});
+            }
+          });
+        }
       }
       if (core && core.mergeDeltaRecords) {
         patchCachedScopes(['followUps', 'reservations'], function (data, actName, entryKey) {
           if (actName === 'getTeamFollowUps' && Array.isArray(data.items)) {
-            return patchFollowUpCachedQuery(data, entryKey, chFu, []);
+            return patchFollowUpCachedQuery(data, entryKey, chFu, [], delFuIds);
           }
           if (actName === 'getMyFollowUps' && Array.isArray(data.items)) {
-            return Object.assign({}, data, { items: core.mergeDeltaRecords(data.items, chFu, 'id') });
+            var nextMyItems = chFu.length > 0 ? core.mergeDeltaRecords(data.items, chFu, 'id') : data.items.slice();
+            if (delFuIds.length > 0) nextMyItems = nextMyItems.filter(function (f) { return f && !delFuMap[String(f.id)]; });
+            return Object.assign({}, data, { items: nextMyItems });
           }
           if (actName === 'getMyFollowUps' && Array.isArray(data.followUps)) {
             var curActUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
             var curActEmpId = curActUser && curActUser.id ? String(curActUser.id) : '';
             var ownFuChanges = curActEmpId
-              ? chFu.filter(function (f) { return f && String(f.employeeId) === curActEmpId; })
-              : chFu;
-            if (ownFuChanges.length > 0) {
-              return Object.assign({}, data, { followUps: core.mergeDeltaRecords(data.followUps, ownFuChanges, 'id') });
+              ? chFu.filter(function (f) { return f && String(f.employeeId) === curActEmpId && !delFuMap[String(f.id)]; })
+              : chFu.filter(function (f) { return f && !delFuMap[String(f.id)]; });
+            var existingMyFus = data.followUps.filter(function (f) { return f && !delFuMap[String(f.id)]; });
+            var nextMyMentions = Array.isArray(data.mentionFollowUps)
+              ? data.mentionFollowUps.filter(function (f) { return f && !delFuMap[String(f.id)]; })
+              : data.mentionFollowUps;
+            if (ownFuChanges.length > 0 || delFuIds.length > 0) {
+              return Object.assign({}, data, {
+                followUps: ownFuChanges.length > 0 ? core.mergeDeltaRecords(existingMyFus, ownFuChanges, 'id') : existingMyFus,
+                mentionFollowUps: nextMyMentions
+              });
             }
           }
           if (actName === 'getReservationDetails' && data.reservation && data.reservation.id) {
-            var resFus = chFu.filter(function (f) { return f && f.reservationId === data.reservation.id; });
-            if (resFus.length > 0) {
-              var existingFus = (Array.isArray(data.followUps) ? data.followUps : []).filter(function (f) {
-                return f && String(f.id || '').indexOf('FU_OPT_') !== 0;
+            var resFus = chFu.filter(function (f) { return f && f.reservationId === data.reservation.id && !delFuMap[String(f.id)]; });
+            var existingFus = Array.isArray(data.followUps) ? data.followUps : [];
+            var removedSomeFu = existingFus.some(function (f) { return f && delFuMap[String(f.id)]; });
+            if (resFus.length > 0 || removedSomeFu) {
+              var cleanedFus = existingFus.filter(function (f) {
+                return f && String(f.id || '').indexOf('FU_OPT_') !== 0 && !delFuMap[String(f.id)];
               });
-              return Object.assign({}, data, { followUps: core.mergeDeltaRecords(existingFus, resFus, 'id') });
+              return Object.assign({}, data, {
+                followUps: resFus.length > 0 ? core.mergeDeltaRecords(cleanedFus, resFus, 'id') : cleanedFus
+              });
             }
           }
           return undefined;
@@ -8186,7 +8392,7 @@
             root.RGIdbCache.resetBootSyncState(ns);
           }
           if (!transportUrl) syncSandboxSnapshotToIdb(ns);
-        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'bulkReassignSelectedReservations' || action === 'bulkReassignEmployeeReservations' || action === 'createProblem' || action === 'updateProblem' || action === 'deleteProblem')) {
+        } else if (!transportUrl && (action === 'addFollowUp' || action === 'updateFollowUp' || action === 'deleteFollowUp' || action === 'recordNoAnswerFollowUp' || action === 'saveReservationPinnedNote' || action === 'togglePinnedCriticalReservation' || action === 'claimReservation' || action === 'unclaimReservation' || action === 'assignEmployees' || action === 'removeAssignment' || action === 'bulkReassignSelectedReservations' || action === 'bulkReassignEmployeeReservations' || action === 'createProblem' || action === 'updateProblem' || action === 'deleteProblem' || action === 'deleteNotification')) {
           var dObj = (parsed && parsed.data) || {};
           var pObj = payload || {};
           var tResId = dObj.reservationId || (dObj.reservation && dObj.reservation.id) || pObj.reservationId || '';

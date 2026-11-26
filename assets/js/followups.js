@@ -72,6 +72,7 @@
     var core = root.RGCrmCore || {};
     var currentUser = root.RGAuth.getUser() || {};
     var currentEmpId = currentUser.id || '';
+    var canEditAnyFollowUp = Boolean(core.canUserPerform && core.canUserPerform(currentUser, 'edit_any_followup'));
     var canViewMentionsTab = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_myfu_mentions');
     var canViewFuHistory = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_myfu_history');
     var canExportPdf = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_pdf');
@@ -234,6 +235,7 @@
         '</div>';
       }
       return '<div class="timeline-list" id="myfu-mentions-list">' + mentionFollowUps.map(function (f) {
+        var canDeleteThisFu = Boolean(canEditAnyFollowUp || (f.employeeId && f.employeeId === currentEmpId));
         return '<div class="timeline-item rg-mention-fu-item">' +
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
@@ -247,7 +249,10 @@
           (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + fmtMention(f.notes, employees) + '</div>' : '') +
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
             '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc((core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + '</span><span>·</span><span dir="ltr">' + esc(fmtTime(f.followUpTime, ctx)) + '</span></div>' +
-            '<button type="button" class="btn btn-sm btn-primary myfu-open" data-id="' + esc(f.reservationId) + '">' + (isEn ? 'Open Booking' : 'فتح الحجز') + '</button>' +
+            '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+              (canDeleteThisFu ? '<button type="button" class="btn btn-sm btn-danger myfu-delete-fu" data-fu-id="' + esc(f.id) + '" data-res-id="' + esc(f.reservationId) + '" data-confirm="0" aria-label="' + (isEn ? 'Delete follow-up' : 'حذف المتابعة') + '">' + (isEn ? 'Delete' : 'حذف') + '</button>' : '') +
+              '<button type="button" class="btn btn-sm btn-primary myfu-open" data-id="' + esc(f.reservationId) + '">' + (isEn ? 'Open Booking' : 'فتح الحجز') + '</button>' +
+            '</div>' +
           '</div>' +
         '</div>';
       }).join('') + '</div>';
@@ -260,6 +265,7 @@
         (followUps.length === 0
           ? '<div class="empty-state">لم تقم بتسجيل أي متابعات بعد.</div>'
           : '<div class="timeline-list">' + followUps.map(function (f) {
+              var canDeleteThisFu = Boolean(canEditAnyFollowUp || (f.employeeId && f.employeeId === currentEmpId));
               return '<div class="timeline-item">' +
                 '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
                   '<button type="button" class="btn-link-inline mono myfu-open" data-id="' + esc(f.reservationId) + '"><span dir="ltr">' + esc(f.reservationNumber) + '</span> — ' + esc(f.customerName) + '</button>' +
@@ -269,7 +275,10 @@
                 (f.notes ? '<div style="color:var(--text-secondary);font-size:12.5px;">' + fmtMention(f.notes, employees) + '</div>' : '') +
                 '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
                   '<div class="meta-inline mono" style="white-space:nowrap;"><span>' + esc((core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + '</span><span>·</span><span dir="ltr">' + esc(fmtTime(f.followUpTime, ctx)) + '</span></div>' +
-                  '<button type="button" class="btn btn-sm myfu-open" data-id="' + esc(f.reservationId) + '">تفاصيل الحجز</button>' +
+                  '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+                    (canDeleteThisFu ? '<button type="button" class="btn btn-sm btn-danger myfu-delete-fu" data-fu-id="' + esc(f.id) + '" data-res-id="' + esc(f.reservationId) + '" data-confirm="0" aria-label="' + (isEn ? 'Delete follow-up' : 'حذف المتابعة') + '">' + (isEn ? 'Delete' : 'حذف') + '</button>' : '') +
+                    '<button type="button" class="btn btn-sm myfu-open" data-id="' + esc(f.reservationId) + '">تفاصيل الحجز</button>' +
+                  '</div>' +
                 '</div>' +
               '</div>';
             }).join('') + '</div>') +
@@ -556,6 +565,50 @@
           });
         });
       });
+
+      container.querySelectorAll('.myfu-delete-fu').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          if (btn.getAttribute('data-confirm') !== '1') {
+            btn.setAttribute('data-confirm', '1');
+            btn.textContent = isEn ? 'Confirm?' : 'تأكيد الحذف؟';
+            setTimeout(function () {
+              if (document.body.contains(btn)) {
+                btn.setAttribute('data-confirm', '0');
+                btn.textContent = isEn ? 'Delete' : 'حذف';
+              }
+            }, 4000);
+            return;
+          }
+          var fuId = btn.getAttribute('data-fu-id');
+          var resId = btn.getAttribute('data-res-id') || '';
+          if (!fuId) return;
+          runWithLock(btn, 'deleteFollowUp:' + fuId, function () {
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteFollowUp', { followUpId: fuId, reservationId: resId }, currentUser);
+            }
+            followUps = followUps.filter(function (x) { return x && x.id !== fuId; });
+            mentionFollowUps = mentionFollowUps.filter(function (x) { return x && x.id !== fuId; });
+            paintMyFollowUpsContent();
+            ctx.toast(isEn ? 'Follow-up deleted.' : 'تم حذف المتابعة بنجاح.');
+            return root.RGApi.callApi('deleteFollowUp', {
+              followUpId: fuId,
+              reservationId: resId,
+              _keepOptimisticCache: true,
+              _spamChecked: true
+            }).then(function (resp) {
+              if (resp && resp.success) {
+                ctx.refreshNotifications();
+              } else {
+                ctx.toast((resp && resp.message) || (isEn ? 'Failed to delete follow-up.' : 'تعذر حذف المتابعة.'), true);
+                refreshMyFollowUpsData({ silentRefresh: true, forceRefresh: true });
+              }
+            }).catch(function () {
+              ctx.toast(isEn ? 'Network error deleting follow-up.' : 'تعذر الاتصال بالخادم أثناء حذف المتابعة.', true);
+              refreshMyFollowUpsData({ silentRefresh: true, forceRefresh: true });
+            });
+          }, { spamAction: 'deleteFollowUp', spamSig: 'deleteFollowUp:' + fuId });
+        });
+      });
     }
 
     async function refreshMyFollowUpsData(refreshOpts) {
@@ -788,6 +841,7 @@
         var d = (ev && ev.detail) || {};
         var relevant = Boolean(
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.deletedFollowUpIds) && d.deletedFollowUpIds.length > 0) ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
           (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
           (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
@@ -824,6 +878,8 @@
     var empDetails = (empDetailRes && empDetailRes.success) ? empDetailRes.data : null;
 
     var currentUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var currentEmpIdTeam = (currentUser && currentUser.id) || '';
+    var canEditAnyFollowUpTeam = Boolean(currentUser && core && core.canUserPerform && core.canUserPerform(currentUser, 'edit_any_followup'));
     var canReassign = Boolean(currentUser && core && core.canUserPerform && core.canUserPerform(currentUser, 'assign_employees'));
     var canExportPdfTeam = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_pdf');
     var canExportExcelTeam = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_excel');
@@ -899,6 +955,7 @@
               '<th>رقم الحجز</th><th>العميل</th><th>الموظف</th><th>الحالة</th><th>الإجراء</th><th>الملاحظات</th><th>التاريخ والوقت</th><th>تفاصيل الحجز</th>' +
             '</tr></thead><tbody>' +
               items.map(function (f) {
+                var canDeleteTeamFu = Boolean(canEditAnyFollowUpTeam || (f.employeeId && f.employeeId === currentEmpIdTeam));
                 return '<tr>' +
                   '<td class="mono"><button type="button" class="btn-link-inline tfu-open-res" dir="ltr" data-res-id="' + esc(f.reservationId) + '">' + esc(f.reservationNumber) + '</button></td>' +
                   '<td>' + esc(f.customerName) + '</td>' +
@@ -907,7 +964,10 @@
                   '<td><div class="cell-clamp-2" title="' + esc(f.action || '') + '">' + fmtMention(f.action, employees) + '</div></td>' +
                   '<td><div class="cell-clamp-2" title="' + esc(f.notes || '') + '">' + (f.notes ? fmtMention(f.notes, employees) : '-') + '</div></td>' +
                   '<td class="mono tabular-nums" dir="ltr" style="white-space:nowrap;">' + esc((core && core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-') + (f.followUpTime ? ' ' + esc(fmtTime(f.followUpTime, ctx)) : '') + '</td>' +
-                  '<td class="table-actions-cell"><button type="button" class="btn btn-sm btn-primary tfu-open-res" data-res-id="' + esc(f.reservationId) + '">التفاصيل</button></td>' +
+                  '<td class="table-actions-cell"><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+                    '<button type="button" class="btn btn-sm btn-primary tfu-open-res" data-res-id="' + esc(f.reservationId) + '">التفاصيل</button>' +
+                    (canDeleteTeamFu ? '<button type="button" class="btn btn-sm btn-danger tfu-delete-fu" data-fu-id="' + esc(f.id) + '" data-res-id="' + esc(f.reservationId) + '" data-confirm="0" aria-label="' + (isEn ? 'Delete follow-up' : 'حذف المتابعة') + '">' + (isEn ? 'Delete' : 'حذف') + '</button>' : '') +
+                  '</div></td>' +
                 '</tr>';
               }).join('') +
             '</tbody></table></div>'));
@@ -935,6 +995,55 @@
               refreshTeamFollowUpsRegion({ silentRefresh: true, forceRefresh: true });
             });
           }
+        });
+      });
+
+      resultsRegion.querySelectorAll('.tfu-delete-fu').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          if (btn.getAttribute('data-confirm') !== '1') {
+            btn.setAttribute('data-confirm', '1');
+            btn.textContent = isEn ? 'Confirm?' : 'تأكيد الحذف؟';
+            setTimeout(function () {
+              if (document.body.contains(btn)) {
+                btn.setAttribute('data-confirm', '0');
+                btn.textContent = isEn ? 'Delete' : 'حذف';
+              }
+            }, 4000);
+            return;
+          }
+          var fuId = btn.getAttribute('data-fu-id');
+          var resId = btn.getAttribute('data-res-id') || '';
+          if (!fuId) return;
+          var execLock = function (fn) {
+            if (root.RGApp && root.RGApp.withActionLock) {
+              return root.RGApp.withActionLock(btn, 'deleteFollowUp:' + fuId, fn, { spamAction: 'deleteFollowUp', spamSig: 'deleteFollowUp:' + fuId });
+            }
+            return Promise.resolve().then(fn);
+          };
+          execLock(function () {
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteFollowUp', { followUpId: fuId, reservationId: resId }, currentUser);
+            }
+            items = items.filter(function (x) { return x && x.id !== fuId; });
+            paintTeamFollowUpsResults();
+            ctx.toast(isEn ? 'Follow-up deleted.' : 'تم حذف المتابعة بنجاح.');
+            return root.RGApi.callApi('deleteFollowUp', {
+              followUpId: fuId,
+              reservationId: resId,
+              _keepOptimisticCache: true,
+              _spamChecked: true
+            }).then(function (resp) {
+              if (resp && resp.success) {
+                ctx.refreshNotifications();
+              } else {
+                ctx.toast((resp && resp.message) || (isEn ? 'Failed to delete follow-up.' : 'تعذر حذف المتابعة.'), true);
+                refreshTeamFollowUpsRegion({ silentRefresh: true, forceRefresh: true });
+              }
+            }).catch(function () {
+              ctx.toast(isEn ? 'Network error deleting follow-up.' : 'تعذر الاتصال بالخادم أثناء حذف المتابعة.', true);
+              refreshTeamFollowUpsRegion({ silentRefresh: true, forceRefresh: true });
+            });
+          });
         });
       });
     }
@@ -1190,6 +1299,7 @@
         var d = (ev && ev.detail) || {};
         var relevant = Boolean(
           (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+          (Array.isArray(d.deletedFollowUpIds) && d.deletedFollowUpIds.length > 0) ||
           (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
           (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
           (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
@@ -1201,13 +1311,13 @@
         if (
           core &&
           typeof core.reapplyFollowUpDeltaToFilteredList === 'function' &&
-          Array.isArray(d.changedFollowUps) &&
-          d.changedFollowUps.length > 0 &&
+          ((Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+           (Array.isArray(d.deletedFollowUpIds) && d.deletedFollowUpIds.length > 0)) &&
           !d.deletedAllReservationsBefore
         ) {
-          var fuDeltaRes = core.reapplyFollowUpDeltaToFilteredList(items, d.changedFollowUps, state);
-          if (fuDeltaRes && Array.isArray(fuDeltaRes.items)) {
-            items = fuDeltaRes.items;
+          var fuDeltaArr = core.reapplyFollowUpDeltaToFilteredList(items, d.changedFollowUps, d.deletedReservationIds, state, d.deletedFollowUpIds);
+          if (Array.isArray(fuDeltaArr)) {
+            items = fuDeltaArr;
             fuLoadErr = '';
             paintTeamFollowUpsResults();
           }

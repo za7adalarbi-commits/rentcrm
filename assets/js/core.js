@@ -3250,10 +3250,11 @@
     });
   }
 
-  function reapplyFollowUpDeltaToFilteredList(currentItems, changedFollowUps, deletedReservationIds, filters) {
+  function reapplyFollowUpDeltaToFilteredList(currentItems, changedFollowUps, deletedReservationIds, filters, deletedFollowUpIds) {
     var base = Array.isArray(currentItems) ? currentItems.slice() : [];
     var changed = Array.isArray(changedFollowUps) ? changedFollowUps : [];
     var delRes = Array.isArray(deletedReservationIds) ? deletedReservationIds : [];
+    var delFu = Array.isArray(deletedFollowUpIds) ? deletedFollowUpIds : [];
     var f = filters || {};
 
     var delResMap = {};
@@ -3262,10 +3263,16 @@
       if (drid) delResMap[drid] = true;
     }
 
+    var delFuMap = {};
+    for (var df = 0; df < delFu.length; df++) {
+      var dfid = normalizeStr(delFu[df]);
+      if (dfid) delFuMap[dfid] = true;
+    }
+
     var changedById = {};
     for (var c = 0; c < changed.length; c++) {
       var ch = changed[c];
-      if (ch && ch.id) changedById[String(ch.id)] = ch;
+      if (ch && ch.id && !delFuMap[normalizeStr(ch.id)]) changedById[String(ch.id)] = ch;
     }
 
     var out = [];
@@ -3275,7 +3282,7 @@
       var candNew = changed[c2];
       if (!candNew || !candNew.id) continue;
       var fidNew = String(candNew.id);
-      if (delResMap[normalizeStr(candNew.reservationId)]) continue;
+      if (delFuMap[fidNew] || delResMap[normalizeStr(candNew.reservationId)]) continue;
       var isAlreadyInBase = base.some(function (x) { return x && String(x.id) === fidNew; });
       if (!isAlreadyInBase && !seen[fidNew]) {
         seen[fidNew] = true;
@@ -3289,12 +3296,12 @@
       var cur = base[i];
       if (!cur || !cur.id) continue;
       var fid = String(cur.id);
-      if (delResMap[normalizeStr(cur.reservationId)] || seen[fid]) continue;
+      if (delFuMap[fid] || delResMap[normalizeStr(cur.reservationId)] || seen[fid]) continue;
       seen[fid] = true;
       var resolved = Object.prototype.hasOwnProperty.call(changedById, fid)
         ? Object.assign({}, cur, changedById[fid])
         : cur;
-      if (delResMap[normalizeStr(resolved.reservationId)]) continue;
+      if (delFuMap[fid] || delResMap[normalizeStr(resolved.reservationId)]) continue;
       if (filterTeamFollowUpsList([resolved], f).length > 0) {
         out.push(resolved);
       }
@@ -3992,6 +3999,7 @@
     recordNoAnswerFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     addFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     updateFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    deleteFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     assignEmployees: ['reservations', 'todayRadar', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     removeAssignment: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     bulkReassignEmployeeReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
@@ -4018,6 +4026,7 @@
     savePermissionDefinition: ['employees', 'activity'],
     deletePermissionDefinition: ['employees', 'activity'],
     markNotificationRead: ['notifications'],
+    deleteNotification: ['notifications'],
     pullReservations: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     importReservationsFromExcel: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
     syncRentalGate: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
@@ -4553,12 +4562,15 @@
       case 'removeAssignment':
         return act + ':' + normalizeStr(p.reservationId) + ':' + normalizeStr(p.employeeId);
       case 'updateFollowUp':
-        return act + ':' + normalizeStr(p.followUpId);
+      case 'deleteFollowUp':
+        return act + ':' + normalizeStr(p.followUpId || p.id);
       case 'updateProblem':
       case 'deleteProblem':
         return act + ':' + normalizeStr(p.problemId || p.id);
       case 'markNotificationRead':
         return act + ':' + (p.markAll ? 'ALL' : normalizeStr(p.notificationId));
+      case 'deleteNotification':
+        return act + ':' + (p.deleteAll ? 'ALL' : normalizeStr(p.notificationId || p.id));
       case 'createEmployee':
         return act + ':' + normalizeLoginUsername(p.username || p.name);
       case 'updateEmployee':
@@ -9846,6 +9858,7 @@
       (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
       (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
       (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+      (Array.isArray(d.deletedFollowUpIds) && d.deletedFollowUpIds.length > 0) ||
       (Array.isArray(d.changedProblems) && d.changedProblems.length > 0) ||
       (Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0) ||
       (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||

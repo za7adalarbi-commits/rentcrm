@@ -4154,12 +4154,16 @@
       var deletedResProblem = Array.isArray(det.deletedProblemIds) && Array.isArray(d.problems)
         ? d.problems.some(function (p) { return p && det.deletedProblemIds.some(function (dpid) { return String(dpid) === String(p.id); }); })
         : false;
+      var deletedResFollowUp = Array.isArray(det.deletedFollowUpIds) && Array.isArray(d.followUps)
+        ? d.followUps.some(function (f) { return f && det.deletedFollowUpIds.some(function (dfuid) { return String(dfuid) === String(f.id); }); })
+        : false;
 
       var hasResUpdate = Boolean(
         (changedRes && changedRes.updatedAt && changedRes.updatedAt !== d.reservation.updatedAt && (!user || changedRes.lastUpdatedById !== user.id)) ||
         changedResFollowUp ||
         changedResProblem ||
-        deletedResProblem
+        deletedResProblem ||
+        deletedResFollowUp
       );
       if (hasResUpdate) {
         var byName = (changedRes && changedRes.lastUpdatedByName) || (isEn ? 'colleague' : 'زميل');
@@ -4504,9 +4508,10 @@
                     return '<div class="timeline-item">' +
                       '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
                         '<strong>' + esc(f.employeeName) + '</strong>' +
-                        '<div style="display:flex;align-items:center;gap:8px;">' +
+                        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                           '<span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span>' +
-                          (canEditThisFu ? '<button type="button" class="btn btn-sm btn-edit-fu" data-fu-id="' + esc(f.id) + '">تعديل</button>' : '') +
+                          (canEditThisFu ? '<button type="button" class="btn btn-sm btn-edit-fu" data-fu-id="' + esc(f.id) + '">' + (isEn ? 'Edit' : 'تعديل') + '</button>' : '') +
+                          (canEditThisFu ? '<button type="button" class="btn btn-sm btn-danger btn-delete-fu" data-fu-id="' + esc(f.id) + '" data-confirm="0" aria-label="' + (isEn ? 'Delete follow-up' : 'حذف المتابعة') + '">' + (isEn ? 'Delete' : 'حذف') + '</button>' : '') +
                         '</div>' +
                       '</div>' +
                       '<div>' + fmtMentionText(f.action) + '</div>' +
@@ -5037,6 +5042,74 @@
           var fuId = btn.getAttribute('data-fu-id');
           var fu = d.followUps.find(function (x) { return x.id === fuId; });
           if (fu) openEditFollowUpModal(fu, r, ctx, reopenSelf, reopenSelf);
+        });
+      });
+
+      modalRoot.querySelectorAll('.btn-delete-fu').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          if (btn.getAttribute('data-confirm') !== '1') {
+            btn.setAttribute('data-confirm', '1');
+            btn.textContent = isEn ? 'Confirm?' : 'تأكيد الحذف؟';
+            setTimeout(function () {
+              if (document.body.contains(btn)) {
+                btn.setAttribute('data-confirm', '0');
+                btn.textContent = isEn ? 'Delete' : 'حذف';
+              }
+            }, 4000);
+            return;
+          }
+          var fuId = btn.getAttribute('data-fu-id');
+          var fu = (d.followUps || []).find(function (x) { return x && x.id === fuId; });
+          if (!fu) return;
+          runWithLock(btn, 'deleteFollowUp:' + fuId, function () {
+            var delPayload = {
+              followUpId: fuId,
+              reservationId: r.id
+            };
+            if (root.RGApi.applyOptimisticMutation) {
+              root.RGApi.applyOptimisticMutation('deleteFollowUp', delPayload, user);
+            }
+            var nextFus = (d.followUps || []).filter(function (it) { return it && it.id !== fuId; });
+            d.followUps = nextFus;
+            var latestNextFu = nextFus[0] || null;
+            var coreObj = root.RGCrmCore || {};
+            var isInactiveCur = Boolean(coreObj.isInactiveReservation && coreObj.isInactiveReservation(r));
+            var resPatchLocal = {
+              isFollowed: nextFus.length > 0,
+              lastUpdatedAt: new Date().toISOString()
+            };
+            if (latestNextFu) {
+              resPatchLocal.lastUpdateText = latestNextFu.action + (latestNextFu.notes ? ' — ' + latestNextFu.notes : '');
+              if (!isInactiveCur && latestNextFu.status) {
+                resPatchLocal.internalStatus = latestNextFu.status;
+              }
+            } else {
+              resPatchLocal.lastUpdateText = isInactiveCur ? r.lastUpdateText : '';
+              if (!isInactiveCur) {
+                resPatchLocal.internalStatus = 'بانتظار المتابعة';
+              }
+            }
+            d.reservation = Object.assign({}, r, resPatchLocal);
+            paintDrawer();
+            notifyParentUpdated();
+            ctx.toast(isEn ? 'Follow-up deleted.' : 'تم حذف المتابعة بنجاح.');
+            return root.RGApi.callApi('deleteFollowUp', Object.assign({ _keepOptimisticCache: true, _spamChecked: true }, delPayload)).then(function (resp) {
+              if (resp && resp.success) {
+                if (resp.data && resp.data.reservation && d && d.reservation) {
+                  d.reservation = Object.assign({}, d.reservation, resp.data.reservation);
+                  notifyParentUpdated(d.reservation);
+                  paintDrawer();
+                }
+                ctx.refreshNotifications();
+              } else {
+                ctx.toast((resp && resp.message) || (isEn ? 'Failed to delete follow-up.' : 'تعذر حذف المتابعة.'), true);
+                reopenSelf(null);
+              }
+            }).catch(function () {
+              ctx.toast(isEn ? 'Network error deleting follow-up.' : 'تعذر الاتصال بالخادم أثناء حذف المتابعة.', true);
+              reopenSelf(null);
+            });
+          }, { spamAction: 'deleteFollowUp', spamSig: 'deleteFollowUp:' + fuId });
         });
       });
 
