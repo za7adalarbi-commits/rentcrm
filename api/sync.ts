@@ -1,9 +1,10 @@
 import { verifySharedSecret } from '../backend/auth.js';
+import { runAutoSyncCycle } from '../backend/autoSyncWorker.js';
 import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from '../backend/db.js';
 import { logBackendError } from '../backend/logger.js';
 import { ensureSeededDatabase } from '../backend/queries.js';
 import { ensureSyncApiSecret } from '../backend/serverConfig.js';
-import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch } from '../backend/syncService.js';
+import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch, readWorkerStateRow } from '../backend/syncService.js';
 import { attachAppVersionHeaders } from '../backend/versionManifest.js';
 
 function parseBody(rawBody: any): Record<string, any> {
@@ -103,6 +104,28 @@ export default async function handler(req: any, res: any) {
         success: true,
         message: 'تمت معالجة قائمة المزامنة العكسية مع Google Sheets.',
         data: mirrorResult,
+        error: null
+      });
+      return;
+    }
+
+    if (body.action === 'getWorkerStatus') {
+      const workerRow = await readWorkerStateRow(executor);
+      res.status(200).json({
+        success: true,
+        message: 'تم جلب حالة عامل المزامنة الخلفي.',
+        data: workerRow,
+        error: null
+      });
+      return;
+    }
+
+    if (body.action === 'runAutoSyncTick') {
+      const cycleResult = await runAutoSyncCycle(executor, { forceDue: Boolean(body.forceDue) });
+      res.status(200).json({
+        success: true,
+        message: 'تم تنفيذ دورة المزامنة التلقائية الخلفية.',
+        data: cycleResult,
         error: null
       });
       return;

@@ -56,7 +56,19 @@
         return;
       }
       var d = (ev && ev.detail) || {};
-      if (!(d.changedRoles || d.changedDelegations || d.changedSettings)) return;
+      var hasEmpDelta = Boolean(
+        d.changedRoles ||
+        d.changedDelegations ||
+        d.changedSettings ||
+        d.deletedAllReservationsBefore ||
+        (Array.isArray(d.changedEmployees) && d.changedEmployees.length > 0) ||
+        (Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) ||
+        (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
+        (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) ||
+        (Array.isArray(d.changedFollowUps) && d.changedFollowUps.length > 0) ||
+        (Array.isArray(d.changedProblems) && d.changedProblems.length > 0)
+      );
+      if (!hasEmpDelta) return;
       var modalRoot = document.getElementById('modal-root');
       if (modalRoot && modalRoot.firstElementChild) return;
       var activeEl = document.activeElement;

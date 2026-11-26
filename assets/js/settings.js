@@ -198,20 +198,58 @@
     var lastSync = syncData.lastSync;
 
     var autoSyncEnabled = settings.auto_sync_enabled !== undefined ? Boolean(settings.auto_sync_enabled) : (syncData.autoSyncEnabled !== false);
-    var rawSyncHours = settings.auto_sync_interval_hours !== undefined ? settings.auto_sync_interval_hours : syncData.autoSyncIntervalHours;
-    var rawSyncMinutes = settings.auto_sync_interval_minutes !== undefined ? settings.auto_sync_interval_minutes : syncData.autoSyncIntervalMinutes;
-    var autoSyncInterval = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncInterval)
-      ? root.RGCrmCore.normalizeAutoSyncInterval(rawSyncHours, rawSyncMinutes)
-      : { hours: Number(rawSyncHours !== undefined ? rawSyncHours : 12), minutes: Number(rawSyncMinutes || 0), totalMinutes: 720 };
-    var autoSyncHours = autoSyncInterval.hours;
-    var autoSyncMinutes = autoSyncInterval.minutes;
-    var formatIntervalAr = function (h, m) {
-      if (root.RGCrmCore && root.RGCrmCore.formatAutoSyncIntervalAr) {
-        return root.RGCrmCore.formatAutoSyncIntervalAr(h, m);
+    var autoSyncNorm = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncIntervalSeconds)
+      ? root.RGCrmCore.normalizeAutoSyncIntervalSeconds({
+          auto_sync_interval_seconds: settings.auto_sync_interval_seconds !== undefined ? settings.auto_sync_interval_seconds : syncData.autoSyncIntervalSeconds,
+          auto_sync_interval_value: settings.auto_sync_interval_value !== undefined ? settings.auto_sync_interval_value : syncData.autoSyncIntervalValue,
+          auto_sync_interval_unit: settings.auto_sync_interval_unit !== undefined ? settings.auto_sync_interval_unit : syncData.autoSyncIntervalUnit,
+          auto_sync_interval_hours: settings.auto_sync_interval_hours !== undefined ? settings.auto_sync_interval_hours : syncData.autoSyncIntervalHours,
+          auto_sync_interval_minutes: settings.auto_sync_interval_minutes !== undefined ? settings.auto_sync_interval_minutes : syncData.autoSyncIntervalMinutes
+        })
+      : { intervalSeconds: 43200, value: 12, unit: 'hours', hours: 12, minutes: 0 };
+    var formatIntervalSecondsAr = function (secOrObj) {
+      if (root.RGCrmCore && root.RGCrmCore.formatAutoSyncIntervalSecondsAr) {
+        return root.RGCrmCore.formatAutoSyncIntervalSecondsAr(secOrObj);
       }
-      return 'كل ' + h + ' ساعة' + (m > 0 ? (' و' + m + ' دقيقة') : '');
+      var sVal = typeof secOrObj === 'number' ? secOrObj : autoSyncNorm.intervalSeconds;
+      if (sVal < 60) return 'كل ' + sVal + ' ثانية';
+      if (sVal < 3600) return 'كل ' + Math.round(sVal / 60) + ' دقيقة';
+      return 'كل ' + Math.round(sVal / 3600) + ' ساعة';
     };
-    var autoSyncBadgeText = autoSyncEnabled ? ('مفعل — ' + formatIntervalAr(autoSyncHours, autoSyncMinutes)) : 'متوقف حاليًا';
+    var autoSyncBadgeText = autoSyncEnabled ? ('مفعل — ' + formatIntervalSecondsAr(autoSyncNorm.intervalSeconds)) : 'متوقف حاليًا';
+    var workerTelemetry = (syncData && syncData.worker && typeof syncData.worker === 'object')
+      ? syncData.worker
+      : {
+          status: autoSyncEnabled ? ((syncData.consecutiveErrors > 0 && syncData.lastError) ? 'error' : 'running') : 'stopped',
+          isSyncing: Boolean(syncData.isSyncing),
+          autoSyncEnabled: autoSyncEnabled,
+          intervalSeconds: autoSyncNorm.intervalSeconds,
+          intervalValue: autoSyncNorm.value,
+          intervalUnit: autoSyncNorm.unit,
+          lastRunAt: syncData.lastRunAt || (lastSync && (lastSync.startedAt || lastSync.finishedAt)) || '',
+          lastSuccessAt: syncData.lastSuccessAt || '',
+          nextRunAt: autoSyncEnabled ? (syncData.nextRunAt || '') : null,
+          lastDurationMs: Number(syncData.lastDurationMs || (lastSync && lastSync.durationMs) || 0),
+          importedCount: Number(lastSync ? lastSync.importedCount : 0),
+          updatedCount: Number(lastSync ? lastSync.updatedCount : 0),
+          extensionsCount: Number(lastSync ? lastSync.extensionsCount : 0),
+          errorCount: Number(syncData.errorCount || 0),
+          consecutiveErrors: Number(syncData.consecutiveErrors || 0),
+          lastError: String(syncData.lastError || ''),
+          lastTriggerType: ''
+        };
+    var autoSyncQuickPresets = [
+      { value: 1, unit: 'seconds', label: 'كل ثانية' },
+      { value: 5, unit: 'seconds', label: '5 ثوانٍ' },
+      { value: 15, unit: 'seconds', label: '15 ثانية' },
+      { value: 30, unit: 'seconds', label: '30 ثانية' },
+      { value: 1, unit: 'minutes', label: 'دقيقة واحدة' },
+      { value: 5, unit: 'minutes', label: '5 دقائق' },
+      { value: 15, unit: 'minutes', label: '15 دقيقة' },
+      { value: 1, unit: 'hours', label: 'ساعة واحدة' },
+      { value: 6, unit: 'hours', label: '6 ساعات' },
+      { value: 12, unit: 'hours', label: '12 ساعة' }
+    ];
 
     var isBackendConnected = Boolean(root.RGApi.isBackendConnected && root.RGApi.isBackendConnected());
     var connInfo = root.RGApi.getConnectionInfo ? root.RGApi.getConnectionInfo() : { url: root.RGApi.getGasUrl(), source: '', defaultUrl: '' };
@@ -441,19 +479,140 @@
         '</form>'
       ) : '') +
 
-      (canSync ? (
+      ((canSync || canManageSettings) ? (
         '<div class="surface-card" id="settings-sync-card">' +
           '<div class="section-header">' +
-            '<div><h2 class="section-title">مزامنة بيانات Rental Gate API</h2>' +
-            '<p class="section-subtitle">يتم السحب عبر الخادم السحابي وGoogle Apps Script · الكاش المحلي (IndexedDB): <strong class="tabular-nums">' + cacheStats.reservationsCount + '</strong> حجز · <strong class="tabular-nums">' + cacheStats.customersCount + '</strong> عميل</p></div>' +
+            '<div>' +
+              '<h2 class="section-title">السحب التلقائي ومراقبة المزامنة — Rental Gate API</h2>' +
+              '<p class="section-subtitle">يعمل السحب التلقائي في الخلفية عبر الخادم وقاعدة بيانات Neon PostgreSQL بشكل مستقل تماماً عن فتح المتصفح · الكاش المحلي: <strong class="tabular-nums">' + cacheStats.reservationsCount + '</strong> حجز · <strong class="tabular-nums">' + cacheStats.customersCount + '</strong> عميل</p>' +
+            '</div>' +
             '<div class="toolbar-row" style="margin-bottom:0;">' +
               '<button type="button" class="btn" id="btn-test-rg">اختبار الاتصال بـ Rental Gate</button>' +
-              '<button type="button" class="btn btn-primary" id="btn-sync-now">سحب الحجوزات الآن</button>' +
+              (canSync ? '<button type="button" class="btn btn-primary" id="btn-sync-now">سحب فوري الآن</button>' : '') +
             '</div>' +
           '</div>' +
-          (isGeneralManager ? (
+
+          '<div class="rg-sync-monitor-panel" id="sync-monitor-panel" aria-live="polite">' +
+            '<div class="rg-sync-monitor-head">' +
+              '<div class="rg-sync-monitor-title-wrap">' +
+                '<h3 class="rg-sync-monitor-title">لوحة مراقبة المزامنة</h3>' +
+                '<span class="rg-sync-monitor-sub">تحديث لحظي تلقائي لحالة السحب في الخلفية دون إعادة تحميل الصفحة</span>' +
+              '</div>' +
+              '<div class="rg-sync-monitor-badges">' +
+                '<span class="status-tag ' + (workerTelemetry.status === 'stopped' ? 'status-warning' : (workerTelemetry.status === 'error' ? 'status-danger' : 'status-success')) + '" id="sync-monitor-status-badge">' +
+                  (workerTelemetry.status === 'stopped' ? 'متوقف' : (workerTelemetry.status === 'error' ? 'خطأ' : 'يعمل')) +
+                '</span>' +
+                '<span class="status-tag status-info rg-sync-pulling-pill' + (workerTelemetry.isSyncing ? '' : ' hidden') + '" id="sync-monitor-active-pill">جاري السحب الآن...</span>' +
+              '</div>' +
+            '</div>' +
+
+            '<div class="rg-sync-monitor-grid">' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">حالة السحب التلقائي</span>' +
+                '<strong class="rg-sync-metric-v" id="sync-monitor-state-text">' +
+                  (workerTelemetry.status === 'stopped' ? 'متوقف' : (workerTelemetry.status === 'error' ? 'خطأ — إعادة محاولة مجدولة' : 'يعمل تلقائياً')) +
+                '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">الفترة الزمنية المحددة</span>' +
+                '<strong class="rg-sync-metric-v tabular-nums" id="sync-monitor-interval">' + escapeHtml(formatIntervalSecondsAr(workerTelemetry.intervalSeconds || autoSyncNorm.intervalSeconds)) + '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">وقت آخر مزامنة</span>' +
+                '<strong class="rg-sync-metric-v mono tabular-nums" dir="ltr" id="sync-monitor-last-run">' + (workerTelemetry.lastRunAt ? escapeHtml(formatSettingDateTime(workerTelemetry.lastRunAt, ctx)) : 'لم يتم السحب بعد') + '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">المزامنة القادمة / العد التنازلي</span>' +
+                '<strong class="rg-sync-metric-v tabular-nums" id="sync-monitor-next-run">' +
+                  (autoSyncEnabled && workerTelemetry.nextRunAt
+                    ? ('<span id="sync-monitor-countdown" class="mono rg-sync-countdown-main" dir="ltr">...</span><span class="rg-sync-next-ts mono" dir="ltr">' + escapeHtml(formatSettingDateTime(workerTelemetry.nextRunAt, ctx)) + '</span>')
+                    : 'متوقف') +
+                '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">الحجوزات الجديدة</span>' +
+                '<strong class="rg-sync-metric-v tabular-nums" id="sync-monitor-imported">' + Number(workerTelemetry.importedCount || 0) + '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">الحجوزات المحدثة</span>' +
+                '<strong class="rg-sync-metric-v tabular-nums" id="sync-monitor-updated">' + Number(workerTelemetry.updatedCount || 0) + '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">التمديدات الجديدة</span>' +
+                '<strong class="rg-sync-metric-v tabular-nums" id="sync-monitor-extensions">' + Number(workerTelemetry.extensionsCount || 0) + '</strong>' +
+              '</div>' +
+              '<div class="rg-sync-metric-card">' +
+                '<span class="rg-sync-metric-k">الأخطاء / مدة آخر عملية</span>' +
+                '<strong class="rg-sync-metric-v tabular-nums" id="sync-monitor-errors-duration">' +
+                  Number(workerTelemetry.errorCount || 0) + ' خطأ · ' +
+                  (Number(workerTelemetry.lastDurationMs || 0) > 0 ? ((Number(workerTelemetry.lastDurationMs) / 1000).toFixed(1) + ' ث') : '-') +
+                '</strong>' +
+              '</div>' +
+            '</div>' +
+
+            '<div class="rg-sync-error-banner' + (workerTelemetry.lastError ? '' : ' hidden') + '" id="sync-monitor-error-box" role="alert">' +
+              '<strong>آخر رسالة خطأ:</strong> <span id="sync-monitor-last-error">' + escapeHtml(workerTelemetry.lastError || '') + '</span>' +
+            '</div>' +
+          '</div>' +
+
+          (canManageSettings ? (
+            '<form class="rg-autosync-settings-box" id="auto-sync-settings-form" novalidate>' +
+              '<div class="rg-autosync-settings-head">' +
+                '<div>' +
+                  '<h3 class="rg-autosync-title">إعدادات المزامنة التلقائية <span dir="ltr">(Automatic Sync Settings)</span></h3>' +
+                  '<p class="rg-autosync-subtitle">تحكم مرن بفترة السحب من ثانية واحدة وحتى 12 ساعة · تُحفظ في Neon PostgreSQL وتُطبَّق فوراً لجميع المستخدمين والأجهزة دون إعادة تشغيل.</p>' +
+                '</div>' +
+                '<label class="rg-autosync-toggle" for="set-auto-sync-enabled">' +
+                  '<input type="checkbox" id="set-auto-sync-enabled"' + (autoSyncEnabled ? ' checked' : '') + '>' +
+                  '<span>تفعيل السحب التلقائي</span>' +
+                '</label>' +
+              '</div>' +
+
+              '<div class="rg-autosync-inputs-grid">' +
+                '<div class="form-group">' +
+                  '<label class="form-label" for="set-auto-sync-value">الفترة الزمنية (قيمة مخصصة)</label>' +
+                  '<input class="input tabular-nums" type="number" min="1" step="1" id="set-auto-sync-value" value="' + escapeHtml(autoSyncNorm.value) + '" placeholder="مثال: 15">' +
+                '</div>' +
+                '<div class="form-group">' +
+                  '<label class="form-label" for="set-auto-sync-unit">وحدة الزمن</label>' +
+                  '<select class="select" id="set-auto-sync-unit">' +
+                    '<option value="seconds"' + (autoSyncNorm.unit === 'seconds' ? ' selected' : '') + '>الثواني</option>' +
+                    '<option value="minutes"' + (autoSyncNorm.unit === 'minutes' ? ' selected' : '') + '>الدقائق</option>' +
+                    '<option value="hours"' + (autoSyncNorm.unit === 'hours' ? ' selected' : '') + '>الساعات</option>' +
+                  '</select>' +
+                '</div>' +
+                '<div class="form-group rg-autosync-preview-group">' +
+                  '<span class="form-label">معاينة الجدولة</span>' +
+                  '<div class="rg-autosync-preview-box" id="auto-sync-live-preview">' + escapeHtml(autoSyncBadgeText) + '</div>' +
+                '</div>' +
+              '</div>' +
+
+              '<div class="rg-autosync-presets-wrap">' +
+                '<span class="form-label">اختصارات سريعة (اختياري — يمكن إدخال أي قيمة مخصصة أعلاه)</span>' +
+                '<div class="rg-autosync-presets-row" id="auto-sync-presets-row">' +
+                  autoSyncQuickPresets.map(function (pr) {
+                    var isMatch = Number(autoSyncNorm.value) === Number(pr.value) && autoSyncNorm.unit === pr.unit;
+                    return '<button type="button" class="btn btn-sm auto-sync-preset' + (isMatch ? ' btn-primary' : '') + '" data-value="' + pr.value + '" data-unit="' + pr.unit + '">' + escapeHtml(pr.label) + '</button>';
+                  }).join('') +
+                '</div>' +
+              '</div>' +
+
+              '<div id="auto-sync-validation-msg" class="hidden" role="alert" style="margin-top:8px;"></div>' +
+
+              '<div class="rg-autosync-footer">' +
+                '<span class="rg-autosync-hint">الحد المسموح: من <strong>ثانية واحدة</strong> (1 ثانية) وحتى <strong>12 ساعة</strong> (43,200 ثانية).</span>' +
+                '<button type="submit" class="btn btn-primary" id="btn-save-auto-sync">حفظ إعدادات المزامنة التلقائية</button>' +
+              '</div>' +
+            '</form>'
+          ) : (
+            '<div class="detail-summary-grid" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">' +
+              '<div class="detail-kv"><span class="detail-k">جدولة المزامنة التلقائية</span><span class="detail-v" id="sync-auto-badge-ro">' + escapeHtml(autoSyncBadgeText) + '</span></div>' +
+            '</div>'
+          )) +
+
+          (isGeneralManager && canSync ? (
             '<div class="gm-pull-bar" id="sync-gm-pull-bar" style="margin-bottom:14px;">' +
-              '<span class="gm-pull-label">تخصيص مدة السحب (المدير العام):</span>' +
+              '<span class="gm-pull-label">تخصيص مدة السحب الفوري (المدير العام):</span>' +
               '<select class="select" id="sync-pull-preset" aria-label="مدة السحب">' +
                 pullPresets.map(function (p) {
                   return '<option value="' + p.key + '">' + p.label + '</option>';
@@ -465,12 +624,15 @@
               '</div>' +
             '</div>'
           ) : '') +
-          '<div class="detail-summary-grid" style="margin-bottom:16px;">' +
+
+          '<div class="detail-summary-grid" style="margin-bottom:16px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">' +
             '<div class="detail-kv"><span class="detail-k">حالة توكن Rental Gate</span><span class="detail-v" id="sync-conn-status">' + (isBackendConnected || root.RGApi.isLiveMode() ? (hasRgToken ? 'مضبوط ومربوط في الخادم' : 'غير مضبوط في متغيرات البيئة') : 'وضع المعاينة المحلية') + '</span></div>' +
             '<div class="detail-kv"><span class="detail-k">جدولة التحديث التلقائي</span><span class="detail-v" id="sync-auto-badge">' + escapeHtml(autoSyncBadgeText) + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono" dir="ltr">' + (lastSync ? escapeHtml(formatSettingDateTime(lastSync.finishedAt, ctx)) : 'لم يتم السحب بعد') + '</span></div>' +
-            '<div class="detail-kv"><span class="detail-k">الحجوزات المستوردة / المحدثة / التمديدات</span><span class="detail-v tabular-nums">' + (lastSync ? (lastSync.importedCount + ' مستورد · ' + lastSync.updatedCount + ' محدث · ' + lastSync.extensionsCount + ' تمديد') : '0 / 0 / 0') + '</span></div>' +
+            '<div class="detail-kv"><span class="detail-k">آخر تاريخ سحب</span><span class="detail-v mono" dir="ltr" id="sync-summary-last-pull">' + (lastSync ? escapeHtml(formatSettingDateTime(lastSync.finishedAt, ctx)) : 'لم يتم السحب بعد') + '</span></div>' +
+            '<div class="detail-kv"><span class="detail-k">ملخص آخر سحب (جديد / محدث / تمديد)</span><span class="detail-v tabular-nums" id="sync-summary-counts">' + (lastSync ? (lastSync.importedCount + ' جديد · ' + lastSync.updatedCount + ' محدث · ' + lastSync.extensionsCount + ' تمديد') : '0 / 0 / 0') + '</span></div>' +
           '</div>' +
+
+          '<div id="sync-reconciliation-host">' +
           (function () {
             var rec = syncData.lastReconciliation;
             if (!rec || typeof rec !== 'object') return '';
@@ -543,8 +705,10 @@
               retryActionHtml +
             '</div>';
           })() +
+          '</div>' +
           '<div id="sync-action-msg" class="hidden" style="margin-bottom:14px;"></div>' +
           '<h3 style="margin:0 0 10px;font-size:14.5px;">سجل عمليات السحب (SyncLog)</h3>' +
+          '<div id="sync-log-table-host">' +
           (syncData.logs.length === 0
             ? '<div class="empty-state" style="padding:20px;">لا توجد عمليات مزامنة مسجلة بعد.</div>'
             : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
@@ -566,6 +730,7 @@
                   '</tr>';
                 }).join('') +
               '</tbody></table></div>') +
+          '</div>' +
         '</div>'
       ) : '') +
 
@@ -614,7 +779,7 @@
 
       ((canManageSettings || canManageRoleUiDefaults) ? (
         '<form class="surface-card" id="sys-settings-form">' +
-          '<div class="section-header"><div><h2 class="section-title">' + (canManageSettings ? (t('nav_settings') + ' العامة والتحديث التلقائي') : 'تخصيص الواجهة وإظهار/إخفاء الأقسام') + '</h2><p class="section-subtitle">' + (canManageSettings ? 'تُحفظ الإعدادات مركزيًا وتُحدّث مؤقت Apps Script تلقائيًا.' : 'إدارة ظهور وإخفاء الأقسام والأزرار وإعدادات كل دور.') + '</p></div>' +
+          '<div class="section-header"><div><h2 class="section-title">' + (canManageSettings ? (t('nav_settings') + ' العامة وتخصيص الواجهة') : 'تخصيص الواجهة وإظهار/إخفاء الأقسام') + '</h2><p class="section-subtitle">' + (canManageSettings ? 'تُحفظ الإعدادات مركزيًا وتُعمَّم على كافة المستخدمين، بينما يتم ضبط مؤقت السحب التلقائي من قسم «إعدادات المزامنة التلقائية» أعلاه.' : 'إدارة ظهور وإخفاء الأقسام والأزرار وإعدادات كل دور.') + '</p></div>' +
             (canCustomizeUi && !isDeveloperUser ? '<button type="button" class="btn btn-sm" id="btn-dev-open-sections">تخصيص الأقسام والواجهة لكل موظف</button>' : '') +
           '</div>' +
           (canManageSettings ? (
@@ -623,38 +788,6 @@
               '<div class="form-group"><label class="form-label" for="set-ttl">مدة صلاحية الجلسة (ساعات)</label><input class="input tabular-nums" type="number" min="1" max="168" id="set-ttl" value="' + (settings.session_ttl_hours || 24) + '"></div>' +
               '<div class="form-group"><label class="form-label" for="set-excluded">الحالات المستبعدة أثناء السحب (مفصولة بفاصلة — لا يشمل الملغي أو المرفوض)</label><input class="input mono" id="set-excluded" value="' + escapeHtml(Array.isArray(settings.excluded_statuses) ? settings.excluded_statuses.filter(function (s) { return !(root.RGCrmCore && ((root.RGCrmCore.isRejectedStatus && root.RGCrmCore.isRejectedStatus(s)) || (root.RGCrmCore.isCancelledStatus && root.RGCrmCore.isCancelledStatus(s)))); }).join(', ') : 'draft, test, abandoned') + '"></div>' +
               '<div class="form-group" style="justify-content:center;"><label class="checkbox-item"><input type="checkbox" id="set-agent-all"' + (settings.allow_agent_view_all ? ' checked' : '') + '> السماح لموظف خدمة العملاء باستعراض جميع الحجوزات</label></div>' +
-            '</div>' +
-
-            '<div style="margin-top:16px;padding:14px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
-              '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">' +
-                '<div><strong style="font-size:14px;">إعدادات التحديث التلقائي من Rental Gate API</strong>' +
-                '<div style="font-size:12px;color:var(--text-muted);">يعمل تلقائيًا كل 12 ساعة افتراضيًا عبر Trigger في Google Apps Script، ويمكنك تعديل الفترة بالساعات والدقائق هنا.</div></div>' +
-                '<label class="checkbox-item" style="font-weight:700;"><input type="checkbox" id="set-auto-sync-enabled"' + (autoSyncEnabled ? ' checked' : '') + '> تفعيل التحديث التلقائي</label>' +
-              '</div>' +
-              '<div class="form-grid-2" style="align-items:end;">' +
-                '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">' +
-                  '<div class="form-group">' +
-                    '<label class="form-label" for="set-auto-sync-hours">فترة التحديث (الساعات)</label>' +
-                    '<input class="input tabular-nums" type="number" min="0" max="168" id="set-auto-sync-hours" value="' + autoSyncHours + '">' +
-                  '</div>' +
-                  '<div class="form-group">' +
-                    '<label class="form-label" for="set-auto-sync-minutes">فترة التحديث (الدقائق)</label>' +
-                    '<input class="input tabular-nums" type="number" min="0" max="59" id="set-auto-sync-minutes" value="' + autoSyncMinutes + '">' +
-                  '</div>' +
-                '</div>' +
-                '<div class="form-group">' +
-                  '<span class="form-label">اختيارات سريعة</span>' +
-                  '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 5 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="5">كل 5 دقائق</button>' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 15 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="15">كل 15 دقيقة</button>' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 0 && autoSyncMinutes === 30 ? ' btn-primary' : '') + '" data-hours="0" data-minutes="30">كل 30 دقيقة</button>' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 1 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="1" data-minutes="0">كل ساعة</button>' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 6 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="6" data-minutes="0">كل 6 ساعات</button>' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 12 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="12" data-minutes="0">كل 12 ساعة (الافتراضي)</button>' +
-                    '<button type="button" class="btn btn-sm auto-sync-preset' + (autoSyncHours === 24 && autoSyncMinutes === 0 ? ' btn-primary' : '') + '" data-hours="24" data-minutes="0">كل 24 ساعة</button>' +
-                  '</div>' +
-                '</div>' +
-              '</div>' +
             '</div>'
           ) : '') +
 
@@ -738,7 +871,7 @@
 
           '<div style="margin-top:14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-              '<button type="submit" class="btn btn-primary" id="btn-save-sys-settings">' + (canManageSettings ? 'حفظ الإعدادات وتحديث المزامنة التلقائية' : 'حفظ تخصيصات الواجهة والأدوار') + '</button>' +
+              '<button type="submit" class="btn btn-primary" id="btn-save-sys-settings">' + (canManageSettings ? 'حفظ الإعدادات العامة والواجهة' : 'حفظ تخصيصات الواجهة والأدوار') + '</button>' +
               (canPreviewSettings
                 ? '<button type="button" class="btn rg-preview-inline-btn" id="btn-preview-role-defaults">👁️ معاينة النظام بدور: موظف خدمة العملاء</button>'
                 : '') +
@@ -1082,6 +1215,197 @@
       document.addEventListener('rg:syncdiagupdate', onSyncDiagUpdate);
     }
 
+    var monitorState = {
+      status: workerTelemetry.status || 'running',
+      isSyncing: Boolean(workerTelemetry.isSyncing),
+      autoSyncEnabled: Boolean(autoSyncEnabled),
+      intervalSeconds: Number(workerTelemetry.intervalSeconds || autoSyncNorm.intervalSeconds || 43200),
+      lastRunAt: workerTelemetry.lastRunAt || '',
+      nextRunAt: autoSyncEnabled ? (workerTelemetry.nextRunAt || '') : '',
+      lastDurationMs: Number(workerTelemetry.lastDurationMs || 0),
+      importedCount: Number(workerTelemetry.importedCount || 0),
+      updatedCount: Number(workerTelemetry.updatedCount || 0),
+      extensionsCount: Number(workerTelemetry.extensionsCount || 0),
+      errorCount: Number(workerTelemetry.errorCount || 0),
+      consecutiveErrors: Number(workerTelemetry.consecutiveErrors || 0),
+      lastError: String(workerTelemetry.lastError || '')
+    };
+
+    function formatCountdownDisplay(targetIso) {
+      if (!targetIso) return 'متوقف';
+      var ts = Date.parse(String(targetIso));
+      if (!isFinite(ts)) return '-';
+      var diffSec = Math.ceil((ts - Date.now()) / 1000);
+      if (monitorState.isSyncing && diffSec <= 0) return 'جاري السحب...';
+      if (diffSec <= 0) return 'خلال ثوانٍ';
+      if (diffSec < 60) return 'بعد ' + diffSec + ' ث';
+      var hrs = Math.floor(diffSec / 3600);
+      var mins = Math.floor((diffSec % 3600) / 60);
+      var secs = diffSec % 60;
+      if (hrs > 0) {
+        return 'بعد ' + String(hrs).padStart(2, '0') + ':' + String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+      }
+      return 'بعد ' + String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+    }
+
+    function updateCountdownNode() {
+      var countdownEl = document.getElementById('sync-monitor-countdown');
+      if (!countdownEl) return;
+      if (!monitorState.autoSyncEnabled || !monitorState.nextRunAt) {
+        countdownEl.textContent = 'متوقف';
+        return;
+      }
+      countdownEl.textContent = formatCountdownDisplay(monitorState.nextRunAt);
+    }
+
+    if (container._rgAutoSyncTimerId) {
+      clearInterval(container._rgAutoSyncTimerId);
+      container._rgAutoSyncTimerId = null;
+    }
+    updateCountdownNode();
+    container._rgAutoSyncTimerId = setInterval(function () {
+      if (!container || !container.isConnected) {
+        clearInterval(container._rgAutoSyncTimerId);
+        container._rgAutoSyncTimerId = null;
+        return;
+      }
+      updateCountdownNode();
+    }, 1000);
+
+    function renderSyncLogsTableHtml(logsList) {
+      var list = Array.isArray(logsList) ? logsList : [];
+      if (!list.length) {
+        return '<div class="empty-state" style="padding:20px;">لا توجد عمليات مزامنة مسجلة بعد.</div>';
+      }
+      return '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+        '<th>المعرف</th><th>المنفذ</th><th>الحالة</th><th>مستورد</th><th>محدث</th><th>تمديدات</th><th>الصفحات</th><th>الرسالة</th><th>التوقيت</th>' +
+      '</tr></thead><tbody>' +
+        list.map(function (l) {
+          var stCls = l.status === 'success' ? 'status-success' : (l.status === 'partial' ? 'status-warning' : 'status-danger');
+          var stText = l.status === 'success' ? 'ناجح' : (l.status === 'partial' ? 'غير مكتمل' : 'فشل');
+          return '<tr>' +
+            '<td class="mono">' + escapeHtml(l.id) + '</td>' +
+            '<td>' + escapeHtml(l.triggeredByName || '') + '</td>' +
+            '<td><span class="status-tag ' + stCls + '">' + stText + '</span></td>' +
+            '<td class="tabular-nums">' + Number(l.importedCount || 0) + '</td>' +
+            '<td class="tabular-nums">' + Number(l.updatedCount || 0) + '</td>' +
+            '<td class="tabular-nums">' + Number(l.extensionsCount || 0) + '</td>' +
+            '<td class="tabular-nums">' + Number(l.pagesFetched || 0) + '</td>' +
+            '<td>' + escapeHtml(l.errorMessage || '-') + '</td>' +
+            '<td class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(l.finishedAt, ctx)) + '</td>' +
+          '</tr>';
+        }).join('') +
+      '</tbody></table></div>';
+    }
+
+    function updateSyncMonitorDom(workerPatch, fullSyncPayload) {
+      if (workerPatch && typeof workerPatch === 'object') {
+        if (workerPatch.status !== undefined) monitorState.status = workerPatch.status;
+        if (workerPatch.isSyncing !== undefined) monitorState.isSyncing = Boolean(workerPatch.isSyncing);
+        if (workerPatch.autoSyncEnabled !== undefined) monitorState.autoSyncEnabled = Boolean(workerPatch.autoSyncEnabled);
+        if (workerPatch.intervalSeconds !== undefined) monitorState.intervalSeconds = Number(workerPatch.intervalSeconds || monitorState.intervalSeconds);
+        if (workerPatch.lastRunAt !== undefined) monitorState.lastRunAt = workerPatch.lastRunAt || '';
+        if (workerPatch.nextRunAt !== undefined) monitorState.nextRunAt = workerPatch.nextRunAt || '';
+        if (workerPatch.lastDurationMs !== undefined) monitorState.lastDurationMs = Number(workerPatch.lastDurationMs || 0);
+        if (workerPatch.importedCount !== undefined) monitorState.importedCount = Number(workerPatch.importedCount || 0);
+        if (workerPatch.updatedCount !== undefined) monitorState.updatedCount = Number(workerPatch.updatedCount || 0);
+        if (workerPatch.extensionsCount !== undefined) monitorState.extensionsCount = Number(workerPatch.extensionsCount || 0);
+        if (workerPatch.errorCount !== undefined) monitorState.errorCount = Number(workerPatch.errorCount || 0);
+        if (workerPatch.consecutiveErrors !== undefined) monitorState.consecutiveErrors = Number(workerPatch.consecutiveErrors || 0);
+        if (workerPatch.lastError !== undefined) monitorState.lastError = String(workerPatch.lastError || '');
+      }
+      if (!monitorState.autoSyncEnabled) {
+        monitorState.status = 'stopped';
+        monitorState.nextRunAt = '';
+      } else if (!monitorState.status || monitorState.status === 'stopped') {
+        monitorState.status = (monitorState.consecutiveErrors > 0 && monitorState.lastError) ? 'error' : 'running';
+      }
+
+      var statusBadge = document.getElementById('sync-monitor-status-badge');
+      var activePill = document.getElementById('sync-monitor-active-pill');
+      var stateTextEl = document.getElementById('sync-monitor-state-text');
+      var intervalEl = document.getElementById('sync-monitor-interval');
+      var lastRunEl = document.getElementById('sync-monitor-last-run');
+      var nextRunWrap = document.getElementById('sync-monitor-next-run');
+      var importedEl = document.getElementById('sync-monitor-imported');
+      var updatedEl = document.getElementById('sync-monitor-updated');
+      var extensionsEl = document.getElementById('sync-monitor-extensions');
+      var errDurEl = document.getElementById('sync-monitor-errors-duration');
+      var errBoxEl = document.getElementById('sync-monitor-error-box');
+      var errTextEl = document.getElementById('sync-monitor-last-error');
+      var autoBadgeEl = document.getElementById('sync-auto-badge');
+      var sumLastPullEl = document.getElementById('sync-summary-last-pull');
+      var sumCountsEl = document.getElementById('sync-summary-counts');
+
+      if (statusBadge) {
+        statusBadge.className = 'status-tag ' + (monitorState.status === 'stopped' ? 'status-warning' : (monitorState.status === 'error' ? 'status-danger' : 'status-success'));
+        statusBadge.textContent = monitorState.status === 'stopped' ? 'متوقف' : (monitorState.status === 'error' ? 'خطأ' : 'يعمل');
+      }
+      if (activePill) {
+        activePill.classList.toggle('hidden', !monitorState.isSyncing);
+      }
+      if (stateTextEl) {
+        stateTextEl.textContent = monitorState.status === 'stopped'
+          ? 'متوقف'
+          : (monitorState.status === 'error' ? 'خطأ — إعادة محاولة مجدولة' : 'يعمل تلقائياً');
+      }
+      var ivLabel = formatIntervalSecondsAr(monitorState.intervalSeconds);
+      if (intervalEl) intervalEl.textContent = ivLabel;
+      if (autoBadgeEl) autoBadgeEl.textContent = monitorState.autoSyncEnabled ? ('مفعل — ' + ivLabel) : 'متوقف حاليًا';
+      if (lastRunEl) {
+        lastRunEl.textContent = monitorState.lastRunAt ? formatSettingDateTime(monitorState.lastRunAt, ctx) : 'لم يتم السحب بعد';
+      }
+      if (nextRunWrap) {
+        if (monitorState.autoSyncEnabled && monitorState.nextRunAt) {
+          nextRunWrap.innerHTML =
+            '<span id="sync-monitor-countdown" class="mono rg-sync-countdown-main" dir="ltr">' + escapeHtml(formatCountdownDisplay(monitorState.nextRunAt)) + '</span>' +
+            '<span class="rg-sync-next-ts mono" dir="ltr">' + escapeHtml(formatSettingDateTime(monitorState.nextRunAt, ctx)) + '</span>';
+        } else {
+          nextRunWrap.textContent = 'متوقف';
+        }
+      }
+      if (importedEl) importedEl.textContent = String(monitorState.importedCount);
+      if (updatedEl) updatedEl.textContent = String(monitorState.updatedCount);
+      if (extensionsEl) extensionsEl.textContent = String(monitorState.extensionsCount);
+      if (errDurEl) {
+        errDurEl.textContent = monitorState.errorCount + ' خطأ · ' +
+          (monitorState.lastDurationMs > 0 ? ((monitorState.lastDurationMs / 1000).toFixed(1) + ' ث') : '-');
+      }
+      if (errBoxEl && errTextEl) {
+        errTextEl.textContent = monitorState.lastError || '';
+        errBoxEl.classList.toggle('hidden', !monitorState.lastError);
+      }
+
+      if (fullSyncPayload && typeof fullSyncPayload === 'object') {
+        var latestLog = fullSyncPayload.lastSync || (Array.isArray(fullSyncPayload.logs) && fullSyncPayload.logs[0]) || null;
+        if (sumLastPullEl && latestLog) {
+          sumLastPullEl.textContent = formatSettingDateTime(latestLog.finishedAt, ctx);
+        }
+        if (sumCountsEl && latestLog) {
+          sumCountsEl.textContent = Number(latestLog.importedCount || 0) + ' جديد · ' + Number(latestLog.updatedCount || 0) + ' محدث · ' + Number(latestLog.extensionsCount || 0) + ' تمديد';
+        }
+        var logsHost = document.getElementById('sync-log-table-host');
+        if (logsHost && Array.isArray(fullSyncPayload.logs)) {
+          logsHost.innerHTML = renderSyncLogsTableHtml(fullSyncPayload.logs);
+        }
+      }
+    }
+
+    var monitorRefreshInFlight = null;
+    var monitorRefreshTimer = null;
+    function refreshSyncMonitorFromServer() {
+      if (!canSync) return Promise.resolve();
+      if (monitorRefreshInFlight) return monitorRefreshInFlight;
+      monitorRefreshInFlight = root.RGApi.callApi('getSyncStatus', { forceRefresh: true }).then(function (sRes) {
+        if (sRes && sRes.success && sRes.data && container && container.isConnected) {
+          updateSyncMonitorDom(sRes.data.worker || sRes.data, sRes.data);
+        }
+      }).catch(function () {}).finally(function () {
+        monitorRefreshInFlight = null;
+      });
+      return monitorRefreshInFlight;
+    }
+
     if (!container._rgSettingsDeltaBound) {
       container._rgSettingsDeltaBound = true;
       var onSettingsDeltaSync = function (ev) {
@@ -1090,11 +1414,29 @@
           return;
         }
         var d = (ev && ev.detail) || {};
+        if (d.syncWorkerState && typeof d.syncWorkerState === 'object') {
+          updateSyncMonitorDom(d.syncWorkerState, null);
+        }
+        var hasMonitorDelta = Boolean(
+          d.syncStatusChanged ||
+          d.syncWorkerState ||
+          (Array.isArray(d.changedReservations) && d.changedReservations.length > 0)
+        );
+        if (hasMonitorDelta && !(d.changedSettings || d.changedRoles || d.changedDelegations || d.deletedAllReservationsBefore)) {
+          if (monitorRefreshTimer) clearTimeout(monitorRefreshTimer);
+          monitorRefreshTimer = setTimeout(function () {
+            refreshSyncMonitorFromServer();
+          }, 250);
+          return;
+        }
         if (!(d.changedSettings || d.changedRoles || d.changedDelegations || d.deletedAllReservationsBefore)) return;
         var modalRoot = document.getElementById('modal-root');
         if (modalRoot && modalRoot.firstElementChild) return;
         var activeEl = document.activeElement;
-        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) return;
+        if (activeEl && container.contains(activeEl) && /^(INPUT|TEXTAREA|SELECT)$/.test(activeEl.tagName)) {
+          if (hasMonitorDelta) refreshSyncMonitorFromServer();
+          return;
+        }
         render(container, ctx).catch(function () {});
       };
       document.addEventListener('rg:deltasync', onSettingsDeltaSync);
@@ -1279,7 +1621,22 @@
                 : '';
               ctx.toast('اكتملت المزامنة والتحقق بنجاح: ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + overlapHint + diagHint);
             }
-            render(container, ctx);
+            if (syncNowBtn.isConnected !== false) syncNowBtn.textContent = prevText;
+            var autoUnsavedDirty = Boolean(
+              typeof captureAutoSyncSnapshot === 'function' &&
+              autoSyncForm &&
+              captureAutoSyncSnapshot() !== initialAutoSyncSnapshot
+            );
+            var sysUnsavedDirty = Boolean(
+              typeof captureSysSnapshot === 'function' &&
+              sysForm &&
+              captureSysSnapshot() !== initialSysSnapshot
+            );
+            if (autoUnsavedDirty || sysUnsavedDirty) {
+              await refreshSyncMonitorFromServer();
+            } else {
+              render(container, ctx);
+            }
           } else {
             var msg = document.getElementById('sync-action-msg');
             if (msg) {
@@ -1316,19 +1673,93 @@
       });
     }
 
+    var autoSyncForm = document.getElementById('auto-sync-settings-form');
+    var autoEnabledInput = document.getElementById('set-auto-sync-enabled');
+    var autoValueInput = document.getElementById('set-auto-sync-value');
+    var autoUnitSelect = document.getElementById('set-auto-sync-unit');
+    var autoPreviewEl = document.getElementById('auto-sync-live-preview');
+    var autoValidationMsgEl = document.getElementById('auto-sync-validation-msg');
+
+    function validateAutoSyncFormInputs(showErrorMsg) {
+      var isEn = autoEnabledInput ? Boolean(autoEnabledInput.checked) : true;
+      var rawVal = autoValueInput ? autoValueInput.value : '';
+      var rawUnit = autoUnitSelect ? autoUnitSelect.value : 'seconds';
+      var check = (root.RGCrmCore && root.RGCrmCore.validateAutoSyncInterval)
+        ? root.RGCrmCore.validateAutoSyncInterval({ value: rawVal, unit: rawUnit })
+        : (function () {
+            var n = Number(rawVal);
+            var mult = rawUnit === 'hours' ? 3600 : (rawUnit === 'minutes' ? 60 : 1);
+            var sec = n * mult;
+            if (!isFinite(n) || rawVal === '' || sec < 1) {
+              return { valid: false, error: 'الحد الأدنى للفترة الزمنية للمزامنة التلقائية هو ثانية واحدة (1 ثانية).', intervalSeconds: 1, value: n, unit: rawUnit, hours: 0, minutes: 1 };
+            }
+            if (sec > 43200) {
+              return { valid: false, error: 'الحد الأقصى للفترة الزمنية للمزامنة التلقائية هو 12 ساعة (43,200 ثانية).', intervalSeconds: 43200, value: n, unit: rawUnit, hours: 12, minutes: 0 };
+            }
+            var rSec = Math.round(sec);
+            var tMin = Math.max(1, Math.round(rSec / 60));
+            return { valid: true, error: '', intervalSeconds: rSec, value: n, unit: rawUnit, hours: Math.floor(tMin / 60), minutes: tMin % 60 };
+          })();
+
+      container.querySelectorAll('.auto-sync-preset').forEach(function (b) {
+        var bVal = Number(b.getAttribute('data-value') || 0);
+        var bUnit = b.getAttribute('data-unit') || 'seconds';
+        b.classList.toggle('btn-primary', check.valid && Number(rawVal) === bVal && rawUnit === bUnit);
+      });
+
+      if (autoPreviewEl) {
+        if (!check.valid) {
+          autoPreviewEl.textContent = 'قيمة غير صالحة (المسموح: 1 ثانية – 12 ساعة)';
+          autoPreviewEl.classList.add('is-invalid');
+        } else {
+          autoPreviewEl.classList.remove('is-invalid');
+          autoPreviewEl.textContent = isEn ? ('مفعل — ' + formatIntervalSecondsAr(check.intervalSeconds)) : ('متوقف (' + formatIntervalSecondsAr(check.intervalSeconds) + ')');
+        }
+      }
+
+      if (autoValidationMsgEl) {
+        if (!check.valid && showErrorMsg) {
+          autoValidationMsgEl.className = 'form-error';
+          autoValidationMsgEl.textContent = check.error;
+        } else {
+          autoValidationMsgEl.className = 'hidden';
+          autoValidationMsgEl.textContent = '';
+        }
+      }
+
+      return Object.assign({ enabled: isEn }, check);
+    }
+
     container.querySelectorAll('.auto-sync-preset').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        var inpH = document.getElementById('set-auto-sync-hours');
-        var inpM = document.getElementById('set-auto-sync-minutes');
-        var chk = document.getElementById('set-auto-sync-enabled');
-        if (inpH) inpH.value = btn.getAttribute('data-hours') || '0';
-        if (inpM) inpM.value = btn.getAttribute('data-minutes') || '0';
-        if (chk) chk.checked = true;
-        container.querySelectorAll('.auto-sync-preset').forEach(function (b) {
-          b.classList.toggle('btn-primary', b === btn);
-        });
+        var pVal = btn.getAttribute('data-value') || '1';
+        var pUnit = btn.getAttribute('data-unit') || 'seconds';
+        if (autoValueInput) autoValueInput.value = pVal;
+        if (autoUnitSelect) autoUnitSelect.value = pUnit;
+        if (autoEnabledInput) autoEnabledInput.checked = true;
+        validateAutoSyncFormInputs(false);
       });
     });
+
+    if (autoEnabledInput) {
+      autoEnabledInput.addEventListener('change', function () {
+        validateAutoSyncFormInputs(false);
+      });
+    }
+    if (autoValueInput) {
+      autoValueInput.addEventListener('input', function () {
+        var v = validateAutoSyncFormInputs(false);
+        if (!v.valid && autoValidationMsgEl) {
+          autoValidationMsgEl.className = 'form-error';
+          autoValidationMsgEl.textContent = v.error;
+        }
+      });
+    }
+    if (autoUnitSelect) {
+      autoUnitSelect.addEventListener('change', function () {
+        validateAutoSyncFormInputs(true);
+      });
+    }
 
     var uiPresetSelect = document.getElementById('set-ui-preset');
     var uiFlagEls = Array.prototype.slice.call(container.querySelectorAll('.ui-simp-flag'));
@@ -1770,22 +2201,6 @@
         return false;
       }
 
-      var hoursEl = document.getElementById('set-auto-sync-hours');
-      var minutesEl = document.getElementById('set-auto-sync-minutes');
-      var rawHours = Number(hoursEl && hoursEl.value !== '' ? hoursEl.value : 0);
-      var rawMinutes = Number(minutesEl && minutesEl.value !== '' ? minutesEl.value : 0);
-      var autoEnabled = Boolean((document.getElementById('set-auto-sync-enabled') || {}).checked);
-
-      if (autoEnabled && (!isFinite(rawHours) || rawHours <= 0) && (!isFinite(rawMinutes) || rawMinutes <= 0)) {
-        ctx.toast('يرجى تحديد مدة لا تقل عن دقيقة واحدة للتحديث التلقائي.', true);
-        if (minutesEl) minutesEl.focus();
-        return false;
-      }
-
-      var normInterval = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncInterval)
-        ? root.RGCrmCore.normalizeAutoSyncInterval(rawHours, rawMinutes)
-        : { hours: Math.max(0, Math.min(168, Math.round(rawHours || 0))), minutes: Math.max(0, Math.min(59, Math.round(rawMinutes || 0))) };
-
       var excluded = (document.getElementById('set-excluded').value || '').split(',').map(function (s) { return s.trim(); }).filter(function (s) {
         if (!s) return false;
         if (root.RGCrmCore && ((root.RGCrmCore.isRejectedStatus && root.RGCrmCore.isRejectedStatus(s)) || (root.RGCrmCore.isCancelledStatus && root.RGCrmCore.isCancelledStatus(s)))) {
@@ -1801,7 +2216,7 @@
       else if (root.RGApp && root.RGApp.applyUiSimplification) root.RGApp.applyUiSimplification(normUiSimp);
 
       clearSettingsUnsavedGuard();
-      ctx.toast('تم حفظ الإعدادات وإعدادات الأدوار وتحديث المزامنة التلقائية (' + (autoEnabled ? formatIntervalAr(normInterval.hours, normInterval.minutes) : 'متوقف') + ').');
+      ctx.toast('تم حفظ الإعدادات العامة وتخصيصات الواجهة والأدوار بنجاح.');
 
       var res = await root.RGApi.callApi('updateSettings', {
         _keepOptimisticCache: true,
@@ -1810,9 +2225,6 @@
         session_ttl_hours: Number(document.getElementById('set-ttl').value || 24),
         excluded_statuses: excluded,
         allow_agent_view_all: document.getElementById('set-agent-all').checked,
-        auto_sync_enabled: autoEnabled,
-        auto_sync_interval_hours: normInterval.hours,
-        auto_sync_interval_minutes: normInterval.minutes,
         ui_simplification: normUiSimp,
         role_ui_defaults: normRoleDefaults
       });
@@ -1837,6 +2249,74 @@
       }
       ctx.toast(res.message, true);
       return false;
+    }
+
+    async function saveAutoSyncSettingsCore(skipReload) {
+      var check = validateAutoSyncFormInputs(true);
+      if (!check.valid) {
+        ctx.toast(check.error, true);
+        if (autoValueInput) autoValueInput.focus();
+        return false;
+      }
+
+      var saveAutoBtn = document.getElementById('btn-save-auto-sync');
+      var prevBtnTxt = saveAutoBtn ? saveAutoBtn.textContent : '';
+      if (saveAutoBtn) saveAutoBtn.textContent = 'جاري الحفظ والتطبيق...';
+
+      try {
+        var res = await root.RGApi.callApi('updateSettings', {
+          _spamChecked: true,
+          auto_sync_enabled: check.enabled,
+          auto_sync_interval_seconds: check.intervalSeconds,
+          auto_sync_interval_value: check.value,
+          auto_sync_interval_unit: check.unit,
+          auto_sync_interval_hours: check.hours,
+          auto_sync_interval_minutes: check.minutes
+        });
+        if (!res || !res.success) {
+          var errMsg = (res && res.message) || 'تعذر حفظ إعدادات المزامنة التلقائية.';
+          if (autoValidationMsgEl) {
+            autoValidationMsgEl.className = 'form-error';
+            autoValidationMsgEl.textContent = errMsg.replace(/^VALIDATION_ERROR:\s*/i, '');
+          }
+          ctx.toast(errMsg, true);
+          return false;
+        }
+        initialAutoSyncSnapshot = captureAutoSyncSnapshot();
+        var nextWorkerPatch = (res.data && res.data.syncWorkerState) ? res.data.syncWorkerState : {
+          autoSyncEnabled: check.enabled,
+          intervalSeconds: check.intervalSeconds,
+          status: check.enabled ? (monitorState.consecutiveErrors > 0 && monitorState.lastError ? 'error' : 'running') : 'stopped',
+          nextRunAt: check.enabled ? new Date(Date.now() + check.intervalSeconds * 1000).toISOString() : ''
+        };
+        updateSyncMonitorDom(nextWorkerPatch, null);
+        if (autoValidationMsgEl) {
+          autoValidationMsgEl.className = 'form-success';
+          autoValidationMsgEl.textContent = check.enabled
+            ? ('تم حفظ المزامنة التلقائية وتطبيقها فوراً (' + formatIntervalSecondsAr(check.intervalSeconds) + ').')
+            : 'تم إيقاف المزامنة التلقائية وتطبيق التغيير فوراً لجميع المستخدمين.';
+        }
+        ctx.toast(check.enabled
+          ? ('تم حفظ وتطبيق المزامنة التلقائية فوراً (' + formatIntervalSecondsAr(check.intervalSeconds) + ').')
+          : 'تم إيقاف المزامنة التلقائية وحفظ الإعداد في قاعدة البيانات.');
+        await refreshSyncMonitorFromServer();
+        if (!skipReload && !captureSysSnapshotDirty()) {
+          // Keep in-place smoothly without form flash
+        }
+        return true;
+      } finally {
+        if (saveAutoBtn && saveAutoBtn.isConnected !== false) saveAutoBtn.textContent = prevBtnTxt;
+      }
+    }
+
+    if (autoSyncForm) {
+      autoSyncForm.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var saveAutoBtn = document.getElementById('btn-save-auto-sync');
+        runWithLock(saveAutoBtn, 'updateAutoSyncSettings', function () {
+          return saveAutoSyncSettingsCore(true);
+        });
+      });
     }
 
     var sysForm = document.getElementById('sys-settings-form');
@@ -1923,6 +2403,14 @@
       });
     }
 
+    function captureAutoSyncSnapshot() {
+      if (!autoSyncForm) return '';
+      return JSON.stringify({
+        autoEnabled: Boolean(autoEnabledInput && autoEnabledInput.checked),
+        autoValue: autoValueInput ? String(autoValueInput.value || '') : '',
+        autoUnit: autoUnitSelect ? String(autoUnitSelect.value || 'seconds') : 'seconds'
+      });
+    }
     function captureSysSnapshot() {
       if (!sysForm) return '';
       var uiFlags = {};
@@ -1935,13 +2423,13 @@
         ttl: (document.getElementById('set-ttl') || {}).value || '',
         excluded: (document.getElementById('set-excluded') || {}).value || '',
         agentAll: Boolean((document.getElementById('set-agent-all') || {}).checked),
-        autoEnabled: Boolean((document.getElementById('set-auto-sync-enabled') || {}).checked),
-        autoHours: (document.getElementById('set-auto-sync-hours') || {}).value || '0',
-        autoMinutes: (document.getElementById('set-auto-sync-minutes') || {}).value || '0',
         uiPreset: uiPresetSelect ? uiPresetSelect.value : 'full',
         uiFlags: uiFlags,
         roleUiDefaults: roleUiDefaultsDraft
       });
+    }
+    function captureSysSnapshotDirty() {
+      return Boolean(sysForm && captureSysSnapshot() !== initialSysSnapshot);
     }
     function captureHoSnapshot() {
       if (!hoForm) return '';
@@ -1957,6 +2445,7 @@
         notes: Boolean((document.getElementById('ho-inc-notes') || {}).checked)
       });
     }
+    var initialAutoSyncSnapshot = captureAutoSyncSnapshot();
     var initialSysSnapshot = captureSysSnapshot();
     var initialHoSnapshot = captureHoSnapshot();
 
@@ -1967,12 +2456,18 @@
           if (!container || !container.isConnected) return false;
           var tokEl = document.getElementById('set-rg-token');
           if (tokEl && String(tokEl.value || '').trim().length > 0) return true;
+          if (autoSyncForm && captureAutoSyncSnapshot() !== initialAutoSyncSnapshot) return true;
           if (sysForm && captureSysSnapshot() !== initialSysSnapshot) return true;
           if (hoForm && captureHoSnapshot() !== initialHoSnapshot) return true;
           return false;
         },
         onSave: async function () {
           var ok = true;
+          if (autoSyncForm && captureAutoSyncSnapshot() !== initialAutoSyncSnapshot) {
+            ok = await saveAutoSyncSettingsCore(true);
+            if (!ok) return false;
+            initialAutoSyncSnapshot = captureAutoSyncSnapshot();
+          }
           if (sysForm && captureSysSnapshot() !== initialSysSnapshot) {
             ok = await saveSystemSettingsCore(true);
             if (!ok) return false;

@@ -8,6 +8,7 @@ import healthHandler from './api/health.js';
 import syncHandler from './api/sync.js';
 import versionHandler from './api/version.js';
 import { requireAuth } from './backend/auth.js';
+import { startAutoSyncWorker, stopAutoSyncWorker } from './backend/autoSyncWorker.js';
 import { createPgExecutor, ensureSchemaInitialized, getDatabaseUrl, isDatabaseConfigured } from './backend/db.js';
 import { ensurePgRealtimeListener, subscribeCrmEvents } from './backend/realtime.js';
 import { attachAppVersionHeaders } from './backend/versionManifest.js';
@@ -364,11 +365,19 @@ async function startServer() {
 
   if (isDatabaseConfigured()) {
     ensurePgRealtimeListener(getDatabaseUrl());
+    startAutoSyncWorker({ initialDelayMs: 2000 });
   }
 
-  app.listen(port, '0.0.0.0', () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`RENTAL GATE CRM server listening on http://0.0.0.0:${port}`);
   });
+
+  const shutdown = () => {
+    stopAutoSyncWorker();
+    server.close(() => process.exit(0));
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 startServer().catch((err) => {

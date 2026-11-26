@@ -3863,6 +3863,9 @@
       allow_agent_view_all: true,
       default_language: 'ar',
       auto_sync_enabled: true,
+      auto_sync_interval_seconds: 43200,
+      auto_sync_interval_value: 12,
+      auto_sync_interval_unit: 'hours',
       auto_sync_interval_hours: 12,
       auto_sync_interval_minutes: 0,
       ui_simplification: (root.RGCrmCore && root.RGCrmCore.normalizeUiSimplificationSettings)
@@ -4092,6 +4095,38 @@
         }
         if (parsed.settings.auto_sync_interval_minutes === undefined || parsed.settings.auto_sync_interval_minutes === null || parsed.settings.auto_sync_interval_minutes === '') {
           parsed.settings.auto_sync_interval_minutes = 0;
+          dirty = true;
+        }
+        if (parsed.settings.auto_sync_interval_seconds === undefined || parsed.settings.auto_sync_interval_seconds === null || parsed.settings.auto_sync_interval_seconds === '') {
+          var hydratedNorm = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncIntervalSeconds)
+            ? root.RGCrmCore.normalizeAutoSyncIntervalSeconds(parsed.settings)
+            : { intervalSeconds: 43200, value: 12, unit: 'hours' };
+          parsed.settings.auto_sync_interval_seconds = hydratedNorm.intervalSeconds;
+          parsed.settings.auto_sync_interval_value = hydratedNorm.value;
+          parsed.settings.auto_sync_interval_unit = hydratedNorm.unit;
+          dirty = true;
+        }
+        if (!parsed.syncWorkerState || typeof parsed.syncWorkerState !== 'object') {
+          var initIvSec = Number(parsed.settings.auto_sync_interval_seconds || 43200);
+          parsed.syncWorkerState = {
+            status: parsed.settings.auto_sync_enabled !== false ? 'running' : 'stopped',
+            isSyncing: false,
+            autoSyncEnabled: parsed.settings.auto_sync_enabled !== false,
+            intervalSeconds: initIvSec,
+            intervalValue: Number(parsed.settings.auto_sync_interval_value || 12),
+            intervalUnit: parsed.settings.auto_sync_interval_unit || 'hours',
+            lastRunAt: (parsed.syncLog && parsed.syncLog[0] && parsed.syncLog[0].finishedAt) || '',
+            lastSuccessAt: (parsed.syncLog && parsed.syncLog[0] && parsed.syncLog[0].finishedAt) || '',
+            nextRunAt: parsed.settings.auto_sync_enabled !== false ? new Date(Date.now() + initIvSec * 1000).toISOString() : null,
+            lastDurationMs: (parsed.syncLog && parsed.syncLog[0] && parsed.syncLog[0].durationMs) || 120,
+            importedCount: (parsed.syncLog && parsed.syncLog[0] && parsed.syncLog[0].importedCount) || 0,
+            updatedCount: (parsed.syncLog && parsed.syncLog[0] && parsed.syncLog[0].updatedCount) || 0,
+            extensionsCount: (parsed.syncLog && parsed.syncLog[0] && parsed.syncLog[0].extensionsCount) || 0,
+            errorCount: 0,
+            consecutiveErrors: 0,
+            lastError: '',
+            lastTriggerType: 'auto'
+          };
           dirty = true;
         }
         if (!Array.isArray(parsed.settings.job_role_presets) || parsed.settings.job_role_presets.length === 0) {
@@ -6450,6 +6485,32 @@
           changedReservations: changedReservations
         };
         db.syncLog.unshift(pullSyncRec);
+        var prevWorkerSb = db.syncWorkerState || {};
+        var ivSecSb = Number(db.settings.auto_sync_interval_seconds || 43200);
+        var preservedNextRunAt = (db.settings.auto_sync_enabled !== false)
+          ? (prevWorkerSb.nextRunAt && Date.parse(prevWorkerSb.nextRunAt) > Date.now()
+              ? prevWorkerSb.nextRunAt
+              : new Date(Date.now() + ivSecSb * 1000).toISOString())
+          : null;
+        db.syncWorkerState = Object.assign({}, prevWorkerSb, {
+          status: db.settings.auto_sync_enabled !== false ? 'running' : 'stopped',
+          isSyncing: false,
+          autoSyncEnabled: db.settings.auto_sync_enabled !== false,
+          intervalSeconds: ivSecSb,
+          intervalValue: Number(db.settings.auto_sync_interval_value || 12),
+          intervalUnit: db.settings.auto_sync_interval_unit || 'hours',
+          lastRunAt: pullSyncRec.startedAt,
+          lastSuccessAt: pullSyncRec.finishedAt,
+          nextRunAt: preservedNextRunAt,
+          lastDurationMs: pullSyncRec.durationMs,
+          importedCount: importedCnt,
+          updatedCount: updatedCnt,
+          extensionsCount: extPulledCnt,
+          errorCount: Number(prevWorkerSb.errorCount || 0),
+          consecutiveErrors: 0,
+          lastError: '',
+          lastTriggerType: 'manual'
+        });
         appendSandboxActivity(
           db,
           session.user,
@@ -6459,6 +6520,15 @@
           'سحب الحجوزات: جديد ' + importedCnt + '، محدث ' + updatedCnt + '، تمديدات ' + extPulledCnt + rangeNote
         );
         saveSandboxDb(db);
+        if (typeof document !== 'undefined' && typeof document.dispatchEvent === 'function') {
+          document.dispatchEvent(new CustomEvent('rg:deltasync', {
+            detail: {
+              changedReservations: changedReservations,
+              syncStatusChanged: true,
+              syncWorkerState: db.syncWorkerState
+            }
+          }));
+        }
         return {
           success: true,
           message: 'تم سحب الحجوزات وتحديث الحالات بنجاح.',
@@ -6533,16 +6603,51 @@
           return { success: false, message: 'FORBIDDEN: صلاحيات API مخصصة للمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
         var syncIv = core.normalizeAutoSyncInterval(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
+        var syncSecCfg = core.normalizeAutoSyncIntervalSeconds
+          ? core.normalizeAutoSyncIntervalSeconds(db.settings)
+          : { intervalSeconds: 43200, value: 12, unit: 'hours' };
         var lastLog = db.syncLog[0] || null;
+        var sbWorker = Object.assign({
+          status: db.settings.auto_sync_enabled !== false ? 'running' : 'stopped',
+          isSyncing: false,
+          autoSyncEnabled: db.settings.auto_sync_enabled !== false,
+          intervalSeconds: syncSecCfg.intervalSeconds,
+          intervalValue: syncSecCfg.value,
+          intervalUnit: syncSecCfg.unit,
+          lastRunAt: (lastLog && lastLog.startedAt) || '',
+          lastSuccessAt: (lastLog && lastLog.finishedAt) || '',
+          nextRunAt: db.settings.auto_sync_enabled !== false ? new Date(Date.now() + syncSecCfg.intervalSeconds * 1000).toISOString() : null,
+          lastDurationMs: (lastLog && lastLog.durationMs) || 0,
+          importedCount: (lastLog && lastLog.importedCount) || 0,
+          updatedCount: (lastLog && lastLog.updatedCount) || 0,
+          extensionsCount: (lastLog && lastLog.extensionsCount) || 0,
+          errorCount: 0,
+          consecutiveErrors: 0,
+          lastError: '',
+          lastTriggerType: 'auto'
+        }, db.syncWorkerState || {});
         return {
           success: true,
           message: '',
           data: {
-            hasToken: false,
+            hasToken: Boolean(db.settings.sandbox_has_rg_token),
             mode: 'sandbox',
             autoSyncEnabled: db.settings.auto_sync_enabled !== false,
+            autoSyncIntervalSeconds: syncSecCfg.intervalSeconds,
+            autoSyncIntervalValue: syncSecCfg.value,
+            autoSyncIntervalUnit: syncSecCfg.unit,
             autoSyncIntervalHours: syncIv.hours,
             autoSyncIntervalMinutes: syncIv.minutes,
+            workerStatus: db.settings.auto_sync_enabled !== false ? (sbWorker.consecutiveErrors > 0 && sbWorker.lastError ? 'error' : 'running') : 'stopped',
+            isSyncing: Boolean(sbWorker.isSyncing),
+            lastRunAt: sbWorker.lastRunAt,
+            lastSuccessAt: sbWorker.lastSuccessAt,
+            nextRunAt: db.settings.auto_sync_enabled !== false ? sbWorker.nextRunAt : null,
+            lastDurationMs: sbWorker.lastDurationMs,
+            errorCount: sbWorker.errorCount,
+            consecutiveErrors: sbWorker.consecutiveErrors,
+            lastError: sbWorker.lastError,
+            worker: sbWorker,
             lastSync: lastLog,
             lastReconciliation: (lastLog && lastLog.reconciliation) || {
               totalInSource: db.reservations.length,
@@ -6671,6 +6776,9 @@
           return { success: false, message: 'FORBIDDEN: إعدادات النظام وAPI مخصصة للمبرمج والمدير العام والمشرف فقط.', data: null, error: 'FORBIDDEN' };
         }
         var getIv = core.normalizeAutoSyncInterval(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
+        var getSecIv = core.normalizeAutoSyncIntervalSeconds
+          ? core.normalizeAutoSyncIntervalSeconds(db.settings)
+          : { intervalSeconds: 43200, value: 12, unit: 'hours' };
         return {
           success: true,
           message: '',
@@ -6681,6 +6789,9 @@
             call_wrapup_shortcuts: core.normalizeCallWrapupShortcutsConfig ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts) : { items: core.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
             handover_settings: core.normalizeHandoverSettings(db.settings.handover_settings),
             auto_sync_enabled: db.settings.auto_sync_enabled !== false,
+            auto_sync_interval_seconds: getSecIv.intervalSeconds,
+            auto_sync_interval_value: getSecIv.value,
+            auto_sync_interval_unit: getSecIv.unit,
             auto_sync_interval_hours: getIv.hours,
             auto_sync_interval_minutes: getIv.minutes,
             hasRgToken: Boolean(db.settings.sandbox_has_rg_token)
@@ -6701,6 +6812,9 @@
           payload.role_ui_defaults !== undefined ||
           payload.stats_control_config !== undefined ||
           payload.call_wrapup_shortcuts !== undefined ||
+          payload.auto_sync_interval_seconds !== undefined ||
+          payload.auto_sync_interval_value !== undefined ||
+          payload.auto_sync_interval_unit !== undefined ||
           payload.auto_sync_interval_hours !== undefined ||
           payload.auto_sync_interval_minutes !== undefined
         );
@@ -6716,6 +6830,25 @@
           }
         } else if (!core.canAccessApi(session.user)) {
           return { success: false, message: 'FORBIDDEN: إعدادات تسليم الوردية مخصصة للمشرف والمدير العام فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var hasAutoSyncIvChange = Boolean(
+          payload.auto_sync_interval_seconds !== undefined ||
+          payload.auto_sync_interval_value !== undefined ||
+          payload.auto_sync_interval_unit !== undefined ||
+          payload.auto_sync_interval_hours !== undefined ||
+          payload.auto_sync_interval_minutes !== undefined
+        );
+        if (hasAutoSyncIvChange && core.validateAutoSyncInterval) {
+          var sbValRes = core.validateAutoSyncInterval({
+            value: payload.auto_sync_interval_value,
+            unit: payload.auto_sync_interval_unit,
+            intervalSeconds: payload.auto_sync_interval_seconds,
+            hours: payload.auto_sync_interval_hours,
+            minutes: payload.auto_sync_interval_minutes
+          });
+          if (!sbValRes.valid) {
+            return { success: false, message: 'VALIDATION_ERROR: ' + sbValRes.error, data: null, error: 'VALIDATION_ERROR' };
+          }
         }
         var settingDiffs = [];
         if (payload.company_name && payload.company_name !== db.settings.company_name) {
@@ -6767,15 +6900,40 @@
             });
           }
         }
-        if (payload.auto_sync_interval_hours !== undefined || payload.auto_sync_interval_minutes !== undefined) {
-          var nextIv = core.normalizeAutoSyncInterval(
-            payload.auto_sync_interval_hours !== undefined ? payload.auto_sync_interval_hours : db.settings.auto_sync_interval_hours,
-            payload.auto_sync_interval_minutes !== undefined ? payload.auto_sync_interval_minutes : db.settings.auto_sync_interval_minutes
-          );
-          db.settings.auto_sync_interval_hours = nextIv.hours;
-          db.settings.auto_sync_interval_minutes = nextIv.minutes;
+        if (hasAutoSyncIvChange) {
+          var nextSecCfg = core.validateAutoSyncInterval
+            ? core.validateAutoSyncInterval({
+                value: payload.auto_sync_interval_value,
+                unit: payload.auto_sync_interval_unit,
+                intervalSeconds: payload.auto_sync_interval_seconds,
+                hours: payload.auto_sync_interval_hours,
+                minutes: payload.auto_sync_interval_minutes
+              })
+            : { intervalSeconds: 43200, value: 12, unit: 'hours', hours: 12, minutes: 0 };
+          db.settings.auto_sync_interval_seconds = nextSecCfg.intervalSeconds;
+          db.settings.auto_sync_interval_value = nextSecCfg.value;
+          db.settings.auto_sync_interval_unit = nextSecCfg.unit;
+          db.settings.auto_sync_interval_hours = nextSecCfg.hours;
+          db.settings.auto_sync_interval_minutes = nextSecCfg.minutes;
+        }
+        if (typeof payload.auto_sync_enabled === 'boolean' || hasAutoSyncIvChange) {
+          var curSec = Number(db.settings.auto_sync_interval_seconds || 43200);
+          var curEn = db.settings.auto_sync_enabled !== false;
+          db.syncWorkerState = Object.assign({}, db.syncWorkerState || {}, {
+            status: curEn ? 'running' : 'stopped',
+            isSyncing: false,
+            autoSyncEnabled: curEn,
+            intervalSeconds: curSec,
+            intervalValue: Number(db.settings.auto_sync_interval_value || 12),
+            intervalUnit: db.settings.auto_sync_interval_unit || 'hours',
+            nextRunAt: curEn ? new Date(Date.now() + curSec * 1000).toISOString() : null,
+            consecutiveErrors: curEn ? Number((db.syncWorkerState && db.syncWorkerState.consecutiveErrors) || 0) : 0
+          });
         }
         db.settings._settings_updated_at = new Date().toISOString();
+        var secDesc = (core.formatAutoSyncIntervalSecondsAr && db.settings.auto_sync_interval_seconds)
+          ? core.formatAutoSyncIntervalSecondsAr(db.settings.auto_sync_interval_seconds)
+          : core.formatAutoSyncIntervalAr(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes);
         appendSandboxActivity(
           db,
           session.user,
@@ -6783,11 +6941,20 @@
           'Settings',
           'system',
           hasSysFields
-            ? ('تحديث إعدادات النظام (التحديث التلقائي: ' + (db.settings.auto_sync_enabled ? core.formatAutoSyncIntervalAr(db.settings.auto_sync_interval_hours, db.settings.auto_sync_interval_minutes) : 'متوقف') + ')')
+            ? ('تحديث إعدادات النظام (المزامنة التلقائية: ' + (db.settings.auto_sync_enabled ? secDesc : 'متوقف') + ')')
             : 'تحديث إعدادات تسليم الوردية',
           settingDiffs
         );
         saveSandboxDb(db);
+        if ((typeof payload.auto_sync_enabled === 'boolean' || hasAutoSyncIvChange) && typeof document !== 'undefined' && typeof document.dispatchEvent === 'function') {
+          document.dispatchEvent(new CustomEvent('rg:deltasync', {
+            detail: {
+              changedSettings: true,
+              syncStatusChanged: true,
+              syncWorkerState: db.syncWorkerState
+            }
+          }));
+        }
         return {
           success: true,
           message: 'تم حفظ الإعدادات.',
@@ -7665,6 +7832,8 @@
       touchedScopes.todayRadar = true;
       touchedScopes.dashboard = true;
       touchedScopes.reports = true;
+      touchedScopes.employees = true;
+      touchedScopes.sync = true;
       writeLocalReservationsState(ns, chRes, false);
       chRes.forEach(function (cr) {
         if (cr && cr.id && localDetailsByNs[ns] && localDetailsByNs[ns][cr.id]) {
@@ -7949,7 +8118,12 @@
     if (delta.changedSettings) {
       touchedScopes.settings = true;
       touchedScopes.dashboard = true;
-      extraInvalidates.push('settings', 'dashboard', 'employees');
+      touchedScopes.sync = true;
+      extraInvalidates.push('settings', 'dashboard', 'employees', 'sync');
+    }
+    if (delta.syncStatusChanged || delta.syncWorkerState) {
+      touchedScopes.sync = true;
+      extraInvalidates.push('sync');
     }
 
     var delResIds = Array.isArray(delta.deletedReservationIds) ? delta.deletedReservationIds : [];
