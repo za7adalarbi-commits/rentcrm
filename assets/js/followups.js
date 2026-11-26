@@ -74,6 +74,8 @@
     var currentEmpId = currentUser.id || '';
     var canViewMentionsTab = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_myfu_mentions');
     var canViewFuHistory = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_myfu_history');
+    var canExportPdf = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_pdf');
+    var canExportExcel = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_excel');
     if (!canViewMentionsTab && fuState.tab === 'mentions') {
       fuState.tab = 'assigned';
       if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
@@ -279,6 +281,16 @@
         '<div class="section-header">' +
           '<div><h2 class="section-title">' + t('nav_my_followups') + '</h2><p class="section-subtitle" id="myfu-subtitle"></p></div>' +
           '<div class="toolbar-actions">' +
+            ((root.RGExportMenu && (canExportPdf || canExportExcel))
+              ? root.RGExportMenu.renderHtml({
+                  wrapId: 'myfu-export-wrap',
+                  btnId: 'myfu-export-btn',
+                  small: true,
+                  canPdf: canExportPdf,
+                  canExcel: canExportExcel,
+                  lang: ctx.lang
+                })
+              : (canExportPdf ? '<button type="button" class="btn btn-sm btn-charcoal" id="myfu-export-pdf">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '')) +
             '<button type="button" class="btn btn-sm' + (assigned.length > 0 ? '' : ' hidden') + '" id="myfu-ics-btn">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
             '<div class="segmented-control" id="myfu-tabs" role="tablist" aria-label="تبويبات متابعاتي">' +
               '<button type="button" class="segmented-btn' + (fuState.tab !== 'mentions' ? ' active' : '') + '" data-myfu-tab="assigned">' +
@@ -580,6 +592,132 @@
       });
     });
 
+    function buildMyFuColsAndRows() {
+      var myCols = [
+        { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr', widthWeight: 1.0 },
+        { key: 'customerName', label: isEn ? 'Customer' : 'العميل', widthWeight: 1.3 },
+        { key: 'customerPhone', label: isEn ? 'Phone' : 'الجوال', formatType: 'ltr', widthWeight: 1.05 },
+        { key: 'carName', label: isEn ? 'Vehicle' : 'السيارة', widthWeight: 1.2 },
+        { key: 'internalStatus', label: isEn ? 'Status' : 'الحالة', widthWeight: 0.95 },
+        { key: 'noAnswerCount', label: isEn ? 'No Answer' : 'لم يرد', formatType: 'number', summable: true, widthWeight: 0.65 },
+        { key: 'lastUpdateText', label: isEn ? 'Last Update' : 'آخر تحديث', widthWeight: 1.8 }
+      ];
+      var myRows = assigned.map(function (r) {
+        return {
+          reservationNumber: r.reservationNumber || '-',
+          customerName: r.customerName || '-',
+          customerPhone: r.customerPhone || '-',
+          carName: r.carName || '-',
+          internalStatus: r.internalStatus || r.originalStatusAr || '-',
+          noAnswerCount: Number(r.noAnswerCount || 0),
+          lastUpdateText: r.lastUpdateText || '-'
+        };
+      });
+      return { myCols: myCols, myRows: myRows };
+    }
+
+    function triggerMyFuPdf() {
+      if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+        ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة تصدير PDF غير متاحة.', true);
+        return;
+      }
+      var dataMy = buildMyFuColsAndRows();
+      var pdfRows = dataMy.myRows.map(function (r) {
+        return Object.assign({}, r, { noAnswerCount: String(r.noAnswerCount) });
+      });
+      var myNotes = followUps.filter(function (f) { return Boolean(f.notes || f.action); }).map(function (f) {
+        var headerLine = (f.reservationNumber || '-') + ' — ' + (f.customerName || '-') + ' [' + (f.status || '-') + '] (' + (f.followUpDate || '-') + ' ' + fmtTime(f.followUpTime, ctx) + ')';
+        return headerLine + '\n' + (f.action || '') + (f.notes ? ('\n' + f.notes) : '');
+      });
+      root.RGReports.openPdfStudio({
+        ctx: ctx,
+        title: isEn ? ('My Follow-Ups — ' + (currentUser.name || '')) : ('تقرير متابعاتي — ' + (currentUser.name || '')),
+        filename: 'rental-gate-my-followups.pdf',
+        scopeKey: 'my_followups',
+        availableColumns: dataMy.myCols,
+        columns: dataMy.myCols,
+        rows: pdfRows,
+        summaryItems: [
+          { label: isEn ? 'My Assigned Bookings' : 'حجوزاتي المستلمة', value: String(assigned.length) },
+          { label: isEn ? 'Pinned Critical' : 'الحجوزات المثبتة', value: String(pinnedReservations.length) },
+          { label: isEn ? 'Follow-Up Log Entries' : 'سجلات المتابعة', value: String(followUps.length) }
+        ],
+        extraSections: myNotes.length ? [{
+          title: isEn ? ('Follow-Up Actions & Notes (' + myNotes.length + ')') : ('تفاصيل وملاحظات المتابعات (' + myNotes.length + ')'),
+          isNotes: true,
+          lines: myNotes
+        }] : [],
+        initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+      });
+    }
+
+    async function triggerMyFuExcel() {
+      if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+        ctx.toast(isEn ? 'Excel export module is unavailable.' : 'وحدة تصدير Excel غير متاحة.', true);
+        return;
+      }
+      var dataMy = buildMyFuColsAndRows();
+      var repTitle = isEn ? ('My Follow-Ups — ' + (currentUser.name || '')) : ('تقرير متابعاتي — ' + (currentUser.name || ''));
+      var fuLogCols = [
+        { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr' },
+        { key: 'customerName', label: isEn ? 'Customer' : 'العميل' },
+        { key: 'status', label: isEn ? 'Status' : 'الحالة' },
+        { key: 'action', label: isEn ? 'Action' : 'الإجراء' },
+        { key: 'notes', label: isEn ? 'Notes' : 'الملاحظات' },
+        { key: 'dateTimeText', label: isEn ? 'Date & Time' : 'التاريخ والوقت', formatType: 'ltr' }
+      ];
+      var fuLogRows = followUps.map(function (f) {
+        var dStr = (core && core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-';
+        return {
+          reservationNumber: f.reservationNumber || '-',
+          customerName: f.customerName || '-',
+          status: f.status || '-',
+          action: f.action || '-',
+          notes: f.notes || '-',
+          dateTimeText: dStr + (f.followUpTime ? (' ' + fmtTime(f.followUpTime, ctx)) : '')
+        };
+      });
+      var sheets = [{
+        name: isEn ? 'My Bookings' : 'حجوزاتي المستلمة',
+        title: repTitle,
+        summaryItems: [
+          { label: isEn ? 'My Assigned Bookings' : 'حجوزاتي المستلمة', value: assigned.length },
+          { label: isEn ? 'Pinned Critical' : 'الحجوزات المثبتة', value: pinnedReservations.length },
+          { label: isEn ? 'Follow-Up Entries' : 'سجلات المتابعة', value: followUps.length }
+        ],
+        headers: dataMy.myCols,
+        rows: dataMy.myRows
+      }];
+      if (fuLogRows.length || assigned.length === 0) {
+        sheets.push({
+          name: isEn ? 'Follow-Up Log' : 'سجل متابعاتي',
+          title: isEn ? 'My Follow-Up Log & Notes' : 'سجل وملاحظات متابعاتي',
+          headers: fuLogCols,
+          rows: fuLogRows
+        });
+      }
+      await root.RGReports.exportExcelWorkbook(sheets, 'rental-gate-my-followups.xlsx', {
+        lang: ctx.lang,
+        title: repTitle
+      });
+      ctx.toast(isEn ? 'My Follow-Ups exported to Excel.' : 'تم تصدير متابعاتي إلى ملف Excel بنجاح.');
+    }
+
+    var myFuExportWrap = document.getElementById('myfu-export-wrap');
+    if (myFuExportWrap && root.RGExportMenu) {
+      root.RGExportMenu.bind(myFuExportWrap, {
+        onPdf: triggerMyFuPdf,
+        onExcel: triggerMyFuExcel,
+        onError: function (err) {
+          ctx.toast((err && err.message) || (isEn ? 'Export failed.' : 'تعذر تنفيذ التصدير.'), true);
+        }
+      });
+    }
+    var myFuPdfBtn = document.getElementById('myfu-export-pdf');
+    if (myFuPdfBtn) {
+      myFuPdfBtn.addEventListener('click', triggerMyFuPdf);
+    }
+
     var myFuIcsBtn = document.getElementById('myfu-ics-btn');
     if (myFuIcsBtn) {
       myFuIcsBtn.addEventListener('click', function () {
@@ -687,6 +825,8 @@
 
     var currentUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
     var canReassign = Boolean(currentUser && core && core.canUserPerform && core.canUserPerform(currentUser, 'assign_employees'));
+    var canExportPdfTeam = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_pdf');
+    var canExportExcelTeam = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_excel');
     var activeTfuSeq = 0;
 
     container.innerHTML =
@@ -694,6 +834,16 @@
         '<div class="section-header">' +
           '<div><h2 class="section-title">' + t('nav_team_followups') + '</h2><p class="section-subtitle">سجل متابعات الفريق بالكامل — اضغط على أي حجز للاطلاع على كامل التفاصيل</p></div>' +
           '<div class="toolbar-actions">' +
+            ((root.RGExportMenu && (canExportPdfTeam || canExportExcelTeam))
+              ? root.RGExportMenu.renderHtml({
+                  wrapId: 'tfu-export-wrap',
+                  btnId: 'tfu-export-btn',
+                  small: true,
+                  canPdf: canExportPdfTeam,
+                  canExcel: canExportExcelTeam,
+                  lang: ctx.lang
+                })
+              : (canExportPdfTeam ? '<button type="button" class="btn btn-sm btn-charcoal" id="tfu-export-pdf">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '')) +
             (canReassign ? '<button type="button" class="btn btn-sm" id="tfu-bulk-reassign-btn">🔄 تحويل جماعي للوردية</button>' : '') +
             '<button type="button" class="btn btn-sm btn-primary' + (state.employeeId ? '' : ' hidden') + '" id="tfu-open-emp-profile">فتح ملف عملاء الموظف بالكامل</button>' +
           '</div>' +
@@ -869,6 +1019,118 @@
           refreshTeamFollowUpsRegion({ silentRefresh: true, forceRefresh: true });
         });
       });
+    }
+
+    function buildTeamFuPayload() {
+      var tfuCols = [
+        { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr', widthWeight: 0.95 },
+        { key: 'customerName', label: isEn ? 'Customer' : 'العميل', widthWeight: 1.2 },
+        { key: 'employeeName', label: isEn ? 'Employee' : 'الموظف', widthWeight: 1.0 },
+        { key: 'status', label: isEn ? 'Status' : 'الحالة', widthWeight: 0.9 },
+        { key: 'action', label: isEn ? 'Action' : 'الإجراء', widthWeight: 1.5 },
+        { key: 'notes', label: isEn ? 'Notes' : 'الملاحظات', widthWeight: 1.6 },
+        { key: 'dateTimeText', label: isEn ? 'Date & Time' : 'التاريخ والوقت', formatType: 'ltr', widthWeight: 1.1 }
+      ];
+      var tfuRows = items.map(function (f) {
+        var dStr = (core && core.formatDisplayDate ? core.formatDisplayDate(f.followUpDate) : f.followUpDate) || '-';
+        return {
+          reservationNumber: f.reservationNumber || '-',
+          customerName: f.customerName || '-',
+          employeeName: f.employeeName || '-',
+          status: f.status || '-',
+          action: f.action || '-',
+          notes: f.notes || '-',
+          dateTimeText: dStr + (f.followUpTime ? (' ' + fmtTime(f.followUpTime, ctx)) : '')
+        };
+      });
+      var uniqueBookingsCount = Object.keys(items.reduce(function (m, x) { if (x.reservationId || x.reservationNumber) m[x.reservationId || x.reservationNumber] = 1; return m; }, {})).length;
+      var notesRecordedCount = items.filter(function (f) { return Boolean(String(f.notes || '').trim()); }).length;
+      var filterParts = [
+        state.employeeId ? ((isEn ? 'Employee: ' : 'الموظف: ') + ((employees.find(function (e) { return e.id === state.employeeId; }) || {}).name || state.employeeId)) : '',
+        state.status ? ((isEn ? 'Status: ' : 'الحالة: ') + state.status) : ''
+      ].filter(Boolean).join(' · ');
+      return {
+        tfuCols: tfuCols,
+        tfuRows: tfuRows,
+        uniqueBookingsCount: uniqueBookingsCount,
+        notesRecordedCount: notesRecordedCount,
+        periodText: state.date || (isEn ? 'All Dates' : 'كافة التواريخ'),
+        filtersText: filterParts
+      };
+    }
+
+    function triggerTeamFuPdf() {
+      if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+        ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة تصدير PDF غير متاحة.', true);
+        return;
+      }
+      var dataTfu = buildTeamFuPayload();
+      var tfuNoteLines = items.filter(function (f) { return Boolean(String(f.notes || '').trim()); }).map(function (f) {
+        return (f.reservationNumber || '-') + ' | ' + (f.employeeName || '-') + ' (' + (f.customerName || '-') + '):\n' + String(f.notes || '').trim();
+      });
+      root.RGReports.openPdfStudio({
+        ctx: ctx,
+        title: isEn ? 'Team Follow-Ups Report' : 'تقرير متابعات الفريق',
+        filename: 'rental-gate-team-followups.pdf',
+        scopeKey: 'team_followups',
+        availableColumns: dataTfu.tfuCols,
+        columns: dataTfu.tfuCols,
+        rows: dataTfu.tfuRows,
+        summaryItems: [
+          { label: isEn ? 'Total Follow-Ups' : 'إجمالي المتابعات', value: String(items.length) },
+          { label: isEn ? 'Unique Bookings' : 'الحجوزات المشمولة', value: String(dataTfu.uniqueBookingsCount) },
+          { label: isEn ? 'Notes Recorded' : 'سجلات بملاحظات', value: String(dataTfu.notesRecordedCount) }
+        ],
+        extraSections: tfuNoteLines.length ? [{
+          title: isEn ? ('Full Follow-Up Notes (' + tfuNoteLines.length + ')') : ('الملاحظات الكاملة للمتابعات (' + tfuNoteLines.length + ')'),
+          isNotes: true,
+          lines: tfuNoteLines
+        }] : [],
+        initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+      });
+    }
+
+    async function triggerTeamFuExcel() {
+      if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+        ctx.toast(isEn ? 'Excel export module is unavailable.' : 'وحدة تصدير Excel غير متاحة.', true);
+        return;
+      }
+      var dataTfu = buildTeamFuPayload();
+      var repTitle = isEn ? 'Team Follow-Ups Report' : 'تقرير متابعات الفريق';
+      await root.RGReports.exportExcelWorkbook([{
+        name: isEn ? 'Team Follow-Ups' : 'متابعات الفريق',
+        title: repTitle,
+        periodText: dataTfu.periodText,
+        filtersText: dataTfu.filtersText,
+        summaryItems: [
+          { label: isEn ? 'Total Follow-Ups' : 'إجمالي المتابعات', value: items.length },
+          { label: isEn ? 'Unique Bookings' : 'الحجوزات المشمولة', value: dataTfu.uniqueBookingsCount },
+          { label: isEn ? 'Notes Recorded' : 'سجلات بملاحظات', value: dataTfu.notesRecordedCount }
+        ],
+        headers: dataTfu.tfuCols,
+        rows: dataTfu.tfuRows
+      }], 'rental-gate-team-followups.xlsx', {
+        lang: ctx.lang,
+        title: repTitle,
+        periodText: dataTfu.periodText,
+        filtersText: dataTfu.filtersText
+      });
+      ctx.toast(isEn ? 'Team Follow-Ups exported to Excel.' : 'تم تصدير متابعات الفريق إلى ملف Excel بنجاح.');
+    }
+
+    var tfuExportWrap = document.getElementById('tfu-export-wrap');
+    if (tfuExportWrap && root.RGExportMenu) {
+      root.RGExportMenu.bind(tfuExportWrap, {
+        onPdf: triggerTeamFuPdf,
+        onExcel: triggerTeamFuExcel,
+        onError: function (err) {
+          ctx.toast((err && err.message) || (isEn ? 'Export failed.' : 'تعذر تنفيذ التصدير.'), true);
+        }
+      });
+    }
+    var tfuPdfBtn = document.getElementById('tfu-export-pdf');
+    if (tfuPdfBtn) {
+      tfuPdfBtn.addEventListener('click', triggerTeamFuPdf);
     }
 
     var tfuBulkBtn = document.getElementById('tfu-bulk-reassign-btn');

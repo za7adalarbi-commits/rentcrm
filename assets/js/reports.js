@@ -178,9 +178,18 @@
   }
 
   async function exportExcelWorkbook(sheetsConfig, filename, options) {
+    var opts = Object.assign({}, options || {});
+    if (root.RGExcelDesigner && typeof root.RGExcelDesigner.exportWorkbook === 'function') {
+      if (!opts.lang) {
+        opts.lang = document.documentElement.getAttribute('lang') === 'en' ? 'en' : 'ar';
+      }
+      if (!opts.timeFormat && root.RGApp && typeof root.RGApp.getTimeFormat === 'function') {
+        opts.timeFormat = root.RGApp.getTimeFormat();
+      }
+      return root.RGExcelDesigner.exportWorkbook(sheetsConfig, filename, opts);
+    }
     await ensureXlsxLoaded();
     var core = root.RGCrmCore;
-    var opts = options || {};
     var normalizedSheets = (core && core.buildCompressedExcelSheets)
       ? core.buildCompressedExcelSheets(sheetsConfig, opts)
       : (sheetsConfig || []);
@@ -250,15 +259,23 @@
     };
   }
 
-  function wrapCanvasText(ctx, text, maxWidth, maxLines) {
+  function wrapCanvasText(ctx, text, maxWidth, maxLinesOrOpts) {
+    var opts = (maxLinesOrOpts && typeof maxLinesOrOpts === 'object')
+      ? maxLinesOrOpts
+      : { maxLines: Number(maxLinesOrOpts || 0), preserveLineBreaks: false };
+    var core = root.RGCrmCore;
+    if (core && typeof core.wrapTextPreservingNewlines === 'function') {
+      return core.wrapTextPreservingNewlines(function (str) {
+        return ctx.measureText(str).width;
+      }, text, maxWidth, opts);
+    }
     var raw = String(text === undefined || text === null ? '' : text).replace(/\s+/g, ' ').trim();
     if (!raw) return ['-'];
     if (maxWidth <= 20 || ctx.measureText(raw).width <= maxWidth) return [raw];
-
+    var maxLines = (!opts.unclipped && opts.maxLines) ? Number(opts.maxLines) : 0;
     var words = raw.split(' ');
     var lines = [];
     var current = '';
-
     for (var i = 0; i < words.length; i++) {
       var word = words[i];
       var candidate = current ? (current + ' ' + word) : word;
@@ -270,43 +287,10 @@
           current = '';
           if (maxLines && lines.length >= maxLines) break;
         }
-        // Break oversized single token if wider than cell
-        if (ctx.measureText(word).width > maxWidth) {
-          var part = '';
-          for (var chIdx = 0; chIdx < word.length; chIdx++) {
-            var nextPart = part + word.charAt(chIdx);
-            if (ctx.measureText(nextPart).width > maxWidth && part) {
-              lines.push(part);
-              part = word.charAt(chIdx);
-              if (maxLines && lines.length >= maxLines) {
-                part = '';
-                break;
-              }
-            } else {
-              part = nextPart;
-            }
-          }
-          current = part;
-        } else {
-          current = word;
-        }
+        current = word;
       }
     }
-
-    if (current && (!maxLines || lines.length < maxLines)) {
-      lines.push(current);
-    }
-
-    if (maxLines && lines.length > maxLines) {
-      lines = lines.slice(0, maxLines);
-    }
-    if (maxLines && lines.length === maxLines && i < words.length) {
-      var last = lines[lines.length - 1];
-      while (last.length > 2 && ctx.measureText(last + '…').width > maxWidth) {
-        last = last.slice(0, -1);
-      }
-      lines[lines.length - 1] = last + '…';
-    }
+    if (current && (!maxLines || lines.length < maxLines)) lines.push(current);
     return lines.length ? lines : ['-'];
   }
 
@@ -330,6 +314,47 @@
     ctx.restore();
   }
 
+  function buildPdfFontStack(fontFamily) {
+    var f = String(fontFamily || 'IBM Plex Sans Arabic');
+    if (f === 'Cairo') return '"Cairo", "IBM Plex Sans Arabic", "Segoe UI", Tahoma, Arial, sans-serif';
+    if (f === 'Tajawal') return '"Tajawal", "IBM Plex Sans Arabic", "Segoe UI", Tahoma, Arial, sans-serif';
+    if (f === 'Tahoma') return 'Tahoma, "IBM Plex Sans Arabic", "Segoe UI", Arial, sans-serif';
+    return '"IBM Plex Sans Arabic", "Cairo", "Plus Jakarta Sans", "Segoe UI", Tahoma, Arial, sans-serif';
+  }
+
+  async function ensurePdfFontReady(fontFamily, sampleText) {
+    if (!fontFamily || fontFamily === 'Tahoma') return;
+    if (typeof document === 'undefined' || !document.fonts || typeof document.fonts.load !== 'function') return;
+    try {
+      await Promise.race([
+        Promise.all([
+          document.fonts.load('400 14px "' + fontFamily + '"', sampleText || 'تقرير RENTAL GATE'),
+          document.fonts.load('700 16px "' + fontFamily + '"', sampleText || 'تقرير RENTAL GATE')
+        ]),
+        new Promise(function (resolve) { setTimeout(resolve, 350); })
+      ]);
+    } catch (_e) {}
+  }
+
+  function isNoteSummaryEntry(item) {
+    if (!item) return false;
+    if (item.isNote) return true;
+    var lbl = String(item.label || '');
+    return /ملاحظ|note|comment/i.test(lbl);
+  }
+
+  function isNoteExtraSection(sec) {
+    if (!sec) return false;
+    if (sec.isNotes) return true;
+    var title = String(sec.title || '');
+    return /ملاحظ|notes/i.test(title);
+  }
+
+  function isLongWrappedColumn(col) {
+    if (!col || !col.key) return false;
+    return /^(notes|lastUpdateText|description|rejectionReason|cancellationReason|driverNotes|action)$/i.test(String(col.key));
+  }
+
   async function exportArabicPdfDocument(options) {
     var signal = options && options.signal;
     throwIfAborted(signal);
@@ -337,6 +362,39 @@
     throwIfAborted(signal);
 
     var core = root.RGCrmCore;
+    var adv = (core && core.resolveAdvancedPdfSettings)
+      ? core.resolveAdvancedPdfSettings(options)
+      : Object.assign({
+          targetPages: 3,
+          preset: 'balanced',
+          optimizeFileSize: true,
+          quality: 'balanced',
+          paperSize: 'a4',
+          orientation: 'landscape',
+          marginPreset: 'normal',
+          customMargins: { top: 10, right: 10, bottom: 10, left: 10 },
+          designStyle: 'modern_minimal',
+          primaryColor: '#D9232A',
+          fontSizeScale: 'medium',
+          fontFamily: 'IBM Plex Sans Arabic',
+          showLogo: true,
+          showTitle: true,
+          showDateTime: true,
+          showFooter: true,
+          showPageNumbers: true,
+          showKpis: true,
+          showTableHeaders: true,
+          repeatTableHeader: true,
+          autoColumnWidths: true,
+          columnWidths: {},
+          selectedColumns: null,
+          columnOrder: null,
+          showNotes: true,
+          notesFullUnclipped: true,
+          notesPreserveLineBreaks: true,
+          notesFontSize: 'medium'
+        }, options || {});
+
     var isRtl = options.dir !== 'ltr';
     var lang = options.lang || (isRtl ? 'ar' : 'en');
     var title = options.title || (lang === 'en' ? 'RENTAL GATE CRM Report' : 'تقرير RENTAL GATE CRM');
@@ -344,16 +402,23 @@
     var summaryItems = Array.isArray(options.summaryItems) ? options.summaryItems : [];
     var columns = Array.isArray(options.columns) ? options.columns : [];
     var rows = Array.isArray(options.rows) ? options.rows : [];
-    var extraSections = Array.isArray(options.extraSections) ? options.extraSections : [];
+    var rawExtraSections = Array.isArray(options.extraSections) ? options.extraSections : [];
     var chartImages = Array.isArray(options.chartImages) ? options.chartImages : [];
+    var tables = Array.isArray(options.tables) ? options.tables : [];
+
+    var extraSections = adv.showNotes
+      ? rawExtraSections
+      : rawExtraSections.filter(function (sec) { return !isNoteExtraSection(sec); });
 
     var kpiItems = [];
     var wideItems = [];
     summaryItems.forEach(function (it) {
       var valStr = String(it && it.value !== undefined && it.value !== null ? it.value : '-');
-      if (valStr.length > 26 || String(it.label || '').length > 26) {
-        wideItems.push({ label: String(it.label || ''), value: valStr });
-      } else {
+      var isNoteItem = isNoteSummaryEntry(it);
+      if (isNoteItem && !adv.showNotes) return;
+      if (isNoteItem || valStr.indexOf('\n') !== -1 || valStr.length > 26 || String(it.label || '').length > 26) {
+        wideItems.push({ label: String(it.label || ''), value: valStr, isNote: isNoteItem });
+      } else if (adv.showKpis) {
         kpiItems.push({ label: String(it.label || ''), value: valStr });
       }
     });
@@ -363,42 +428,57 @@
     }, 0);
     var validCharts = chartImages.filter(function (c) { return c && c.dataUrl; });
 
-    var tables = Array.isArray(options.tables) ? options.tables : [];
-    var totalTableRows = rows.length + tables.reduce(function (acc, tb) {
+    function resolveEffectiveTableCols(tblCols) {
+      var list = Array.isArray(tblCols) ? tblCols.slice() : [];
+      if (!list.length) return [];
+      var hasSelMatch = Array.isArray(adv.selectedColumns) && adv.selectedColumns.some(function (k) {
+        return list.some(function (c) { return c && c.key === k; });
+      });
+      var selKeys = hasSelMatch ? adv.selectedColumns : null;
+      var widthMap = adv.autoColumnWidths ? null : adv.columnWidths;
+      if (core && typeof core.applyPdfColumnSelectionAndOrder === 'function') {
+        return core.applyPdfColumnSelectionAndOrder(list, selKeys, adv.columnOrder, widthMap);
+      }
+      return list;
+    }
+
+    var effectiveMainCols = resolveEffectiveTableCols(columns);
+    var effectiveTables = tables.map(function (tb) {
+      return Object.assign({}, tb, {
+        columns: resolveEffectiveTableCols(tb && tb.columns)
+      });
+    });
+
+    var totalTableRows = rows.length + effectiveTables.reduce(function (acc, tb) {
       return acc + (Array.isArray(tb && tb.rows) ? tb.rows.length : 0);
     }, 0);
-    var maxTableCols = tables.reduce(function (acc, tb) {
+    var maxTableCols = effectiveTables.reduce(function (acc, tb) {
       var len = Array.isArray(tb && tb.columns) ? tb.columns.length : 0;
       return Math.max(acc, len);
-    }, columns.length);
+    }, effectiveMainCols.length);
 
     var plan = (core && core.computePdfLayoutPlan)
-      ? core.computePdfLayoutPlan({
-          targetPages: options.targetPages,
-          preset: options.preset,
-          optimizeFileSize: options.optimizeFileSize,
-          quality: options.quality,
-          paperSize: options.paperSize || 'a4',
-          orientation: options.orientation || 'landscape',
+      ? core.computePdfLayoutPlan(Object.assign({}, adv, {
           lang: lang,
           rowCount: totalTableRows,
           columnCount: maxTableCols,
           kpiCount: kpiItems.length,
           wideSummaryCount: wideItems.length,
-          extraSectionsCount: extraSections.length + tables.length,
+          extraSectionsCount: extraSections.length + effectiveTables.length,
           extraLinesCount: extraLinesTotal,
           chartCount: validCharts.length
-        })
+        }))
       : {
           targetPages: 3,
           preset: 'balanced',
           optimizeFileSize: true,
           quality: 'balanced',
-          paperSize: options.paperSize || 'a4',
-          orientation: options.orientation || 'landscape',
-          marginPt: 30,
-          headerH: 70,
-          contHeaderH: 42,
+          paperSize: adv.paperSize || 'a4',
+          orientation: adv.orientation || 'landscape',
+          marginPt: 28,
+          marginsPt: { top: 28, right: 28, bottom: 28, left: 28 },
+          headerH: 68,
+          contHeaderH: 38,
           headerGap: 14,
           footerReserve: 36,
           baseFont: 9.3,
@@ -432,6 +512,7 @@
 
     var paperSize = plan.paperSize;
     var orientation = plan.orientation;
+    var isPortrait = orientation === 'portrait';
     var doc = new root.jspdf.jsPDF({
       orientation: orientation,
       unit: 'mm',
@@ -451,10 +532,31 @@
     var scale = plan.renderScale || 1.45;
     var cw = Math.round(pageWmm * 3.78 * scale);
     var ch = Math.round(pageHmm * 3.78 * scale);
-    var pad = Math.round(plan.marginPt * scale);
-    var footerReserve = Math.round(plan.footerReserve * scale);
-    var fontStack = '"IBM Plex Sans Arabic", "Plus Jakarta Sans", "Segoe UI", Tahoma, Arial, sans-serif';
-    var logoImg = await loadLogoImage(plan.downsampleLogoPx || 96);
+
+    var mPts = plan.marginsPt || { top: plan.marginPt, right: plan.marginPt, bottom: plan.marginPt, left: plan.marginPt };
+    var padTop = Math.round(Number(mPts.top || plan.marginPt || 28) * scale);
+    var padRight = Math.round(Number(mPts.right || plan.marginPt || 28) * scale);
+    var padBottom = Math.round(Number(mPts.bottom || plan.marginPt || 28) * scale);
+    var padLeft = Math.round(Number(mPts.left || plan.marginPt || 28) * scale);
+    var contentX = padLeft;
+    var contentRightX = cw - padRight;
+    var contentW = Math.max(120, contentRightX - contentX);
+    var footerReserve = (adv.showFooter || adv.showPageNumbers)
+      ? Math.max(Math.round(plan.footerReserve * scale), padBottom + Math.round(18 * scale))
+      : padBottom;
+
+    // Web God Brand Tokens
+    var brandRed = adv.primaryColor || '#D9232A';
+    var brandDark = '#303030';
+    var brandSurface = '#F7F7F8';
+    var brandBorder = '#E4E4E7';
+    var brandText = '#1F2937';
+    var brandMuted = '#52525B';
+    var isMinimalTheme = adv.designStyle !== 'executive_classic';
+
+    var fontStack = buildPdfFontStack(adv.fontFamily);
+    await ensurePdfFontReady(adv.fontFamily, title);
+    var logoImg = adv.showLogo ? await loadLogoImage(plan.downsampleLogoPx || 96) : null;
     throwIfAborted(signal);
 
     var activePdfTf = options.timeFormat || ((root.RGApp && root.RGApp.getTimeFormat) ? root.RGApp.getTimeFormat() : '24h');
@@ -463,7 +565,9 @@
       : ((core && core.formatDisplayDateTime)
           ? core.formatDisplayDateTime(new Date().toISOString())
           : new Date().toISOString().substring(0, 16).replace('T', ' '));
-    var metaText = (isRtl ? 'التاريخ: ' : 'Date: ') + nowFormatted + (exporterName ? (isRtl ? '  |  المصدر: ' : '  |  By: ') + exporterName : '');
+    var dateLabelText = (isRtl ? 'تاريخ الإصدار: ' : 'Issued: ') + nowFormatted;
+    var exporterLabelText = exporterName ? ((isRtl ? 'المُصدِر: ' : 'Prepared by: ') + exporterName) : '';
+    var metaText = dateLabelText + (exporterLabelText ? ('  |  ' + exporterLabelText) : '');
 
     var pages = [];
     function newPage() {
@@ -475,54 +579,153 @@
       ctx.fillRect(0, 0, cw, ch);
       ctx.direction = isRtl ? 'rtl' : 'ltr';
       ctx.textBaseline = 'alphabetic';
-      pages.push({ canvas: canvas, ctx: ctx, y: pad });
+      pages.push({ canvas: canvas, ctx: ctx, y: padTop });
       return pages[pages.length - 1];
     }
 
     function drawHeader(p, isContinuation) {
       var ctx = p.ctx;
-      var useCompactCont = Boolean(isContinuation && plan.contHeaderH < plan.headerH - 8);
-      var headerH = Math.round((useCompactCont ? plan.contHeaderH : plan.headerH) * scale);
+      var hasVisibleHeader = Boolean((adv.showLogo && logoImg) || adv.showTitle || adv.showDateTime);
+      var topStripeH = Math.max(3, Math.round(3.5 * scale));
 
-      ctx.fillStyle = '#313232';
-      ctx.fillRect(0, 0, cw, headerH);
-      ctx.fillStyle = '#d32228';
-      ctx.fillRect(0, 0, cw, Math.max(2, Math.round(4.5 * scale)));
-
-      if (useCompactCont) {
-        var contFontSz = Math.round(Math.max(10.5, plan.baseFont * 1.15) * scale);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold ' + contFontSz + 'px ' + fontStack;
-        drawSmartLine(ctx, title, isRtl ? cw - pad : pad, Math.round(headerH * 0.66), cw - pad * 2, isRtl);
-        p.y = headerH + Math.round(Math.max(8, plan.headerGap * 0.75) * scale);
+      if (!hasVisibleHeader) {
+        ctx.fillStyle = brandRed;
+        ctx.fillRect(0, 0, cw, topStripeH);
+        p.y = padTop + Math.round(4 * scale);
         return;
       }
 
-      var logoOffset = 0;
-      if (logoImg) {
-        var boxSz = Math.round(Math.min(48, Math.max(30, plan.headerH * 0.62)) * scale);
-        var lx = isRtl ? cw - pad - boxSz : pad;
-        var ly = Math.round(((headerH - boxSz) / 2) + 1.5 * scale);
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(lx - 2 * scale, ly - 2 * scale, boxSz + 4 * scale, boxSz + 4 * scale);
-        ctx.drawImage(logoImg, lx, ly, boxSz, boxSz);
-        logoOffset = boxSz + Math.round(14 * scale);
+      var useCompactCont = Boolean(isContinuation);
+      if (useCompactCont) {
+        if (!adv.showTitle) {
+          ctx.fillStyle = brandRed;
+          ctx.fillRect(0, 0, cw, topStripeH);
+          p.y = padTop + Math.round(4 * scale);
+          return;
+        }
+        var contH = padTop + Math.round(28 * scale);
+        if (isMinimalTheme) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, cw, contH);
+          ctx.fillStyle = brandRed;
+          ctx.fillRect(0, 0, cw, topStripeH);
+          ctx.strokeStyle = brandBorder;
+          ctx.lineWidth = Math.max(1, scale);
+          ctx.beginPath();
+          ctx.moveTo(contentX, contH);
+          ctx.lineTo(contentRightX, contH);
+          ctx.stroke();
+          ctx.fillStyle = brandDark;
+        } else {
+          ctx.fillStyle = brandDark;
+          ctx.fillRect(0, 0, cw, contH);
+          ctx.fillStyle = brandRed;
+          ctx.fillRect(0, 0, cw, topStripeH);
+          ctx.fillStyle = '#ffffff';
+        }
+        var contFontSz = Math.round(Math.max(10, plan.baseFont * 1.12) * scale);
+        ctx.font = 'bold ' + contFontSz + 'px ' + fontStack;
+        drawSmartLine(ctx, title, isRtl ? contentRightX : contentX, padTop + Math.round(18 * scale), contentW, isRtl);
+        p.y = contH + Math.round(Math.max(8, plan.headerGap * 0.72) * scale);
+        return;
       }
 
-      var textX = isRtl ? cw - pad - logoOffset : pad + logoOffset;
-      var maxHeaderW = cw - pad * 2 - logoOffset;
-      var titleSz = Math.round(Math.min(18, Math.max(12.5, plan.headerH * 0.22)) * scale);
-      var metaSz = Math.round(Math.min(11, Math.max(8.5, plan.headerH * 0.14)) * scale);
+      // First Page Header — Distinct Portrait (vertical stack) vs Landscape (horizontal split)
+      var logoBoxSz = (adv.showLogo && logoImg)
+        ? Math.round((isPortrait ? 40 : 44) * scale)
+        : 0;
+      var logoPadGap = logoBoxSz > 0 ? Math.round(12 * scale) : 0;
+      var titleSz = Math.round(Math.min(18.5, Math.max(12.5, plan.baseFont * (isPortrait ? 1.55 : 1.65))) * scale);
+      var metaSz = Math.round(Math.min(11.0, Math.max(8.8, plan.baseFont * 0.96)) * scale);
 
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold ' + titleSz + 'px ' + fontStack;
-      drawSmartLine(ctx, title, textX, Math.round(headerH * 0.48), maxHeaderW, isRtl);
+      var bandInnerH;
+      if (isPortrait) {
+        bandInnerH = Math.round((adv.showDateTime ? 64 : 50) * scale);
+        if (logoBoxSz + Math.round(8 * scale) > bandInnerH) bandInnerH = logoBoxSz + Math.round(12 * scale);
+      } else {
+        bandInnerH = Math.round(Math.max(54, logoBoxSz + 14 * scale));
+      }
 
-      ctx.fillStyle = '#d4d6d8';
-      ctx.font = metaSz + 'px ' + fontStack;
-      drawSmartLine(ctx, metaText, textX, Math.round(headerH * 0.77), maxHeaderW, isRtl);
+      var headerBottomY = padTop + bandInnerH;
 
-      p.y = headerH + Math.round(plan.headerGap * scale);
+      if (isMinimalTheme) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, cw, headerBottomY);
+        ctx.fillStyle = brandRed;
+        ctx.fillRect(0, 0, cw, topStripeH);
+        // Subtle vertical brand accent beside header content
+        var pillarW = Math.max(3, Math.round(3.5 * scale));
+        ctx.fillRect(isRtl ? contentRightX - pillarW : contentX, padTop + Math.round(6 * scale), pillarW, bandInnerH - Math.round(14 * scale));
+
+        ctx.strokeStyle = brandBorder;
+        ctx.lineWidth = Math.max(1, 1.1 * scale);
+        ctx.beginPath();
+        ctx.moveTo(contentX, headerBottomY);
+        ctx.lineTo(contentRightX, headerBottomY);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = brandDark;
+        ctx.fillRect(0, 0, cw, headerBottomY);
+        ctx.fillStyle = brandRed;
+        ctx.fillRect(0, 0, cw, topStripeH);
+      }
+
+      var startInset = isMinimalTheme ? Math.round(10 * scale) : 0;
+      if (logoBoxSz > 0 && logoImg) {
+        var lx = isRtl ? (contentRightX - startInset - logoBoxSz) : (contentX + startInset);
+        var ly = padTop + Math.round((bandInnerH - logoBoxSz) / 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(lx - 2 * scale, ly - 2 * scale, logoBoxSz + 4 * scale, logoBoxSz + 4 * scale);
+        if (isMinimalTheme) {
+          ctx.strokeStyle = brandBorder;
+          ctx.lineWidth = Math.max(1, scale);
+          ctx.strokeRect(lx - 2 * scale, ly - 2 * scale, logoBoxSz + 4 * scale, logoBoxSz + 4 * scale);
+        }
+        ctx.drawImage(logoImg, lx, ly, logoBoxSz, logoBoxSz);
+      }
+
+      var textAnchorStart = isRtl
+        ? (contentRightX - startInset - logoBoxSz - logoPadGap)
+        : (contentX + startInset + logoBoxSz + logoPadGap);
+
+      if (isPortrait) {
+        var availPortraitW = Math.max(80, contentW - startInset - logoBoxSz - logoPadGap);
+        if (adv.showTitle) {
+          ctx.fillStyle = isMinimalTheme ? brandDark : '#ffffff';
+          ctx.font = 'bold ' + titleSz + 'px ' + fontStack;
+          var ty = padTop + Math.round((adv.showDateTime ? 26 : 34) * scale);
+          drawSmartLine(ctx, title, textAnchorStart, ty, availPortraitW, isRtl);
+        }
+        if (adv.showDateTime) {
+          ctx.fillStyle = isMinimalTheme ? brandMuted : '#d4d6d8';
+          ctx.font = metaSz + 'px ' + fontStack;
+          var my = padTop + Math.round((adv.showTitle ? 48 : 34) * scale);
+          drawSmartLine(ctx, metaText, textAnchorStart, my, availPortraitW, isRtl);
+        }
+      } else {
+        // Landscape split header: Title on start side, Date/Exporter cleanly stacked on end side
+        var metaSideW = adv.showDateTime ? Math.round(contentW * 0.34) : 0;
+        var titleSideW = Math.max(120, contentW - startInset - logoBoxSz - logoPadGap - metaSideW - Math.round(16 * scale));
+        if (adv.showTitle) {
+          ctx.fillStyle = isMinimalTheme ? brandDark : '#ffffff';
+          ctx.font = 'bold ' + titleSz + 'px ' + fontStack;
+          drawSmartLine(ctx, title, textAnchorStart, padTop + Math.round(bandInnerH * 0.56), titleSideW, isRtl);
+        }
+        if (adv.showDateTime) {
+          var endAnchorX = isRtl ? contentX : contentRightX;
+          var endAlign = isRtl ? 'left' : 'right';
+          ctx.fillStyle = isMinimalTheme ? brandMuted : '#d4d6d8';
+          ctx.font = metaSz + 'px ' + fontStack;
+          drawSmartLine(ctx, dateLabelText, endAnchorX, padTop + Math.round(bandInnerH * (exporterLabelText ? 0.40 : 0.56)), metaSideW, isRtl, endAlign);
+          if (exporterLabelText) {
+            ctx.fillStyle = isMinimalTheme ? brandDark : '#f4f4f5';
+            ctx.font = 'bold ' + metaSz + 'px ' + fontStack;
+            drawSmartLine(ctx, exporterLabelText, endAnchorX, padTop + Math.round(bandInnerH * 0.72), metaSideW, isRtl, endAlign);
+          }
+        }
+      }
+
+      p.y = headerBottomY + Math.round(plan.headerGap * scale);
     }
 
     function ensureSpace(p, neededHeight) {
@@ -537,129 +740,156 @@
     var page = newPage();
     drawHeader(page, false);
 
-    // 1. Summary Section: compact KPI strip + wide multi-line cards
-    if (summaryItems.length > 0) {
-      if (kpiItems.length > 0) {
-        var gap = Math.round(plan.kpiGap * scale);
-        var perRow = Math.min(plan.kpiPerRow || 4, kpiItems.length);
-        var rowCount = Math.ceil(kpiItems.length / perRow);
-        var idx = 0;
-        var kpiLabelSz = Math.round(Math.max(8.0, Math.min(10.5, plan.baseFont * 0.96)) * scale);
-        var kpiValSz = Math.round(Math.max(10.0, Math.min(14.5, plan.baseFont * 1.28)) * scale);
-        for (var r = 0; r < rowCount; r++) {
-          var colsInRow = Math.min(perRow, kpiItems.length - idx);
-          var cardH = Math.round(plan.kpiH * scale);
-          page = ensureSpace(page, cardH + gap);
-          var cardW = (cw - pad * 2 - (colsInRow - 1) * gap) / colsInRow;
-          for (var c = 0; c < colsInRow; c++) {
-            var item = kpiItems[idx++];
-            var bx = isRtl
-              ? cw - pad - (c + 1) * cardW - c * gap
-              : pad + c * (cardW + gap);
-            page.ctx.save();
-            page.ctx.fillStyle = '#f8fafc';
-            page.ctx.strokeStyle = '#cbd5e1';
-            page.ctx.lineWidth = Math.max(1, 1 * scale);
-            page.ctx.fillRect(bx, page.y, cardW, cardH);
-            page.ctx.strokeRect(bx, page.y, cardW, cardH);
+    // 1. Summary Section: KPI strip + multi-page unclipped Note / Wide summary cards
+    if (kpiItems.length > 0) {
+      var gap = Math.round(plan.kpiGap * scale);
+      var perRow = Math.min(plan.kpiPerRow || (isPortrait ? 3 : 4), kpiItems.length);
+      var rowCount = Math.ceil(kpiItems.length / perRow);
+      var idx = 0;
+      var kpiLabelSz = Math.round(Math.max(8.0, Math.min(10.5, plan.baseFont * 0.94)) * scale);
+      var kpiValSz = Math.round(Math.max(10.5, Math.min(15.0, plan.baseFont * 1.3)) * scale);
+      for (var r = 0; r < rowCount; r++) {
+        var colsInRow = Math.min(perRow, kpiItems.length - idx);
+        var cardH = Math.round(plan.kpiH * scale);
+        page = ensureSpace(page, cardH + gap);
+        var cardW = (contentW - (colsInRow - 1) * gap) / colsInRow;
+        for (var c = 0; c < colsInRow; c++) {
+          var item = kpiItems[idx++];
+          var bx = isRtl
+            ? contentRightX - (c + 1) * cardW - c * gap
+            : contentX + c * (cardW + gap);
+          page.ctx.save();
+          page.ctx.fillStyle = brandSurface;
+          page.ctx.strokeStyle = brandBorder;
+          page.ctx.lineWidth = Math.max(1, scale);
+          page.ctx.fillRect(bx, page.y, cardW, cardH);
+          page.ctx.strokeRect(bx, page.y, cardW, cardH);
 
-            page.ctx.beginPath();
-            page.ctx.rect(bx + 3 * scale, page.y + 2 * scale, cardW - 6 * scale, cardH - 4 * scale);
-            page.ctx.clip();
-
-            var anchorX = isRtl ? bx + cardW - Math.round(9 * scale) : bx + Math.round(9 * scale);
-            var innerW = cardW - Math.round(18 * scale);
-            page.ctx.fillStyle = '#475569';
-            page.ctx.font = kpiLabelSz + 'px ' + fontStack;
-            drawSmartLine(page.ctx, item.label, anchorX, page.y + Math.round(cardH * 0.37), innerW, isRtl);
-
-            page.ctx.fillStyle = '#0f172a';
-            page.ctx.font = 'bold ' + kpiValSz + 'px ' + fontStack;
-            drawSmartLine(page.ctx, item.value, anchorX, page.y + Math.round(cardH * 0.78), innerW, isRtl);
-            page.ctx.restore();
+          // Web God crisp accent strip
+          var accentW = Math.max(2.5, Math.round(3 * scale));
+          page.ctx.fillStyle = brandRed;
+          if (isPortrait) {
+            page.ctx.fillRect(isRtl ? (bx + cardW - accentW) : bx, page.y, accentW, cardH);
+          } else {
+            page.ctx.fillRect(bx, page.y, cardW, Math.max(2, Math.round(2.5 * scale)));
           }
-          page.y += cardH + gap;
+
+          page.ctx.beginPath();
+          page.ctx.rect(bx + 4 * scale, page.y + 2 * scale, cardW - 8 * scale, cardH - 4 * scale);
+          page.ctx.clip();
+
+          var anchorX = isRtl ? bx + cardW - Math.round(11 * scale) : bx + Math.round(11 * scale);
+          var innerW = cardW - Math.round(20 * scale);
+          page.ctx.fillStyle = brandMuted;
+          page.ctx.font = kpiLabelSz + 'px ' + fontStack;
+          drawSmartLine(page.ctx, item.label, anchorX, page.y + Math.round(cardH * 0.38), innerW, isRtl);
+
+          page.ctx.fillStyle = brandDark;
+          page.ctx.font = 'bold ' + kpiValSz + 'px ' + fontStack;
+          drawSmartLine(page.ctx, item.value, anchorX, page.y + Math.round(cardH * 0.78), innerW, isRtl);
+          page.ctx.restore();
         }
-      }
-
-      if (wideItems.length > 0) {
-        var wideGap = Math.round(plan.kpiGap * scale);
-        var colsWide = cw > 900 * scale && wideItems.length > 1 ? 2 : 1;
-        var wBoxW = (cw - pad * 2 - (colsWide - 1) * wideGap) / colsWide;
-        var wideFontSz = Math.round(Math.max(8.2, plan.baseFont * 1.02) * scale);
-        var wideLabelSz = Math.round(Math.max(7.6, plan.baseFont * 0.92) * scale);
-        var wideLineH = Math.round(plan.extraLineH * scale);
-        for (var wi = 0; wi < wideItems.length; wi += colsWide) {
-          var pair = wideItems.slice(wi, wi + colsWide);
-          var prepared = pair.map(function (it) {
-            page.ctx.font = wideFontSz + 'px ' + fontStack;
-            var valLines = wrapCanvasText(page.ctx, it.value, wBoxW - Math.round(20 * scale), plan.maxCellLines + 1);
-            var h = Math.round(20 * scale) + valLines.length * wideLineH + Math.round(6 * scale);
-            return { item: it, lines: valLines, h: h };
-          });
-          var rowCardH = Math.max.apply(null, prepared.map(function (p2) { return p2.h; }));
-          page = ensureSpace(page, rowCardH + wideGap);
-
-          prepared.forEach(function (prep, pcIdx) {
-            var bx = isRtl
-              ? cw - pad - (pcIdx + 1) * wBoxW - pcIdx * wideGap
-              : pad + pcIdx * (wBoxW + wideGap);
-            page.ctx.save();
-            page.ctx.fillStyle = '#f8fafc';
-            page.ctx.strokeStyle = '#cbd5e1';
-            page.ctx.lineWidth = Math.max(1, 1 * scale);
-            page.ctx.fillRect(bx, page.y, wBoxW, rowCardH);
-            page.ctx.strokeRect(bx, page.y, wBoxW, rowCardH);
-
-            page.ctx.beginPath();
-            page.ctx.rect(bx + 3 * scale, page.y + 2 * scale, wBoxW - 6 * scale, rowCardH - 4 * scale);
-            page.ctx.clip();
-
-            var anchorX = isRtl ? bx + wBoxW - Math.round(9 * scale) : bx + Math.round(9 * scale);
-            page.ctx.fillStyle = '#64748b';
-            page.ctx.font = 'bold ' + wideLabelSz + 'px ' + fontStack;
-            drawSmartLine(page.ctx, prep.item.label, anchorX, page.y + Math.round(13 * scale), wBoxW - Math.round(18 * scale), isRtl);
-
-            page.ctx.fillStyle = '#0f172a';
-            page.ctx.font = wideFontSz + 'px ' + fontStack;
-            prep.lines.forEach(function (ln, li) {
-              drawSmartLine(page.ctx, ln, anchorX, page.y + Math.round(27 * scale) + li * wideLineH, wBoxW - Math.round(18 * scale), isRtl);
-            });
-            page.ctx.restore();
-          });
-          page.y += rowCardH + wideGap;
-        }
-        page.y += Math.round(Math.max(2, plan.sectionGap * 0.35) * scale);
+        page.y += cardH + gap;
       }
     }
 
-    // 2. Reusable Structured Table Renderer + Main Table & Sub-Tables (options.tables[])
+    if (wideItems.length > 0) {
+      var wideGap = Math.round(plan.kpiGap * scale);
+      var noteMult = adv.notesFontSize === 'small' ? 0.9 : (adv.notesFontSize === 'large' ? 1.18 : 1.02);
+      var wideFontSz = Math.round(Math.max(8.2, plan.baseFont * noteMult) * scale);
+      var wideLabelSz = Math.round(Math.max(7.6, plan.baseFont * 0.92) * scale);
+      var wideLineH = Math.round(plan.extraLineH * noteMult * scale);
+
+      for (var wi = 0; wi < wideItems.length; wi++) {
+        var it = wideItems[wi];
+        page.ctx.font = wideFontSz + 'px ' + fontStack;
+        var valLines = wrapCanvasText(page.ctx, it.value, contentW - Math.round(24 * scale), {
+          unclipped: adv.notesFullUnclipped,
+          preserveLineBreaks: adv.notesPreserveLineBreaks,
+          maxLines: adv.notesFullUnclipped ? 0 : (plan.maxCellLines + 2)
+        });
+
+        var lineOffset = 0;
+        var chunkIndex = 0;
+        while (lineOffset < valLines.length) {
+          var headerPad = Math.round(24 * scale);
+          var tailPad = Math.round(8 * scale);
+          var availH = (ch - footerReserve) - page.y;
+          var minNeeded = headerPad + wideLineH + tailPad;
+          if (availH < minNeeded) {
+            page = newPage();
+            drawHeader(page, true);
+            availH = (ch - footerReserve) - page.y;
+          }
+          var maxFitLines = Math.max(1, Math.floor((availH - headerPad - tailPad) / Math.max(1, wideLineH)));
+          var chunk = valLines.slice(lineOffset, lineOffset + maxFitLines);
+          lineOffset += chunk.length;
+          var boxH = headerPad + chunk.length * wideLineH + tailPad;
+          var lblText = chunkIndex === 0
+            ? it.label
+            : (it.label + (isRtl ? ' (يتبع)' : ' (cont.)'));
+
+          page.ctx.save();
+          page.ctx.fillStyle = brandSurface;
+          page.ctx.strokeStyle = brandBorder;
+          page.ctx.lineWidth = Math.max(1, scale);
+          page.ctx.fillRect(contentX, page.y, contentW, boxH);
+          page.ctx.strokeRect(contentX, page.y, contentW, boxH);
+
+          var noteBarW = Math.max(2.5, Math.round(3 * scale));
+          page.ctx.fillStyle = brandRed;
+          page.ctx.fillRect(isRtl ? (contentRightX - noteBarW) : contentX, page.y, noteBarW, boxH);
+
+          var anchorX = isRtl ? contentRightX - Math.round(12 * scale) : contentX + Math.round(12 * scale);
+          page.ctx.fillStyle = brandMuted;
+          page.ctx.font = 'bold ' + wideLabelSz + 'px ' + fontStack;
+          drawSmartLine(page.ctx, lblText, anchorX, page.y + Math.round(14 * scale), contentW - Math.round(24 * scale), isRtl);
+
+          page.ctx.fillStyle = brandText;
+          page.ctx.font = wideFontSz + 'px ' + fontStack;
+          chunk.forEach(function (ln, li) {
+            drawSmartLine(page.ctx, ln, anchorX, page.y + Math.round(29 * scale) + li * wideLineH, contentW - Math.round(24 * scale), isRtl);
+          });
+          page.ctx.restore();
+
+          page.y += boxH + wideGap;
+          chunkIndex += 1;
+        }
+      }
+      page.y += Math.round(Math.max(2, plan.sectionGap * 0.35) * scale);
+    }
+
+    // 2. Structured Table Renderer
     async function renderStructuredTable(tblTitle, tblCols, tblRows, tblMeta) {
       if (!Array.isArray(tblCols) || !tblCols.length) return;
       var tableKind = (tblMeta && tblMeta.kind) || '';
       var headerFill = tableKind === 'pickups'
         ? '#1e3a8a'
-        : (tableKind === 'returns' ? '#92400e' : '#313232');
+        : (tableKind === 'returns' ? '#92400e' : brandDark);
       var headerBorder = tableKind === 'pickups'
         ? '#1d4ed8'
-        : (tableKind === 'returns' ? '#b45309' : '#1e293b');
+        : (tableKind === 'returns' ? '#b45309' : brandDark);
       var titleAccentColor = tableKind === 'pickups'
         ? '#1d4ed8'
-        : (tableKind === 'returns' ? '#b45309' : '#d32228');
+        : (tableKind === 'returns' ? '#b45309' : brandRed);
       var titleBannerBg = tableKind === 'pickups'
         ? '#eff6ff'
         : (tableKind === 'returns' ? '#fffbeb' : '');
       var titleBannerBorder = tableKind === 'pickups'
         ? '#bfdbfe'
         : (tableKind === 'returns' ? '#fde68a' : '');
-      var tableW = cw - pad * 2;
+      var usePortraitStackedCards = Boolean(isPortrait && tblCols.length > 8 && adv.autoColumnWidths !== false);
+      var activeCols = usePortraitStackedCards ? tblCols.slice(0, 6) : tblCols;
+      var detailCols = usePortraitStackedCards ? tblCols.slice(6) : [];
+
+      var tableW = contentW;
       var colWidths = (core && core.computePdfColumnWidths)
-        ? core.computePdfColumnWidths(tblCols, tableW)
-        : tblCols.map(function () { return tableW / tblCols.length; });
+        ? core.computePdfColumnWidths(activeCols, tableW, adv.autoColumnWidths ? null : adv.columnWidths)
+        : activeCols.map(function () { return tableW / activeCols.length; });
 
       var colOffsets = [];
-      var running = isRtl ? cw - pad : pad;
-      for (var ci = 0; ci < tblCols.length; ci++) {
+      var running = isRtl ? contentRightX : contentX;
+      for (var ci = 0; ci < activeCols.length; ci++) {
         var cwItem = colWidths[ci];
         if (isRtl) {
           running -= cwItem;
@@ -674,29 +904,48 @@
       var headerFontSize = plan.headerFont || baseFontSize;
       var headerFont = 'bold ' + Math.round(headerFontSize * scale) + 'px ' + fontStack;
       var bodyFont = Math.round(baseFontSize * scale) + 'px ' + fontStack;
+      var detailLabelFont = 'bold ' + Math.round(Math.max(7.6, baseFontSize * 0.86) * scale) + 'px ' + fontStack;
+      var detailValFont = Math.round(Math.max(7.9, baseFontSize * 0.92) * scale) + 'px ' + fontStack;
       var cellPadX = Math.round(plan.cellPadX * scale);
       var cellPadY = Math.round(plan.cellPadY * scale);
       var cellLineH = Math.round(plan.cellLineH * scale);
-      var maxCellLines = Math.max(2, Number(plan.maxCellLines || 3));
+      var maxCellLines = Math.max(isPortrait ? 4 : 3, Number(plan.maxCellLines || 3));
+
+      function formatTableCell(col, row) {
+        if (core && core.formatReportCellValue) {
+          return core.formatReportCellValue(col, row, lang, { timeFormat: activePdfTf });
+        }
+        var v = typeof col.value === 'function' ? col.value(row) : row[col.key];
+        if (Array.isArray(v)) return v.join('، ') || '-';
+        return v !== undefined && v !== null && v !== '' ? String(v) : '-';
+      }
 
       page.ctx.font = headerFont;
-      var headerWrapped = tblCols.map(function (col, idx) {
+      var headerWrapped = activeCols.map(function (col, idx) {
         var lbl = (lang === 'en' && col.labelEn) ? col.labelEn : col.label;
         return wrapCanvasText(page.ctx, lbl || col.key || '', Math.max(20, colWidths[idx] - cellPadX * 2), 2);
       });
       var maxHeaderLines = Math.max.apply(null, headerWrapped.map(function (l) { return l.length; }).concat([1]));
-      var headerRowH = Math.max(Math.round((headerFontSize * 2.1) * scale), maxHeaderLines * cellLineH + cellPadY * 2);
+      var headerRowH = adv.showTableHeaders
+        ? Math.max(Math.round((headerFontSize * 2.1) * scale), maxHeaderLines * cellLineH + cellPadY * 2)
+        : 0;
 
       function drawTableHeader(p) {
+        if (!adv.showTableHeaders || headerRowH <= 0) return;
         p.ctx.fillStyle = headerFill;
-        p.ctx.fillRect(pad, p.y, tableW, headerRowH);
+        p.ctx.fillRect(contentX, p.y, tableW, headerRowH);
         p.ctx.strokeStyle = headerBorder;
         p.ctx.lineWidth = Math.max(1, 0.8 * scale);
-        p.ctx.strokeRect(pad, p.y, tableW, headerRowH);
+        p.ctx.strokeRect(contentX, p.y, tableW, headerRowH);
+        // Brand bottom accent rule under table header
+        if (!tableKind || tableKind === 'main') {
+          p.ctx.fillStyle = brandRed;
+          p.ctx.fillRect(contentX, p.y + headerRowH - Math.max(2, Math.round(2 * scale)), tableW, Math.max(2, Math.round(2 * scale)));
+        }
 
         p.ctx.fillStyle = '#ffffff';
         p.ctx.font = headerFont;
-        tblCols.forEach(function (col, cIdx) {
+        activeCols.forEach(function (col, cIdx) {
           var cellX = colOffsets[cIdx];
           var cellW = colWidths[cIdx];
           p.ctx.save();
@@ -714,7 +963,7 @@
 
           if (cIdx > 0) {
             p.ctx.beginPath();
-            p.ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+            p.ctx.strokeStyle = 'rgba(255,255,255,0.16)';
             p.ctx.moveTo(isRtl ? cellX + cellW : cellX, p.y);
             p.ctx.lineTo(isRtl ? cellX + cellW : cellX, p.y + headerRowH);
             p.ctx.stroke();
@@ -734,35 +983,35 @@
           page.ctx.fillStyle = titleBannerBg;
           page.ctx.strokeStyle = titleBannerBorder;
           page.ctx.lineWidth = Math.max(1, 0.8 * scale);
-          page.ctx.fillRect(pad, page.y, tableW, banH);
-          page.ctx.strokeRect(pad, page.y, tableW, banH);
+          page.ctx.fillRect(contentX, page.y, tableW, banH);
+          page.ctx.strokeRect(contentX, page.y, tableW, banH);
           var barW = Math.round(4 * scale);
           page.ctx.fillStyle = titleAccentColor;
-          page.ctx.fillRect(isRtl ? (cw - pad - barW) : pad, page.y, barW, banH);
+          page.ctx.fillRect(isRtl ? (contentRightX - barW) : contentX, page.y, barW, banH);
           page.ctx.fillStyle = titleAccentColor;
           page.ctx.font = 'bold ' + tblTitleSz + 'px ' + fontStack;
           var textOffset = Math.round(10 * scale);
-          drawSmartLine(page.ctx, tblTitle, isRtl ? (cw - pad - textOffset) : (pad + textOffset), page.y + Math.round(13.5 * scale), tableW - textOffset * 2, isRtl);
+          drawSmartLine(page.ctx, tblTitle, isRtl ? (contentRightX - textOffset) : (contentX + textOffset), page.y + Math.round(13.5 * scale), tableW - textOffset * 2, isRtl);
           page.ctx.restore();
           page.y += banH + Math.round(4 * scale);
         } else {
           page.ctx.fillStyle = titleAccentColor;
           page.ctx.font = 'bold ' + tblTitleSz + 'px ' + fontStack;
-          drawSmartLine(page.ctx, tblTitle, isRtl ? cw - pad : pad, page.y + Math.round(13 * scale), tableW, isRtl);
+          drawSmartLine(page.ctx, tblTitle, isRtl ? contentRightX : contentX, page.y + Math.round(13 * scale), tableW, isRtl);
           page.y += titleBlockH;
         }
       }
 
       if (!Array.isArray(tblRows) || tblRows.length === 0) {
         drawTableHeader(page);
-        page.ctx.fillStyle = '#f8fafc';
-        page.ctx.fillRect(pad, page.y, tableW, Math.round(26 * scale));
-        page.ctx.strokeStyle = '#cbd5e1';
-        page.ctx.strokeRect(pad, page.y, tableW, Math.round(26 * scale));
-        page.ctx.fillStyle = '#64748b';
+        page.ctx.fillStyle = brandSurface;
+        page.ctx.fillRect(contentX, page.y, tableW, Math.round(26 * scale));
+        page.ctx.strokeStyle = brandBorder;
+        page.ctx.strokeRect(contentX, page.y, tableW, Math.round(26 * scale));
+        page.ctx.fillStyle = brandMuted;
         page.ctx.font = bodyFont;
         page.ctx.textAlign = 'center';
-        page.ctx.fillText(isRtl ? 'لا توجد سجلات مطابقة في هذا القسم.' : 'No matching records found in this section.', cw / 2, page.y + Math.round(17 * scale));
+        page.ctx.fillText(isRtl ? 'لا توجد سجلات مطابقة في هذا القسم.' : 'No matching records found in this section.', contentX + tableW / 2, page.y + Math.round(17 * scale));
         page.y += Math.round(32 * scale);
       } else {
         drawTableHeader(page);
@@ -776,51 +1025,125 @@
           }
           var row = tblRows[ri];
           page.ctx.font = bodyFont;
-          var cellLines = tblCols.map(function (col, cIdx) {
-            var formatted = (core && core.formatReportCellValue)
-              ? core.formatReportCellValue(col, row, lang, { timeFormat: activePdfTf })
-              : (function () {
-                  var v = typeof col.value === 'function' ? col.value(row) : row[col.key];
-                  if (Array.isArray(v)) return v.join('، ') || '-';
-                  return v !== undefined && v !== null && v !== '' ? String(v) : '-';
-                })();
-            return wrapCanvasText(page.ctx, formatted, Math.max(20, colWidths[cIdx] - cellPadX * 2), maxCellLines);
+          var cellLines = activeCols.map(function (col, cIdx) {
+            var formatted = formatTableCell(col, row);
+            var cellInnerW = Math.max(20, colWidths[cIdx] - cellPadX * 2);
+            var isAtomicToken = (col.formatType === 'ltr' || col.formatType === 'date' || col.formatType === 'time' || col.formatType === 'number') &&
+              formatted.length <= 16 &&
+              formatted.indexOf(' ') === -1 &&
+              formatted.indexOf('\n') === -1;
+            if (isAtomicToken && page.ctx.measureText(formatted).width <= cellInnerW * 1.45) {
+              return [formatted];
+            }
+            var isLongCol = isLongWrappedColumn(col);
+            return wrapCanvasText(page.ctx, formatted, cellInnerW, {
+              unclipped: isLongCol && adv.notesFullUnclipped,
+              preserveLineBreaks: isLongCol && adv.notesPreserveLineBreaks,
+              maxLines: (isLongCol && adv.notesFullUnclipped) ? 0 : maxCellLines
+            });
           });
           var maxLines = Math.max.apply(null, cellLines.map(function (l) { return l.length; }).concat([1]));
-          var rowH = Math.max(Math.round((baseFontSize * 1.9) * scale), maxLines * cellLineH + cellPadY * 2);
+          var primaryRowH = Math.max(Math.round((baseFontSize * 1.9) * scale), maxLines * cellLineH + cellPadY * 2);
+
+          // Portrait detail sub-grid for columns beyond index 5 (no squeezing or mid-number wrap)
+          var detailBlocks = [];
+          var detailGridH = 0;
+          if (usePortraitStackedCards && detailCols.length > 0) {
+            var detailLineH = Math.max(Math.round(cellLineH * 0.92), Math.round(11 * scale));
+            var detailPadY = Math.round(5 * scale);
+            var halfColW = Math.floor((tableW - cellPadX * 3) / 2);
+            var inlinePair = [];
+            var buildDetailBlock = function (dCol, boxW, isFull) {
+              var dLbl = ((lang === 'en' && dCol.labelEn) ? dCol.labelEn : dCol.label) + ': ';
+              var dVal = formatTableCell(dCol, row);
+              page.ctx.font = detailLabelFont;
+              var lblW = page.ctx.measureText(dLbl).width + Math.round(4 * scale);
+              page.ctx.font = detailValFont;
+              var isLongD = isLongWrappedColumn(dCol);
+              var valMaxW = Math.max(36, boxW - (isFull ? lblW : Math.min(lblW, boxW * 0.45)));
+              var wrappedD = wrapCanvasText(page.ctx, dVal, valMaxW, {
+                unclipped: isLongD && adv.notesFullUnclipped,
+                preserveLineBreaks: isLongD && adv.notesPreserveLineBreaks,
+                maxLines: (isLongD && adv.notesFullUnclipped) ? 0 : 3
+              });
+              return {
+                label: dLbl,
+                lblW: lblW,
+                lines: wrappedD,
+                isFull: isFull,
+                h: Math.max(detailLineH, wrappedD.length * detailLineH)
+              };
+            };
+
+            for (var dIdx = 0; dIdx < detailCols.length; dIdx++) {
+              var dc = detailCols[dIdx];
+              var isFullRow = isLongWrappedColumn(dc) || dc.key === 'assignedEmployeeNames';
+              if (isFullRow) {
+                if (inlinePair.length > 0) {
+                  var pairH0 = Math.max.apply(null, inlinePair.map(function (b) { return b.h; }));
+                  detailBlocks.push({ type: 'pair', items: inlinePair, h: pairH0 });
+                  detailGridH += pairH0 + Math.round(3 * scale);
+                  inlinePair = [];
+                }
+                var fullBlk = buildDetailBlock(dc, tableW - cellPadX * 2, true);
+                detailBlocks.push({ type: 'full', item: fullBlk, h: fullBlk.h });
+                detailGridH += fullBlk.h + Math.round(3 * scale);
+              } else {
+                inlinePair.push(buildDetailBlock(dc, halfColW, false));
+                if (inlinePair.length === 2) {
+                  var pairH = Math.max(inlinePair[0].h, inlinePair[1].h);
+                  detailBlocks.push({ type: 'pair', items: inlinePair, h: pairH });
+                  detailGridH += pairH + Math.round(3 * scale);
+                  inlinePair = [];
+                }
+              }
+            }
+            if (inlinePair.length > 0) {
+              var tailH = inlinePair[0].h;
+              detailBlocks.push({ type: 'pair', items: inlinePair, h: tailH });
+              detailGridH += tailH + Math.round(3 * scale);
+            }
+            if (detailGridH > 0) {
+              detailGridH += detailPadY * 2;
+            }
+          }
+
+          var rowH = primaryRowH + detailGridH;
 
           var hitRowCap = maxRowsLimit > 0 && rowsOnPage >= maxRowsLimit;
           if (hitRowCap || (page.y + rowH > ch - footerReserve)) {
             page = newPage();
             drawHeader(page, true);
-            drawTableHeader(page);
+            if (adv.repeatTableHeader && adv.showTableHeaders) {
+              drawTableHeader(page);
+            }
             rowsOnPage = 0;
           }
 
-          page.ctx.fillStyle = ri % 2 === 0 ? '#ffffff' : '#f8fafc';
-          page.ctx.fillRect(pad, page.y, tableW, rowH);
-          page.ctx.strokeStyle = '#cbd5e1';
-          page.ctx.lineWidth = Math.max(0.75, 0.75 * scale);
-          page.ctx.strokeRect(pad, page.y, tableW, rowH);
+          page.ctx.fillStyle = ri % 2 === 0 ? '#ffffff' : brandSurface;
+          page.ctx.fillRect(contentX, page.y, tableW, rowH);
+          page.ctx.strokeStyle = brandBorder;
+          page.ctx.lineWidth = Math.max(0.75, 0.8 * scale);
+          page.ctx.strokeRect(contentX, page.y, tableW, rowH);
 
-          page.ctx.fillStyle = '#0f172a';
+          page.ctx.fillStyle = brandText;
           page.ctx.font = bodyFont;
 
-          tblCols.forEach(function (col, cIdx) {
+          activeCols.forEach(function (col, cIdx) {
             var cellX = colOffsets[cIdx];
             var cellW = colWidths[cIdx];
 
             if (cIdx > 0) {
               page.ctx.beginPath();
-              page.ctx.strokeStyle = '#e2e8f0';
+              page.ctx.strokeStyle = brandBorder;
               page.ctx.moveTo(isRtl ? cellX + cellW : cellX, page.y);
-              page.ctx.lineTo(isRtl ? cellX + cellW : cellX, page.y + rowH);
+              page.ctx.lineTo(isRtl ? cellX + cellW : cellX, page.y + primaryRowH);
               page.ctx.stroke();
             }
 
             page.ctx.save();
             page.ctx.beginPath();
-            page.ctx.rect(cellX + 1, page.y + 1, Math.max(1, cellW - 2), rowH - 2);
+            page.ctx.rect(cellX + 1, page.y + 1, Math.max(1, cellW - 2), primaryRowH - 2);
             page.ctx.clip();
 
             var lines = cellLines[cIdx];
@@ -832,33 +1155,83 @@
             page.ctx.restore();
           });
 
-          page.y += rowH;
+          if (usePortraitStackedCards && detailGridH > 0) {
+            var detTopY = page.y + primaryRowH;
+            page.ctx.save();
+            page.ctx.beginPath();
+            page.ctx.strokeStyle = brandBorder;
+            page.ctx.lineWidth = Math.max(0.75, 0.7 * scale);
+            page.ctx.moveTo(contentX + cellPadX, detTopY);
+            page.ctx.lineTo(contentRightX - cellPadX, detTopY);
+            page.ctx.stroke();
+
+            var detLineH = Math.max(Math.round(cellLineH * 0.92), Math.round(11 * scale));
+            var curY = detTopY + Math.round(5 * scale) + Math.round(baseFontSize * 0.88 * scale);
+            var halfW = Math.floor((tableW - cellPadX * 3) / 2);
+
+            detailBlocks.forEach(function (blk) {
+              if (blk.type === 'full') {
+                var itm = blk.item;
+                var startX = isRtl ? (contentRightX - cellPadX) : (contentX + cellPadX);
+                page.ctx.font = detailLabelFont;
+                page.ctx.fillStyle = brandMuted;
+                drawSmartLine(page.ctx, itm.label, startX, curY, itm.lblW, isRtl);
+                var valAnchor = isRtl ? (startX - itm.lblW) : (startX + itm.lblW);
+                var valMax = Math.max(40, tableW - cellPadX * 2 - itm.lblW);
+                page.ctx.font = detailValFont;
+                page.ctx.fillStyle = brandText;
+                itm.lines.forEach(function (ln, li) {
+                  drawSmartLine(page.ctx, ln, valAnchor, curY + li * detLineH, valMax, isRtl);
+                });
+              } else if (blk.type === 'pair') {
+                blk.items.forEach(function (itm, slotIdx) {
+                  var slotX = isRtl
+                    ? (contentRightX - cellPadX - slotIdx * (halfW + cellPadX))
+                    : (contentX + cellPadX + slotIdx * (halfW + cellPadX));
+                  page.ctx.font = detailLabelFont;
+                  page.ctx.fillStyle = brandMuted;
+                  drawSmartLine(page.ctx, itm.label, slotX, curY, Math.min(itm.lblW, halfW * 0.52), isRtl);
+                  var usedLblW = Math.min(itm.lblW, halfW * 0.52);
+                  var vX = isRtl ? (slotX - usedLblW) : (slotX + usedLblW);
+                  var vMax = Math.max(30, halfW - usedLblW);
+                  page.ctx.font = detailValFont;
+                  page.ctx.fillStyle = brandText;
+                  itm.lines.forEach(function (ln, li) {
+                    drawSmartLine(page.ctx, ln, vX, curY + li * detLineH, vMax, isRtl);
+                  });
+                });
+              }
+              curY += blk.h + Math.round(3 * scale);
+            });
+            page.ctx.restore();
+          }
+
+          page.y += rowH + (usePortraitStackedCards ? Math.round(4 * scale) : 0);
           rowsOnPage += 1;
         }
         page.y += Math.round(plan.sectionGap * scale);
       }
     }
 
-    for (var ti = 0; ti < tables.length; ti++) {
-      var tbItem = tables[ti];
+    for (var ti = 0; ti < effectiveTables.length; ti++) {
+      var tbItem = effectiveTables[ti];
       if (!tbItem || !Array.isArray(tbItem.columns) || !tbItem.columns.length) continue;
       await renderStructuredTable(tbItem.title || '', tbItem.columns, tbItem.rows || [], { kind: tbItem.kind || '' });
     }
 
-    if (columns.length > 0) {
-      await renderStructuredTable('', columns, rows, { kind: 'main' });
+    if (effectiveMainCols.length > 0) {
+      await renderStructuredTable('', effectiveMainCols, rows, { kind: 'main' });
     }
 
-    // 3. Extra Sections (Notes, FollowUps, Extensions, Problems)
+    // 3. Extra Sections (Notes, FollowUps, Extensions, Problems) with Unclipped Line-Break Preservation & Multi-Page Continuation
     if (extraSections.length > 0 && plan.breakBeforeExtra && page.y > Math.round((plan.headerH + plan.headerGap + 40) * scale)) {
       page = newPage();
       drawHeader(page, true);
     }
 
     var extraTitleSz = Math.round(Math.max(10, plan.baseFont * 1.24) * scale);
-    var extraBodySz = Math.round(Math.max(8.0, plan.baseFont * 1.02) * scale);
-    var secLineH = Math.round(plan.extraLineH * scale);
-    var secBlockPad = Math.round(plan.extraBlockPad * scale);
+    var defaultBodyMult = 1.02;
+    var noteScaleMult = adv.notesFontSize === 'small' ? 0.9 : (adv.notesFontSize === 'large' ? 1.2 : 1.04);
     var maxExtraPerPage = Number(plan.maxExtraPerPage || 0);
     var extraCountOnPage = 0;
 
@@ -866,44 +1239,66 @@
       var sec = extraSections[sIdx];
       var secLines = Array.isArray(sec.lines) ? sec.lines : [];
       if (!secLines.length) continue;
+      var isNotesSec = isNoteExtraSection(sec);
+      var mult = isNotesSec ? noteScaleMult : defaultBodyMult;
+      var secBodySz = Math.round(Math.max(8.0, plan.baseFont * mult) * scale);
+      var secLineH = Math.round(plan.extraLineH * (isNotesSec ? (noteScaleMult / 1.02) : 1) * scale);
+      var secBlockPad = Math.round(plan.extraBlockPad * scale);
+
       page = ensureSpace(page, Math.round(38 * scale));
 
-      page.ctx.fillStyle = '#d32228';
+      page.ctx.fillStyle = brandRed;
       page.ctx.font = 'bold ' + extraTitleSz + 'px ' + fontStack;
-      drawSmartLine(page.ctx, sec.title || '', isRtl ? cw - pad : pad, page.y + Math.round(13 * scale), cw - pad * 2, isRtl);
+      drawSmartLine(page.ctx, sec.title || '', isRtl ? contentRightX : contentX, page.y + Math.round(13 * scale), contentW, isRtl);
       page.y += Math.round(Math.max(18, plan.baseFont * 2.2) * scale);
 
-      var maxLineW = cw - pad * 2 - Math.round(22 * scale);
+      var maxLineW = contentW - Math.round(24 * scale);
       for (var liIdx = 0; liIdx < secLines.length; liIdx++) {
-        var rawLine = secLines[liIdx];
-        page.ctx.font = extraBodySz + 'px ' + fontStack;
-        var wrapped = wrapCanvasText(page.ctx, '• ' + String(rawLine), maxLineW, Math.max(3, plan.maxCellLines + 1));
-        var blockH = wrapped.length * secLineH + secBlockPad;
-        if (maxExtraPerPage > 0 && extraCountOnPage >= maxExtraPerPage) {
-          page = newPage();
-          drawHeader(page, true);
-          extraCountOnPage = 0;
-        } else {
-          page = ensureSpace(page, blockH);
-        }
+        var rawLine = String(secLines[liIdx] === undefined || secLines[liIdx] === null ? '' : secLines[liIdx]);
+        var hasNewlines = rawLine.indexOf('\n') !== -1 || rawLine.indexOf('\r') !== -1;
+        var textToWrap = (isNotesSec && hasNewlines) ? rawLine : ('• ' + rawLine);
+        page.ctx.font = secBodySz + 'px ' + fontStack;
 
-        page.ctx.fillStyle = '#f8fafc';
-        page.ctx.fillRect(pad, page.y - Math.round(2 * scale), cw - pad * 2, blockH - Math.round(2 * scale));
-        page.ctx.fillStyle = '#d32228';
-        page.ctx.fillRect(isRtl ? cw - pad - Math.round(3 * scale) : pad, page.y - Math.round(2 * scale), Math.round(3 * scale), blockH - Math.round(2 * scale));
-
-        page.ctx.fillStyle = '#1e293b';
-        wrapped.forEach(function (ln, li) {
-          var anchorX = isRtl ? cw - pad - Math.round(12 * scale) : pad + Math.round(12 * scale);
-          drawSmartLine(page.ctx, ln, anchorX, page.y + Math.round((plan.baseFont * 1.1) * scale) + li * secLineH, maxLineW, isRtl);
+        var wrapped = wrapCanvasText(page.ctx, textToWrap, maxLineW, {
+          unclipped: adv.notesFullUnclipped,
+          preserveLineBreaks: adv.notesPreserveLineBreaks,
+          maxLines: adv.notesFullUnclipped ? 0 : Math.max(3, plan.maxCellLines + 1)
         });
-        page.y += blockH;
-        extraCountOnPage += 1;
+
+        var chunkOffset = 0;
+        while (chunkOffset < wrapped.length) {
+          var singleChunkAvail = (ch - footerReserve) - page.y;
+          var minBlockH = secLineH + secBlockPad;
+          if ((maxExtraPerPage > 0 && extraCountOnPage >= maxExtraPerPage) || singleChunkAvail < minBlockH) {
+            page = newPage();
+            drawHeader(page, true);
+            extraCountOnPage = 0;
+            singleChunkAvail = (ch - footerReserve) - page.y;
+          }
+          var fitCount = Math.max(1, Math.floor((singleChunkAvail - secBlockPad) / Math.max(1, secLineH)));
+          var lineChunk = wrapped.slice(chunkOffset, chunkOffset + fitCount);
+          chunkOffset += lineChunk.length;
+          var blockH = lineChunk.length * secLineH + secBlockPad;
+
+          page.ctx.fillStyle = brandSurface;
+          page.ctx.fillRect(contentX, page.y - Math.round(2 * scale), contentW, blockH - Math.round(2 * scale));
+          page.ctx.fillStyle = brandRed;
+          page.ctx.fillRect(isRtl ? contentRightX - Math.round(3 * scale) : contentX, page.y - Math.round(2 * scale), Math.round(3 * scale), blockH - Math.round(2 * scale));
+
+          page.ctx.fillStyle = brandText;
+          page.ctx.font = secBodySz + 'px ' + fontStack;
+          lineChunk.forEach(function (ln, li) {
+            var anchorX = isRtl ? contentRightX - Math.round(12 * scale) : contentX + Math.round(12 * scale);
+            drawSmartLine(page.ctx, ln, anchorX, page.y + Math.round((plan.baseFont * mult * 1.05) * scale) + li * secLineH, maxLineW, isRtl);
+          });
+          page.y += blockH;
+          extraCountOnPage += 1;
+        }
       }
       page.y += Math.round(Math.max(6, plan.sectionGap * 0.75) * scale);
     }
 
-    // 4. Charts Grid
+    // 4. Charts Grid (Portrait: 1 full-width col; Landscape: 2-col grid)
     if (validCharts.length > 0) {
       throwIfAborted(signal);
       var loadedCharts = await Promise.all(validCharts.map(function (chImg) {
@@ -922,8 +1317,10 @@
           drawHeader(page, true);
         }
         var chartGap = Math.round(plan.chartGap * scale);
-        var colsCharts = Math.min(readyCharts.length, Math.max(1, Number(plan.chartCols || (readyCharts.length > 1 ? 2 : 1))));
-        var slotW = (cw - pad * 2 - (colsCharts - 1) * chartGap) / colsCharts;
+        var colsCharts = isPortrait
+          ? 1
+          : Math.min(readyCharts.length, Math.max(1, Number(plan.chartCols || (readyCharts.length > 1 ? 2 : 1))));
+        var slotW = (contentW - (colsCharts - 1) * chartGap) / colsCharts;
         var cardChartH = Math.round(plan.chartH * scale);
         var chartTitleSz = Math.round(Math.max(8.8, plan.baseFont * 1.06) * scale);
 
@@ -932,15 +1329,18 @@
           var pairCharts = readyCharts.slice(chIdx, chIdx + colsCharts);
           pairCharts.forEach(function (item, idxInPair) {
             var bx = isRtl
-              ? cw - pad - (idxInPair + 1) * slotW - idxInPair * chartGap
-              : pad + idxInPair * (slotW + chartGap);
+              ? contentRightX - (idxInPair + 1) * slotW - idxInPair * chartGap
+              : contentX + idxInPair * (slotW + chartGap);
             page.ctx.fillStyle = '#ffffff';
-            page.ctx.strokeStyle = '#cbd5e1';
-            page.ctx.lineWidth = Math.max(1, 1 * scale);
+            page.ctx.strokeStyle = brandBorder;
+            page.ctx.lineWidth = Math.max(1, scale);
             page.ctx.fillRect(bx, page.y, slotW, cardChartH);
             page.ctx.strokeRect(bx, page.y, slotW, cardChartH);
 
-            page.ctx.fillStyle = '#313232';
+            page.ctx.fillStyle = brandRed;
+            page.ctx.fillRect(bx, page.y, slotW, Math.max(2, Math.round(2.5 * scale)));
+
+            page.ctx.fillStyle = brandDark;
             page.ctx.font = 'bold ' + chartTitleSz + 'px ' + fontStack;
             drawSmartLine(page.ctx, item.title, isRtl ? bx + slotW - Math.round(10 * scale) : bx + Math.round(10 * scale), page.y + Math.round(18 * scale), slotW - Math.round(20 * scale), isRtl);
 
@@ -962,12 +1362,12 @@
       }
     }
 
-    // 5. Footers + Real File Compression & Resource Optimization
+    // 5. Footers, Page Numbers + Real Compression
     var totalPages = pages.length;
     var pageImages = [];
-    var footerLineY = ch - Math.round(Math.max(20, plan.footerReserve * 0.78) * scale);
-    var footerTextY = ch - Math.round(Math.max(8, plan.footerReserve * 0.34) * scale);
-    var footerFontSz = Math.round(Math.max(8.0, plan.baseFont * 0.96) * scale);
+    var footerLineY = ch - Math.round(Math.max(20, (footerReserve / scale) * 0.78) * scale);
+    var footerTextY = ch - Math.round(Math.max(8, (footerReserve / scale) * 0.34) * scale);
+    var footerFontSz = Math.round(Math.max(8.0, plan.baseFont * 0.94) * scale);
     var imgCompressionMode = plan.imageCompression || 'MEDIUM';
     var jpegQuality = Number(plan.jpegQuality || 0.76);
 
@@ -978,20 +1378,26 @@
         throwIfAborted(signal);
       }
       var p = pages[idx];
-      p.ctx.strokeStyle = '#e2e8f0';
-      p.ctx.lineWidth = Math.max(1, 1 * scale);
-      p.ctx.beginPath();
-      p.ctx.moveTo(pad, footerLineY);
-      p.ctx.lineTo(cw - pad, footerLineY);
-      p.ctx.stroke();
+      if (adv.showFooter || adv.showPageNumbers) {
+        p.ctx.strokeStyle = brandBorder;
+        p.ctx.lineWidth = Math.max(1, scale);
+        p.ctx.beginPath();
+        p.ctx.moveTo(contentX, footerLineY);
+        p.ctx.lineTo(contentRightX, footerLineY);
+        p.ctx.stroke();
 
-      p.ctx.fillStyle = '#64748b';
-      p.ctx.font = footerFontSz + 'px ' + fontStack;
-      p.ctx.textAlign = 'center';
-      var footerLabel = lang === 'en'
-        ? ('RENTAL GATE CRM — Page ' + (idx + 1) + ' of ' + totalPages)
-        : ('RENTAL GATE CRM — صفحة ' + (idx + 1) + ' من ' + totalPages);
-      p.ctx.fillText(footerLabel, cw / 2, footerTextY);
+        var footerParts = [];
+        if (adv.showFooter) footerParts.push('RENTAL GATE CRM');
+        if (adv.showPageNumbers) {
+          footerParts.push(lang === 'en'
+            ? ('Page ' + (idx + 1) + ' of ' + totalPages)
+            : ('صفحة ' + (idx + 1) + ' من ' + totalPages));
+        }
+        p.ctx.fillStyle = brandMuted;
+        p.ctx.font = footerFontSz + 'px ' + fontStack;
+        p.ctx.textAlign = 'center';
+        p.ctx.fillText(footerParts.join('  —  '), contentX + contentW / 2, footerTextY);
+      }
 
       if (idx > 0) doc.addPage(paperSize, orientation);
       var jpegData = p.canvas.toDataURL('image/jpeg', jpegQuality);
@@ -1126,7 +1532,15 @@
           '<div><h2 class="section-title">' + t('nav_reports') + '</h2><p class="section-subtitle">' + t('reports_subtitle') + '</p></div>' +
           '<div class="toolbar-row" style="margin-bottom:0;">' +
             ((root.RGHandover && canUseRepHandover) ? '<button type="button" class="btn" id="btn-shift-handover-modal">' + (ctx.lang === 'en' ? 'Shift Handover (PDF)' : 'ملخص تسليم الوردية (PDF)') + '</button>' : '') +
-            ((canUseRepExcel || canUseRepPdf) ? '<button type="button" class="btn btn-primary" id="btn-open-export-modal">' + t('export_settings_btn') + '</button>' : '') +
+            ((root.RGExportMenu && (canUseRepPdf || canUseRepExcel))
+              ? root.RGExportMenu.renderHtml({
+                  wrapId: 'rep-export-wrap',
+                  btnId: 'rep-export-btn',
+                  lang: ctx.lang,
+                  canPdf: canUseRepPdf,
+                  canExcel: canUseRepExcel
+                })
+              : (canUseRepPdf ? '<button type="button" class="btn btn-primary" id="btn-rep-pdf-studio">' + (ctx.lang === 'en' ? 'Export' : 'تصدير') + '</button>' : '')) +
           '</div>' +
         '</div>' +
         '<div class="segmented-control" id="report-type-tabs" style="margin-bottom:16px;">' +
@@ -1579,10 +1993,192 @@
       }
     });
 
-    var openExpModalBtn = document.getElementById('btn-open-export-modal');
-    if (openExpModalBtn) {
-      openExpModalBtn.addEventListener('click', function () {
-        openExportConfigModal(ctx, state, employees, facets);
+    function formatPeriodText(dFrom, dTo, isEnR) {
+      if (dFrom && dTo) return dFrom + ' → ' + dTo;
+      if (dFrom) return (isEnR ? 'From ' : 'من ') + dFrom;
+      if (dTo) return (isEnR ? 'Until ' : 'حتى ') + dTo;
+      return isEnR ? 'All Dates' : 'جميع التواريخ';
+    }
+
+    function buildReportsFilterSummary(isEnR) {
+      var parts = [];
+      if (state.company) parts.push((isEnR ? 'Company: ' : 'الشركة: ') + state.company);
+      if (state.branch) parts.push((isEnR ? 'Branch: ' : 'الفرع: ') + state.branch);
+      if (state.employeeId) {
+        var matchedEmp = employees.find(function (e) { return e && e.id === state.employeeId; });
+        parts.push((isEnR ? 'Employee: ' : 'الموظف: ') + (matchedEmp ? matchedEmp.name : state.employeeId));
+      }
+      return parts.join(' · ');
+    }
+
+    async function triggerReportPdfStudio() {
+      var coreR = root.RGCrmCore;
+      var isEnR = ctx.lang === 'en';
+      var repTitleLabel = getReportLabel(state.reportType, ctx.lang);
+      var rowsSnap = Array.isArray(state.rows) ? state.rows.slice() : [];
+      var activeCols = (coreR && coreR.getReportColumns)
+        ? coreR.getReportColumns(state.reportType, rowsSnap)
+        : RESERVATION_COLUMNS;
+      var userNow = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+      var chartImgs = [];
+      var ch1 = captureChartForPdf(document.getElementById('report-chart-primary'), isEnR ? 'Report Distribution' : 'توزيع بيانات التقرير', {});
+      var ch2 = captureChartForPdf(document.getElementById('report-chart-secondary'), isEnR ? 'Distribution by Company / Priority' : 'التوزيع حسب الشركة / الأولوية', {});
+      if (ch1) chartImgs.push(ch1);
+      if (ch2) chartImgs.push(ch2);
+
+      var scopeKey = 'reports_' + state.reportType;
+      var pdfTitle = isEnR ? (repTitleLabel + ' Report — Rental Gate') : ('تقرير ' + repTitleLabel + ' — Rental Gate');
+      var pdfFile = 'rental-gate-' + state.reportType + '.pdf';
+
+      try {
+        var fuSections = [];
+        if (state.reportType !== 'followups_log') {
+          var fuRes = await root.RGApi.callApi('getTeamFollowUps', {
+            employeeId: state.employeeId || '',
+            dateFrom: state.dateFrom || '',
+            dateTo: state.dateTo || '',
+            silentRefresh: true
+          });
+          if (fuRes && fuRes.success && fuRes.data && Array.isArray(fuRes.data.items) && fuRes.data.items.length) {
+            fuSections.push({
+              title: (isEnR ? 'Recent Follow-Ups & Notes (' : 'أحدث المتابعات والملاحظات (') + Math.min(20, fuRes.data.items.length) + ')',
+              isNotes: true,
+              lines: fuRes.data.items.slice(0, 20).map(function (f) {
+                var d = (coreR && coreR.formatDisplayDate) ? coreR.formatDisplayDate(f.followUpDate) : f.followUpDate;
+                return d + ' | ' + f.reservationNumber + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (f.notes ? ('\n' + f.notes) : '');
+              })
+            });
+          }
+        }
+        await openPdfStudio({
+          ctx: ctx,
+          title: pdfTitle,
+          filename: pdfFile,
+          scopeKey: scopeKey,
+          availableColumns: activeCols,
+          summaryItems: [
+            { label: isEnR ? 'Report Type' : 'نوع التقرير', value: repTitleLabel },
+            { label: isEnR ? 'Records Count' : 'عدد السجلات', value: rowsSnap.length },
+            { label: isEnR ? 'Company Filter' : 'الشركة', value: state.company || (isEnR ? 'All' : 'الكل') },
+            { label: isEnR ? 'Branch Filter' : 'الفرع', value: state.branch || (isEnR ? 'All' : 'الكل') }
+          ],
+          columns: activeCols,
+          rows: rowsSnap,
+          extraSections: fuSections,
+          chartImages: chartImgs,
+          exporterName: userNow ? userNow.name : ''
+        });
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        ctx.toast((err && err.message) || (isEnR ? 'Failed to open PDF preview.' : 'تعذر فتح معاينة PDF.'), true);
+      }
+    }
+
+    async function triggerReportExcelExport() {
+      var coreR = root.RGCrmCore;
+      var isEnR = ctx.lang === 'en';
+      var repTitleLabel = getReportLabel(state.reportType, ctx.lang);
+      var dFrom = (document.getElementById('rep-from') && document.getElementById('rep-from').value) || state.dateFrom || '';
+      var dTo = (document.getElementById('rep-to') && document.getElementById('rep-to').value) || state.dateTo || '';
+      var empFilter = (document.getElementById('rep-emp') && document.getElementById('rep-emp').value) || state.employeeId || '';
+      var compFilter = (document.getElementById('rep-company') && document.getElementById('rep-company').value) || state.company || '';
+      var brFilter = (document.getElementById('rep-branch') && document.getElementById('rep-branch').value) || state.branch || '';
+
+      var rows = Array.isArray(state.rows) && state.rows.length > 0 ? state.rows.slice() : null;
+      if (!rows) {
+        var rExp = await root.RGApi.callApi('getReports', {
+          reportType: state.reportType,
+          dateFrom: dFrom,
+          dateTo: dTo,
+          company: compFilter,
+          branch: brFilter,
+          employeeId: empFilter,
+          logExport: true
+        });
+        rows = (rExp && rExp.success && rExp.data && Array.isArray(rExp.data.rows)) ? rExp.data.rows : [];
+      }
+      var headers = (coreR && coreR.getReportColumns)
+        ? coreR.getReportColumns(state.reportType, rows)
+        : RESERVATION_COLUMNS;
+      var periodStr = formatPeriodText(dFrom, dTo, isEnR);
+      var filtersStr = buildReportsFilterSummary(isEnR);
+      var reportTitleFull = isEnR ? (repTitleLabel + ' Report') : ('تقرير ' + repTitleLabel);
+
+      var sheets = [{
+        name: repTitleLabel,
+        title: reportTitleFull,
+        periodText: periodStr,
+        filtersText: filtersStr,
+        headers: headers,
+        rows: rows
+      }];
+
+      if (state.reportType !== 'followups_log') {
+        var fuRes = await root.RGApi.callApi('getTeamFollowUps', {
+          employeeId: empFilter || '',
+          dateFrom: dFrom || '',
+          dateTo: dTo || '',
+          silentRefresh: true
+        });
+        if (fuRes && fuRes.success && fuRes.data && Array.isArray(fuRes.data.items) && fuRes.data.items.length) {
+          var fuHeaders = (coreR && coreR.getReportColumns)
+            ? coreR.getReportColumns('followups_log', fuRes.data.items)
+            : [
+                { key: 'reservationNumber', label: isEnR ? 'Booking #' : 'رقم الحجز', formatType: 'ltr' },
+                { key: 'customerName', label: isEnR ? 'Customer' : 'العميل' },
+                { key: 'employeeName', label: isEnR ? 'Employee' : 'الموظف' },
+                { key: 'status', label: isEnR ? 'Status' : 'الحالة' },
+                { key: 'action', label: isEnR ? 'Action' : 'الإجراء' },
+                { key: 'notes', label: isEnR ? 'Notes' : 'الملاحظات' },
+                { key: 'followUpDate', label: isEnR ? 'Date' : 'التاريخ', formatType: 'date' },
+                { key: 'followUpTime', label: isEnR ? 'Time' : 'الوقت', formatType: 'time' }
+              ];
+          sheets.push({
+            name: isEnR ? 'Follow-Ups Log' : 'سجل المتابعات',
+            title: isEnR ? 'Team Follow-Ups Log' : 'سجل متابعات الفريق',
+            periodText: periodStr,
+            filtersText: filtersStr,
+            headers: fuHeaders,
+            rows: fuRes.data.items
+          });
+        }
+      }
+
+      await exportExcelWorkbook(sheets, 'rental-gate-' + state.reportType + '.xlsx', {
+        lang: ctx.lang,
+        title: reportTitleFull,
+        periodText: periodStr,
+        filtersText: filtersStr
+      });
+      ctx.toast(isEnR ? 'Report exported to Excel successfully.' : 'تم تصدير التقرير إلى ملف Excel بنجاح.');
+    }
+
+    var repExportWrap = document.getElementById('rep-export-wrap');
+    if (repExportWrap && root.RGExportMenu) {
+      root.RGExportMenu.bind(repExportWrap, {
+        onPdf: function (triggerBtn) {
+          if (ctx.withActionLock) {
+            return ctx.withActionLock(triggerBtn, 'reports:pdfStudio', triggerReportPdfStudio);
+          }
+          return triggerReportPdfStudio();
+        },
+        onExcel: function (triggerBtn) {
+          if (ctx.withActionLock) {
+            return ctx.withActionLock(triggerBtn, 'reports:exportExcel', triggerReportExcelExport);
+          }
+          return triggerReportExcelExport();
+        },
+        onError: function (err) {
+          ctx.toast((err && err.message) || (ctx.lang === 'en' ? 'Export failed.' : 'تعذر تنفيذ التصدير.'), true);
+        }
+      });
+    }
+
+    var repPdfStudioBtn = document.getElementById('btn-rep-pdf-studio');
+    if (repPdfStudioBtn) {
+      repPdfStudioBtn.addEventListener('click', function () {
+        if (ctx.withActionLock) ctx.withActionLock(repPdfStudioBtn, 'reports:pdfStudio', triggerReportPdfStudio);
+        else triggerReportPdfStudio();
       });
     }
 
@@ -1688,14 +2284,15 @@
       sheetCountOptions += '<option value="' + sNum + '"' + (sNum === 1 ? ' selected' : '') + '>' + sLabel + '</option>';
     }
 
+    var pdfScopeKey = 'reports_' + state.reportType;
     var initialPdfSettings = (root.RGPdfControls && root.RGPdfControls.createDefaultState)
-      ? root.RGPdfControls.createDefaultState({ paperSize: 'a4', orientation: 'landscape' })
+      ? root.RGPdfControls.createDefaultState({ paperSize: 'a4', orientation: 'landscape' }, pdfScopeKey)
       : { targetPages: 3, preset: 'balanced', optimizeFileSize: true, quality: 'balanced', paperSize: 'a4', orientation: 'landscape' };
 
     var initRows = Array.isArray(state.rows) ? state.rows : [];
     var initStats = {
       rowCount: initRows.length,
-      columnCount: Math.min(initialPdfSettings.orientation === 'portrait' ? 7 : 9, defaultSelectedKeys.length || 6),
+      columnCount: defaultSelectedKeys.length || 6,
       kpiCount: 2,
       wideSummaryCount: 0,
       extraSectionsCount: state.reportType !== 'followups_log' ? 1 : 0,
@@ -1717,13 +2314,6 @@
             root.RGCrmCore.PROBLEM_PRIORITIES.map(function (p) { return '<option value="' + p + '">' + p + '</option>'; }).join('') +
           '</select></div>' +
         '</div>' +
-        '<div class="form-group"><span class="form-label">' + (isEn ? 'Included Columns' : 'الأعمدة المطلوبة') + ' (' + reportTitleAr + ')</span><div class="checkbox-grid">' +
-          activeCols.map(function (col) {
-            var checked = defaultSelectedKeys.indexOf(col.key) !== -1 ? 'checked' : '';
-            var lbl = (ctx.lang === 'en' && col.labelEn) ? col.labelEn : col.label;
-            return '<label class="checkbox-item"><input type="checkbox" class="exp-col-chk" value="' + col.key + '" ' + checked + '> ' + lbl + '</label>';
-          }).join('') +
-        '</div></div>' +
         '<div class="checkbox-grid" style="margin-bottom:10px;">' +
           '<label class="checkbox-item"><input type="checkbox" id="exp-inc-notes" checked> ' + (isEn ? 'Include Notes' : 'تضمين الملاحظات') + '</label>' +
           '<label class="checkbox-item"><input type="checkbox" id="exp-inc-fu" checked> ' + (isEn ? 'Include Follow-ups' : 'تضمين سجل المتابعات') + '</label>' +
@@ -1746,6 +2336,8 @@
           idPrefix: 'rg-rep-pdfc',
           lang: ctx.lang,
           settings: initialPdfSettings,
+          columns: activeCols,
+          scopeKey: pdfScopeKey,
           contentStats: initStats,
           advancedExtraHtml: advancedModalExtras
         })
@@ -1759,7 +2351,7 @@
       '<div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">' +
         '<div class="modal-panel modal-panel-wide">' +
           '<div class="modal-header">' +
-            '<h3 class="modal-title" id="export-modal-title">' + (isEn ? 'Export & PDF Optimization — ' : 'إعدادات التقرير والتصدير الذكي — ') + reportTitleAr + '</h3>' +
+            '<h3 class="modal-title" id="export-modal-title">' + (isEn ? 'Export & PDF Studio — ' : 'إعدادات التقرير وتصدير PDF — ') + reportTitleAr + '</h3>' +
             '<button type="button" class="btn btn-sm" id="exp-close">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
           '</div>' +
           pdfControlsHtml +
@@ -1776,6 +2368,8 @@
       ? root.RGPdfControls.mount(pdfPanelEl, {
           lang: ctx.lang,
           initialSettings: initialPdfSettings,
+          columns: activeCols,
+          scopeKey: pdfScopeKey,
           contentStats: initStats
         })
       : null;
@@ -1783,13 +2377,14 @@
     function refreshEstimatedStatsFromModal() {
       if (!pdfCtrl) return;
       var curSettings = pdfCtrl.getSettings();
-      var maxCols = curSettings.orientation === 'portrait' ? 7 : 9;
-      var chosenCount = modalRoot.querySelectorAll('.exp-col-chk:checked').length || 6;
+      var chosenCount = (Array.isArray(curSettings.selectedColumns) && curSettings.selectedColumns.length)
+        ? curSettings.selectedColumns.length
+        : (activeCols.length || 6);
       var incCharts = document.getElementById('exp-inc-charts') ? document.getElementById('exp-inc-charts').checked : true;
       var incFu = document.getElementById('exp-inc-fu') ? document.getElementById('exp-inc-fu').checked : true;
       pdfCtrl.setContentStats({
         rowCount: (state.rows || []).length,
-        columnCount: Math.min(maxCols, chosenCount),
+        columnCount: chosenCount,
         kpiCount: 2,
         wideSummaryCount: 0,
         extraSectionsCount: (incFu && state.reportType !== 'followups_log') ? 1 : 0,
@@ -1798,7 +2393,7 @@
       });
     }
 
-    modalRoot.querySelectorAll('.exp-col-chk, #exp-inc-notes, #exp-inc-fu, #exp-inc-charts').forEach(function (el) {
+    modalRoot.querySelectorAll('#exp-inc-notes, #exp-inc-fu, #exp-inc-charts').forEach(function (el) {
       el.addEventListener('change', refreshEstimatedStatsFromModal);
     });
 
@@ -1829,16 +2424,23 @@
       return (res.success && res.data.rows) || state.rows || [];
     }
 
-    function getSelectedHeaders(rows, includeNotes) {
-      var chosenKeys = Array.from(modalRoot.querySelectorAll('.exp-col-chk:checked')).map(function (el) { return el.value; });
+    function getSelectedHeaders(rows, includeNotes, ctrlSettings) {
       var schemaCols = (core && core.getReportColumns)
         ? core.getReportColumns(state.reportType, rows)
         : RESERVATION_COLUMNS;
-      var filtered = schemaCols.filter(function (c) {
-        if (!includeNotes && (c.key === 'notes' || c.key === 'lastUpdateText')) return false;
-        return chosenKeys.length ? chosenKeys.indexOf(c.key) !== -1 : true;
+      var curSt = ctrlSettings || (pdfCtrl ? pdfCtrl.getSettings() : initialPdfSettings);
+      var filteredByNotes = schemaCols.filter(function (c) {
+        return includeNotes || (c.key !== 'notes' && c.key !== 'lastUpdateText');
       });
-      return filtered.length ? filtered : schemaCols.slice(0, 6);
+      if (core && typeof core.applyPdfColumnSelectionAndOrder === 'function') {
+        return core.applyPdfColumnSelectionAndOrder(
+          filteredByNotes,
+          curSt.selectedColumns,
+          curSt.columnOrder,
+          curSt.autoColumnWidths ? null : curSt.columnWidths
+        );
+      }
+      return filteredByNotes;
     }
 
     var expExcelBtn = document.getElementById('exp-excel-btn');
@@ -1854,7 +2456,12 @@
           var headers = getSelectedHeaders(rows, incNotes);
           var sheets = [{ name: reportTitleAr, headers: headers, rows: rows }];
           if (incFu && state.reportType !== 'followups_log') {
-            var fuRes = await root.RGApi.callApi('getTeamFollowUps', {});
+            var expEmpValX = (document.getElementById('exp-emp') || {}).value || '';
+            var fuRes = await root.RGApi.callApi('getTeamFollowUps', {
+              employeeId: expEmpValX || state.employeeId || '',
+              dateFrom: state.dateFrom || '',
+              dateTo: state.dateTo || ''
+            });
             if (fuRes.success && fuRes.data.items.length) {
               var fuHeaders = (core && core.getReportColumns)
                 ? core.getReportColumns('followups_log', fuRes.data.items).filter(function (c) {
@@ -1902,7 +2509,6 @@
       var incFu = document.getElementById('exp-inc-fu').checked;
       var incCharts = document.getElementById('exp-inc-charts').checked;
       var empFilterVal = document.getElementById('exp-emp').value;
-      var selectedColKeys = Array.from(modalRoot.querySelectorAll('.exp-col-chk:checked')).map(function (el) { return el.value; });
       var pdfFilename = 'rental-gate-' + state.reportType + '.pdf';
 
       var cachedRowsPromise = null;
@@ -1931,15 +2537,20 @@
         var extraSections = [];
         if (incFu && state.reportType !== 'followups_log') {
           if (!cachedFuPromise) {
-            cachedFuPromise = root.RGApi.callApi('getTeamFollowUps', { employeeId: empFilterVal });
+            cachedFuPromise = root.RGApi.callApi('getTeamFollowUps', {
+              employeeId: empFilterVal || state.employeeId || '',
+              dateFrom: state.dateFrom || '',
+              dateTo: state.dateTo || ''
+            });
           }
           var fuRes = await cachedFuPromise;
           if (fuRes.success && Array.isArray(fuRes.data.items) && fuRes.data.items.length) {
             extraSections.push({
               title: (isEn ? 'Recent Follow-Ups (' : 'أحدث المتابعات المسجلة (') + Math.min(25, fuRes.data.items.length) + (isEn ? ' of ' : ' من ') + fuRes.data.items.length + ')',
+              isNotes: true,
               lines: fuRes.data.items.slice(0, 25).map(function (f) {
                 var d = (core && core.formatDisplayDate) ? core.formatDisplayDate(f.followUpDate) : f.followUpDate;
-                return d + ' | ' + f.reservationNumber + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (incNotes && f.notes ? ' — ' + f.notes : '');
+                return d + ' | ' + f.reservationNumber + ' | ' + f.employeeName + ' [' + f.status + ']: ' + f.action + (incNotes && f.notes ? ('\n' + f.notes) : '');
               })
             });
           }
@@ -1947,28 +2558,17 @@
         return { rows: rows, extraSections: extraSections };
       }
 
-      function computeHeadersForOrient(rows, orientVal) {
-        var maxCols = orientVal === 'portrait' ? 7 : 9;
-        var schemaCols = (core && core.getReportColumns)
-          ? core.getReportColumns(state.reportType, rows)
-          : RESERVATION_COLUMNS;
-        var filtered = schemaCols.filter(function (c) {
-          if (!incNotes && (c.key === 'notes' || c.key === 'lastUpdateText')) return false;
-          return selectedColKeys.length ? selectedColKeys.indexOf(c.key) !== -1 : true;
-        });
-        return (filtered.length ? filtered : schemaCols.slice(0, 6)).slice(0, maxCols);
-      }
-
       return {
         pdfTitle: pdfTitle,
         pdfFilename: pdfFilename,
         baseSettings: baseSettings,
         getContentStats: function (s) {
-          var orient = (s && s.orientation) || baseSettings.orientation;
-          var maxCols = orient === 'portrait' ? 7 : 9;
+          var colsChosen = (s && Array.isArray(s.selectedColumns) && s.selectedColumns.length)
+            ? s.selectedColumns.length
+            : (activeCols.length || 6);
           return {
             rowCount: (state.rows || []).length,
-            columnCount: Math.min(maxCols, selectedColKeys.length || 6),
+            columnCount: colsChosen,
             kpiCount: 2,
             wideSummaryCount: 0,
             extraSectionsCount: (incFu && state.reportType !== 'followups_log') ? 1 : 0,
@@ -1978,23 +2578,18 @@
         },
         generate: async function (liveSettings, signal, previewMode) {
           var s = Object.assign({}, baseSettings, liveSettings || {});
+          if (!incNotes) s.showNotes = false;
           var ds = await resolveDataset();
           throwIfAborted(signal);
-          var headers = computeHeadersForOrient(ds.rows, s.orientation);
+          var headers = getSelectedHeaders(ds.rows, incNotes && s.showNotes !== false, s);
           var user = root.RGAuth.getUser();
           var qProf = (core && core.PDF_QUALITY_PROFILES && s.optimizeFileSize)
             ? (core.PDF_QUALITY_PROFILES[s.quality] || core.PDF_QUALITY_PROFILES.balanced)
             : (core && core.PDF_QUALITY_PROFILES ? core.PDF_QUALITY_PROFILES.unoptimized : null);
           var chartImgs = getCachedChartImages(qProf);
 
-          return exportArabicPdfDocument({
+          return exportArabicPdfDocument(Object.assign({}, s, {
             title: pdfTitle,
-            paperSize: s.paperSize,
-            orientation: s.orientation,
-            targetPages: s.targetPages,
-            preset: s.preset,
-            optimizeFileSize: s.optimizeFileSize,
-            quality: s.quality,
             lang: ctx.lang,
             exporterName: user ? user.name : '',
             summaryItems: [
@@ -2008,7 +2603,7 @@
             filename: pdfFilename,
             signal: signal,
             previewOnly: Boolean(previewMode)
-          });
+          }));
         }
       };
     }
@@ -2023,6 +2618,8 @@
               await root.RGPdfPreview.open({
                 title: snap.pdfTitle,
                 filename: snap.pdfFilename,
+                scopeKey: pdfScopeKey,
+                availableColumns: activeCols,
                 initialSettings: snap.baseSettings,
                 getContentStats: snap.getContentStats,
                 generatePdf: function (liveSettings, signal) {
@@ -2085,6 +2682,104 @@
     }
   }
 
+  async function openPdfStudio(cfg) {
+    var opts = cfg || {};
+    var ctx = opts.ctx || {};
+    var lang = opts.lang || ctx.lang || (document.documentElement.getAttribute('lang') === 'en' ? 'en' : 'ar');
+    var isEn = lang === 'en';
+    var user = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
+    var coreR = root.RGCrmCore;
+    if (coreR && typeof coreR.canUserUseActionButton === 'function' && user && !coreR.canUserUseActionButton(user, 'act_export_pdf')) {
+      if (ctx.toast) ctx.toast(isEn ? 'You do not have permission to export PDF.' : 'ليست لديك صلاحية تصدير ملفات PDF.', true);
+      return null;
+    }
+
+    var cols = Array.isArray(opts.availableColumns)
+      ? opts.availableColumns
+      : (Array.isArray(opts.columns) ? opts.columns : []);
+    var rows = Array.isArray(opts.rows) ? opts.rows : [];
+    var extraSections = Array.isArray(opts.extraSections) ? opts.extraSections : [];
+    var summaryItems = Array.isArray(opts.summaryItems) ? opts.summaryItems : [];
+    var chartImages = Array.isArray(opts.chartImages) ? opts.chartImages : [];
+    var scopeKey = opts.scopeKey || '';
+    var title = opts.title || (isEn ? 'RENTAL GATE CRM Report' : 'تقرير RENTAL GATE CRM');
+    var filename = opts.filename || 'rental-gate-report.pdf';
+
+    var initSettings = (root.RGPdfControls && root.RGPdfControls.createDefaultState)
+      ? root.RGPdfControls.createDefaultState(opts.initialSettings, scopeKey)
+      : Object.assign({ paperSize: 'a4', orientation: 'landscape' }, opts.initialSettings || {});
+
+    var statsFn = typeof opts.getContentStats === 'function'
+      ? opts.getContentStats
+      : function (s) {
+          var selLen = (s && Array.isArray(s.selectedColumns) && s.selectedColumns.length)
+            ? s.selectedColumns.length
+            : cols.length;
+          return {
+            rowCount: rows.length,
+            columnCount: selLen,
+            kpiCount: summaryItems.length,
+            wideSummaryCount: 0,
+            extraSectionsCount: extraSections.length,
+            extraLinesCount: extraSections.reduce(function (sum, sec) {
+              return sum + (Array.isArray(sec && sec.lines) ? sec.lines.length : 0);
+            }, 0),
+            chartCount: chartImages.length
+          };
+        };
+
+    var buildDocConfig = function (liveSettings, signal, previewMode) {
+      var merged = Object.assign({}, initSettings, liveSettings || {});
+      return Object.assign({}, merged, {
+        title: title,
+        filename: filename,
+        lang: lang,
+        dir: isEn ? 'ltr' : 'rtl',
+        exporterName: opts.exporterName || (user ? user.name : ''),
+        summaryItems: summaryItems,
+        columns: Array.isArray(opts.columns) ? opts.columns : cols,
+        rows: rows,
+        tables: Array.isArray(opts.tables) ? opts.tables : [],
+        extraSections: extraSections,
+        chartImages: chartImages,
+        timeFormat: opts.timeFormat,
+        signal: signal,
+        previewOnly: Boolean(previewMode)
+      });
+    };
+
+    if (root.RGPdfPreview && typeof root.RGPdfPreview.open === 'function') {
+      return root.RGPdfPreview.open({
+        title: title,
+        filename: filename,
+        scopeKey: scopeKey,
+        availableColumns: cols,
+        initialSettings: initSettings,
+        getContentStats: statsFn,
+        generatePdf: function (liveSettings, signal) {
+          return exportArabicPdfDocument(buildDocConfig(liveSettings, signal, true));
+        },
+        onDownloadToast: function (meta) {
+          var kb = Math.max(1, Math.round((meta.sizeBytes || 0) / 1024));
+          if (ctx.toast) {
+            ctx.toast(isEn
+              ? ('Downloaded PDF (' + meta.pages + ' pages · ' + kb + ' KB).')
+              : ('تم تحميل ملف PDF (' + meta.pages + ' صفحة · ' + kb + ' KB).'));
+          }
+        }
+      });
+    }
+
+    var meta = await exportArabicPdfDocument(buildDocConfig(initSettings, null, false));
+    var kb = Math.max(1, Math.round((meta.sizeBytes || 0) / 1024));
+    if (ctx.toast) {
+      ctx.toast(isEn
+        ? ('Exported PDF (' + meta.pages + ' pages · ' + kb + ' KB).')
+        : ('تم تصدير ملف PDF (' + meta.pages + ' صفحة · ' + kb + ' KB).'));
+    }
+    return meta;
+  }
+
   function refreshTheme() {
     var viewEl = document.querySelector('#page-content .route-view');
     if (viewEl && typeof viewEl._rgRefreshReportCharts === 'function') {
@@ -2100,6 +2795,7 @@
     readExcelWorkbookRows: readExcelWorkbookRows,
     exportExcelWorkbook: exportExcelWorkbook,
     exportArabicPdfDocument: exportArabicPdfDocument,
+    openPdfStudio: openPdfStudio,
     captureChartForPdf: captureChartForPdf,
     RESERVATION_COLUMNS: RESERVATION_COLUMNS
   };

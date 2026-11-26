@@ -98,6 +98,8 @@
     var currentUser = (root.RGAuth && root.RGAuth.getUser) ? root.RGAuth.getUser() : null;
     var canViewPrbRates = !core.canUserViewSubSection || core.canUserViewSubSection(currentUser, 'sub_view_prb_rates');
     var canCloseTicketBtn = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_close_delete_ticket');
+    var canExportPdf = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_pdf');
+    var canExportExcel = !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_excel');
     var RATES_VISIBLE_STORAGE_KEY = core.PROBLEM_RATE_VISIBILITY_STORAGE_KEY || 'rg_crm_problems_rate_visible_v1';
     var isRatesVisible = canViewPrbRates && (function () {
       if (typeof ctx.state.problemsRateVisible === 'boolean') return ctx.state.problemsRateVisible;
@@ -146,11 +148,23 @@
             '<h2 class="section-title">' + t('nav_problems') + '</h2>' +
             '<p class="section-subtitle">' + (isEn ? 'Matching problems total: ' : 'إجمالي المشكلات المطابقة: ') + '<strong class="tabular-nums" id="prb-total-count">' + items.length + '</strong></p>' +
           '</div>' +
-          (canViewPrbRates ? (
+          ((canViewPrbRates || canExportPdf || canExportExcel) ? (
             '<div class="toolbar-row" style="margin-bottom:0;">' +
-              '<button type="button" class="btn btn-sm rg-rate-toggle-btn' + (isRatesVisible ? ' is-visible' : '') + '" id="prb-toggle-rates-btn" aria-expanded="' + (isRatesVisible ? 'true' : 'false') + '" aria-controls="prb-rates-card">' +
-                getToggleBtnHtml(isRatesVisible) +
-              '</button>' +
+              (canViewPrbRates ? (
+                '<button type="button" class="btn btn-sm rg-rate-toggle-btn' + (isRatesVisible ? ' is-visible' : '') + '" id="prb-toggle-rates-btn" aria-expanded="' + (isRatesVisible ? 'true' : 'false') + '" aria-controls="prb-rates-card">' +
+                  getToggleBtnHtml(isRatesVisible) +
+                '</button>'
+              ) : '') +
+              ((root.RGExportMenu && (canExportPdf || canExportExcel))
+                ? root.RGExportMenu.renderHtml({
+                    wrapId: 'prb-export-wrap',
+                    btnId: 'prb-export-btn',
+                    small: true,
+                    canPdf: canExportPdf,
+                    canExcel: canExportExcel,
+                    lang: ctx.lang
+                  })
+                : (canExportPdf ? '<button type="button" class="btn btn-sm btn-charcoal" id="prb-export-pdf">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '')) +
             '</div>'
           ) : '') +
         '</div>' +
@@ -597,6 +611,122 @@
       if (ctx && ctx.saveRouteFilters) ctx.saveRouteFilters();
       refreshProblemsRegion();
     });
+
+    function buildProblemsExportPayload() {
+      var openCnt = items.filter(function (p) { return !isClosedStatus(p.status); }).length;
+      var resolvedCnt = items.length - openCnt;
+      var highCnt = items.filter(function (p) { return p.priority === 'مرتفع' || p.priority === 'مرتفعة' || p.priority === 'عاجلة'; }).length;
+      var prbCols = [
+        { key: 'problemNumber', label: isEn ? 'Ticket #' : 'رقم المشكلة', formatType: 'ltr', widthWeight: 0.9 },
+        { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr', widthWeight: 0.95 },
+        { key: 'customerName', label: isEn ? 'Customer' : 'العميل', widthWeight: 1.2 },
+        { key: 'priority', label: isEn ? 'Priority' : 'الأولوية', widthWeight: 0.7 },
+        { key: 'status', label: isEn ? 'Status' : 'الحالة', widthWeight: 0.8 },
+        { key: 'employeeName', label: isEn ? 'Assigned To' : 'المسؤول', widthWeight: 1.0 },
+        { key: 'description', label: isEn ? 'Description & Notes' : 'وصف المشكلة والملاحظات', widthWeight: 2.0 },
+        { key: 'createdAtText', label: isEn ? 'Created At' : 'تاريخ التسجيل', formatType: 'ltr', widthWeight: 1.0 }
+      ];
+      var prbRows = items.map(function (p) {
+        return {
+          problemNumber: p.problemNumber || p.id || '-',
+          reservationNumber: p.reservationNumber || '-',
+          customerName: p.customerName || '-',
+          priority: p.priority || '-',
+          status: p.status || '-',
+          employeeName: p.employeeName || '-',
+          description: p.description || '-',
+          createdAtText: fmtDateTime(p.createdAt || p.updatedAt, ctx)
+        };
+      });
+      var filterParts = [
+        state.status ? ((isEn ? 'Status: ' : 'الحالة: ') + state.status) : '',
+        state.priority ? ((isEn ? 'Priority: ' : 'الأولوية: ') + state.priority) : '',
+        state.employeeId ? ((isEn ? 'Employee: ' : 'الموظف: ') + ((employees.find(function (e) { return e.id === state.employeeId; }) || {}).name || state.employeeId)) : '',
+        state.search ? ((isEn ? 'Search: ' : 'البحث: ') + state.search) : ''
+      ].filter(Boolean).join(' · ');
+      return {
+        openCnt: openCnt,
+        resolvedCnt: resolvedCnt,
+        highCnt: highCnt,
+        prbCols: prbCols,
+        prbRows: prbRows,
+        filterParts: filterParts
+      };
+    }
+
+    function triggerPrbPdf() {
+      if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+        if (ctx && ctx.toast) ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة تصدير PDF غير متاحة.', true);
+        return;
+      }
+      var dataExp = buildProblemsExportPayload();
+      var fullNotes = items.filter(function (p) { return Boolean(String(p.description || '').trim()); }).map(function (p) {
+        return (p.problemNumber || '-') + ' [' + (p.reservationNumber || '-') + ' · ' + (p.priority || '-') + ']:\n' + String(p.description || '').trim();
+      });
+      root.RGReports.openPdfStudio({
+        ctx: ctx,
+        title: isEn ? 'Problems & Tickets Report' : 'تقرير المشكلات والتذاكر',
+        filename: 'rental-gate-problems.pdf',
+        scopeKey: 'problems',
+        availableColumns: dataExp.prbCols,
+        columns: dataExp.prbCols,
+        rows: dataExp.prbRows,
+        summaryItems: [
+          { label: isEn ? 'Matching Problems' : 'إجمالي المشكلات', value: String(items.length) },
+          { label: isEn ? 'Open / Active' : 'المشكلات المفتوحة', value: String(dataExp.openCnt) },
+          { label: isEn ? 'Resolved / Closed' : 'المغلقة / تم الحل', value: String(dataExp.resolvedCnt) },
+          { label: isEn ? 'High Priority' : 'أولوية مرتفعة', value: String(dataExp.highCnt) }
+        ],
+        extraSections: fullNotes.length ? [{
+          title: isEn ? ('Full Problem Descriptions & Notes (' + fullNotes.length + ')') : ('تفاصيل وملاحظات المشكلات الكاملة (' + fullNotes.length + ')'),
+          isNotes: true,
+          lines: fullNotes
+        }] : [],
+        initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+      });
+    }
+
+    async function triggerPrbExcel() {
+      if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+        if (ctx && ctx.toast) ctx.toast(isEn ? 'Excel export module is unavailable.' : 'وحدة تصدير Excel غير متاحة.', true);
+        return;
+      }
+      var dataExp = buildProblemsExportPayload();
+      var repTitle = isEn ? 'Problems & Tickets Report' : 'تقرير المشكلات والتذاكر';
+      await root.RGReports.exportExcelWorkbook([{
+        name: isEn ? 'Problems' : 'سجل المشكلات',
+        title: repTitle,
+        filtersText: dataExp.filterParts,
+        summaryItems: [
+          { label: isEn ? 'Matching Problems' : 'إجمالي المشكلات', value: items.length },
+          { label: isEn ? 'Open / Active' : 'المفتوحة', value: dataExp.openCnt },
+          { label: isEn ? 'Resolved / Closed' : 'المغلقة / تم الحل', value: dataExp.resolvedCnt },
+          { label: isEn ? 'High Priority' : 'أولوية مرتفعة', value: dataExp.highCnt }
+        ],
+        headers: dataExp.prbCols,
+        rows: dataExp.prbRows
+      }], 'rental-gate-problems.xlsx', {
+        lang: ctx.lang,
+        title: repTitle,
+        filtersText: dataExp.filterParts
+      });
+      if (ctx && ctx.toast) ctx.toast(isEn ? 'Problems exported to Excel successfully.' : 'تم تصدير سجل المشكلات إلى Excel بنجاح.');
+    }
+
+    var prbExportWrap = document.getElementById('prb-export-wrap');
+    if (prbExportWrap && root.RGExportMenu) {
+      root.RGExportMenu.bind(prbExportWrap, {
+        onPdf: triggerPrbPdf,
+        onExcel: triggerPrbExcel,
+        onError: function (err) {
+          if (ctx && ctx.toast) ctx.toast((err && err.message) || 'تعذر تنفيذ التصدير.', true);
+        }
+      });
+    }
+    var prbPdfBtn = document.getElementById('prb-export-pdf');
+    if (prbPdfBtn) {
+      prbPdfBtn.addEventListener('click', triggerPrbPdf);
+    }
 
     function schedulePrbRefreshWhenIdle(opts) {
       var activeEl = document.activeElement;

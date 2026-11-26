@@ -216,7 +216,7 @@
       summary: null,
       pdfCtrl: null,
       pdfSettings: (root.RGPdfControls && root.RGPdfControls.createDefaultState)
-        ? root.RGPdfControls.createDefaultState({ paperSize: 'a4', orientation: 'landscape', targetPages: 2 })
+        ? root.RGPdfControls.createDefaultState({ paperSize: 'a4', orientation: 'landscape', targetPages: 2 }, 'handover')
         : { targetPages: 2, preset: 'balanced', optimizeFileSize: true, quality: 'balanced', paperSize: 'a4', orientation: 'landscape' },
       restoreFocusEl: document.activeElement
     };
@@ -643,6 +643,26 @@
       });
     }
 
+    function getHandoverAvailableColumns(payloadCols) {
+      var cols = Array.isArray(payloadCols) && payloadCols.length ? payloadCols : [
+        { key: 'category', label: isEn ? 'Category' : 'التصنيف', widthWeight: 1.0 },
+        { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr', widthWeight: 1.05 },
+        { key: 'customerName', label: isEn ? 'Customer' : 'العميل', widthWeight: 1.25 },
+        { key: 'carName', label: isEn ? 'Vehicle' : 'السيارة', widthWeight: 1.15 },
+        { key: 'internalStatus', label: isEn ? 'Status' : 'الحالة', widthWeight: 1.0 },
+        { key: 'priority', label: isEn ? 'Priority' : 'الأولوية', widthWeight: 0.75 },
+        { key: 'lastUpdateText', label: isEn ? 'Last Update / Next Action' : 'آخر تحديث / إجراء مطلوب', widthWeight: 1.75 }
+      ];
+      return cols.map(function (c) {
+        return {
+          key: c.key,
+          label: isEn ? (c.labelEn || c.label || c.key) : (c.label || c.key),
+          widthWeight: c.widthWeight || 1,
+          formatType: c.formatType
+        };
+      });
+    }
+
     function buildHandoverPdfConfig(liveSettings) {
       recomputeSummary();
       var payload = (core && core.buildShiftHandoverPdfPayload)
@@ -652,14 +672,18 @@
             pdfVisibility: state.pdfVisibility
           })
         : { title: 'Shift Handover', filename: 'shift-handover.pdf', summaryItems: [], columns: [], rows: [], extraSections: [] };
+      var summaryWithNotes = (Array.isArray(payload.summaryItems) ? payload.summaryItems : []).map(function (item) {
+        if (!item) return item;
+        var lbl = String(item.label || '');
+        if (/ملاحظ|note/i.test(lbl)) {
+          return Object.assign({}, item, { isNote: true });
+        }
+        return item;
+      });
       var s = Object.assign({}, state.pdfSettings, liveSettings || {});
-      return Object.assign({}, payload, {
-        paperSize: s.paperSize,
-        orientation: s.orientation,
-        targetPages: s.targetPages,
-        preset: s.preset,
-        optimizeFileSize: s.optimizeFileSize,
-        quality: s.quality,
+      return Object.assign({}, s, payload, {
+        summaryItems: summaryWithNotes,
+        scopeKey: 'handover',
         lang: appCtx.lang || 'ar',
         dir: isEn ? 'ltr' : 'rtl',
         exporterName: state.staffName || (user ? user.name : '')
@@ -677,6 +701,8 @@
             mode: 'modal',
             idPrefix: 'rg-handover-pdfc',
             lang: appCtx.lang || 'ar',
+            scopeKey: 'handover',
+            availableColumns: getHandoverAvailableColumns(),
             settings: state.pdfSettings,
             contentStats: getContentStatsForSummary(s)
           })
@@ -958,6 +984,8 @@
       if (root.RGPdfControls && pdfPanelEl) {
         state.pdfCtrl = root.RGPdfControls.mount(pdfPanelEl, {
           lang: appCtx.lang || 'ar',
+          scopeKey: 'handover',
+          availableColumns: getHandoverAvailableColumns(),
           initialSettings: state.pdfSettings,
           contentStats: getContentStatsForSummary(s),
           onChange: function (nextSettings) {
@@ -1051,10 +1079,13 @@
           var runPreview = async function () {
             try {
               var snapSettings = state.pdfCtrl ? state.pdfCtrl.getSettings() : state.pdfSettings;
+              var previewInitCfg = buildHandoverPdfConfig(snapSettings);
               if (root.RGPdfPreview && typeof root.RGPdfPreview.open === 'function') {
                 await root.RGPdfPreview.open({
                   title: isEn ? 'Shift Handover Report' : 'ملخص تسليم الوردية',
-                  filename: buildHandoverPdfConfig(snapSettings).filename,
+                  filename: previewInitCfg.filename,
+                  scopeKey: 'handover',
+                  availableColumns: getHandoverAvailableColumns(previewInitCfg.columns),
                   initialSettings: snapSettings,
                   getContentStats: function () {
                     recomputeSummary();

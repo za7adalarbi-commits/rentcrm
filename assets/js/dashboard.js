@@ -1167,6 +1167,8 @@
       (!core || !core.canUserViewDashboardSection || core.canUserViewDashboardSection(currentUser, 'dash_view_handover')) &&
       (!core || !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_handover_pdf'))
     );
+    var canExportPdf = !core || !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_pdf');
+    var canExportExcel = !core || !core.canUserUseActionButton || core.canUserUseActionButton(currentUser, 'act_export_excel');
 
     var orderedVisibleDefs = activeOrder.map(function (id) {
       return visBySec[id] ? visBySec[id].def : null;
@@ -1550,6 +1552,16 @@
           '<div class="dashboard-filter-bar">' +
             ((currentUser && currentUser.role === 'developer') ? '<button type="button" class="btn btn-sm" id="dash-dev-stats-btn">' + (isEn ? 'Stats Visibility Control' : 'تحكم الإحصائيات') + '</button>' : '') +
             '<button type="button" class="btn btn-sm rg-ui-dash-customize' + (isCustomizeMode ? ' btn-primary' : '') + '" id="dash-customize-btn">' + (isEn ? (isCustomizeMode ? 'Done Customizing' : 'Customize Layout') : (isCustomizeMode ? 'إنهاء التخصيص' : 'تخصيص وترتيب اللوحة')) + '</button>' +
+            ((root.RGExportMenu && (canExportPdf || canExportExcel))
+              ? root.RGExportMenu.renderHtml({
+                  wrapId: 'dash-export-wrap',
+                  btnId: 'dash-export-btn',
+                  small: true,
+                  canPdf: canExportPdf,
+                  canExcel: canExportExcel,
+                  lang: ctx.lang
+                })
+              : (canExportPdf ? '<button type="button" class="btn btn-sm btn-primary" id="dash-export-pdf">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '')) +
             (canHandover && root.RGHandover ? '<button type="button" class="btn btn-sm btn-charcoal rg-ui-handover-btn" id="dash-shift-handover-btn">' + (isEn ? 'Shift Handover (PDF)' : 'تسليم الوردية (PDF)') + '</button>' : '') +
             '<div class="segmented-control" role="tablist" aria-label="' + t('time_filter') + '">' +
               ['today', '7d', '30d', 'month', 'custom'].map(function (r) {
@@ -1860,6 +1872,169 @@
           });
         }
       });
+
+      function buildDashPeriodText() {
+        if (state.range === 'custom' && (state.dateFrom || state.dateTo)) {
+          return (state.dateFrom || '...') + ' → ' + (state.dateTo || '...');
+        }
+        return t('range_' + (state.range || 'today')) || (state.range || '');
+      }
+
+      function buildDashSummaryItems() {
+        var dashPayload = state._lastDashPayload || {};
+        var k = dashPayload.kpis || {};
+        return [
+          { label: t('kpi_total'), value: Number(k.totalReservations || 0) },
+          { label: isEn ? 'Delivered' : 'تم التسليم', value: Number(k.delivered || 0) },
+          { label: t('kpi_today_followups'), value: Number(k.todayFollowUps || 0) },
+          { label: t('kpi_open_problems'), value: Number(k.openProblems || 0) },
+          { label: t('kpi_today'), value: Number(k.todayReservations || 0) },
+          { label: isEn ? 'Booked' : 'تم الحجز', value: Number(k.booked || 0) },
+          { label: isEn ? 'Received' : 'تم الاستلام', value: Number(k.received || 0) },
+          { label: t('kpi_high_problems'), value: Number(k.highProblems || 0) }
+        ];
+      }
+
+      function triggerDashPdf() {
+        if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+          ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة تصدير PDF غير متاحة.', true);
+          return;
+        }
+        var dashPayload = state._lastDashPayload || {};
+        var summaryItems = buildDashSummaryItems().map(function (it) {
+          return { label: it.label, value: String(it.value) };
+        });
+        var chartDefs = [
+          { id: 'chart-daily-followups', title: t('chart_daily_fu') },
+          { id: 'chart-status-dist', title: t('chart_status_dist') },
+          { id: 'chart-emp-perf', title: t('chart_emp_perf') },
+          { id: 'chart-problems-priority', title: t('chart_prb_prio') },
+          { id: 'chart-problems-open-closed', title: t('chart_prb_open_closed') },
+          { id: 'chart-res-company', title: t('chart_res_company') },
+          { id: 'chart-emp-comparison', title: t('chart_emp_comp') }
+        ];
+        var chartImages = [];
+        if (typeof root.RGReports.captureChartForPdf === 'function') {
+          chartDefs.forEach(function (cd) {
+            var canvas = container.querySelector('#' + cd.id);
+            if (canvas) {
+              var img = root.RGReports.captureChartForPdf(canvas, cd.title);
+              if (img) chartImages.push(img);
+            }
+          });
+        }
+        var lb = Array.isArray(dashPayload.leaderboard) ? dashPayload.leaderboard : [];
+        var lbCols = [
+          { key: 'rank', label: '#', formatType: 'ltr', widthWeight: 0.45 },
+          { key: 'name', label: isEn ? 'Employee' : 'الموظف', widthWeight: 1.4 },
+          { key: 'followUps', label: isEn ? 'Follow-Ups' : 'المتابعات', widthWeight: 0.9 },
+          { key: 'closed', label: isEn ? 'Completed' : 'المنجزة', widthWeight: 0.9 },
+          { key: 'problemsResolved', label: isEn ? 'Resolved Problems' : 'مشكلات محلولة', widthWeight: 1.0 },
+          { key: 'score', label: isEn ? 'Score' : 'النقاط', widthWeight: 0.8 }
+        ];
+        var lbRows = lb.map(function (row, idx) {
+          return {
+            rank: String(idx + 1),
+            name: row.name || '-',
+            followUps: String(Number(row.followUps || row.followUpsCount || 0)),
+            closed: String(Number(row.closed || row.completedCount || 0)),
+            problemsResolved: String(Number(row.problemsResolved || row.resolvedProblems || 0)),
+            score: String(Number(row.score || 0))
+          };
+        });
+        root.RGReports.openPdfStudio({
+          ctx: ctx,
+          title: isEn ? 'Dashboard Executive Summary' : 'التقرير التنفيذي للوحة التحكم',
+          filename: 'rental-gate-dashboard.pdf',
+          scopeKey: 'dashboard',
+          availableColumns: lbCols,
+          columns: lbRows.length ? lbCols : [],
+          rows: lbRows,
+          summaryItems: summaryItems,
+          chartImages: chartImages,
+          initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+        });
+      }
+
+      async function triggerDashExcel() {
+        if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+          ctx.toast(isEn ? 'Excel export module is unavailable.' : 'وحدة تصدير Excel غير متاحة.', true);
+          return;
+        }
+        var dashPayload = state._lastDashPayload || {};
+        var summaryItems = buildDashSummaryItems();
+        var periodStr = buildDashPeriodText();
+        var dashTitle = isEn ? 'Dashboard Executive Summary' : 'التقرير التنفيذي للوحة التحكم';
+        var kpiCols = [
+          { key: 'metric', label: isEn ? 'KPI Metric' : 'المؤشر التشغيلي' },
+          { key: 'value', label: isEn ? 'Value' : 'القيمة', formatType: 'number', summable: false }
+        ];
+        var kpiRows = summaryItems.map(function (it) {
+          return { metric: it.label, value: Number(it.value || 0) };
+        });
+
+        var sheets = [{
+          name: isEn ? 'Executive KPIs' : 'ملخص المؤشرات',
+          title: dashTitle,
+          periodText: periodStr,
+          summaryItems: summaryItems.slice(0, 4),
+          headers: kpiCols,
+          rows: kpiRows
+        }];
+
+        var lb = Array.isArray(dashPayload.leaderboard) ? dashPayload.leaderboard : [];
+        if (lb.length) {
+          var lbExcelCols = [
+            { key: 'rank', label: isEn ? 'Rank' : 'الترتيب', formatType: 'number', summable: false },
+            { key: 'name', label: isEn ? 'Employee' : 'الموظف' },
+            { key: 'followUps', label: isEn ? 'Follow-Ups' : 'المتابعات', formatType: 'number', summable: true },
+            { key: 'closed', label: isEn ? 'Completed' : 'المنجزة', formatType: 'number', summable: true },
+            { key: 'problemsResolved', label: isEn ? 'Resolved Problems' : 'مشكلات محلولة', formatType: 'number', summable: true },
+            { key: 'completionRate', label: isEn ? 'Completion %' : 'نسبة الإنجاز %', formatType: 'number', summable: false },
+            { key: 'score', label: isEn ? 'Score' : 'النقاط', formatType: 'number', summable: true }
+          ];
+          var lbExcelRows = lb.map(function (row, idx) {
+            return {
+              rank: Number(row.rank || (idx + 1)),
+              name: row.name || '-',
+              followUps: Number(row.followUps || row.followUpsCount || 0),
+              closed: Number(row.closedBookingsCount !== undefined ? row.closedBookingsCount : (row.closed || row.completedCount || row.closedCount || 0)),
+              problemsResolved: Number(row.problemsResolved || row.resolvedProblemsCount || row.resolvedProblems || 0),
+              completionRate: Number(row.completionRate || 0),
+              score: Number(row.score || 0)
+            };
+          });
+          sheets.push({
+            name: isEn ? 'Leaderboard' : 'لوحة الصدارة',
+            title: isEn ? 'Team Performance Leaderboard' : 'لوحة الصدارة وأداء الفريق',
+            periodText: periodStr,
+            headers: lbExcelCols,
+            rows: lbExcelRows
+          });
+        }
+
+        await root.RGReports.exportExcelWorkbook(sheets, 'rental-gate-dashboard.xlsx', {
+          lang: ctx.lang,
+          title: dashTitle,
+          periodText: periodStr
+        });
+        ctx.toast(isEn ? 'Dashboard exported to Excel successfully.' : 'تم تصدير ملخص لوحة التحكم إلى Excel بنجاح.');
+      }
+
+      var dashExportWrap = container.querySelector('#dash-export-wrap');
+      if (dashExportWrap && root.RGExportMenu) {
+        root.RGExportMenu.bind(dashExportWrap, {
+          onPdf: triggerDashPdf,
+          onExcel: triggerDashExcel,
+          onError: function (err) {
+            ctx.toast((err && err.message) || (isEn ? 'Export failed.' : 'تعذر تنفيذ التصدير.'), true);
+          }
+        });
+      }
+      var dashPdfBtn = container.querySelector('#dash-export-pdf');
+      if (dashPdfBtn) {
+        dashPdfBtn.addEventListener('click', triggerDashPdf);
+      }
 
       container.querySelectorAll('[data-range]').forEach(function (btn) {
         btn.addEventListener('click', function () {

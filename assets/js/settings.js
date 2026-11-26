@@ -2073,11 +2073,17 @@
                   var tag = scPayload.scope === 'month' ? ('month-' + scPayload.month) : (scPayload.scope === 'year' ? ('year-' + scPayload.year) : 'all');
                   var fname = 'rental-gate-deleted-' + tag + '-' + new Date().toISOString().slice(0, 10) + '.xlsx';
                   var cols = Array.isArray(root.RGReports.RESERVATION_COLUMNS) ? root.RGReports.RESERVATION_COLUMNS.slice() : Object.keys(exportedRows[0] || {});
+                  var backupTitle = 'نسخة احتياطية قبل الحذف — الحجوزات (' + tag + ')';
                   await root.RGReports.exportExcelWorkbook([{
                     name: 'Deleted_Reservations',
+                    title: backupTitle,
+                    periodText: tag === 'all' ? 'كافة الحجوزات' : tag,
                     headers: cols,
                     rows: exportedRows
-                  }], fname);
+                  }], fname, {
+                    title: backupTitle,
+                    periodText: tag === 'all' ? 'كافة الحجوزات' : tag
+                  });
                   autoExported = true;
                 } catch (_expErr) {
                   exportFailed = true;

@@ -3305,7 +3305,7 @@
   }
 
   function computeDashboardMetrics(reservations, followUps, problems, employees, dateRange, todayStr, options) {
-    var today = todayStr || new Date().toISOString().substring(0, 10);
+    var today = todayStr || getRiyadhTodayDateStr();
     var start = (dateRange && dateRange.start) || '';
     var end = (dateRange && dateRange.end) || '';
     var opts = options || {};
@@ -4065,25 +4065,42 @@
     return s.toLowerCase();
   }
 
+  function normalizeEmployeeEmail(raw) {
+    return normalizeStr(raw).toLowerCase();
+  }
+
+  function normalizeEmployeePhone(raw) {
+    var s = convertEasternDigitsToAscii(normalizeStr(raw));
+    if (!s) return '';
+    var digits = s.replace(/\D+/g, '');
+    if (!digits) return '';
+    if (digits.indexOf('00966') === 0) digits = digits.slice(5);
+    else if (digits.indexOf('966') === 0 && digits.length >= 11) digits = digits.slice(3);
+    if (digits.length === 9 && digits.charAt(0) === '5') {
+      digits = '0' + digits;
+    }
+    return digits;
+  }
+
   var RESERVATION_REPORT_COLUMNS = [
-    { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 1.0, formatType: 'ltr' },
-    { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer Name', widthWeight: 1.35, formatType: 'text' },
-    { key: 'customerPhone', label: 'الجوال', labelEn: 'Phone', widthWeight: 1.0, formatType: 'ltr' },
+    { key: 'reservationNumber', label: 'رقم الحجز', labelEn: 'Reservation #', widthWeight: 1.38, formatType: 'ltr' },
+    { key: 'customerName', label: 'اسم العميل', labelEn: 'Customer Name', widthWeight: 1.4, formatType: 'text' },
+    { key: 'customerPhone', label: 'الجوال', labelEn: 'Phone', widthWeight: 1.28, formatType: 'ltr' },
     { key: 'companyName', label: 'الشركة', labelEn: 'Company', widthWeight: 1.15, formatType: 'text' },
     { key: 'branchName', label: 'الفرع', labelEn: 'Branch', widthWeight: 1.2, formatType: 'text' },
-    { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.2, formatType: 'text' },
-    { key: 'startDate', label: 'بداية الحجز', labelEn: 'Start Date', widthWeight: 0.9, formatType: 'date' },
-    { key: 'endDate', label: 'نهاية الحجز', labelEn: 'End Date', widthWeight: 0.9, formatType: 'date' },
-    { key: 'extensionsCount', label: 'مرات التمديد', labelEn: 'Extensions #', widthWeight: 0.75, formatType: 'number' },
-    { key: 'extendedUntilDate', label: 'التمديد لحد', labelEn: 'Extended Until', widthWeight: 0.9, formatType: 'date' },
-    { key: 'extensionsAmount', label: 'سعر التمديد', labelEn: 'Ext. Amount', widthWeight: 0.8, formatType: 'number' },
+    { key: 'carName', label: 'السيارة', labelEn: 'Vehicle', widthWeight: 1.25, formatType: 'text' },
+    { key: 'startDate', label: 'بداية الحجز', labelEn: 'Start Date', widthWeight: 1.18, formatType: 'date' },
+    { key: 'endDate', label: 'نهاية الحجز', labelEn: 'End Date', widthWeight: 1.18, formatType: 'date' },
+    { key: 'extensionsCount', label: 'مرات التمديد', labelEn: 'Extensions #', widthWeight: 0.68, formatType: 'number' },
+    { key: 'extendedUntilDate', label: 'التمديد لحد', labelEn: 'Extended Until', widthWeight: 1.18, formatType: 'date' },
+    { key: 'extensionsAmount', label: 'سعر التمديد', labelEn: 'Ext. Amount', widthWeight: 0.72, formatType: 'number' },
     { key: 'originalStatusAr', label: 'حالة الحجز الأصلية', labelEn: 'Original Status', widthWeight: 1.0, formatType: 'text' },
-    { key: 'internalStatus', label: 'حالة المتابعة الداخلية', labelEn: 'Internal Status', widthWeight: 1.0, formatType: 'text' },
+    { key: 'internalStatus', label: 'حالة المتابعة الداخلية', labelEn: 'Internal Status', widthWeight: 1.05, formatType: 'text' },
     { key: 'assignedEmployeeNames', label: 'الموظفون المسؤولون', labelEn: 'Assigned Staff', widthWeight: 1.25, formatType: 'list' },
-    { key: 'priority', label: 'الأولوية', labelEn: 'Priority', widthWeight: 0.75, formatType: 'text' },
-    { key: 'totalAmount', label: 'الإجمالي', labelEn: 'Total (SAR)', widthWeight: 0.8, formatType: 'number' },
-    { key: 'lastUpdateText', label: 'آخر تحديث', labelEn: 'Last Update', widthWeight: 1.5, formatType: 'text' },
-    { key: 'lastUpdatedByName', label: 'آخر موظف', labelEn: 'Updated By', widthWeight: 1.0, formatType: 'text' }
+    { key: 'priority', label: 'الأولوية', labelEn: 'Priority', widthWeight: 0.68, formatType: 'text' },
+    { key: 'totalAmount', label: 'الإجمالي', labelEn: 'Total (SAR)', widthWeight: 0.78, formatType: 'number' },
+    { key: 'lastUpdateText', label: 'آخر تحديث', labelEn: 'Last Update', widthWeight: 1.55, formatType: 'text' },
+    { key: 'lastUpdatedByName', label: 'آخر موظف', labelEn: 'Updated By', widthWeight: 0.95, formatType: 'text' }
   ];
 
   var REPORT_COLUMNS_BY_TYPE = {
@@ -4203,11 +4220,16 @@
     return String(val).replace(/\s+/g, ' ').trim() || fallback;
   }
 
-  function computePdfColumnWidths(columns, totalWidth) {
+  function computePdfColumnWidths(columns, totalWidth, customWidthsMap) {
     var cols = Array.isArray(columns) ? columns : [];
     var totalW = Number(totalWidth || 0);
     if (!cols.length || totalW <= 0) return [];
+    var customMap = (customWidthsMap && typeof customWidthsMap === 'object') ? customWidthsMap : null;
     var weights = cols.map(function (c) {
+      var customVal = (customMap && c && c.key && customMap[c.key] !== undefined)
+        ? Number(customMap[c.key])
+        : (c && c.customWidthWeight !== undefined ? Number(c.customWidthWeight) : NaN);
+      if (isFinite(customVal) && customVal > 0) return customVal;
       var w = Number(c && c.widthWeight);
       return w > 0 ? w : 1;
     });
@@ -4220,6 +4242,117 @@
     return rawWidths.map(function (w) {
       return (w / rawSum) * totalW;
     });
+  }
+
+  function wrapTextPreservingNewlines(measureFn, text, maxWidth, options) {
+    var opts = (options && typeof options === 'object') ? options : {};
+    var measure = typeof measureFn === 'function' ? measureFn : function (s) { return String(s || '').length * 6; };
+    var preserveBreaks = opts.preserveLineBreaks !== false;
+    var unclipped = Boolean(opts.unclipped);
+    var maxLines = (!unclipped && opts.maxLines && Number(opts.maxLines) > 0) ? Math.floor(Number(opts.maxLines)) : 0;
+    var emptyFallback = opts.emptyFallback !== undefined ? String(opts.emptyFallback) : '-';
+    var rawInput = text === undefined || text === null ? '' : String(text);
+
+    if (!preserveBreaks) {
+      rawInput = rawInput.replace(/\s+/g, ' ').trim();
+    } else {
+      rawInput = rawInput.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    }
+
+    if (!rawInput.trim()) return [emptyFallback];
+
+    var paragraphs = preserveBreaks ? rawInput.split('\n') : [rawInput];
+    while (paragraphs.length > 1 && !paragraphs[0].trim()) paragraphs.shift();
+    while (paragraphs.length > 1 && !paragraphs[paragraphs.length - 1].trim()) paragraphs.pop();
+
+    var safeMaxW = Math.max(20, Number(maxWidth || 200));
+    var outLines = [];
+    var truncated = false;
+
+    for (var pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+      var para = String(paragraphs[pIdx] || '').replace(/[ \t]+/g, ' ').trim();
+      if (!para) {
+        if (preserveBreaks) {
+          if (maxLines && outLines.length >= maxLines) {
+            truncated = true;
+            break;
+          }
+          outLines.push('');
+        }
+        continue;
+      }
+
+      if (measure(para) <= safeMaxW) {
+        if (maxLines && outLines.length >= maxLines) {
+          truncated = true;
+          break;
+        }
+        outLines.push(para);
+        continue;
+      }
+
+      var words = para.split(' ');
+      var current = '';
+      for (var wIdx = 0; wIdx < words.length; wIdx++) {
+        var word = words[wIdx];
+        var candidate = current ? (current + ' ' + word) : word;
+        if (measure(candidate) <= safeMaxW) {
+          current = candidate;
+        } else {
+          if (current) {
+            outLines.push(current);
+            current = '';
+            if (maxLines && outLines.length >= maxLines) {
+              truncated = true;
+              break;
+            }
+          }
+          if (measure(word) > safeMaxW) {
+            var part = '';
+            for (var chIdx = 0; chIdx < word.length; chIdx++) {
+              var nextPart = part + word.charAt(chIdx);
+              if (measure(nextPart) > safeMaxW && part) {
+                outLines.push(part);
+                part = word.charAt(chIdx);
+                if (maxLines && outLines.length >= maxLines) {
+                  part = '';
+                  truncated = true;
+                  break;
+                }
+              } else {
+                part = nextPart;
+              }
+            }
+            if (truncated) break;
+            current = part;
+          } else {
+            current = word;
+          }
+        }
+      }
+
+      if (truncated) break;
+      if (current) {
+        if (maxLines && outLines.length >= maxLines) {
+          truncated = true;
+          break;
+        }
+        outLines.push(current);
+      }
+    }
+
+    if (maxLines && outLines.length > maxLines) {
+      outLines = outLines.slice(0, maxLines);
+      truncated = true;
+    }
+    if (maxLines && truncated && outLines.length === maxLines) {
+      var last = outLines[outLines.length - 1];
+      while (last.length > 2 && measure(last + '…') > safeMaxW) {
+        last = last.slice(0, -1);
+      }
+      outLines[outLines.length - 1] = last + '…';
+    }
+    return outLines.length ? outLines : [emptyFallback];
   }
 
   function isPureLtrText(text) {
@@ -5149,6 +5282,49 @@
     return n;
   }
 
+  var PDF_BRAND_IDENTITY = {
+    primaryColor: '#D9232A',
+    darkGray: '#303030',
+    white: '#FFFFFF',
+    surfaceLight: '#F7F7F8',
+    borderLight: '#E4E4E7'
+  };
+
+  var PDF_ARABIC_FONTS = [
+    { id: 'IBM Plex Sans Arabic', labelAr: 'IBM Plex Sans Arabic (الافتراضي)', labelEn: 'IBM Plex Sans Arabic (Default)' },
+    { id: 'Cairo', labelAr: 'Cairo (كايرو الحديث)', labelEn: 'Cairo (Modern)' },
+    { id: 'Tajawal', labelAr: 'Tajawal (تجوال الواضح)', labelEn: 'Tajawal (Clean)' },
+    { id: 'Tahoma', labelAr: 'Tahoma (الخط الكلاسيكي)', labelEn: 'Tahoma (System)' }
+  ];
+
+  var PDF_DESIGN_STYLES = [
+    { id: 'modern_minimal', labelAr: 'Modern Minimal (هوية Web God)', labelEn: 'Modern Minimal (Web God)' },
+    { id: 'executive_classic', labelAr: 'التصميم التنفيذي الداكن', labelEn: 'Executive Dark Header' }
+  ];
+
+  var PDF_MARGIN_PRESETS_MM = {
+    narrow: { top: 6, right: 6, bottom: 6, left: 6 },
+    normal: { top: 10, right: 10, bottom: 10, left: 10 },
+    wide: { top: 15, right: 15, bottom: 15, left: 15 }
+  };
+
+  var PDF_FONT_SIZE_SCALES = {
+    small: 0.88,
+    medium: 1.0,
+    large: 1.15
+  };
+
+  function normalizePdfHexColor(color, fallback) {
+    var def = normalizeStr(fallback) || PDF_BRAND_IDENTITY.primaryColor;
+    var raw = normalizeStr(color);
+    if (!raw) return def;
+    if (/^#[0-9a-fA-F]{6}$/.test(raw)) return raw.toUpperCase();
+    if (/^#[0-9a-fA-F]{3}$/.test(raw)) {
+      return ('#' + raw.charAt(1) + raw.charAt(1) + raw.charAt(2) + raw.charAt(2) + raw.charAt(3) + raw.charAt(3)).toUpperCase();
+    }
+    return def;
+  }
+
   function resolvePdfExportSettings(opts) {
     var o = (opts && typeof opts === 'object') ? opts : {};
     var presetRaw = normalizeStr(o.preset).toLowerCase();
@@ -5162,7 +5338,8 @@
     var defaultTp = (PDF_LAYOUT_PRESETS[preset] && PDF_LAYOUT_PRESETS[preset].defaultTargetPages) || 3;
     var targetPages = o.targetPages !== undefined ? clampPdfTargetPages(o.targetPages) : defaultTp;
     var optimizeFileSize = o.optimizeFileSize === undefined ? true : Boolean(o.optimizeFileSize);
-    var paperSize = normalizeStr(o.paperSize).toLowerCase() === 'letter' ? 'letter' : 'a4';
+    var rawPaper = normalizeStr(o.paperSize).toLowerCase();
+    var paperSize = rawPaper === 'letter' ? 'letter' : (rawPaper === 'a3' ? 'a3' : 'a4');
     var orientation = normalizeStr(o.orientation).toLowerCase() === 'portrait' ? 'portrait' : 'landscape';
     return {
       targetPages: targetPages,
@@ -5174,10 +5351,147 @@
     };
   }
 
+  function clampMarginMm(val, fallback) {
+    var n = Number(val);
+    if (!isFinite(n)) return fallback;
+    return Math.max(4, Math.min(35, Math.round(n * 10) / 10));
+  }
+
+  function resolvePdfMarginsMm(marginPreset, customMargins) {
+    var mp = normalizeStr(marginPreset).toLowerCase();
+    if (mp === 'narrow' || mp === 'wide' || mp === 'normal') {
+      return Object.assign({}, PDF_MARGIN_PRESETS_MM[mp]);
+    }
+    if (mp === 'custom') {
+      var cm = (customMargins && typeof customMargins === 'object') ? customMargins : {};
+      return {
+        top: clampMarginMm(cm.top, 10),
+        right: clampMarginMm(cm.right, 10),
+        bottom: clampMarginMm(cm.bottom, 10),
+        left: clampMarginMm(cm.left, 10)
+      };
+    }
+    return Object.assign({}, PDF_MARGIN_PRESETS_MM.normal);
+  }
+
+  function resolveAdvancedPdfSettings(opts) {
+    var o = (opts && typeof opts === 'object') ? opts : {};
+    var base = resolvePdfExportSettings(o);
+    var rawMarginPreset = normalizeStr(o.marginPreset).toLowerCase();
+    var marginPreset = (rawMarginPreset === 'narrow' || rawMarginPreset === 'normal' || rawMarginPreset === 'wide' || rawMarginPreset === 'custom')
+      ? rawMarginPreset
+      : 'normal';
+    var customMargins = resolvePdfMarginsMm(marginPreset === 'custom' ? 'custom' : 'normal', o.customMargins);
+
+    var rawStyle = normalizeStr(o.designStyle).toLowerCase();
+    var designStyle = rawStyle === 'executive_classic' ? 'executive_classic' : 'modern_minimal';
+
+    var rawScale = normalizeStr(o.fontSizeScale).toLowerCase();
+    var fontSizeScale = (rawScale === 'small' || rawScale === 'large') ? rawScale : 'medium';
+
+    var allowedFontIds = PDF_ARABIC_FONTS.map(function (f) { return f.id; });
+    var fontFamily = allowedFontIds.indexOf(normalizeStr(o.fontFamily)) !== -1
+      ? normalizeStr(o.fontFamily)
+      : 'IBM Plex Sans Arabic';
+
+    var rawNotesSize = normalizeStr(o.notesFontSize).toLowerCase();
+    var notesFontSize = (rawNotesSize === 'small' || rawNotesSize === 'large') ? rawNotesSize : 'medium';
+
+    var customWidthsClean = {};
+    if (o.columnWidths && typeof o.columnWidths === 'object') {
+      Object.keys(o.columnWidths).forEach(function (k) {
+        var num = Number(o.columnWidths[k]);
+        if (isFinite(num) && num >= 5 && num <= 80) {
+          customWidthsClean[k] = Math.round(num * 10) / 10;
+        }
+      });
+    }
+
+    return Object.assign({}, base, {
+      marginPreset: marginPreset,
+      customMargins: customMargins,
+      designStyle: designStyle,
+      primaryColor: normalizePdfHexColor(o.primaryColor, PDF_BRAND_IDENTITY.primaryColor),
+      fontSizeScale: fontSizeScale,
+      fontFamily: fontFamily,
+      showLogo: o.showLogo === undefined ? true : Boolean(o.showLogo),
+      showTitle: o.showTitle === undefined ? true : Boolean(o.showTitle),
+      showDateTime: o.showDateTime === undefined ? true : Boolean(o.showDateTime),
+      showFooter: o.showFooter === undefined ? true : Boolean(o.showFooter),
+      showPageNumbers: o.showPageNumbers === undefined ? true : Boolean(o.showPageNumbers),
+      showKpis: o.showKpis === undefined ? true : Boolean(o.showKpis),
+      showTableHeaders: o.showTableHeaders === undefined ? true : Boolean(o.showTableHeaders),
+      repeatTableHeader: o.repeatTableHeader === undefined ? true : Boolean(o.repeatTableHeader),
+      autoColumnWidths: o.autoColumnWidths === undefined ? true : Boolean(o.autoColumnWidths),
+      columnWidths: customWidthsClean,
+      selectedColumns: Array.isArray(o.selectedColumns) ? o.selectedColumns.map(normalizeStr).filter(Boolean) : null,
+      columnOrder: Array.isArray(o.columnOrder) ? o.columnOrder.map(normalizeStr).filter(Boolean) : null,
+      showNotes: o.showNotes === undefined ? true : Boolean(o.showNotes),
+      notesFullUnclipped: o.notesFullUnclipped === undefined ? true : Boolean(o.notesFullUnclipped),
+      notesPreserveLineBreaks: o.notesPreserveLineBreaks === undefined ? true : Boolean(o.notesPreserveLineBreaks),
+      notesFontSize: notesFontSize
+    });
+  }
+
+  function applyPdfColumnSelectionAndOrder(allColumns, selectedKeys, orderedKeys, customWidthsMap) {
+    var list = Array.isArray(allColumns) ? allColumns.slice() : [];
+    if (!list.length) return [];
+
+    var byKey = {};
+    list.forEach(function (col) {
+      if (col && col.key) byKey[col.key] = col;
+    });
+
+    var ordered = [];
+    var seen = {};
+    if (Array.isArray(orderedKeys) && orderedKeys.length) {
+      orderedKeys.forEach(function (k) {
+        if (byKey[k] && !seen[k]) {
+          ordered.push(byKey[k]);
+          seen[k] = true;
+        }
+      });
+    }
+    list.forEach(function (col) {
+      if (col && col.key && !seen[col.key]) {
+        ordered.push(col);
+        seen[col.key] = true;
+      }
+    });
+
+    var hasSelection = Array.isArray(selectedKeys) && selectedKeys.length > 0;
+    var selectedSet = {};
+    if (hasSelection) {
+      selectedKeys.forEach(function (k) { selectedSet[k] = true; });
+    }
+
+    var filtered = hasSelection
+      ? ordered.filter(function (c) { return Boolean(selectedSet[c.key]); })
+      : ordered;
+    if (!filtered.length) filtered = ordered.slice(0, Math.min(6, ordered.length));
+
+    var widths = (customWidthsMap && typeof customWidthsMap === 'object') ? customWidthsMap : null;
+    return filtered.map(function (c) {
+      var copy = Object.assign({}, c);
+      if (widths && widths[c.key] !== undefined && Number(widths[c.key]) > 0) {
+        copy.customWidthWeight = Number(widths[c.key]);
+      }
+      return copy;
+    });
+  }
+
+  function getUserPdfPrefsStorageKey(user) {
+    var u = (user && typeof user === 'object') ? user : {};
+    var rawKey = normalizeStr(u.id || u.employeeId || u.username || 'guest')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '_');
+    return 'rg_crm_pdf_export_prefs_v2_' + (rawKey || 'guest');
+  }
+
   function getPaperDimensionsMm(paperSize, orientation) {
-    var isLetter = normalizeStr(paperSize).toLowerCase() === 'letter';
-    var baseW = isLetter ? 215.9 : 210;
-    var baseH = isLetter ? 279.4 : 297;
+    var ps = normalizeStr(paperSize).toLowerCase();
+    var baseW = ps === 'letter' ? 215.9 : (ps === 'a3' ? 297 : 210);
+    var baseH = ps === 'letter' ? 279.4 : (ps === 'a3' ? 420 : 297);
     if (normalizeStr(orientation).toLowerCase() === 'portrait') {
       return { widthMm: baseW, heightMm: baseH };
     }
@@ -5330,9 +5644,11 @@
 
   function computePdfLayoutPlan(params) {
     var cfg = resolvePdfExportSettings(params);
+    var adv = resolveAdvancedPdfSettings(params);
     var p = params || {};
     var lang = normalizeStr(p.lang) === 'en' ? 'en' : 'ar';
     var dims = getPaperDimensionsMm(cfg.paperSize, cfg.orientation);
+    var isPortrait = cfg.orientation === 'portrait';
     var pageWpt = Math.round(dims.widthMm * 3.78);
     var pageHpt = Math.round(dims.heightMm * 3.78);
     var colCount = Math.max(0, Number(p.columnCount || 0));
@@ -5340,8 +5656,15 @@
     var chartCount = Math.max(0, Number(p.chartCount || 0));
     var extraSectionsCount = Math.max(0, Number(p.extraSectionsCount || 0));
     var extraLinesCount = Math.max(0, Number(p.extraLinesCount || 0));
-    var kpiCount = Math.max(0, Number(p.kpiCount !== undefined ? p.kpiCount : (p.summaryCount || 0)));
+    var kpiCount = adv.showKpis
+      ? Math.max(0, Number(p.kpiCount !== undefined ? p.kpiCount : (p.summaryCount || 0)))
+      : 0;
     var wideSummaryCount = Math.max(0, Number(p.wideSummaryCount || 0));
+
+    var fontScaleMult = PDF_FONT_SIZE_SCALES[adv.fontSizeScale] || 1.0;
+    var hasExplicitMargin = Boolean(p.marginPreset && normalizeStr(p.marginPreset).toLowerCase() !== 'normal');
+    var marginMmObj = resolvePdfMarginsMm(adv.marginPreset, adv.customMargins);
+    var explicitMarginPt = Math.round(((marginMmObj.left + marginMmObj.right) / 2) * 2.84);
 
     var stats = {
       rowCount: rowCount,
@@ -5363,71 +5686,82 @@
       marginPt: 16,
       headerH: 48,
       contHeaderH: 26,
-      footerReserve: 24,
+      footerReserve: (adv.showFooter || adv.showPageNumbers) ? 24 : 10,
       baseFont: minReadableFont,
       cellPadX: 3.4,
       cellPadY: 2.5,
       lineRatio: 1.18,
-      kpiH: 32,
+      kpiH: isPortrait ? 38 : 32,
       kpiGap: 5,
-      kpiPerRow: 5,
+      kpiPerRow: isPortrait ? 3 : 5,
       sectionGap: 5,
       extraLineH: 11,
       extraBlockPad: 2.5,
-      chartH: 106,
+      chartH: isPortrait ? 136 : 106,
       chartGap: 6,
-      maxCellLines: 2
+      maxCellLines: isPortrait ? 4 : 2
     };
 
     var ceilProfile = {
       marginPt: 46,
       headerH: 86,
       contHeaderH: 54,
-      footerReserve: 46,
+      footerReserve: (adv.showFooter || adv.showPageNumbers) ? 46 : 16,
       baseFont: colCount >= 9 ? 10.2 : 11.4,
       cellPadX: 10,
       cellPadY: 9.5,
       lineRatio: 1.62,
-      kpiH: 60,
+      kpiH: isPortrait ? 64 : 58,
       kpiGap: 14,
-      kpiPerRow: 3,
+      kpiPerRow: isPortrait ? 2 : 4,
       sectionGap: 22,
       extraLineH: 19,
       extraBlockPad: 10,
-      chartH: 220,
+      chartH: isPortrait ? 230 : 210,
       chartGap: 18,
-      maxCellLines: 4
+      maxCellLines: isPortrait ? 6 : 4
     };
 
     function buildMetricsFromProfile(prof, extraOpts) {
       var eo = extraOpts || {};
+      var scaledBase = prof.baseFont * fontScaleMult;
       var baseFont = colCount >= 10
-        ? Math.min(prof.baseFont, 8.8)
-        : (colCount >= 8 ? Math.min(prof.baseFont, 9.5) : prof.baseFont);
+        ? Math.min(scaledBase, 8.8 * fontScaleMult)
+        : (colCount >= 8 ? Math.min(scaledBase, 9.5 * fontScaleMult) : scaledBase);
       baseFont = Math.max(minReadableFont, Math.round(baseFont * 10) / 10);
       var cellLineH = Math.round((baseFont * prof.lineRatio + 1.2) * 10) / 10;
+      var chosenMarginPt = hasExplicitMargin ? explicitMarginPt : Math.round(prof.marginPt);
+      var kpiPerRowResolved = isPortrait
+        ? Math.min(3, Math.max(2, Math.round(prof.kpiPerRow)))
+        : Math.max(3, Math.round(prof.kpiPerRow));
       return {
         pageWpt: pageWpt,
         pageHpt: pageHpt,
-        marginPt: Math.round(prof.marginPt),
+        marginPt: chosenMarginPt,
+        marginsPt: {
+          top: hasExplicitMargin ? Math.round(marginMmObj.top * 2.84) : chosenMarginPt,
+          right: hasExplicitMargin ? Math.round(marginMmObj.right * 2.84) : chosenMarginPt,
+          bottom: hasExplicitMargin ? Math.round(marginMmObj.bottom * 2.84) : chosenMarginPt,
+          left: hasExplicitMargin ? Math.round(marginMmObj.left * 2.84) : chosenMarginPt
+        },
         headerH: Math.round(prof.headerH),
         contHeaderH: Math.round(prof.contHeaderH),
         headerGap: Math.round(Math.max(8, prof.sectionGap * 1.15)),
-        footerReserve: Math.round(prof.footerReserve),
+        footerReserve: (adv.showFooter || adv.showPageNumbers) ? Math.round(prof.footerReserve) : 14,
         baseFont: baseFont,
         headerFont: Math.round(Math.max(baseFont, baseFont * 1.02) * 10) / 10,
         cellPadX: Math.round(prof.cellPadX * 10) / 10,
         cellPadY: Math.round(prof.cellPadY * 10) / 10,
         cellLineH: cellLineH,
-        kpiH: Math.round(prof.kpiH),
+        kpiH: Math.round(prof.kpiH * (fontScaleMult > 1 ? 1.08 : 1)),
         kpiGap: Math.round(prof.kpiGap),
-        kpiPerRow: Math.round(prof.kpiPerRow),
+        kpiPerRow: kpiPerRowResolved,
         sectionGap: Math.round(prof.sectionGap),
-        extraLineH: Math.round(prof.extraLineH * 10) / 10,
+        extraLineH: Math.round(prof.extraLineH * fontScaleMult * 10) / 10,
         extraBlockPad: Math.round(prof.extraBlockPad * 10) / 10,
         chartH: Math.round(prof.chartH),
         chartGap: Math.round(prof.chartGap),
-        chartCols: eo.chartCols || (chartCount > 1 ? 2 : 1),
+        chartCols: eo.chartCols || (isPortrait ? 1 : (chartCount > 1 ? 2 : 1)),
         maxCellLines: Math.round(prof.maxCellLines),
         maxRowsPerPage: eo.maxRowsPerPage || 0,
         maxExtraPerPage: eo.maxExtraPerPage || 0,
@@ -5458,7 +5792,16 @@
       };
     }
 
-    var naturalMetrics = buildMetricsFromProfile(baseProfile, {});
+    var portraitAdjustedBase = isPortrait
+      ? Object.assign({}, baseProfile, {
+          kpiPerRow: presetKey === 'compact' ? 3 : 2,
+          kpiH: baseProfile.kpiH + 6,
+          maxCellLines: baseProfile.maxCellLines + 2,
+          chartH: Math.round(baseProfile.chartH * 1.12)
+        })
+      : baseProfile;
+
+    var naturalMetrics = buildMetricsFromProfile(portraitAdjustedBase, {});
     var naturalSim = simulatePdfPagination(naturalMetrics, stats);
     var chosenMetrics = naturalMetrics;
     var chosenSim = naturalSim;
@@ -5468,14 +5811,13 @@
     var warningMessageEn = '';
 
     if (cfg.targetPages < naturalSim.pages) {
-      // Compress gradually from baseProfile toward floorProfile until targetPages is reached
       var foundFit = false;
       var steps = 16;
       for (var st = 1; st <= steps; st++) {
         var frac = st / steps;
-        var candidateProf = blendProfiles(baseProfile, floorProfile, frac);
+        var candidateProf = blendProfiles(portraitAdjustedBase, floorProfile, frac);
         var candMetrics = buildMetricsFromProfile(candidateProf, {
-          chartCols: chartCount >= 3 ? 3 : (chartCount > 1 ? 2 : 1)
+          chartCols: isPortrait ? 1 : (chartCount >= 3 ? 3 : (chartCount > 1 ? 2 : 1))
         });
         var candSim = simulatePdfPagination(candMetrics, stats);
         chosenMetrics = candMetrics;
@@ -5492,14 +5834,12 @@
         warningMessageAr = 'بعض المحتوى يتطلب صفحات إضافية (' + chosenSim.pages + ' صفحات على الأقل) للحفاظ على وضوح القراءة.';
       }
     } else if (cfg.targetPages > naturalSim.pages) {
-      // Expand toward comfortable spacing + balanced distribution across targetPages
       var expandRatio = Math.min(1, (cfg.targetPages - naturalSim.pages) / Math.max(2, 10 - naturalSim.pages));
-      var expProf = blendProfiles(baseProfile, ceilProfile, expandRatio);
-      var useSingleChartCol = (cfg.targetPages >= 6 && chartCount > 1);
+      var expProf = blendProfiles(portraitAdjustedBase, ceilProfile, expandRatio);
+      var useSingleChartCol = isPortrait || (cfg.targetPages >= 6 && chartCount > 1);
       var breakCharts = (chartCount > 0 && cfg.targetPages >= naturalSim.pages + 1);
       var breakExtra = (extraLinesCount > 0 && cfg.targetPages >= naturalSim.pages + 2);
 
-      // Estimate reserved pages for charts & extra sections so table rows spread harmoniously
       var chartPageReserve = chartCount > 0 ? (useSingleChartCol ? Math.min(chartCount, 2) : 1) : 0;
       var extraPageReserve = extraLinesCount > 0 ? (breakExtra ? Math.max(1, Math.ceil(extraLinesCount / 14)) : 0) : 0;
       var tablePageBudget = Math.max(1, cfg.targetPages - (breakCharts ? chartPageReserve : 0) - extraPageReserve);
@@ -5523,7 +5863,6 @@
       });
       var expSim = simulatePdfPagination(expMetrics, stats);
 
-      // If still slightly under targetPages and we have rows, refine maxRowsPerPage down to 1-2 if needed
       if (expSim.pages < cfg.targetPages && rowCount > 1) {
         for (var mr = Math.max(1, maxRowsPerPage - 1); mr >= 1; mr--) {
           var refinedMetrics = buildMetricsFromProfile(expProf, {
@@ -6752,8 +7091,7 @@
     var list = Array.isArray(reservations) ? reservations : [];
     var opts = options || {};
     var now = (typeof nowMs === 'number' && isFinite(nowMs)) ? nowMs : Date.now();
-    var nowDt = new Date(now);
-    var todayDate = formatDisplayDate(opts.todayDate) || formatIsoDateParts(nowDt.getFullYear(), nowDt.getMonth() + 1, nowDt.getDate());
+    var todayDate = formatDisplayDate(opts.todayDate) || getRiyadhTodayDateStr(now);
     var subFilter = normalizeStr(opts.subFilter || 'all').toLowerCase();
     var search = normalizeStr(opts.search);
 
@@ -6944,37 +7282,48 @@
   ];
 
   function extractDayAndHourFromDateValue(rawDateStr, explicitTimeStr) {
+    var strVal = normalizeStr(rawDateStr);
+    var hasExplicitTimeArg = Boolean(normalizeStr(explicitTimeStr));
+    var hasExplicitTz = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(strVal);
+    if (!hasExplicitTimeArg && hasExplicitTz) {
+      var parsedTz = new Date(strVal);
+      if (!isNaN(parsedTz.getTime())) {
+        var riyadhDt = new Date(parsedTz.getTime() + 3 * 3600000);
+        return { dayIndex: riyadhDt.getUTCDay(), hour: riyadhDt.getUTCHours() };
+      }
+    }
+
     var dateOnly = formatDisplayDate(rawDateStr);
     var timeClean = normalizeTimeHHmm(normalizeStr(explicitTimeStr) || extractTimeOnly(rawDateStr), '');
     if (dateOnly && timeClean) {
       var parts = dateOnly.split('-');
       var tParts = timeClean.split(':');
-      var dtLocal = new Date(
+      var dtUtc = new Date(Date.UTC(
         parseInt(parts[0], 10),
         parseInt(parts[1], 10) - 1,
         parseInt(parts[2], 10),
         parseInt(tParts[0], 10),
         parseInt(tParts[1], 10),
         0
-      );
-      if (!isNaN(dtLocal.getTime())) {
-        return { dayIndex: dtLocal.getDay(), hour: dtLocal.getHours() };
+      ));
+      if (!isNaN(dtUtc.getTime())) {
+        return { dayIndex: dtUtc.getUTCDay(), hour: dtUtc.getUTCHours() };
       }
     }
 
-    var strVal = normalizeStr(rawDateStr);
     if (strVal) {
       var parsed = new Date(strVal);
       if (!isNaN(parsed.getTime())) {
-        return { dayIndex: parsed.getDay(), hour: parsed.getHours() };
+        var riyadhFallback = new Date(parsed.getTime() + 3 * 3600000);
+        return { dayIndex: riyadhFallback.getUTCDay(), hour: riyadhFallback.getUTCHours() };
       }
     }
 
     if (dateOnly) {
       var dp = dateOnly.split('-');
-      var dOnly = new Date(parseInt(dp[0], 10), parseInt(dp[1], 10) - 1, parseInt(dp[2], 10), 10, 0, 0);
+      var dOnly = new Date(Date.UTC(parseInt(dp[0], 10), parseInt(dp[1], 10) - 1, parseInt(dp[2], 10), 10, 0, 0));
       if (!isNaN(dOnly.getTime())) {
-        return { dayIndex: dOnly.getDay(), hour: 10 };
+        return { dayIndex: dOnly.getUTCDay(), hour: 10 };
       }
     }
     return null;
@@ -9680,10 +10029,11 @@
     var typeFilter = normalizeStr(opts.eventType || opts.typeFilter || 'all').toLowerCase();
     var searchTerm = normalizeStr(opts.search);
     var includeCancelled = Boolean(opts.includeCancelled);
+    var now = (typeof opts.nowMs === 'number' && isFinite(opts.nowMs)) ? opts.nowMs : Date.now();
 
     var events = [];
     var seenKeys = {};
-    var counts = { total: 0, pickup: 0, return: 0, extension: 0 };
+    var counts = { total: 0, pickup: 0, return: 0, extension: 0, completed: 0, overdue: 0 };
 
     function pushEv(ev) {
       if (!ev || !ev.dateIso) return;
@@ -9706,6 +10056,8 @@
       if (ev.type === 'pickup') counts.pickup += 1;
       else if (ev.type === 'return') counts.return += 1;
       else if (ev.type === 'extension') counts.extension += 1;
+      if (ev.isCompleted) counts.completed += 1;
+      if (ev.isOverdue) counts.overdue += 1;
       if (typeFilter && typeFilter !== 'all' && ev.type !== typeFilter) return;
       events.push(ev);
     }
@@ -9724,11 +10076,15 @@
       var comp = normalizeStr(r.companyName);
       var branch = normalizeStr(r.branchName);
       var statusTxt = normalizeStr(r.internalStatus || r.originalStatusAr) || '-';
+      var resPriority = normalizeStr(r.priority || 'عادي') || 'عادي';
       var extCount = Number(r.extensionsCount || 0);
       var hasExt = Boolean(r.hasExtensions || extCount > 0 || Number(r.extendedDaysCount || 0) > 0);
+      var pickupDone = isPickupCompletedStatus(r);
+      var closedDone = isReservationClosedStatus(r);
 
       var pInfo = resolveReservationStartInfo(r);
       if (pInfo.date) {
+        var pickupOverdue = !pickupDone && pInfo.timestampMs !== null && pInfo.timestampMs < now;
         pushEv({
           eventKey: rid + ':pickup:' + pInfo.date,
           type: 'pickup',
@@ -9745,6 +10101,9 @@
           companyName: comp,
           branchName: branch,
           status: statusTxt,
+          priority: resPriority,
+          isCompleted: pickupDone,
+          isOverdue: pickupOverdue,
           isExtended: hasExt,
           extensionDays: 0,
           extensionNumber: '',
@@ -9757,6 +10116,8 @@
       var returnTime = normalizeTimeHHmm(effEnd.time || r.endTime || r.originalEndTime, '12:00');
       var returnMins = parseMinutesOfDay(returnTime);
       if (returnDate) {
+        var returnTsMs = parseReservationEndTimestampMs(returnDate, returnTime || '23:59');
+        var returnOverdue = !closedDone && returnTsMs !== null && returnTsMs < now;
         pushEv({
           eventKey: rid + ':return:' + returnDate,
           type: 'return',
@@ -9773,6 +10134,9 @@
           companyName: comp,
           branchName: normalizeStr(r.deliverBranchName) || branch,
           status: statusTxt,
+          priority: resPriority,
+          isCompleted: closedDone,
+          isOverdue: returnOverdue,
           isExtended: Boolean(effEnd.isExtended || hasExt),
           extensionDays: Number(r.extendedDaysCount || 0),
           extensionNumber: '',
@@ -9789,6 +10153,8 @@
         if (!extDate) continue;
         var extTime = normalizeTimeHHmm(ext.endTime || ext.extendedUntilTime || r.extendedUntilTime || returnTime, '12:00');
         var extMins = parseMinutesOfDay(extTime);
+        var extTsMs = parseReservationEndTimestampMs(extDate, extTime || '23:59');
+        var extOverdue = !closedDone && extTsMs !== null && extTsMs < now;
         emittedExt = true;
         pushEv({
           eventKey: rid + ':extension:' + String(ext.id || ext.extensionNumber || (j + 1)) + ':' + extDate,
@@ -9806,6 +10172,9 @@
           companyName: comp,
           branchName: branch,
           status: statusTxt,
+          priority: resPriority,
+          isCompleted: closedDone,
+          isOverdue: extOverdue,
           isExtended: true,
           extensionDays: Number(ext.extendDays || ext.daysCount || r.extendedDaysCount || 0),
           extensionNumber: normalizeStr(ext.extensionNumber || ext.code || ('#' + (j + 1))),
@@ -9818,6 +10187,8 @@
         var sumExtTime = normalizeTimeHHmm(r.extendedUntilTime || returnTime, '12:00');
         var sumExtMins = parseMinutesOfDay(sumExtTime);
         if (sumExtDate) {
+          var sumExtTsMs = parseReservationEndTimestampMs(sumExtDate, sumExtTime || '23:59');
+          var sumExtOverdue = !closedDone && sumExtTsMs !== null && sumExtTsMs < now;
           pushEv({
             eventKey: rid + ':extension:summary:' + sumExtDate,
             type: 'extension',
@@ -9834,6 +10205,9 @@
             companyName: comp,
             branchName: branch,
             status: statusTxt,
+            priority: resPriority,
+            isCompleted: closedDone,
+            isOverdue: sumExtOverdue,
             isExtended: true,
             extensionDays: Number(r.extendedDaysCount || 0),
             extensionNumber: extCount > 1 ? ('×' + extCount) : '#1',
@@ -10046,6 +10420,7 @@
     getReportColumns: getReportColumns,
     formatReportCellValue: formatReportCellValue,
     computePdfColumnWidths: computePdfColumnWidths,
+    wrapTextPreservingNewlines: wrapTextPreservingNewlines,
     isPureLtrText: isPureLtrText,
     formatBidiPdfText: formatBidiPdfText,
     buildCompressedExcelSheets: buildCompressedExcelSheets,
@@ -10074,10 +10449,20 @@
     clampPdfPage: clampPdfPage,
     clampPdfZoom: clampPdfZoom,
     computePdfZoom: computePdfZoom,
+    PDF_BRAND_IDENTITY: PDF_BRAND_IDENTITY,
+    PDF_ARABIC_FONTS: PDF_ARABIC_FONTS,
+    PDF_DESIGN_STYLES: PDF_DESIGN_STYLES,
+    PDF_MARGIN_PRESETS_MM: PDF_MARGIN_PRESETS_MM,
+    PDF_FONT_SIZE_SCALES: PDF_FONT_SIZE_SCALES,
+    normalizePdfHexColor: normalizePdfHexColor,
     PDF_LAYOUT_PRESETS: PDF_LAYOUT_PRESETS,
     PDF_QUALITY_PROFILES: PDF_QUALITY_PROFILES,
     clampPdfTargetPages: clampPdfTargetPages,
     resolvePdfExportSettings: resolvePdfExportSettings,
+    resolvePdfMarginsMm: resolvePdfMarginsMm,
+    resolveAdvancedPdfSettings: resolveAdvancedPdfSettings,
+    applyPdfColumnSelectionAndOrder: applyPdfColumnSelectionAndOrder,
+    getUserPdfPrefsStorageKey: getUserPdfPrefsStorageKey,
     getPaperDimensionsMm: getPaperDimensionsMm,
     simulatePdfPagination: simulatePdfPagination,
     estimatePdfFileSizeBytes: estimatePdfFileSizeBytes,
@@ -10220,6 +10605,9 @@
     UI_DASHBOARD_HIDE_KEYS: UI_DASHBOARD_HIDE_KEYS,
     UI_ACTION_HIDE_KEYS: UI_ACTION_HIDE_KEYS,
     isUiOptionHiddenForUser: isUiOptionHiddenForUser,
-    dedupeEmployeesList: dedupeEmployeesList
+    dedupeEmployeesList: dedupeEmployeesList,
+    normalizeEmployeePhone: normalizeEmployeePhone,
+    normalizeEmployeeEmail: normalizeEmployeeEmail,
+    extractDayAndHourFromDateValue: extractDayAndHourFromDateValue
   };
 }));

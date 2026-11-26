@@ -98,6 +98,9 @@
       (user && user.role === 'general_manager') ||
       (root.RGCrmCore && root.RGCrmCore.canUserPerform && root.RGCrmCore.canUserPerform(user, 'customize_ui'))
     );
+    var canExportPdf = !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_export_pdf');
+    var canExportExcel = !root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_export_excel');
+    var isEn = Boolean(ctx && ctx.lang === 'en');
     var canActorImpersonate = Boolean(root.RGCrmCore && root.RGCrmCore.canUserImpersonate && root.RGCrmCore.canUserImpersonate(realOrCurUser));
     var allowedPreviewRoles = (canActorImpersonate && root.RGCrmCore.getAllowedPreviewRoles)
       ? root.RGCrmCore.getAllowedPreviewRoles(realOrCurUser)
@@ -320,8 +323,17 @@
               '<h2 class="section-title">' + t('nav_employees') + '</h2>' +
               '<p class="section-subtitle">إجمالي الموظفين الحاليين: <strong class="tabular-nums" style="color:var(--text-primary);" id="emp-total-count">' + items.length + '</strong> · تحديث لحظي مباشر مع نظام الحالة</p>' +
             '</div>' +
-            ((canManage || canReassign || canCustomizeUi) ? (
+            ((canManage || canReassign || canCustomizeUi || canExportPdf || canExportExcel) ? (
               '<div class="toolbar-actions">' +
+                ((root.RGExportMenu && (canExportPdf || canExportExcel))
+                  ? root.RGExportMenu.renderHtml({
+                      wrapId: 'emp-export-wrap',
+                      btnId: 'emp-export-btn',
+                      canPdf: canExportPdf,
+                      canExcel: canExportExcel,
+                      lang: ctx.lang
+                    })
+                  : (canExportPdf ? '<button type="button" class="btn btn-charcoal" id="emp-export-pdf">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '')) +
                 ((canReassign && (!root.RGCrmCore || !root.RGCrmCore.canUserUseActionButton || root.RGCrmCore.canUserUseActionButton(user, 'act_bulk_reassign'))) ? '<button type="button" class="btn rg-ui-emp-transfer" id="emp-bulk-reassign-btn">🔄 تحويل حجوزات نهاية الوردية</button>' : '') +
                 ((canManage && canViewPresetsSub) ? '<button type="button" class="btn rg-ui-role-presets" id="emp-scroll-presets-btn">الصلاحيات الجاهزة (' + rolePresets.length + ')</button>' : '') +
                 (canCustomizeUi ? '<button type="button" class="btn" id="emp-dev-sections-btn">' + (isActorDeveloper ? 'إظهار / إخفاء الأقسام لكل موظف' : 'إظهار / إخفاء الأقسام والواجهة للموظفين') + '</button>' : '') +
@@ -392,6 +404,122 @@
         var sec = document.getElementById('role-presets-section');
         if (sec) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
       });
+    }
+
+    function buildEmployeesExportData() {
+      var empCols = [
+        { key: 'name', label: isEn ? 'Employee Name' : 'اسم الموظف', widthWeight: 1.35 },
+        { key: 'username', label: isEn ? 'Username' : 'المستخدم', formatType: 'ltr', widthWeight: 1.0 },
+        { key: 'phone', label: isEn ? 'Phone' : 'الجوال', formatType: 'ltr', widthWeight: 1.0 },
+        { key: 'jobTitle', label: isEn ? 'Job Title' : 'الوظيفة', widthWeight: 1.15 },
+        { key: 'roleLabel', label: isEn ? 'Role' : 'الدور الوظيفي', widthWeight: 1.0 },
+        { key: 'statusLabel', label: isEn ? 'Status' : 'الحالة', widthWeight: 0.85 },
+        { key: 'reservationsCount', label: isEn ? 'Bookings' : 'حجوزات', formatType: 'number', summable: true, widthWeight: 0.7 },
+        { key: 'followUpsCount', label: isEn ? 'Follow-Ups' : 'متابعات', formatType: 'number', summable: true, widthWeight: 0.7 },
+        { key: 'problemsCount', label: isEn ? 'Problems' : 'مشكلات', formatType: 'number', summable: true, widthWeight: 0.7 },
+        { key: 'lastActivityText', label: isEn ? 'Last Activity' : 'آخر نشاط', formatType: 'ltr', widthWeight: 1.15 }
+      ];
+      var empRows = items.map(function (e) {
+        var resCnt = Number(e.reservationsCount !== undefined ? e.reservationsCount : ((e.stats && e.stats.assignedCount) || 0));
+        var fuCnt = Number(e.followUpsCount !== undefined ? e.followUpsCount : ((e.stats && e.stats.followUpsCount) || 0));
+        var prbCnt = Number(e.problemsCount !== undefined ? e.problemsCount : ((e.stats && e.stats.openProblemsCount) || 0));
+        var lastAct = e.lastActivity
+          ? (ctx && ctx.formatDateTime ? ctx.formatDateTime(e.lastActivity) : String(e.lastActivity).replace('T', ' ').substring(0, 16))
+          : '-';
+        return {
+          name: e.name || '-',
+          username: e.username || '-',
+          phone: e.phone || '-',
+          jobTitle: e.jobTitle || '-',
+          roleLabel: roleLabels[e.role] || e.role || '-',
+          statusLabel: e.status === 'active' ? (isEn ? 'Active' : 'نشط') : (isEn ? 'Disabled' : 'متوقف'),
+          reservationsCount: resCnt,
+          followUpsCount: fuCnt,
+          problemsCount: prbCnt,
+          lastActivityText: lastAct
+        };
+      });
+      var activeEmps = items.filter(function (e) { return e.status === 'active'; }).length;
+      var totalAssigned = empRows.reduce(function (s, r) { return s + Number(r.reservationsCount || 0); }, 0);
+      var totalFus = empRows.reduce(function (s, r) { return s + Number(r.followUpsCount || 0); }, 0);
+      return {
+        empCols: empCols,
+        empRows: empRows,
+        activeEmps: activeEmps,
+        totalAssigned: totalAssigned,
+        totalFus: totalFus
+      };
+    }
+
+    function triggerEmpPdf() {
+      if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+        if (ctx && ctx.toast) ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة تصدير PDF غير متاحة.', true);
+        return;
+      }
+      var dataEmp = buildEmployeesExportData();
+      var pdfRows = dataEmp.empRows.map(function (r) {
+        return Object.assign({}, r, {
+          reservationsCount: String(r.reservationsCount),
+          followUpsCount: String(r.followUpsCount),
+          problemsCount: String(r.problemsCount)
+        });
+      });
+      root.RGReports.openPdfStudio({
+        ctx: ctx,
+        title: isEn ? 'Employees & Team Performance Report' : 'تقرير الموظفين ومؤشرات الأداء',
+        filename: 'rental-gate-employees.pdf',
+        scopeKey: 'employees',
+        availableColumns: dataEmp.empCols,
+        columns: dataEmp.empCols,
+        rows: pdfRows,
+        summaryItems: [
+          { label: isEn ? 'Total Employees' : 'إجمالي الموظفين', value: String(items.length) },
+          { label: isEn ? 'Active Accounts' : 'الحسابات النشطة', value: String(dataEmp.activeEmps) },
+          { label: isEn ? 'Assigned Bookings' : 'إجمالي الحجوزات المسندة', value: String(dataEmp.totalAssigned) },
+          { label: isEn ? 'Total Follow-Ups' : 'إجمالي المتابعات', value: String(dataEmp.totalFus) }
+        ],
+        initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+      });
+    }
+
+    async function triggerEmpExcel() {
+      if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+        if (ctx && ctx.toast) ctx.toast(isEn ? 'Excel export module is unavailable.' : 'وحدة تصدير Excel غير متاحة.', true);
+        return;
+      }
+      var dataEmp = buildEmployeesExportData();
+      var repTitle = isEn ? 'Employees & Team Performance Report' : 'تقرير الموظفين ومؤشرات الأداء';
+      await root.RGReports.exportExcelWorkbook([{
+        name: isEn ? 'Employees' : 'الموظفون',
+        title: repTitle,
+        summaryItems: [
+          { label: isEn ? 'Total Employees' : 'إجمالي الموظفين', value: items.length },
+          { label: isEn ? 'Active Accounts' : 'الحسابات النشطة', value: dataEmp.activeEmps },
+          { label: isEn ? 'Assigned Bookings' : 'إجمالي الحجوزات المسندة', value: dataEmp.totalAssigned },
+          { label: isEn ? 'Total Follow-Ups' : 'إجمالي المتابعات', value: dataEmp.totalFus }
+        ],
+        headers: dataEmp.empCols,
+        rows: dataEmp.empRows
+      }], 'rental-gate-employees.xlsx', {
+        lang: ctx.lang,
+        title: repTitle
+      });
+      if (ctx && ctx.toast) ctx.toast(isEn ? 'Employees exported to Excel.' : 'تم تصدير قائمة الموظفين إلى ملف Excel بنجاح.');
+    }
+
+    var empExportWrap = document.getElementById('emp-export-wrap');
+    if (empExportWrap && root.RGExportMenu) {
+      root.RGExportMenu.bind(empExportWrap, {
+        onPdf: triggerEmpPdf,
+        onExcel: triggerEmpExcel,
+        onError: function (err) {
+          if (ctx && ctx.toast) ctx.toast((err && err.message) || 'تعذر تنفيذ التصدير.', true);
+        }
+      });
+    }
+    var empPdfBtn = document.getElementById('emp-export-pdf');
+    if (empPdfBtn) {
+      empPdfBtn.addEventListener('click', triggerEmpPdf);
     }
 
     var addBtn = document.getElementById('emp-add-btn');
@@ -1373,6 +1501,7 @@
     var options = opts || {};
     var modalRoot = document.getElementById('modal-root');
     var isEdit = Boolean(existing);
+    var createClientRequestId = isEdit ? '' : ('REQ_EMP_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
     var presets = root.RGCrmCore.normalizeRolePresets(options.rolePresets);
     var customPermissions = Array.isArray(options.customPermissions) ? options.customPermissions.slice() : [];
     var catalog = root.RGCrmCore.mergePermissionsCatalog(customPermissions);
@@ -1901,6 +2030,37 @@
           if (pwd) payload.newPassword = pwd;
         } else {
           payload.password = pwd;
+          payload.clientRequestId = createClientRequestId;
+        }
+
+        var coreEmpRef = root.RGCrmCore || {};
+        var empListForDup = (ctx && ctx.appState && typeof ctx.appState.getEmployeesState === 'function')
+          ? ((ctx.appState.getEmployeesState() || {}).items || [])
+          : [];
+        var normUserFn = coreEmpRef.normalizeLoginUsername || function (v) { return String(v || '').trim().toLowerCase(); };
+        var normEmailFn = coreEmpRef.normalizeEmployeeEmail || function (v) { return String(v || '').trim().toLowerCase(); };
+        var normPhoneFn = coreEmpRef.normalizeEmployeePhone || function (v) { return String(v || '').replace(/\D/g, ''); };
+        var chkUser = normUserFn(payload.username);
+        var chkEmail = normEmailFn(payload.email);
+        var chkPhone = normPhoneFn(payload.phone);
+        var dupEmpRow = empListForDup.find(function (e) {
+          if (!e) return false;
+          if (isEdit && existing && e.id === existing.id) return false;
+          if (chkUser && normUserFn(e.username) === chkUser) return true;
+          if (chkEmail && normEmailFn(e.email) === chkEmail) return true;
+          if (chkPhone && normPhoneFn(e.phone) === chkPhone) return true;
+          return false;
+        });
+        if (dupEmpRow) {
+          var dupFieldMsg = (chkUser && normUserFn(dupEmpRow.username) === chkUser)
+            ? 'اسم المستخدم مسجل بالفعل لموظف آخر.'
+            : ((chkEmail && normEmailFn(dupEmpRow.email) === chkEmail)
+              ? 'البريد الإلكتروني مسجل بالفعل لموظف آخر.'
+              : 'رقم الجوال مسجل بالفعل لموظف آخر.');
+          errEl.textContent = dupFieldMsg;
+          errEl.classList.remove('hidden');
+          releaseEmpFormLock();
+          return false;
         }
 
         if (root.RGApp && typeof root.RGApp.checkActionSpam === 'function') {

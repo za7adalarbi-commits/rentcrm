@@ -340,6 +340,7 @@
     var searchDebounce = null;
 
     var canExport = canUseAction(user, 'act_export_excel');
+    var canExportPdf = canUseAction(user, 'act_export_pdf');
     var canRestore = false;
     var allowIdView = canViewIdNumber(user);
 
@@ -412,12 +413,16 @@
                 '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>' +
                 '<span>' + (isEn ? 'Refresh' : 'تحديث') + '</span>' +
               '</button>' +
-              (canExport ? (
-                '<button type="button" class="btn btn-charcoal rg-ui-res-export-btn" id="inact-export-btn">' +
-                  '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>' +
-                  '<span>' + (isEn ? 'Export Excel' : 'تصدير Excel') + '</span>' +
-                '</button>'
-              ) : '') +
+              ((root.RGExportMenu && (canExportPdf || canExport))
+                ? root.RGExportMenu.renderHtml({
+                    wrapId: 'inact-export-wrap',
+                    btnId: 'inact-export-btn-menu',
+                    canPdf: canExportPdf,
+                    canExcel: canExport,
+                    lang: ctx.lang
+                  })
+                : ((canExportPdf ? '<button type="button" class="btn btn-primary" id="inact-export-pdf"><span>' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</span></button>' : '') +
+                   (canExport ? '<button type="button" class="btn btn-charcoal rg-ui-res-export-btn" id="inact-export-btn"><span>' + (isEn ? 'Export Excel' : 'تصدير Excel') + '</span></button>' : ''))) +
             '</div>' +
           '</div>' +
           '<div class="rg-inactive-adv-filters' + (state.filtersExpanded ? '' : ' hidden') + '" id="inact-adv-filters">' +
@@ -745,62 +750,161 @@
         });
       }
 
-      var exportBtn = hostEl.querySelector('#inact-export-btn');
-      if (exportBtn) {
-        exportBtn.addEventListener('click', async function () {
-          exportBtn.disabled = true;
-          try {
-            var reasonCol = isCancelled
-              ? { key: 'cancellationReason', label: isEn ? 'Cancellation Reason' : 'سبب الإلغاء' }
-              : { key: 'rejectionReason', label: isEn ? 'Rejection Reason' : 'سبب الرفض' };
-            var actorCol = isCancelled
-              ? { key: 'cancelledByName', label: isEn ? 'Confirmed By' : 'الموظف الذي أكد الإجراء' }
-              : { key: 'rejectedByName', label: isEn ? 'Confirmed By' : 'الموظف الذي أكد الإجراء' };
-            var dateCol = isCancelled
-              ? { key: 'cancelledAt', label: isEn ? 'Cancellation Date' : 'تاريخ ووقت الإلغاء' }
-              : { key: 'rejectedAt', label: isEn ? 'Rejection Date' : 'تاريخ ووقت الرفض' };
-            var headers = [
-              { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز' },
-              { key: 'customerName', label: isEn ? 'Customer Name' : 'اسم العميل' }
-            ];
-            if (allowIdView) {
-              headers.push({ key: 'customerIdNumber', label: isEn ? 'National ID' : 'رقم الهوية' });
-            }
-            headers = headers.concat([
-              { key: 'customerPhone', label: isEn ? 'Phone' : 'رقم الجوال' },
-              { key: 'companyName', label: isEn ? 'Company' : 'الشركة' },
-              { key: 'newCompanyName', label: isEn ? 'New Company' : 'الشركة الجديدة' },
-              reasonCol,
-              { key: 'internalStatus', label: isEn ? 'Status' : 'حالة الحجز' },
-              { key: 'carStatusAtRequest', label: isEn ? 'Car Status at Request' : 'حالة حجز السيارة عند الطلب' },
-              { key: 'refundAmount', label: isEn ? 'Refund Amount' : 'مبلغ الاسترداد' },
-              actorCol,
-              dateCol
-            ]);
-            if (root.RGReports && typeof root.RGReports.exportExcelWorkbook === 'function') {
-              var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
-              var exportRows = currentItems.map(function (row) {
-                var copy = Object.assign({}, row);
-                if (isCancelled) {
-                  copy.cancellationReason = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
-                } else {
-                  copy.rejectionReason = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
-                }
-                return copy;
-              });
-              await root.RGReports.exportExcelWorkbook([{
-                name: isCancelled ? 'CancelledReservations' : 'RejectedReservations',
-                headers: headers,
-                rows: exportRows
-              }], isCancelled ? 'rental-gate-cancelled-reservations.xlsx' : 'rental-gate-rejected-reservations.xlsx');
-              if (ctx && ctx.toast) ctx.toast(isEn ? 'Exported to Excel.' : 'تم تصدير البيانات إلى ملف Excel بنجاح.');
-            }
-          } catch (err) {
+      async function triggerInactiveExcelExport() {
+        var reasonCol = isCancelled
+          ? { key: 'cancellationReason', label: isEn ? 'Cancellation Reason' : 'سبب الإلغاء' }
+          : { key: 'rejectionReason', label: isEn ? 'Rejection Reason' : 'سبب الرفض' };
+        var actorCol = isCancelled
+          ? { key: 'cancelledByName', label: isEn ? 'Confirmed By' : 'الموظف الذي أكد الإجراء' }
+          : { key: 'rejectedByName', label: isEn ? 'Confirmed By' : 'الموظف الذي أكد الإجراء' };
+        var dateCol = isCancelled
+          ? { key: 'cancelledAt', label: isEn ? 'Cancellation Date' : 'تاريخ ووقت الإلغاء', formatType: 'datetime' }
+          : { key: 'rejectedAt', label: isEn ? 'Rejection Date' : 'تاريخ ووقت الرفض', formatType: 'datetime' };
+        var headers = [
+          { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr' },
+          { key: 'customerName', label: isEn ? 'Customer Name' : 'اسم العميل' }
+        ];
+        if (allowIdView) {
+          headers.push({ key: 'customerIdNumber', label: isEn ? 'National ID' : 'رقم الهوية', formatType: 'ltr' });
+        }
+        headers = headers.concat([
+          { key: 'customerPhone', label: isEn ? 'Phone' : 'رقم الجوال', formatType: 'ltr' },
+          { key: 'companyName', label: isEn ? 'Company' : 'الشركة' },
+          { key: 'newCompanyName', label: isEn ? 'New Company' : 'الشركة الجديدة' },
+          reasonCol,
+          { key: 'internalStatus', label: isEn ? 'Status' : 'حالة الحجز' },
+          { key: 'carStatusAtRequest', label: isEn ? 'Car Status at Request' : 'حالة حجز السيارة عند الطلب' },
+          { key: 'refundAmount', label: isEn ? 'Refund Amount' : 'مبلغ الاسترداد', formatType: 'number', summable: true },
+          actorCol,
+          dateCol
+        ]);
+        if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+          if (ctx && ctx.toast) ctx.toast(isEn ? 'Excel export is unavailable.' : 'وحدة تصدير Excel غير متاحة.', true);
+          return;
+        }
+        var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+        var exportRows = currentItems.map(function (row) {
+          var copy = Object.assign({}, row);
+          if (isCancelled) {
+            copy.cancellationReason = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
+          } else {
+            copy.rejectionReason = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
+          }
+          return copy;
+        });
+        var repTitle = isCancelled
+          ? (isEn ? 'Cancelled Reservations Report' : 'تقرير الحجوزات الملغاة')
+          : (isEn ? 'Rejected Reservations Report' : 'تقرير الحجوزات المرفوضة');
+        var periodTxt = (state.dateFrom || state.dateTo)
+          ? ((state.dateFrom || '...') + ' → ' + (state.dateTo || '...'))
+          : (isEn ? 'All Dates / Active View' : 'كافة التواريخ / العرض الحالي');
+        var activeFiltersList = [
+          state.company ? ((isEn ? 'Company: ' : 'الشركة: ') + state.company) : '',
+          state.newCompanyName ? ((isEn ? 'New Company: ' : 'الشركة الجديدة: ') + state.newCompanyName) : '',
+          state.status ? ((isEn ? 'Status: ' : 'الحالة: ') + state.status) : '',
+          state.reason ? ((isEn ? 'Reason: ' : 'السبب: ') + state.reason) : '',
+          state.search ? ((isEn ? 'Search: ' : 'البحث: ') + state.search) : ''
+        ].filter(Boolean).join(' · ');
+
+        await root.RGReports.exportExcelWorkbook([{
+          name: isCancelled ? (isEn ? 'Cancelled Bookings' : 'الحجوزات الملغاة') : (isEn ? 'Rejected Bookings' : 'الحجوزات المرفوضة'),
+          title: repTitle,
+          periodText: periodTxt,
+          filtersText: activeFiltersList,
+          summaryItems: [
+            { label: isEn ? 'Total Matching' : 'إجمالي المطابق', value: Number(currentTotal || exportRows.length) },
+            { label: isEn ? 'Exported Rows' : 'الصفوف المصدرة', value: exportRows.length }
+          ],
+          headers: headers,
+          rows: exportRows
+        }], isCancelled ? 'rental-gate-cancelled-reservations.xlsx' : 'rental-gate-rejected-reservations.xlsx', {
+          lang: ctx && ctx.lang,
+          title: repTitle,
+          periodText: periodTxt,
+          filtersText: activeFiltersList
+        });
+        if (ctx && ctx.toast) ctx.toast(isEn ? 'Exported to Excel.' : 'تم تصدير البيانات إلى ملف Excel بنجاح.');
+      }
+
+      function triggerInactivePdfExport() {
+        if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+          if (ctx && ctx.toast) ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة تصدير PDF غير متاحة.', true);
+          return;
+        }
+        var reasonKey = isCancelled ? 'cancellationReason' : 'rejectionReason';
+        var reasonCol = { key: reasonKey, label: isCancelled ? (isEn ? 'Cancellation Reason' : 'سبب الإلغاء') : (isEn ? 'Rejection Reason' : 'سبب الرفض'), widthWeight: 1.8 };
+        var actorCol = { key: isCancelled ? 'cancelledByName' : 'rejectedByName', label: isEn ? 'Confirmed By' : 'تأكيد بواسطة', widthWeight: 1.0 };
+        var dateCol = { key: isCancelled ? 'cancelledAtText' : 'rejectedAtText', label: isCancelled ? (isEn ? 'Cancellation Date' : 'تاريخ الإلغاء') : (isEn ? 'Rejection Date' : 'تاريخ الرفض'), formatType: 'ltr', widthWeight: 1.0 };
+        var cols = [
+          { key: 'reservationNumber', label: isEn ? 'Booking #' : 'رقم الحجز', formatType: 'ltr', widthWeight: 1.0 },
+          { key: 'customerName', label: isEn ? 'Customer Name' : 'اسم العميل', widthWeight: 1.25 }
+        ];
+        if (allowIdView) {
+          cols.push({ key: 'customerIdNumber', label: isEn ? 'National ID' : 'رقم الهوية', formatType: 'ltr', widthWeight: 1.0 });
+        }
+        cols = cols.concat([
+          { key: 'customerPhone', label: isEn ? 'Phone' : 'الجوال', formatType: 'ltr', widthWeight: 1.0 },
+          { key: 'companyName', label: isEn ? 'Company' : 'الشركة', widthWeight: 1.05 },
+          reasonCol,
+          { key: 'internalStatus', label: isEn ? 'Status' : 'الحالة', widthWeight: 0.9 },
+          actorCol,
+          dateCol
+        ]);
+        var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+        var pdfRows = currentItems.map(function (row) {
+          var copy = Object.assign({}, row);
+          var cleanR = (core && core.sanitizeReasonText ? core.sanitizeReasonText(copy[reasonKey]) : String(copy[reasonKey] || '').trim()) || emptyReasonExp;
+          copy[reasonKey] = cleanR;
+          copy.cancelledAtText = row.cancelledAt ? String(row.cancelledAt).replace('T', ' ').substring(0, 16) : '-';
+          copy.rejectedAtText = row.rejectedAt ? String(row.rejectedAt).replace('T', ' ').substring(0, 16) : '-';
+          return copy;
+        });
+        var fullReasons = currentItems.map(function (row) {
+          var rawR = (core && core.sanitizeReasonText ? core.sanitizeReasonText(row[reasonKey]) : String(row[reasonKey] || '').trim());
+          var drvN = (core && core.sanitizeReasonText ? core.sanitizeReasonText(row.driverNotes) : String(row.driverNotes || '').trim());
+          if (!rawR && !drvN) return '';
+          return (row.reservationNumber || '-') + ' — ' + (row.customerName || '-') + ':\n' + [rawR, drvN ? ((isEn ? 'Driver notes: ' : 'ملاحظات السائق: ') + drvN) : ''].filter(Boolean).join('\n');
+        }).filter(Boolean);
+        var scopeKey = 'inactive_' + mode;
+        root.RGReports.openPdfStudio({
+          ctx: ctx,
+          title: isCancelled ? (isEn ? 'Cancelled Reservations Report' : 'تقرير الحجوزات الملغاة') : (isEn ? 'Rejected Reservations Report' : 'تقرير الحجوزات المرفوضة'),
+          filename: 'rental-gate-' + scopeKey + '.pdf',
+          scopeKey: scopeKey,
+          availableColumns: cols,
+          columns: cols,
+          rows: pdfRows,
+          summaryItems: [
+            { label: isEn ? 'Total Matching' : 'إجمالي المطابق', value: String(currentTotal || pdfRows.length) },
+            { label: isEn ? 'Exported Page Rows' : 'الصفوف المعروضة', value: String(pdfRows.length) }
+          ],
+          extraSections: fullReasons.length ? [{
+            title: isCancelled ? (isEn ? 'Full Cancellation Reasons & Driver Notes' : 'أسباب الإلغاء وملاحظات السائق الكاملة') : (isEn ? 'Full Rejection Reasons & Notes' : 'أسباب الرفض والملاحظات الكاملة'),
+            isNotes: true,
+            lines: fullReasons
+          }] : [],
+          initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+        });
+      }
+
+      var inactExportWrap = hostEl.querySelector('#inact-export-wrap');
+      if (inactExportWrap && root.RGExportMenu) {
+        root.RGExportMenu.bind(inactExportWrap, {
+          onPdf: triggerInactivePdfExport,
+          onExcel: triggerInactiveExcelExport,
+          onError: function (err) {
             if (ctx && ctx.toast) ctx.toast((err && err.message) || 'تعذر التصدير.', true);
-          } finally {
-            exportBtn.disabled = false;
           }
         });
+      }
+
+      var exportBtn = hostEl.querySelector('#inact-export-btn');
+      if (exportBtn) {
+        exportBtn.addEventListener('click', triggerInactiveExcelExport);
+      }
+      var exportPdfBtn = hostEl.querySelector('#inact-export-pdf');
+      if (exportPdfBtn) {
+        exportPdfBtn.addEventListener('click', triggerInactivePdfExport);
       }
 
       ['#inact-f-search', '#inact-f-resnum', '#inact-f-cmpnum', '#inact-f-oldcmp', '#inact-f-newcmp'].forEach(function (sel) {

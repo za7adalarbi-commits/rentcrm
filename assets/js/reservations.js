@@ -362,6 +362,7 @@
     var canHandoverPdf = Boolean(root.RGHandover && canAction('act_handover_pdf'));
     var canResColumns = canAction('act_res_columns');
     var canExportExcel = canAction('act_export_excel');
+    var canExportPdf = canAction('act_export_pdf');
     var canClaimButtons = canAction('act_claim_reservation');
     var canLookupIdBtn = Boolean(
       root.RGInactive && currentUser && root.RGCrmCore &&
@@ -428,7 +429,17 @@
             (canPullReservations ? '<button type="button" class="btn btn-charcoal rg-ui-res-pull-btn" id="res-pull-btn" title="جلب أحدث الحجوزات والتمديدات">' + t('pull_reservations') + '</button>' : '') +
             (canImportExcel ? '<button type="button" class="btn rg-ui-res-import-btn" id="res-import-xlsx">' + (isEn ? 'Import Excel' : 'استيراد من Excel') + '</button>' : '') +
             (canResColumns ? '<button type="button" class="btn rg-ui-res-cols-btn" id="res-cols-btn">' + t('toggle_columns') + '</button>' : '') +
-            (canExportExcel ? '<button type="button" class="btn btn-primary rg-ui-res-export-btn" id="res-export-xlsx">' + t('export_excel') + '</button>' : '') +
+            ((root.RGExportMenu && (canExportPdf || canExportExcel))
+              ? root.RGExportMenu.renderHtml({
+                  wrapId: 'res-export-wrap',
+                  btnId: 'res-export-btn',
+                  extraWrapClass: 'rg-ui-res-export-wrap',
+                  canPdf: canExportPdf,
+                  canExcel: canExportExcel,
+                  lang: ctx.lang
+                })
+              : ((canExportPdf ? '<button type="button" class="btn btn-charcoal rg-ui-res-export-pdf-btn" id="res-export-pdf">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '') +
+                 (canExportExcel ? '<button type="button" class="btn btn-primary rg-ui-res-export-btn" id="res-export-xlsx">' + t('export_excel') + '</button>' : ''))) +
           '</div>' +
         '</div>' +
         '<div class="res-view-tabs" role="tablist" aria-label="' + (isEn ? 'Reservations View' : 'تبويبات الحجوزات') + '">' +
@@ -1998,6 +2009,7 @@
                 ensureTodayCalendarLoaded({ forceRefresh: true });
               } else {
                 calendarRawItems = null;
+                calendarLoadedWindow = { from: '', to: '' };
               }
             } else {
               ctx.toast((resp && resp.message) || 'تعذر سحب الحجوزات.', true);
@@ -2009,41 +2021,224 @@
       });
     }
 
-    var exportBtn = document.getElementById('res-export-xlsx');
-    if (exportBtn) {
-      exportBtn.addEventListener('click', async function () {
-        exportBtn.disabled = true;
-        try {
-          var exportHeaders = state.viewMode === 'rejected'
-            ? REJECTED_COLUMNS.slice()
-            : (state.viewMode === 'cancelled'
-                ? CANCELLED_COLUMNS.slice()
-                : ALL_COLUMNS.filter(function (col) { return col.key !== 'customerIdNumber' || canViewId; }));
-          var exportSheetName = state.viewMode === 'rejected'
-            ? 'Rejected'
-            : (state.viewMode === 'cancelled' ? 'Cancelled' : 'Reservations');
-          var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
-          var exportRows = currentItems.map(function (row) {
-            var copy = Object.assign({}, row);
-            if (state.viewMode === 'rejected') {
-              copy.rejectionReason = (core.sanitizeReasonText ? core.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
-            } else if (state.viewMode === 'cancelled') {
-              copy.cancellationReason = (core.sanitizeReasonText ? core.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
-            }
-            return copy;
-          });
-          await root.RGReports.exportExcelWorkbook([{
-            name: exportSheetName,
-            headers: exportHeaders,
-            rows: exportRows
-          }], 'rental-gate-reservations.xlsx');
-          ctx.toast('تم تصدير جدول الحجوزات إلى Excel.');
-        } catch (err) {
-          ctx.toast((err && err.message) || 'تعذر تصدير ملف Excel.', true);
-        } finally {
-          exportBtn.disabled = false;
+    function buildResExportMeta() {
+      var selectedItems = currentItems.filter(function (row) { return Boolean(selectedResIds[row.id]); });
+      var sourceRows = selectedItems.length > 0 ? selectedItems : currentItems;
+      var tabTitleAr = state.viewMode === 'rejected'
+        ? 'تقرير الحجوزات المرفوضة'
+        : (state.viewMode === 'cancelled' ? 'تقرير الحجوزات الملغاة' : 'تقرير جدول الحجوزات');
+      var tabTitleEn = state.viewMode === 'rejected'
+        ? 'Rejected Reservations Report'
+        : (state.viewMode === 'cancelled' ? 'Cancelled Reservations Report' : 'Reservations Report');
+      var periodStr = (state.dateFrom || state.dateTo)
+        ? ((state.dateFrom || '...') + ' → ' + (state.dateTo || '...'))
+        : (isEn ? 'All Dates / Active Filter View' : 'كافة التواريخ / حسب الفلتر النشط');
+      var filtersArr = [
+        selectedItems.length > 0 ? ((isEn ? 'Selected Only: ' : 'محددة فقط: ') + selectedItems.length) : '',
+        state.company ? ((isEn ? 'Company: ' : 'الشركة: ') + state.company) : '',
+        state.branch ? ((isEn ? 'Branch: ' : 'الفرع: ') + state.branch) : '',
+        state.status ? ((isEn ? 'Status: ' : 'الحالة: ') + state.status) : '',
+        state.employeeId ? ((isEn ? 'Employee: ' : 'الموظف: ') + ((employees.find(function (e) { return e.id === state.employeeId; }) || {}).name || state.employeeId)) : '',
+        state.priority ? ((isEn ? 'Priority: ' : 'الأولوية: ') + state.priority) : '',
+        state.search ? ((isEn ? 'Search: ' : 'البحث: ') + state.search) : '',
+        state.reservationNumber ? ((isEn ? 'Booking #: ' : 'رقم الحجز: ') + state.reservationNumber) : '',
+        state.unfollowedOnly ? (isEn ? 'Unfollowed Only' : 'بانتظار المتابعة فقط') : '',
+        state.hasProblemsOnly ? (isEn ? 'Has Problems' : 'تحتوي مشكلات') : '',
+        state.overdueUnpaidOnly ? (isEn ? 'Overdue Unpaid' : 'متأخرة الدفع') : ''
+      ].filter(Boolean);
+      return {
+        selectedItems: selectedItems,
+        sourceRows: sourceRows,
+        tabTitleAr: tabTitleAr,
+        tabTitleEn: tabTitleEn,
+        periodStr: periodStr,
+        filtersStr: filtersArr.join(' · ')
+      };
+    }
+
+    async function resolveExportSourceRows(metaExp) {
+      if (metaExp.selectedItems && metaExp.selectedItems.length > 0) {
+        return metaExp.selectedItems;
+      }
+      var totalMatched = Number(payload.total || 0);
+      if (totalMatched <= currentItems.length && Number(state.page || 1) === 1 && currentTotalPages <= 1) {
+        return currentItems.slice();
+      }
+      if (typeof ctx.toast === 'function') {
+        ctx.toast(isEn ? 'Preparing all matching records for export...' : 'جاري تجهيز جميع السجلات المطابقة للتصدير...');
+      }
+      var collected = [];
+      var seenIds = {};
+      var pageNum = 1;
+      var totalPagesExp = 1;
+      var chunkSize = 200;
+      while (pageNum <= totalPagesExp && pageNum <= 25) {
+        var qExp = getQueryPayload({
+          page: pageNum,
+          pageSize: chunkSize,
+          exportMode: true,
+          abortKey: ''
+        });
+        var expResp = await root.RGApi.callApi('getReservations', qExp);
+        if (!expResp || !expResp.success || !expResp.data) break;
+        var batch = Array.isArray(expResp.data.items) ? expResp.data.items : [];
+        batch.forEach(function (row) {
+          var rk = String((row && (row.id || row.reservationNumber)) || '');
+          if (rk && seenIds[rk]) return;
+          if (rk) seenIds[rk] = true;
+          collected.push(row);
+        });
+        totalPagesExp = Math.max(1, Number(expResp.data.totalPages || 1));
+        if (batch.length < chunkSize) break;
+        pageNum += 1;
+      }
+      return collected.length ? collected : currentItems.slice();
+    }
+
+    async function triggerResExcelExport() {
+      var metaExp = buildResExportMeta();
+      var fullSourceRows = await resolveExportSourceRows(metaExp);
+      var exportHeaders = state.viewMode === 'rejected'
+        ? REJECTED_COLUMNS.slice()
+        : (state.viewMode === 'cancelled'
+            ? CANCELLED_COLUMNS.slice()
+            : ALL_COLUMNS.filter(function (col) { return col.key !== 'customerIdNumber' || canViewId; }));
+      var exportSheetName = state.viewMode === 'rejected'
+        ? (isEn ? 'Rejected' : 'الحجوزات المرفوضة')
+        : (state.viewMode === 'cancelled' ? (isEn ? 'Cancelled' : 'الحجوزات الملغاة') : (isEn ? 'Reservations' : 'جدول الحجوزات'));
+      var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+      var coreRef = root.RGCrmCore || {};
+      var exportRows = fullSourceRows.map(function (row) {
+        var copy = Object.assign({}, row);
+        if (state.viewMode === 'rejected') {
+          copy.rejectionReason = (coreRef.sanitizeReasonText ? coreRef.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
+        } else if (state.viewMode === 'cancelled') {
+          copy.cancellationReason = (coreRef.sanitizeReasonText ? coreRef.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
+        }
+        return copy;
+      });
+      var repTitleFull = isEn ? metaExp.tabTitleEn : metaExp.tabTitleAr;
+      var totalAmtSum = Math.round(exportRows.reduce(function (s, r) { return s + Number(r.totalAmount || 0); }, 0) * 100) / 100;
+      var extAmtSum = Math.round(exportRows.reduce(function (s, r) { return s + Number(r.extensionsAmount || 0); }, 0) * 100) / 100;
+      var summaryItems = [
+        { label: isEn ? 'Matching Results' : 'إجمالي النتائج المطابقة', value: Number(payload.total || exportRows.length) },
+        { label: isEn ? 'Exported Rows' : 'الصفوف المصدرة', value: exportRows.length },
+        { label: isEn ? 'Active Tab' : 'التبويب النشط', value: repTitleFull }
+      ];
+      if (state.viewMode !== 'rejected' && state.viewMode !== 'cancelled') {
+        summaryItems.push({ label: isEn ? 'Total Amount' : 'إجمالي المبالغ', value: totalAmtSum.toLocaleString('en-US') });
+        if (extAmtSum > 0) {
+          summaryItems.push({ label: isEn ? 'Extensions Amount' : 'مبالغ التمديد', value: extAmtSum.toLocaleString('en-US') });
+        }
+      }
+      await root.RGReports.exportExcelWorkbook([{
+        name: exportSheetName,
+        title: repTitleFull,
+        periodText: metaExp.periodStr,
+        filtersText: metaExp.filtersStr,
+        summaryItems: summaryItems,
+        headers: exportHeaders,
+        rows: exportRows
+      }], 'rental-gate-reservations.xlsx', {
+        lang: ctx.lang,
+        title: repTitleFull,
+        periodText: metaExp.periodStr,
+        filtersText: metaExp.filtersStr
+      });
+      ctx.toast(isEn ? 'Reservations exported to Excel successfully.' : 'تم تصدير جدول الحجوزات إلى Excel بنجاح.');
+    }
+
+    async function triggerResPdfExport() {
+      if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+        ctx.toast(isEn ? 'PDF Studio is unavailable.' : 'وحدة معاينة وتصدير PDF غير متاحة.', true);
+        return;
+      }
+      var metaExp = buildResExportMeta();
+      var fullSourceRows = await resolveExportSourceRows(metaExp);
+      var activeCols = state.viewMode === 'rejected'
+        ? REJECTED_COLUMNS.slice()
+        : (state.viewMode === 'cancelled'
+            ? CANCELLED_COLUMNS.slice()
+            : ALL_COLUMNS.filter(function (c) {
+                if (c.key === 'customerIdNumber' && !canViewId) return false;
+                return state.visibleCols.indexOf(c.key) !== -1;
+              }));
+      var allScopeCols = state.viewMode === 'rejected'
+        ? REJECTED_COLUMNS.slice()
+        : (state.viewMode === 'cancelled'
+            ? CANCELLED_COLUMNS.slice()
+            : ALL_COLUMNS.filter(function (c) { return c.key !== 'customerIdNumber' || canViewId; }));
+      var emptyReasonExp = isEn ? 'No reason recorded in source for this booking' : 'لم يُسجّل سبب في المصدر لهذا الحجز';
+      var corePdfRef = root.RGCrmCore || {};
+      var pdfRows = fullSourceRows.map(function (row) {
+        var copy = Object.assign({}, row);
+        copy.startDate = formatDateOnly(row.startDate);
+        copy.endDate = formatDateOnly(row.endDate);
+        copy.extendedUntilDate = row.extendedUntilDate ? formatDateOnly(row.extendedUntilDate) : '-';
+        copy.lastUpdatedAt = row.lastUpdatedAt ? formatTimestamp(row.lastUpdatedAt, ctx.lang) : '-';
+        copy.sourceCreatedAt = row.sourceCreatedAt ? formatTimestamp(row.sourceCreatedAt, ctx.lang) : '-';
+        copy.rejectedAt = row.rejectedAt ? formatTimestamp(row.rejectedAt, ctx.lang) : '-';
+        copy.cancelledAt = row.cancelledAt ? formatTimestamp(row.cancelledAt, ctx.lang) : '-';
+        copy.assignedEmployeeNames = Array.isArray(row.assignedEmployeeNames) && row.assignedEmployeeNames.length
+          ? row.assignedEmployeeNames.join('، ')
+          : (isEn ? 'Unassigned' : 'متاح للاستلام');
+        if (state.viewMode === 'rejected') {
+          copy.rejectionReason = (corePdfRef.sanitizeReasonText ? corePdfRef.sanitizeReasonText(copy.rejectionReason) : String(copy.rejectionReason || '').trim()) || emptyReasonExp;
+        } else if (state.viewMode === 'cancelled') {
+          copy.cancellationReason = (corePdfRef.sanitizeReasonText ? corePdfRef.sanitizeReasonText(copy.cancellationReason) : String(copy.cancellationReason || '').trim()) || emptyReasonExp;
+        }
+        return copy;
+      });
+      var scopeKey = 'reservations_' + (state.viewMode || 'all');
+      root.RGReports.openPdfStudio({
+        ctx: ctx,
+        title: isEn ? metaExp.tabTitleEn : metaExp.tabTitleAr,
+        filename: 'rental-gate-' + scopeKey + '.pdf',
+        scopeKey: scopeKey,
+        availableColumns: allScopeCols.map(function (c) {
+          return {
+            key: c.key,
+            label: c.label,
+            visible: activeCols.some(function (ac) { return ac.key === c.key; }),
+            widthWeight: (c.key === 'customerName' || c.key === 'carName' || c.key === 'lastUpdateText' || c.key === 'rejectionReason' || c.key === 'cancellationReason' || c.key === 'driverNotes') ? 1.4 : 1
+          };
+        }),
+        columns: activeCols.map(function (c) {
+          return {
+            key: c.key,
+            label: c.label,
+            formatType: (c.key === 'reservationNumber' || c.key === 'customerPhone' || c.key === 'customerIdNumber' || c.key === 'startDate' || c.key === 'endDate') ? 'ltr' : undefined,
+            widthWeight: (c.key === 'customerName' || c.key === 'carName' || c.key === 'lastUpdateText' || c.key === 'rejectionReason' || c.key === 'cancellationReason' || c.key === 'driverNotes') ? 1.4 : 1
+          };
+        }),
+        rows: pdfRows,
+        summaryItems: [
+          { label: isEn ? 'Matching Results' : 'إجمالي النتائج المطابقة', value: String(payload.total || pdfRows.length) },
+          { label: isEn ? 'Exported Rows' : 'الصفوف المصدرة', value: String(pdfRows.length) },
+          { label: isEn ? 'Active Tab' : 'التبويب النشط', value: isEn ? metaExp.tabTitleEn : metaExp.tabTitleAr }
+        ],
+        initialSettings: { orientation: 'landscape', paperSize: 'a4' }
+      });
+    }
+
+    var resExportWrap = document.getElementById('res-export-wrap');
+    if (resExportWrap && root.RGExportMenu) {
+      root.RGExportMenu.bind(resExportWrap, {
+        onPdf: triggerResPdfExport,
+        onExcel: triggerResExcelExport,
+        onError: function (err) {
+          ctx.toast((err && err.message) || (isEn ? 'Export failed.' : 'تعذر تنفيذ التصدير.'), true);
         }
       });
+    }
+
+    var exportBtn = document.getElementById('res-export-xlsx');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', triggerResExcelExport);
+    }
+    var exportPdfBtn = document.getElementById('res-export-pdf');
+    if (exportPdfBtn) {
+      exportPdfBtn.addEventListener('click', triggerResPdfExport);
     }
 
     var importBtn = document.getElementById('res-import-xlsx');
@@ -2056,6 +2251,7 @@
             ensureTodayCalendarLoaded({ forceRefresh: true });
           } else {
             calendarRawItems = null;
+            calendarLoadedWindow = { from: '', to: '' };
           }
         }, currentItems);
       });
@@ -2071,6 +2267,19 @@
     var calendarRawItems = null;
     var calendarLoadError = '';
     var calendarFetchSeq = 0;
+    var calendarLoadedWindow = { from: '', to: '' };
+
+    function resolveActiveCalendarFetchRange(overrideFrom, overrideTo) {
+      var core = root.RGCrmCore;
+      var anchorIso = state.todayCalendarAnchorDate || (core && core.getRiyadhTodayDateStr ? core.getRiyadhTodayDateStr() : new Date().toISOString().substring(0, 10));
+      var win = (core && core.buildCalendarPeriodWindow)
+        ? core.buildCalendarPeriodWindow(anchorIso, 'month', { weekStartsOn: 6 })
+        : { startIso: anchorIso, endIso: anchorIso };
+      return {
+        fromIso: overrideFrom || win.startIso || anchorIso,
+        toIso: overrideTo || win.endIso || anchorIso
+      };
+    }
 
     function formatCalPeriodTitle(win) {
       if (!win) return '';
@@ -2101,6 +2310,10 @@
           : { cls: 'is-return', label: isEn ? 'Return' : 'إرجاع' });
       var timeDisplay = ev.timeStr ? formatTimeOnly(ev.timeStr, ctx.lang) : '';
       var metaLine = [formatCarNameDisplay(ev.carName), ev.branchName].filter(Boolean).join(' · ');
+      var stateCls = ev.isOverdue ? ' is-overdue' : (ev.isCompleted ? ' is-completed' : '');
+      var stateTagHtml = ev.isOverdue
+        ? '<span class="rg-cal-state-tag is-overdue">' + (isEn ? 'Overdue' : 'متأخر') + '</span>'
+        : (ev.isCompleted ? '<span class="rg-cal-state-tag is-completed">' + (isEn ? 'Done' : 'منجز') + '</span>' : '');
       var extMeta = ev.type === 'extension' && (ev.extensionDays > 0 || ev.extensionNumber)
         ? ('<span class="rg-cal-ext-meta tabular-nums">' +
             (ev.extensionNumber ? esc(ev.extensionNumber) + ' ' : '') +
@@ -2109,16 +2322,17 @@
         : '';
 
       if (compactMode) {
-        return '<button type="button" class="rg-cal-month-ev ' + typeMeta.cls + '" data-res-id="' + esc(ev.reservationId) + '" title="' + esc(typeMeta.label + ' · ' + ev.reservationNumber + ' · ' + (ev.customerName || '-') + (timeDisplay ? (' · ' + timeDisplay) : '')) + '">' +
+        return '<button type="button" class="rg-cal-month-ev ' + typeMeta.cls + stateCls + '" data-res-id="' + esc(ev.reservationId) + '" title="' + esc(typeMeta.label + ' · ' + ev.reservationNumber + ' · ' + (ev.customerName || '-') + (timeDisplay ? (' · ' + timeDisplay) : '')) + '">' +
           '<span class="rg-cal-dot ' + typeMeta.cls + '" aria-hidden="true"></span>' +
           '<span class="rg-cal-month-ev-time mono tabular-nums" dir="ltr">' + esc(timeDisplay || ev.timeStr || '') + '</span>' +
           '<span class="rg-cal-month-ev-title">' + esc(ev.customerName !== '-' ? ev.customerName : ev.reservationNumber) + '</span>' +
         '</button>';
       }
 
-      return '<button type="button" class="rg-cal-event-card ' + typeMeta.cls + '" data-res-id="' + esc(ev.reservationId) + '" title="' + esc(ev.reservationNumber + ' · ' + ev.customerName) + '">' +
+      return '<button type="button" class="rg-cal-event-card ' + typeMeta.cls + stateCls + '" data-res-id="' + esc(ev.reservationId) + '" title="' + esc(ev.reservationNumber + ' · ' + ev.customerName) + '">' +
         '<div class="rg-cal-event-top">' +
           '<span class="rg-cal-event-type ' + typeMeta.cls + '">' + esc(typeMeta.label) + '</span>' +
+          stateTagHtml +
           '<span class="rg-cal-event-time mono tabular-nums" dir="ltr">' + esc(timeDisplay || ev.timeStr || '') + '</span>' +
         '</div>' +
         '<div class="rg-cal-event-head">' +
@@ -2133,15 +2347,23 @@
     async function ensureTodayCalendarLoaded(opts) {
       var o = opts || {};
       var force = Boolean(o.forceRefresh);
-      if (!force && Array.isArray(calendarRawItems)) {
+      var rangeReq = resolveActiveCalendarFetchRange(o.fromIso, o.toIso);
+      var windowCovered = Boolean(
+        calendarLoadedWindow.from &&
+        calendarLoadedWindow.to &&
+        rangeReq.fromIso >= calendarLoadedWindow.from &&
+        rangeReq.toIso <= calendarLoadedWindow.to
+      );
+      if (!force && Array.isArray(calendarRawItems) && windowCovered) {
         if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
           paintTodayView();
         }
         return;
       }
-      if (!force && !checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length) {
+      if (!force && !checkHasActiveResFilters() && !initialLoadError && Number(payload.total || 0) <= currentItems.length && Number(payload.total || 0) > 0) {
         calendarLoadError = '';
         calendarRawItems = currentItems.slice();
+        calendarLoadedWindow = { from: '0000-01-01', to: '9999-12-31' };
         if (state.viewMode === 'today' && state.todayDisplayMode === 'calendar') {
           paintTodayView();
         }
@@ -2151,8 +2373,11 @@
       calendarLoadError = '';
       var resp = await root.RGApi.callApi('getReservations', {
         lifecycle: 'active',
+        calendarMode: true,
+        calendarFrom: rangeReq.fromIso,
+        calendarTo: rangeReq.toIso,
         page: 1,
-        pageSize: 500,
+        pageSize: 2500,
         forceRefresh: force,
         silentRefresh: Boolean(o.silentRefresh),
         abortKey: 'res:todayCalendar'
@@ -2162,6 +2387,7 @@
       if (resp && resp.success && resp.data) {
         calendarLoadError = '';
         calendarRawItems = Array.isArray(resp.data.items) ? resp.data.items : [];
+        calendarLoadedWindow = { from: rangeReq.fromIso, to: rangeReq.toIso };
       } else if (!Array.isArray(calendarRawItems)) {
         calendarLoadError = (resp && resp.message) || (isEn ? 'Failed to load calendar data.' : 'تعذر تحميل بيانات التقويم.');
       }
@@ -2185,9 +2411,10 @@
       var extracted = (core && core.extractReservationCalendarEvents)
         ? core.extractReservationCalendarEvents(calendarRawItems || [], win.startIso, win.endIso, {
             eventType: state.todayCalendarEventFilter || 'all',
-            search: state.todayCalendarSearch || ''
+            search: state.todayCalendarSearch || '',
+            nowMs: Date.now()
           })
-        : { events: [], byDate: {}, counts: { total: 0, pickup: 0, return: 0, extension: 0 } };
+        : { events: [], byDate: {}, counts: { total: 0, pickup: 0, return: 0, extension: 0, completed: 0, overdue: 0 } };
       return { gran: gran, win: win, extracted: extracted };
     }
 
@@ -2395,6 +2622,7 @@
           state.todayCalendarAnchorDate = liveWin.prevAnchorIso;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
+          ensureTodayCalendarLoaded({ silentRefresh: true });
         });
       }
       if (todayBtn) {
@@ -2403,6 +2631,7 @@
           state.todayCalendarAnchorDate = liveWin.todayIso;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
+          ensureTodayCalendarLoaded({ silentRefresh: true });
         });
       }
       if (nextBtn) {
@@ -2411,6 +2640,7 @@
           state.todayCalendarAnchorDate = liveWin.nextAnchorIso;
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
+          ensureTodayCalendarLoaded({ silentRefresh: true });
         });
       }
 
@@ -2421,6 +2651,7 @@
           saveTodayCalPrefs();
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
+          ensureTodayCalendarLoaded({ silentRefresh: true });
         });
       });
 
@@ -2501,6 +2732,7 @@
           saveTodayCalPrefs();
           if (ctx.saveRouteFilters) ctx.saveRouteFilters();
           paintTodayView();
+          ensureTodayCalendarLoaded({ silentRefresh: true });
         });
       });
 
@@ -3340,6 +3572,7 @@
         });
         radarRawReservations = activeOnlyForOps.slice();
         calendarRawItems = activeOnlyForOps.slice();
+        calendarLoadedWindow = { from: '0000-01-01', to: '9999-12-31' };
         paintRadarView();
         paintTodayView();
       } else {
@@ -3371,7 +3604,7 @@
         refreshRadarData(false, { forceRefresh: force }),
         (state.viewMode === 'today' && state.todayDisplayMode === 'calendar')
           ? ensureTodayCalendarLoaded({ silentRefresh: silent, forceRefresh: force })
-          : Promise.resolve().then(function () { calendarRawItems = null; })
+          : Promise.resolve().then(function () { calendarRawItems = null; calendarLoadedWindow = { from: '', to: '' }; })
       ]).catch(function () {});
     };
 
@@ -3535,6 +3768,7 @@
     var canEditAnyFollowUp = root.RGCrmCore.canUserPerform(user, 'edit_any_followup');
     var canEditTicket = root.RGCrmCore.canUserPerform(user, 'edit_ticket_details');
     var canExportPdfBtn = canDrawerAct('act_export_pdf');
+    var canExportExcelBtn = canDrawerAct('act_export_excel');
     var canReportProblemBtn = canDrawerAct('act_report_problem');
     var canClaimDrawerBtn = canDrawerAct('act_claim_reservation');
     var canCloseTicketDrawerBtn = canDrawerAct('act_close_delete_ticket');
@@ -3952,7 +4186,16 @@
                 (canPinNote ? '<button type="button" class="btn btn-sm btn-warning" id="drawer-header-pin-note-btn">📌 ' + (isEn ? 'Supervisor Pinned Note' : 'ملاحظة مشرف/مدير مثبتة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-ics-btn" title="' + (isEn ? 'Add pickup & return to Google Calendar (.ics)' : 'إضافة موعد الاستلام والتسليم للتقويم (.ics)') + '">📅 ' + (isEn ? 'Calendar .ics' : 'تقويم .ics') + '</button>' +
                 (canEditReservation ? '<button type="button" class="btn btn-sm btn-charcoal" id="drawer-edit-res-btn">' + (isEn ? 'Edit Booking' : 'تعديل تفاصيل الحجز') + '</button>' : '') +
-                (canExportPdfBtn ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '') +
+                ((root.RGExportMenu && (canExportPdfBtn || canExportExcelBtn))
+                  ? root.RGExportMenu.renderHtml({
+                      wrapId: 'drawer-export-wrap',
+                      btnId: 'drawer-export-btn',
+                      small: true,
+                      canPdf: canExportPdfBtn,
+                      canExcel: canExportExcelBtn,
+                      lang: ctx.lang
+                    })
+                  : (canExportPdfBtn ? '<button type="button" class="btn btn-sm btn-primary" id="drawer-pdf-btn">' + (isEn ? 'Export PDF' : 'تصدير PDF') + '</button>' : '')) +
                 (canReportProblemBtn ? '<button type="button" class="btn btn-sm btn-danger" id="drawer-problem-btn">' + (isEn ? 'Report Problem' : 'تحويل إلى مشكلة') + '</button>' : '') +
                 '<button type="button" class="btn btn-sm" id="drawer-close-btn">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
               '</div>' +
@@ -4967,6 +5210,23 @@
 
       var drawerCharts = renderDrawerCharts(d);
 
+      var drawerExportWrap = document.getElementById('drawer-export-wrap');
+      if (drawerExportWrap && root.RGExportMenu) {
+        root.RGExportMenu.bind(drawerExportWrap, {
+          onPdf: function () {
+            requestDrawerExit(function () {
+              cleanupDrawerLifecycle();
+              openSingleReservationPdfModal(d, ctx, drawerCharts, reopenSelf);
+            });
+          },
+          onExcel: function () {
+            return exportSingleReservationExcel(d, ctx);
+          },
+          onError: function (err) {
+            ctx.toast((err && err.message) || (isEn ? 'Export failed.' : 'تعذر تنفيذ التصدير.'), true);
+          }
+        });
+      }
       var drawerPdfBtn = document.getElementById('drawer-pdf-btn');
       if (drawerPdfBtn) {
         drawerPdfBtn.addEventListener('click', function () {
@@ -5726,6 +5986,108 @@
     });
   }
 
+  async function exportSingleReservationExcel(details, ctx) {
+    if (!root.RGReports || typeof root.RGReports.exportExcelWorkbook !== 'function') {
+      if (ctx && ctx.toast) ctx.toast('وحدة تصدير Excel غير متاحة.', true);
+      return;
+    }
+    var r = (details && details.reservation) || {};
+    var isEn = Boolean(ctx && ctx.lang === 'en');
+    var repTitle = isEn
+      ? ('Booking File #' + (r.reservationNumber || r.id || ''))
+      : ('ملف الحجز رقم ' + (r.reservationNumber || r.id || ''));
+    var periodTxt = (r.startDate || r.endDate)
+      ? (formatDateOnly(r.startDate) + ' → ' + formatDateOnly(r.extendedUntilDate || r.endDate))
+      : '-';
+
+    var detailCols = ALL_COLUMNS.filter(function (col) {
+      if (col.key !== 'customerIdNumber') return true;
+      var u = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+      return !root.RGCrmCore || !root.RGCrmCore.canUserViewCustomerId || root.RGCrmCore.canUserViewCustomerId(u);
+    });
+    var detailRow = Object.assign({}, r, {
+      assignedEmployeeNames: Array.isArray(r.assignedEmployeeNames) && r.assignedEmployeeNames.length
+        ? r.assignedEmployeeNames.join('، ')
+        : (isEn ? 'Unassigned' : 'متاح للاستلام')
+    });
+    var sheets = [{
+      name: isEn ? 'Booking Summary' : 'بيانات الحجز',
+      title: repTitle,
+      periodText: periodTxt,
+      summaryItems: [
+        { label: isEn ? 'Days' : 'عدد الأيام', value: Number(r.daysCount || 0) },
+        { label: isEn ? 'Total (SAR)' : 'الإجمالي', value: Number(r.totalAmount || 0) },
+        { label: isEn ? 'Follow-Ups' : 'المتابعات', value: Array.isArray(details.followUps) ? details.followUps.length : 0 },
+        { label: isEn ? 'Problems' : 'المشكلات', value: Array.isArray(details.problems) ? details.problems.length : 0 }
+      ],
+      headers: detailCols,
+      rows: [detailRow]
+    }];
+
+    var exts = Array.isArray(details.extensions) ? details.extensions : [];
+    if (exts.length) {
+      sheets.push({
+        name: isEn ? 'Extensions' : 'التمديدات',
+        title: repTitle + ' — ' + (isEn ? 'Extensions' : 'التمديدات'),
+        periodText: periodTxt,
+        headers: [
+          { key: 'extensionNumber', label: isEn ? 'Extension #' : 'رقم التمديد', formatType: 'ltr' },
+          { key: 'extendDays', label: isEn ? 'Days' : 'الأيام', formatType: 'number', summable: true },
+          { key: 'extendAmount', label: isEn ? 'Amount' : 'المبلغ', formatType: 'number', summable: true },
+          { key: 'newEndDate', label: isEn ? 'New End Date' : 'تاريخ الانتهاء الجديد', formatType: 'date' },
+          { key: 'status', label: isEn ? 'Status' : 'الحالة' },
+          { key: 'notes', label: isEn ? 'Notes' : 'الملاحظات' }
+        ],
+        rows: exts
+      });
+    }
+
+    var fus = Array.isArray(details.followUps) ? details.followUps : [];
+    if (fus.length) {
+      sheets.push({
+        name: isEn ? 'Follow-Ups' : 'المتابعات',
+        title: repTitle + ' — ' + (isEn ? 'Follow-Ups' : 'سجل المتابعات'),
+        periodText: periodTxt,
+        headers: [
+          { key: 'employeeName', label: isEn ? 'Employee' : 'الموظف' },
+          { key: 'status', label: isEn ? 'Status' : 'الحالة' },
+          { key: 'action', label: isEn ? 'Action' : 'الإجراء' },
+          { key: 'notes', label: isEn ? 'Notes' : 'الملاحظات' },
+          { key: 'followUpDate', label: isEn ? 'Date' : 'التاريخ', formatType: 'date' },
+          { key: 'followUpTime', label: isEn ? 'Time' : 'الوقت', formatType: 'time' }
+        ],
+        rows: fus
+      });
+    }
+
+    var prbs = Array.isArray(details.problems) ? details.problems : [];
+    if (prbs.length) {
+      sheets.push({
+        name: isEn ? 'Problems' : 'المشكلات',
+        title: repTitle + ' — ' + (isEn ? 'Problems' : 'سجل المشكلات'),
+        periodText: periodTxt,
+        headers: [
+          { key: 'problemNumber', label: isEn ? 'Ticket #' : 'رقم المشكلة', formatType: 'ltr' },
+          { key: 'priority', label: isEn ? 'Priority' : 'الأولوية' },
+          { key: 'status', label: isEn ? 'Status' : 'الحالة' },
+          { key: 'employeeName', label: isEn ? 'Assigned To' : 'المسؤول' },
+          { key: 'description', label: isEn ? 'Description & Notes' : 'وصف المشكلة والملاحظات' },
+          { key: 'createdAt', label: isEn ? 'Created At' : 'تاريخ التسجيل', formatType: 'datetime' }
+        ],
+        rows: prbs
+      });
+    }
+
+    await root.RGReports.exportExcelWorkbook(sheets, 'rental-gate-booking-' + (r.reservationNumber || r.id || 'file') + '.xlsx', {
+      lang: ctx && ctx.lang,
+      title: repTitle,
+      periodText: periodTxt
+    });
+    if (ctx && ctx.toast) {
+      ctx.toast(isEn ? 'Booking file exported to Excel.' : 'تم تصدير ملف الحجز إلى Excel بنجاح.');
+    }
+  }
+
   function openSingleReservationPdfModal(details, ctx, drawerCharts, onCancel) {
     var r = details.reservation;
     var isEn = ctx && ctx.lang === 'en';
@@ -5733,7 +6095,7 @@
     var modalRoot = document.getElementById('modal-root');
 
     var initialSettings = (root.RGPdfControls && root.RGPdfControls.createDefaultState)
-      ? root.RGPdfControls.createDefaultState({ paperSize: 'a4', orientation: 'portrait' })
+      ? root.RGPdfControls.createDefaultState({ paperSize: 'a4', orientation: 'portrait' }, 'single_reservation')
       : { targetPages: 2, preset: 'balanced', optimizeFileSize: true, quality: 'balanced', paperSize: 'a4', orientation: 'portrait' };
 
     function calcSingleStats() {
@@ -5812,6 +6174,7 @@
           mode: 'modal',
           idPrefix: 'rg-spdf-ctrl',
           lang: ctx.lang,
+          scopeKey: 'single_reservation',
           settings: initialSettings,
           contentStats: initStats,
           advancedExtraHtml: advancedExtras
@@ -5843,6 +6206,7 @@
     var pdfCtrl = (root.RGPdfControls && pdfPanelEl)
       ? root.RGPdfControls.mount(pdfPanelEl, {
           lang: ctx.lang,
+          scopeKey: 'single_reservation',
           initialSettings: initialSettings,
           contentStats: initStats
         })
@@ -5939,7 +6303,23 @@
         if (noteLines.length) {
           extraSections.push({
             title: 'الملاحظات المسجلة (' + noteLines.length + ')',
+            isNotes: true,
             lines: noteLines
+          });
+        }
+      }
+      if (incNotes && !incFollowUps) {
+        // already handled above; if incFollowUps is checked and there are standalone note lines, also offer notes block
+      }
+      if (incNotes && incFollowUps) {
+        var dedicatedNotes = details.followUps.filter(function (f) { return Boolean(f.notes); }).map(function (f) {
+          return formatDateOnly(f.followUpDate) + ' | ' + f.employeeName + ':\n' + f.notes;
+        });
+        if (dedicatedNotes.length) {
+          extraSections.push({
+            title: 'ملاحظات الحجز الكاملة (' + dedicatedNotes.length + ')',
+            isNotes: true,
+            lines: dedicatedNotes
           });
         }
       }
@@ -5972,14 +6352,9 @@
         generate: function (liveSettings, signal, previewMode) {
           var s = Object.assign({}, baseSettings, liveSettings || {});
           var user = root.RGAuth.getUser();
-          return root.RGReports.exportArabicPdfDocument({
+          return root.RGReports.exportArabicPdfDocument(Object.assign({}, s, {
             title: spdfTitleVal,
-            paperSize: s.paperSize,
-            orientation: s.orientation,
-            targetPages: s.targetPages,
-            preset: s.preset,
-            optimizeFileSize: s.optimizeFileSize,
-            quality: s.quality,
+            scopeKey: 'single_reservation',
             lang: ctx.lang,
             exporterName: user ? user.name : '',
             summaryItems: summary,
@@ -5988,7 +6363,7 @@
             filename: spdfFilename,
             signal: signal,
             previewOnly: Boolean(previewMode)
-          });
+          }));
         }
       };
     }
@@ -6001,6 +6376,7 @@
           await root.RGPdfPreview.open({
             title: snap.title,
             filename: snap.filename,
+            scopeKey: 'single_reservation',
             initialSettings: snap.baseSettings,
             getContentStats: function () { return snap.stats; },
             generatePdf: function (liveSettings, signal) {

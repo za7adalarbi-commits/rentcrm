@@ -1,5 +1,5 @@
 /**
- * RENTAL GATE CRM — Real PDF Preview Modal with Live Density/Compression Controls, Debounced Regeneration & Exact-Blob Download
+ * RENTAL GATE CRM — Web God PDF Studio Preview Modal (Split Studio Sidebar, Live Regeneration, Print & Exact-Blob Download)
  */
 (function (root) {
   'use strict';
@@ -329,7 +329,7 @@
       if (activeSession === session) {
         loadArtifactIntoSession(session, { isInitial: false });
       }
-    }, typeof delayMs === 'number' ? delayMs : 280);
+    }, typeof delayMs === 'number' ? delayMs : 220);
   }
 
   function renderPreviewShell(session) {
@@ -337,22 +337,24 @@
     var lang = getLang();
     var isEn = lang === 'en';
     var titleText = session.title || (isEn ? 'PDF Document Preview' : 'معاينة مستند PDF');
-    var isMobileViewport = typeof window !== 'undefined' && window.innerWidth <= 768;
+    var isMobileViewport = typeof window !== 'undefined' && window.innerWidth <= 900;
     var showControls = Boolean(session.enableControls && root.RGPdfControls && root.RGPdfControls.renderPanelHtml);
     var controlsExpanded = showControls && !isMobileViewport;
     var controlsHtml = showControls
       ? root.RGPdfControls.renderPanelHtml({
-          mode: 'preview',
+          mode: 'studio',
           idPrefix: 'rg-pdfp-ctrl',
           lang: lang,
           settings: session.settings,
+          columns: session.availableColumns,
+          scopeKey: session.scopeKey,
           contentStats: resolveSessionStats(session)
         })
       : '';
 
     rootEl.innerHTML =
       '<div class="rg-pdf-backdrop" id="rg-pdf-backdrop" role="dialog" aria-modal="true" aria-labelledby="rg-pdf-modal-title">' +
-        '<div class="rg-pdf-modal">' +
+        '<div class="rg-pdf-modal' + (showControls ? ' has-studio' : '') + '">' +
           '<div class="rg-pdf-toolbar">' +
             '<div class="rg-pdf-title-group">' +
               '<div class="rg-pdf-icon-badge" aria-hidden="true">' +
@@ -366,25 +368,29 @@
             '<div class="rg-pdf-controls-center" id="rg-pdf-controls-center"></div>' +
             '<div class="rg-pdf-actions-end">' +
               (showControls
-                ? '<button type="button" class="btn btn-sm' + (controlsExpanded ? ' is-active' : '') + '" id="rg-pdf-toggle-ctrl-btn" aria-expanded="' + String(controlsExpanded) + '">' + (isEn ? 'Density & Size' : 'الضغط والحجم') + '</button>'
+                ? '<button type="button" class="btn btn-sm' + (controlsExpanded ? ' is-active' : '') + '" id="rg-pdf-toggle-ctrl-btn" aria-expanded="' + String(controlsExpanded) + '">' + (isEn ? 'PDF Settings' : 'إعدادات PDF') + '</button>'
                 : '') +
               '<button type="button" class="btn btn-sm" id="rg-pdf-print-btn" disabled>' + (isEn ? 'Print' : 'طباعة') + '</button>' +
               '<button type="button" class="btn btn-sm btn-primary" id="rg-pdf-download-btn" disabled>' + (isEn ? 'Download PDF' : 'تحميل PDF') + '</button>' +
               '<button type="button" class="btn btn-sm" id="rg-pdf-close-btn">' + (isEn ? 'Close' : 'إغلاق') + '</button>' +
             '</div>' +
           '</div>' +
-          (showControls ? '<div class="rg-pdf-preview-ctrl-host' + (controlsExpanded ? '' : ' hidden') + '" id="rg-pdf-preview-ctrl-host">' + controlsHtml + '</div>' : '') +
-          '<div class="rg-pdf-stage-wrap">' +
-            '<div class="rg-pdf-regen-banner hidden" id="rg-pdf-regen-banner" role="status" aria-live="polite">' +
-              '<span class="rg-pdf-regen-spinner" aria-hidden="true"></span>' +
-              '<span>' + esc(isEn ? 'Updating PDF layout & optimization...' : 'جاري تحديث التخطيط وضغط الملف...') + '</span>' +
-              '<button type="button" class="rg-pdf-regen-cancel" id="rg-pdf-cancel-regen">' + esc(isEn ? 'Cancel' : 'إلغاء') + '</button>' +
-            '</div>' +
-            '<div class="rg-pdf-stage" id="rg-pdf-stage">' +
-              '<div class="rg-pdf-loading-state">' +
-                '<div class="rg-pdf-spinner" aria-hidden="true"></div>' +
-                '<div class="rg-pdf-loading-title">' + esc(isEn ? 'Preparing real PDF preview...' : 'جاري إنشاء صفحات التقرير ومعاينتها...') + '</div>' +
-                '<div class="rg-pdf-loading-sub">' + esc(isEn ? 'The exact generated PDF will appear here before download.' : 'ستظهر هنا نفس النسخة الفعلية من ملف PDF قبل التحميل أو الطباعة.') + '</div>' +
+          '<div class="rg-pdf-studio-body">' +
+            (showControls
+              ? '<aside class="rg-pdf-studio-sidebar' + (controlsExpanded ? '' : ' is-collapsed') + '" id="rg-pdf-preview-ctrl-host" aria-label="' + esc(isEn ? 'PDF Settings' : 'إعدادات PDF') + '">' + controlsHtml + '</aside>'
+              : '') +
+            '<div class="rg-pdf-stage-wrap">' +
+              '<div class="rg-pdf-regen-banner hidden" id="rg-pdf-regen-banner" role="status" aria-live="polite">' +
+                '<span class="rg-pdf-regen-spinner" aria-hidden="true"></span>' +
+                '<span>' + esc(isEn ? 'Updating PDF preview...' : 'جاري تحديث معاينة PDF...') + '</span>' +
+                '<button type="button" class="rg-pdf-regen-cancel" id="rg-pdf-cancel-regen">' + esc(isEn ? 'Cancel' : 'إلغاء') + '</button>' +
+              '</div>' +
+              '<div class="rg-pdf-stage" id="rg-pdf-stage">' +
+                '<div class="rg-pdf-loading-state">' +
+                  '<div class="rg-pdf-spinner" aria-hidden="true"></div>' +
+                  '<div class="rg-pdf-loading-title">' + esc(isEn ? 'Preparing real PDF preview...' : 'جاري إنشاء صفحات التقرير ومعاينتها...') + '</div>' +
+                  '<div class="rg-pdf-loading-sub">' + esc(isEn ? 'The exact generated PDF will appear here before download.' : 'ستظهر هنا نفس النسخة الفعلية من ملف PDF قبل التحميل أو الطباعة.') + '</div>' +
+                '</div>' +
               '</div>' +
             '</div>' +
           '</div>' +
@@ -414,12 +420,14 @@
     var ctrlHost = document.getElementById('rg-pdf-preview-ctrl-host');
     if (toggleCtrlBtn && ctrlHost) {
       toggleCtrlBtn.addEventListener('click', function () {
-        var nextHidden = !ctrlHost.classList.contains('hidden');
-        ctrlHost.classList.toggle('hidden', nextHidden);
-        toggleCtrlBtn.setAttribute('aria-expanded', String(!nextHidden));
-        toggleCtrlBtn.classList.toggle('is-active', !nextHidden);
+        var nextCollapsed = !ctrlHost.classList.contains('is-collapsed');
+        ctrlHost.classList.toggle('is-collapsed', nextCollapsed);
+        toggleCtrlBtn.setAttribute('aria-expanded', String(!nextCollapsed));
+        toggleCtrlBtn.classList.toggle('is-active', !nextCollapsed);
         if (session.artifact && (session.zoomMode === 'fit-width' || session.zoomMode === 'fit-page')) {
-          runZoomAction(session, session.zoomMode);
+          setTimeout(function () {
+            if (activeSession === session) runZoomAction(session, session.zoomMode);
+          }, 40);
         }
       });
     }
@@ -443,6 +451,8 @@
         session.ctrl = root.RGPdfControls.mount(panelEl, {
           lang: lang,
           initialSettings: session.settings,
+          columns: session.availableColumns,
+          scopeKey: session.scopeKey,
           contentStats: resolveSessionStats(session),
           onChange: function (nextSettings, _plan, triggerKind) {
             session.settings = nextSettings;
@@ -452,7 +462,7 @@
             if (typeof session.onSettingsChange === 'function') {
               try { session.onSettingsChange(Object.assign({}, nextSettings)); } catch (_e) {}
             }
-            var waitMs = triggerKind === 'slider-input' ? 280 : 150;
+            var waitMs = triggerKind === 'slider-input' || triggerKind === 'color-input' ? 240 : 120;
             scheduleLiveRegeneration(session, waitMs);
           }
         });
@@ -502,6 +512,13 @@
       try { URL.revokeObjectURL(session.blobUrl); } catch (_e) {}
       session.blobUrl = '';
     }
+    var geometryChanged = Boolean(
+      session.lastPaperSize !== artifact.paperSize ||
+      session.lastOrientation !== artifact.orientation
+    );
+    session.lastPaperSize = artifact.paperSize;
+    session.lastOrientation = artifact.orientation;
+
     session.artifact = artifact;
     session.isGenerating = false;
     setRegeneratingUi(session, false);
@@ -512,7 +529,7 @@
     var kb = Math.max(1, Math.round(Number(artifact.sizeBytes || 0) / 1024));
     var pagesUnit = isEn ? (totalPages === 1 ? 'page' : 'pages') : 'صفحة';
     var paperInfo = String(artifact.paperSize || 'A4').toUpperCase() + ' · ' +
-      (artifact.orientation === 'portrait' ? (isEn ? 'Portrait' : 'عمودي') : (isEn ? 'Landscape' : 'أفقي'));
+      (artifact.orientation === 'portrait' ? (isEn ? 'Portrait' : 'عمودي (Portrait)') : (isEn ? 'Landscape' : 'أفقي (Landscape)'));
 
     var subMeta = document.getElementById('rg-pdf-sub-meta');
     if (subMeta) {
@@ -563,7 +580,7 @@
     }
 
     var stageEl = document.getElementById('rg-pdf-stage');
-    var prevScrollTop = isRegen && stageEl ? stageEl.scrollTop : 0;
+    var prevScrollTop = isRegen && !geometryChanged && stageEl ? stageEl.scrollTop : 0;
     var pageImages = Array.isArray(artifact.pageImages) ? artifact.pageImages : [];
     if (stageEl) {
       stageEl.innerHTML =
@@ -572,7 +589,7 @@
             var pNum = idx + 1;
             return '<div class="rg-pdf-page-card" data-page="' + pNum + '">' +
               '<img src="' + dataUrl + '" alt="' + esc((isEn ? 'Page ' : 'صفحة ') + pNum) + '" draggable="false" />' +
-              '<span class="rg-pdf-page-badge mono tabular-nums">' + pNum + ' / ' + totalPages + '</span>' +
+              '<span class="rg-pdf-page-badge mono tabular-nums" dir="ltr">' + pNum + ' / ' + totalPages + '</span>' +
             '</div>';
           }).join('') +
         '</div>';
@@ -627,16 +644,14 @@
       }, { passive: true });
     }
 
-    if (!isRegen || session.zoomMode === 'fit-width' || session.zoomMode === 'fit-page') {
-      if (!isRegen) {
-        var base = getPageBaseDimensions(artifact);
-        var stageRect = stageEl ? stageEl.getBoundingClientRect() : { width: 880, height: 600 };
-        var stageW = stageRect.width || 880;
-        var padFit = stageW <= 520 ? 24 : 48;
-        var fitScale = Math.min(1.05, Math.max(0.25, (stageW - padFit) / Math.max(1, base.width)));
-        session.zoomScale = Math.round(fitScale * 100) / 100;
-        session.zoomMode = 'fit-width';
-        session.currentPage = 1;
+    if (!isRegen || geometryChanged || session.zoomMode === 'fit-width' || session.zoomMode === 'fit-page') {
+      if (!isRegen || geometryChanged) {
+        var targetFit = artifact.orientation === 'portrait' ? 'fit-page' : 'fit-width';
+        if (isRegen && geometryChanged && (session.zoomMode === 'fit-width' || session.zoomMode === 'fit-page')) {
+          targetFit = artifact.orientation === 'portrait' ? 'fit-page' : 'fit-width';
+        }
+        runZoomAction(session, targetFit);
+        if (!isRegen) session.currentPage = 1;
       } else {
         runZoomAction(session, session.zoomMode);
       }
@@ -645,7 +660,7 @@
     applyZoomToPages(session);
     updatePageIndicator(session);
 
-    if (isRegen && stageEl && prevScrollTop > 0) {
+    if (isRegen && !geometryChanged && stageEl && prevScrollTop > 0) {
       stageEl.scrollTop = Math.min(prevScrollTop, Math.max(0, stageEl.scrollHeight - stageEl.clientHeight));
     }
 
@@ -711,7 +726,6 @@
         return;
       }
       if (hasExisting && !isInitial) {
-        // Keep previous preview visible if regeneration fails unexpectedly
         return;
       }
       renderErrorState(session, (err && err.message) || '');
@@ -727,8 +741,9 @@
       closePreview();
     }
 
+    var scopeKey = cfg.scopeKey || '';
     var initSettings = (root.RGPdfControls && root.RGPdfControls.createDefaultState)
-      ? root.RGPdfControls.createDefaultState(cfg.initialSettings)
+      ? root.RGPdfControls.createDefaultState(cfg.initialSettings, scopeKey)
       : Object.assign({
           targetPages: 3,
           preset: 'balanced',
@@ -744,6 +759,8 @@
       generatePdf: cfg.generatePdf,
       getContentStats: cfg.getContentStats || null,
       contentStats: cfg.contentStats || {},
+      availableColumns: Array.isArray(cfg.availableColumns) ? cfg.availableColumns.slice() : [],
+      scopeKey: scopeKey,
       onSettingsChange: cfg.onSettingsChange || null,
       onDownloadToast: cfg.onDownloadToast || null,
       onClose: cfg.onClose || null,
@@ -760,6 +777,8 @@
       currentPage: 1,
       zoomScale: 1,
       zoomMode: 'fit-width',
+      lastPaperSize: '',
+      lastOrientation: '',
       blobUrl: '',
       artifact: null
     };
