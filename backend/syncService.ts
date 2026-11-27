@@ -9,6 +9,7 @@ import type { DbClient, DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
 import { resolveServerConfig } from './serverConfig.js';
+import { upsertCustomersFromReservationsTx } from './customerHelpers.js';
 
 export interface SyncActor {
   id: string;
@@ -1433,6 +1434,14 @@ export async function ingestIncrementalSyncBatch(
         }
       }
 
+      const persistedResList = reservationBatch.filter((r) => successfullyPersistedRes.has(str(r.reservationNumber)));
+      if (persistedResList.length > 0) {
+        await upsertCustomersFromReservationsTx(tx, persistedResList, {
+          source: sourceName,
+          overwriteProfileFields: false
+        });
+      }
+
       if (payload?.isFullSnapshot === true && reservationBatch.length > 0 && failedRecords.length === 0 && incompleteEndpoints.length === 0) {
         const liveResNums = reservationBatch.map((r) => str(r.reservationNumber)).filter(Boolean);
         if (liveResNums.length > 0) {
@@ -1924,13 +1933,13 @@ export async function ingestIncrementalSyncBatch(
     if (importedCount > 0 || updatedCount > 0 || extensionsCount > 0) {
       const version = await invalidateAndBumpVersion(
         executor,
-        ['reservations', 'todayRadar', 'dashboard', 'reports', 'employees', 'activity', 'sync'],
+        ['reservations', 'todayRadar', 'customers', 'dashboard', 'reports', 'employees', 'activity', 'sync'],
         true
       ).catch(() => 0);
       const syncRtEvent = {
         type: 'delta' as const,
         action: 'ingestSyncBatch',
-        scopes: ['reservations', 'todayRadar', 'dashboard', 'reports', 'employees', 'sync'],
+        scopes: ['reservations', 'todayRadar', 'customers', 'dashboard', 'reports', 'employees', 'sync'],
         entityIds: changedReservations.map((r: any) => str(r?.id)).filter(Boolean).slice(0, 50),
         actorId: actor.id,
         version: version || undefined,

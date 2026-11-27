@@ -56,6 +56,11 @@ import {
   retryFailedSyncRecords,
   sanitizeExcludedStatusesList
 } from './syncService.js';
+import {
+  deterministicCustomerId,
+  formatCustomerSummaryRow,
+  upsertCustomersFromReservationsTx
+} from './customerHelpers.js';
 
 function str(v: unknown, fallback = ''): string {
   if (v === null || v === undefined) return fallback;
@@ -324,6 +329,8 @@ function formatProblemRow(row: any, updatesByProblemId?: Map<string, any[]>): Re
     problemNumber: str(row.problem_number ?? row.problemNumber),
     reservationId: str(row.reservation_id ?? row.reservationId),
     reservationNumber: str(row.reservation_number ?? row.reservationNumber),
+    customerId: str(row.customer_id ?? row.customerId),
+    ticketType: str(row.ticket_type ?? row.ticketType) || 'مشكلة',
     customerName: str(row.customer_name ?? row.customerName),
     createdById: str(row.created_by_id ?? row.createdById),
     createdByName: str(row.created_by_name ?? row.createdByName),
@@ -494,7 +501,7 @@ async function dispatchMentionNotifications(
   opts: {
     texts: string[];
     sender: AuthSession['user'];
-    entityType: 'Reservation' | 'Problem';
+    entityType: 'Reservation' | 'Problem' | 'Customer';
     entityId: string;
     label: string;
     sourceKey?: string;
@@ -519,7 +526,9 @@ async function dispatchMentionNotifications(
   const snippet = normSnippet.slice(0, 120);
   const titlePrefix = opts.entityType === 'Problem'
     ? `إشارة لك في المشكلة ${opts.label || ''}`.trim()
-    : `إشارة لك في الحجز ${opts.label || ''}`.trim();
+    : opts.entityType === 'Customer'
+      ? `إشارة لك في ملف العميل ${opts.label || ''}`.trim()
+      : `إشارة لك في الحجز ${opts.label || ''}`.trim();
   const mentionBaseKey = str(opts.sourceKey) || buildNotificationEventKey([
     'mention',
     opts.entityType,
@@ -2428,6 +2437,11 @@ export async function updateReservationDetails(
       { field: 'internalStatus', label: 'حالة المتابعة' },
       { field: 'priority', label: 'الأولوية' }
     ]);
+    await upsertCustomersFromReservationsTx(tx, [nextObj], {
+      source: 'manual_res_edit',
+      overwriteProfileFields: Boolean(payload.customerName !== undefined || payload.customerPhone !== undefined || payload.customerEmail !== undefined || payload.customerIdNumber !== undefined)
+    });
+
     await logActivity(tx, session.user, 'تعديل بيانات حجز', 'Reservation', existing.reservationNumber, 'تعديل تفاصيل الحجز بواسطة المشرف / الإدارة', diffs);
     await enqueueSheetsMirror(tx, 'Reservation', nextObj.id, 'upsertReservation', nextObj);
     return redactReservationForUser(nextObj, session.user);
@@ -3129,7 +3143,8 @@ export async function getMyFollowUps(executor: DbExecutor, session: AuthSession,
   };
 }
 
-export async function getTeamFollowUps(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+export async function getTeamFollowUps(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'view_team_followups');
   const params: any[] = [];
   const clauses: string[] = [];
   if (payload.employeeId) {
@@ -3173,9 +3188,12 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
   requirePermission(session, 'create_problem');
   const resId = str(payload.reservationId);
   const resNumberInput = str(payload.reservationNumber);
+  const explicitCustomerId = str(payload.customerId);
+  const rawTicketType = str(payload.ticketType);
+  const ticketType = rawTicketType === 'شكوى' ? 'شكوى' : 'مشكلة';
   const description = str(payload.description);
   const priority = crmCore.PROBLEM_PRIORITIES.includes(str(payload.priority)) ? str(payload.priority) : 'متوسط';
-  if (!description) throw new Error('VALIDATION_ERROR: وصف المشكلة مطلوب.');
+  if (!description) throw new Error('VALIDATION_ERROR: وصف المشكلة أو الشكوى مطلوب.');
 
   return runWithIdempotency(executor, session.user.id, 'createProblem', str(payload.clientRequestId), async () => {
     const out = await executor.withTransaction(async (tx) => {
@@ -3186,6 +3204,21 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
           [resId, resNumberInput]
         );
         if (rRes.rows[0]) resObj = mapReservationRowToClient(rRes.rows[0], false);
+      }
+
+      let resolvedCustId = explicitCustomerId || (resObj ? str(resObj.customerId) : '');
+      let resolvedCustName = resObj ? resObj.customerName : str(payload.customerName);
+      if (resolvedCustId && (!resolvedCustName || !explicitCustomerId)) {
+        const custQ = await runTxOptional(
+          tx,
+          'lookup_cust_prb',
+          () => tx.query<{ id: string; full_name: string }>(`SELECT id, full_name FROM customers WHERE id = $1 LIMIT 1`, [resolvedCustId]),
+          { rows: [] as Array<{ id: string; full_name: string }>, rowCount: 0 }
+        );
+        if (custQ?.rows?.[0]) {
+          resolvedCustId = str(custQ.rows[0].id);
+          if (!resolvedCustName) resolvedCustName = str(custQ.rows[0].full_name);
+        }
       }
 
       const assignedIdsInput: string[] = Array.isArray(payload.assignedEmployeeIds)
@@ -3202,34 +3235,36 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
         problemNumber: `PRB-${String(Date.now()).slice(-6)}`,
         reservationId: resObj ? resObj.id : resId,
         reservationNumber: resObj ? resObj.reservationNumber : resNumberInput,
-        customerName: resObj ? resObj.customerName : str(payload.customerName),
+        customerId: resolvedCustId,
+        ticketType,
+        customerName: resolvedCustName,
         createdById: session.user.id,
         createdByName: session.user.name,
         assignedEmployeeIds: empIds,
         assignedEmployeeNames: empNames,
         description,
         priority,
-        status: 'جديدة',
+        status: ticketType === 'شكوى' ? 'قيد المعالجة' : 'جديدة',
         createdAt: nowIso,
         updatedAt: nowIso
       };
 
       const insertSql = `
-        INSERT INTO %TABLE% (id, problem_number, reservation_id, reservation_number, customer_name, created_by_id, created_by_name, assigned_employee_ids, assigned_employee_names, description, priority, status, created_at, updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13::timestamptz,$13::timestamptz)
+        INSERT INTO %TABLE% (id, problem_number, reservation_id, reservation_number, customer_name, created_by_id, created_by_name, assigned_employee_ids, assigned_employee_names, description, priority, status, created_at, updated_at, customer_id, ticket_type)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13::timestamptz,$13::timestamptz,$14,$15)
       `;
       const params = [
         prb.id, prb.problemNumber, prb.reservationId || null, prb.reservationNumber, prb.customerName,
         prb.createdById, prb.createdByName, JSON.stringify(prb.assignedEmployeeIds), JSON.stringify(prb.assignedEmployeeNames),
-        prb.description, prb.priority, prb.status, nowIso
+        prb.description, prb.priority, prb.status, nowIso, prb.customerId, prb.ticketType
       ];
       await tx.query(insertSql.replace('%TABLE%', 'problems'), params);
       await tx.query(insertSql.replace('%TABLE%', 'issues'), params);
 
       await tx.query(
         `INSERT INTO problem_updates (id, problem_id, reservation_number, employee_id, employee_name, previous_status, new_status, previous_priority, new_priority, note, created_at)
-         VALUES ($1,$2,$3,$4,$5,'','جديدة','',$6,'فتح تذكرة مشكلة جديدة',$7::timestamptz)`,
-        [generateId('PRBU'), prb.id, prb.reservationNumber, session.user.id, session.user.name, prb.priority, nowIso]
+         VALUES ($1,$2,$3,$4,$5,'',$6,'',$7,$8,$9::timestamptz)`,
+        [generateId('PRBU'), prb.id, prb.reservationNumber, session.user.id, session.user.name, prb.status, prb.priority, ticketType === 'شكوى' ? 'تسجيل شكوى عميل جديدة' : 'فتح تذكرة مشكلة جديدة', nowIso]
       );
 
       if (resObj) {
@@ -3243,11 +3278,26 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
         );
       }
 
-      if (prb.priority === 'مرتفع') {
+      if (resolvedCustId) {
+        await runTxOptional(
+          tx,
+          'touch_cust_prb',
+          () => tx.query(
+            `UPDATE customers
+             SET status = CASE WHEN status_override = FALSE AND status <> 'محظور' THEN 'لديه مشكلة' ELSE status END,
+                 updated_at = $2::timestamptz
+             WHERE id = $1`,
+            [resolvedCustId, nowIso]
+          ),
+          undefined
+        );
+      }
+
+      if (prb.priority === 'مرتفع' || ticketType === 'شكوى') {
         await createNotification(tx, {
           recipientRole: 'supervisor',
           type: 'high_priority_problem',
-          title: `مشكلة عالية الأولوية (${prb.problemNumber})`,
+          title: ticketType === 'شكوى' ? `شكوى عميل جديدة (${prb.problemNumber})` : `مشكلة عالية الأولوية (${prb.problemNumber})`,
           message: `${prb.customerName || prb.reservationNumber}: ${prb.description.slice(0, 80)}`,
           entityType: 'Problem',
           entityId: prb.id,
@@ -3264,7 +3314,7 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
         sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `prb:${prb.id}`
       });
 
-      await logActivity(tx, session.user, 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
+      await logActivity(tx, session.user, ticketType === 'شكوى' ? 'تسجيل شكوى عميل' : 'فتح مشكلة', 'Problem', prb.problemNumber, prb.description.slice(0, 120));
       await enqueueSheetsMirror(tx, 'Problem', prb.id, 'upsertProblem', prb);
       return { ...prb, updates: [] };
     });
@@ -3513,7 +3563,8 @@ export async function deleteProblem(executor: DbExecutor, session: AuthSession, 
   });
 }
 
-export async function getProblems(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+export async function getProblems(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'view_problems');
   const params: any[] = [];
   const clauses: string[] = [];
   if (payload.status) {
@@ -3527,6 +3578,14 @@ export async function getProblems(executor: DbExecutor, _session: AuthSession, p
   if (payload.employeeId) {
     params.push(JSON.stringify([str(payload.employeeId)]));
     clauses.push(`assigned_employee_ids @> $${params.length}::jsonb`);
+  }
+  if (payload.ticketType) {
+    params.push(str(payload.ticketType));
+    clauses.push(`COALESCE(ticket_type, 'مشكلة') = $${params.length}`);
+  }
+  if (payload.customerId) {
+    params.push(str(payload.customerId));
+    clauses.push(`customer_id = $${params.length}`);
   }
   if (payload.search) {
     const searchCondPrb = buildPgSearchCondition([
@@ -3557,7 +3616,8 @@ export async function getProblems(executor: DbExecutor, _session: AuthSession, p
   return { items, total: items.length };
 }
 
-export async function getProblemDetails(executor: DbExecutor, _session: AuthSession, payload: Record<string, any> = {}) {
+export async function getProblemDetails(executor: DbExecutor, session: AuthSession, payload: Record<string, any> = {}) {
+  requirePermission(session, 'view_problems');
   const target = str(payload.problemId || payload.problemNumber);
   if (!target) throw new Error('VALIDATION_ERROR: معرف المشكلة مطلوب.');
   const pRes = await executor.query(`SELECT * FROM problems WHERE id = $1 OR problem_number = $1 LIMIT 1`, [target]);
@@ -4068,6 +4128,16 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
         [p.id, JSON.stringify(nextIds), JSON.stringify(nextNames)]
       );
     }
+
+    await runTxOptional(
+      tx,
+      'clear_cust_emp_assign',
+      () => tx.query(
+        `UPDATE customers SET assigned_employee_id = '', assigned_employee_name = '', updated_at = NOW() WHERE assigned_employee_id = $1`,
+        [empId]
+      ),
+      undefined
+    );
 
     await tx.query(`DELETE FROM users WHERE id = $1`, [empId]);
     await tx.query(`DELETE FROM employees WHERE id = $1`, [empId]);
@@ -5009,6 +5079,11 @@ export async function importReservationsFromExcel(
       );
     }
 
+    await upsertCustomersFromReservationsTx(tx, rowsToSave, {
+      source: 'excel_import',
+      overwriteProfileFields: false
+    });
+
     await logActivity(
       tx,
       session.user,
@@ -5305,13 +5380,30 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
         return { reportType: rType, rows: aRes.rows, facets };
       }
 
+      if (rType === 'customers') {
+        const custReportRes = await getCustomers(executor, session, {
+          search: str(payload.search),
+          status: str(payload.status),
+          company: str(payload.company),
+          assignedEmployeeId: str(payload.employeeId),
+          page: 1,
+          pageSize: 1000,
+          forceRefresh: true
+        });
+        return {
+          reportType: rType,
+          rows: custReportRes.items || [],
+          facets
+        };
+      }
+
       const resRows = await executor.query(
         `SELECT * FROM reservations r ${where} ORDER BY r.source_order ASC NULLS LAST LIMIT 2000`,
         params
       );
       return {
         reportType: rType,
-        rows: resRows.rows.map((r) => mapReservationRowToClient(r, false)),
+        rows: redactReservationsList(resRows.rows.map((r) => mapReservationRowToClient(r, false)), session.user),
         facets
       };
     }
@@ -6879,3 +6971,893 @@ export async function restoreUiDefaults(
     role_ui_defaults: {}
   };
 }
+
+// ---------- CUSTOMER MANAGEMENT SYSTEM ----------
+
+const SQL_CUST_COMPLETED_OR_INACTIVE = `(
+  NOT ${SQL_ACTIVE_CONDITION} OR
+  LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('completed','finished','finished_by_driver','closed','ended','returned') OR
+  TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') IN ('مكتمل','مكتمله','منتهي','منتهيه','مغلق','تم الاغلاق','تم التسليم والاسترجاع')
+)`;
+
+function requireCustomersRouteAccess(session: AuthSession): void {
+  const canRoute = typeof crmCore.canUserViewRoute === 'function' && crmCore.canUserViewRoute(session.user, 'customers');
+  const canPerm = crmCore.canUserPerform(session.user, 'view_customers');
+  if (!canRoute && !canPerm) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية الوصول إلى قسم العملاء.');
+  }
+}
+
+export async function getCustomers(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requireCustomersRouteAccess(session);
+  const canViewId = typeof crmCore.canUserViewCustomerId === 'function'
+    ? crmCore.canUserViewCustomerId(session.user)
+    : false;
+  const settings = await getSettingsMap(executor);
+  const allowAgentViewAll = settings.allow_agent_view_all !== false;
+  const scopedAgentId = session.user.role === 'agent' && !allowAgentViewAll ? str(session.user.id) : '';
+
+  const page = Math.max(1, Math.floor(num(payload.page, 1)));
+  const pageSize = Math.min(200, Math.max(10, Math.floor(num(payload.pageSize, 50))));
+  const sortBy = str(payload.sortBy || 'last_activity');
+  const search = str(payload.search);
+  const statusFilter = str(payload.status);
+  const companyFilter = str(payload.company);
+  const empFilter = str(payload.assignedEmployeeId || payload.employeeId);
+  const problemFilter = str(payload.problemFilter);
+  const kpiFilter = str(payload.kpiFilter || 'all');
+
+  const cacheKey = JSON.stringify({
+    uid: scopedAgentId || 'ALL',
+    canViewId,
+    page,
+    pageSize,
+    sortBy,
+    search,
+    statusFilter,
+    companyFilter,
+    empFilter,
+    problemFilter,
+    kpiFilter
+  });
+
+  return getCachedOrLoad(
+    executor,
+    { scope: 'customers', key: cacheKey, ttlMs: 15000, bypassCache: toBool(payload.forceRefresh) },
+    async () => {
+      const params: any[] = [];
+      let agentScopeSql = '';
+      if (scopedAgentId) {
+        params.push(scopedAgentId);
+        const pId = `$${params.length}`;
+        params.push(JSON.stringify([scopedAgentId]));
+        const pJson = `$${params.length}`;
+        agentScopeSql = `AND (
+          c.assigned_employee_id = ${pId}
+          OR EXISTS (SELECT 1 FROM reservations rs WHERE rs.customer_id = c.id AND rs.assigned_employee_ids @> ${pJson}::jsonb)
+          OR EXISTS (SELECT 1 FROM problems ps WHERE ps.customer_id = c.id AND ps.assigned_employee_ids @> ${pJson}::jsonb)
+        )`;
+      }
+
+      const cteSql = `
+        WITH res_agg AS (
+          SELECT
+            r.customer_id,
+            COUNT(*)::int AS bookings_count,
+            COUNT(*) FILTER (WHERE NOT ${SQL_CUST_COMPLETED_OR_INACTIVE})::int AS active_bookings_count,
+            COUNT(*) FILTER (WHERE ${SQL_CUST_COMPLETED_OR_INACTIVE})::int AS past_bookings_count,
+            COALESCE(SUM(COALESCE(r.extensions_count, 0)), 0)::int AS extensions_count,
+            COALESCE(SUM(COALESCE(r.total_amount, 0)), 0)::numeric AS total_amount,
+            COALESCE(SUM(COALESCE(r.paid_amount, 0)), 0)::numeric AS paid_amount,
+            MAX(COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD'))) AS last_reservation_date,
+            (ARRAY_AGG(r.reservation_number ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC) FILTER (WHERE COALESCE(r.reservation_number, '') <> ''))[1] AS last_reservation_number,
+            (ARRAY_AGG(r.company_name ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC) FILTER (WHERE COALESCE(r.company_name, '') <> ''))[1] AS last_company_name,
+            COALESCE(ARRAY_AGG(DISTINCT r.company_name) FILTER (WHERE COALESCE(r.company_name, '') <> ''), ARRAY[]::text[]) AS companies,
+            COALESCE(STRING_AGG(DISTINCT r.reservation_number, ' '), '') AS all_res_numbers,
+            COALESCE(STRING_AGG(DISTINCT r.reference_number, ' '), '') AS all_ref_numbers,
+            MAX(r.updated_at) AS max_res_updated_at
+          FROM reservations r
+          WHERE COALESCE(r.customer_id, '') <> ''
+          GROUP BY r.customer_id
+        ),
+        prb_agg AS (
+          SELECT
+            COALESCE(NULLIF(p.customer_id, ''), r.customer_id) AS customer_id,
+            COUNT(*) FILTER (WHERE p.status NOT IN ('مغلقة', 'تم الحل'))::int AS open_problems_count,
+            COUNT(*) FILTER (WHERE p.status NOT IN ('مغلقة', 'تم الحل') AND COALESCE(p.ticket_type, 'مشكلة') = 'شكوى')::int AS open_complaints_count,
+            MAX(p.updated_at) AS max_prb_updated_at
+          FROM problems p
+          LEFT JOIN reservations r ON p.reservation_id = r.id
+          WHERE COALESCE(NULLIF(p.customer_id, ''), r.customer_id, '') <> ''
+          GROUP BY COALESCE(NULLIF(p.customer_id, ''), r.customer_id)
+        ),
+        fu_agg AS (
+          SELECT
+            r.customer_id,
+            COUNT(fu.id)::int AS follow_ups_count,
+            MAX(COALESCE(NULLIF(fu.follow_up_date, ''), TO_CHAR(fu.created_at, 'YYYY-MM-DD'))) AS last_fu_contact_at,
+            MAX(fu.created_at) AS max_fu_created_at
+          FROM follow_ups fu
+          JOIN reservations r ON fu.reservation_id = r.id
+          WHERE COALESCE(r.customer_id, '') <> ''
+          GROUP BY r.customer_id
+        ),
+        note_agg AS (
+          SELECT
+            cn.customer_id,
+            COUNT(*)::int AS notes_count,
+            MAX(cn.created_at) AS max_note_created_at
+          FROM customer_notes cn
+          GROUP BY cn.customer_id
+        ),
+        customer_summary AS (
+          SELECT
+            c.*,
+            COALESCE(ra.bookings_count, 0) AS bookings_count,
+            COALESCE(ra.active_bookings_count, 0) AS active_bookings_count,
+            COALESCE(ra.past_bookings_count, 0) AS past_bookings_count,
+            COALESCE(ra.extensions_count, 0) AS extensions_count,
+            COALESCE(pa.open_problems_count, 0) AS open_problems_count,
+            COALESCE(pa.open_complaints_count, 0) AS open_complaints_count,
+            COALESCE(fa.follow_ups_count, 0) AS follow_ups_count,
+            COALESCE(na.notes_count, 0) AS notes_count,
+            COALESCE(ra.total_amount, 0) AS total_amount,
+            COALESCE(ra.paid_amount, 0) AS paid_amount,
+            COALESCE(ra.last_reservation_number, '') AS last_reservation_number,
+            COALESCE(ra.last_reservation_date, '') AS last_reservation_date,
+            COALESCE(ra.last_company_name, '') AS last_company_name,
+            COALESCE(ra.companies, ARRAY[]::text[]) AS companies,
+            COALESCE(ra.all_res_numbers, '') AS all_res_numbers,
+            COALESCE(ra.all_ref_numbers, '') AS all_ref_numbers,
+            CASE
+              WHEN COALESCE(c.last_contact_at, '') <> '' AND COALESCE(fa.last_fu_contact_at, '') <> ''
+                THEN GREATEST(c.last_contact_at, fa.last_fu_contact_at)
+              WHEN COALESCE(c.last_contact_at, '') <> '' THEN c.last_contact_at
+              WHEN COALESCE(fa.last_fu_contact_at, '') <> '' THEN fa.last_fu_contact_at
+              WHEN na.max_note_created_at IS NOT NULL THEN TO_CHAR(na.max_note_created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD HH24:MI')
+              ELSE ''
+            END AS effective_last_contact_at,
+            GREATEST(
+              c.updated_at,
+              COALESCE(ra.max_res_updated_at, c.updated_at),
+              COALESCE(pa.max_prb_updated_at, c.updated_at),
+              COALESCE(fa.max_fu_created_at, c.updated_at),
+              COALESCE(na.max_note_created_at, c.updated_at)
+            ) AS last_activity_at
+          FROM customers c
+          LEFT JOIN res_agg ra ON ra.customer_id = c.id
+          LEFT JOIN prb_agg pa ON pa.customer_id = c.id
+          LEFT JOIN fu_agg fa ON fa.customer_id = c.id
+          LEFT JOIN note_agg na ON na.customer_id = c.id
+          WHERE 1=1 ${agentScopeSql}
+        )
+      `;
+
+      // 1) KPI & Facets summary over the user's scoped universe
+      const kpiRes = await executor.query(
+        `${cteSql}
+         SELECT
+           COUNT(*)::int AS total_customers,
+           COUNT(*) FILTER (WHERE status = 'جديد' OR (bookings_count <= 1 AND open_problems_count = 0 AND created_at >= NOW() - INTERVAL '30 days'))::int AS new_customers,
+           COUNT(*) FILTER (WHERE active_bookings_count > 0)::int AS active_booking_customers,
+           COUNT(*) FILTER (WHERE past_bookings_count > 0)::int AS past_booking_customers,
+           COUNT(*) FILTER (WHERE open_problems_count > 0)::int AS open_problem_customers,
+           COUNT(*) FILTER (WHERE open_complaints_count > 0)::int AS complaint_customers,
+           COUNT(*) FILTER (WHERE extensions_count > 0)::int AS with_extensions_customers,
+           COUNT(*) FILTER (WHERE follow_ups_count = 0 AND notes_count = 0 AND COALESCE(effective_last_contact_at, '') = '')::int AS unfollowed_customers,
+           COUNT(*) FILTER (WHERE bookings_count > 1)::int AS repeat_customers,
+           COUNT(*) FILTER (WHERE GREATEST(created_at, updated_at) >= NOW() - INTERVAL '7 days')::int AS recent_customers
+         FROM customer_summary`,
+        params
+      );
+      const kpiRow = kpiRes.rows[0] || {};
+      const kpis = {
+        totalCustomers: num(kpiRow.total_customers),
+        newCustomers: num(kpiRow.new_customers),
+        activeBookingCustomers: num(kpiRow.active_booking_customers),
+        pastBookingCustomers: num(kpiRow.past_booking_customers),
+        openProblemCustomers: num(kpiRow.open_problem_customers),
+        inProgressComplaintCustomers: num(kpiRow.complaint_customers),
+        withExtensionsCustomers: num(kpiRow.with_extensions_customers),
+        unfollowedCustomers: num(kpiRow.unfollowed_customers),
+        repeatCustomers: num(kpiRow.repeat_customers),
+        recentCustomers: num(kpiRow.recent_customers)
+      };
+
+      // 2) Filter clauses
+      const filterParams = [...params];
+      const clauses: string[] = [];
+
+      if (search) {
+        const searchCols = ['full_name', 'phone', 'normalized_phone', 'email', 'all_res_numbers', 'all_ref_numbers'];
+        if (canViewId) searchCols.push('id_number');
+        const cond = buildPgSearchCondition(searchCols, search, filterParams);
+        if (cond) clauses.push(cond);
+      }
+      if (statusFilter) {
+        filterParams.push(statusFilter);
+        clauses.push(`status = $${filterParams.length}`);
+      }
+      if (companyFilter) {
+        filterParams.push(companyFilter);
+        clauses.push(`$${filterParams.length} = ANY(companies)`);
+      }
+      if (empFilter) {
+        if (empFilter === 'unassigned') {
+          clauses.push(`COALESCE(assigned_employee_id, '') = ''`);
+        } else {
+          filterParams.push(empFilter);
+          clauses.push(`assigned_employee_id = $${filterParams.length}`);
+        }
+      }
+      if (problemFilter === 'open_problems') {
+        clauses.push(`open_problems_count > 0`);
+      } else if (problemFilter === 'open_complaints') {
+        clauses.push(`open_complaints_count > 0`);
+      } else if (problemFilter === 'no_problems') {
+        clauses.push(`open_problems_count = 0`);
+      }
+
+      if (kpiFilter === 'new') {
+        clauses.push(`(status = 'جديد' OR (bookings_count <= 1 AND open_problems_count = 0 AND created_at >= NOW() - INTERVAL '30 days'))`);
+      } else if (kpiFilter === 'active') {
+        clauses.push(`active_bookings_count > 0`);
+      } else if (kpiFilter === 'past') {
+        clauses.push(`past_bookings_count > 0`);
+      } else if (kpiFilter === 'open_problems') {
+        clauses.push(`open_problems_count > 0`);
+      } else if (kpiFilter === 'complaints') {
+        clauses.push(`open_complaints_count > 0`);
+      } else if (kpiFilter === 'extensions') {
+        clauses.push(`extensions_count > 0`);
+      } else if (kpiFilter === 'unfollowed') {
+        clauses.push(`(follow_ups_count = 0 AND notes_count = 0 AND COALESCE(effective_last_contact_at, '') = '')`);
+      } else if (kpiFilter === 'repeat') {
+        clauses.push(`bookings_count > 1`);
+      } else if (kpiFilter === 'recent') {
+        clauses.push(`GREATEST(created_at, updated_at) >= NOW() - INTERVAL '7 days'`);
+      }
+
+      const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      let orderSql = `last_activity_at DESC NULLS LAST, updated_at DESC`;
+      if (sortBy === 'bookings_desc') orderSql = `bookings_count DESC, last_activity_at DESC`;
+      else if (sortBy === 'active_desc') orderSql = `active_bookings_count DESC, last_activity_at DESC`;
+      else if (sortBy === 'amount_desc') orderSql = `total_amount DESC, last_activity_at DESC`;
+      else if (sortBy === 'created_desc') orderSql = `created_at DESC`;
+      else if (sortBy === 'name_asc') orderSql = `full_name ASC, updated_at DESC`;
+
+      const countRes = await executor.query<{ cnt: number }>(
+        `${cteSql} SELECT COUNT(*)::int AS cnt FROM customer_summary ${whereSql}`,
+        filterParams
+      );
+      const total = num(countRes.rows[0]?.cnt, 0);
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const offset = (safePage - 1) * pageSize;
+
+      const listParams = [...filterParams, pageSize, offset];
+      const rowsRes = await executor.query(
+        `${cteSql}
+         SELECT *
+         FROM customer_summary
+         ${whereSql}
+         ORDER BY ${orderSql}
+         LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+        listParams
+      );
+
+      const recentRes = await executor.query(
+        `${cteSql}
+         SELECT * FROM customer_summary
+         ORDER BY GREATEST(created_at, updated_at) DESC
+         LIMIT 6`,
+        params
+      );
+
+      const facets = await getCachedReservationFacets(executor);
+      const empsRes = await executor.query(`SELECT id, name, role, status FROM employees WHERE status = 'active' ORDER BY name ASC`);
+
+      const items = rowsRes.rows.map((r) => formatCustomerSummaryRow({
+        ...r,
+        last_contact_at: r.effective_last_contact_at
+      }, session.user));
+      const recentCustomers = recentRes.rows.map((r) => formatCustomerSummaryRow({
+        ...r,
+        last_contact_at: r.effective_last_contact_at
+      }, session.user));
+
+      return {
+        items,
+        kpis,
+        recentCustomers,
+        facets: {
+          companies: facets.companies || [],
+          employees: empsRes.rows.map((e: any) => ({ id: str(e.id), name: str(e.name), role: str(e.role) })),
+          statuses: crmCore.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور']
+        },
+        total,
+        page: safePage,
+        pageSize,
+        totalPages
+      };
+    }
+  );
+}
+
+export async function getCustomerDetails(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requireCustomersRouteAccess(session);
+  const target = str(payload.customerId || payload.customerKey || payload.id);
+  const resLookup = str(payload.reservationId || payload.reservationNumber);
+  const phoneLookup = str(payload.phone);
+
+  if (!target && !resLookup && !phoneLookup) {
+    throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+  }
+
+  let custRow: any = null;
+  if (target) {
+    const q = await executor.query(
+      `SELECT * FROM customers WHERE id = $1 OR customer_key = $1 LIMIT 1`,
+      [target]
+    );
+    custRow = q.rows[0] || null;
+  }
+
+  if (!custRow && resLookup) {
+    const rq = await executor.query(
+      `SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 LIMIT 1`,
+      [resLookup]
+    );
+    if (rq.rows[0]) {
+      await executor.withTransaction(async (tx) => {
+        const keyMap = await upsertCustomersFromReservationsTx(tx, [rq.rows[0]], { source: 'profile_lookup' });
+        const cid = Array.from(keyMap.values())[0];
+        if (cid) {
+          const cq = await tx.query(`SELECT * FROM customers WHERE id = $1 LIMIT 1`, [cid]);
+          custRow = cq.rows[0] || null;
+        }
+      });
+    }
+  }
+
+  if (!custRow && phoneLookup) {
+    const digits = phoneLookup.replace(/\D/g, '');
+    const normPhone = digits.length >= 9 ? digits.slice(-9) : digits;
+    if (normPhone) {
+      const cq = await executor.query(
+        `SELECT * FROM customers WHERE normalized_phone LIKE $1 OR phone = $2 ORDER BY updated_at DESC LIMIT 1`,
+        [`%${normPhone}`, phoneLookup]
+      );
+      custRow = cq.rows[0] || null;
+    }
+  }
+
+  if (!custRow) {
+    throw new Error('NOT_FOUND: ملف العميل غير موجود.');
+  }
+
+  const settings = await getSettingsMap(executor);
+  const allowAgentViewAll = settings.allow_agent_view_all !== false;
+
+  const custId = str(custRow.id);
+  const resQ = await executor.query(
+    `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
+     FROM reservations r
+     WHERE r.customer_id = $1
+     ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC
+     LIMIT 400`,
+    [custId]
+  );
+
+  let reservations = resQ.rows.map((r) => mapReservationRowToClient(r, false));
+  if (session.user.role === 'agent' && !allowAgentViewAll) {
+    const uid = str(session.user.id);
+    const hasCustAccess =
+      str(custRow.assigned_employee_id) === uid ||
+      reservations.some((r) => Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds.includes(uid));
+    if (!hasCustAccess) {
+      throw new Error('FORBIDDEN: ليس لديك صلاحية عرض ملف هذا العميل.');
+    }
+  }
+
+  const resIds = reservations.map((r) => str(r.id)).filter(Boolean);
+  const resNums = reservations.map((r) => str(r.reservationNumber)).filter(Boolean);
+
+  const [extRes, prbRes, fuRes, notesRes, actRes, empsRes] = await Promise.all([
+    (resIds.length || resNums.length)
+      ? executor.query(
+          `SELECT * FROM extensions WHERE reservation_id = ANY($1::text[]) OR reservation_number = ANY($2::text[]) ORDER BY start_date DESC, sequence_number DESC`,
+          [resIds, resNums]
+        )
+      : Promise.resolve({ rows: [] as any[] }),
+    executor.query(
+      `SELECT * FROM problems WHERE customer_id = $1 OR reservation_id = ANY($2::text[]) ORDER BY updated_at DESC LIMIT 200`,
+      [custId, resIds]
+    ),
+    resIds.length
+      ? executor.query(`SELECT * FROM follow_ups WHERE reservation_id = ANY($1::text[]) ORDER BY created_at DESC LIMIT 300`, [resIds])
+      : Promise.resolve({ rows: [] as any[] }),
+    executor.query(`SELECT * FROM customer_notes WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 300`, [custId]),
+    executor.query(
+      `SELECT * FROM activity_log WHERE (entity_type = 'Customer' AND entity_id = $1) OR (entity_type = 'Reservation' AND entity_id = ANY($2::text[])) ORDER BY created_at DESC LIMIT 120`,
+      [custId, resNums]
+    ),
+    executor.query(`SELECT id, name, role, status FROM employees WHERE status = 'active' ORDER BY name ASC`)
+  ]);
+
+  const extensions = extRes.rows.map(mapExtensionRowToClient);
+  const prbIds = prbRes.rows.map((p) => str(p.id)).filter(Boolean);
+  const prbUpdMap = new Map<string, any[]>();
+  if (prbIds.length > 0) {
+    const prbUpds = await executor.query(
+      `SELECT * FROM problem_updates WHERE problem_id = ANY($1::text[]) ORDER BY created_at DESC`,
+      [prbIds]
+    );
+    for (const u of prbUpds.rows) {
+      const pid = str(u.problem_id);
+      const arr = prbUpdMap.get(pid) || [];
+      arr.push(formatProblemUpdateRow(u));
+      prbUpdMap.set(pid, arr);
+    }
+  }
+  const problems = prbRes.rows.map((p) => formatProblemRow(p, prbUpdMap));
+  const followUps = fuRes.rows.map(formatFollowUpRow);
+  const notes = notesRes.rows.map((n: any) => ({
+    id: str(n.id),
+    customerId: str(n.customer_id),
+    reservationId: str(n.reservation_id),
+    reservationNumber: str(n.reservation_number),
+    noteType: str(n.note_type) || 'ملاحظة',
+    content: str(n.content),
+    createdById: str(n.created_by_id),
+    createdByName: str(n.created_by_name),
+    createdAt: n.created_at instanceof Date ? n.created_at.toISOString() : str(n.created_at),
+    updatedAt: n.updated_at instanceof Date ? n.updated_at.toISOString() : str(n.updated_at)
+  }));
+
+  let activeCount = 0;
+  let pastCount = 0;
+  let totalAmount = 0;
+  let baseAmount = 0;
+  let extensionsAmount = 0;
+  let paidAmount = 0;
+  let refundAmount = 0;
+  let penaltyAmount = 0;
+
+  for (const r of reservations) {
+    const stText = `${r.originalStatusCode || ''} ${r.internalStatus || ''}`;
+    const isPast = (typeof crmCore.isInactiveReservation === 'function' && crmCore.isInactiveReservation(r))
+      || /(completed|finished|finished_by_driver|closed|ended|returned|مكتمل|منتهي|مغلق)/i.test(stText);
+    if (isPast) pastCount++;
+    else activeCount++;
+    totalAmount += num(r.totalAmount, 0);
+    baseAmount += num(r.baseAmount, 0);
+    extensionsAmount += num(r.extensionsAmount, 0);
+    paidAmount += num(r.paidAmount, 0);
+    refundAmount += num(r.refundAmount, 0);
+    penaltyAmount += num(r.penaltyAmount, 0);
+  }
+
+  const openProblems = problems.filter((p) => p.status !== 'مغلقة' && p.status !== 'تم الحل');
+  const openComplaints = openProblems.filter((p) => p.ticketType === 'شكوى');
+  const companiesSet = new Set(reservations.map((r) => str(r.companyName)).filter(Boolean));
+  const lastRes = reservations[0] || null;
+  const lastFuDate = followUps[0] ? str(followUps[0].followUpDate || followUps[0].createdAt) : '';
+  const lastNoteDate = notes[0] ? str(notes[0].createdAt) : '';
+  const effectiveLastContact = [str(custRow.last_contact_at), lastFuDate, lastNoteDate].filter(Boolean).sort().reverse()[0] || '';
+
+  const customer = formatCustomerSummaryRow({
+    ...custRow,
+    last_contact_at: effectiveLastContact,
+    bookings_count: reservations.length,
+    active_bookings_count: activeCount,
+    past_bookings_count: pastCount,
+    extensions_count: extensions.length || reservations.reduce((acc, r) => acc + num(r.extensionsCount, 0), 0),
+    open_problems_count: openProblems.length,
+    open_complaints_count: openComplaints.length,
+    follow_ups_count: followUps.length,
+    total_amount: Number(totalAmount.toFixed(2)),
+    paid_amount: Number(paidAmount.toFixed(2)),
+    last_reservation_number: lastRes ? str(lastRes.reservationNumber) : '',
+    last_reservation_date: lastRes ? str(lastRes.startDate || lastRes.createdAt) : '',
+    last_company_name: lastRes ? str(lastRes.companyName) : ''
+  }, session.user);
+
+  const financialSummary = {
+    totalAmount: Number(totalAmount.toFixed(2)),
+    baseAmount: Number(baseAmount.toFixed(2)),
+    extensionsAmount: Number(extensionsAmount.toFixed(2)),
+    paidAmount: Number(paidAmount.toFixed(2)),
+    refundAmount: Number(refundAmount.toFixed(2)),
+    penaltyAmount: Number(penaltyAmount.toFixed(2)),
+    outstandingAmount: Math.max(0, Number((totalAmount - paidAmount).toFixed(2))),
+    bookingsCount: reservations.length,
+    activeBookingsCount: activeCount,
+    pastBookingsCount: pastCount,
+    extensionsCount: extensions.length,
+    companiesCount: companiesSet.size,
+    openProblemsCount: openProblems.length,
+    openComplaintsCount: openComplaints.length
+  };
+
+  // Unified chronological timeline
+  const timeline: Array<{ id: string; kind: string; title: string; subtitle: string; actor: string; status: string; at: string; entityId?: string }> = [];
+  for (const r of reservations) {
+    timeline.push({
+      id: `TL_RES_${r.id}`,
+      kind: 'reservation',
+      title: `حجز ${r.reservationNumber} — ${r.carName || r.companyName || ''}`,
+      subtitle: `${r.startDate || ''} ← ${r.extendedUntilDate || r.endDate || ''} · ${Number(r.totalAmount || 0).toLocaleString('en-US')} ر.س`,
+      actor: str(r.companyName),
+      status: str(r.internalStatus),
+      at: str(r.sourceCreatedAt || r.createdAt || r.startDate),
+      entityId: r.id
+    });
+  }
+  for (const e of extensions) {
+    timeline.push({
+      id: `TL_EXT_${e.id}`,
+      kind: 'extension',
+      title: `تمديد #${e.sequenceNumber || e.extensionNumber} على الحجز ${e.reservationNumber}`,
+      subtitle: `${e.extendDays || 0} يوم · ${Number(e.amount || 0).toLocaleString('en-US')} ر.س`,
+      actor: str(e.paymentMethod || e.extensionTypeAr),
+      status: str(e.statusAr || e.paymentStatus),
+      at: str(e.paymentDate || e.startDate || e.syncedAt),
+      entityId: e.reservationId
+    });
+  }
+  for (const p of problems) {
+    timeline.push({
+      id: `TL_PRB_${p.id}`,
+      kind: 'problem',
+      title: `${p.ticketType === 'شكوى' ? 'شكوى' : 'مشكلة'} ${p.problemNumber}${p.reservationNumber ? ` (${p.reservationNumber})` : ''}`,
+      subtitle: str(p.description),
+      actor: str(p.createdByName),
+      status: str(p.status),
+      at: str(p.createdAt),
+      entityId: p.id
+    });
+  }
+  for (const f of followUps) {
+    timeline.push({
+      id: `TL_FU_${f.id}`,
+      kind: 'followup',
+      title: `متابعة حجز ${f.reservationNumber}: ${f.action || f.status}`,
+      subtitle: str(f.notes),
+      actor: str(f.employeeName),
+      status: str(f.status),
+      at: str(f.createdAt),
+      entityId: f.reservationId
+    });
+  }
+  for (const n of notes) {
+    timeline.push({
+      id: `TL_NOTE_${n.id}`,
+      kind: 'note',
+      title: `${n.noteType}${n.reservationNumber ? ` (الحجز ${n.reservationNumber})` : ''}`,
+      subtitle: str(n.content),
+      actor: str(n.createdByName),
+      status: str(n.noteType),
+      at: str(n.createdAt),
+      entityId: n.id
+    });
+  }
+  for (const a of actRes.rows || []) {
+    timeline.push({
+      id: `TL_ACT_${str(a.id)}`,
+      kind: 'activity',
+      title: `${str(a.action_type)}${a.entity_id ? ` (${str(a.entity_id)})` : ''}`,
+      subtitle: str(a.details),
+      actor: str(a.user_name),
+      status: '',
+      at: a.created_at instanceof Date ? a.created_at.toISOString() : str(a.created_at)
+    });
+  }
+  timeline.sort((x, y) => String(y.at || '').localeCompare(String(x.at || '')));
+
+  return {
+    customer,
+    reservations: redactReservationsList(reservations, session.user),
+    extensions,
+    problems,
+    followUps,
+    notes,
+    financialSummary,
+    timeline: timeline.slice(0, 250),
+    employees: empsRes.rows.map((e: any) => ({ id: str(e.id), name: str(e.name), role: str(e.role) }))
+  };
+}
+
+export async function createCustomer(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'edit_customer_details');
+  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_edit_customer')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية إضافة أو تعديل العملاء.');
+  }
+  const fullName = str(payload.fullName);
+  const phone = str(payload.phone);
+  const email = str(payload.email);
+  if (!fullName) throw new Error('VALIDATION_ERROR: اسم العميل مطلوب.');
+  if (!phone && !email) throw new Error('VALIDATION_ERROR: رقم الجوال أو البريد الإلكتروني مطلوب.');
+
+  const phoneMeta = typeof crmCore.extractPhoneCountryCode === 'function'
+    ? crmCore.extractPhoneCountryCode(phone)
+    : { countryCode: '', nationalPhone: phone.replace(/\D/g, ''), normalizedPhone: phone.replace(/\D/g, '') };
+
+  const canViewId = typeof crmCore.canUserViewCustomerId === 'function'
+    ? crmCore.canUserViewCustomerId(session.user)
+    : false;
+  const idNumber = canViewId ? str(payload.idNumber) : '';
+  const idType = canViewId
+    ? (str(payload.idType) || (typeof crmCore.detectCustomerIdType === 'function' ? crmCore.detectCustomerIdType(idNumber) : ''))
+    : '';
+  const customerKey = typeof crmCore.buildCustomerCanonicalKey === 'function'
+    ? crmCore.buildCustomerCanonicalKey({ phone, email, idNumber, name: fullName })
+    : (phoneMeta.normalizedPhone ? `PH:${phoneMeta.normalizedPhone}` : `NAME:${fullName}`);
+
+  return runWithIdempotency(executor, session.user.id, 'createCustomer', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const existingQ = await tx.query(`SELECT id FROM customers WHERE customer_key = $1 LIMIT 1`, [customerKey]);
+      if (existingQ.rows[0]) {
+        throw new Error('CONFLICT: يوجد عميل مسجل بنفس رقم الجوال أو الهوية بالفعل.');
+      }
+
+      const id = deterministicCustomerId(customerKey);
+      const statusList: string[] = crmCore.CUSTOMER_STATUS_LIST || ['جديد'];
+      const status = statusList.includes(str(payload.status)) ? str(payload.status) : 'جديد';
+      const statusOverride = status !== 'جديد';
+      const assignedEmpId = str(payload.assignedEmployeeId);
+      let assignedEmpName = '';
+      if (assignedEmpId) {
+        const empQ = await tx.query<{ name: string }>(`SELECT name FROM employees WHERE id = $1 LIMIT 1`, [assignedEmpId]);
+        assignedEmpName = str(empQ.rows[0]?.name);
+      }
+      const notes = str(payload.notes);
+      const tags = Array.isArray(payload.tags) ? payload.tags.map((t: any) => str(t)).filter(Boolean) : [];
+      const nowIso = new Date().toISOString();
+
+      await tx.query(
+        `INSERT INTO customers (
+           id, customer_key, full_name, phone, country_code, normalized_phone,
+           email, id_number, id_type, status, status_override,
+           assigned_employee_id, assigned_employee_name, notes, tags, source,
+           last_contact_at, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,'manual',$16,$17::timestamptz,$17::timestamptz)`,
+        [
+          id, customerKey, fullName, phone, str(payload.countryCode || phoneMeta.countryCode), phoneMeta.normalizedPhone,
+          email, idNumber, idType, status, statusOverride,
+          assignedEmpId, assignedEmpName, notes, JSON.stringify(tags), '', nowIso
+        ]
+      );
+
+      await logActivity(tx, session.user, 'إضافة عميل', 'Customer', id, `${fullName} (${phone || email})`);
+      const resQ = await tx.query(`SELECT * FROM customers WHERE id = $1 LIMIT 1`, [id]);
+      return formatCustomerSummaryRow(resQ.rows[0], session.user);
+    });
+    return out;
+  });
+}
+
+export async function updateCustomerProfile(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'edit_customer_details');
+  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_edit_customer')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية تعديل بيانات العملاء.');
+  }
+  const customerId = str(payload.customerId || payload.id);
+  if (!customerId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+
+  const canViewId = typeof crmCore.canUserViewCustomerId === 'function'
+    ? crmCore.canUserViewCustomerId(session.user)
+    : false;
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [customerId]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: العميل غير موجود.');
+
+    const nextFullName = payload.fullName !== undefined ? (str(payload.fullName) || str(cur.full_name)) : str(cur.full_name);
+    const nextPhone = payload.phone !== undefined ? str(payload.phone) : str(cur.phone);
+    const phoneMeta = typeof crmCore.extractPhoneCountryCode === 'function'
+      ? crmCore.extractPhoneCountryCode(nextPhone)
+      : { countryCode: '', normalizedPhone: nextPhone.replace(/\D/g, '') };
+    const nextCountryCode = payload.countryCode !== undefined
+      ? str(payload.countryCode)
+      : (payload.phone !== undefined ? str(phoneMeta.countryCode) : str(cur.country_code));
+    const nextNormPhone = payload.phone !== undefined ? str(phoneMeta.normalizedPhone) : str(cur.normalized_phone);
+    const nextEmail = payload.email !== undefined ? str(payload.email) : str(cur.email);
+    const nextIdNumber = (payload.idNumber !== undefined && canViewId) ? str(payload.idNumber) : str(cur.id_number);
+    const nextIdType = (payload.idType !== undefined && canViewId)
+      ? str(payload.idType)
+      : ((payload.idNumber !== undefined && canViewId && typeof crmCore.detectCustomerIdType === 'function')
+        ? crmCore.detectCustomerIdType(nextIdNumber)
+        : str(cur.id_type));
+
+    const validStatuses: string[] = crmCore.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور'];
+    let nextStatus = str(cur.status || 'جديد');
+    let nextStatusOverride = Boolean(cur.status_override);
+    if (payload.autoStatus === true) {
+      nextStatusOverride = false;
+    } else if (payload.status !== undefined && validStatuses.includes(str(payload.status))) {
+      nextStatus = str(payload.status);
+      nextStatusOverride = true;
+    }
+
+    const nextNotes = payload.notes !== undefined ? str(payload.notes) : str(cur.notes);
+    const nextTags = Array.isArray(payload.tags)
+      ? payload.tags.map((t: any) => str(t)).filter(Boolean)
+      : parseJsonArray<string>(cur.tags);
+    const nowIso = new Date().toISOString();
+
+    await tx.query(
+      `UPDATE customers
+       SET full_name = $2, phone = $3, country_code = $4, normalized_phone = $5,
+           email = $6, id_number = $7, id_type = $8,
+           status = $9, status_override = $10, notes = $11, tags = $12::jsonb,
+           updated_at = $13::timestamptz
+       WHERE id = $1`,
+      [
+        customerId, nextFullName, nextPhone, nextCountryCode, nextNormPhone,
+        nextEmail, nextIdNumber, nextIdType,
+        nextStatus, nextStatusOverride, nextNotes, JSON.stringify(nextTags), nowIso
+      ]
+    );
+
+    const diffs = crmCore.computeAuditFieldDiffs(
+      { fullName: cur.full_name, phone: cur.phone, email: cur.email, status: cur.status, notes: cur.notes },
+      { fullName: nextFullName, phone: nextPhone, email: nextEmail, status: nextStatus, notes: nextNotes },
+      [
+        { field: 'fullName', label: 'الاسم' },
+        { field: 'phone', label: 'الجوال' },
+        { field: 'email', label: 'البريد الإلكتروني' },
+        { field: 'status', label: 'حالة العميل' },
+        { field: 'notes', label: 'الملاحظات' }
+      ]
+    );
+    await logActivity(tx, session.user, 'تحديث ملف عميل', 'Customer', customerId, `${nextFullName}`, diffs);
+    const updatedQ = await tx.query(`SELECT * FROM customers WHERE id = $1 LIMIT 1`, [customerId]);
+    return formatCustomerSummaryRow(updatedQ.rows[0], session.user);
+  });
+
+  return { customer: out };
+}
+
+export async function assignCustomerEmployee(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'assign_customer_employee');
+  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_assign_customer')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية إسناد العملاء للموظفين.');
+  }
+  const customerId = str(payload.customerId || payload.id);
+  const employeeId = str(payload.employeeId);
+  if (!customerId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [customerId]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: العميل غير موجود.');
+
+    let employeeName = '';
+    if (employeeId) {
+      const empQ = await tx.query<{ name: string }>(`SELECT name FROM employees WHERE id = $1 LIMIT 1`, [employeeId]);
+      if (!empQ.rows[0]) throw new Error('NOT_FOUND: الموظف المحدد غير موجود.');
+      employeeName = str(empQ.rows[0].name);
+    }
+
+    const nowIso = new Date().toISOString();
+    await tx.query(
+      `UPDATE customers SET assigned_employee_id = $2, assigned_employee_name = $3, updated_at = $4::timestamptz WHERE id = $1`,
+      [customerId, employeeId, employeeName, nowIso]
+    );
+
+    if (employeeId && employeeId !== session.user.id) {
+      await createNotification(tx, {
+        recipientEmployeeId: employeeId,
+        type: 'customer_assigned',
+        title: `تم إسناد عميل إليك: ${str(cur.full_name)}`,
+        message: `أسند ${session.user.name} ملف العميل ${str(cur.full_name)} إليك للمتابعة.`,
+        entityType: 'Customer',
+        entityId: customerId,
+        eventKey: buildNotificationEventKey(['customer_assigned', str(payload.clientRequestId) || customerId, employeeId])
+      });
+    }
+
+    await logActivity(tx, session.user, 'إسناد عميل', 'Customer', customerId, `${str(cur.full_name)} ← ${employeeName || 'بدون موظف'}`);
+    const updatedQ = await tx.query(`SELECT * FROM customers WHERE id = $1 LIMIT 1`, [customerId]);
+    return formatCustomerSummaryRow(updatedQ.rows[0], session.user);
+  });
+
+  return { customer: out };
+}
+
+export async function addCustomerNote(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'add_customer_note');
+  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_add_customer_note')) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية إضافة ملاحظات أو تواصل للعميل.');
+  }
+  const customerId = str(payload.customerId);
+  const content = str(payload.content || payload.note);
+  const allowedTypes = ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
+  const noteType = allowedTypes.includes(str(payload.noteType)) ? str(payload.noteType) : 'ملاحظة';
+  const reservationId = str(payload.reservationId) || null;
+  let reservationNumber = str(payload.reservationNumber);
+
+  if (!customerId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+  if (!content) throw new Error('VALIDATION_ERROR: نص الملاحظة أو التواصل مطلوب.');
+
+  return runWithIdempotency(executor, session.user.id, 'addCustomerNote', str(payload.clientRequestId), async () => {
+    const out = await executor.withTransaction(async (tx) => {
+      const custQ = await tx.query(`SELECT id, full_name FROM customers WHERE id = $1 FOR UPDATE`, [customerId]);
+      if (!custQ.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+
+      if (reservationId && !reservationNumber) {
+        const rq = await tx.query<{ reservation_number: string }>(`SELECT reservation_number FROM reservations WHERE id = $1 LIMIT 1`, [reservationId]);
+        reservationNumber = str(rq.rows[0]?.reservation_number);
+      }
+
+      const id = generateId('CNOTE');
+      const nowIso = new Date().toISOString();
+      await tx.query(
+        `INSERT INTO customer_notes (id, customer_id, reservation_id, reservation_number, note_type, content, created_by_id, created_by_name, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$9::timestamptz)`,
+        [id, customerId, reservationId, reservationNumber, noteType, content, session.user.id, session.user.name, nowIso]
+      );
+
+      const isContactType = noteType !== 'ملاحظة';
+      await tx.query(
+        `UPDATE customers
+         SET last_contact_at = CASE WHEN $2::boolean THEN $3::timestamptz ELSE last_contact_at END,
+             updated_at = $3::timestamptz
+         WHERE id = $1`,
+        [customerId, isContactType, nowIso]
+      );
+
+      await dispatchMentionNotifications(tx, {
+        texts: [content],
+        sender: session.user,
+        entityType: 'Customer',
+        entityId: customerId,
+        label: str(custQ.rows[0].full_name),
+        sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `cnote:${id}`
+      });
+
+      await logActivity(tx, session.user, `${noteType} للعميل`, 'Customer', customerId, content.slice(0, 140));
+      return {
+        id,
+        customerId,
+        reservationId: reservationId || '',
+        reservationNumber,
+        noteType,
+        content,
+        createdById: session.user.id,
+        createdByName: session.user.name,
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
+    });
+
+    return { note: out };
+  });
+}
+

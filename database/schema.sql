@@ -591,3 +591,58 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_key_unique ON notifica
 CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismissals (employee_id, notification_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));
+
+-- 26. Unified Customers Directory (CRM Customer Profile Master)
+CREATE TABLE IF NOT EXISTS customers (
+  id TEXT PRIMARY KEY,
+  customer_key TEXT NOT NULL UNIQUE,
+  full_name TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  country_code TEXT NOT NULL DEFAULT '+966',
+  normalized_phone TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  id_number TEXT NOT NULL DEFAULT '',
+  id_type TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'جديد',
+  status_override BOOLEAN NOT NULL DEFAULT FALSE,
+  assigned_employee_id TEXT NOT NULL DEFAULT '',
+  assigned_employee_name TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+  source TEXT NOT NULL DEFAULT 'sync',
+  last_contact_at TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 27. Customer Notes & Direct Interaction Log
+CREATE TABLE IF NOT EXISTS customer_notes (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  reservation_id TEXT DEFAULT NULL REFERENCES reservations(id) ON DELETE SET NULL,
+  reservation_number TEXT NOT NULL DEFAULT '',
+  note_type TEXT NOT NULL DEFAULT 'ملاحظة',
+  content TEXT NOT NULL DEFAULT '',
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE problems ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE problems ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';
+
+CREATE INDEX IF NOT EXISTS idx_customers_name_trgm ON customers USING GIN (full_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_customers_phone_trgm ON customers USING GIN (phone gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_customers_norm_phone ON customers (normalized_phone) WHERE normalized_phone <> '';
+CREATE INDEX IF NOT EXISTS idx_customers_email_lower ON customers (LOWER(email)) WHERE email <> '';
+CREATE INDEX IF NOT EXISTS idx_customers_id_number ON customers (id_number) WHERE id_number <> '';
+CREATE INDEX IF NOT EXISTS idx_customers_status_updated ON customers (status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customers_assigned_emp ON customers (assigned_employee_id) WHERE assigned_employee_id <> '';
+CREATE INDEX IF NOT EXISTS idx_customer_notes_cust_created ON customer_notes (customer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_fk ON reservations (customer_id) WHERE customer_id <> '';
+CREATE INDEX IF NOT EXISTS idx_reservations_customer_email_trgm ON reservations USING GIN (customer_email gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_problems_customer_id_fk ON problems (customer_id) WHERE customer_id <> '';

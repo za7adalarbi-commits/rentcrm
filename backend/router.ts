@@ -336,6 +336,24 @@ export async function dispatchCrmRequest(
       case 'restoreUiDefaults':
         result = await queries.restoreUiDefaults(executor, session, payload);
         break;
+      case 'getCustomers':
+        result = await queries.getCustomers(executor, session, payload);
+        break;
+      case 'getCustomerDetails':
+        result = await queries.getCustomerDetails(executor, session, payload);
+        break;
+      case 'createCustomer':
+        result = await queries.createCustomer(executor, session, payload);
+        break;
+      case 'updateCustomerProfile':
+        result = await queries.updateCustomerProfile(executor, session, payload);
+        break;
+      case 'assignCustomerEmployee':
+        result = await queries.assignCustomerEmployee(executor, session, payload);
+        break;
+      case 'addCustomerNote':
+        result = await queries.addCustomerNote(executor, session, payload);
+        break;
       default:
         return {
           success: false,
@@ -369,6 +387,8 @@ export async function dispatchCrmRequest(
       const entityIds: string[] = [];
       const candidateResId = String(payload?.reservationId || outResult?.reservation?.id || outResult?.id || '').trim();
       if (candidateResId) entityIds.push(candidateResId);
+      const candidateCustId = String(payload?.customerId || outResult?.customer?.id || '').trim();
+      if (candidateCustId && !entityIds.includes(candidateCustId)) entityIds.push(candidateCustId);
       const originTabId = String(payload?.originTabId || '').trim() || undefined;
       const rtEvent = {
         type: syncSpec.eventType,

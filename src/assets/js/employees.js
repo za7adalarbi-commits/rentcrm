@@ -149,7 +149,10 @@
         '</div>' +
         '<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">' +
           rolePresets.map(function (pr) {
-            var permKeys = Array.isArray(pr.permissions) ? pr.permissions : [];
+            var rawPermKeys = Array.isArray(pr.permissions) ? pr.permissions : [];
+            var permKeys = rawPermKeys.filter(function (k) {
+              return !/^(?:perms_sections_configured|perms_subsections_configured|dash_perms_configured|perms_actions_configured)$/.test(String(k || ''));
+            });
             var previewLabels = permKeys.slice(0, 4).map(function (k) {
               return (catalogMap[k] && catalogMap[k].label) || k;
             });
