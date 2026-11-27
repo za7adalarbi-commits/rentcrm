@@ -211,6 +211,11 @@ const SQL_CANCELLED_CONDITION = `(
 
 const SQL_ACTIVE_CONDITION = `(NOT ${SQL_REJECTED_CONDITION} AND NOT ${SQL_CANCELLED_CONDITION})`;
 
+const SQL_REJECTED_TAB_CONDITION = `(
+  ${SQL_REJECTED_CONDITION} OR
+  TRIM(COALESCE(r.rcc_status, '')) <> ''
+)`;
+
 function redactReservationForUser<T extends Record<string, any>>(res: T, user: any): T {
   if (!res || typeof res !== 'object') return res;
   if (typeof crmCore.redactReservationSensitiveFields === 'function') {
@@ -1057,7 +1062,7 @@ export async function getDashboard(
                   COUNT(*) FILTER (WHERE ${SQL_ACTIVE_CONDITION})::int AS active_cnt,
                   COUNT(*) FILTER (WHERE LEFT(COALESCE(NULLIF(r.start_date, ''), ''), 10) = $${todayParamIdx}::text OR (r.created_at >= (($${todayParamIdx}::text || ' 00:00:00')::timestamp AT TIME ZONE 'Asia/Riyadh') AND r.created_at < ((($${todayParamIdx}::text || ' 00:00:00')::timestamp AT TIME ZONE 'Asia/Riyadh') + INTERVAL '1 day')))::int AS today_cnt,
                   COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::int AS cancelled_cnt,
-                  COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::int AS rejected_cnt
+                  COUNT(*) FILTER (WHERE ${SQL_REJECTED_TAB_CONDITION})::int AS rejected_cnt
            FROM reservations r ${resAliasedWhere}`,
           totalParams
         ),
@@ -1422,11 +1427,11 @@ export async function getReservations(
 
   const lifecycle = str(payload.lifecycle || 'active').toLowerCase();
   if (lifecycle === 'rejected') {
-    clauses.push(SQL_REJECTED_CONDITION);
+    clauses.push(SQL_REJECTED_TAB_CONDITION);
   } else if (lifecycle === 'cancelled') {
     clauses.push(SQL_CANCELLED_CONDITION);
   } else if (lifecycle === 'inactive') {
-    clauses.push(`(${SQL_REJECTED_CONDITION} OR ${SQL_CANCELLED_CONDITION})`);
+    clauses.push(`(${SQL_REJECTED_TAB_CONDITION} OR ${SQL_CANCELLED_CONDITION})`);
   } else if (lifecycle !== 'all') {
     clauses.push(SQL_ACTIVE_CONDITION);
   }
@@ -1640,7 +1645,7 @@ export async function getReservations(
            COUNT(*)::text AS total_cnt,
            COUNT(*) FILTER (WHERE ${SQL_ACTIVE_CONDITION})::text AS active_cnt,
            COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::text AS cancelled_cnt,
-           COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::text AS rejected_cnt
+           COUNT(*) FILTER (WHERE ${SQL_REJECTED_TAB_CONDITION})::text AS rejected_cnt
          FROM reservations r ${scopeWhere}`,
         scopeParams
       ).catch(() => ({ rows: [] as any[] })),
@@ -6521,9 +6526,9 @@ export async function getInactiveReservations(
   if (subTab === 'cancelled') {
     clauses.push(SQL_CANCELLED_CONDITION);
   } else if (subTab === 'all' || subTab === 'inactive') {
-    clauses.push(`(${SQL_REJECTED_CONDITION} OR ${SQL_CANCELLED_CONDITION})`);
+    clauses.push(`(${SQL_REJECTED_TAB_CONDITION} OR ${SQL_CANCELLED_CONDITION})`);
   } else {
-    clauses.push(SQL_REJECTED_CONDITION);
+    clauses.push(SQL_REJECTED_TAB_CONDITION);
   }
 
   const resNumberQuery = str(payload.reservationNumber).replace(/^#+/, '').trim();
@@ -6605,7 +6610,7 @@ export async function getInactiveReservations(
   const listParams = [...params, pageSize, offset];
   const scopeWhere = subTab === 'cancelled'
     ? SQL_CANCELLED_CONDITION
-    : (subTab === 'all' || subTab === 'inactive' ? `(${SQL_REJECTED_CONDITION} OR ${SQL_CANCELLED_CONDITION})` : SQL_REJECTED_CONDITION);
+    : (subTab === 'all' || subTab === 'inactive' ? `(${SQL_REJECTED_TAB_CONDITION} OR ${SQL_CANCELLED_CONDITION})` : SQL_REJECTED_TAB_CONDITION);
 
   const [countRes, rowsRes, facetRowsRes] = await Promise.all([
     executor.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM reservations r ${whereSql}`, params),

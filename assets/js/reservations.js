@@ -293,9 +293,11 @@
       if (life === 'all') return true;
       var coreRef = root.RGCrmCore;
       if (life === 'rejected') {
-        return (coreRef && typeof coreRef.isRejectedStatus === 'function')
-          ? coreRef.isRejectedStatus(rec)
-          : (coreRef && coreRef.classifyReservationLifecycle ? coreRef.classifyReservationLifecycle(rec) === 'rejected' : false);
+        return (coreRef && typeof coreRef.isInRejectedTab === 'function')
+          ? coreRef.isInRejectedTab(rec)
+          : ((coreRef && typeof coreRef.isRejectedStatus === 'function')
+              ? coreRef.isRejectedStatus(rec)
+              : (coreRef && coreRef.classifyReservationLifecycle ? coreRef.classifyReservationLifecycle(rec) === 'rejected' : false));
       }
       if (life === 'cancelled') {
         return (coreRef && typeof coreRef.isCancelledStatus === 'function')

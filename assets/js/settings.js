@@ -652,11 +652,9 @@
             var parts = [];
             if (sb && Number(sb.uniqueSourceTotal || 0) > 0) {
               parts.push('إجمالي المصدر الفريد: <strong>' + Number(sb.uniqueSourceTotal) + '</strong>');
-              if (Number(sb.grossAcrossThreeLists || 0) > Number(sb.uniqueSourceTotal || 0)) {
-                var effCan = Number(sb.effectiveCancelledCount !== undefined ? sb.effectiveCancelledCount : (sb.cancelledListCount || 0));
-                var effRej = Number(sb.effectiveRejectedCount !== undefined ? sb.effectiveRejectedCount : (sb.rejectedListCount || 0));
-                parts.push('التصنيف الموحد: <strong>' + Number(sb.activeOrOtherCount || 0) + '</strong> مستحق · <strong>' + effCan + '</strong> ملغي · <strong>' + effRej + '</strong> مرفوض');
-              }
+              var canListCnt = Number(sb.cancelledListCount !== undefined ? sb.cancelledListCount : (sb.effectiveCancelledCount || 0));
+              var rejListCnt = Number(sb.rejectedListCount !== undefined ? sb.rejectedListCount : (sb.effectiveRejectedCount || 0));
+              parts.push('التصنيف: <strong>' + Number(sb.activeOrOtherCount || 0) + '</strong> مستحق · <strong>' + canListCnt + '</strong> ملغي · <strong>' + rejListCnt + '</strong> مرفوض');
             } else if (Number(rec.totalInSource || 0) > 0) {
               parts.push('إجمالي المصدر: <strong>' + Number(rec.totalInSource) + '</strong>');
             }

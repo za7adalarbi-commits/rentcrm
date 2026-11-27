@@ -65,6 +65,10 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
     return mockRowLifecycle(r) === 'rejected';
   }
 
+  function mockIsInRejectedTab(r: any): boolean {
+    return mockIsRejected(r) || String(r.rcc_status || '').trim().length > 0;
+  }
+
   function mockIsCancelled(r: any): boolean {
     return mockRowLifecycle(r) === 'cancelled';
   }
@@ -80,8 +84,13 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
 
     const hasRejCond = whereSegment.includes("'rejected_by_provider'");
     const hasCanCond = whereSegment.includes("'cancelled_by_provider'");
+    const hasRccTab = whereSegment.includes('r.rcc_status');
     if (hasRejCond && /AND NOT\s*\(\s*CASE/i.test(whereSegment)) {
       list = list.filter((r) => !mockIsRejected(r) && !mockIsCancelled(r));
+    } else if (hasRccTab && /\)\s*OR\s*\(\s*CASE/i.test(whereSegment)) {
+      list = list.filter((r) => mockIsInRejectedTab(r) || mockIsCancelled(r));
+    } else if (hasRccTab) {
+      list = list.filter((r) => mockIsInRejectedTab(r));
     } else if (hasRejCond && /\)\s*OR\s*\(\s*CASE/i.test(whereSegment)) {
       list = list.filter((r) => mockIsRejected(r) || mockIsCancelled(r));
     } else if (hasCanCond && /THEN\s*\(\s*NOT\s*\(\s*COALESCE\(r\.is_source_cancelled/i.test(whereSegment)) {
@@ -939,13 +948,14 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
 
     if (sql.startsWith('SELECT COUNT(*)::text AS total_cnt')) {
       const list = filterMockReservations(sql, params);
+      const useRejTab = sql.includes('r.rcc_status');
       let activeCnt = 0;
       let cancelledCnt = 0;
       let rejectedCnt = 0;
       for (const r of list) {
         const isRej = mockIsRejected(r);
         const isCan = mockIsCancelled(r);
-        if (isRej) rejectedCnt++;
+        if (useRejTab ? mockIsInRejectedTab(r) : isRej) rejectedCnt++;
         if (isCan) cancelledCnt++;
         if (!isRej && !isCan) activeCnt++;
       }
@@ -1026,17 +1036,22 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
     if (sql.startsWith('SELECT COUNT(*)::int AS total_cnt')) {
       const todayStr = String(params[params.length - 1] || '');
       const list = filterMockReservations(sql, params, params.length - 1);
+      const useRejTab = sql.includes('r.rcc_status');
+      let activeCnt = 0;
       let todayCnt = 0;
       let cancelledCnt = 0;
       let rejectedCnt = 0;
       for (const r of list) {
         const createdDay = r.created_at instanceof Date ? r.created_at.toISOString().slice(0, 10) : String(r.created_at || '').slice(0, 10);
+        const isRej = mockIsRejected(r);
+        const isCan = mockIsCancelled(r);
         if (r.start_date === todayStr || createdDay === todayStr) todayCnt++;
-        if (mockIsRejected(r)) rejectedCnt++;
-        if (mockIsCancelled(r)) cancelledCnt++;
+        if (useRejTab ? mockIsInRejectedTab(r) : isRej) rejectedCnt++;
+        if (isCan) cancelledCnt++;
+        if (!isRej && !isCan) activeCnt++;
       }
       return {
-        rows: [{ total_cnt: list.length, today_cnt: todayCnt, cancelled_cnt: cancelledCnt, rejected_cnt: rejectedCnt }] as any[],
+        rows: [{ total_cnt: list.length, active_cnt: activeCnt, today_cnt: todayCnt, cancelled_cnt: cancelledCnt, rejected_cnt: rejectedCnt }] as any[],
         rowCount: 1
       };
     }
@@ -4298,13 +4313,13 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
     assert.equal(allRes.data.total, 102);
     assert.equal(allRes.data.lifecycleCounts.active, 15);
     assert.equal(allRes.data.lifecycleCounts.cancelled, 40);
-    assert.equal(allRes.data.lifecycleCounts.rejected, 47);
-    assert.equal(rejRes.data.total, 47);
+    assert.equal(allRes.data.lifecycleCounts.rejected, 58);
+    assert.equal(rejRes.data.total, 58);
     assert.equal(canRes.data.total, 40);
     assert.equal(dashRes.data.kpis.activeReservations, 15);
     assert.equal(dashRes.data.kpis.cancelled, 40);
-    assert.equal(dashRes.data.kpis.rejected, 47);
-    assert.equal(inactRej.data.total, 47);
+    assert.equal(dashRes.data.kpis.rejected, 58);
+    assert.equal(inactRej.data.total, 58);
     assert.equal(inactCan.data.total, 40);
 
     // Verify canonical mutually exclusive flags and preserved company-change audit info

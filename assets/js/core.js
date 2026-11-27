@@ -2854,11 +2854,11 @@
       if (lifecycle === 'active') {
         if (isInactiveReservation(r)) continue;
       } else if (lifecycle === 'rejected') {
-        if (!isRejectedStatus(r)) continue;
+        if (!isInRejectedTab(r)) continue;
       } else if (lifecycle === 'cancelled') {
         if (!isCancelledStatus(r)) continue;
       } else if (lifecycle === 'inactive') {
-        if (!isInactiveReservation(r)) continue;
+        if (!isInactiveReservation(r) && !isInRejectedTab(r)) continue;
       }
 
       if (reservationNumberQuery && !matchesSearchFields([
@@ -3381,7 +3381,7 @@
       var st = r.internalStatus || 'تم الإنشاء';
       statusCounts[st] = (statusCounts[st] || 0) + 1;
       if (isCancelledStatus(r)) cancelledCount++;
-      if (isRejectedStatus(r)) rejectedCount++;
+      if (isInRejectedTab(r)) rejectedCount++;
       var createdDate = normalizeStr(r.createdAt).substring(0, 10);
       var startDate = normalizeStr(r.startDate).substring(0, 10);
       if (createdDate === today || startDate === today) {
@@ -7206,6 +7206,12 @@
     return classifyReservationLifecycle(resOrStatus) === 'rejected';
   }
 
+  function isInRejectedTab(resOrStatus) {
+    if (!resOrStatus || typeof resOrStatus === 'string') return isRejectedStatus(resOrStatus);
+    if (isRejectedStatus(resOrStatus)) return true;
+    return Boolean(normalizeStr(resOrStatus.rccStatus || resOrStatus.rcc_status));
+  }
+
   function isCancelledStatus(resOrStatus) {
     return classifyReservationLifecycle(resOrStatus) === 'cancelled';
   }
@@ -10938,6 +10944,7 @@
     CANCELLATION_REASONS_LIST: CANCELLATION_REASONS_LIST,
     CAR_STATUS_AT_REQUEST_OPTIONS: CAR_STATUS_AT_REQUEST_OPTIONS,
     isRejectedStatus: isRejectedStatus,
+    isInRejectedTab: isInRejectedTab,
     isCancelledStatus: isCancelledStatus,
     isInactiveReservation: isInactiveReservation,
     classifyReservationLifecycle: classifyReservationLifecycle,
