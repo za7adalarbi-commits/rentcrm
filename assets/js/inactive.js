@@ -215,7 +215,7 @@
         return '<div class="glass-subcard" style="padding:14px;margin-bottom:12px;">' +
           '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px;">' +
             '<div>' +
-              '<div style="font-size:15px;font-weight:700;color:var(--text-primary);">' + esc(cust.customerName || '-') + '</div>' +
+              '<div style="font-size:15px;font-weight:700;color:var(--text-primary);"><button type="button" class="rg-customer-link" data-cust-id="' + esc(cust.customerId || '') + '" data-res-id="' + esc((custBookings[0] && custBookings[0].id) || '') + '" data-phone="' + esc(cust.customerPhone || '') + '">' + esc(cust.customerName || '-') + '</button></div>' +
               '<div class="meta-inline">' +
                 '<span>' + (isEn ? 'ID:' : 'رقم الهوية:') + ' <strong class="mono" dir="ltr">' + esc(cust.customerIdNumber || '-') + '</strong></span>' +
                 (cust.customerPhone ? '<span>·</span><span class="mono" dir="ltr">' + esc(cust.customerPhone) + '</span>' : '') +
@@ -567,7 +567,7 @@
                   '</div>' +
                 '</td>' +
                 '<td>' +
-                  '<div class="cell-primary">' + esc(r.customerName || '-') + '</div>' +
+                  '<div class="cell-primary"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName || '-') + '</button></div>' +
                   (r.customerPhone ? '<div class="cell-sub mono" dir="ltr">' + esc(r.customerPhone) + '</div>' : '') +
                 '</td>' +
                 (allowIdView ? '<td class="mono" dir="ltr" style="white-space:nowrap;">' + esc(r.customerIdNumber || '-') + '</td>' : '') +

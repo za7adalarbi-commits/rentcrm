@@ -913,7 +913,7 @@
           '<div style="min-width:0;flex:1;">' +
             '<div style="display:flex;align-items:center;gap:8px;min-width:0;">' +
               '<strong class="mono" dir="ltr" style="font-size:12px;color:var(--text-primary);white-space:nowrap;flex-shrink:0;">' + esc(r.reservationNumber || r.id) + '</strong>' +
-              '<span style="font-size:12.5px;font-weight:600;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.customerName || '-') + '</span>' +
+              '<span class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '" style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.customerName || '-') + '</span>' +
             '</div>' +
             '<div style="font-size:11.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.companyName || '-') + (r.carName ? ' · ' + esc(r.carName) : '') + '</div>' +
           '</div>' +
@@ -951,7 +951,7 @@
           '<div style="min-width:0;">' +
             '<div style="display:flex;align-items:center;gap:6px;">' +
               '<strong class="mono" style="font-size:12.5px;color:var(--text-primary);">' + esc(p.problemNumber || p.reservationNumber || p.id) + '</strong>' +
-              '<span style="font-size:12px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.customerName || '-') + '</span>' +
+              '<span class="rg-customer-link" data-cust-id="' + esc(p.customerId || '') + '" data-res-id="' + esc(p.reservationId || '') + '" style="font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.customerName || '-') + '</span>' +
             '</div>' +
             '<div style="font-size:11.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.description || '-') + '</div>' +
           '</div>' +
@@ -1218,7 +1218,7 @@
             '<div style="min-width:0;flex:1;">' +
               '<div style="display:flex;align-items:center;gap:8px;min-width:0;">' +
                 '<strong class="mono" dir="ltr" style="font-size:12px;color:var(--text-primary);white-space:nowrap;flex-shrink:0;">' + esc(r.reservationNumber || r.id) + '</strong>' +
-                '<span style="font-size:12.5px;font-weight:600;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.customerName || '-') + '</span>' +
+                '<span class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '" style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.customerName || '-') + '</span>' +
               '</div>' +
               '<div style="font-size:11.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(r.carName || '-') + (entry.effectiveEndTime ? ' · ' + esc(ctx.formatTime ? ctx.formatTime(entry.effectiveEndTime) : fmtTime(entry.effectiveEndTime, ctx.lang)) : '') + '</div>' +
             '</div>' +

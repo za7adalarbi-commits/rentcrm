@@ -1473,7 +1473,8 @@
     { id: 'problems', labelAr: 'المشكلات', labelEn: 'Problems' },
     { id: 'priorities', labelAr: 'الأولويات', labelEn: 'Priorities' },
     { id: 'unfollowed', labelAr: 'الحجوزات غير المتابعة', labelEn: 'Unfollowed Reservations' },
-    { id: 'extensions', labelAr: 'التمديدات', labelEn: 'Extensions' }
+    { id: 'extensions', labelAr: 'التمديدات', labelEn: 'Extensions' },
+    { id: 'customers', labelAr: 'العملاء', labelEn: 'Customers' }
   ];
 
   var RESERVATION_COLUMNS = (root.RGCrmCore && root.RGCrmCore.REPORT_COLUMNS_BY_TYPE && root.RGCrmCore.REPORT_COLUMNS_BY_TYPE.all_reservations)
@@ -1526,6 +1527,24 @@
     var canUseRepExcel = !coreRep.canUserUseActionButton || coreRep.canUserUseActionButton(curRepUser, 'act_export_excel');
     var canUseRepPdf = !coreRep.canUserUseActionButton || coreRep.canUserUseActionButton(curRepUser, 'act_export_pdf');
 
+    var canViewCustomersRep = !coreRep.canUserViewRoute || coreRep.canUserViewRoute(curRepUser, 'customers');
+    var canViewCustIdRep = Boolean(coreRep.canUserViewCustomerId && coreRep.canUserViewCustomerId(curRepUser));
+    function getSafeReportColumns(rTypeKey, sampleRows) {
+      var rawCols = (coreRep && coreRep.getReportColumns)
+        ? coreRep.getReportColumns(rTypeKey, sampleRows)
+        : RESERVATION_COLUMNS;
+      if (canViewCustIdRep) return rawCols;
+      return rawCols.filter(function (col) {
+        return col && col.key !== 'idNumber' && col.key !== 'customerIdNumber';
+      });
+    }
+    var visibleReportTypes = REPORT_TYPES.filter(function (rt) {
+      return rt.id !== 'customers' || canViewCustomersRep;
+    });
+    if (state.reportType === 'customers' && !canViewCustomersRep) {
+      state.reportType = 'all_reservations';
+    }
+
     container.innerHTML =
       '<div class="surface-card">' +
         '<div class="section-header">' +
@@ -1544,7 +1563,7 @@
           '</div>' +
         '</div>' +
         '<div class="segmented-control" id="report-type-tabs" style="margin-bottom:16px;">' +
-          REPORT_TYPES.map(function (rt) {
+          visibleReportTypes.map(function (rt) {
             var active = state.reportType === rt.id ? ' active' : '';
             var lbl = ctx.lang === 'en' ? rt.labelEn : rt.labelAr;
             return '<button type="button" class="segmented-btn' + active + '" data-rtype="' + rt.id + '">' + lbl + '</button>';
@@ -1669,9 +1688,7 @@
       }
 
       var core = root.RGCrmCore;
-      var cols = (core && core.getReportColumns)
-        ? core.getReportColumns(state.reportType, state.rows).slice(0, 11)
-        : RESERVATION_COLUMNS.slice(0, 11);
+      var cols = getSafeReportColumns(state.reportType, state.rows).slice(0, 11);
 
       renderReportCharts(state.reportType, state.rows);
 
@@ -2016,9 +2033,7 @@
       var isEnR = ctx.lang === 'en';
       var repTitleLabel = getReportLabel(state.reportType, ctx.lang);
       var rowsSnap = Array.isArray(state.rows) ? state.rows.slice() : [];
-      var activeCols = (coreR && coreR.getReportColumns)
-        ? coreR.getReportColumns(state.reportType, rowsSnap)
-        : RESERVATION_COLUMNS;
+      var activeCols = getSafeReportColumns(state.reportType, rowsSnap);
       var userNow = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
       var chartImgs = [];
       var ch1 = captureChartForPdf(document.getElementById('report-chart-primary'), isEnR ? 'Report Distribution' : 'توزيع بيانات التقرير', {});
@@ -2097,9 +2112,7 @@
         });
         rows = (rExp && rExp.success && rExp.data && Array.isArray(rExp.data.rows)) ? rExp.data.rows : [];
       }
-      var headers = (coreR && coreR.getReportColumns)
-        ? coreR.getReportColumns(state.reportType, rows)
-        : RESERVATION_COLUMNS;
+      var headers = getSafeReportColumns(state.reportType, rows);
       var periodStr = formatPeriodText(dFrom, dTo, isEnR);
       var filtersStr = buildReportsFilterSummary(isEnR);
       var reportTitleFull = isEnR ? (repTitleLabel + ' Report') : ('تقرير ' + repTitleLabel);

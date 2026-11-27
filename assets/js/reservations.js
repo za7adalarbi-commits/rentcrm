@@ -715,7 +715,7 @@
                   var showSubPhone = !colVisible.customerPhone && r.customerPhone;
                   var showSubId = !colVisible.customerIdNumber && canViewId && r.customerIdNumber;
                   return '<td class="cell-customer">' +
-                    '<div class="cell-primary">' + esc(r.customerName || notRecordedLabel) + '</div>' +
+                    '<div class="cell-primary"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName || notRecordedLabel) + '</button></div>' +
                     ((showSubPhone || showSubId) ? (
                       '<div class="cell-sub">' +
                         (showSubPhone ? '<span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' : '') +
@@ -3031,7 +3031,7 @@
                 '</div>' +
               '</td>' +
               '<td>' +
-                '<div class="cell-primary">' + esc(r.customerName || '-') + '</div>' +
+                '<div class="cell-primary"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName || '-') + '</button></div>' +
                 '<div class="cell-sub"><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></div>' +
               '</td>' +
               '<td>' +
@@ -3473,7 +3473,7 @@
                 '<div class="cell-sub rg-ui-field-car-meta">' + esc(isPickup ? (r.pickupTypeAr || '-') : (r.returnTypeAr || '-')) + '</div>' +
               '</td>' +
               '<td>' +
-                '<div class="cell-primary">' + esc(r.customerName || '-') + '</div>' +
+                '<div class="cell-primary"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName || '-') + '</button></div>' +
                 '<div class="cell-sub"><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></div>' +
               '</td>' +
               '<td>' +
@@ -3511,7 +3511,7 @@
                   '<button type="button" class="btn-link-inline today-open-res mono" dir="ltr" data-id="' + esc(r.id) + '">' + esc(r.reservationNumber || r.id) + '</button>' +
                   '<span class="cell-sub rg-ui-field-car-meta">' + esc(isPickup ? (r.pickupTypeAr || '-') : (r.returnTypeAr || '-')) + (entry.isExtended ? ' · ' + (isEn ? 'After Extension' : 'بعد التمديد') : '') + '</span>' +
                 '</div>' +
-                '<div class="cell-primary">' + esc(r.customerName || '-') + ' · <span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></div>' +
+                '<div class="cell-primary"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName || '-') + '</button> · <span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone || '-') + '</span></div>' +
                 '<div class="cell-sub">' + esc(formatCarNameDisplay(r.carName)) + ' · ' + esc([r.companyName, r.branchName].filter(Boolean).join(' · ') || '-') + '</div>' +
               '</div>' +
               '<div class="today-mobile-card-actions">' +
@@ -4300,7 +4300,7 @@
                   (overdueInfo && overdueInfo.isOverdueUnpaid ? ' <span class="rg-overdue-badge">⏰ <span dir="ltr">' + esc(isEn ? overdueInfo.labelEn : overdueInfo.labelAr) + '</span></span>' : '') +
                 '</h3>' +
                 '<div class="meta-inline">' +
-                  '<span>' + esc(r.customerName) + '</span><span>·</span><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' +
+                  '<button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName) + '</button><span>·</span><span class="mono cell-phone" dir="ltr">' + esc(r.customerPhone) + '</span>' +
                   (r.customerEmail ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono" dir="ltr">' + esc(r.customerEmail) + '</span></span>' : '') +
                   (canViewId && r.customerIdNumber ? '<span class="rg-ui-field-customer-extra"><span>·</span><span class="mono">' + (isEn ? 'ID: ' : 'هوية: ') + '<span dir="ltr">' + esc(String(r.customerIdNumber)) + '</span></span></span>' : '') +
                 '</div>' +

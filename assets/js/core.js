@@ -1831,6 +1831,461 @@
     return !Array.isArray(arr) || arr.length === 0;
   }
 
+  var CUSTOMER_STATUS_LIST = [
+    'جديد',
+    'نشط',
+    'متكرر',
+    'بحاجة لمتابعة',
+    'لديه مشكلة',
+    'غير نشط',
+    'محظور'
+  ];
+
+  var KNOWN_COUNTRY_DIAL_CODES = [
+    '966', '971', '965', '973', '974', '968', '962', '961', '963', '964', '967',
+    '970', '212', '213', '216', '218', '249', '90', '20', '44', '33', '49', '39', '34', '91', '92', '63', '62', '60', '1'
+  ];
+
+  function extractPhoneCountryCode(rawPhone) {
+    var raw = convertEasternDigitsToAscii(normalizeStr(rawPhone));
+    if (!raw) {
+      return { rawPhone: '', countryCode: '+966', localPhone: '', normalizedPhone: '', displayPhone: '' };
+    }
+    var trimmed = raw.trim();
+    var hasPlus = trimmed.charAt(0) === '+';
+    var digits = trimmed.replace(/\D+/g, '');
+    if (!digits) {
+      return { rawPhone: raw, countryCode: '+966', localPhone: '', normalizedPhone: '', displayPhone: raw };
+    }
+    var hadIntlZero = !hasPlus && digits.indexOf('00') === 0 && digits.length > 5;
+    if (hadIntlZero) {
+      digits = digits.slice(2);
+    }
+    var countryCode = '+966';
+    var localPhone = digits;
+    var normalizedPhone = digits;
+
+    if (hasPlus || hadIntlZero || digits.length >= 11) {
+      var matchedPrefix = '';
+      for (var i = 0; i < KNOWN_COUNTRY_DIAL_CODES.length; i++) {
+        var code = KNOWN_COUNTRY_DIAL_CODES[i];
+        if (digits.indexOf(code) === 0 && digits.length > code.length + 5) {
+          matchedPrefix = code;
+          break;
+        }
+      }
+      if (!matchedPrefix && (hasPlus || hadIntlZero) && digits.length >= 9) {
+        matchedPrefix = digits.slice(0, digits.length > 12 ? 3 : 2);
+      }
+      if (matchedPrefix) {
+        countryCode = '+' + matchedPrefix;
+        localPhone = digits.slice(matchedPrefix.length).replace(/^0+/, '') || digits.slice(matchedPrefix.length);
+        normalizedPhone = matchedPrefix + localPhone;
+      }
+    }
+    if (countryCode === '+966') {
+      if (digits.indexOf('966') === 0 && digits.length >= 12) {
+        localPhone = digits.slice(3).replace(/^0+/, '');
+        normalizedPhone = '966' + localPhone;
+      } else if (digits.length === 10 && digits.charAt(0) === '0') {
+        localPhone = digits.slice(1);
+        normalizedPhone = '966' + localPhone;
+      } else if (digits.length === 9 && digits.charAt(0) === '5') {
+        localPhone = digits;
+        normalizedPhone = '966' + digits;
+      }
+    }
+
+    return {
+      rawPhone: raw,
+      countryCode: countryCode,
+      localPhone: localPhone,
+      normalizedPhone: normalizedPhone,
+      displayPhone: (countryCode === '+966' && localPhone.length === 9 && localPhone.charAt(0) === '5')
+        ? ('0' + localPhone)
+        : (digits ? ('+' + normalizedPhone) : raw)
+    };
+  }
+
+  function detectCustomerIdType(rawId) {
+    var clean = normalizeNationalId(rawId);
+    if (!clean) return '';
+    if (/^1\d{9}$/.test(clean)) return 'هوية وطنية';
+    if (/^2\d{9}$/.test(clean)) return 'إقامة';
+    if (clean.length >= 5) return 'جواز سفر';
+    return 'هوية';
+  }
+
+  function buildCustomerCanonicalKey(phone, idNumber, fullName) {
+    var rawPhone = phone;
+    var rawId = idNumber;
+    var rawName = fullName;
+    var rawEmail = '';
+    var rawResNum = '';
+    if (phone && typeof phone === 'object') {
+      rawPhone = phone.phone || phone.customerPhone || '';
+      rawId = phone.idNumber || phone.customerIdNumber || '';
+      rawName = phone.fullName || phone.name || phone.customerName || '';
+      rawEmail = phone.email || phone.customerEmail || '';
+      rawResNum = phone.reservationNumber || '';
+    }
+    var pInfo = extractPhoneCountryCode(rawPhone);
+    if (pInfo.normalizedPhone && pInfo.normalizedPhone.length >= 7) {
+      return 'PH_' + pInfo.normalizedPhone;
+    }
+    var rawCleanPhone = convertEasternDigitsToAscii(normalizeStr(rawPhone)).replace(/[\s\-()]/g, '');
+    if (rawCleanPhone && rawCleanPhone.length >= 5) {
+      return 'PH_' + rawCleanPhone;
+    }
+    var normId = normalizeNationalId(rawId);
+    if (normId && normId.length >= 4) {
+      return 'ID_' + normId;
+    }
+    var cleanEmail = normalizeStr(rawEmail).toLowerCase();
+    if (cleanEmail && cleanEmail.indexOf('@') !== -1) {
+      return 'EM_' + cleanEmail;
+    }
+    var cleanName = normalizeSearchText(rawName).replace(/\s+/g, ' ').trim();
+    if (cleanName) {
+      return 'NM_' + cleanName.toLowerCase();
+    }
+    var cleanRes = normalizeStr(rawResNum);
+    if (cleanRes) {
+      return 'RS_' + cleanRes;
+    }
+    return '';
+  }
+
+  function computeCustomerLifecycleStatus(stats) {
+    var s = stats && typeof stats === 'object' ? stats : {};
+    if (s.statusOverride && CUSTOMER_STATUS_LIST.indexOf(s.manualStatus) !== -1) {
+      return s.manualStatus;
+    }
+    if (toNum(s.openProblemsCount, 0) > 0 || toNum(s.inProgressComplaintsCount, 0) > 0) {
+      return 'لديه مشكلة';
+    }
+    if (toNum(s.activeBookingsCount, 0) > 0 && toNum(s.unfollowedActiveCount, 0) > 0) {
+      return 'بحاجة لمتابعة';
+    }
+    if (toNum(s.activeBookingsCount, 0) > 0) {
+      return 'نشط';
+    }
+    if (toNum(s.totalBookings, 0) > 1) {
+      return 'متكرر';
+    }
+    if (toNum(s.isNewRecent, 0) > 0 || (toNum(s.totalBookings, 0) === 1 && toNum(s.pastBookingsCount, 0) === 0)) {
+      return 'جديد';
+    }
+    return toNum(s.totalBookings, 0) === 0 ? 'جديد' : 'غير نشط';
+  }
+
+  function redactCustomerSensitiveFields(custObj, roleOrUser) {
+    if (!custObj || typeof custObj !== 'object') return custObj;
+    if (canUserViewCustomerId(roleOrUser)) return custObj;
+    return Object.assign({}, custObj, {
+      idNumber: '',
+      customerIdNumber: '',
+      idType: ''
+    });
+  }
+
+  function buildCustomersAggregateFromData(input) {
+    var opts = input && typeof input === 'object' ? input : {};
+    var storedCustomers = Array.isArray(opts.customers) ? opts.customers : [];
+    var reservations = Array.isArray(opts.reservations) ? opts.reservations : [];
+    var extensions = Array.isArray(opts.extensions) ? opts.extensions : [];
+    var followUps = Array.isArray(opts.followUps) ? opts.followUps : [];
+    var problems = Array.isArray(opts.problems) ? opts.problems : [];
+    var customerNotes = Array.isArray(opts.customerNotes) ? opts.customerNotes : [];
+    var nowMs = isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+    var recentCutoffMs = nowMs - (7 * 24 * 60 * 60 * 1000);
+
+    var byKey = {};
+    var byId = {};
+    var order = [];
+
+    function ensureBucket(key, seed) {
+      if (!key) return null;
+      if (!byKey[key]) {
+        var sd = seed || {};
+        var phoneInfo = extractPhoneCountryCode(sd.phone || sd.customerPhone || '');
+        var idNum = normalizeStr(sd.idNumber || sd.customerIdNumber || '');
+        var bucket = {
+          id: normalizeStr(sd.id) || ('CUST_' + key),
+          customerKey: key,
+          fullName: normalizeStr(sd.fullName || sd.customerName) || 'عميل',
+          customerName: normalizeStr(sd.fullName || sd.customerName) || 'عميل',
+          phone: normalizeStr(sd.phone || sd.customerPhone || phoneInfo.displayPhone),
+          customerPhone: normalizeStr(sd.phone || sd.customerPhone || phoneInfo.displayPhone),
+          countryCode: normalizeStr(sd.countryCode) || phoneInfo.countryCode || '+966',
+          normalizedPhone: normalizeStr(sd.normalizedPhone) || phoneInfo.normalizedPhone,
+          email: normalizeStr(sd.email || sd.customerEmail),
+          customerEmail: normalizeStr(sd.email || sd.customerEmail),
+          idNumber: idNum,
+          customerIdNumber: idNum,
+          idType: normalizeStr(sd.idType) || detectCustomerIdType(idNum),
+          manualStatus: normalizeStr(sd.status || 'جديد') || 'جديد',
+          statusOverride: Boolean(sd.statusOverride),
+          assignedEmployeeId: normalizeStr(sd.assignedEmployeeId),
+          assignedEmployeeName: normalizeStr(sd.assignedEmployeeName),
+          notes: normalizeStr(sd.notes),
+          tags: Array.isArray(sd.tags) ? sd.tags.slice() : [],
+          source: normalizeStr(sd.source) || 'sync',
+          lastContactAt: normalizeStr(sd.lastContactAt),
+          createdAt: normalizeStr(sd.createdAt) || new Date(nowMs).toISOString(),
+          updatedAt: normalizeStr(sd.updatedAt) || new Date(nowMs).toISOString(),
+          totalBookings: 0,
+          activeBookingsCount: 0,
+          pastBookingsCount: 0,
+          extensionsCount: 0,
+          extensionsDays: 0,
+          openProblemsCount: 0,
+          inProgressComplaintsCount: 0,
+          totalProblemsCount: 0,
+          followUpsCount: 0,
+          notesCount: 0,
+          unfollowedActiveCount: 0,
+          totalSpent: 0,
+          paidAmount: 0,
+          lastBookingDate: '',
+          lastBookingNumber: '',
+          latestReservationId: '',
+          lastActivityAt: normalizeStr(sd.updatedAt || sd.createdAt),
+          companies: [],
+          reservationIds: []
+        };
+        byKey[key] = bucket;
+        byId[bucket.id] = bucket;
+        order.push(key);
+      }
+      return byKey[key];
+    }
+
+    for (var ci = 0; ci < storedCustomers.length; ci++) {
+      var sc = storedCustomers[ci];
+      if (!sc || typeof sc !== 'object') continue;
+      var scKey = normalizeStr(sc.customerKey) || buildCustomerCanonicalKey(sc.phone, sc.idNumber, sc.fullName);
+      var b0 = ensureBucket(scKey, sc);
+      if (b0 && sc.id) byId[sc.id] = b0;
+    }
+
+    var fuByResId = {};
+    var fuLatestByResId = {};
+    for (var fi = 0; fi < followUps.length; fi++) {
+      var fu = followUps[fi];
+      if (!fu || !fu.reservationId) continue;
+      fuByResId[fu.reservationId] = (fuByResId[fu.reservationId] || 0) + 1;
+      var fStamp = normalizeStr(fu.createdAt || (fu.followUpDate ? (fu.followUpDate + 'T' + (fu.followUpTime || '00:00:00')) : ''));
+      if (!fuLatestByResId[fu.reservationId] || fStamp > fuLatestByResId[fu.reservationId]) {
+        fuLatestByResId[fu.reservationId] = fStamp;
+      }
+    }
+
+    var extCountByResId = {};
+    var extDaysByResId = {};
+    for (var ei = 0; ei < extensions.length; ei++) {
+      var ex = extensions[ei];
+      if (!ex) continue;
+      var exKey = normalizeStr(ex.reservationId || ex.reservationNumber);
+      if (!exKey) continue;
+      extCountByResId[exKey] = (extCountByResId[exKey] || 0) + 1;
+      extDaysByResId[exKey] = (extDaysByResId[exKey] || 0) + toNum(ex.extendDays, 0);
+    }
+
+    var resIdToCust = {};
+    var resNumToCust = {};
+
+    for (var ri = 0; ri < reservations.length; ri++) {
+      var r = reservations[ri];
+      if (!r || typeof r !== 'object') continue;
+      var cBucket = (r.customerId && byId[r.customerId]) ? byId[r.customerId] : null;
+      if (!cBucket) {
+        var cKey = buildCustomerCanonicalKey(r.customerPhone, r.customerIdNumber, r.customerName);
+        cBucket = ensureBucket(cKey, {
+          fullName: r.customerName,
+          phone: r.customerPhone,
+          email: r.customerEmail,
+          idNumber: r.customerIdNumber,
+          assignedEmployeeId: Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds[0] ? r.assignedEmployeeIds[0] : '',
+          assignedEmployeeName: Array.isArray(r.assignedEmployeeNames) && r.assignedEmployeeNames[0] ? r.assignedEmployeeNames[0] : '',
+          createdAt: r.sourceCreatedAt || r.createdAt,
+          updatedAt: r.lastUpdatedAt || r.updatedAt || r.createdAt
+        });
+      }
+      if (!cBucket) continue;
+      if (r.id) resIdToCust[r.id] = cBucket;
+      if (r.reservationNumber) resNumToCust[r.reservationNumber] = cBucket;
+
+      if (r.customerName && (cBucket.fullName === 'عميل' || !cBucket.fullName)) {
+        cBucket.fullName = normalizeStr(r.customerName);
+        cBucket.customerName = cBucket.fullName;
+      }
+      if (r.customerPhone && !cBucket.phone) {
+        var pi2 = extractPhoneCountryCode(r.customerPhone);
+        cBucket.phone = normalizeStr(r.customerPhone);
+        cBucket.customerPhone = cBucket.phone;
+        cBucket.countryCode = pi2.countryCode;
+        cBucket.normalizedPhone = pi2.normalizedPhone;
+      }
+      if (r.customerEmail && !cBucket.email) {
+        cBucket.email = normalizeStr(r.customerEmail);
+        cBucket.customerEmail = cBucket.email;
+      }
+      if (r.customerIdNumber && !cBucket.idNumber) {
+        cBucket.idNumber = normalizeStr(r.customerIdNumber);
+        cBucket.customerIdNumber = cBucket.idNumber;
+        cBucket.idType = detectCustomerIdType(cBucket.idNumber);
+      }
+      if (!cBucket.assignedEmployeeId && Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds[0]) {
+        cBucket.assignedEmployeeId = normalizeStr(r.assignedEmployeeIds[0]);
+        cBucket.assignedEmployeeName = normalizeStr((r.assignedEmployeeNames && r.assignedEmployeeNames[0]) || '');
+      }
+
+      cBucket.totalBookings += 1;
+      if (r.id && cBucket.reservationIds.indexOf(r.id) === -1) cBucket.reservationIds.push(r.id);
+      if (r.companyName && cBucket.companies.indexOf(r.companyName) === -1) cBucket.companies.push(r.companyName);
+      cBucket.totalSpent = Math.round((cBucket.totalSpent + toNum(r.totalAmount, 0)) * 100) / 100;
+      cBucket.paidAmount = Math.round((cBucket.paidAmount + toNum(r.paidAmount, 0)) * 100) / 100;
+
+      var isClosedOrInactive = isReservationClosedStatus(r) || isInactiveReservation(r);
+      if (isClosedOrInactive) {
+        cBucket.pastBookingsCount += 1;
+      } else {
+        cBucket.activeBookingsCount += 1;
+      }
+
+      var rExtCnt = Math.max(toNum(r.extensionsCount, 0), toNum(extCountByResId[r.id] || extCountByResId[r.reservationNumber], 0));
+      var rExtDays = Math.max(toNum(r.extendedDaysCount, 0), toNum(extDaysByResId[r.id] || extDaysByResId[r.reservationNumber], 0));
+      cBucket.extensionsCount += rExtCnt;
+      cBucket.extensionsDays += rExtDays;
+
+      var rFuCount = toNum(fuByResId[r.id], 0) + (r.isFollowed && !fuByResId[r.id] ? 1 : 0);
+      cBucket.followUpsCount += rFuCount;
+      if (!isClosedOrInactive && rFuCount === 0) {
+        cBucket.unfollowedActiveCount += 1;
+      }
+      var rFuStamp = fuLatestByResId[r.id] || '';
+      if (rFuStamp && (!cBucket.lastContactAt || rFuStamp > cBucket.lastContactAt)) {
+        cBucket.lastContactAt = rFuStamp;
+      }
+
+      var bookDate = normalizeStr(r.startDate || r.sourceCreatedAt || r.createdAt);
+      if (bookDate && (!cBucket.lastBookingDate || bookDate > cBucket.lastBookingDate)) {
+        cBucket.lastBookingDate = formatDisplayDate(bookDate) || bookDate.slice(0, 10);
+        cBucket.lastBookingNumber = normalizeStr(r.reservationNumber);
+        cBucket.latestReservationId = normalizeStr(r.id);
+      }
+
+      var rStamp = normalizeStr(r.lastUpdatedAt || r.updatedAt || r.createdAt || r.startDate);
+      if (rStamp && (!cBucket.lastActivityAt || rStamp > cBucket.lastActivityAt)) {
+        cBucket.lastActivityAt = rStamp;
+      }
+      var rCreated = normalizeStr(r.createdAt || r.sourceCreatedAt);
+      if (rCreated && (!cBucket.createdAt || rCreated < cBucket.createdAt)) {
+        cBucket.createdAt = rCreated;
+      }
+    }
+
+    for (var pi = 0; pi < problems.length; pi++) {
+      var pr = problems[pi];
+      if (!pr || typeof pr !== 'object') continue;
+      var pCust = (pr.customerId && byId[pr.customerId]) ||
+        (pr.reservationId && resIdToCust[pr.reservationId]) ||
+        (pr.reservationNumber && resNumToCust[pr.reservationNumber]) ||
+        null;
+      if (!pCust && pr.customerName) {
+        var nmKey = buildCustomerCanonicalKey('', '', pr.customerName);
+        if (nmKey && byKey[nmKey]) pCust = byKey[nmKey];
+      }
+      if (!pCust) continue;
+      pCust.totalProblemsCount += 1;
+      var isOpenPr = !isProblemClosedStatus(pr.status);
+      if (isOpenPr) {
+        pCust.openProblemsCount += 1;
+        if (normalizeStr(pr.status) === 'قيد المعالجة' || normalizeStr(pr.ticketType) === 'شكوى') {
+          pCust.inProgressComplaintsCount += 1;
+        }
+      }
+      var pStamp = normalizeStr(pr.updatedAt || pr.createdAt);
+      if (pStamp && (!pCust.lastActivityAt || pStamp > pCust.lastActivityAt)) {
+        pCust.lastActivityAt = pStamp;
+      }
+    }
+
+    for (var ni = 0; ni < customerNotes.length; ni++) {
+      var nt = customerNotes[ni];
+      if (!nt || typeof nt !== 'object') continue;
+      var nCust = (nt.customerId && byId[nt.customerId]) || null;
+      if (!nCust) continue;
+      nCust.notesCount += 1;
+      var nStamp = normalizeStr(nt.createdAt || nt.updatedAt);
+      if (nStamp && (!nCust.lastContactAt || nStamp > nCust.lastContactAt)) {
+        nCust.lastContactAt = nStamp;
+      }
+      if (nStamp && (!nCust.lastActivityAt || nStamp > nCust.lastActivityAt)) {
+        nCust.lastActivityAt = nStamp;
+      }
+    }
+
+    var kpis = {
+      totalCustomers: 0,
+      newCustomers: 0,
+      activeBookingCustomers: 0,
+      pastBookingCustomers: 0,
+      openProblemCustomers: 0,
+      inProgressComplaintCustomers: 0,
+      extensionCustomers: 0,
+      unfollowedCustomers: 0,
+      repeatCustomers: 0,
+      recentUpdatedCustomers: 0
+    };
+
+    var rows = order.map(function (k) {
+      var c = byKey[k];
+      var createdMs = Date.parse(c.createdAt || '');
+      var updatedMs = Date.parse(c.lastActivityAt || c.updatedAt || '');
+      var isNewRec = (!isNaN(createdMs) && createdMs >= recentCutoffMs) || (c.totalBookings <= 1 && c.pastBookingsCount === 0);
+      var isRecentUpd = (!isNaN(updatedMs) && updatedMs >= recentCutoffMs) || (!isNaN(createdMs) && createdMs >= recentCutoffMs);
+      var status = computeCustomerLifecycleStatus({
+        statusOverride: c.statusOverride,
+        manualStatus: c.manualStatus,
+        openProblemsCount: c.openProblemsCount,
+        inProgressComplaintsCount: c.inProgressComplaintsCount,
+        activeBookingsCount: c.activeBookingsCount,
+        unfollowedActiveCount: c.unfollowedActiveCount,
+        totalBookings: c.totalBookings,
+        pastBookingsCount: c.pastBookingsCount,
+        isNewRecent: isNewRec ? 1 : 0
+      });
+      var hasUnfollowed = (c.unfollowedActiveCount > 0) || (c.totalBookings > 0 && c.followUpsCount === 0 && c.notesCount === 0);
+
+      kpis.totalCustomers += 1;
+      if (isNewRec || status === 'جديد') kpis.newCustomers += 1;
+      if (c.activeBookingsCount > 0) kpis.activeBookingCustomers += 1;
+      if (c.pastBookingsCount > 0) kpis.pastBookingCustomers += 1;
+      if (c.openProblemsCount > 0) kpis.openProblemCustomers += 1;
+      if (c.inProgressComplaintsCount > 0) kpis.inProgressComplaintCustomers += 1;
+      if (c.extensionsCount > 0) kpis.extensionCustomers += 1;
+      if (hasUnfollowed) kpis.unfollowedCustomers += 1;
+      if (c.totalBookings > 1) kpis.repeatCustomers += 1;
+      if (isRecentUpd) kpis.recentUpdatedCustomers += 1;
+
+      return Object.assign({}, c, {
+        status: status,
+        isNew: isNewRec,
+        isRecent: isRecentUpd,
+        unfollowed: hasUnfollowed,
+        isRepeat: c.totalBookings > 1
+      });
+    });
+
+    rows.sort(function (a, b) {
+      return String(b.lastActivityAt || b.updatedAt || '').localeCompare(String(a.lastActivityAt || a.updatedAt || ''));
+    });
+
+    return { items: rows, kpis: kpis };
+  }
+
   function buildCustomersIndexFromReservations(reservations) {
     var list = Array.isArray(reservations) ? reservations : [];
     var byKey = {};
@@ -1950,6 +2405,7 @@
   ];
 
   var SECTION_VIEW_PERMISSION_KEYS = [
+    'view_customers',
     'view_reservations',
     'view_my_followups',
     'view_team_followups',
@@ -1973,7 +2429,10 @@
 
   var EXTRA_SUBSECTION_VIEW_PERMISSION_KEYS = [
     'sub_view_rejected_tab',
-    'sub_view_cancelled_tab'
+    'sub_view_cancelled_tab',
+    'sub_view_cust_dashboard',
+    'sub_view_cust_complaints',
+    'sub_view_cust_timeline'
   ];
 
   var ACTION_BUTTON_PERMISSION_KEYS = [
@@ -1988,11 +2447,15 @@
     'act_close_delete_ticket',
     'act_report_problem',
     'act_delete_employee',
-    'act_customer_id_lookup'
+    'act_customer_id_lookup',
+    'act_edit_customer',
+    'act_assign_customer',
+    'act_add_customer_note'
   ];
 
   var ROUTE_PERMISSION_MAP = {
     dashboard: 'view_dashboard',
+    customers: 'view_customers',
     reservations: 'view_reservations',
     'my-followups': 'view_my_followups',
     'team-followups': 'view_team_followups',
@@ -2009,6 +2472,7 @@
     'view_all_reservations', 'view_customer_id', 'pull_reservations', 'assign_employees', 'add_followup',
     'claim_reservation', 'unclaim_reservation', 'quick_update_status',
     'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
+    'edit_customer_details', 'assign_customer_employee', 'add_customer_note',
     'create_problem', 'update_problem', 'delete_reservations', 'view_employees', 'manage_employees',
     'view_all_logs', 'sync_data', 'manage_api_connection', 'manage_settings',
     'manage_role_ui_defaults', 'customize_ui', 'manage_announcements', 'manage_developer_tools', 'export_reports'
@@ -2023,24 +2487,26 @@
       'view_all_reservations', 'view_customer_id', 'pull_reservations', 'assign_employees', 'add_followup',
       'claim_reservation', 'unclaim_reservation', 'quick_update_status',
       'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
+      'edit_customer_details', 'assign_customer_employee', 'add_customer_note',
       'create_problem', 'update_problem', 'view_employees', 'view_all_logs',
       'sync_data', 'export_reports'
     ]),
     agent: [
       'view_dashboard', 'dash_perms_configured', 'perms_subsections_configured', 'perms_actions_configured'
     ].concat(DASHBOARD_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS.filter(function (ak) {
-      return ak !== 'act_customer_id_lookup';
+      return ak !== 'act_customer_id_lookup' && ak !== 'act_edit_customer' && ak !== 'act_assign_customer';
     })).concat([
-      'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
+      'view_customers', 'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
       'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab', 'sub_view_myfu_mentions', 'sub_view_myfu_history',
-      'sub_view_prb_rates', 'sub_view_rep_charts',
-      'pull_reservations', 'add_followup', 'claim_reservation', 'unclaim_reservation',
+      'sub_view_prb_rates', 'sub_view_rep_charts', 'sub_view_cust_dashboard', 'sub_view_cust_complaints', 'sub_view_cust_timeline',
+      'pull_reservations', 'add_followup', 'add_customer_note', 'claim_reservation', 'unclaim_reservation',
       'quick_update_status', 'create_problem', 'update_problem', 'export_reports'
     ])
   };
 
   var PERMISSIONS_CATALOG = [
     { key: 'view_dashboard', label: 'عرض قسم: لوحة التحكم والإحصائيات', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_customers', label: 'عرض قسم: إدارة العملاء وملفاتهم', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_reservations', label: 'عرض قسم: الحجوزات', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_my_followups', label: 'عرض قسم: متابعاتي', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_team_followups', label: 'عرض قسم: متابعات الفريق', group: 'إظهار وإخفاء الأقسام والصفحات' },
@@ -2059,6 +2525,9 @@
     { key: 'sub_view_rep_charts', label: 'عرض الرسوم البيانية ومصفوفة الذروة في التقارير', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_emp_delegations', label: 'عرض قسم: تفويض الصلاحيات المؤقت (الإنابة)', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'sub_view_emp_presets', label: 'عرض قسم: الصلاحيات الجاهزة (القوالب الوظيفية)', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_cust_dashboard', label: 'عرض لوحة مؤشرات العملاء (Dashboard)', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_cust_complaints', label: 'عرض تبويب المشاكل والشكاوى في ملف العميل', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'sub_view_cust_timeline', label: 'عرض السجل الزمني الموحد للعميل', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'act_export_excel', label: 'زر تصدير Excel في الجداول والتقارير', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_export_pdf', label: 'زر تصدير ومعاينة PDF', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_pull_reservations', label: 'زر وشريط سحب الحجوزات', group: 'أزرار وإجراءات الجداول والتصدير' },
@@ -2071,6 +2540,9 @@
     { key: 'act_report_problem', label: 'زر تحويل الحجز إلى مشكلة', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_delete_employee', label: 'أزرار حذف وإيقاف الموظفين', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_customer_id_lookup', label: 'زر الاستعلام عن العميل برقم الهوية', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_edit_customer', label: 'زر تعديل بيانات وحالة العميل', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_assign_customer', label: 'زر تعيين وتغيير الموظف المسؤول للعميل', group: 'أزرار وإجراءات الجداول والتصدير' },
+    { key: 'act_add_customer_note', label: 'زر إضافة ملاحظة وسجل تواصل في ملف العميل', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'dash_view_hero_kpis', label: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', group: 'لوحة التحكم' },
     { key: 'dash_view_strip_kpis', label: 'شريط مؤشرات الحالات التفصيلية (KPI Strip)', group: 'لوحة التحكم' },
     { key: 'dash_view_daily_chart', label: 'رسم المتابعات اليومية', group: 'لوحة التحكم' },
@@ -2087,6 +2559,9 @@
     { key: 'claim_reservation', label: 'استلام الحجوزات ذاتيًا', group: 'الحجوزات' },
     { key: 'unclaim_reservation', label: 'إلغاء استلام الحجز', group: 'الحجوزات' },
     { key: 'quick_update_status', label: 'التحديث السريع لحالة الحجز', group: 'الحجوزات' },
+    { key: 'edit_customer_details', label: 'إنشاء وتعديل بيانات وحالة العميل', group: 'إدارة العملاء' },
+    { key: 'assign_customer_employee', label: 'تعيين الموظف المسؤول عن العميل', group: 'إدارة العملاء' },
+    { key: 'add_customer_note', label: 'إضافة ملاحظات وتواصل مباشر على ملف العميل', group: 'إدارة العملاء' },
     { key: 'add_followup', label: 'إضافة متابعات وملاحظات', group: 'المتابعات' },
     { key: 'edit_any_followup', label: 'تعديل متابعات وتحديثات الفريق', group: 'المتابعات' },
     { key: 'assign_employees', label: 'إسناد وإزالة الموظفين عن الحجوزات', group: 'الإشراف' },
@@ -2123,6 +2598,7 @@
       role: ROLES.AGENT,
       permissions: ROLE_PERMISSION_MATRIX.agent.concat([
         'view_all_reservations', 'view_customer_id', 'act_customer_id_lookup',
+        'edit_customer_details', 'act_edit_customer',
         'view_employees', 'edit_any_followup'
       ])
     },
@@ -2136,9 +2612,9 @@
         'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
         'dash_view_recent_activity', 'dash_view_charts_grid', 'dash_view_radar',
         'dash_view_heatmap', 'dash_view_leaderboard', 'dash_view_bottom_bento',
-        'view_reservations', 'view_reports', 'view_activity',
+        'view_customers', 'view_reservations', 'view_reports', 'view_activity',
         'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab',
-        'sub_view_prb_rates', 'sub_view_rep_charts',
+        'sub_view_prb_rates', 'sub_view_rep_charts', 'sub_view_cust_dashboard', 'sub_view_cust_complaints', 'sub_view_cust_timeline',
         'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports'
       ]
     },
@@ -2218,6 +2694,7 @@
   }
 
   var UI_ROUTE_HIDE_KEYS = {
+    customers: 'hideNavCustomers',
     'team-followups': 'hideNavTeamFollowups',
     problems: 'hideNavProblems',
     reports: 'hideNavReports',
@@ -2235,7 +2712,10 @@
     sub_view_prb_rates: 'hideProblemsRateIndicator',
     sub_view_rep_charts: 'hideReportsCharts',
     sub_view_emp_delegations: 'hideEmployeesDelegations',
-    sub_view_emp_presets: 'hideRolePresetsSection'
+    sub_view_emp_presets: 'hideRolePresetsSection',
+    sub_view_cust_dashboard: 'hideCustDashboard',
+    sub_view_cust_complaints: 'hideCustComplaintsTab',
+    sub_view_cust_timeline: 'hideCustTimelineTab'
   };
 
   var UI_DASHBOARD_HIDE_KEYS = {
@@ -2260,9 +2740,13 @@
     act_handover_pdf: 'hideShiftHandoverBtn',
     act_res_columns: 'hideResColsToggle',
     act_claim_reservation: ['hideResClaimBtns', 'hideDrawerClaimBtns'],
+    act_close_delete_ticket: 'hideProblemsCloseDeleteBtn',
     act_report_problem: 'hideDrawerReportProblemBtn',
     act_customer_id_lookup: 'hideResCustomerIdLookupBtn',
-    act_delete_employee: 'hideEmployeesRowActions'
+    act_delete_employee: 'hideEmployeesRowActions',
+    act_edit_customer: 'hideCustEditBtn',
+    act_assign_customer: 'hideCustAssignBtn',
+    act_add_customer_note: 'hideCustAddNoteBtn'
   };
 
   function isUiOptionHiddenForUser(roleOrUser, hideKey, uiContext) {
@@ -2369,7 +2853,10 @@
     prb_rates: 'sub_view_prb_rates',
     rep_charts: 'sub_view_rep_charts',
     emp_delegations: 'sub_view_emp_delegations',
-    emp_presets: 'sub_view_emp_presets'
+    emp_presets: 'sub_view_emp_presets',
+    cust_dashboard: 'sub_view_cust_dashboard',
+    cust_complaints: 'sub_view_cust_complaints',
+    cust_timeline: 'sub_view_cust_timeline'
   };
 
   function canUserViewSubSection(roleOrUser, subKey, uiContext) {
@@ -2425,6 +2912,7 @@
       sentinelKey: 'perms_sections_configured',
       items: [
         { key: 'view_dashboard', routeId: 'dashboard', labelAr: 'لوحة التحكم والإحصائيات', labelEn: 'Dashboard & KPIs' },
+        { key: 'view_customers', routeId: 'customers', labelAr: 'إدارة العملاء وملفاتهم', labelEn: 'Customers Management' },
         { key: 'view_reservations', routeId: 'reservations', labelAr: 'الحجوزات', labelEn: 'Reservations' },
         { key: 'view_my_followups', routeId: 'my-followups', labelAr: 'متابعاتي', labelEn: 'My Follow-Ups' },
         { key: 'view_team_followups', routeId: 'team-followups', labelAr: 'متابعات الفريق', labelEn: 'Team Follow-Ups' },
@@ -2441,6 +2929,9 @@
       labelEn: 'Tabs & Sub-Sections',
       sentinelKey: 'perms_subsections_configured',
       items: [
+        { key: 'sub_view_cust_dashboard', labelAr: 'لوحة مؤشرات العملاء (Dashboard)', labelEn: 'Customers Dashboard KPIs' },
+        { key: 'sub_view_cust_complaints', labelAr: 'تبويب المشاكل والشكاوى في ملف العميل', labelEn: 'Customer Profile Complaints Tab' },
+        { key: 'sub_view_cust_timeline', labelAr: 'السجل الزمني الموحد في ملف العميل', labelEn: 'Customer Profile Activity Timeline' },
         { key: 'sub_view_today_tab', labelAr: 'تبويب التسليم والاستلام اليوم', labelEn: 'Today Pickups & Returns Tab' },
         { key: 'sub_view_radar_tab', labelAr: 'تبويب رادار انتهاء الحجوزات (24 ساعة)', labelEn: '24h Expiry Radar Tab' },
         { key: 'sub_view_rejected_tab', labelAr: 'تبويب الحجوزات المرفوضة', labelEn: 'Rejected Reservations Tab' },
@@ -2488,6 +2979,9 @@
         { key: 'act_close_delete_ticket', labelAr: 'أزرار إغلاق / حذف التذاكر والمشكلات', labelEn: 'Close / Delete Ticket Buttons' },
         { key: 'act_report_problem', labelAr: 'زر تحويل الحجز إلى مشكلة', labelEn: 'Report Problem Button' },
         { key: 'act_customer_id_lookup', labelAr: 'زر الاستعلام عن العميل برقم الهوية', labelEn: 'National ID Lookup Button' },
+        { key: 'act_edit_customer', labelAr: 'زر تعديل بيانات وحالة العميل', labelEn: 'Edit Customer Button' },
+        { key: 'act_assign_customer', labelAr: 'زر تعيين الموظف المسؤول للعميل', labelEn: 'Assign Customer Employee Button' },
+        { key: 'act_add_customer_note', labelAr: 'زر إضافة ملاحظة وسجل تواصل للعميل', labelEn: 'Add Customer Note Button' },
         { key: 'act_delete_employee', labelAr: 'أزرار حذف وإيقاف الموظفين', labelEn: 'Delete / Toggle Employee Buttons' }
       ]
     }
@@ -3990,6 +4484,8 @@
     getEmployees: { cacheable: true, ttlMs: 300000, scope: 'employees' },
     getEmployeeDetails: { cacheable: true, ttlMs: 60000, scope: 'employees' },
     getDashboard: { cacheable: true, ttlMs: 60000, scope: 'dashboard' },
+    getCustomers: { cacheable: true, ttlMs: 60000, scope: 'customers' },
+    getCustomerDetails: { cacheable: true, ttlMs: 45000, scope: 'customers' },
     getTodayAndRadar: { cacheable: true, ttlMs: 25000, scope: 'todayRadar' },
     getReservations: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getInactiveReservations: { cacheable: true, ttlMs: 45000, scope: 'reservations' },
@@ -4015,33 +4511,37 @@
   var MUTATION_INVALIDATIONS = {
     login: ['*'],
     logout: ['*'],
-    claimReservation: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
-    unclaimReservation: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
-    quickUpdateReservationStatus: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    rejectReservation: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    cancelReservation: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    restoreReservation: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateReservationDetails: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
-    saveReservationPinnedNote: ['reservations', 'todayRadar', 'followUps', 'activity'],
+    createCustomer: ['customers', 'dashboard', 'activity', 'reports'],
+    updateCustomerProfile: ['customers', 'reservations', 'dashboard', 'activity', 'reports'],
+    assignCustomerEmployee: ['customers', 'employees', 'notifications', 'activity'],
+    addCustomerNote: ['customers', 'followUps', 'notifications', 'activity'],
+    claimReservation: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    unclaimReservation: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    quickUpdateReservationStatus: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    rejectReservation: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    cancelReservation: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    restoreReservation: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    updateReservationDetails: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    saveReservationPinnedNote: ['reservations', 'customers', 'todayRadar', 'followUps', 'activity'],
     togglePinnedCriticalReservation: ['followUps', 'reservations'],
-    recordNoAnswerFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    addFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    updateFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    deleteFollowUp: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    assignEmployees: ['reservations', 'todayRadar', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    removeAssignment: ['reservations', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
-    bulkReassignEmployeeReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    bulkReassignSelectedReservations: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    createProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    updateProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
-    deleteProblem: ['reservations', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    recordNoAnswerFollowUp: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    addFollowUp: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    updateFollowUp: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    deleteFollowUp: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    assignEmployees: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    removeAssignment: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
+    bulkReassignEmployeeReservations: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    bulkReassignSelectedReservations: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    createProblem: ['reservations', 'customers', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    updateProblem: ['reservations', 'customers', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
+    deleteProblem: ['reservations', 'customers', 'todayRadar', 'problems', 'dashboard', 'employees', 'notifications', 'activity', 'reports'],
     createEmployee: ['employees', 'dashboard', 'activity', 'reports'],
-    updateEmployee: ['employees', 'dashboard', 'activity', 'reports'],
+    updateEmployee: ['employees', 'customers', 'dashboard', 'activity', 'reports'],
     saveEmployeeUiOverrides: ['employees', 'settings', 'dashboard', 'activity'],
     saveRoleUiDefaults: ['employees', 'settings', 'dashboard', 'activity'],
     restoreUiDefaults: ['employees', 'settings', 'dashboard', 'activity'],
-    disableEmployee: ['employees', 'dashboard', 'activity', 'reports'],
-    deleteEmployee: ['employees', 'reservations', 'todayRadar', 'problems', 'dashboard', 'activity', 'reports'],
+    disableEmployee: ['employees', 'customers', 'dashboard', 'activity', 'reports'],
+    deleteEmployee: ['employees', 'customers', 'reservations', 'todayRadar', 'problems', 'dashboard', 'activity', 'reports'],
     saveDelegation: ['employees', 'activity', 'notifications'],
     revokeDelegation: ['employees', 'activity', 'notifications'],
     saveAnnouncement: ['announcements', 'dashboard', 'activity'],
@@ -4055,14 +4555,14 @@
     deletePermissionDefinition: ['employees', 'activity'],
     markNotificationRead: ['notifications'],
     deleteNotification: ['notifications'],
-    pullReservations: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
-    importReservationsFromExcel: ['reservations', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
-    syncRentalGate: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
-    retryFailedSyncRecords: ['reservations', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    pullReservations: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    importReservationsFromExcel: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
+    syncRentalGate: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
+    retryFailedSyncRecords: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'sync', 'activity', 'reports'],
     saveApiToken: ['settings', 'sync', 'activity'],
     saveGlobalConnectionSettings: ['settings', 'sync', 'activity'],
     applyUnifiedConnectionSetup: ['*'],
-    updateSettings: ['settings', 'sync', 'reservations', 'todayRadar', 'dashboard', 'reports', 'activity'],
+    updateSettings: ['settings', 'sync', 'reservations', 'customers', 'todayRadar', 'dashboard', 'reports', 'activity'],
     saveUserLayoutPrefs: ['dashboard', 'employees'],
     deleteAllReservations: ['*']
   };
@@ -4240,6 +4740,24 @@
       { key: 'details', label: 'التفاصيل', labelEn: 'Details', widthWeight: 1.8, formatType: 'text' },
       { key: 'logDate', label: 'التاريخ', labelEn: 'Date', widthWeight: 0.95, formatType: 'date' },
       { key: 'logTime', label: 'الوقت', labelEn: 'Time', widthWeight: 0.8, formatType: 'time' }
+    ],
+    customers: [
+      { key: 'fullName', label: 'اسم العميل', labelEn: 'Customer Name', widthWeight: 1.45, formatType: 'text' },
+      { key: 'countryCode', label: 'مفتاح الدولة', labelEn: 'Code', widthWeight: 0.72, formatType: 'ltr' },
+      { key: 'phone', label: 'رقم الجوال', labelEn: 'Phone', widthWeight: 1.18, formatType: 'ltr' },
+      { key: 'email', label: 'البريد الإلكتروني', labelEn: 'Email', widthWeight: 1.3, formatType: 'ltr' },
+      { key: 'idNumber', label: 'رقم الهوية / الإقامة / الجواز', labelEn: 'ID / Passport', widthWeight: 1.15, formatType: 'ltr' },
+      { key: 'bookingsCount', label: 'عدد الحجوزات', labelEn: 'Bookings', widthWeight: 0.72, formatType: 'number' },
+      { key: 'activeBookingsCount', label: 'النشطة', labelEn: 'Active', widthWeight: 0.65, formatType: 'number' },
+      { key: 'pastBookingsCount', label: 'السابقة', labelEn: 'Past', widthWeight: 0.65, formatType: 'number' },
+      { key: 'extensionsCount', label: 'التمديدات', labelEn: 'Extensions', widthWeight: 0.68, formatType: 'number' },
+      { key: 'openProblemsCount', label: 'المشاكل المفتوحة', labelEn: 'Open Problems', widthWeight: 0.75, formatType: 'number' },
+      { key: 'lastReservationNumber', label: 'آخر حجز', labelEn: 'Last Booking #', widthWeight: 0.95, formatType: 'ltr' },
+      { key: 'lastReservationDate', label: 'تاريخ آخر حجز', labelEn: 'Last Booking', widthWeight: 0.95, formatType: 'date' },
+      { key: 'lastContactAt', label: 'آخر تواصل', labelEn: 'Last Contact', widthWeight: 1.05, formatType: 'datetime' },
+      { key: 'assignedEmployeeName', label: 'الموظف المسؤول', labelEn: 'Assigned Employee', widthWeight: 1.15, formatType: 'text' },
+      { key: 'status', label: 'الحالة', labelEn: 'Status', widthWeight: 0.85, formatType: 'text' },
+      { key: 'createdAt', label: 'تاريخ الإنشاء', labelEn: 'Created At', widthWeight: 0.95, formatType: 'date' }
     ]
   };
 
@@ -7999,6 +8517,7 @@
 
   var UI_SIMPLIFICATION_OPTIONS = [
     // Group 1: Sidebar Navigation & Topbar
+    { key: 'hideNavCustomers', legacyId: 'set-ui-hide-nav-customers', cssClass: 'rg-ui-hide-nav-customers', group: 'nav_topbar', labelAr: 'إخفاء صفحة «العملاء» من القائمة الجانبية', labelEn: 'Hide "Customers" from sidebar navigation' },
     { key: 'hideNavTeamFollowups', legacyId: 'set-ui-hide-nav-team-followups', cssClass: 'rg-ui-hide-nav-team-followups', group: 'nav_topbar', labelAr: 'إخفاء صفحة «متابعات الفريق» من القائمة الجانبية', labelEn: 'Hide "Team Follow-Ups" from sidebar navigation' },
     { key: 'hideNavProblems', legacyId: 'set-ui-hide-nav-problems', cssClass: 'rg-ui-hide-nav-problems', group: 'nav_topbar', labelAr: 'إخفاء صفحة «المشكلات» من القائمة الجانبية', labelEn: 'Hide "Problems" from sidebar navigation' },
     { key: 'hideNavReports', legacyId: 'set-ui-hide-nav-reports', cssClass: 'rg-ui-hide-nav-reports', group: 'nav_topbar', labelAr: 'إخفاء صفحة «التقارير والإحصائيات» من القائمة الجانبية', labelEn: 'Hide "Reports & Analytics" from sidebar navigation' },
@@ -8079,7 +8598,13 @@
     { key: 'hideDrawerAddFollowupForm', legacyId: 'set-ui-hide-drawer-add-fu', cssClass: 'rg-ui-hide-drawer-add-fu', group: 'drawer', labelAr: 'إخفاء نموذج «إضافة متابعة جديدة» داخل تفاصيل الحجز', labelEn: 'Hide "Add Follow-Up" form inside Drawer' },
     { key: 'hideDrawerEditFollowupBtns', legacyId: 'set-ui-hide-drawer-edit-fu', cssClass: 'rg-ui-hide-drawer-edit-fu', group: 'drawer', labelAr: 'إخفاء أزرار «تعديل / إغلاق» داخل سجل المتابعات والتذاكر', labelEn: 'Hide Edit/Close buttons in Drawer timeline & tickets' },
 
-    // Group 5: Other Modules
+    // Group 5: Customers & Other Modules
+    { key: 'hideCustDashboard', legacyId: 'set-ui-hide-cust-dashboard', cssClass: 'rg-ui-hide-cust-dashboard', group: 'modules', labelAr: 'إخفاء لوحة مؤشرات العملاء (KPIs) في صفحة العملاء', labelEn: 'Hide Customers KPI dashboard' },
+    { key: 'hideCustComplaintsTab', legacyId: 'set-ui-hide-cust-complaints', cssClass: 'rg-ui-hide-cust-complaints', group: 'modules', labelAr: 'إخفاء تبويب «المشاكل والشكاوى» داخل ملف العميل', labelEn: 'Hide Complaints tab in Customer Profile' },
+    { key: 'hideCustTimelineTab', legacyId: 'set-ui-hide-cust-timeline', cssClass: 'rg-ui-hide-cust-timeline', group: 'modules', labelAr: 'إخفاء تبويب «السجل الزمني الموحد» داخل ملف العميل', labelEn: 'Hide Unified Timeline tab in Customer Profile' },
+    { key: 'hideCustEditBtn', legacyId: 'set-ui-hide-cust-edit', cssClass: 'rg-ui-hide-cust-edit', group: 'modules', labelAr: 'إخفاء أزرار «إضافة / تعديل بيانات العميل»', labelEn: 'Hide Add/Edit Customer buttons' },
+    { key: 'hideCustAssignBtn', legacyId: 'set-ui-hide-cust-assign', cssClass: 'rg-ui-hide-cust-assign', group: 'modules', labelAr: 'إخفاء عنصر «تعيين الموظف المسؤول» داخل ملف العميل', labelEn: 'Hide Assign Responsible Employee control in Customer Profile' },
+    { key: 'hideCustAddNoteBtn', legacyId: 'set-ui-hide-cust-add-note', cssClass: 'rg-ui-hide-cust-add-note', group: 'modules', labelAr: 'إخفاء نموذج وأزرار «إضافة ملاحظة / تواصل» في ملف العميل', labelEn: 'Hide Add Customer Note / Contact form' },
     { key: 'hideMyfuPinnedStrip', legacyId: 'set-ui-hide-myfu-pinned', cssClass: 'rg-ui-hide-myfu-pinned', group: 'modules', labelAr: 'إخفاء شريط وأزرار تثبيت «الحجوزات الحرجة» في متابعاتي', labelEn: 'Hide "Pinned Critical Bookings" strip & pin buttons' },
     { key: 'hideMyfuMentionsTab', legacyId: 'set-ui-hide-myfu-mentions', cssClass: 'rg-ui-hide-myfu-mentions', group: 'modules', labelAr: 'إخفاء تبويب «إشارات @Mention» في متابعاتي', labelEn: 'Hide "@Mentions" tab in My Follow-Ups' },
     { key: 'hideMyfuHistoryCard', legacyId: 'set-ui-hide-myfu-history', cssClass: 'rg-ui-hide-myfu-history', group: 'modules', labelAr: 'إخفاء قسم «سجل متابعاتي السابقة» في متابعاتي', labelEn: 'Hide "My Previous Follow-Ups" history card' },
@@ -8087,6 +8612,7 @@
     { key: 'hideTeamFuBulkBtn', legacyId: 'set-ui-hide-tfu-bulk', cssClass: 'rg-ui-hide-tfu-bulk', group: 'modules', labelAr: 'إخفاء أزرار «تحويل جماعي» و«ملف عملاء الموظف» و«إعادة ضبط» في متابعات الفريق', labelEn: 'Hide Team Follow-Ups bulk reassign, profile & reset buttons' },
     { key: 'hideProblemsRateIndicator', legacyId: 'set-ui-hide-prb-rates', cssClass: 'rg-ui-hide-prb-rates', group: 'modules', labelAr: 'إخفاء مؤشر «نسبة المشكلات لكل 100 حجز» في المشكلات والتقارير', labelEn: 'Hide "Problems per 100 Bookings" indicator & toggle' },
     { key: 'hideProblemsManageBtns', legacyId: 'set-ui-hide-prb-manage', cssClass: 'rg-ui-hide-prb-manage', group: 'modules', labelAr: 'إخفاء أزرار «تحديث / إدارة» التذاكر في جدول المشكلات', labelEn: 'Hide "Manage / Update" buttons in Problems table' },
+    { key: 'hideProblemsCloseDeleteBtn', legacyId: 'set-ui-hide-prb-close-del', cssClass: 'rg-ui-hide-prb-close-del', group: 'modules', labelAr: 'إخفاء أزرار «إغلاق / حذف» التذاكر والمشكلات', labelEn: 'Hide Close & Delete ticket buttons in Problems' },
     { key: 'hideProblemsOpenResBtn', legacyId: 'set-ui-hide-prb-open-res', cssClass: 'rg-ui-hide-prb-open-res', group: 'modules', labelAr: 'إخفاء أزرار «فتح الحجز» من المشكلات وتفاصيل التذكرة', labelEn: 'Hide "Open Booking" buttons in Problems view & modal' },
     { key: 'hideProblemsResetBtn', legacyId: 'set-ui-hide-prb-reset', cssClass: 'rg-ui-hide-prb-reset', group: 'modules', labelAr: 'إخفاء أزرار «إعادة ضبط» و«إغلاق المشكلة» السريع في المشكلات', labelEn: 'Hide Problems reset filter & quick close buttons' },
     { key: 'hideReportsCharts', legacyId: 'set-ui-hide-reports-charts', cssClass: 'rg-ui-hide-reports-charts', group: 'modules', labelAr: 'إخفاء الرسوم البيانية في صفحة التقارير', labelEn: 'Hide charts section in Reports page' },
@@ -9112,7 +9638,7 @@
     return visible ? 'إخفاء مؤشر نسبة المشكلات' : 'إظهار مؤشر نسبة المشكلات';
   }
 
-  var NAV_ROUTE_IDS = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var NAV_ROUTE_IDS = ['dashboard', 'customers', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
   var PROTECTED_NAV_ROUTES = ['dashboard', 'settings'];
 
   var DASHBOARD_SECTION_DEFS = [
@@ -10745,6 +11271,13 @@
     formatStatusStageSourceLabel: formatStatusStageSourceLabel,
     resolvePullDateRange: resolvePullDateRange,
     filterSourceReservationsByPullRange: filterSourceReservationsByPullRange,
+    CUSTOMER_STATUS_LIST: CUSTOMER_STATUS_LIST,
+    extractPhoneCountryCode: extractPhoneCountryCode,
+    detectCustomerIdType: detectCustomerIdType,
+    buildCustomerCanonicalKey: buildCustomerCanonicalKey,
+    computeCustomerLifecycleStatus: computeCustomerLifecycleStatus,
+    redactCustomerSensitiveFields: redactCustomerSensitiveFields,
+    buildCustomersAggregateFromData: buildCustomersAggregateFromData,
     buildCustomersIndexFromReservations: buildCustomersIndexFromReservations,
     mergeReservationBatch: mergeReservationBatch,
     translateDeliveryType: translateDeliveryType,

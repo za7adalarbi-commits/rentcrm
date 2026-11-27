@@ -155,7 +155,7 @@
                     '<button type="button" class="btn btn-sm rg-pin-btn is-pinned myfu-pin-toggle" data-id="' + esc(r.id) + '" title="' + (isEn ? 'Unpin' : 'إلغاء التثبيت') + '">📌 ' + (isEn ? 'Unpin' : 'إلغاء التثبيت') + '</button>' +
                   '</div>' +
                 '</div>' +
-                '<div style="font-weight:700;font-size:13.5px;">' + esc(r.customerName) + ' · <span class="mono cell-phone" dir="ltr" style="font-size:12px;">' + esc(r.customerPhone) + '</span></div>' +
+                '<div style="font-weight:700;font-size:13.5px;"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName) + '</button> · <span class="mono cell-phone" dir="ltr" style="font-size:12px;">' + esc(r.customerPhone) + '</span></div>' +
                 '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--text-muted);">' +
                   '<span>' + esc(r.carName) + ' (' + esc(r.companyName) + ')</span>' +
                   renderSharedBadge(r) +
@@ -190,7 +190,7 @@
                     (r.pinnedNote ? '<div class="cell-sub" style="color:var(--brand-primary);font-weight:700;">📌 ملاحظة مثبتة</div>' : '') +
                   '</td>' +
                   '<td>' +
-                    '<div class="cell-primary">' + esc(r.customerName) + '</div>' +
+                    '<div class="cell-primary"><button type="button" class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName) + '</button></div>' +
                     '<div class="cell-badges">' + renderSharedBadge(r) + '</div>' +
                   '</td>' +
                   '<td class="mono">' +
@@ -939,7 +939,7 @@
                         '<strong class="mono" dir="ltr">' + esc(r.reservationNumber) + '</strong>' +
                         '<span class="status-tag ' + statusClass(r.internalStatus) + '">' + esc(r.internalStatus) + '</span>' +
                       '</div>' +
-                      '<div style="font-weight:600;">' + esc(r.customerName) + ' <span class="mono cell-phone" dir="ltr" style="font-size:12px;color:var(--text-muted);">(' + esc(r.customerPhone) + ')</span></div>' +
+                      '<div style="font-weight:600;"><span class="rg-customer-link" data-cust-id="' + esc(r.customerId || '') + '" data-res-id="' + esc(r.id) + '" data-phone="' + esc(r.customerPhone || '') + '">' + esc(r.customerName) + '</span> <span class="mono cell-phone" dir="ltr" style="font-size:12px;color:var(--text-muted);">(' + esc(r.customerPhone) + ')</span></div>' +
                       '<div class="res-story-box"><strong>ما حدث:</strong> ' + fmtMention(story, employees) + '</div>' +
                       '<div style="font-size:12px;color:var(--brand-primary);font-weight:700;">عرض تفاصيل الحجز ←</div>' +
                     '</button>';
@@ -958,7 +958,7 @@
                 var canDeleteTeamFu = Boolean(canEditAnyFollowUpTeam || (f.employeeId && f.employeeId === currentEmpIdTeam));
                 return '<tr>' +
                   '<td class="mono"><button type="button" class="btn-link-inline tfu-open-res" dir="ltr" data-res-id="' + esc(f.reservationId) + '">' + esc(f.reservationNumber) + '</button></td>' +
-                  '<td>' + esc(f.customerName) + '</td>' +
+                  '<td><button type="button" class="rg-customer-link" data-res-id="' + esc(f.reservationId) + '">' + esc(f.customerName) + '</button></td>' +
                   '<td><button type="button" class="btn-link-inline tfu-open-emp" data-emp-id="' + esc(f.employeeId) + '">' + esc(f.employeeName) + '</button></td>' +
                   '<td><span class="status-tag ' + statusClass(f.status) + '">' + esc(f.status) + '</span></td>' +
                   '<td><div class="cell-clamp-2" title="' + esc(f.action || '') + '">' + fmtMention(f.action, employees) + '</div></td>' +

@@ -389,7 +389,7 @@
               return '<tr data-prb-row="' + esc(p.id) + '">' +
                 '<td class="mono" style="white-space:nowrap;" dir="ltr"><strong>' + esc(p.problemNumber) + '</strong></td>' +
                 '<td class="mono" style="white-space:nowrap;"><button type="button" class="btn-link-inline prb-open-res" dir="ltr" data-res-id="' + esc(p.reservationId) + '">' + esc(p.reservationNumber) + '</button></td>' +
-                '<td>' + esc(p.customerName) + '</td>' +
+                '<td><button type="button" class="rg-customer-link" data-cust-id="' + esc(p.customerId || '') + '" data-res-id="' + esc(p.reservationId || '') + '">' + esc(p.customerName || '-') + '</button></td>' +
                 '<td style="max-width:260px;">' + fmtMention(p.description, employees) + '</td>' +
                 '<td>' + prioBadge(p.priority) + '</td>' +
                 '<td>' + statusBadge(p.status) + '</td>' +
@@ -841,7 +841,7 @@
         '<form class="modal-panel" id="prb-upd-form">' +
           '<div class="modal-header">' +
             '<div><h3 class="modal-title mono" id="prb-upd-title">' + esc(problem.problemNumber) + ' — حجز ' + esc(problem.reservationNumber) + '</h3>' +
-            '<div class="meta-inline"><span>' + esc(problem.customerName) + '</span><span>·</span><span>أنشئت بواسطة: ' + esc(problem.createdByName || '-') + '</span><span>·</span>' + statusBadge(problem.status) + ' ' + prioBadge(problem.priority) + '</div></div>' +
+            '<div class="meta-inline"><button type="button" class="rg-customer-link" data-cust-id="' + esc(problem.customerId || '') + '" data-res-id="' + esc(problem.reservationId || '') + '">' + esc(problem.customerName || '-') + '</button><span>·</span><span>أنشئت بواسطة: ' + esc(problem.createdByName || '-') + '</span><span>·</span>' + statusBadge(problem.status) + ' ' + prioBadge(problem.priority) + '</div></div>' +
             '<button type="button" class="btn btn-sm" id="prb-upd-close">إغلاق النافذة</button>' +
           '</div>' +
           (canEditTicket

@@ -1037,7 +1037,9 @@
     var SCOPE_ALIASES = {
       followups: 'followUps',
       teamfollowups: 'followUps',
-      todayradar: 'todayRadar'
+      todayradar: 'todayRadar',
+      customer: 'customers',
+      customers: 'customers'
     };
     var rawList = Array.isArray(scopes) ? scopes : [scopes];
     var markAll = !scopes || rawList.indexOf('*') !== -1;
@@ -1054,6 +1056,9 @@
         entry.swrValidInPage = true;
       }
     });
+    if (markAll || list.indexOf('reservations') !== -1 || list.indexOf('customers') !== -1) {
+      customersDirtyByNs[ns] = true;
+    }
     if (markAll || list.indexOf('reservations') !== -1) {
       localReservationsFreshInPage[ns] = false;
     }
@@ -3952,6 +3957,8 @@
       notifications: notifications,
       syncLog: syncLog,
       announcements: announcements,
+      customers: [],
+      customerNotes: [],
       delegations: delegations,
       locks: locks,
       settings: settings,
@@ -4007,7 +4014,7 @@
         });
       }
 
-      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'announcements', 'delegations', 'locks', 'sessions'].forEach(function (k) {
+      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'announcements', 'customers', 'customerNotes', 'delegations', 'locks', 'sessions'].forEach(function (k) {
         if (!Array.isArray(parsed[k])) {
           parsed[k] = defaults[k] || [];
           dirty = true;
@@ -4338,6 +4345,115 @@
     }
     var delegatedUser = resolveSandboxDelegatedUser(db, user);
     return { token: token, employeeId: user.id, role: delegatedUser.role, user: delegatedUser };
+  }
+
+  function buildSandboxCustomersView(db, user) {
+    var core = root.RGCrmCore;
+    var agg = (core && core.buildCustomersAggregateFromData)
+      ? core.buildCustomersAggregateFromData({
+          customers: db.customers || [],
+          reservations: db.reservations || [],
+          extensions: db.extensions || [],
+          followUps: db.followUps || [],
+          problems: db.problems || [],
+          customerNotes: db.customerNotes || []
+        })
+      : { items: [], kpis: {} };
+
+    var items = (agg.items || []).map(function (c) {
+      var mapped = {
+        id: c.id,
+        customerKey: c.customerKey,
+        fullName: c.fullName,
+        phone: c.phone,
+        countryCode: c.countryCode,
+        normalizedPhone: c.normalizedPhone,
+        email: c.email,
+        idNumber: c.idNumber,
+        idType: c.idType,
+        status: c.status,
+        statusOverride: Boolean(c.statusOverride),
+        assignedEmployeeId: c.assignedEmployeeId || '',
+        assignedEmployeeName: c.assignedEmployeeName || '',
+        notes: c.notes || '',
+        tags: Array.isArray(c.tags) ? c.tags.slice() : [],
+        source: c.source || 'sync',
+        lastContactAt: c.lastContactAt || '',
+        createdAt: c.createdAt || '',
+        updatedAt: c.updatedAt || '',
+        lastActivityAt: c.lastActivityAt || c.updatedAt || c.createdAt || '',
+        bookingsCount: Number(c.totalBookings || 0),
+        activeBookingsCount: Number(c.activeBookingsCount || 0),
+        pastBookingsCount: Number(c.pastBookingsCount || 0),
+        extensionsCount: Number(c.extensionsCount || 0),
+        openProblemsCount: Number(c.openProblemsCount || 0),
+        openComplaintsCount: Number(c.inProgressComplaintsCount || 0),
+        followUpsCount: Number(c.followUpsCount || 0),
+        notesCount: Number(c.notesCount || 0),
+        unfollowedActiveCount: Number(c.unfollowedActiveCount || 0),
+        totalAmount: Number(c.totalSpent || 0),
+        paidAmount: Number(c.paidAmount || 0),
+        lastReservationNumber: c.lastBookingNumber || '',
+        lastReservationDate: c.lastBookingDate || '',
+        lastCompanyName: (Array.isArray(c.companies) && c.companies[0]) ? c.companies[0] : '',
+        companies: Array.isArray(c.companies) ? c.companies.slice() : [],
+        reservationIds: Array.isArray(c.reservationIds) ? c.reservationIds.slice() : [],
+        isNew: Boolean(c.isNew),
+        isRecent: Boolean(c.isRecent),
+        unfollowed: Boolean(c.unfollowed),
+        isRepeat: Boolean(c.isRepeat)
+      };
+      return (core && core.redactCustomerSensitiveFields)
+        ? core.redactCustomerSensitiveFields(mapped, user)
+        : mapped;
+    });
+
+    var rawK = agg.kpis || {};
+    var kpis = {
+      totalCustomers: Number(rawK.totalCustomers || items.length),
+      newCustomers: Number(rawK.newCustomers || 0),
+      activeBookingCustomers: Number(rawK.activeBookingCustomers || 0),
+      pastBookingCustomers: Number(rawK.pastBookingCustomers || 0),
+      openProblemCustomers: Number(rawK.openProblemCustomers || 0),
+      inProgressComplaintCustomers: Number(rawK.inProgressComplaintCustomers || 0),
+      withExtensionsCustomers: Number(rawK.extensionCustomers || 0),
+      unfollowedCustomers: Number(rawK.unfollowedCustomers || 0),
+      repeatCustomers: Number(rawK.repeatCustomers || 0),
+      recentCustomers: Number(rawK.recentUpdatedCustomers || 0)
+    };
+
+    return { items: items, kpis: kpis };
+  }
+
+  function ensureSandboxCustomerRecord(db, itemView) {
+    if (!Array.isArray(db.customers)) db.customers = [];
+    var existing = db.customers.find(function (x) {
+      return x && (x.id === itemView.id || (itemView.customerKey && x.customerKey === itemView.customerKey));
+    });
+    if (existing) return existing;
+    var created = {
+      id: itemView.id,
+      customerKey: itemView.customerKey,
+      fullName: itemView.fullName,
+      phone: itemView.phone,
+      countryCode: itemView.countryCode || '',
+      normalizedPhone: itemView.normalizedPhone || '',
+      email: itemView.email || '',
+      idNumber: itemView.idNumber || '',
+      idType: itemView.idType || '',
+      status: itemView.status || 'جديد',
+      statusOverride: Boolean(itemView.statusOverride),
+      assignedEmployeeId: itemView.assignedEmployeeId || '',
+      assignedEmployeeName: itemView.assignedEmployeeName || '',
+      notes: itemView.notes || '',
+      tags: Array.isArray(itemView.tags) ? itemView.tags.slice() : [],
+      source: itemView.source || 'sync',
+      lastContactAt: itemView.lastContactAt || '',
+      createdAt: itemView.createdAt || new Date().toISOString(),
+      updatedAt: itemView.updatedAt || new Date().toISOString()
+    };
+    db.customers.push(created);
+    return created;
   }
 
   function sandboxExecute(action, token, payload) {
@@ -5341,10 +5457,22 @@
       }
 
       case 'createProblem': {
-        var rPrb = db.reservations.find(function (r) { return r.id === payload.reservationId; });
-        if (!rPrb) return { success: false, message: 'الحجز غير موجود.', data: null, error: 'NOT_FOUND' };
+        var rPrb = payload.reservationId
+          ? db.reservations.find(function (r) { return r.id === payload.reservationId || r.reservationNumber === payload.reservationId; })
+          : null;
+        var custPrbId = String(payload.customerId || '').trim();
+        var custPrbRec = null;
+        if (!rPrb && custPrbId) {
+          var vAll = buildSandboxCustomersView(db, session.user);
+          var matchedView = vAll.items.find(function (c) { return c.id === custPrbId || c.customerKey === custPrbId; });
+          if (matchedView) custPrbRec = ensureSandboxCustomerRecord(db, matchedView);
+        }
+        if (!rPrb && !custPrbRec) {
+          return { success: false, message: 'الحجز أو العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        }
         var desc = String(payload.description || '').trim();
         var prio = payload.priority || 'متوسط';
+        var ticketType = String(payload.ticketType || 'مشكلة').trim() === 'شكوى' ? 'شكوى' : 'مشكلة';
         if (!desc) return { success: false, message: 'يرجى كتابة وصف المشكلة.', data: null, error: 'VALIDATION' };
 
         var assignIds = (payload.assignedEmployeeIds && payload.assignedEmployeeIds.length) ? payload.assignedEmployeeIds : [session.employeeId];
@@ -5353,13 +5481,28 @@
           return e ? e.name : session.user.name;
         });
 
+        var resolvedCustId = custPrbId || (rPrb && rPrb.customerId) || '';
+        if (!resolvedCustId && rPrb) {
+          var keyPrb = (core && core.buildCustomerCanonicalKey)
+            ? core.buildCustomerCanonicalKey({ phone: rPrb.customerPhone, email: rPrb.customerEmail, idNumber: rPrb.customerIdNumber, name: rPrb.customerName, reservationNumber: rPrb.reservationNumber })
+            : '';
+          if (keyPrb) {
+            var vLookup = buildSandboxCustomersView(db, session.user);
+            var vMatch = vLookup.items.find(function (c) { return c.customerKey === keyPrb; });
+            if (vMatch) resolvedCustId = vMatch.id;
+          }
+        }
+        var resCustName = (rPrb && rPrb.customerName) || (custPrbRec && custPrbRec.fullName) || String(payload.customerName || 'عميل');
+
         var nowPrb = new Date().toISOString();
         var newProblem = {
           id: genId('PRB'),
-          problemNumber: 'PRB-' + String(Date.now()).slice(-6),
-          reservationId: rPrb.id,
-          reservationNumber: rPrb.reservationNumber,
-          customerName: rPrb.customerName,
+          problemNumber: (ticketType === 'شكوى' ? 'CMP-' : 'PRB-') + String(Date.now()).slice(-6),
+          reservationId: rPrb ? rPrb.id : '',
+          reservationNumber: rPrb ? rPrb.reservationNumber : String(payload.reservationNumber || ''),
+          customerId: resolvedCustId,
+          customerName: resCustName,
+          ticketType: ticketType,
           createdById: session.employeeId,
           createdByName: session.user.name,
           assignedEmployeeIds: assignIds,
@@ -5374,25 +5517,33 @@
         db.problemUpdates.unshift({
           id: genId('PRBU'),
           problemId: newProblem.id,
-          reservationNumber: rPrb.reservationNumber,
+          reservationNumber: newProblem.reservationNumber,
           employeeId: session.employeeId,
           employeeName: session.user.name,
           previousStatus: '',
           newStatus: 'جديدة',
           previousPriority: '',
           newPriority: prio,
-          note: 'تم إنشاء المشكلة: ' + desc,
+          note: 'تم إنشاء ' + ticketType + ': ' + desc,
           createdAt: nowPrb
         });
-        rPrb.hasProblem = true;
-        if (prio === 'مرتفع') rPrb.priority = 'مرتفع';
-        rPrb.updatedAt = nowPrb;
+        if (rPrb) {
+          rPrb.hasProblem = true;
+          if (prio === 'مرتفع') rPrb.priority = 'مرتفع';
+          rPrb.updatedAt = nowPrb;
+        }
 
-        appendSandboxActivity(db, session.user, 'إنشاء مشكلة', 'Problem', newProblem.problemNumber, 'حجز ' + rPrb.reservationNumber + ' | الأولوية: ' + prio);
+        appendSandboxActivity(
+          db, session.user,
+          ticketType === 'شكوى' ? 'تسجيل شكوى عميل' : 'إنشاء مشكلة',
+          'Problem',
+          newProblem.problemNumber,
+          (rPrb ? ('حجز ' + rPrb.reservationNumber) : ('عميل ' + resCustName)) + ' | الأولوية: ' + prio
+        );
 
         assignIds.forEach(function (eid) {
           if (eid !== session.employeeId) {
-            pushSandboxNotification(db, eid, '', 'new_problem', 'مشكلة جديدة مسندة إليك', 'مشكلة على الحجز ' + rPrb.reservationNumber + ': ' + desc, 'Problem', newProblem.id);
+            pushSandboxNotification(db, eid, '', 'new_problem', ticketType + ' جديدة مسندة إليك', (rPrb ? ('على الحجز ' + rPrb.reservationNumber) : ('للعميل ' + resCustName)) + ': ' + desc, 'Problem', newProblem.id);
           }
         });
 
@@ -5401,8 +5552,8 @@
             if (emp.status === 'active' && (emp.role === 'supervisor' || emp.role === 'general_manager' || emp.role === 'developer')) {
               pushSandboxNotification(
                 db, emp.id, emp.role, 'high_priority_problem',
-                'تنبيه: مشكلة بأولوية مرتفعة',
-                'تم فتح مشكلة مرتفعة الأولوية للحجز ' + rPrb.reservationNumber + ' (' + rPrb.customerName + ') بواسطة ' + session.user.name,
+                'تنبيه: ' + ticketType + ' بأولوية مرتفعة',
+                'تم فتح ' + ticketType + ' مرتفعة الأولوية ' + (rPrb ? ('للحجز ' + rPrb.reservationNumber) : ('للعميل ' + resCustName)) + ' (' + resCustName + ') بواسطة ' + session.user.name,
                 'Problem', newProblem.id
               );
             }
@@ -5410,7 +5561,7 @@
         }
         dispatchSandboxMentionNotifications(db, session.user, [desc], 'Problem', newProblem.id, newProblem.problemNumber);
         saveSandboxDb(db);
-        return { success: true, message: 'تم تحويل الحجز إلى مشكلة.', data: newProblem, error: null };
+        return { success: true, message: ticketType === 'شكوى' ? 'تم تسجيل شكوى العميل بنجاح.' : 'تم تحويل الحجز إلى مشكلة.', data: newProblem, error: null };
       }
 
       case 'updateProblem': {
@@ -5983,6 +6134,12 @@
         };
         (db.reservations || []).forEach(scrubAssigned);
         (db.problems || []).forEach(scrubAssigned);
+        (db.customers || []).forEach(function (c) {
+          if (c && c.assignedEmployeeId === delEmpId) {
+            c.assignedEmployeeId = '';
+            c.assignedEmployeeName = '';
+          }
+        });
         appendSandboxActivity(db, session.user, 'حذف موظف', 'Employee', delEmpId, empDel.name + ' (' + empDel.username + ')');
         saveSandboxDb(db);
         return { success: true, message: 'تم حذف الموظف بنجاح.', data: { id: delEmpId, deleted: true, name: empDel.name }, error: null };
@@ -6723,8 +6880,22 @@
           });
           return { success: true, message: '', data: { reportType: rType, rows: extFiltered, facets: repFacets }, error: null };
         }
+        if (rType === 'customers') {
+          if (!core.canUserViewRoute(session.user, 'customers') || !core.canUserPerform(session.user, 'view_customers')) {
+            return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية عرض تقارير العملاء.', data: null, error: 'FORBIDDEN' };
+          }
+          var custRepView = buildSandboxCustomersView(db, session.user);
+          var custRepRows = custRepView.items.filter(function (c) {
+            if (fStatus && c.status !== fStatus) return false;
+            if (fEmp && c.assignedEmployeeId !== fEmp) return false;
+            if (payload.company && (c.companies || []).indexOf(payload.company) === -1) return false;
+            return true;
+          });
+          return { success: true, message: '', data: { reportType: rType, rows: custRepRows, facets: repFacets }, error: null };
+        }
         if (rType === 'unfollowed') {
-          return { success: true, message: '', data: { reportType: rType, rows: filteredRes.filter(function (r) { return !r.isFollowed; }), facets: repFacets }, error: null };
+          var redactedUnf = core.redactReservationsList ? core.redactReservationsList(filteredRes.filter(function (r) { return !r.isFollowed; }), session.user) : filteredRes.filter(function (r) { return !r.isFollowed; });
+          return { success: true, message: '', data: { reportType: rType, rows: redactedUnf, facets: repFacets }, error: null };
         }
         if (rType === 'priorities') {
           var prioRank = { 'مرتفع': 0, 'متوسط': 1, 'عادي': 2 };
@@ -6733,7 +6904,8 @@
             var rb = prioRank[b.priority] !== undefined ? prioRank[b.priority] : 3;
             return ra - rb;
           });
-          return { success: true, message: '', data: { reportType: rType, rows: prioSorted, facets: repFacets }, error: null };
+          var redactedPrio = core.redactReservationsList ? core.redactReservationsList(prioSorted, session.user) : prioSorted;
+          return { success: true, message: '', data: { reportType: rType, rows: redactedPrio, facets: repFacets }, error: null };
         }
         if (rType === 'employee_performance') {
           var statsEmpsRep = (core && core.filterEmployeesForStats)
@@ -6768,7 +6940,8 @@
           });
           return { success: true, message: '', data: { reportType: rType, rows: actRows, facets: repFacets }, error: null };
         }
-        return { success: true, message: '', data: { reportType: rType, rows: filteredRes, facets: repFacets }, error: null };
+        var redactedAll = core.redactReservationsList ? core.redactReservationsList(filteredRes, session.user) : filteredRes;
+        return { success: true, message: '', data: { reportType: rType, rows: redactedAll, facets: repFacets }, error: null };
       }
 
       case 'getSettings': {
@@ -7797,6 +7970,445 @@
         };
       }
 
+      case 'getCustomers': {
+        if (!core.canUserViewRoute(session.user, 'customers') || !core.canUserPerform(session.user, 'view_customers')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية الوصول إلى قسم العملاء.', data: null, error: 'FORBIDDEN' };
+        }
+        var canViewId = core.canUserViewCustomerId ? core.canUserViewCustomerId(session.user) : false;
+        var allowAllCust = db.settings.allow_agent_view_all !== false;
+        var viewData = buildSandboxCustomersView(db, session.user);
+        var scopedItems = (session.role === 'agent' && !allowAllCust)
+          ? viewData.items.filter(function (c) {
+              if (c.assignedEmployeeId === session.employeeId) return true;
+              return (db.reservations || []).some(function (r) {
+                return c.reservationIds.indexOf(r.id) !== -1 && (r.assignedEmployeeIds || []).indexOf(session.employeeId) !== -1;
+              });
+            })
+          : viewData.items;
+
+        var cSearch = String(payload.search || '').trim().toLowerCase();
+        var cStatus = String(payload.status || '').trim();
+        var cCompany = String(payload.company || '').trim();
+        var cEmp = String(payload.assignedEmployeeId || payload.employeeId || '').trim();
+        var cPrbFilter = String(payload.problemFilter || '').trim();
+        var cKpi = String(payload.kpiFilter || 'all').trim();
+        var cSort = String(payload.sortBy || 'last_activity').trim();
+
+        var cFiltered = scopedItems.filter(function (c) {
+          if (cSearch) {
+            var resTexts = (c.reservationIds || []).map(function (rid) {
+              var rm = (db.reservations || []).find(function (x) { return x.id === rid; });
+              return rm ? ((rm.reservationNumber || '') + ' ' + (rm.referenceNumber || '')) : '';
+            }).join(' ');
+            var hay = [
+              c.fullName, c.phone, c.normalizedPhone, c.email,
+              canViewId ? c.idNumber : '',
+              c.lastReservationNumber, resTexts
+            ].join(' ').toLowerCase();
+            if (hay.indexOf(cSearch) === -1) return false;
+          }
+          if (cStatus && c.status !== cStatus) return false;
+          if (cCompany && (c.companies || []).indexOf(cCompany) === -1) return false;
+          if (cEmp) {
+            if (cEmp === 'unassigned') {
+              if (c.assignedEmployeeId) return false;
+            } else if (c.assignedEmployeeId !== cEmp) {
+              return false;
+            }
+          }
+          if (cPrbFilter === 'open_problems' && c.openProblemsCount <= 0) return false;
+          if (cPrbFilter === 'open_complaints' && c.openComplaintsCount <= 0) return false;
+          if (cPrbFilter === 'no_problems' && c.openProblemsCount > 0) return false;
+
+          if (cKpi === 'new' && !(c.isNew || c.status === 'جديد')) return false;
+          if (cKpi === 'active' && c.activeBookingsCount <= 0) return false;
+          if (cKpi === 'past' && c.pastBookingsCount <= 0) return false;
+          if (cKpi === 'open_problems' && c.openProblemsCount <= 0) return false;
+          if (cKpi === 'complaints' && c.openComplaintsCount <= 0) return false;
+          if (cKpi === 'extensions' && c.extensionsCount <= 0) return false;
+          if (cKpi === 'unfollowed' && !c.unfollowed) return false;
+          if (cKpi === 'repeat' && c.bookingsCount <= 1) return false;
+          if (cKpi === 'recent' && !c.isRecent) return false;
+          return true;
+        });
+
+        cFiltered.sort(function (a, b) {
+          if (cSort === 'bookings_desc') return b.bookingsCount - a.bookingsCount;
+          if (cSort === 'active_desc') return b.activeBookingsCount - a.activeBookingsCount;
+          if (cSort === 'amount_desc') return b.totalAmount - a.totalAmount;
+          if (cSort === 'created_desc') return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+          if (cSort === 'name_asc') return String(a.fullName || '').localeCompare(String(b.fullName || ''), 'ar');
+          return String(b.lastActivityAt || b.updatedAt || '').localeCompare(String(a.lastActivityAt || a.updatedAt || ''));
+        });
+
+        var cPage = Math.max(1, Math.floor(Number(payload.page || 1)));
+        var cPageSize = Math.min(200, Math.max(10, Math.floor(Number(payload.pageSize || 50))));
+        var cTotal = cFiltered.length;
+        var cTotalPages = Math.max(1, Math.ceil(cTotal / cPageSize));
+        var cSafePage = Math.min(cPage, cTotalPages);
+        var cSlice = cFiltered.slice((cSafePage - 1) * cPageSize, cSafePage * cPageSize);
+
+        var cCompaniesMap = {};
+        (db.reservations || []).forEach(function (r) { if (r && r.companyName) cCompaniesMap[r.companyName] = true; });
+        var cRecent = scopedItems.slice().sort(function (a, b) {
+          return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
+        }).slice(0, 6);
+
+        return {
+          success: true,
+          message: '',
+          data: {
+            items: cSlice,
+            kpis: viewData.kpis,
+            recentCustomers: cRecent,
+            facets: {
+              companies: Object.keys(cCompaniesMap).sort(),
+              employees: (db.employees || []).filter(function (e) { return e && e.status === 'active'; }).map(function (e) { return { id: e.id, name: e.name, role: e.role }; }),
+              statuses: core.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور']
+            },
+            total: cTotal,
+            page: cSafePage,
+            pageSize: cPageSize,
+            totalPages: cTotalPages
+          },
+          error: null
+        };
+      }
+
+      case 'getCustomerDetails': {
+        if (!core.canUserViewRoute(session.user, 'customers') || !core.canUserPerform(session.user, 'view_customers')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية الوصول إلى قسم العملاء.', data: null, error: 'FORBIDDEN' };
+        }
+        var targetCid = String(payload.customerId || payload.customerKey || payload.id || '').trim();
+        var lookupRes = String(payload.reservationId || payload.reservationNumber || '').trim();
+        var lookupPhone = String(payload.phone || '').trim();
+        if (!targetCid && !lookupRes && !lookupPhone) {
+          return { success: false, message: 'معرف العميل مطلوب.', data: null, error: 'VALIDATION' };
+        }
+
+        var detView = buildSandboxCustomersView(db, session.user);
+        var custObj = null;
+        if (targetCid) {
+          custObj = detView.items.find(function (c) { return c.id === targetCid || c.customerKey === targetCid; });
+        }
+        if (!custObj && lookupRes) {
+          var resMatch = (db.reservations || []).find(function (r) { return r.id === lookupRes || r.reservationNumber === lookupRes; });
+          if (resMatch) {
+            custObj = detView.items.find(function (c) { return c.reservationIds.indexOf(resMatch.id) !== -1; });
+          }
+        }
+        if (!custObj && lookupPhone) {
+          var normDigits = lookupPhone.replace(/\D/g, '');
+          var tail9 = normDigits.length >= 9 ? normDigits.slice(-9) : normDigits;
+          custObj = detView.items.find(function (c) {
+            var cd = String(c.normalizedPhone || c.phone || '').replace(/\D/g, '');
+            return (tail9 && cd.indexOf(tail9) !== -1) || c.phone === lookupPhone;
+          });
+        }
+        if (!custObj) {
+          return { success: false, message: 'ملف العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        }
+
+        ensureSandboxCustomerRecord(db, custObj);
+        var custResList = (db.reservations || []).filter(function (r) {
+          return custObj.reservationIds.indexOf(r.id) !== -1 || r.customerId === custObj.id;
+        }).sort(function (a, b) {
+          return String(b.startDate || b.createdAt || '').localeCompare(String(a.startDate || a.createdAt || ''));
+        });
+
+        if (session.role === 'agent' && db.settings.allow_agent_view_all === false) {
+          var hasAg = custObj.assignedEmployeeId === session.employeeId ||
+            custResList.some(function (r) { return (r.assignedEmployeeIds || []).indexOf(session.employeeId) !== -1; });
+          if (!hasAg) {
+            return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية عرض ملف هذا العميل.', data: null, error: 'FORBIDDEN' };
+          }
+        }
+
+        var resIdSet = {};
+        var resNumSet = {};
+        custResList.forEach(function (r) {
+          if (r.id) resIdSet[r.id] = true;
+          if (r.reservationNumber) resNumSet[r.reservationNumber] = true;
+        });
+
+        var custExts = (db.extensions || []).filter(function (e) { return resIdSet[e.reservationId] || resNumSet[e.reservationNumber]; });
+        var custPrbs = (db.problems || []).filter(function (p) { return p.customerId === custObj.id || resIdSet[p.reservationId]; });
+        var custFus = (db.followUps || []).filter(function (f) { return resIdSet[f.reservationId]; });
+        var custNotes = (db.customerNotes || []).filter(function (n) { return n.customerId === custObj.id; })
+          .sort(function (a, b) { return String(b.createdAt || '').localeCompare(String(a.createdAt || '')); });
+        var custActs = (db.activityLog || []).filter(function (a) {
+          return (a.entityType === 'Customer' && a.entityId === custObj.id) ||
+                 (a.entityType === 'Reservation' && resNumSet[a.entityId]);
+        }).slice(0, 120);
+
+        var totalAmt = 0, baseAmt = 0, extAmt = 0, paidAmt = 0, refundAmt = 0, penaltyAmt = 0;
+        custResList.forEach(function (r) {
+          totalAmt += Number(r.totalAmount || 0);
+          baseAmt += Number(r.baseAmount || 0);
+          extAmt += Number(r.extensionsAmount || 0);
+          paidAmt += Number(r.paidAmount || 0);
+          refundAmt += Number(r.refundAmount || 0);
+          penaltyAmt += Number(r.penaltyAmount || 0);
+        });
+
+        var tl = [];
+        custResList.forEach(function (r) {
+          tl.push({
+            id: 'TL_RES_' + r.id,
+            kind: 'reservation',
+            title: 'حجز ' + (r.reservationNumber || r.id) + ' — ' + (r.carName || r.companyName || ''),
+            subtitle: (r.startDate || '') + ' ← ' + (r.extendedUntilDate || r.endDate || '') + ' · ' + Number(r.totalAmount || 0).toLocaleString('en-US') + ' ر.س',
+            actor: r.companyName || '',
+            status: r.internalStatus || '',
+            at: r.sourceCreatedAt || r.createdAt || r.startDate || '',
+            entityId: r.id
+          });
+        });
+        custExts.forEach(function (e) {
+          tl.push({
+            id: 'TL_EXT_' + e.id,
+            kind: 'extension',
+            title: 'تمديد #' + (e.sequenceNumber || e.extensionNumber || '') + ' على الحجز ' + (e.reservationNumber || ''),
+            subtitle: Number(e.extendDays || 0) + ' يوم · ' + Number(e.amount || 0).toLocaleString('en-US') + ' ر.س',
+            actor: e.paymentMethod || e.extensionTypeAr || '',
+            status: e.statusAr || e.paymentStatus || '',
+            at: e.paymentDate || e.startDate || e.syncedAt || '',
+            entityId: e.reservationId
+          });
+        });
+        custPrbs.forEach(function (p) {
+          tl.push({
+            id: 'TL_PRB_' + p.id,
+            kind: 'problem',
+            title: (p.ticketType === 'شكوى' ? 'شكوى ' : 'مشكلة ') + p.problemNumber + (p.reservationNumber ? (' (' + p.reservationNumber + ')') : ''),
+            subtitle: p.description || '',
+            actor: p.createdByName || '',
+            status: p.status || '',
+            at: p.createdAt || '',
+            entityId: p.id
+          });
+        });
+        custFus.forEach(function (f) {
+          tl.push({
+            id: 'TL_FU_' + f.id,
+            kind: 'followup',
+            title: 'متابعة حجز ' + (f.reservationNumber || '') + ': ' + (f.action || f.status || ''),
+            subtitle: f.notes || '',
+            actor: f.employeeName || '',
+            status: f.status || '',
+            at: f.createdAt || '',
+            entityId: f.reservationId
+          });
+        });
+        custNotes.forEach(function (n) {
+          tl.push({
+            id: 'TL_NOTE_' + n.id,
+            kind: 'note',
+            title: (n.noteType || 'ملاحظة') + (n.reservationNumber ? (' (الحجز ' + n.reservationNumber + ')') : ''),
+            subtitle: n.content || '',
+            actor: n.createdByName || '',
+            status: n.noteType || '',
+            at: n.createdAt || '',
+            entityId: n.id
+          });
+        });
+        custActs.forEach(function (a) {
+          tl.push({
+            id: 'TL_ACT_' + a.id,
+            kind: 'activity',
+            title: (a.actionType || '') + (a.entityId ? (' (' + a.entityId + ')') : ''),
+            subtitle: a.details || '',
+            actor: a.userName || '',
+            status: '',
+            at: a.createdAt || ''
+          });
+        });
+        tl.sort(function (x, y) { return String(y.at || '').localeCompare(String(x.at || '')); });
+
+        return {
+          success: true,
+          message: '',
+          data: {
+            customer: custObj,
+            reservations: core.redactReservationsList ? core.redactReservationsList(custResList, session.user) : custResList,
+            extensions: custExts,
+            problems: custPrbs,
+            followUps: custFus,
+            notes: custNotes,
+            financialSummary: {
+              totalAmount: Number(totalAmt.toFixed(2)),
+              baseAmount: Number(baseAmt.toFixed(2)),
+              extensionsAmount: Number(extAmt.toFixed(2)),
+              paidAmount: Number(paidAmt.toFixed(2)),
+              refundAmount: Number(refundAmt.toFixed(2)),
+              penaltyAmount: Number(penaltyAmt.toFixed(2)),
+              outstandingAmount: Math.max(0, Number((totalAmt - paidAmt).toFixed(2))),
+              bookingsCount: custResList.length,
+              activeBookingsCount: custObj.activeBookingsCount,
+              pastBookingsCount: custObj.pastBookingsCount,
+              extensionsCount: custExts.length || custObj.extensionsCount,
+              companiesCount: (custObj.companies || []).length,
+              openProblemsCount: custObj.openProblemsCount,
+              openComplaintsCount: custObj.openComplaintsCount
+            },
+            timeline: tl.slice(0, 250),
+            employees: (db.employees || []).filter(function (e) { return e && e.status === 'active'; }).map(function (e) { return { id: e.id, name: e.name, role: e.role }; })
+          },
+          error: null
+        };
+      }
+
+      case 'createCustomer': {
+        if (!core.canUserPerform(session.user, 'edit_customer_details') || !core.canUserUseActionButton(session.user, 'act_edit_customer')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إضافة العملاء.', data: null, error: 'FORBIDDEN' };
+        }
+        var cName = String(payload.fullName || '').trim();
+        var cPhone = String(payload.phone || '').trim();
+        var cEmail = String(payload.email || '').trim();
+        if (!cName) return { success: false, message: 'اسم العميل مطلوب.', data: null, error: 'VALIDATION' };
+        if (!cPhone && !cEmail) return { success: false, message: 'رقم الجوال أو البريد الإلكتروني مطلوب.', data: null, error: 'VALIDATION' };
+
+        var pMeta = core.extractPhoneCountryCode ? core.extractPhoneCountryCode(cPhone) : { countryCode: '', normalizedPhone: cPhone.replace(/\D/g, '') };
+        var canIdC = core.canUserViewCustomerId ? core.canUserViewCustomerId(session.user) : false;
+        var cIdNum = canIdC ? String(payload.idNumber || '').trim() : '';
+        var cIdType = canIdC ? (String(payload.idType || '').trim() || (core.detectCustomerIdType ? core.detectCustomerIdType(cIdNum) : '')) : '';
+        var cKey = core.buildCustomerCanonicalKey ? core.buildCustomerCanonicalKey({ phone: cPhone, email: cEmail, idNumber: cIdNum, name: cName }) : ('PH:' + pMeta.normalizedPhone);
+
+        var curCustList = buildSandboxCustomersView(db, session.user).items;
+        if (curCustList.some(function (x) { return x.customerKey === cKey; })) {
+          return { success: false, message: 'يوجد عميل مسجل بنفس رقم الجوال أو الهوية بالفعل.', data: null, error: 'CONFLICT' };
+        }
+        var nowC = new Date().toISOString();
+        var cEmpId = String(payload.assignedEmployeeId || '').trim();
+        var cEmpObj = cEmpId ? db.employees.find(function (e) { return e.id === cEmpId; }) : null;
+        var newC = {
+          id: genId('CUS'),
+          customerKey: cKey,
+          fullName: cName,
+          phone: cPhone,
+          countryCode: String(payload.countryCode || pMeta.countryCode || '').trim(),
+          normalizedPhone: pMeta.normalizedPhone || '',
+          email: cEmail,
+          idNumber: cIdNum,
+          idType: cIdType,
+          status: (core.CUSTOMER_STATUS_LIST || []).indexOf(payload.status) !== -1 ? payload.status : 'جديد',
+          statusOverride: Boolean(payload.status && payload.status !== 'جديد'),
+          assignedEmployeeId: cEmpObj ? cEmpObj.id : '',
+          assignedEmployeeName: cEmpObj ? cEmpObj.name : '',
+          notes: String(payload.notes || '').trim(),
+          tags: Array.isArray(payload.tags) ? payload.tags : [],
+          source: 'manual',
+          lastContactAt: '',
+          createdAt: nowC,
+          updatedAt: nowC
+        };
+        if (!Array.isArray(db.customers)) db.customers = [];
+        db.customers.unshift(newC);
+        appendSandboxActivity(db, session.user, 'إضافة عميل', 'Customer', newC.id, cName + ' (' + (cPhone || cEmail) + ')');
+        saveSandboxDb(db);
+        return { success: true, message: 'تم إنشاء ملف العميل بنجاح.', data: core.redactCustomerSensitiveFields(newC, session.user), error: null };
+      }
+
+      case 'updateCustomerProfile': {
+        if (!core.canUserPerform(session.user, 'edit_customer_details') || !core.canUserUseActionButton(session.user, 'act_edit_customer')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية تعديل بيانات العملاء.', data: null, error: 'FORBIDDEN' };
+        }
+        var updCid = String(payload.customerId || payload.id || '').trim();
+        if (!updCid) return { success: false, message: 'معرف العميل مطلوب.', data: null, error: 'VALIDATION' };
+        var vBefore = buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.id === updCid; });
+        if (!vBefore) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        var recUpd = ensureSandboxCustomerRecord(db, vBefore);
+        var canIdUpd = core.canUserViewCustomerId ? core.canUserViewCustomerId(session.user) : false;
+        if (payload.fullName !== undefined && String(payload.fullName).trim()) recUpd.fullName = String(payload.fullName).trim();
+        if (payload.phone !== undefined) {
+          recUpd.phone = String(payload.phone).trim();
+          var pm = core.extractPhoneCountryCode ? core.extractPhoneCountryCode(recUpd.phone) : { countryCode: '', normalizedPhone: recUpd.phone.replace(/\D/g, '') };
+          recUpd.countryCode = payload.countryCode !== undefined ? String(payload.countryCode).trim() : pm.countryCode;
+          recUpd.normalizedPhone = pm.normalizedPhone;
+        } else if (payload.countryCode !== undefined) {
+          recUpd.countryCode = String(payload.countryCode).trim();
+        }
+        if (payload.email !== undefined) recUpd.email = String(payload.email).trim();
+        if (payload.idNumber !== undefined && canIdUpd) {
+          recUpd.idNumber = String(payload.idNumber).trim();
+          recUpd.idType = payload.idType !== undefined ? String(payload.idType).trim() : (core.detectCustomerIdType ? core.detectCustomerIdType(recUpd.idNumber) : '');
+        }
+        if (payload.status !== undefined && (core.CUSTOMER_STATUS_LIST || []).indexOf(payload.status) !== -1) {
+          recUpd.status = payload.status;
+          recUpd.statusOverride = true;
+        }
+        if (payload.notes !== undefined) recUpd.notes = String(payload.notes).trim();
+        if (Array.isArray(payload.tags)) recUpd.tags = payload.tags;
+        recUpd.updatedAt = new Date().toISOString();
+        appendSandboxActivity(db, session.user, 'تحديث ملف عميل', 'Customer', recUpd.id, recUpd.fullName);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم تحديث بيانات العميل.', data: { customer: core.redactCustomerSensitiveFields(recUpd, session.user) }, error: null };
+      }
+
+      case 'assignCustomerEmployee': {
+        if (!core.canUserPerform(session.user, 'assign_customer_employee') || !core.canUserUseActionButton(session.user, 'act_assign_customer')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إسناد العملاء للموظفين.', data: null, error: 'FORBIDDEN' };
+        }
+        var asgCid = String(payload.customerId || payload.id || '').trim();
+        var asgEmpId = String(payload.employeeId || '').trim();
+        var vAsg = buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.id === asgCid; });
+        if (!vAsg) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        var recAsg = ensureSandboxCustomerRecord(db, vAsg);
+        var empAsg = asgEmpId ? db.employees.find(function (e) { return e.id === asgEmpId; }) : null;
+        if (asgEmpId && !empAsg) return { success: false, message: 'الموظف غير موجود.', data: null, error: 'NOT_FOUND' };
+        recAsg.assignedEmployeeId = empAsg ? empAsg.id : '';
+        recAsg.assignedEmployeeName = empAsg ? empAsg.name : '';
+        recAsg.updatedAt = new Date().toISOString();
+        if (empAsg && empAsg.id !== session.employeeId) {
+          pushSandboxNotification(db, empAsg.id, empAsg.role, 'customer_assigned', 'تم إسناد عميل إليك: ' + recAsg.fullName, 'أسند ' + session.user.name + ' ملف العميل ' + recAsg.fullName + ' إليك.', 'Customer', recAsg.id);
+        }
+        appendSandboxActivity(db, session.user, 'إسناد عميل', 'Customer', recAsg.id, recAsg.fullName + ' ← ' + (recAsg.assignedEmployeeName || 'بدون موظف'));
+        saveSandboxDb(db);
+        return { success: true, message: 'تم تحديث الموظف المسؤول.', data: { customer: core.redactCustomerSensitiveFields(recAsg, session.user) }, error: null };
+      }
+
+      case 'addCustomerNote': {
+        if (!core.canUserPerform(session.user, 'add_customer_note') || !core.canUserUseActionButton(session.user, 'act_add_customer_note')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إضافة ملاحظات للعميل.', data: null, error: 'FORBIDDEN' };
+        }
+        var noteCid = String(payload.customerId || '').trim();
+        var noteBody = String(payload.content || payload.note || '').trim();
+        if (!noteCid) return { success: false, message: 'معرف العميل مطلوب.', data: null, error: 'VALIDATION' };
+        if (!noteBody) return { success: false, message: 'نص الملاحظة أو التواصل مطلوب.', data: null, error: 'VALIDATION' };
+        var vNote = buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.id === noteCid; });
+        if (!vNote) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
+        var recNoteCust = ensureSandboxCustomerRecord(db, vNote);
+        var nTypes = ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
+        var noteType = nTypes.indexOf(payload.noteType) !== -1 ? payload.noteType : 'ملاحظة';
+        var noteResId = String(payload.reservationId || '').trim();
+        var noteResNum = String(payload.reservationNumber || '').trim();
+        if (noteResId && !noteResNum) {
+          var rmNote = db.reservations.find(function (r) { return r.id === noteResId; });
+          if (rmNote) noteResNum = rmNote.reservationNumber;
+        }
+        var nowNote = new Date().toISOString();
+        var newNoteObj = {
+          id: genId('CNOTE'),
+          customerId: recNoteCust.id,
+          reservationId: noteResId,
+          reservationNumber: noteResNum,
+          noteType: noteType,
+          content: noteBody,
+          createdById: session.employeeId,
+          createdByName: session.user.name,
+          createdAt: nowNote,
+          updatedAt: nowNote
+        };
+        if (!Array.isArray(db.customerNotes)) db.customerNotes = [];
+        db.customerNotes.unshift(newNoteObj);
+        if (noteType !== 'ملاحظة') recNoteCust.lastContactAt = nowNote;
+        recNoteCust.updatedAt = nowNote;
+        dispatchSandboxMentionNotifications(db, session.user, [noteBody], 'Customer', recNoteCust.id, recNoteCust.fullName);
+        appendSandboxActivity(db, session.user, noteType !== 'ملاحظة' ? 'تسجيل تواصل مع عميل' : 'إضافة ملاحظة عميل', 'Customer', recNoteCust.id, recNoteCust.fullName + ': ' + noteBody.slice(0, 120));
+        saveSandboxDb(db);
+        return { success: true, message: 'تم إضافة الملاحظة إلى ملف العميل.', data: newNoteObj, error: null };
+      }
+
       default:
         return { success: false, message: 'الإجراء غير مدعوم.', data: null, error: 'UNKNOWN_ACTION' };
     }
@@ -7819,11 +8431,12 @@
       touchedScopes.dashboard = true;
       touchedScopes.followUps = true;
       touchedScopes.problems = true;
+      touchedScopes.customers = true;
       touchedScopes.reports = true;
       touchedScopes.activity = true;
       setLocalReservationsState(ns, [], false);
       localDetailsByNs[ns] = {};
-      extraInvalidates.push('reservations', 'todayRadar', 'dashboard', 'followUps', 'problems', 'reports', 'activity');
+      extraInvalidates.push('reservations', 'todayRadar', 'dashboard', 'followUps', 'problems', 'customers', 'reports', 'activity');
     }
 
     var chRes = Array.isArray(delta.changedReservations) ? delta.changedReservations : [];
@@ -7831,6 +8444,7 @@
       touchedScopes.reservations = true;
       touchedScopes.todayRadar = true;
       touchedScopes.dashboard = true;
+      touchedScopes.customers = true;
       touchedScopes.reports = true;
       touchedScopes.employees = true;
       touchedScopes.sync = true;
@@ -7868,6 +8482,7 @@
       touchedScopes.followUps = true;
       touchedScopes.dashboard = true;
       touchedScopes.todayRadar = true;
+      touchedScopes.customers = true;
       if (localReservationsByNs[ns] && localReservationsByNs[ns].byId) {
         var fuResPatch = [];
         chFu.forEach(function (f) {
@@ -7965,6 +8580,7 @@
       delPrbIds.forEach(function (id) { if (id) delPrbMap[String(id)] = true; });
       touchedScopes.problems = true;
       touchedScopes.dashboard = true;
+      touchedScopes.customers = true;
       touchedScopes.reports = true;
       if (delPrbIds.length > 0) {
         touchedScopes.todayRadar = true;
@@ -8170,6 +8786,7 @@
     var invalidateList = extraInvalidates.slice();
     if (touchedScopes.dashboard) invalidateList.push('dashboard');
     if (touchedScopes.todayRadar) invalidateList.push('todayRadar');
+    if (touchedScopes.customers) invalidateList.push('customers');
     if (touchedScopes.reports) invalidateList.push('reports');
     if (invalidateList.length > 0) {
       var dedupInv = [];

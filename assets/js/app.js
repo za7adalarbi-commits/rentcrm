@@ -7,7 +7,7 @@
   var PREFS_KEY = 'rg_crm_user_prefs';
   var UI_SIMP_STORAGE_KEY = 'rg_crm_ui_simplification_v1';
   var ROUTE_FILTERS_STORAGE_KEY = 'rg_crm_route_filters_v1';
-  var VALID_ROUTES = ['dashboard', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var VALID_ROUTES = ['dashboard', 'reservations', 'customers', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
 
   function saveRouteFilters(userOverride) {
     try {
@@ -95,6 +95,19 @@
           branch: state.reports.branch || ''
         };
       }
+      if (state.customers && typeof state.customers === 'object') {
+        payload.filters.customers = {
+          search: state.customers.search || '',
+          status: state.customers.status || '',
+          company: state.customers.company || '',
+          assignedEmployeeId: state.customers.assignedEmployeeId || '',
+          problemFilter: state.customers.problemFilter || '',
+          kpiFilter: state.customers.kpiFilter || 'all',
+          sortBy: state.customers.sortBy || 'last_activity',
+          page: Math.max(1, Number(state.customers.page || 1)),
+          pageSize: Math.max(10, Number(state.customers.pageSize || 50))
+        };
+      }
       sessionStorage.setItem(ROUTE_FILTERS_STORAGE_KEY, JSON.stringify(payload));
     } catch (_eRf) {}
   }
@@ -134,6 +147,13 @@
       }
       if (f.reports && typeof f.reports === 'object' && !state.reports) {
         state.reports = Object.assign({ reportType: 'all_reservations', rows: [] }, f.reports);
+      }
+      if (f.customers && typeof f.customers === 'object' && !state.customers) {
+        state.customers = Object.assign({
+          search: '', status: '', company: '', assignedEmployeeId: '',
+          problemFilter: '', kpiFilter: 'all', sortBy: 'last_activity',
+          page: 1, pageSize: 50, selectedCustomerId: ''
+        }, f.customers);
       }
     } catch (_eRfLoad) {}
   }
@@ -2113,6 +2133,16 @@
       withActionLock: withActionLock,
       isActionLocked: isActionLocked,
       saveRouteFilters: function () { saveRouteFilters(); },
+      getState: function () { return state; },
+      buildAppCtx: buildAppCtx,
+      navigateTo: function (routeId, subOpts) {
+        return navigateToRoute(routeId, subOpts);
+      },
+      openCustomerProfile: function (target) {
+        if (root.RGCustomers && typeof root.RGCustomers.openCustomerProfile === 'function') {
+          return root.RGCustomers.openCustomerProfile(target, buildAppCtx());
+        }
+      },
       onAuthChanged: bootAuthenticatedApp
     };
   }
@@ -2122,6 +2152,7 @@
       brand: 'RENTAL GATE CRM',
       nav_dashboard: 'لوحة التحكم',
       nav_reservations: 'الحجوزات',
+      nav_customers: 'العملاء',
       nav_inactive_reservations: 'الحجوزات غير الفعالة',
       nav_my_followups: 'متابعاتي',
       nav_team_followups: 'متابعات الفريق',
@@ -2205,6 +2236,7 @@
       brand: 'RENTAL GATE CRM',
       nav_dashboard: 'Dashboard',
       nav_reservations: 'Reservations',
+      nav_customers: 'Customers',
       nav_inactive_reservations: 'Inactive Reservations',
       nav_my_followups: 'My Follow-Ups',
       nav_team_followups: 'Team Follow-Ups',
@@ -3191,6 +3223,7 @@
   var NAV_ITEMS = [
     { id: 'dashboard', key: 'nav_dashboard', group: 'ops', icon: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z' },
     { id: 'reservations', key: 'nav_reservations', group: 'ops', icon: 'M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 16H5V9h14v11z' },
+    { id: 'customers', key: 'nav_customers', group: 'ops', icon: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm13 14v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' },
     { id: 'my-followups', key: 'nav_my_followups', group: 'ops', icon: 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' },
     { id: 'team-followups', key: 'nav_team_followups', group: 'ops', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm14 14v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' },
     { id: 'problems', key: 'nav_problems', group: 'ops', icon: 'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01' },
@@ -3232,7 +3265,7 @@
           '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line md"></div><div class="rg-skeleton-box" style="height:175px;"></div></div>' +
           '<div class="rg-skeleton-interactive rg-skeleton-panel"><div class="rg-skeleton-line sm"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
         '</div>';
-    } else if (rId === 'reservations' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
+    } else if (rId === 'reservations' || rId === 'customers' || rId === 'employees' || rId === 'activity' || rId === 'problems') {
       var rows = '';
       for (var i = 0; i < 5; i++) {
         rows +=
@@ -3326,6 +3359,23 @@
             : Object.assign({ page: 1, pageSize: 20, lifecycle: lifePre }, resSt)
         };
       }
+      case 'customers': {
+        var custSt = state.customers || {};
+        return {
+          action: 'getCustomers',
+          payload: {
+            search: custSt.search || '',
+            status: custSt.status || '',
+            company: custSt.company || '',
+            assignedEmployeeId: custSt.assignedEmployeeId || '',
+            problemFilter: custSt.problemFilter || '',
+            kpiFilter: custSt.kpiFilter || 'all',
+            sortBy: custSt.sortBy || 'last_activity',
+            page: custSt.page || 1,
+            pageSize: custSt.pageSize || 50
+          }
+        };
+      }
       case 'my-followups':
         return { action: 'getMyFollowUps', payload: {} };
       case 'team-followups':
@@ -3390,6 +3440,11 @@
         break;
       case 'reservations':
         await root.RGReservations.render(slot, ctx);
+        break;
+      case 'customers':
+        if (root.RGCustomers && typeof root.RGCustomers.render === 'function') {
+          await root.RGCustomers.render(slot, ctx);
+        }
         break;
       case 'my-followups':
         await root.RGFollowUps.renderMyFollowUps(slot, ctx);
@@ -5977,8 +6032,33 @@
     setCallWrapupShortcutsConfig: setCallWrapupShortcutsConfig,
     getActiveCallWrapupShortcuts: getActiveCallWrapupShortcuts,
     mountCallShortcutsControlPanel: mountCallShortcutsControlPanel,
-    openDeveloperCallShortcutsModal: openDeveloperCallShortcutsModal
+    openDeveloperCallShortcutsModal: openDeveloperCallShortcutsModal,
+    getState: function () { return state; },
+    buildAppCtx: buildAppCtx,
+    navigateTo: navigateToRoute,
+    openCustomerProfile: function (target) {
+      if (root.RGCustomers && typeof root.RGCustomers.openCustomerProfile === 'function') {
+        return root.RGCustomers.openCustomerProfile(target, buildAppCtx());
+      }
+    }
   };
+
+  async function navigateToRoute(routeId, subOpts) {
+    var curU = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var safeRoute = resolveSafeRouteForUser(routeId || 'dashboard', curU, getLayoutPrefs(curU));
+    if (safeRoute === 'customers' && subOpts && subOpts.customerId) {
+      if (!state.customers || typeof state.customers !== 'object') state.customers = {};
+      state.customers.selectedCustomerId = String(subOpts.customerId);
+    }
+    state.route = safeRoute;
+    try {
+      var targetHash = '#' + safeRoute;
+      if (window.location.hash !== targetHash) {
+        window.history.replaceState(null, '', targetHash);
+      }
+    } catch (_eNav) {}
+    return renderRoute();
+  }
 
   document.addEventListener('rg:unauthorized', function () {
     stopAutoRefreshLoop();
@@ -6076,6 +6156,25 @@
   });
 
   document.addEventListener('click', function (ev) {
+    var custLinkEl = ev.target && ev.target.closest ? ev.target.closest('.rg-customer-link') : null;
+    if (custLinkEl && !custLinkEl.classList.contains('cust-open-profile')) {
+      var curLinkU = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+      var canViewCust = curLinkU && root.RGCrmCore && root.RGCrmCore.canUserViewRoute
+        ? root.RGCrmCore.canUserViewRoute(curLinkU, 'customers')
+        : true;
+      if (canViewCust && root.RGCustomers && typeof root.RGCustomers.openCustomerProfile === 'function') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var modalRootClose = document.getElementById('modal-root');
+        if (modalRootClose) modalRootClose.innerHTML = '';
+        root.RGCustomers.openCustomerProfile({
+          customerId: custLinkEl.getAttribute('data-cust-id') || '',
+          reservationId: custLinkEl.getAttribute('data-res-id') || '',
+          phone: custLinkEl.getAttribute('data-phone') || ''
+        }, buildAppCtx());
+        return;
+      }
+    }
     var telEl = ev.target && ev.target.closest ? ev.target.closest('a.rg-tel-btn') : null;
     if (telEl) {
       var callResId = telEl.getAttribute('data-call-res-id') || '';
