@@ -746,8 +746,8 @@
 
   function isProtectedRejectedOrCancelledItem(item) {
     if (!item || typeof item !== 'object') return false;
-    if (item.isSourceRejected === true || item.isSourceCancelled === true) return true;
-    return isRejectedStatus(item) || isCancelledStatus(item);
+    var lc = classifyReservationLifecycle(item);
+    return lc === 'rejected' || lc === 'cancelled';
   }
 
   function extractExplicitReferenceNumber(apiItem, existing, excludeValues) {
@@ -1610,23 +1610,45 @@
       : ((isFinite(existingSeq) && existingSeq > 0) ? Math.floor(existingSeq) : null);
 
     var resolvedCompanyNumber = normalizeStr((existing && existing.companyNumber) || apiItem.companyNumber || apiItem.company_number || apiItem.companyCode || apiItem.companyId || '');
-    var finalLifecycle = getReservationLifecycleKind({
+    var rawLifecycleProbe = {
       originalStatusCode: statusCode,
       originalStatusAr: sourceStatusAr,
       internalStatus: nextInternalStatus
+    };
+    var hasExplicitExternalActive = isExplicitActiveStatusToken(statusCode) || isExplicitActiveStatusToken(sourceStatusAr);
+    var resolvedIsSourceCancelled = hasExplicitExternalActive
+      ? false
+      : (typeof apiItem.isSourceCancelled === 'boolean'
+          ? apiItem.isSourceCancelled
+          : (classifyReservationLifecycle(rawLifecycleProbe) === 'cancelled'
+              ? true
+              : (existing && !sourceChanged && typeof existing.isSourceCancelled === 'boolean' ? existing.isSourceCancelled : null)));
+    var resolvedIsSourceRejected = (hasExplicitExternalActive || resolvedIsSourceCancelled === true)
+      ? false
+      : (typeof apiItem.isSourceRejected === 'boolean'
+          ? apiItem.isSourceRejected
+          : (classifyReservationLifecycle(rawLifecycleProbe) === 'rejected'
+              ? true
+              : (existing && !sourceChanged && typeof existing.isSourceRejected === 'boolean' ? existing.isSourceRejected : null)));
+    var finalLifecycle = classifyReservationLifecycle({
+      originalStatusCode: statusCode,
+      originalStatusAr: sourceStatusAr,
+      internalStatus: nextInternalStatus,
+      isSourceRejected: resolvedIsSourceRejected,
+      isSourceCancelled: resolvedIsSourceCancelled
     });
-    var resolvedIsSourceRejected = typeof apiItem.isSourceRejected === 'boolean'
-      ? apiItem.isSourceRejected
-      : (existing && typeof existing.isSourceRejected === 'boolean' ? existing.isSourceRejected : null);
-    var resolvedIsSourceCancelled = typeof apiItem.isSourceCancelled === 'boolean'
-      ? apiItem.isSourceCancelled
-      : (existing && typeof existing.isSourceCancelled === 'boolean' ? existing.isSourceCancelled : null);
-    var incomingRejected = (typeof resolvedIsSourceRejected === 'boolean')
-      ? resolvedIsSourceRejected
-      : (finalLifecycle === 'rejected');
-    var incomingCancelled = (typeof resolvedIsSourceCancelled === 'boolean')
-      ? resolvedIsSourceCancelled
-      : (finalLifecycle === 'cancelled');
+    if (finalLifecycle === 'active') {
+      resolvedIsSourceRejected = false;
+      resolvedIsSourceCancelled = false;
+    } else if (finalLifecycle === 'cancelled') {
+      resolvedIsSourceCancelled = true;
+      resolvedIsSourceRejected = false;
+    } else if (finalLifecycle === 'rejected') {
+      resolvedIsSourceRejected = true;
+      resolvedIsSourceCancelled = false;
+    }
+    var incomingRejected = finalLifecycle === 'rejected';
+    var incomingCancelled = finalLifecycle === 'cancelled';
 
     var newCompanyRaw = apiItem.newCompanyName || apiItem.new_company_name || apiItem.targetCompanyName || apiItem.target_company_name || apiItem.transferCompanyName || apiItem.transfer_company_name || apiItem.alternativeCompanyName || apiItem.alternative_company_name || (apiItem.newCompany && (apiItem.newCompany.arName || apiItem.newCompany.enName || apiItem.newCompany.name)) || (apiItem.transferCompany && (apiItem.transferCompany.arName || apiItem.transferCompany.enName || apiItem.transferCompany.name));
     var resolvedNewCompanyName = incomingRejected
@@ -3574,11 +3596,17 @@
             merged[k] = prev[k];
           }
         }
-        if (prev.isSourceCancelled === true || item.isSourceCancelled === true) {
-          merged.isSourceCancelled = true;
-        }
-        if (prev.isSourceRejected === true || item.isSourceRejected === true) {
-          merged.isSourceRejected = true;
+        var mergedExtCode = extractReservationStatusCode(merged, true);
+        if (isExplicitActiveStatusToken(mergedExtCode)) {
+          merged.isSourceCancelled = false;
+          merged.isSourceRejected = false;
+        } else {
+          if (prev.isSourceCancelled === true || item.isSourceCancelled === true) {
+            merged.isSourceCancelled = true;
+            merged.isSourceRejected = false;
+          } else if (prev.isSourceRejected === true || item.isSourceRejected === true) {
+            merged.isSourceRejected = true;
+          }
         }
         map[finalKey] = merged;
       }
@@ -6988,14 +7016,35 @@
 
   // ---------- TODAY'S PICKUPS & RETURNS RADAR ----------
 
+  var EXPLICIT_ACTIVE_STATUS_VALUES = [
+    'confirmed', 'completed', 'finished', 'closed', 'ended', 'active', 'started',
+    'finished_by_driver', 'in_progress', 'booked', 'reserved', 'delivered', 'picked_up',
+    'received', 'on_rent', 'rented', 'car_received', 'ongoing', 'returned', 'extended',
+    'automatically_extended', 'approved', 'accepted', 'admin_approved', 'paid',
+    'wallet_paid', 'paid_by_wallet', 'paid_wallet', 'hold', 'on_hold', 'onhold',
+    'suspended', 'suspend', 'paused', 'pause', 'frozen', 'hold_by_admin', 'admin_hold',
+    'waiting_approval', 'waiting_confirmation', 'pending_approval', 'pending_confirmation',
+    'under_review', 'ready', 'ready_for_pickup', 'ready_to_pickup', 'on_the_way',
+    'pending', 'new', 'created', 'expired', 'no_show', 'draft', 'unpaid',
+    'waiting_payment', 'awaiting_payment', 'pending_payment', 'location_changed',
+    'مؤكد', 'منتهي', 'مكتمل', 'نشط الآن', 'نشط الان', 'ناشط', 'نشط',
+    'تم التسليم', 'تم التسليم من قبل السائق', 'تم الاستلام', 'تم الإرجاع', 'تم الارجاع',
+    'تم التمديد', 'تم التمديد تلقائيًا', 'تم التمديد تلقائيا', 'مقبول', 'معتمد إداريًا', 'معتمد اداريا',
+    'مدفوع', 'مدفوع عن طريق المحفظة', 'مدفوع بالمحفظة', 'تم الحجز', 'معلق',
+    'قيد الانتظار', 'قيد التنفيذ', 'بدأ التنفيذ', 'جديد', 'في الطريق',
+    'جاهز للاستلام', 'تم تغيير الموقع', 'بانتظار الدفع', 'غير مدفوع',
+    'لم يحضر', 'مسودة', 'تم الإنشاء', 'تم الانشاء', 'لم يتم الحجز'
+  ];
+
   var REJECTED_STATUS_VALUES = [
     'مرفوض', 'مرفوضة', 'تم الرفض', 'تم الرفض من الشركة', 'تم الرفض من المزود', 'مرفوض من الموقع', 'مرفوض من الشركة', 'مرفوض من المزود', 'مرفوض من الادارة', 'مرفوض من الإدارة', 'مرفوض تلقائيا', 'مرفوض تلقائياً',
-    'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'rejected_by_provider', 'rejected_by_customer', 'rejected_by_client', 'rejected_by_user', 'provider_rejected', 'admin_rejected', 'company_rejected', 'customer_rejected', 'client_rejected', 'user_rejected', 'auto_rejected', 'system_rejected', 'declined_by_admin', 'declined_by_company', 'declined_by_provider', 'refused_by_admin', 'refused_by_company', 'refused_by_provider'
+    'rejected', 'declined', 'refused', 'rejected_by_admin', 'rejected_by_company', 'rejected_by_provider', 'rejected_by_customer', 'rejected_by_client', 'rejected_by_user', 'provider_rejected', 'admin_rejected', 'company_rejected', 'customer_rejected', 'client_rejected', 'user_rejected', 'auto_rejected', 'system_rejected', 'declined_by_admin', 'declined_by_company', 'declined_by_provider', 'refused_by_admin', 'refused_by_company', 'refused_by_provider', 'declined_by_user', 'declined_by_client', 'declined_by_customer', 'refused_by_user', 'refused_by_client', 'refused_by_customer'
   ];
 
   var CANCELLED_STATUS_VALUES = [
-    'تم الإلغاء', 'تم الالغاء', 'تم الإلغاء من العميل', 'تم الالغاء من العميل',
-    'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل', 'ملغى من العميل', 'ملغي من الشركة', 'ملغى من الشركة', 'ملغي من الادارة', 'ملغي من الإدارة', 'ملغى من الادارة', 'ملغى من الإدارة', 'ملغي تلقائيا', 'ملغي تلقائياً',
+    'تم الإلغاء', 'تم الالغاء', 'تم الإلغاء من العميل', 'تم الالغاء من العميل', 'تم الإلغاء من الشركة', 'تم الالغاء من الشركة',
+    'الغاء العميل', 'إلغاء العميل', 'الغاء الحجز', 'إلغاء الحجز',
+    'ملغي', 'ملغى', 'ملغاة', 'ملغي من العميل', 'ملغى من العميل', 'ملغاة من العميل', 'ملغي من الشركة', 'ملغى من الشركة', 'ملغي من الادارة', 'ملغي من الإدارة', 'ملغى من الادارة', 'ملغى من الإدارة', 'ملغي تلقائيا', 'ملغي تلقائياً',
     'cancelled', 'canceled', 'cancelled_by_customer', 'canceled_by_customer', 'cancelled_by_client', 'canceled_by_client', 'cancelled_by_user', 'canceled_by_user', 'cancelled_by_admin', 'canceled_by_admin', 'cancelled_by_provider', 'canceled_by_provider', 'cancelled_by_company', 'canceled_by_company', 'customer_cancelled', 'customer_canceled', 'user_cancelled', 'user_canceled', 'client_cancelled', 'client_canceled', 'admin_cancelled', 'admin_canceled', 'provider_cancelled', 'provider_canceled', 'company_cancelled', 'company_canceled', 'system_cancelled', 'system_canceled', 'auto_cancelled', 'auto_canceled'
   ];
 
@@ -7040,19 +7089,62 @@
     return false;
   }
 
+  function isExplicitActiveStatusToken(val) {
+    var norm = normalizeSearchText(val);
+    if (!norm || norm === 'غير محدد') return false;
+    if (isRejectedToken(norm) || isCancelledToken(norm)) return false;
+    return matchesStatusList(norm, EXPLICIT_ACTIVE_STATUS_VALUES);
+  }
+
+  function isRejectedToken(val) {
+    var norm = normalizeSearchText(val);
+    if (!norm || norm === 'غير محدد') return false;
+    if (matchesStatusList(norm, REJECTED_STATUS_VALUES)) return true;
+    var u = norm.replace(/[\s-]+/g, '_');
+    if (
+      u.indexOf('rejected_by_') === 0 ||
+      u.indexOf('declined_by_') === 0 ||
+      u.indexOf('refused_by_') === 0 ||
+      /_rejected$/.test(u) ||
+      /_declined$/.test(u) ||
+      /_refused$/.test(u) ||
+      norm.indexOf('مرفوض') === 0 ||
+      norm.indexOf('تم الرفض') === 0
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function isCancelledToken(val) {
+    var norm = normalizeSearchText(val);
+    if (!norm || norm === 'غير محدد') return false;
+    if (matchesStatusList(norm, CANCELLED_STATUS_VALUES)) return true;
+    var u = norm.replace(/[\s-]+/g, '_');
+    if (
+      u.indexOf('cancelled_by_') === 0 ||
+      u.indexOf('canceled_by_') === 0 ||
+      /_cancelled$/.test(u) ||
+      /_canceled$/.test(u) ||
+      norm.indexOf('ملغي') === 0 ||
+      norm.indexOf('ملغى') === 0 ||
+      norm.indexOf('ملغاه') === 0 ||
+      norm.indexOf('تم الالغاء') === 0 ||
+      norm.indexOf('تم الغاء') === 0
+    ) {
+      return true;
+    }
+    return false;
+  }
+
   function classifyReservationLifecycle(resOrStatus) {
     if (!resOrStatus) return 'active';
     if (typeof resOrStatus === 'string') {
-      if (matchesStatusList(resOrStatus, REJECTED_STATUS_VALUES)) return 'rejected';
-      if (matchesStatusList(resOrStatus, CANCELLED_STATUS_VALUES)) return 'cancelled';
+      if (isRejectedToken(resOrStatus)) return 'rejected';
+      if (isCancelledToken(resOrStatus)) return 'cancelled';
       return 'active';
     }
-    if (typeof resOrStatus.isSourceRejected === 'boolean' || typeof resOrStatus.isSourceCancelled === 'boolean') {
-      if (resOrStatus.isSourceRejected === true && resOrStatus.isSourceCancelled !== true) return 'rejected';
-      if (resOrStatus.isSourceCancelled === true && resOrStatus.isSourceRejected !== true) return 'cancelled';
-      if (resOrStatus.isSourceRejected === false && resOrStatus.isSourceCancelled === false) return 'active';
-    }
-    // Authoritative external status fields ALWAYS take precedence over stale internalStatus or timestamps
+    // 1) Authoritative external status fields ALWAYS take precedence over stale flags or internalStatus
     var externalFields = [
       resOrStatus.originalStatusCode,
       resOrStatus.statusCode,
@@ -7068,20 +7160,36 @@
       var fv = typeof externalFields[i] === 'object' ? extractStatusTokenValue(externalFields[i]) : normalizeStr(externalFields[i]);
       if (!fv || fv === 'غير محدد') continue;
       sawExplicitExternal = true;
-      if (matchesStatusList(fv, REJECTED_STATUS_VALUES)) return 'rejected';
-      if (matchesStatusList(fv, CANCELLED_STATUS_VALUES)) return 'cancelled';
+      if (isRejectedToken(fv)) return 'rejected';
+      if (isCancelledToken(fv)) {
+        // Authoritative refund/rejected override ONLY when source explicitly says NOT in cancelled list & IS in rejected list
+        if (resOrStatus.isSourceRejected === true && resOrStatus.isSourceCancelled !== true) {
+          return 'rejected';
+        }
+        return 'cancelled';
+      }
     }
-    if (resOrStatus.isSourceRejected === true && resOrStatus.isSourceCancelled === true) {
-      return 'rejected';
-    }
-    // If an explicit external status was stated (e.g. confirmed / completed / started) and was NOT rejected/cancelled, treat as active
+    // Any explicit non-rejected/non-cancelled external status (e.g. finished, started, automatically_extended, wallet_paid) is ALWAYS active!
     if (sawExplicitExternal) {
       return 'active';
     }
+
+    // 2) Without explicit external status fields, consult mutually exclusive source flags (cancelled wins if both set)
+    if (resOrStatus.isSourceCancelled === true) return 'cancelled';
+    if (resOrStatus.isSourceRejected === true) return 'rejected';
+    if (resOrStatus.isSourceRejected === false && resOrStatus.isSourceCancelled === false) {
+      var fallbackInt = normalizeStr(resOrStatus.internalStatus);
+      if (!fallbackInt || fallbackInt === 'غير محدد') return 'active';
+      if (isRejectedToken(fallbackInt)) return 'rejected';
+      if (isCancelledToken(fallbackInt)) return 'cancelled';
+      return 'active';
+    }
+
+    // 3) Fallback to internalStatus then timestamps
     var internalVal = normalizeStr(resOrStatus.internalStatus);
     if (internalVal && internalVal !== 'غير محدد') {
-      if (matchesStatusList(internalVal, REJECTED_STATUS_VALUES)) return 'rejected';
-      if (matchesStatusList(internalVal, CANCELLED_STATUS_VALUES)) return 'cancelled';
+      if (isRejectedToken(internalVal)) return 'rejected';
+      if (isCancelledToken(internalVal)) return 'cancelled';
       return 'active';
     }
     var rejAt = normalizeStr(resOrStatus.rejectedAt);
@@ -7095,21 +7203,16 @@
   }
 
   function isRejectedStatus(resOrStatus) {
-    if (resOrStatus && typeof resOrStatus === 'object' && typeof resOrStatus.isSourceRejected === 'boolean') {
-      return resOrStatus.isSourceRejected;
-    }
     return classifyReservationLifecycle(resOrStatus) === 'rejected';
   }
 
   function isCancelledStatus(resOrStatus) {
-    if (resOrStatus && typeof resOrStatus === 'object' && typeof resOrStatus.isSourceCancelled === 'boolean') {
-      return resOrStatus.isSourceCancelled;
-    }
     return classifyReservationLifecycle(resOrStatus) === 'cancelled';
   }
 
   function isInactiveReservation(res) {
-    return isRejectedStatus(res) || isCancelledStatus(res);
+    var lc = classifyReservationLifecycle(res);
+    return lc === 'rejected' || lc === 'cancelled';
   }
 
   function getReservationLifecycleKind(res) {
@@ -10825,8 +10928,12 @@
     canUserUseActionButton: canUserUseActionButton,
     canUserViewCustomerId: canUserViewCustomerId,
     normalizeNationalId: normalizeNationalId,
+    EXPLICIT_ACTIVE_STATUS_VALUES: EXPLICIT_ACTIVE_STATUS_VALUES,
     REJECTED_STATUS_VALUES: REJECTED_STATUS_VALUES,
     CANCELLED_STATUS_VALUES: CANCELLED_STATUS_VALUES,
+    isExplicitActiveStatusToken: isExplicitActiveStatusToken,
+    isRejectedToken: isRejectedToken,
+    isCancelledToken: isCancelledToken,
     REJECTION_REASONS_LIST: REJECTION_REASONS_LIST,
     CANCELLATION_REASONS_LIST: CANCELLATION_REASONS_LIST,
     CAR_STATUS_AT_REQUEST_OPTIONS: CAR_STATUS_AT_REQUEST_OPTIONS,

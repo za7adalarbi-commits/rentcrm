@@ -609,9 +609,9 @@ const NEVER_EXCLUDED_LIFECYCLE = new Set([
   'مرفوض من الشركة', 'مرفوض من المزود', 'مرفوض من الإدارة', 'مرفوض تلقائيا', 'مرفوض تلقائياً'
 ]);
 
-const EXPLICIT_ACTIVE_SOURCE_CODES = `('confirmed','completed','finished','closed','ended','active','started','in_progress','booked','reserved','delivered','picked_up','received','on_rent','rented','car_received','ongoing','returned','extended','automatically_extended','approved','accepted','admin_approved','paid','wallet_paid','paid_by_wallet','paid_wallet','hold','on_hold','onhold','pending','new','created')`;
+const EXPLICIT_ACTIVE_SOURCE_CODES = `('confirmed','completed','finished','finished_by_driver','closed','ended','active','started','in_progress','booked','reserved','delivered','picked_up','received','on_rent','rented','car_received','ongoing','returned','extended','automatically_extended','approved','accepted','admin_approved','paid','wallet_paid','paid_by_wallet','paid_wallet','hold','on_hold','onhold','pending','new','created')`;
 const EXPLICIT_CANCELLED_SOURCE_CODES = `('cancelled','canceled','cancelled_by_customer','canceled_by_customer','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','cancelled_by_provider','canceled_by_provider','cancelled_by_company','canceled_by_company','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','admin_cancelled','admin_canceled','provider_cancelled','provider_canceled','company_cancelled','company_canceled','system_cancelled','system_canceled','auto_cancelled','auto_canceled')`;
-const EXPLICIT_REJECTED_SOURCE_CODES = `('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','refused_by_admin','refused_by_company','refused_by_provider')`;
+const EXPLICIT_REJECTED_SOURCE_CODES = `('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','declined_by_user','declined_by_client','declined_by_customer','refused_by_admin','refused_by_company','refused_by_provider','refused_by_user','refused_by_client','refused_by_customer')`;
 
 export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor): Promise<void> {
   // 1) Remove rejected/cancelled statuses from settings.excluded_statuses if seeded earlier
@@ -638,14 +638,30 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
     // Non-fatal in mock/unit environments
   }
 
-  // 2) Clear stale cross-timestamps, repair stale internal_status when external original_status_code is active, and scrub stored placeholder reasons
+  // 2) Clear stale flags on explicit active bookings, enforce mutual exclusion on dual cancelled+rejected rows, clear stale timestamps, and scrub placeholder reasons
   try {
+    await executor.query(
+      `UPDATE reservations
+       SET is_source_rejected = FALSE,
+           is_source_cancelled = FALSE
+       WHERE LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_ACTIVE_SOURCE_CODES}
+         AND (COALESCE(is_source_rejected, FALSE) = TRUE OR COALESCE(is_source_cancelled, FALSE) = TRUE)`
+    );
+    await executor.query(
+      `UPDATE reservations
+       SET is_source_rejected = FALSE
+       WHERE COALESCE(is_source_cancelled, FALSE) = TRUE
+         AND COALESCE(is_source_rejected, FALSE) = TRUE`
+    );
     await executor.query(
       `UPDATE reservations
        SET rejected_at = '', rejected_by_id = '', rejected_by_name = ''
        WHERE COALESCE(rejected_at, '') <> ''
          AND COALESCE(is_source_rejected, FALSE) = FALSE
-         AND LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_CANCELLED_SOURCE_CODES}`
+         AND (
+           LOWER(TRIM(COALESCE(original_status_code, ''))) IN ${EXPLICIT_CANCELLED_SOURCE_CODES}
+           OR COALESCE(is_source_cancelled, FALSE) = TRUE
+         )`
     );
     await executor.query(
       `UPDATE reservations

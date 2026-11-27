@@ -638,21 +638,30 @@
             if (!rec || typeof rec !== 'object') return '';
             var failedCnt = Number(rec.failedCount || 0);
             var missingCnt = Number(rec.missingLocalCount || 0);
+            var eligibleGap = Number(rec.eligibleCountGap || 0);
             var unfetchedGap = Number(rec.unfetchedSourceGap || 0);
             var incEps = Array.isArray(rec.incompleteEndpoints) ? rec.incompleteEndpoints : [];
             var bfFailed = Array.isArray(rec.backfillFailedIds) ? rec.backfillFailedIds : [];
             var missingIds = Array.isArray(rec.missingSourceIds) ? rec.missingSourceIds : [];
+            var missingEligIds = Array.isArray(rec.missingEligibleIds) ? rec.missingEligibleIds : [];
             var failedRecs = Array.isArray(rec.failedRecords) ? rec.failedRecords : [];
-            var recIncomplete = rec.syncComplete === false || failedCnt > 0 || missingCnt > 0 || unfetchedGap > 0 || incEps.length > 0 || bfFailed.length > 0;
             var sb = rec.sourceBreakdown || null;
+            var srcElig = Number(rec.sourceEligibleCount !== undefined ? rec.sourceEligibleCount : ((sb && sb.sourceEligibleCount) || 0));
+            var dbElig = Number(rec.dbEligibleCount !== undefined ? rec.dbEligibleCount : 0);
+            var recIncomplete = rec.syncComplete === false || failedCnt > 0 || missingCnt > 0 || eligibleGap > 0 || missingEligIds.length > 0 || unfetchedGap > 0 || incEps.length > 0 || bfFailed.length > 0;
             var parts = [];
             if (sb && Number(sb.uniqueSourceTotal || 0) > 0) {
               parts.push('إجمالي المصدر الفريد: <strong>' + Number(sb.uniqueSourceTotal) + '</strong>');
               if (Number(sb.grossAcrossThreeLists || 0) > Number(sb.uniqueSourceTotal || 0)) {
-                parts.push('قوائم المصدر الثلاثة: <strong>' + Number(sb.grossAcrossThreeLists) + '</strong> (' + Number(sb.activeOrOtherCount || 0) + ' نشط/منتهي + ' + Number(sb.cancelledListCount || 0) + ' ملغي + ' + Number(sb.rejectedListCount || 0) + ' مرفوض/محوّل · مشترك: ' + Number(sb.overlapCount || 0) + ')');
+                var effCan = Number(sb.effectiveCancelledCount !== undefined ? sb.effectiveCancelledCount : (sb.cancelledListCount || 0));
+                var effRej = Number(sb.effectiveRejectedCount !== undefined ? sb.effectiveRejectedCount : (sb.rejectedListCount || 0));
+                parts.push('التصنيف الموحد: <strong>' + Number(sb.activeOrOtherCount || 0) + '</strong> مستحق · <strong>' + effCan + '</strong> ملغي · <strong>' + effRej + '</strong> مرفوض');
               }
             } else if (Number(rec.totalInSource || 0) > 0) {
               parts.push('إجمالي المصدر: <strong>' + Number(rec.totalInSource) + '</strong>');
+            }
+            if (srcElig > 0 || dbElig > 0) {
+              parts.push('المستحقة (CRM / المصدر): <strong style="color:' + (eligibleGap === 0 && missingEligIds.length === 0 ? 'var(--success,#16a34a)' : 'var(--danger,#ef4444)') + ';">' + dbElig + ' / ' + srcElig + '</strong>');
             }
             if (rec.fetchedCount !== undefined) {
               parts.push('المسحوب: <strong>' + Number(rec.fetchedCount || 0) + '</strong>');
@@ -670,16 +679,16 @@
               parts.push('مستبعد بالإعدادات: <strong>' + Number(rec.excludedFilteredCount) + '</strong>');
             }
             if (recIncomplete) {
-              parts.push('<span style="color:var(--danger,#ef4444);font-weight:700;">تحذير عدم اكتمال المطابقة: فشل ' + failedCnt + ' · ناقص محلياً ' + missingCnt + (unfetchedGap > 0 ? (' · فجوة مصدر غير مجلوبة ' + unfetchedGap) : '') + (incEps.length ? (' · واجهات ناقصة: ' + escapeHtml(incEps.join(' | '))) : '') + '</span>');
+              parts.push('<span style="color:var(--danger,#ef4444);font-weight:700;">تحذير عدم اكتمال المطابقة: فشل ' + failedCnt + ' · ناقص محلياً ' + missingCnt + (eligibleGap > 0 ? (' · فرق المستحقة ' + eligibleGap) : '') + (unfetchedGap > 0 ? (' · فجوة مصدر غير مجلوبة ' + unfetchedGap) : '') + (incEps.length ? (' · واجهات ناقصة: ' + escapeHtml(incEps.join(' | '))) : '') + '</span>');
             } else if (parts.length > 0) {
               parts.push('<span style="color:var(--success,#16a34a);font-weight:600;">✓ مكتمل ومطابق 100%</span>');
             }
             var extraDetails = '';
-            if (missingIds.length > 0 || bfFailed.length > 0) {
-              var allMissingList = Array.from(new Set(missingIds.concat(bfFailed)));
+            var combinedMissingAll = Array.from(new Set(missingIds.concat(bfFailed).concat(missingEligIds)));
+            if (combinedMissingAll.length > 0) {
               extraDetails += '<div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-hairline);">' +
-                '<strong>المعرفات الناقصة (' + allMissingList.length + '):</strong> ' +
-                '<span class="mono" dir="ltr" style="word-break:break-all;">' + escapeHtml(allMissingList.slice(0, 40).join(', ')) + (allMissingList.length > 40 ? (' ... (+' + (allMissingList.length - 40) + ')') : '') + '</span>' +
+                '<strong>المعرفات الناقصة/المتأثرة (' + combinedMissingAll.length + '):</strong> ' +
+                '<span class="mono" dir="ltr" style="word-break:break-all;">' + escapeHtml(combinedMissingAll.slice(0, 40).join(', ')) + (combinedMissingAll.length > 40 ? (' ... (+' + (combinedMissingAll.length - 40) + ')') : '') + '</span>' +
               '</div>';
             }
             if (failedRecs.length > 0) {
@@ -1591,10 +1600,12 @@
             var exts = d.extensionsCount || 0;
             var failedCount = Number(d.failedCount || 0);
             var missingCount = Number(d.missingLocalCount || 0);
+            var eligibleGap = Number(d.eligibleCountGap || 0);
+            var missingElig = Array.isArray(d.missingEligibleIds) ? d.missingEligibleIds : [];
             var unfetchedGap = Number(d.unfetchedSourceGap || 0);
             var incompleteEps = Array.isArray(d.incompleteEndpoints) ? d.incompleteEndpoints : [];
             var backfillFailed = Array.isArray(d.backfillFailedIds) ? d.backfillFailedIds : [];
-            var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || unfetchedGap > 0 || incompleteEps.length > 0 || backfillFailed.length > 0;
+            var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || eligibleGap > 0 || missingElig.length > 0 || unfetchedGap > 0 || incompleteEps.length > 0 || backfillFailed.length > 0;
             var sb = d.sourceBreakdown || null;
             var diagHint = '';
             if (imported === 0 && updated === 0 && !isIncomplete) {
@@ -1611,14 +1622,18 @@
               var warnParts = [];
               if (failedCount > 0) warnParts.push('فشل: ' + failedCount);
               if (missingCount > 0) warnParts.push('ناقص بالتحقق: ' + missingCount);
+              if (eligibleGap > 0) warnParts.push('فرق المستحقة: ' + eligibleGap + ' (' + Number(d.dbEligibleCount || 0) + '/' + Number(d.sourceEligibleCount || 0) + ')');
               if (unfetchedGap > 0) warnParts.push('فجوة مصدر: ' + unfetchedGap);
               if (backfillFailed.length > 0) warnParts.push('تعذر جلب تفاصيل: ' + backfillFailed.length);
               if (incompleteEps.length > 0) warnParts.push('واجهات غير مكتملة: ' + incompleteEps.join(', '));
               ctx.toast('تحذير: المزامنة غير مكتملة (' + warnParts.join(' · ') + ') — تم حفظ ' + (imported + updated) + ' سجل', true);
             } else {
-              var overlapHint = (sb && Number(sb.overlapCount || 0) > 0)
-                ? (' · تطابق ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' فريد (' + sb.grossAcrossThreeLists + ' بقوائم المصدر مع ' + sb.overlapCount + ' مشترك)')
+              var eligHint = Number(d.sourceEligibleCount || 0) > 0
+                ? (' · المستحقة ' + Number(d.dbEligibleCount || 0) + '/' + Number(d.sourceEligibleCount || 0))
                 : '';
+              var overlapHint = (sb && Number(sb.uniqueSourceTotal || 0) > 0)
+                ? (' · الإجمالي ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + eligHint)
+                : eligHint;
               ctx.toast('اكتملت المزامنة والتحقق بنجاح: ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + overlapHint + diagHint);
             }
             if (syncNowBtn.isConnected !== false) syncNowBtn.textContent = prevText;

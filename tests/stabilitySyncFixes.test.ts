@@ -252,7 +252,7 @@ function createFixTestExecutor(): DbExecutor & {
       }
       return { rows: [], rowCount: r ? 1 : 0 };
     }
-    if (sql.startsWith('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND')) {
+    if (sql.startsWith('UPDATE notifications SET is_read = TRUE') && sql.includes('WHERE id = $1 AND')) {
       const [notifId, empId, role] = params;
       let count = 0;
       for (const n of state.notifications) {

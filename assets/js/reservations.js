@@ -1753,6 +1753,86 @@
       paintTableRegion(payload);
     }
 
+    function paintSyncWarningBannerFromReport(rec) {
+      var syncWarnBanner = container.querySelector('#res-sync-warning-banner');
+      if (!syncWarnBanner) return;
+      if (!rec || typeof rec !== 'object') {
+        syncWarnBanner.classList.add('hidden');
+        syncWarnBanner.innerHTML = '';
+        return;
+      }
+      var failedCount = Number(rec.failedCount || 0);
+      var missingCount = Number(rec.missingLocalCount || 0);
+      var eligibleGap = Number(rec.eligibleCountGap || 0);
+      var missingElig = Array.isArray(rec.missingEligibleIds) ? rec.missingEligibleIds : [];
+      var unfetchedGap = Number(rec.unfetchedSourceGap || 0);
+      var incompleteEps = Array.isArray(rec.incompleteEndpoints) ? rec.incompleteEndpoints : [];
+      var backfillFailed = Array.isArray(rec.backfillFailedIds) ? rec.backfillFailedIds : [];
+      var missingIdsList = Array.isArray(rec.missingSourceIds) ? rec.missingSourceIds : [];
+      var isIncomplete = rec.syncComplete === false || failedCount > 0 || missingCount > 0 || eligibleGap > 0 || missingElig.length > 0 || unfetchedGap > 0 || incompleteEps.length > 0 || backfillFailed.length > 0;
+      if (!isIncomplete) {
+        syncWarnBanner.classList.add('hidden');
+        syncWarnBanner.innerHTML = '';
+        return;
+      }
+      var warnParts = [];
+      if (failedCount > 0) warnParts.push('فشل ' + failedCount);
+      if (missingCount > 0) warnParts.push('ناقص ' + missingCount);
+      if (eligibleGap > 0) warnParts.push('فرق المستحقة ' + eligibleGap + ' (' + Number(rec.dbEligibleCount || 0) + '/' + Number(rec.sourceEligibleCount || 0) + ')');
+      if (unfetchedGap > 0) warnParts.push('فجوة مصدر ' + unfetchedGap);
+      if (backfillFailed.length > 0) warnParts.push('فشل جلب ' + backfillFailed.length);
+      if (incompleteEps.length > 0) warnParts.push('واجهات غير مكتملة: ' + incompleteEps.length);
+      var combinedMissingIds = Array.from(new Set(missingIdsList.concat(backfillFailed).concat(missingElig)));
+      var idPreview = combinedMissingIds.length
+        ? (' · المعرفات: ' + combinedMissingIds.slice(0, 8).join(', ') + (combinedMissingIds.length > 8 ? (' (+' + (combinedMissingIds.length - 8) + ')') : ''))
+        : '';
+      syncWarnBanner.classList.remove('hidden');
+      syncWarnBanner.innerHTML =
+        '<div class="rg-error-banner" role="alert" style="border-color:rgba(217,31,43,0.38);background:rgba(217,31,43,0.06);">' +
+          '<div class="rg-error-banner-body">' +
+            '<div class="rg-error-banner-title">' + (isEn ? 'Sync Reconciliation Mismatch' : 'تحذير عدم تطابق أعداد السحب مع المصدر') + '</div>' +
+            '<div class="rg-error-banner-msg">' + esc(warnParts.join(' · ') + idPreview) + '</div>' +
+          '</div>' +
+          '<button type="button" class="btn btn-sm btn-primary" id="res-retry-failed-sync-btn">' + (isEn ? 'Retry Missing Records' : 'إعادة معالجة السجلات الناقصة') + '</button>' +
+        '</div>';
+      var resRetryBtn = syncWarnBanner.querySelector('#res-retry-failed-sync-btn');
+      if (resRetryBtn) {
+        resRetryBtn.addEventListener('click', function () {
+          runWithLock(resRetryBtn, 'retryFailedSyncRecords', async function () {
+            var rPrev = resRetryBtn.textContent;
+            resRetryBtn.textContent = isEn ? 'Retrying...' : 'جاري إعادة المعالجة...';
+            var rResp = await root.RGApi.callApi('retryFailedSyncRecords', {});
+            if (rResp && rResp.success && rResp.data) {
+              var rd = rResp.data;
+              var stillGap = rd.syncComplete === false || Number(rd.failedCount || 0) > 0 || Number(rd.missingLocalCount || 0) > 0 || Number(rd.eligibleCountGap || 0) > 0 || Number(rd.unfetchedSourceGap || 0) > 0;
+              if (!stillGap) {
+                syncWarnBanner.classList.add('hidden');
+                syncWarnBanner.innerHTML = '';
+                ctx.toast(isEn ? 'Missing records recovered successfully.' : 'تمت إعادة معالجة السجلات الناقصة واكتمل التطابق بنجاح.');
+              } else {
+                paintSyncWarningBannerFromReport(rd);
+                ctx.toast(isEn ? 'Some records still missing after retry.' : 'ما زال هناك نقص بعد إعادة المحاولة.', true);
+                if (resRetryBtn.isConnected !== false) resRetryBtn.textContent = rPrev;
+              }
+              refreshTableRegion({ forceRefresh: true });
+            } else {
+              ctx.toast((rResp && rResp.message) || 'تعذر إعادة معالجة السجلات الفاشلة.', true);
+              if (resRetryBtn.isConnected !== false) resRetryBtn.textContent = rPrev;
+            }
+          });
+        });
+      }
+    }
+
+    if (canPullReservations || isGeneralManager) {
+      root.RGApi.callApi('getSyncStatus', { silentRefresh: true, abortKey: 'res:syncWarn' }).then(function (sRes) {
+        if (!container.isConnected || !sRes || !sRes.success || !sRes.data) return;
+        if (sRes.data.lastReconciliation) {
+          paintSyncWarningBannerFromReport(sRes.data.lastReconciliation);
+        }
+      }).catch(function () {});
+    }
+
     function applyFilterChange() {
       state.search = document.getElementById('res-search').value;
       var resNumInp = document.getElementById('res-number-search');
@@ -1990,11 +2070,13 @@
               var exts = d.extensionsCount || 0;
               var failedCount = Number(d.failedCount || 0);
               var missingCount = Number(d.missingLocalCount || 0);
+              var eligibleGap = Number(d.eligibleCountGap || 0);
+              var missingElig = Array.isArray(d.missingEligibleIds) ? d.missingEligibleIds : [];
               var unfetchedGap = Number(d.unfetchedSourceGap || 0);
               var incompleteEps = Array.isArray(d.incompleteEndpoints) ? d.incompleteEndpoints : [];
               var backfillFailed = Array.isArray(d.backfillFailedIds) ? d.backfillFailedIds : [];
               var missingIdsList = Array.isArray(d.missingSourceIds) ? d.missingSourceIds : [];
-              var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || unfetchedGap > 0 || incompleteEps.length > 0 || backfillFailed.length > 0;
+              var isIncomplete = d.syncComplete === false || failedCount > 0 || missingCount > 0 || eligibleGap > 0 || missingElig.length > 0 || unfetchedGap > 0 || incompleteEps.length > 0 || backfillFailed.length > 0;
               var sb = d.sourceBreakdown || null;
               var diagHint = '';
               if (imported === 0 && updated === 0 && !isIncomplete) {
@@ -2007,15 +2089,16 @@
                   diagHint = ' — أرجعت الواجهة 0 حجز لهذا الحساب/الفترة';
                 }
               }
-              var syncWarnBanner = container.querySelector('#res-sync-warning-banner');
+              paintSyncWarningBannerFromReport(isIncomplete ? d : null);
               if (isIncomplete) {
                 var warnParts = [];
                 if (failedCount > 0) warnParts.push('فشل ' + failedCount);
                 if (missingCount > 0) warnParts.push('ناقص ' + missingCount);
+                if (eligibleGap > 0) warnParts.push('فرق المستحقة ' + eligibleGap + ' (' + Number(d.dbEligibleCount || 0) + '/' + Number(d.sourceEligibleCount || 0) + ')');
                 if (unfetchedGap > 0) warnParts.push('فجوة مصدر ' + unfetchedGap);
                 if (backfillFailed.length > 0) warnParts.push('فشل جلب ' + backfillFailed.length);
                 if (incompleteEps.length > 0) warnParts.push('واجهات غير مكتملة: ' + incompleteEps.length);
-                var combinedMissingIds = Array.from(new Set(missingIdsList.concat(backfillFailed)));
+                var combinedMissingIds = Array.from(new Set(missingIdsList.concat(backfillFailed).concat(missingElig)));
                 var idPreview = combinedMissingIds.length
                   ? (' · المعرفات: ' + combinedMissingIds.slice(0, 8).join(', ') + (combinedMissingIds.length > 8 ? (' (+' + (combinedMissingIds.length - 8) + ')') : ''))
                   : '';
@@ -2023,53 +2106,17 @@
                   ? ('Incomplete pull' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + warnParts.join(' · ') + idPreview)
                   : ('تحذير: السحب غير مكتمل' + rangeNote + ' (' + warnParts.join(' · ') + ') — تم حفظ ' + (imported + updated) + ' سجل' + idPreview);
                 ctx.toast(warnMsg, true);
-                if (syncWarnBanner) {
-                  syncWarnBanner.classList.remove('hidden');
-                  syncWarnBanner.innerHTML =
-                    '<div class="rg-error-banner" role="alert" style="border-color:rgba(217,31,43,0.38);background:rgba(217,31,43,0.06);">' +
-                      '<div class="rg-error-banner-body">' +
-                        '<div class="rg-error-banner-title">' + (ctx.lang === 'en' ? 'Sync Reconciliation Mismatch' : 'تحذير عدم تطابق أعداد السحب مع المصدر') + '</div>' +
-                        '<div class="rg-error-banner-msg">' + esc(warnParts.join(' · ') + idPreview) + '</div>' +
-                      '</div>' +
-                      '<button type="button" class="btn btn-sm btn-primary" id="res-retry-failed-sync-btn">' + (ctx.lang === 'en' ? 'Retry Missing Records' : 'إعادة معالجة السجلات الناقصة') + '</button>' +
-                    '</div>';
-                  var resRetryBtn = syncWarnBanner.querySelector('#res-retry-failed-sync-btn');
-                  if (resRetryBtn) {
-                    resRetryBtn.addEventListener('click', function () {
-                      runWithLock(resRetryBtn, 'retryFailedSyncRecords', async function () {
-                        var rPrev = resRetryBtn.textContent;
-                        resRetryBtn.textContent = ctx.lang === 'en' ? 'Retrying...' : 'جاري إعادة المعالجة...';
-                        var rResp = await root.RGApi.callApi('retryFailedSyncRecords', {});
-                        if (rResp && rResp.success && rResp.data) {
-                          var rd = rResp.data;
-                          var stillGap = rd.syncComplete === false || Number(rd.failedCount || 0) > 0 || Number(rd.missingLocalCount || 0) > 0 || Number(rd.unfetchedSourceGap || 0) > 0;
-                          if (!stillGap) {
-                            syncWarnBanner.classList.add('hidden');
-                            syncWarnBanner.innerHTML = '';
-                            ctx.toast(ctx.lang === 'en' ? 'Missing records recovered successfully.' : 'تمت إعادة معالجة السجلات الناقصة واكتمل التطابق بنجاح.');
-                          } else {
-                            ctx.toast(ctx.lang === 'en' ? 'Some records still missing after retry.' : 'ما زال هناك نقص بعد إعادة المحاولة.', true);
-                            if (resRetryBtn.isConnected !== false) resRetryBtn.textContent = rPrev;
-                          }
-                          refreshTableRegion({ forceRefresh: true });
-                        } else {
-                          ctx.toast((rResp && rResp.message) || 'تعذر إعادة معالجة السجلات الفاشلة.', true);
-                          if (resRetryBtn.isConnected !== false) resRetryBtn.textContent = rPrev;
-                        }
-                      });
-                    });
-                  }
-                }
               } else {
-                if (syncWarnBanner) {
-                  syncWarnBanner.classList.add('hidden');
-                  syncWarnBanner.innerHTML = '';
-                }
-                var overlapHint = (sb && Number(sb.overlapCount || 0) > 0)
+                var eligHint = Number(d.sourceEligibleCount || 0) > 0
                   ? (ctx.lang === 'en'
-                      ? (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' unique (' + sb.grossAcrossThreeLists + ' across source lists, ' + sb.overlapCount + ' overlap)')
-                      : (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' حجز فريد مكتمل (' + sb.grossAcrossThreeLists + ' بقوائم المصدر مع ' + sb.overlapCount + ' مشترك)'))
+                      ? (' · eligible ' + Number(d.dbEligibleCount || 0) + '/' + Number(d.sourceEligibleCount || 0))
+                      : (' · المستحقة ' + Number(d.dbEligibleCount || 0) + '/' + Number(d.sourceEligibleCount || 0)))
                   : '';
+                var overlapHint = (sb && Number(sb.uniqueSourceTotal || 0) > 0)
+                  ? (ctx.lang === 'en'
+                      ? (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' unique' + eligHint)
+                      : (' · ' + sb.uniqueSourceTotal + '/' + sb.uniqueSourceTotal + ' إجمالي فريد' + eligHint))
+                  : eligHint;
                 var msg = ctx.lang === 'en'
                   ? ('Pulled reservations' + rangeNote + ': ' + imported + ' new · ' + updated + ' updated · ' + exts + ' extensions' + overlapHint)
                   : ('تم سحب الحجوزات والتحقق بنجاح' + rangeNote + ': ' + imported + ' جديد · ' + updated + ' محدث · ' + exts + ' تمديد' + overlapHint + diagHint);

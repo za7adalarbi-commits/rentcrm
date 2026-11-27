@@ -54,18 +54,18 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
       originalStatusCode: r.original_status_code,
       originalStatusAr: r.original_status_ar,
       internalStatus: r.internal_status,
+      isSourceCancelled: r.is_source_cancelled,
+      isSourceRejected: r.is_source_rejected,
       rejectedAt: r.rejected_at,
       cancelledAt: r.cancelled_at
     });
   }
 
   function mockIsRejected(r: any): boolean {
-    if (typeof r.is_source_rejected === 'boolean') return r.is_source_rejected;
     return mockRowLifecycle(r) === 'rejected';
   }
 
   function mockIsCancelled(r: any): boolean {
-    if (typeof r.is_source_cancelled === 'boolean') return r.is_source_cancelled;
     return mockRowLifecycle(r) === 'cancelled';
   }
 
@@ -80,16 +80,16 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
 
     const hasRejCond = whereSegment.includes("'rejected_by_provider'");
     const hasCanCond = whereSegment.includes("'cancelled_by_provider'");
-    if (hasRejCond && !hasCanCond) {
+    if (hasRejCond && /AND NOT\s*\(\s*CASE/i.test(whereSegment)) {
+      list = list.filter((r) => !mockIsRejected(r) && !mockIsCancelled(r));
+    } else if (hasRejCond && /\)\s*OR\s*\(\s*CASE/i.test(whereSegment)) {
+      list = list.filter((r) => mockIsRejected(r) || mockIsCancelled(r));
+    } else if (hasCanCond && /THEN\s*\(\s*NOT\s*\(\s*COALESCE\(r\.is_source_cancelled/i.test(whereSegment)) {
+      list = list.filter((r) => mockIsCancelled(r));
+    } else if (hasRejCond) {
       list = list.filter((r) => mockIsRejected(r));
-    } else if (hasRejCond && hasCanCond) {
-      if (whereSegment.includes('AND NOT (')) {
-        list = list.filter((r) => !mockIsRejected(r) && !mockIsCancelled(r));
-      } else if (/\)\s*OR\s*\(\s*CASE/i.test(whereSegment)) {
-        list = list.filter((r) => mockIsRejected(r) || mockIsCancelled(r));
-      } else {
-        list = list.filter((r) => mockIsCancelled(r));
-      }
+    } else if (hasCanCond) {
+      list = list.filter((r) => mockIsCancelled(r));
     }
 
     if (whereSegment.includes('assigned_employee_ids @>') && idxSet.size > 0) {
@@ -860,10 +860,31 @@ function createInMemoryMockExecutor(opts: { injectUpsertFailFor?: (rec: Record<s
     }
 
     if (sql.startsWith('INSERT INTO notifications')) {
+      const eventKey = sql.includes('event_key') ? String(params[8] ?? params[5] ?? '') : '';
+      const recEmp = String(params[1] || '');
+      const recRole = String(params[2] || '');
+      const evk = sql.includes('VALUES ($1,\'\',$2') ? String(params[5] || '') : String(params[8] || '');
+      if (evk && state.notifications.some((n) => n.event_key === evk && n.recipient_employee_id === recEmp && n.recipient_role === recRole)) {
+        return { rows: [], rowCount: 0 };
+      }
       state.notifications.push({
-        id: params[0], recipient_employee_id: params[1], recipient_role: params[2],
+        id: params[0], recipient_employee_id: recEmp, recipient_role: recRole,
         type: params[3], title: params[4], message: params[5], entity_type: params[6], entity_id: params[7],
-        is_read: false, created_at: new Date()
+        event_key: evk, is_read: false, created_at: new Date()
+      });
+      void eventKey;
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO error_logs')) {
+      state.error_logs.push({
+        id: params[0],
+        context: params[1],
+        action: params[2],
+        message: params[3],
+        stack: params[4],
+        meta: params[5] ? JSON.parse(params[5]) : {},
+        created_at: new Date()
       });
       return { rows: [], rowCount: 1 };
     }
@@ -4188,7 +4209,7 @@ test('Clamped 1-based pagination probes page=1 then advances to page=2 without s
   }
 });
 
-test('Authoritative /admin/cancelled-reservations & /reservation-company-changes/admin/filter resolve dual & reassigned overlaps to exact 40 cancelled and 58 rejected with 0 duplicates', async () => {
+test('Authoritative /admin/cancelled-reservations & /reservation-company-changes/admin/filter resolve dual & reassigned overlaps into mutually exclusive 15 active, 40 cancelled, and 47 rejected (total 102)', async () => {
   const db = createInMemoryMockExecutor();
   await dispatchCrmRequest(db, { action: 'ping' });
   const loginRes = await dispatchCrmRequest(db, {
@@ -4198,14 +4219,14 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
   assert.equal(loginRes.success, true);
   const token = loginRes.data.token;
 
-  // Build exact production-matching shape:
-  // - 34 pure CANCELLED (in reservations/filter + cancelled-reservations)
-  // - 3 CANCELLED that moved to REFUND_PROCESSED/REJECTED_BY_COMPANY (excluded from cancelled-reservations, present in company-changes -> count only in Rejected)
-  // - 6 CANCELLED with cancelledFromDecline=true (present in BOTH cancelled-reservations AND company-changes -> count in BOTH Cancelled & Rejected)
-  // - 44 DECLINED (present in company-changes)
-  // - 5 FINISHED with COMPANY_CHANGED (present in company-changes -> count in Rejected while keeping single row)
-  // - 10 normal active CONFIRMED bookings
-  // Total = 102 unique bookings -> 40 Cancelled, 58 Rejected
+  // Build exact production-matching shape (mutually exclusive lifecycle partition):
+  // - 34 pure CANCELLED (in reservations/filter + cancelled-reservations -> Cancelled)
+  // - 3 CANCELLED that moved to REFUND_PROCESSED/REJECTED_BY_COMPANY (excluded from cancelled-reservations, present in company-changes -> Rejected)
+  // - 6 CANCELLED with cancelledFromDecline=true (present in BOTH cancelled-reservations AND company-changes -> count strictly in Cancelled, never double-counted in Rejected)
+  // - 44 DECLINED (present in company-changes -> Rejected)
+  // - 5 FINISHED with COMPANY_CHANGED (present in company-changes -> Active/Eligible! Must never be excluded)
+  // - 10 normal active CONFIRMED bookings -> Active/Eligible
+  // Total = 102 unique bookings -> 15 Active/Eligible, 40 Cancelled, 47 Rejected (15 + 40 + 47 = 102)
   const filterItems: any[] = [];
   const cancelledItems: any[] = [];
   const rccItems: any[] = [];
@@ -4263,7 +4284,8 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
     await pullFromRentalGateDirect(db, { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' }, { maxPages: 5 }, mockFetch);
     assert.equal(db.state.reservations.length, 102);
 
-    const [allRes, rejRes, canRes, dashRes, inactRej, inactCan] = await Promise.all([
+    const [activeRes, allRes, rejRes, canRes, dashRes, inactRej, inactCan] = await Promise.all([
+      dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'active', page: 1, pageSize: 200 } }),
       dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'all', page: 1, pageSize: 200 } }),
       dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'rejected', page: 1, pageSize: 200 } }),
       dispatchCrmRequest(db, { action: 'getReservations', token, payload: { lifecycle: 'cancelled', page: 1, pageSize: 200 } }),
@@ -4272,48 +4294,141 @@ test('Authoritative /admin/cancelled-reservations & /reservation-company-changes
       dispatchCrmRequest(db, { action: 'getInactiveReservations', token, payload: { subTab: 'cancelled', page: 1, pageSize: 200 } })
     ]);
 
+    assert.equal(activeRes.data.total, 15);
     assert.equal(allRes.data.total, 102);
+    assert.equal(allRes.data.lifecycleCounts.active, 15);
     assert.equal(allRes.data.lifecycleCounts.cancelled, 40);
-    assert.equal(allRes.data.lifecycleCounts.rejected, 58);
-    assert.equal(rejRes.data.total, 58);
+    assert.equal(allRes.data.lifecycleCounts.rejected, 47);
+    assert.equal(rejRes.data.total, 47);
     assert.equal(canRes.data.total, 40);
+    assert.equal(dashRes.data.kpis.activeReservations, 15);
     assert.equal(dashRes.data.kpis.cancelled, 40);
-    assert.equal(dashRes.data.kpis.rejected, 58);
-    assert.equal(inactRej.data.total, 58);
+    assert.equal(dashRes.data.kpis.rejected, 47);
+    assert.equal(inactRej.data.total, 47);
     assert.equal(inactCan.data.total, 40);
 
-    // Verify canonical key & dual classification properties
+    // Verify canonical mutually exclusive flags and preserved company-change audit info
     const refundRow = db.state.reservations.find((r) => r.source_reservation_id === '2001');
     assert.equal(refundRow?.is_source_cancelled, false);
     assert.equal(refundRow?.is_source_rejected, true);
 
     const dualRow = db.state.reservations.find((r) => r.source_reservation_id === '3001');
     assert.equal(dualRow?.is_source_cancelled, true);
-    assert.equal(dualRow?.is_source_rejected, true);
+    assert.equal(dualRow?.is_source_rejected, false);
     assert.equal(dualRow?.reference_number, 'RG-DUAL-3001');
+    assert.equal(dualRow?.rcc_status, 'CLIENT_CANCELLED');
 
     const finChangedRow = db.state.reservations.find((r) => r.source_reservation_id === '5001');
     assert.equal(finChangedRow?.is_source_cancelled, false);
-    assert.equal(finChangedRow?.is_source_rejected, true);
+    assert.equal(finChangedRow?.is_source_rejected, false);
     assert.equal(finChangedRow?.rcc_status, 'COMPANY_CHANGED');
+    assert.equal(finChangedRow?.new_company_name, 'Almaqam');
 
-    // Verify sourceBreakdown & reconciliation counts match exact 102 unique vs 113 across 3 source screens (11 overlaps: 6 dual + 5 reassigned)
+    // Verify sourceBreakdown & eligible reconciliation counts match 15/15 cleanly
     const pullInfo = await pullFromRentalGateDirect(db, { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' }, { maxPages: 5 }, mockFetch);
     assert.equal(pullInfo.syncComplete, true);
     assert.equal(pullInfo.status, 'success');
     assert.equal(pullInfo.totalInSource, 102);
-    assert.equal(pullInfo.savedOrUpdatedCount, 102);
-    assert.equal(pullInfo.importedCount, 0);
+    assert.equal(pullInfo.sourceEligibleCount, 15);
+    assert.equal(pullInfo.dbEligibleCount, 15);
+    assert.equal(pullInfo.eligibleCountGap, 0);
+    assert.deepEqual(pullInfo.missingEligibleIds, []);
     assert.equal(pullInfo.missingLocalCount, 0);
     assert.equal(pullInfo.failedCount, 0);
     assert.equal(pullInfo.sourceBreakdown?.uniqueSourceTotal, 102);
     assert.equal(pullInfo.sourceBreakdown?.activeOrOtherCount, 15);
+    assert.equal(pullInfo.sourceBreakdown?.effectiveCancelledCount, 40);
+    assert.equal(pullInfo.sourceBreakdown?.effectiveRejectedCount, 47);
     assert.equal(pullInfo.sourceBreakdown?.cancelledListCount, 40);
     assert.equal(pullInfo.sourceBreakdown?.rejectedListCount, 58);
-    assert.equal(pullInfo.sourceBreakdown?.grossAcrossThreeLists, 113);
     assert.equal(pullInfo.sourceBreakdown?.dualCancelledRejectedCount, 6);
     assert.equal(pullInfo.sourceBreakdown?.reassignedActiveCount, 5);
-    assert.equal(pullInfo.sourceBreakdown?.overlapCount, 11);
+  } finally {
+    if (prevRgToken === undefined) delete process.env.RG_TOKEN;
+    else process.env.RG_TOKEN = prevRgToken;
+  }
+});
+
+test('Unified status classification covers all active vs cancelled/rejected variants, runs targeted auto-recovery for missing eligible IDs, and logs idempotent alerts when discrepancy persists', async () => {
+  // 1) Status classification & token variants
+  const activeVariants = ['finished', 'started', 'finished_by_driver', 'in_progress', 'wallet_paid', 'automatically_extended', 'paid', 'confirmed', 'received'];
+  for (const st of activeVariants) {
+    assert.equal(crmCore.classifyReservationLifecycle({ originalStatusCode: st, isSourceRejected: true }), 'active', `${st} must remain active even if stale isSourceRejected=true`);
+    assert.equal(crmCore.isCancelledStatus({ originalStatusCode: st }), false);
+    assert.equal(crmCore.isRejectedStatus({ originalStatusCode: st }), false);
+  }
+  const rejectedVariants = ['rejected', 'declined', 'refused', 'REJECTED_BY_COMPANY', 'مرفوض', 'مرفوضة'];
+  for (const st of rejectedVariants) {
+    assert.equal(crmCore.classifyReservationLifecycle({ originalStatusCode: st }), 'rejected', `${st} must classify as rejected`);
+  }
+  const cancelledVariants = ['cancelled', 'canceled', 'CANCELLED_BY_CUSTOMER', 'ملغي', 'ملغى', 'ملغاة'];
+  for (const st of cancelledVariants) {
+    assert.equal(crmCore.classifyReservationLifecycle({ originalStatusCode: st }), 'cancelled', `${st} must classify as cancelled`);
+  }
+
+  // 2) Auto-recovery recovers transient upsert failure without discrepancy
+  let failOnce8801 = true;
+  const recoverDb = createInMemoryMockExecutor({
+    injectUpsertFailFor: (rec) => {
+      if (String(rec.source_reservation_id ?? rec.sourceReservationId) === '8801' && failOnce8801) {
+        failOnce8801 = false;
+        return true;
+      }
+      return false;
+    }
+  });
+  const prevRgToken = process.env.RG_TOKEN;
+  process.env.RG_TOKEN = 'rg_test_token_recovery_and_alert';
+
+  const makeMockFetch = (items: any[]) => (async (url: any) => {
+    const u = new URL(String(url));
+    if (u.pathname.includes('/reservations/8801')) {
+      const body = { data: { reservation: items.find((x) => String(x.reservationId) === '8801') } };
+      return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) } as any;
+    }
+    const page = Number(u.searchParams.get('page') || '0');
+    const body = u.pathname.includes('/reservations/filter')
+      ? { content: page === 0 ? items : [], totalElements: items.length, totalPages: 1, last: true }
+      : { content: [], totalElements: 0, totalPages: 1, last: true };
+    return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) } as any;
+  }) as any;
+
+  try {
+    const resRec = await pullFromRentalGateDirect(
+      recoverDb,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { maxPages: 3 },
+      makeMockFetch([
+        { reservationId: 8801, clientName: 'Recover Me', reservationStatus: 'CONFIRMED', startDate: '2026-11-24' },
+        { reservationId: 8802, clientName: 'Normal Active', reservationStatus: 'FINISHED', startDate: '2026-11-24' }
+      ])
+    );
+    assert.equal(resRec.syncComplete, true);
+    assert.equal(resRec.sourceEligibleCount, 2);
+    assert.equal(resRec.dbEligibleCount, 2);
+    assert.equal(resRec.eligibleCountGap, 0);
+    assert.equal(recoverDb.state.notifications.length, 0);
+
+    // 3) Persistent upsert failure leaves gap after auto-recovery and triggers idempotent role alerts + error_logs
+    const failDb = createInMemoryMockExecutor({
+      injectUpsertFailFor: (rec) => String(rec.source_reservation_id ?? rec.sourceReservationId) === '8801'
+    });
+    const resFail = await pullFromRentalGateDirect(
+      failDb,
+      { id: 'EMP_ADMIN', name: 'Admin', role: 'general_manager' },
+      { maxPages: 3 },
+      makeMockFetch([
+        { reservationId: 8801, clientName: 'Always Fails', reservationStatus: 'CONFIRMED', startDate: '2026-11-24' },
+        { reservationId: 8802, clientName: 'Always Succeeds', reservationStatus: 'FINISHED', startDate: '2026-11-24' }
+      ])
+    );
+    assert.equal(resFail.syncComplete, false);
+    assert.equal(resFail.sourceEligibleCount, 2);
+    assert.equal(resFail.dbEligibleCount, 1);
+    assert.equal(resFail.eligibleCountGap, 1);
+    assert.ok(resFail.missingEligibleIds.includes('8801'));
+    assert.ok(failDb.state.error_logs.some((e) => e.context === 'syncService' && e.action === 'reconciliationDiscrepancy'));
+    assert.equal(failDb.state.notifications.filter((n) => n.entity_type === 'Sync').length, 3);
   } finally {
     if (prevRgToken === undefined) delete process.env.RG_TOKEN;
     else process.env.RG_TOKEN = prevRgToken;

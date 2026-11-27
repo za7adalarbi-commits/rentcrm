@@ -85,32 +85,77 @@ export function buildPgSearchCondition(columns: string[], rawQuery: unknown, par
   return tokenClauses.length === 1 ? tokenClauses[0] : `(${tokenClauses.join(' AND ')})`;
 }
 
-const SQL_REJECTED_CODES = `('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','refused_by_admin','refused_by_company','refused_by_provider')`;
+const SQL_REJECTED_CODES = `('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','declined_by_user','declined_by_client','declined_by_customer','refused_by_admin','refused_by_company','refused_by_provider','refused_by_user','refused_by_client','refused_by_customer')`;
 const SQL_CANCELLED_CODES = `('cancelled','canceled','cancelled_by_customer','canceled_by_customer','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','cancelled_by_provider','canceled_by_provider','cancelled_by_company','canceled_by_company','admin_cancelled','admin_canceled','provider_cancelled','provider_canceled','company_cancelled','company_canceled','system_cancelled','system_canceled','auto_cancelled','auto_canceled')`;
-const SQL_REJECTED_STATUS_LIST = `('مرفوض','مرفوضة','تم الرفض','تم الرفض من الشركة','تم الرفض من المزود','مرفوض من الموقع','مرفوضة من الموقع','مرفوض من الشركة','مرفوضة من الشركة','مرفوض من المزود','مرفوض من الادارة','مرفوض من الإدارة','مرفوض تلقائيا','مرفوض تلقائياً','rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','refused_by_admin','refused_by_company','refused_by_provider')`;
-const SQL_CANCELLED_STATUS_LIST = `('تم الإلغاء','تم الالغاء','تم الإلغاء من العميل','تم الالغاء من العميل','ملغي','ملغى','ملغاة','ملغي من العميل','ملغى من العميل','ملغاة من العميل','ملغي من الشركة','ملغى من الشركة','ملغي من الادارة','ملغي من الإدارة','ملغى من الادارة','ملغى من الإدارة','ملغي تلقائيا','ملغي تلقائياً','الغاء العميل','إلغاء العميل','cancelled','canceled','cancelled_by_customer','canceled_by_customer','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','cancelled_by_provider','canceled_by_provider','cancelled_by_company','canceled_by_company','admin_cancelled','admin_canceled','provider_cancelled','provider_canceled','company_cancelled','company_canceled','system_cancelled','system_canceled','auto_cancelled','auto_canceled')`;
+const SQL_REJECTED_STATUS_LIST = `('مرفوض','مرفوضه','تم الرفض','تم الرفض من الشركه','تم الرفض من المزود','مرفوض من الموقع','مرفوضه من الموقع','مرفوض من الشركه','مرفوضه من الشركه','مرفوض من المزود','مرفوض من الاداره','مرفوض تلقائيا','rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','declined_by_user','declined_by_client','declined_by_customer','refused_by_admin','refused_by_company','refused_by_provider','refused_by_user','refused_by_client','refused_by_customer')`;
+const SQL_CANCELLED_STATUS_LIST = `('تم الالغاء','تم الغاء','تم الالغاء من العميل','تم الالغاء من الشركه','ملغي','ملغاه','ملغي من العميل','ملغاه من العميل','ملغي من الشركه','ملغي من الاداره','ملغي تلقائيا','الغاء العميل','الغاء الحجز','cancelled','canceled','cancelled_by_customer','canceled_by_customer','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','cancelled_by_provider','canceled_by_provider','cancelled_by_company','canceled_by_company','admin_cancelled','admin_canceled','provider_cancelled','provider_canceled','company_cancelled','company_canceled','system_cancelled','system_canceled','auto_cancelled','auto_canceled')`;
+
+const SQL_NORM_EXT_CODE = `REGEXP_REPLACE(LOWER(TRIM(COALESCE(r.original_status_code, ''))), '[\\s-]+', '_', 'g')`;
+const SQL_NORM_EXT_AR = `TRANSLATE(LOWER(TRIM(COALESCE(r.original_status_ar, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}')`;
+const SQL_NORM_INT_ST = `TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}')`;
 
 const SQL_NO_EXPLICIT_EXTERNAL = `(
   TRIM(COALESCE(r.original_status_code, '')) = '' AND
   (TRIM(COALESCE(r.original_status_ar, '')) = '' OR TRIM(COALESCE(r.original_status_ar, '')) = 'غير محدد')
 )`;
 
+const SQL_EXT_CODE_IS_REJECTED = `(
+  ${SQL_NORM_EXT_CODE} IN ${SQL_REJECTED_CODES} OR
+  ${SQL_NORM_EXT_CODE} LIKE 'rejected\\_by\\_%' ESCAPE '\\' OR
+  ${SQL_NORM_EXT_CODE} LIKE 'declined\\_by\\_%' ESCAPE '\\' OR
+  ${SQL_NORM_EXT_CODE} LIKE 'refused\\_by\\_%' ESCAPE '\\' OR
+  ${SQL_NORM_EXT_CODE} LIKE '%\\_rejected' ESCAPE '\\' OR
+  ${SQL_NORM_EXT_CODE} LIKE '%\\_declined' ESCAPE '\\' OR
+  ${SQL_NORM_EXT_CODE} LIKE '%\\_refused' ESCAPE '\\' OR
+  ${SQL_NORM_EXT_AR} IN ${SQL_REJECTED_STATUS_LIST} OR
+  ${SQL_NORM_EXT_AR} LIKE 'مرفوض%' OR
+  ${SQL_NORM_EXT_AR} LIKE 'تم الرفض%'
+)`;
+
+const SQL_EXT_CODE_IS_CANCELLED = `(
+  NOT ${SQL_EXT_CODE_IS_REJECTED} AND (
+    ${SQL_NORM_EXT_CODE} IN ${SQL_CANCELLED_CODES} OR
+    ${SQL_NORM_EXT_CODE} LIKE 'cancelled\\_by\\_%' ESCAPE '\\' OR
+    ${SQL_NORM_EXT_CODE} LIKE 'canceled\\_by\\_%' ESCAPE '\\' OR
+    ${SQL_NORM_EXT_CODE} LIKE '%\\_cancelled' ESCAPE '\\' OR
+    ${SQL_NORM_EXT_CODE} LIKE '%\\_canceled' ESCAPE '\\' OR
+    ${SQL_NORM_EXT_AR} IN ${SQL_CANCELLED_STATUS_LIST} OR
+    ${SQL_NORM_EXT_AR} LIKE 'ملغي%' OR
+    ${SQL_NORM_EXT_AR} LIKE 'ملغاه%' OR
+    ${SQL_NORM_EXT_AR} LIKE 'تم الالغاء%' OR
+    ${SQL_NORM_EXT_AR} LIKE 'تم الغاء%'
+  )
+)`;
+
 const SQL_EXPLICIT_REJECTED = `(
-  LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ${SQL_REJECTED_CODES} OR
-  LOWER(TRIM(COALESCE(r.original_status_ar, ''))) IN ${SQL_REJECTED_STATUS_LIST} OR
+  ${SQL_EXT_CODE_IS_REJECTED} OR
+  (
+    ${SQL_EXT_CODE_IS_CANCELLED} AND
+    COALESCE(r.is_source_rejected, FALSE) = TRUE AND
+    COALESCE(r.is_source_cancelled, FALSE) = FALSE
+  ) OR
   (
     ${SQL_NO_EXPLICIT_EXTERNAL} AND
-    LOWER(TRIM(COALESCE(r.internal_status, ''))) IN ${SQL_REJECTED_STATUS_LIST}
+    COALESCE(r.is_source_cancelled, FALSE) = FALSE AND
+    (
+      r.is_source_rejected = TRUE OR
+      ${SQL_NORM_INT_ST} IN ${SQL_REJECTED_STATUS_LIST}
+    )
   )
 )`;
 
 const SQL_EXPLICIT_CANCELLED = `(
   NOT ${SQL_EXPLICIT_REJECTED} AND (
-    LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ${SQL_CANCELLED_CODES} OR
-    LOWER(TRIM(COALESCE(r.original_status_ar, ''))) IN ${SQL_CANCELLED_STATUS_LIST} OR
+    (
+      ${SQL_EXT_CODE_IS_CANCELLED} AND
+      NOT (COALESCE(r.is_source_rejected, FALSE) = TRUE AND COALESCE(r.is_source_cancelled, FALSE) = FALSE)
+    ) OR
     (
       ${SQL_NO_EXPLICIT_EXTERNAL} AND
-      LOWER(TRIM(COALESCE(r.internal_status, ''))) IN ${SQL_CANCELLED_STATUS_LIST}
+      (
+        r.is_source_cancelled = TRUE OR
+        (COALESCE(r.is_source_rejected, FALSE) = FALSE AND ${SQL_NORM_INT_ST} IN ${SQL_CANCELLED_STATUS_LIST})
+      )
     )
   )
 )`;
@@ -123,34 +168,44 @@ const SQL_HAS_EXPLICIT_STATUS = `(
 
 const SQL_REJECTED_CONDITION = `(
   CASE
-    WHEN r.is_source_rejected IS NOT NULL THEN r.is_source_rejected = TRUE
-    ELSE (
-      ${SQL_EXPLICIT_REJECTED} OR (
-        NOT ${SQL_HAS_EXPLICIT_STATUS} AND
-        COALESCE(r.rejected_at, '') <> '' AND
-        (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+    WHEN ${SQL_NO_EXPLICIT_EXTERNAL} THEN (
+      COALESCE(r.is_source_cancelled, FALSE) = FALSE AND (
+        r.is_source_rejected = TRUE OR
+        ${SQL_NORM_INT_ST} IN ${SQL_REJECTED_STATUS_LIST} OR (
+          NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+          r.is_source_rejected IS NULL AND
+          COALESCE(r.rejected_at, '') <> '' AND
+          (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+        )
       )
     )
+    ELSE ${SQL_EXPLICIT_REJECTED}
   END
 )`;
 
 const SQL_CANCELLED_CONDITION = `(
   CASE
-    WHEN r.is_source_cancelled IS NOT NULL THEN r.is_source_cancelled = TRUE
-    ELSE (
+    WHEN ${SQL_NO_EXPLICIT_EXTERNAL} THEN (
       NOT (
-        ${SQL_EXPLICIT_REJECTED} OR (
-          NOT ${SQL_HAS_EXPLICIT_STATUS} AND
-          COALESCE(r.rejected_at, '') <> '' AND
-          (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+        COALESCE(r.is_source_cancelled, FALSE) = FALSE AND (
+          r.is_source_rejected = TRUE OR
+          ${SQL_NORM_INT_ST} IN ${SQL_REJECTED_STATUS_LIST} OR (
+            NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+            r.is_source_rejected IS NULL AND
+            COALESCE(r.rejected_at, '') <> '' AND
+            (COALESCE(r.cancelled_at, '') = '' OR r.rejected_at >= r.cancelled_at)
+          )
         )
       ) AND (
-        ${SQL_EXPLICIT_CANCELLED} OR (
+        r.is_source_cancelled = TRUE OR
+        (COALESCE(r.is_source_rejected, FALSE) = FALSE AND ${SQL_NORM_INT_ST} IN ${SQL_CANCELLED_STATUS_LIST}) OR (
           NOT ${SQL_HAS_EXPLICIT_STATUS} AND
+          r.is_source_cancelled IS NULL AND
           COALESCE(r.cancelled_at, '') <> ''
         )
       )
     )
+    ELSE ${SQL_EXPLICIT_CANCELLED}
   END
 )`;
 
@@ -997,8 +1052,9 @@ export async function getDashboard(
         lbFuQuery,
         lbPrbQuery
       ] = await Promise.all([
-        executor.query<{ total_cnt: number; today_cnt: number; cancelled_cnt?: number; rejected_cnt?: number }>(
+        executor.query<{ total_cnt: number; active_cnt?: number; today_cnt: number; cancelled_cnt?: number; rejected_cnt?: number }>(
           `SELECT COUNT(*)::int AS total_cnt,
+                  COUNT(*) FILTER (WHERE ${SQL_ACTIVE_CONDITION})::int AS active_cnt,
                   COUNT(*) FILTER (WHERE LEFT(COALESCE(NULLIF(r.start_date, ''), ''), 10) = $${todayParamIdx}::text OR (r.created_at >= (($${todayParamIdx}::text || ' 00:00:00')::timestamp AT TIME ZONE 'Asia/Riyadh') AND r.created_at < ((($${todayParamIdx}::text || ' 00:00:00')::timestamp AT TIME ZONE 'Asia/Riyadh') + INTERVAL '1 day')))::int AS today_cnt,
                   COUNT(*) FILTER (WHERE ${SQL_CANCELLED_CONDITION})::int AS cancelled_cnt,
                   COUNT(*) FILTER (WHERE ${SQL_REJECTED_CONDITION})::int AS rejected_cnt
@@ -1113,6 +1169,9 @@ export async function getDashboard(
   const metrics = {
     kpis: {
       totalReservations: num(resTotalsQuery.rows[0]?.total_cnt),
+      activeReservations: resTotalsQuery.rows[0]?.active_cnt !== undefined
+        ? num(resTotalsQuery.rows[0]?.active_cnt)
+        : Math.max(0, num(resTotalsQuery.rows[0]?.total_cnt) - num(resTotalsQuery.rows[0]?.cancelled_cnt) - num(resTotalsQuery.rows[0]?.rejected_cnt)),
       todayReservations: num(resTotalsQuery.rows[0]?.today_cnt),
       newReservations,
       booked: statusCounts['تم الحجز'] || 0,

@@ -30,6 +30,9 @@ export interface SyncSourceBreakdown {
   activeOrOtherCount: number;
   cancelledListCount: number;
   rejectedListCount: number;
+  effectiveCancelledCount?: number;
+  effectiveRejectedCount?: number;
+  sourceEligibleCount?: number;
   grossAcrossThreeLists: number;
   dualCancelledRejectedCount: number;
   reassignedActiveCount: number;
@@ -47,6 +50,11 @@ export interface SyncReconciliationReport {
   importedCount: number;
   updatedCount: number;
   dbTotalReservations: number;
+  sourceEligibleCount: number;
+  dbEligibleCount: number;
+  eligibleCountGap: number;
+  missingEligibleIds: string[];
+  extraEligibleDbIds: string[];
   duplicateHandledCount: number;
   excludedFilteredCount: number;
   excludedSourceIds: string[];
@@ -80,6 +88,8 @@ export interface SyncBatchPayload {
   cancelledSourceIds?: string[];
   rejectedSourceIds?: string[];
   expectedSourceIds?: string[];
+  expectedEligibleSourceIds?: string[];
+  sourceEligibleCount?: number;
   excludedSourceIds?: string[];
   totalInSource?: number;
   incompleteEndpoints?: string[];
@@ -109,6 +119,11 @@ export interface SyncIngestResult {
   totalInSource: number;
   savedOrUpdatedCount: number;
   dbTotalReservations: number;
+  sourceEligibleCount: number;
+  dbEligibleCount: number;
+  eligibleCountGap: number;
+  missingEligibleIds: string[];
+  extraEligibleDbIds: string[];
   duplicateHandledCount: number;
   failedCount: number;
   failedRecords: SyncFailedRecord[];
@@ -501,23 +516,52 @@ function normalizeIncomingReservation(
       ? Math.floor(explicitOrder)
       : (prevOrder > 0 ? Math.floor(prevOrder) : (seqFallback > 0 ? Math.floor(seqFallback) : null));
 
-  const finalLifecycle = crmCore.getReservationLifecycleKind({
-    originalStatusCode: rawCode,
-    originalStatusAr: sourceStatusAr,
-    internalStatus: nextInternalStatus
-  });
-  const resolvedIsSourceRejected: boolean | null = typeof raw.isSourceRejected === 'boolean'
+  const rawRejFlag: boolean | null = typeof raw.isSourceRejected === 'boolean'
     ? raw.isSourceRejected
     : (typeof merged.isSourceRejected === 'boolean'
       ? merged.isSourceRejected
       : (typeof existingClient?.isSourceRejected === 'boolean' ? existingClient.isSourceRejected : null));
-  const resolvedIsSourceCancelled: boolean | null = typeof raw.isSourceCancelled === 'boolean'
+  const rawCanFlag: boolean | null = typeof raw.isSourceCancelled === 'boolean'
     ? raw.isSourceCancelled
     : (typeof merged.isSourceCancelled === 'boolean'
       ? merged.isSourceCancelled
       : (typeof existingClient?.isSourceCancelled === 'boolean' ? existingClient.isSourceCancelled : null));
-  const isRejectedRes = typeof resolvedIsSourceRejected === 'boolean' ? resolvedIsSourceRejected : (finalLifecycle === 'rejected');
-  const isCancelledRes = typeof resolvedIsSourceCancelled === 'boolean' ? resolvedIsSourceCancelled : (finalLifecycle === 'cancelled');
+
+  const extIsRejected = crmCore.isRejectedToken(rawCode) || crmCore.isRejectedToken(sourceStatusAr);
+  const extIsCancelled = !extIsRejected && (crmCore.isCancelledToken(rawCode) || crmCore.isCancelledToken(sourceStatusAr));
+  const extIsExplicitActive = !extIsRejected && !extIsCancelled && (
+    crmCore.isExplicitActiveStatusToken(rawCode) || crmCore.isExplicitActiveStatusToken(sourceStatusAr)
+  );
+
+  let resolvedIsSourceRejected: boolean | null = rawRejFlag;
+  let resolvedIsSourceCancelled: boolean | null = rawCanFlag;
+  if (extIsExplicitActive) {
+    resolvedIsSourceCancelled = false;
+    resolvedIsSourceRejected = false;
+  } else if (extIsRejected) {
+    resolvedIsSourceRejected = true;
+    resolvedIsSourceCancelled = false;
+  } else if (extIsCancelled) {
+    if (rawCanFlag !== true && rawRejFlag === true) {
+      resolvedIsSourceCancelled = false;
+      resolvedIsSourceRejected = true;
+    } else {
+      resolvedIsSourceCancelled = true;
+      resolvedIsSourceRejected = false;
+    }
+  } else if (resolvedIsSourceCancelled === true && resolvedIsSourceRejected === true) {
+    resolvedIsSourceRejected = false;
+  }
+
+  const finalLifecycle = crmCore.classifyReservationLifecycle({
+    originalStatusCode: rawCode,
+    originalStatusAr: sourceStatusAr,
+    internalStatus: nextInternalStatus,
+    isSourceCancelled: resolvedIsSourceCancelled,
+    isSourceRejected: resolvedIsSourceRejected
+  });
+  const isRejectedRes = finalLifecycle === 'rejected';
+  const isCancelledRes = finalLifecycle === 'cancelled';
 
   const rawPaidCand = merged.paidAmount !== undefined
     ? merged.paidAmount
@@ -534,6 +578,7 @@ function normalizeIncomingReservation(
         ? totalAmt
         : 0));
 
+  const preservedRccStatus = str(raw.rccStatus ?? merged.rccStatus ?? existingClient?.rccStatus);
   const record: Record<string, any> = {
     id: resId,
     sourceReservationId: srcResId,
@@ -550,7 +595,9 @@ function normalizeIncomingReservation(
     customerIdNumber: (typeof crmCore.extractCustomerNationalId === 'function' ? crmCore.extractCustomerNationalId(raw, existingClient) : '') || str(merged.customerIdNumber),
     companyName: str(merged.companyName),
     companyNumber: str(existingClient?.companyNumber || merged.companyNumber || raw.companyNumber || raw.company_number || raw.companyCode || ''),
-    newCompanyName: isRejectedRes ? str(merged.newCompanyName || raw.newCompanyName || raw.new_company_name || raw.transferCompanyName || raw.alternativeCompanyName || existingClient?.newCompanyName || '') : '',
+    newCompanyName: (isRejectedRes || Boolean(preservedRccStatus))
+      ? str(merged.newCompanyName || raw.newCompanyName || raw.new_company_name || raw.transferCompanyName || raw.alternativeCompanyName || existingClient?.newCompanyName || '')
+      : '',
     branchName: str(merged.branchName),
     deliverBranchName: str(merged.deliverBranchName || merged.branchName),
     carName: str(merged.carName),
@@ -970,6 +1017,11 @@ export async function ingestIncrementalSyncBatch(
   let extensionsCount = 0;
   let duplicateHandledCount = num(payload?.duplicateSourceRowsSkipped, 0);
   let dbTotalReservations = 0;
+  let sourceEligibleCountOut = 0;
+  let dbEligibleCountOut = 0;
+  let eligibleCountGapOut = 0;
+  let missingEligibleIdsOut: string[] = [];
+  let extraEligibleDbIdsOut: string[] = [];
   let unfetchedSourceGap = 0;
   let syncCompleteOut = false;
   let reconciliationOut: SyncReconciliationReport | null = null;
@@ -988,6 +1040,9 @@ export async function ingestIncrementalSyncBatch(
     : [];
   const expectedSourceIds = Array.isArray(payload?.expectedSourceIds)
     ? Array.from(new Set(payload.expectedSourceIds.map((s) => str(s)).filter(Boolean)))
+    : [];
+  const expectedEligibleSourceIds = Array.isArray(payload?.expectedEligibleSourceIds)
+    ? Array.from(new Set(payload.expectedEligibleSourceIds.map((s) => str(s)).filter(Boolean)))
     : [];
 
   try {
@@ -1265,8 +1320,15 @@ export async function ingestIncrementalSyncBatch(
               resDedupMap.set(disambigNum, record);
             } else {
               duplicateHandledCount++;
-              if (dupExisting.isSourceCancelled === true) record.isSourceCancelled = true;
-              if (dupExisting.isSourceRejected === true) record.isSourceRejected = true;
+              const recExtCode = crmCore.extractReservationStatusCode(record, false);
+              if (!crmCore.isExplicitActiveStatusToken(recExtCode)) {
+                if (dupExisting.isSourceCancelled === true) {
+                  record.isSourceCancelled = true;
+                  record.isSourceRejected = false;
+                } else if (dupExisting.isSourceRejected === true && record.isSourceCancelled !== true) {
+                  record.isSourceRejected = true;
+                }
+              }
               resDedupMap.set(record.reservationNumber, record);
             }
           } else {
@@ -1587,6 +1649,116 @@ export async function ingestIncrementalSyncBatch(
       }
       missingSourceIds = Array.from(missingSet);
 
+      const rowIsEligible = (row: any) =>
+        crmCore.classifyReservationLifecycle({
+          originalStatusCode: row.original_status_code ?? row.originalStatusCode,
+          originalStatusAr: row.original_status_ar ?? row.originalStatusAr,
+          internalStatus: row.internal_status ?? row.internalStatus,
+          isSourceCancelled: row.is_source_cancelled ?? row.isSourceCancelled,
+          isSourceRejected: row.is_source_rejected ?? row.isSourceRejected,
+          rejectedAt: row.rejected_at ?? row.rejectedAt,
+          cancelledAt: row.cancelled_at ?? row.cancelledAt
+        }) === 'active';
+
+      const batchActiveCount = reservationBatch.filter((r) => rowIsEligible(r)).length;
+      const sourceEligibleCount = payload?.sourceEligibleCount !== undefined
+        ? num(payload.sourceEligibleCount, 0)
+        : (expectedEligibleSourceIds.length > 0 ? expectedEligibleSourceIds.length : batchActiveCount);
+
+      let dbEligibleCount = 0;
+      let missingEligibleIds: string[] = [];
+      let extraEligibleDbIds: string[] = [];
+      let eligibleCountGap = 0;
+
+      if (payload?.isFullSnapshot === true) {
+        const spElig = 'rg_elig_verify';
+        await trySavepoint(tx, spElig);
+        let dbLifecycleRows: any[] = [];
+        try {
+          const elRes = await tx.query(
+            `SELECT id, reservation_number, source_reservation_id, original_status_code, original_status_ar, internal_status, is_source_cancelled, is_source_rejected, rejected_at, cancelled_at FROM reservations`
+          );
+          await tryReleaseSavepoint(tx, spElig);
+          dbLifecycleRows = Array.isArray(elRes?.rows) ? elRes.rows : [];
+        } catch {
+          await tryRollbackToSavepoint(tx, spElig);
+        }
+        if (dbLifecycleRows.length === 0 && (dbTotalReservations > 0 || reservationBatch.length > 0)) {
+          const spEligStar = 'rg_elig_verify_star';
+          await trySavepoint(tx, spEligStar);
+          try {
+            const starRes = await tx.query(`SELECT * FROM reservations`);
+            await tryReleaseSavepoint(tx, spEligStar);
+            if (Array.isArray(starRes?.rows) && starRes.rows.length > 0) {
+              dbLifecycleRows = starRes.rows;
+            }
+          } catch {
+            await tryRollbackToSavepoint(tx, spEligStar);
+          }
+        }
+        const effectiveDbRows = dbLifecycleRows.length > 0
+          ? dbLifecycleRows
+          : reservationBatch.filter((r) => {
+              const rn = str(r.reservationNumber);
+              const sid = str(r.sourceReservationId || rn);
+              return verifiedNums.has(rn) || verifiedSrcIds.has(sid) || verifiedSrcIds.has(normLookupKey(sid));
+            });
+        const dbEligibleRows = effectiveDbRows.filter(rowIsEligible);
+        dbEligibleCount = dbEligibleRows.length;
+        const dbEligibleKeySet = new Set<string>();
+        for (const r of dbEligibleRows) {
+          const sid = str(r.source_reservation_id ?? r.sourceReservationId);
+          const rn = str(r.reservation_number ?? r.reservationNumber);
+          if (sid) {
+            dbEligibleKeySet.add(sid);
+            dbEligibleKeySet.add(normLookupKey(sid));
+          }
+          if (rn) {
+            dbEligibleKeySet.add(rn);
+            dbEligibleKeySet.add(normLookupKey(rn));
+          }
+        }
+        const expectedEligSourceList = expectedEligibleSourceIds.length > 0
+          ? expectedEligibleSourceIds
+          : reservationBatch
+              .filter(rowIsEligible)
+              .map((r) => str(r.sourceReservationId || r.reservationNumber))
+              .filter(Boolean);
+        missingEligibleIds = expectedEligSourceList.filter((esid) => {
+          const clean = normLookupKey(esid);
+          if (excludedSrcSet.has(clean)) return false;
+          return !dbEligibleKeySet.has(esid) && !dbEligibleKeySet.has(clean);
+        });
+        if (!payload?.appliedRange?.hasCustomRange) {
+          const expectedEligKeySet = new Set<string>();
+          for (const esid of expectedEligSourceList) {
+            expectedEligKeySet.add(esid);
+            expectedEligKeySet.add(normLookupKey(esid));
+          }
+          extraEligibleDbIds = dbEligibleRows
+            .map((r) => str(r.source_reservation_id ?? r.sourceReservationId ?? r.reservation_number ?? r.reservationNumber))
+            .filter((k) => k && !expectedEligKeySet.has(k) && !expectedEligKeySet.has(normLookupKey(k)));
+          eligibleCountGap = Math.max(Math.abs(sourceEligibleCount - dbEligibleCount), missingEligibleIds.length);
+        } else {
+          eligibleCountGap = missingEligibleIds.length;
+        }
+      } else {
+        const verifiedBatchActive = reservationBatch.filter((r) => {
+          if (!rowIsEligible(r)) return false;
+          const rn = str(r.reservationNumber);
+          const sid = str(r.sourceReservationId || rn);
+          return verifiedNums.has(rn) || verifiedSrcIds.has(sid) || verifiedSrcIds.has(normLookupKey(sid));
+        });
+        dbEligibleCount = verifiedBatchActive.length;
+        eligibleCountGap = Math.max(0, batchActiveCount - dbEligibleCount);
+      }
+
+      sourceEligibleCountOut = sourceEligibleCount;
+      dbEligibleCountOut = dbEligibleCount;
+      eligibleCountGapOut = eligibleCountGap;
+      missingEligibleIdsOut = missingEligibleIds;
+      extraEligibleDbIdsOut = extraEligibleDbIds;
+
       const savedOrUpdatedCount = importedCount + updatedCount;
       const excludedCnt = num(payload?.excludedFilteredCount, excludedSourceIds.length);
       const rangeCnt = num(payload?.rangeFilteredCount, 0);
@@ -1603,13 +1775,16 @@ export async function ingestIncrementalSyncBatch(
         missingSourceIds.length === 0 &&
         incompleteEndpoints.length === 0 &&
         backfillFailedIds.length === 0 &&
-        unfetchedSourceGap === 0;
+        unfetchedSourceGap === 0 &&
+        missingEligibleIds.length === 0 &&
+        eligibleCountGap === 0;
       syncCompleteOut = syncComplete;
       const finalStatus: 'success' | 'partial' = syncComplete ? 'success' : 'partial';
 
       const summaryParts: string[] = [];
       if (failedRecords.length > 0) summaryParts.push(`فشل حفظ/معالجة ${failedRecords.length} سجل`);
       if (missingSourceIds.length > 0) summaryParts.push(`سجلات مفقودة بعد التحقق: ${missingSourceIds.length} (${missingSourceIds.slice(0, 8).join(', ')})`);
+      if (eligibleCountGap > 0 || missingEligibleIds.length > 0) summaryParts.push(`فرق المستحقة (المصدر ${sourceEligibleCount} / CRM ${dbEligibleCount}): ${eligibleCountGap}${missingEligibleIds.length ? ` [${missingEligibleIds.slice(0, 8).join(', ')}]` : ''}`);
       if (unfetchedSourceGap > 0) summaryParts.push(`نقص غير مجلوب من المصدر: ${unfetchedSourceGap}`);
       if (incompleteEndpoints.length > 0) summaryParts.push(`واجهات غير مكتملة: ${incompleteEndpoints.join(' | ')}`);
       const statusMessage = syncComplete ? '' : summaryParts.join(' · ').slice(0, 500);
@@ -1645,6 +1820,11 @@ export async function ingestIncrementalSyncBatch(
         importedCount,
         updatedCount,
         dbTotalReservations,
+        sourceEligibleCount,
+        dbEligibleCount,
+        eligibleCountGap,
+        missingEligibleIds: missingEligibleIds.slice(0, 100),
+        extraEligibleDbIds: extraEligibleDbIds.slice(0, 100),
         duplicateHandledCount,
         excludedFilteredCount: excludedCnt,
         excludedSourceIds: excludedSourceIds.slice(0, 100),
@@ -1691,6 +1871,11 @@ export async function ingestIncrementalSyncBatch(
             fetchedCount: incomingRes.length,
             savedOrUpdatedCount,
             dbTotalReservations,
+            sourceEligibleCount,
+            dbEligibleCount,
+            eligibleCountGap,
+            missingEligibleIds: missingEligibleIds.slice(0, 100),
+            extraEligibleDbIds: extraEligibleDbIds.slice(0, 100),
             duplicateHandledCount,
             excludedFilteredCount: excludedCnt,
             excludedSourceIds: excludedSourceIds.slice(0, 100),
@@ -1724,7 +1909,7 @@ export async function ingestIncrementalSyncBatch(
             syncId,
             syncComplete
               ? `استيراد ${importedCount}، تحديث ${updatedCount}، تمديدات ${extensionsCount}`
-              : `مزامنة غير مكتملة: استيراد ${importedCount}، تحديث ${updatedCount}، مفقود ${missingSourceIds.length}، فاشل ${failedRecords.length}${unfetchedSourceGap ? `، فجوة مصدر ${unfetchedSourceGap}` : ''}`,
+              : `مزامنة غير مكتملة: استيراد ${importedCount}، تحديث ${updatedCount}، مفقود ${missingSourceIds.length}، فرق المستحقة ${eligibleCountGap}، فاشل ${failedRecords.length}${unfetchedSourceGap ? `، فجوة مصدر ${unfetchedSourceGap}` : ''}`,
             finishedAt.slice(0, 10),
             finishedAt.slice(11, 19),
             finishedAt
@@ -1779,6 +1964,11 @@ export async function ingestIncrementalSyncBatch(
       importedCount,
       updatedCount,
       dbTotalReservations,
+      sourceEligibleCount: sourceEligibleCountOut,
+      dbEligibleCount: dbEligibleCountOut,
+      eligibleCountGap: eligibleCountGapOut,
+      missingEligibleIds: missingEligibleIdsOut,
+      extraEligibleDbIds: extraEligibleDbIdsOut,
       duplicateHandledCount,
       excludedFilteredCount: num(payload?.excludedFilteredCount, excludedSourceIds.length),
       excludedSourceIds,
@@ -1813,6 +2003,11 @@ export async function ingestIncrementalSyncBatch(
       totalInSource,
       savedOrUpdatedCount,
       dbTotalReservations,
+      sourceEligibleCount: sourceEligibleCountOut,
+      dbEligibleCount: dbEligibleCountOut,
+      eligibleCountGap: eligibleCountGapOut,
+      missingEligibleIds: missingEligibleIdsOut,
+      extraEligibleDbIds: extraEligibleDbIdsOut,
       duplicateHandledCount,
       failedCount: failedRecords.length,
       failedRecords,
@@ -2978,22 +3173,46 @@ export async function pullFromRentalGateDirect(
     const canAuthoritative = canPaged.ok && (cancelledBySrcId.size > 0 || !resHasHeuristicCancelled);
     const rccAuthoritative = rccPaged.ok && (rccBySrcId.size > 0 || !resHasHeuristicRejected);
 
-    const enrichedResItems = resPaged.items.map((rawItem: any) => {
+    const isPrimaryActiveStatus = (item: any) => {
+      const code = crmCore.extractReservationStatusCode(item, false);
+      const ar = str(item?.originalStatusAr || item?.statusAr || item?.status_ar);
+      if (crmCore.isRejectedToken(code) || crmCore.isRejectedToken(ar)) return false;
+      if (crmCore.isCancelledToken(code) || crmCore.isCancelledToken(ar)) return false;
+      return crmCore.isExplicitActiveStatusToken(code) || crmCore.isExplicitActiveStatusToken(ar);
+    };
+    const isPrimaryExplicitRejected = (item: any) => {
+      const code = crmCore.extractReservationStatusCode(item, false);
+      const ar = str(item?.originalStatusAr || item?.statusAr || item?.status_ar);
+      return crmCore.isRejectedToken(code) || crmCore.isRejectedToken(ar);
+    };
+
+    const enrichResItem = (rawItem: any): Record<string, any> => {
       const sid = str(crmCore.extractSourceReservationId(rawItem) || crmCore.extractReservationNumber(rawItem));
       const cleanSid = sid.replace(/^#+/, '').trim();
       const canRec = (sid ? cancelledBySrcId.get(sid) : null) || (cleanSid ? cancelledBySrcId.get(cleanSid) : null);
       const rccRec = (sid ? rccBySrcId.get(sid) : null) || (cleanSid ? rccBySrcId.get(cleanSid) : null);
       const copy: Record<string, any> = { ...rawItem };
-      if (canAuthoritative) {
-        copy.isSourceCancelled = Boolean(canRec);
-      } else if (canRec) {
-        copy.isSourceCancelled = true;
-      }
-      if (rccAuthoritative) {
-        copy.isSourceRejected = Boolean(rccRec);
-      } else if (rccRec) {
+      const primaryActive = isPrimaryActiveStatus(rawItem);
+      const primaryRejected = isPrimaryExplicitRejected(rawItem);
+
+      if (primaryActive) {
+        copy.isSourceCancelled = false;
+        copy.isSourceRejected = false;
+      } else if (primaryRejected) {
         copy.isSourceRejected = true;
+        copy.isSourceCancelled = false;
+      } else {
+        const canFlag = canAuthoritative ? Boolean(canRec) : (canRec ? true : undefined);
+        const rejFlag = rccAuthoritative ? Boolean(rccRec) : (rccRec ? true : undefined);
+        if (canFlag === true) {
+          copy.isSourceCancelled = true;
+          copy.isSourceRejected = false;
+        } else {
+          if (typeof canFlag === 'boolean') copy.isSourceCancelled = canFlag;
+          if (typeof rejFlag === 'boolean') copy.isSourceRejected = rejFlag;
+        }
       }
+
       if (canRec) {
         if (canRec.reservationNumber) copy.referenceNumber = str(canRec.reservationNumber);
         if (canRec.paid !== undefined && canRec.paid !== null) copy.paidAmount = num(canRec.paid, 0);
@@ -3050,7 +3269,9 @@ export async function pullFromRentalGateDirect(
         if (rejActorAt) copy.rejectedAt = rejActorAt;
       }
       return copy;
-    });
+    };
+
+    const enrichedResItems = resPaged.items.map(enrichResItem);
 
     const settingsRes = await executor.query<{ value: string }>(
       `SELECT value FROM settings WHERE key = 'excluded_statuses' LIMIT 1`
@@ -3101,27 +3322,39 @@ export async function pullFromRentalGateDirect(
 
     const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.items);
 
-    const isPrimaryActiveStatus = (item: any) => {
-      const code = crmCore.extractReservationStatusCode(item, false);
-      return crmCore.classifyReservationLifecycle({ originalStatusCode: code }) === 'active';
-    };
-    const activeOrOtherCount = dedupedAllRes.filter((item: any) => isPrimaryActiveStatus(item)).length;
+    const activeOrOtherCount = dedupedAllRes.filter((item: any) => crmCore.classifyReservationLifecycle(item) === 'active').length;
+    const effectiveCancelledCount = dedupedAllRes.filter((item: any) => crmCore.classifyReservationLifecycle(item) === 'cancelled').length;
+    const effectiveRejectedCount = dedupedAllRes.filter((item: any) => crmCore.classifyReservationLifecycle(item) === 'rejected').length;
     const cancelledListCount = canAuthoritative
       ? cancelledBySrcId.size
-      : dedupedAllRes.filter((item: any) => crmCore.isCancelledStatus(item) || item.isSourceCancelled === true).length;
+      : effectiveCancelledCount;
     const rejectedListCount = rccAuthoritative
       ? rccBySrcId.size
-      : dedupedAllRes.filter((item: any) => crmCore.isRejectedStatus(item) || item.isSourceRejected === true).length;
-    const dualCancelledRejectedCount = dedupedAllRes.filter((item: any) => item.isSourceCancelled === true && item.isSourceRejected === true).length;
-    const reassignedActiveCount = dedupedAllRes.filter(
-      (item: any) => isPrimaryActiveStatus(item) && item.isSourceRejected === true
-    ).length;
+      : effectiveRejectedCount;
+    const dualCancelledRejectedCount = dedupedAllRes.filter((item: any) => {
+      const sid = str(crmCore.extractSourceReservationId(item) || crmCore.extractReservationNumber(item)).replace(/^#+/, '').trim();
+      return Boolean(
+        ((sid && cancelledBySrcId.has(sid)) || item.isSourceCancelled === true) &&
+        ((sid && rccBySrcId.has(sid)) || (item.rccStatus && str(item.rccStatus).toUpperCase() === 'CLIENT_CANCELLED'))
+      );
+    }).length;
+    const reassignedActiveCount = dedupedAllRes.filter((item: any) => {
+      const sid = str(crmCore.extractSourceReservationId(item) || crmCore.extractReservationNumber(item)).replace(/^#+/, '').trim();
+      return isPrimaryActiveStatus(item) && Boolean((sid && rccBySrcId.has(sid)) || item.rccStatus);
+    }).length;
     const grossAcrossThreeLists = activeOrOtherCount + cancelledListCount + rejectedListCount;
+    const filteredEligibleSourceIds = filteredRes
+      .filter((item: any) => crmCore.classifyReservationLifecycle(item) === 'active')
+      .map((item: any) => str(crmCore.extractSourceReservationId(item) || crmCore.extractReservationNumber(item)))
+      .filter(Boolean);
     const sourceBreakdown: SyncSourceBreakdown = {
       uniqueSourceTotal: dedupedAllRes.length,
       activeOrOtherCount,
       cancelledListCount,
       rejectedListCount,
+      effectiveCancelledCount,
+      effectiveRejectedCount,
+      sourceEligibleCount: filteredEligibleSourceIds.length,
       grossAcrossThreeLists,
       dualCancelledRejectedCount,
       reassignedActiveCount,
@@ -3139,7 +3372,7 @@ export async function pullFromRentalGateDirect(
       .map((item: any) => str(crmCore.extractSourceReservationId(item) || crmCore.extractReservationNumber(item)))
       .filter(Boolean);
 
-    const syncResult = await ingestIncrementalSyncBatch(executor, {
+    let syncResult = await ingestIncrementalSyncBatch(executor, {
       source: 'rental_gate_direct',
       actor,
       pagesFetched: resPaged.pages + extPaged.pages + canPaged.pages + rccPaged.pages,
@@ -3150,6 +3383,8 @@ export async function pullFromRentalGateDirect(
       cancelledSourceIds: canAuthoritative ? Array.from(cancelledBySrcId.keys()) : undefined,
       rejectedSourceIds: rccAuthoritative ? Array.from(rccBySrcId.keys()) : undefined,
       expectedSourceIds,
+      expectedEligibleSourceIds: filteredEligibleSourceIds,
+      sourceEligibleCount: filteredEligibleSourceIds.length,
       excludedSourceIds,
       totalInSource,
       incompleteEndpoints,
@@ -3162,6 +3397,214 @@ export async function pullFromRentalGateDirect(
       reservations: filteredRes,
       extensions: dedupedExt
     });
+
+    // Automatic targeted recovery pass if any source or eligible booking IDs are missing/mismatched
+    const recoveryTargetIds = (!appliedRange?.hasCustomRange)
+      ? Array.from(new Set([
+          ...(syncResult.missingSourceIds || []),
+          ...(syncResult.missingEligibleIds || []),
+          ...(syncResult.backfillFailedIds || [])
+        ].map((s) => str(s)).filter(Boolean)))
+      : [];
+    if (recoveryTargetIds.length > 0 && recoveryTargetIds.length <= 100) {
+      const filteredByKey = new Map<string, any>();
+      for (const item of filteredRes) {
+        const sid = str(crmCore.extractSourceReservationId(item) || crmCore.extractReservationNumber(item));
+        const cleanSid = sid.replace(/^#+/, '').trim();
+        if (sid) filteredByKey.set(sid, item);
+        if (cleanSid) filteredByKey.set(cleanSid, item);
+      }
+      const recoveredBatch: any[] = [];
+      for (const rChunk of chunkList(recoveryTargetIds, 5)) {
+        const fetchedDetails = await Promise.all(
+          rChunk.map(async (sid) => {
+            const freshDetail = await fetchReservationDetailById(sid);
+            if (freshDetail) return enrichResItem(freshDetail);
+            return filteredByKey.get(sid) || filteredByKey.get(sid.replace(/^#+/, '').trim()) || null;
+          })
+        );
+        for (const item of fetchedDetails) {
+          if (item) recoveredBatch.push(item);
+        }
+      }
+      if (recoveredBatch.length > 0) {
+        const recoveryRes = await ingestIncrementalSyncBatch(executor, {
+          source: 'rental_gate_direct',
+          actor,
+          isFullSnapshot: false,
+          isRetryPass: true,
+          pagesFetched: recoveredBatch.length,
+          expectedSourceIds: recoveryTargetIds,
+          totalInSource,
+          sourceBreakdown,
+          reservations: recoveredBatch,
+          extensions: []
+        });
+        const recSet = new Set(recoveredBatch.map((r) => str(crmCore.extractSourceReservationId(r) || crmCore.extractReservationNumber(r)).replace(/^#+/, '').trim()).filter(Boolean));
+        const recFailSet = new Set((recoveryRes.failedRecords || []).map((f) => str(f.sourceReservationId || f.reservationNumber || f.identifier).replace(/^#+/, '').trim()).filter(Boolean));
+        const checkDbRes = await executor.query(
+          `SELECT id, reservation_number, source_reservation_id, original_status_code, original_status_ar, internal_status, is_source_cancelled, is_source_rejected, rejected_at, cancelled_at FROM reservations`
+        ).catch(() => ({ rows: [] as any[] }));
+        let verifyRows: any[] = Array.isArray(checkDbRes?.rows) ? checkDbRes.rows : [];
+        if (verifyRows.length === 0) {
+          const starVerify = await executor.query(`SELECT * FROM reservations`).catch(() => ({ rows: [] as any[] }));
+          if (Array.isArray(starVerify?.rows)) verifyRows = starVerify.rows;
+        }
+        if (verifyRows.length > 0) {
+          const dbEligSet = new Set<string>();
+          let nextDbElig = 0;
+          for (const vr of verifyRows) {
+            const isElig = crmCore.classifyReservationLifecycle({
+              originalStatusCode: vr.original_status_code,
+              originalStatusAr: vr.original_status_ar,
+              internalStatus: vr.internal_status,
+              isSourceCancelled: vr.is_source_cancelled,
+              isSourceRejected: vr.is_source_rejected,
+              rejectedAt: vr.rejected_at,
+              cancelledAt: vr.cancelled_at
+            }) === 'active';
+            if (isElig) {
+              nextDbElig++;
+              const k1 = str(vr.source_reservation_id);
+              const k2 = str(vr.reservation_number);
+              if (k1) { dbEligSet.add(k1); dbEligSet.add(k1.replace(/^#+/, '').trim()); }
+              if (k2) { dbEligSet.add(k2); dbEligSet.add(k2.replace(/^#+/, '').trim()); }
+            }
+          }
+          const nextMissingElig = filteredEligibleSourceIds.filter((esid: string) => {
+            const clean = esid.replace(/^#+/, '').trim();
+            return !dbEligSet.has(esid) && !dbEligSet.has(clean);
+          });
+          const nextDbAllSet = new Set<string>();
+          for (const vr of verifyRows) {
+            const k1 = str(vr.source_reservation_id);
+            const k2 = str(vr.reservation_number);
+            if (k1) { nextDbAllSet.add(k1); nextDbAllSet.add(k1.replace(/^#+/, '').trim()); }
+            if (k2) { nextDbAllSet.add(k2); nextDbAllSet.add(k2.replace(/^#+/, '').trim()); }
+          }
+          const nextMissingSrc = expectedSourceIds.filter((esid: string) => {
+            const clean = esid.replace(/^#+/, '').trim();
+            return !nextDbAllSet.has(esid) && !nextDbAllSet.has(clean);
+          });
+          const nextEligGap = Math.max(Math.abs(filteredEligibleSourceIds.length - nextDbElig), nextMissingElig.length);
+          const nextBackfillFailed = (syncResult.backfillFailedIds || []).filter((id) => !recSet.has(str(id).replace(/^#+/, '').trim()) || recFailSet.has(str(id).replace(/^#+/, '').trim()));
+          const nextComplete =
+            recoveryRes.failedRecords.length === 0 &&
+            nextMissingSrc.length === 0 &&
+            incompleteEndpoints.length === 0 &&
+            nextBackfillFailed.length === 0 &&
+            syncResult.unfetchedSourceGap === 0 &&
+            nextMissingElig.length === 0 &&
+            nextEligGap === 0;
+          syncResult = {
+            ...syncResult,
+            importedCount: syncResult.importedCount + recoveryRes.importedCount,
+            updatedCount: syncResult.updatedCount + recoveryRes.updatedCount,
+            savedOrUpdatedCount: syncResult.savedOrUpdatedCount + recoveryRes.savedOrUpdatedCount,
+            dbTotalReservations: verifyRows.length,
+            sourceEligibleCount: filteredEligibleSourceIds.length,
+            dbEligibleCount: nextDbElig,
+            eligibleCountGap: nextEligGap,
+            missingEligibleIds: nextMissingElig,
+            missingLocalCount: nextMissingSrc.length,
+            missingSourceIds: nextMissingSrc,
+            backfillFailedIds: nextBackfillFailed,
+            failedRecords: recoveryRes.failedRecords,
+            failedCount: recoveryRes.failedRecords.length,
+            syncComplete: nextComplete,
+            status: nextComplete ? 'success' : 'partial',
+            reconciliation: {
+              ...syncResult.reconciliation,
+              importedCount: syncResult.importedCount + recoveryRes.importedCount,
+              updatedCount: syncResult.updatedCount + recoveryRes.updatedCount,
+              savedOrUpdatedCount: syncResult.savedOrUpdatedCount + recoveryRes.savedOrUpdatedCount,
+              dbTotalReservations: verifyRows.length,
+              sourceEligibleCount: filteredEligibleSourceIds.length,
+              dbEligibleCount: nextDbElig,
+              eligibleCountGap: nextEligGap,
+              missingEligibleIds: nextMissingElig.slice(0, 100),
+              missingLocalCount: nextMissingSrc.length,
+              missingSourceIds: nextMissingSrc.slice(0, 100),
+              backfillFailedIds: nextBackfillFailed.slice(0, 100),
+              failedRecords: recoveryRes.failedRecords.slice(0, 100),
+              failedCount: recoveryRes.failedRecords.length,
+              syncComplete: nextComplete,
+              verifiedAt: recoveryRes.finishedAt
+            }
+          };
+          await executor.query(
+            `UPDATE sync_checkpoints
+             SET last_status = $2,
+                 last_successful_at = CASE WHEN $2 = 'success' THEN $3::timestamptz ELSE last_successful_at END,
+                 last_error = $4,
+                 meta = $5::jsonb,
+                 updated_at = $3::timestamptz
+             WHERE source = 'rental_gate_direct'`,
+            [
+              'rental_gate_direct',
+              syncResult.status,
+              recoveryRes.finishedAt,
+              nextComplete ? '' : `فرق المستحقة (${filteredEligibleSourceIds.length}/${nextDbElig}) · مفقود ${nextMissingSrc.length}`,
+              JSON.stringify(syncResult.reconciliation)
+            ]
+          ).catch(() => undefined);
+        }
+      }
+    }
+
+    // Alert supervisors/admins and log whenever any discrepancy remains after auto-recovery
+    const hasPersistentDiscrepancy =
+      !syncResult.syncComplete ||
+      syncResult.missingLocalCount > 0 ||
+      syncResult.eligibleCountGap > 0 ||
+      (syncResult.missingEligibleIds && syncResult.missingEligibleIds.length > 0);
+    if (hasPersistentDiscrepancy && !appliedRange?.hasCustomRange) {
+      const gapDesc = `عدم تطابق أعداد الحجوزات بعد المزامنة: المستحقة في Rental Gate (${syncResult.sourceEligibleCount}) مقابل CRM (${syncResult.dbEligibleCount}) · الفرق: ${syncResult.eligibleCountGap} · سجلات مفقودة: ${syncResult.missingLocalCount}`;
+      if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+        console.warn(`[RG Sync Discrepancy] ${gapDesc}`, {
+          missingSourceIds: syncResult.missingSourceIds.slice(0, 20),
+          missingEligibleIds: syncResult.missingEligibleIds.slice(0, 20),
+          incompleteEndpoints: syncResult.incompleteEndpoints
+        });
+      }
+      await logBackendError(
+        executor,
+        'syncService',
+        'reconciliationDiscrepancy',
+        new Error(gapDesc),
+        {
+          sourceEligibleCount: syncResult.sourceEligibleCount,
+          dbEligibleCount: syncResult.dbEligibleCount,
+          eligibleCountGap: syncResult.eligibleCountGap,
+          missingLocalCount: syncResult.missingLocalCount,
+          missingEligibleIds: syncResult.missingEligibleIds.slice(0, 50),
+          missingSourceIds: syncResult.missingSourceIds.slice(0, 50),
+          incompleteEndpoints: syncResult.incompleteEndpoints
+        }
+      ).catch(() => undefined);
+
+      const dayBucket = new Date().toISOString().slice(0, 10);
+      const sigIds = syncResult.missingEligibleIds.slice(0, 6).join('_') || syncResult.missingSourceIds.slice(0, 6).join('_') || 'gap';
+      const eventKey = `sync_gap:${dayBucket}:${syncResult.sourceEligibleCount}_${syncResult.dbEligibleCount}_${sigIds.replace(/[^A-Za-z0-9_.:|-]/g, '_').slice(0, 60)}`;
+      for (const alertRole of ['general_manager', 'developer', 'supervisor']) {
+        await executor.query(
+          `INSERT INTO notifications (id, recipient_employee_id, recipient_role, type, title, message, entity_type, entity_id, is_read, created_at, updated_at, event_key)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW(),NOW(),$9)
+           ON CONFLICT (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '' DO NOTHING`,
+          [
+            generateId('NTF'),
+            '',
+            alertRole,
+            'warning',
+            'تنبيه: فرق في مطابقة أعداد الحجوزات مع Rental Gate',
+            gapDesc,
+            'Sync',
+            syncResult.syncId,
+            eventKey
+          ]
+        ).catch(() => undefined);
+      }
+    }
 
     if (serverCfg.gasWebAppUrl && Array.isArray(syncResult.mutatedReservations) && syncResult.mutatedReservations.length > 0) {
       const toMirror = syncResult.mutatedReservations.slice(0, 100);
