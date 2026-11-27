@@ -1,8 +1,8 @@
 /**
- * RENTAL GATE CRM — Custom Frosted Glass Dropdown Enhancer & Floating Menu Manager
- * Enhances <select class="select"> & <select class="quick-status-select"> controls with
- * translucent glass trigger + portaled viewport-aware menu while keeping native <select>
- * DOM IDs, .value getters/setters, <option> lists, and change listeners 100% intact.
+ * RENTAL GATE CRM — Custom Searchable Frosted Glass Dropdown Enhancer & Floating Menu Manager
+ * Enhances <select class="select">, <select class="quick-status-select">, and <select class="input">
+ * with unified searchable portaled menu while preserving native <select> DOM IDs, .value getters/setters,
+ * <option> lists, and change listeners.
  */
 (function (root) {
   'use strict';
@@ -16,8 +16,6 @@
   var activeSession = null;
   var observer = null;
   var globalEventsBound = false;
-  var typeBuffer = '';
-  var typeTimer = null;
 
   function ensurePortal() {
     var portal = document.getElementById(PORTAL_ID);
@@ -28,6 +26,21 @@
       document.body.appendChild(portal);
     }
     return portal;
+  }
+
+  function isEnglish() {
+    return document.documentElement.getAttribute('lang') === 'en';
+  }
+
+  function normalizeSearchText(str) {
+    return String(str || '')
+      .toLowerCase()
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ة/g, 'ه')
+      .replace(/ى/g, 'ي')
+      .replace(/[\u064B-\u065F\u0670]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   function getAccessibleLabel(selectEl) {
@@ -59,16 +72,33 @@
     if (['مؤكد', 'مقبول', 'تم الحجز', 'تم التسليم', 'تم الاستلام', 'تم التسليم من قبل السائق', 'تم الإرجاع', 'مدفوع', 'مدفوع بالمحفظة', 'تم الحل', 'مغلقة'].indexOf(s) !== -1) {
       return 'success';
     }
-    if (['جديد', 'تم الإنشاء', 'تم التمديد', 'تم التمديد تلقائيًا', 'قيد التنفيذ', 'نشط الآن', 'في الطريق'].indexOf(s) !== -1) {
+    if (['جديد', 'تم الإنشاء', 'تم التمديد', 'تم التمديد تلقائيًا', 'قيد التنفيذ', 'نشط الآن', 'في الطريق', 'قيد المراجعة', 'قيد المعالجة'].indexOf(s) !== -1) {
       return 'info';
     }
-    if (['متوسط', 'معلق', 'بانتظار الدفع', 'لم يتم الحجز'].indexOf(s) !== -1) {
+    if (['متوسط', 'معلق', 'بانتظار الدفع', 'لم يتم الحجز', 'بانتظار رد العميل', 'بانتظار شركة التأجير'].indexOf(s) !== -1) {
       return 'warning';
     }
-    if (['مرتفع', 'عاجل', 'ملغي', 'تم الإلغاء', 'مرفوض', 'جديدة'].indexOf(s) !== -1) {
+    if (['مرتفع', 'عاجل', 'ملغي', 'تم الإلغاء', 'مرفوض', 'جديدة', 'ملغاة'].indexOf(s) !== -1) {
       return 'danger';
     }
     return '';
+  }
+
+  function createDotElement(opt, isCompact) {
+    var customColor = opt && opt.getAttribute ? String(opt.getAttribute('data-color') || '').trim() : '';
+    if (/^#[0-9a-fA-F]{3,8}$/.test(customColor) || /^rgb/i.test(customColor)) {
+      var customDot = document.createElement('span');
+      customDot.className = 'rg-tone-dot';
+      customDot.style.background = customColor;
+      customDot.setAttribute('aria-hidden', 'true');
+      return customDot;
+    }
+    var tone = opt ? (opt.getAttribute('data-tone') || (isCompact ? getSemanticDotTone(opt.textContent) : '')) : '';
+    if (!tone) return null;
+    var dot = document.createElement('span');
+    dot.className = 'rg-tone-dot is-' + tone;
+    dot.setAttribute('aria-hidden', 'true');
+    return dot;
   }
 
   function syncTriggerFromSelect(selectEl) {
@@ -79,14 +109,25 @@
     var val = opt ? opt.value : '';
     var isCompact = selectEl.classList.contains('quick-status-select');
 
-    ref.valueEl.textContent = labelText;
+    ref.valueEl.innerHTML = '';
+    var dot = createDotElement(opt, false);
+    if (dot && !isCompact) {
+      ref.valueEl.appendChild(dot);
+    }
+    var txtSpan = document.createElement('span');
+    txtSpan.style.overflow = 'hidden';
+    txtSpan.style.textOverflow = 'ellipsis';
+    txtSpan.style.whiteSpace = 'nowrap';
+    txtSpan.textContent = labelText;
+    ref.valueEl.appendChild(txtSpan);
+
     ref.trigger.setAttribute('data-value', val);
     ref.trigger.disabled = Boolean(selectEl.disabled);
     ref.wrap.classList.toggle('is-disabled', Boolean(selectEl.disabled));
     ref.wrap.classList.toggle('has-placeholder', val === '');
 
     if (isCompact) {
-      var tone = getSemanticDotTone(labelText);
+      var tone = (opt && opt.getAttribute('data-tone')) || getSemanticDotTone(labelText);
       ref.trigger.setAttribute('data-tone', tone);
     }
 
@@ -157,25 +198,29 @@
     var vh = window.innerHeight || document.documentElement.clientHeight || 800;
     var margin = 10;
     var gap = 6;
-    var minWidth = Math.max(triggerRect.width, activeSession.isCompact ? 176 : 190);
-    var maxWidth = Math.min(vw - margin * 2, Math.max(minWidth, 340));
+    var minWidth = Math.max(triggerRect.width, activeSession.isCompact ? 210 : 220);
+    var maxWidth = Math.min(vw - margin * 2, Math.max(minWidth, 360));
 
     menu.style.minWidth = minWidth + 'px';
     menu.style.maxWidth = maxWidth + 'px';
 
+    var desiredMaxH = 330;
+    menu.style.maxHeight = desiredMaxH + 'px';
+
     var menuRect = menu.getBoundingClientRect();
     var actualW = Math.min(maxWidth, Math.max(minWidth, menuRect.width || minWidth));
-    var actualH = Math.min(290, menu.scrollHeight || menuRect.height || 220);
+    var actualH = Math.min(desiredMaxH, menu.scrollHeight || menuRect.height || 240);
 
     var spaceBelow = vh - triggerRect.bottom - margin;
     var spaceAbove = triggerRect.top - margin;
-    var openUpward = spaceBelow < Math.min(actualH, 180) && spaceAbove > spaceBelow;
-    var maxAllowedH = Math.max(120, Math.min(290, (openUpward ? spaceAbove : spaceBelow) - gap));
+    var openUpward = spaceBelow < Math.min(actualH, 210) && spaceAbove > spaceBelow;
+    var maxAllowedH = Math.max(150, Math.min(desiredMaxH, (openUpward ? spaceAbove : spaceBelow) - gap));
 
     menu.style.maxHeight = maxAllowedH + 'px';
+    var boxH = Math.min(actualH, maxAllowedH);
     var topPos = openUpward
-      ? Math.max(margin, triggerRect.top - Math.min(actualH, maxAllowedH) - gap)
-      : Math.min(vh - margin - Math.min(actualH, maxAllowedH), triggerRect.bottom + gap);
+      ? Math.max(margin, triggerRect.top - boxH - gap)
+      : Math.min(vh - margin - boxH, triggerRect.bottom + gap);
 
     var isRtl = document.documentElement.getAttribute('dir') !== 'ltr';
     var leftPos = isRtl ? (triggerRect.right - actualW) : triggerRect.left;
@@ -191,8 +236,20 @@
     menu.classList.toggle('is-upward', openUpward);
   }
 
+  function getFocusableIndices() {
+    if (!activeSession || !activeSession.optionButtons.length) return [];
+    var indices = [];
+    activeSession.optionButtons.forEach(function (btn, idx) {
+      if (!btn.disabled) indices.push(idx);
+    });
+    return indices;
+  }
+
   function highlightOptionIndex(nextIdx, shouldScroll) {
-    if (!activeSession || !activeSession.optionButtons.length) return;
+    if (!activeSession || !activeSession.optionButtons.length) {
+      if (activeSession) activeSession.focusIndex = -1;
+      return;
+    }
     var total = activeSession.optionButtons.length;
     var idx = Math.max(0, Math.min(total - 1, nextIdx));
     activeSession.focusIndex = idx;
@@ -229,38 +286,83 @@
     }
   }
 
+  function collectDeduplicatedOptions(selectEl, curVal) {
+    var rawOptions = Array.from(selectEl.options || []);
+    var seen = {};
+    var deduped = [];
+    rawOptions.forEach(function (opt) {
+      var val = String(opt.value || '');
+      var txt = String(opt.textContent || '').trim();
+      var key = val + '::' + txt;
+      if (seen[key]) {
+        if (val === curVal && !seen[key].isSelected) {
+          seen[key].isSelected = true;
+        }
+        return;
+      }
+      var isInactive = opt.getAttribute('data-inactive') === 'true' || Boolean(opt.disabled && val !== '' && val === curVal);
+      var item = {
+        opt: opt,
+        value: val,
+        text: txt,
+        disabled: Boolean(opt.disabled),
+        isInactive: isInactive,
+        isSelected: val === curVal
+      };
+      seen[key] = item;
+      deduped.push(item);
+    });
+    return deduped;
+  }
+
   function renderActiveMenuOptions() {
-    if (!activeSession) return;
+    if (!activeSession || !activeSession.listEl) return;
     var selectEl = activeSession.select;
-    var menu = activeSession.menu;
+    var listEl = activeSession.listEl;
     var curVal = nativeValueDescriptor ? nativeValueDescriptor.get.call(selectEl) : selectEl.value;
-    var options = Array.from(selectEl.options || []);
+    var allItems = collectDeduplicatedOptions(selectEl, curVal);
+    var queryNorm = normalizeSearchText(activeSession.searchQuery || '');
     var uid = activeSession.uid;
 
-    menu.innerHTML = '';
+    var visibleItems = queryNorm
+      ? allItems.filter(function (item) {
+          return normalizeSearchText(item.text).indexOf(queryNorm) !== -1 ||
+            normalizeSearchText(item.value).indexOf(queryNorm) !== -1;
+        })
+      : allItems;
+
+    listEl.innerHTML = '';
     activeSession.optionButtons = [];
 
-    if (!options.length) {
+    if (!visibleItems.length) {
       var empty = document.createElement('div');
       empty.className = 'rg-select-empty';
-      empty.textContent = document.documentElement.getAttribute('lang') === 'en' ? 'No options available' : 'لا توجد خيارات';
-      menu.appendChild(empty);
+      empty.textContent = isEnglish()
+        ? 'No matching results'
+        : (queryNorm ? 'لا توجد نتائج مطابقة' : 'لا توجد خيارات');
+      listEl.appendChild(empty);
+      activeSession.focusIndex = -1;
+      positionMenu();
       return;
     }
 
     var selectedIdx = -1;
-    options.forEach(function (opt, idx) {
+    var firstEnabledIdx = -1;
+    visibleItems.forEach(function (item, idx) {
+      var opt = item.opt;
       var optBtn = document.createElement('button');
       optBtn.type = 'button';
       optBtn.id = uid + '-opt-' + idx;
       optBtn.className = 'rg-select-option';
       optBtn.setAttribute('role', 'option');
-      optBtn.setAttribute('data-value', opt.value);
+      optBtn.setAttribute('data-value', item.value);
       optBtn.setAttribute('data-index', String(idx));
-      optBtn.disabled = Boolean(opt.disabled);
+      optBtn.disabled = item.disabled;
 
-      var isSelected = opt.value === curVal;
-      if (isSelected) {
+      if (!item.disabled && firstEnabledIdx === -1) {
+        firstEnabledIdx = idx;
+      }
+      if (item.isSelected) {
         selectedIdx = idx;
         optBtn.classList.add('is-selected');
         optBtn.setAttribute('aria-selected', 'true');
@@ -270,19 +372,22 @@
 
       var labelSpan = document.createElement('span');
       labelSpan.className = 'rg-select-option-label';
-      var tone = activeSession.isCompact ? getSemanticDotTone(opt.textContent) : '';
-      if (tone) {
-        var dot = document.createElement('span');
-        dot.className = 'rg-tone-dot is-' + tone;
-        dot.setAttribute('aria-hidden', 'true');
-        labelSpan.appendChild(dot);
-      }
+      var dot = createDotElement(opt, activeSession.isCompact);
+      if (dot) labelSpan.appendChild(dot);
+
       var textNode = document.createElement('span');
-      textNode.textContent = opt.textContent;
+      textNode.textContent = item.text;
       labelSpan.appendChild(textNode);
       optBtn.appendChild(labelSpan);
 
-      if (isSelected) {
+      if (item.isInactive) {
+        var inactBadge = document.createElement('span');
+        inactBadge.className = 'rg-select-inactive-badge';
+        inactBadge.textContent = isEnglish() ? 'Inactive' : 'غير نشطة';
+        optBtn.appendChild(inactBadge);
+      }
+
+      if (item.isSelected) {
         var chk = document.createElement('span');
         chk.className = 'rg-select-check';
         chk.setAttribute('aria-hidden', 'true');
@@ -300,12 +405,15 @@
         commitSelectionByIndex(idx);
       });
 
-      menu.appendChild(optBtn);
+      listEl.appendChild(optBtn);
       activeSession.optionButtons.push(optBtn);
     });
 
-    var startIdx = selectedIdx >= 0 ? selectedIdx : 0;
+    var startIdx = selectedIdx >= 0 && !visibleItems[selectedIdx].disabled
+      ? selectedIdx
+      : (firstEnabledIdx >= 0 ? firstEnabledIdx : (selectedIdx >= 0 ? selectedIdx : 0));
     highlightOptionIndex(startIdx, true);
+    positionMenu();
   }
 
   function openMenuForSelect(selectEl) {
@@ -328,6 +436,44 @@
     var accLabel = getAccessibleLabel(selectEl);
     if (accLabel) menu.setAttribute('aria-label', accLabel);
 
+    var searchable = selectEl.getAttribute('data-searchable') !== 'false';
+    var searchInp = null;
+    var clearBtn = null;
+
+    if (searchable) {
+      var searchWrap = document.createElement('div');
+      searchWrap.className = 'rg-select-search-wrap';
+
+      var searchIcon = document.createElement('span');
+      searchIcon.className = 'rg-select-search-icon';
+      searchIcon.setAttribute('aria-hidden', 'true');
+      searchIcon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
+
+      searchInp = document.createElement('input');
+      searchInp.type = 'text';
+      searchInp.className = 'rg-select-search-input';
+      searchInp.autocomplete = 'off';
+      searchInp.spellcheck = false;
+      searchInp.placeholder = selectEl.getAttribute('data-search-placeholder') ||
+        (isEnglish() ? 'Search...' : 'ابحث عن الحالة...');
+      searchInp.setAttribute('aria-label', searchInp.placeholder);
+
+      clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'rg-select-search-clear hidden';
+      clearBtn.setAttribute('aria-label', isEnglish() ? 'Clear search' : 'مسح البحث');
+      clearBtn.textContent = '×';
+
+      searchWrap.appendChild(searchIcon);
+      searchWrap.appendChild(searchInp);
+      searchWrap.appendChild(clearBtn);
+      menu.appendChild(searchWrap);
+    }
+
+    var listEl = document.createElement('div');
+    listEl.className = 'rg-select-options-list';
+    menu.appendChild(listEl);
+
     portal.appendChild(menu);
 
     activeSession = {
@@ -335,10 +481,38 @@
       select: selectEl,
       trigger: ref.trigger,
       menu: menu,
+      listEl: listEl,
+      searchInp: searchInp,
+      clearBtn: clearBtn,
+      searchQuery: '',
       isCompact: selectEl.classList.contains('quick-status-select'),
       optionButtons: [],
       focusIndex: 0
     };
+
+    if (searchInp && clearBtn) {
+      searchInp.addEventListener('input', function () {
+        if (!activeSession || activeSession.searchInp !== searchInp) return;
+        activeSession.searchQuery = searchInp.value || '';
+        clearBtn.classList.toggle('hidden', !activeSession.searchQuery);
+        renderActiveMenuOptions();
+      });
+      searchInp.addEventListener('keydown', function (ev) {
+        if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp' || ev.key === 'Enter' || ev.key === 'Escape' || ev.key === 'Tab') {
+          handleMenuKeyDown(ev, true);
+        }
+      });
+      clearBtn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!activeSession) return;
+        searchInp.value = '';
+        activeSession.searchQuery = '';
+        clearBtn.classList.add('hidden');
+        renderActiveMenuOptions();
+        try { searchInp.focus({ preventScroll: true }); } catch (_e) {}
+      });
+    }
 
     ref.trigger.setAttribute('aria-controls', menu.id);
     ref.trigger.setAttribute('aria-expanded', 'true');
@@ -354,47 +528,24 @@
           if (activeSession.optionButtons[activeSession.focusIndex]) {
             activeSession.optionButtons[activeSession.focusIndex].scrollIntoView({ block: 'nearest' });
           }
+          if (searchInp) {
+            try { searchInp.focus({ preventScroll: true }); } catch (_e) {}
+          }
         }
       });
     } else {
       menu.classList.add('is-open');
+      if (searchInp) {
+        try { searchInp.focus({ preventScroll: true }); } catch (_e) {}
+      }
     }
   }
 
-  function handleMenuKeyDown(ev) {
+  function handleMenuKeyDown(ev, fromSearchInput) {
     if (!activeSession) return false;
     var total = activeSession.optionButtons.length;
-    if (!total) return false;
+    var enabledIndices = getFocusableIndices();
 
-    if (ev.key === 'ArrowDown') {
-      ev.preventDefault();
-      var nextDown = activeSession.focusIndex + 1;
-      while (nextDown < total && activeSession.optionButtons[nextDown].disabled) nextDown++;
-      if (nextDown < total) highlightOptionIndex(nextDown, true);
-      return true;
-    }
-    if (ev.key === 'ArrowUp') {
-      ev.preventDefault();
-      var nextUp = activeSession.focusIndex - 1;
-      while (nextUp >= 0 && activeSession.optionButtons[nextUp].disabled) nextUp--;
-      if (nextUp >= 0) highlightOptionIndex(nextUp, true);
-      return true;
-    }
-    if (ev.key === 'Home') {
-      ev.preventDefault();
-      highlightOptionIndex(0, true);
-      return true;
-    }
-    if (ev.key === 'End') {
-      ev.preventDefault();
-      highlightOptionIndex(total - 1, true);
-      return true;
-    }
-    if (ev.key === 'Enter' || ev.key === ' ') {
-      ev.preventDefault();
-      commitSelectionByIndex(activeSession.focusIndex);
-      return true;
-    }
     if (ev.key === 'Escape') {
       ev.preventDefault();
       ev.stopPropagation();
@@ -405,15 +556,46 @@
       closeActiveMenu({ restoreFocus: false });
       return false;
     }
-    if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
-      typeBuffer += ev.key.toLowerCase();
-      clearTimeout(typeTimer);
-      typeTimer = setTimeout(function () { typeBuffer = ''; }, 550);
-      var matchIdx = activeSession.optionButtons.findIndex(function (btn) {
-        return !btn.disabled && String(btn.textContent || '').trim().toLowerCase().indexOf(typeBuffer) === 0;
-      });
-      if (matchIdx >= 0) {
-        highlightOptionIndex(matchIdx, true);
+    if (!total) return false;
+
+    if (ev.key === 'ArrowDown') {
+      ev.preventDefault();
+      var nextDown = activeSession.focusIndex + 1;
+      while (nextDown < total && activeSession.optionButtons[nextDown].disabled) nextDown++;
+      if (nextDown < total) {
+        highlightOptionIndex(nextDown, true);
+      } else if (enabledIndices.length) {
+        highlightOptionIndex(enabledIndices[0], true);
+      }
+      return true;
+    }
+    if (ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      var nextUp = activeSession.focusIndex - 1;
+      while (nextUp >= 0 && activeSession.optionButtons[nextUp].disabled) nextUp--;
+      if (nextUp >= 0) {
+        highlightOptionIndex(nextUp, true);
+      } else if (enabledIndices.length) {
+        highlightOptionIndex(enabledIndices[enabledIndices.length - 1], true);
+      }
+      return true;
+    }
+    if (!fromSearchInput && ev.key === 'Home') {
+      ev.preventDefault();
+      if (enabledIndices.length) highlightOptionIndex(enabledIndices[0], true);
+      return true;
+    }
+    if (!fromSearchInput && ev.key === 'End') {
+      ev.preventDefault();
+      if (enabledIndices.length) highlightOptionIndex(enabledIndices[enabledIndices.length - 1], true);
+      return true;
+    }
+    if (ev.key === 'Enter' || (!fromSearchInput && ev.key === ' ')) {
+      ev.preventDefault();
+      if (activeSession.focusIndex >= 0 && activeSession.optionButtons[activeSession.focusIndex] && !activeSession.optionButtons[activeSession.focusIndex].disabled) {
+        commitSelectionByIndex(activeSession.focusIndex);
+      } else if (enabledIndices.length) {
+        commitSelectionByIndex(enabledIndices[0]);
       }
       return true;
     }
@@ -429,7 +611,7 @@
     }
 
     var isCompact = selectEl.classList.contains('quick-status-select');
-    var isTarget = selectEl.classList.contains('select') || isCompact;
+    var isTarget = selectEl.classList.contains('select') || isCompact || selectEl.classList.contains('input');
     if (!isTarget) return;
 
     selectEl.dataset[ENHANCED_FLAG] = '1';
@@ -438,6 +620,9 @@
     wrap.className = 'rg-select-wrap' + (isCompact ? ' is-compact' : '');
     if (selectEl.style && selectEl.style.maxWidth) {
       wrap.style.maxWidth = selectEl.style.maxWidth;
+    }
+    if (selectEl.style && selectEl.style.minWidth) {
+      wrap.style.minWidth = selectEl.style.minWidth;
     }
 
     var parent = selectEl.parentNode;
@@ -486,7 +671,7 @@
 
     trigger.addEventListener('keydown', function (ev) {
       if (activeSession && activeSession.select === selectEl) {
-        handleMenuKeyDown(ev);
+        handleMenuKeyDown(ev, false);
         return;
       }
       if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
@@ -502,7 +687,7 @@
 
   function enhanceAll(container) {
     var rootEl = container || document;
-    var selects = rootEl.querySelectorAll('select.select, select.quick-status-select');
+    var selects = rootEl.querySelectorAll('select.select, select.quick-status-select, select.input');
     selects.forEach(function (sel) {
       enhanceSelect(sel);
     });
@@ -522,8 +707,9 @@
 
     document.addEventListener('keydown', function (ev) {
       if (!activeSession) return;
+      if (activeSession.searchInp && document.activeElement === activeSession.searchInp) return;
       if (activeSession.trigger && document.activeElement === activeSession.trigger) return;
-      handleMenuKeyDown(ev);
+      handleMenuKeyDown(ev, false);
     }, true);
 
     window.addEventListener('resize', function () {
@@ -596,7 +782,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['disabled', 'selected']
+      attributeFilter: ['disabled', 'selected', 'data-color', 'data-inactive']
     });
   }
 

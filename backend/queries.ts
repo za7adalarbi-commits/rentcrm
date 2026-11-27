@@ -1362,6 +1362,12 @@ export async function getAppBootstrap(
     ? crmCore.normalizeCallWrapupShortcutsConfig(settings.call_wrapup_shortcuts)
     : { items: crmCore.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' };
   const handoverSettings = crmCore.normalizeHandoverSettings(settings.handover_settings);
+  const customerNotesConfig = typeof crmCore.normalizeCustomerNotesConfig === 'function'
+    ? crmCore.normalizeCustomerNotesConfig(settings.customer_notes_config)
+    : {};
+  const customerNoteStatuses = await loadCustomerNoteStatusesList(executor).catch(() =>
+    (crmCore.CUSTOMER_NOTE_DEFAULT_STATUSES || []).map((s: any) => ({ ...s }))
+  );
   const layoutPrefs = crmCore.normalizeUserLayoutPrefs(parseJsonValue(settings[`layout_prefs_u_${session.user.id}`], {}));
   const rawPinnedCritical = parseJsonValue<any[]>(settings[`pinned_res_u_${session.user.id}`], []);
   const pinnedCriticalIds = Array.isArray(rawPinnedCritical)
@@ -1385,6 +1391,7 @@ export async function getAppBootstrap(
       stats_control_config: statsControlConfig,
       call_wrapup_shortcuts: callWrapupShortcuts,
       handover_settings: handoverSettings,
+      customer_notes_config: customerNotesConfig,
       gas_webapp_url: serverCfg.gasWebAppUrl,
       auto_sync_enabled: settings.auto_sync_enabled !== false,
       auto_sync_interval_hours: syncInterval.hours,
@@ -1408,6 +1415,8 @@ export async function getAppBootstrap(
     statsControlConfig,
     callWrapupShortcuts,
     handoverSettings,
+    customerNotesConfig,
+    customerNoteStatuses,
     announcements: announcementsData.activeItems || [],
     activeLocks: locksData.items || [],
     layoutPrefs,
@@ -1910,7 +1919,8 @@ export async function getReservationDetails(
     throw new Error('FORBIDDEN: ليس لديك صلاحية عرض هذا الحجز.');
   }
 
-  const [extRes, asnRes, fuRes, fuhRes, prbRes] = await Promise.all([
+  const customerId = str(row.customer_id);
+  const [extRes, asnRes, fuRes, fuhRes, prbRes, notesRes, noteStatuses] = await Promise.all([
     executor.query(
       `SELECT * FROM extensions
        WHERE reservation_id = $1 OR reservation_number = $2
@@ -1933,7 +1943,14 @@ export async function getReservationDetails(
     executor.query(
       `SELECT * FROM problems WHERE reservation_id = $1 ORDER BY updated_at DESC`,
       [reservation.id]
-    )
+    ),
+    executor.query(
+      `SELECT * FROM customer_notes
+       WHERE deleted_at IS NULL AND (reservation_id = $1 OR reservation_number = $2)
+       ORDER BY created_at DESC LIMIT 120`,
+      [reservation.id, reservation.reservationNumber]
+    ).catch(() => ({ rows: [] as any[] })),
+    loadCustomerNoteStatusesList(executor).catch(() => [])
   ]);
 
   let problemUpdates: any[] = [];
@@ -1946,7 +1963,13 @@ export async function getReservationDetails(
     problemUpdates = puRes.rows.map(formatProblemUpdateRow);
   }
 
+  const custNotes = await enrichCustomerNoteRows(executor, notesRes.rows || [], session.user).catch(() => []);
+  const notesConfig = typeof crmCore.normalizeCustomerNotesConfig === 'function'
+    ? crmCore.normalizeCustomerNotesConfig(settings.customer_notes_config)
+    : {};
+
   reservation.isFollowed = fuRes.rows.length > 0;
+  reservation.customerId = customerId;
 
   return {
     reservation: redactReservationForUser(reservation, session.user),
@@ -1967,7 +1990,11 @@ export async function getReservationDetails(
     followUps: fuRes.rows.map(formatFollowUpRow),
     followUpHistory: fuhRes.rows.map(formatFollowUpHistoryRow),
     problems: prbRes.rows.map((p) => formatProblemRow(p)),
-    problemUpdates
+    problemUpdates,
+    customerId,
+    customerNotes: custNotes,
+    noteStatuses,
+    notesConfig
   };
 }
 
@@ -3622,9 +3649,33 @@ export async function getProblemDetails(executor: DbExecutor, session: AuthSessi
   if (!target) throw new Error('VALIDATION_ERROR: معرف المشكلة مطلوب.');
   const pRes = await executor.query(`SELECT * FROM problems WHERE id = $1 OR problem_number = $1 LIMIT 1`, [target]);
   if (!pRes.rows[0]) throw new Error('NOT_FOUND: المشكلة غير موجودة.');
-  const updRes = await executor.query(`SELECT * FROM problem_updates WHERE problem_id = $1 ORDER BY created_at DESC`, [pRes.rows[0].id]);
-  const updMap = new Map<string, any[]>([[str(pRes.rows[0].id), updRes.rows.map(formatProblemUpdateRow)]]);
-  return { problem: formatProblemRow(pRes.rows[0], updMap) };
+  const pRow = pRes.rows[0];
+  const prbId = str(pRow.id);
+  const resId = str(pRow.reservation_id);
+  const custId = str(pRow.customer_id);
+  const [updRes, notesRes, noteStatuses, settings] = await Promise.all([
+    executor.query(`SELECT * FROM problem_updates WHERE problem_id = $1 ORDER BY created_at DESC`, [prbId]),
+    executor.query(
+      `SELECT * FROM customer_notes
+       WHERE deleted_at IS NULL AND (problem_id = $1 OR ($2 <> '' AND reservation_id = $2))
+       ORDER BY created_at DESC LIMIT 80`,
+      [prbId, resId]
+    ).catch(() => ({ rows: [] as any[] })),
+    loadCustomerNoteStatusesList(executor).catch(() => []),
+    getSettingsMap(executor).catch(() => ({} as Record<string, any>))
+  ]);
+  const updMap = new Map<string, any[]>([[prbId, updRes.rows.map(formatProblemUpdateRow)]]);
+  const customerNotes = await enrichCustomerNoteRows(executor, notesRes.rows || [], session.user).catch(() => []);
+  const notesConfig = typeof crmCore.normalizeCustomerNotesConfig === 'function'
+    ? crmCore.normalizeCustomerNotesConfig(settings.customer_notes_config)
+    : {};
+  return {
+    problem: formatProblemRow(pRow, updMap),
+    customerId: custId,
+    customerNotes,
+    noteStatuses,
+    notesConfig
+  };
 }
 
 // ---------- EMPLOYEES, ROLES & PERMISSIONS ----------
@@ -4131,9 +4182,9 @@ export async function deleteEmployee(executor: DbExecutor, session: AuthSession,
 
     await runTxOptional(
       tx,
-      'clear_cust_emp_assign',
+      'clear_note_emp_assign',
       () => tx.query(
-        `UPDATE customers SET assigned_employee_id = '', assigned_employee_name = '', updated_at = NOW() WHERE assigned_employee_id = $1`,
+        `UPDATE customer_notes SET assigned_employee_id = '', assigned_employee_name = '', updated_at = NOW() WHERE assigned_employee_id = $1`,
         [empId]
       ),
       undefined
@@ -4476,6 +4527,9 @@ export async function getSettings(executor: DbExecutor, session: AuthSession) {
     stats_control_config: typeof crmCore.normalizeStatsControlConfig === 'function' ? crmCore.normalizeStatsControlConfig(map.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
     call_wrapup_shortcuts: typeof crmCore.normalizeCallWrapupShortcutsConfig === 'function' ? crmCore.normalizeCallWrapupShortcutsConfig(map.call_wrapup_shortcuts) : { items: crmCore.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
     handover_settings: crmCore.normalizeHandoverSettings(map.handover_settings),
+    customer_notes_config: typeof crmCore.normalizeCustomerNotesConfig === 'function'
+      ? crmCore.normalizeCustomerNotesConfig(map.customer_notes_config)
+      : {},
     connection_mode: serverCfg.mode || 'neon',
     gas_webapp_url: serverCfg.gasWebAppUrl,
     rg_api_base_url: serverCfg.rgApiBaseUrl,
@@ -4532,6 +4586,7 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     payload.role_ui_defaults !== undefined ||
     payload.stats_control_config !== undefined ||
     payload.call_wrapup_shortcuts !== undefined ||
+    payload.customer_notes_config !== undefined ||
     payload.auto_sync_interval_seconds !== undefined ||
     payload.auto_sync_interval_value !== undefined ||
     payload.auto_sync_interval_unit !== undefined ||
@@ -4543,6 +4598,11 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
   }
   if (payload.call_wrapup_shortcuts !== undefined && session.user.role !== 'developer') {
     throw new Error('FORBIDDEN: التحكم في اختصارات نافذة الاتصال متاح للمبرمج فقط.');
+  }
+  if (payload.customer_notes_config !== undefined) {
+    if (!crmCore.canUserPerform(session.user, 'manage_customer_notes_settings') && !crmCore.canUserPerform(session.user, 'manage_settings')) {
+      throw new Error('FORBIDDEN: ليس لديك صلاحية تعديل إعدادات ملاحظات العملاء.');
+    }
   }
   if (hasSystemSettingFields || payload.handover_settings === undefined) {
     requirePermission(session, 'manage_settings');
@@ -4599,6 +4659,12 @@ export async function updateSettings(executor: DbExecutor, session: AuthSession,
     if (JSON.stringify(prevHandover) !== JSON.stringify(normHandover)) {
       handoverChangedDiff = { field: 'handover_settings', label: 'إعدادات تسليم الوردية', before: bSummary, after: aSummary };
     }
+  }
+  if (payload.customer_notes_config !== undefined && typeof crmCore.normalizeCustomerNotesConfig === 'function') {
+    const normNotesCfg = crmCore.normalizeCustomerNotesConfig(payload.customer_notes_config);
+    normNotesCfg.updatedAt = new Date().toISOString();
+    normNotesCfg.updatedBy = session.user.name;
+    updates.push(['customer_notes_config', JSON.stringify(normNotesCfg)]);
   }
 
   const hasAutoSyncIntervalChange = Boolean(
@@ -5385,7 +5451,8 @@ export async function getReports(executor: DbExecutor, session: AuthSession, pay
           search: str(payload.search),
           status: str(payload.status),
           company: str(payload.company),
-          assignedEmployeeId: str(payload.employeeId),
+          dateFrom: str(payload.dateFrom),
+          dateTo: str(payload.dateTo),
           page: 1,
           pageSize: 1000,
           forceRefresh: true
@@ -6127,6 +6194,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
   const deletedAnnouncementIds: string[] = [];
   const deletedProblemIds: string[] = [];
   const deletedNotificationIds: string[] = [];
+  const deletedCustomerNoteIds: string[] = [];
   let deletedAllReservationsBefore = '';
   let deletedAllNotificationsBefore = '';
   const userNotifTombstoneType = `notification:${str(session.user.id)}`;
@@ -6145,6 +6213,8 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       deletedAnnouncementIds.push(eid);
     } else if (et === 'problem' && eid) {
       deletedProblemIds.push(eid);
+    } else if (et === 'customer_note' && eid) {
+      deletedCustomerNoteIds.push(eid);
     } else if ((et === 'notification' || et === userNotifTombstoneType) && eid) {
       deletedNotificationIds.push(eid);
     } else if (et === 'notification_clear_all' && (!eid || eid === userNotifAllEntityId)) {
@@ -6184,7 +6254,10 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
       roleUiDefaults: typeof crmCore.normalizeRoleUiDefaults === 'function' ? crmCore.normalizeRoleUiDefaults(setMap.role_ui_defaults) : {},
       statsControlConfig: typeof crmCore.normalizeStatsControlConfig === 'function' ? crmCore.normalizeStatsControlConfig(setMap.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
       callWrapupShortcuts: callWrapupShortcuts || { items: crmCore.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
-      handoverSettings: crmCore.normalizeHandoverSettings(setMap.handover_settings)
+      handoverSettings: crmCore.normalizeHandoverSettings(setMap.handover_settings),
+      customerNotesConfig: typeof crmCore.normalizeCustomerNotesConfig === 'function'
+        ? crmCore.normalizeCustomerNotesConfig(setMap.customer_notes_config)
+        : {}
     };
   }
 
@@ -6236,6 +6309,7 @@ export async function getDeltaSync(executor: DbExecutor, session: AuthSession, p
     deletedAnnouncementIds: Array.from(new Set(deletedAnnouncementIds)),
     deletedProblemIds: Array.from(new Set(deletedProblemIds)),
     deletedNotificationIds: Array.from(new Set(deletedNotificationIds)),
+    deletedCustomerNoteIds: Array.from(new Set(deletedCustomerNoteIds)),
     deletedAllReservationsBefore,
     deletedAllNotificationsBefore,
     changedSettings: Boolean(settingsUpdatedAt),
@@ -6980,11 +7054,386 @@ const SQL_CUST_COMPLETED_OR_INACTIVE = `(
   TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') IN ('مكتمل','مكتمله','منتهي','منتهيه','مغلق','تم الاغلاق','تم التسليم والاسترجاع')
 )`;
 
+function buildReservationStatusFilterClause(statusFilterRaw: string, params: any[]): string {
+  const s = str(statusFilterRaw);
+  if (!s) return '';
+  if (s === 'ملغي') {
+    return SQL_CANCELLED_CONDITION;
+  }
+  if (s === 'مرفوض') {
+    return SQL_REJECTED_CONDITION;
+  }
+  if (s === 'منتهي') {
+    return `(
+      ${SQL_ACTIVE_CONDITION} AND (
+        LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('completed','finished','finished_by_driver','closed','ended','returned') OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%منتهي%' OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%مكتمل%' OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%مغلق%'
+      )
+    )`;
+  }
+  if (s === 'نشط الآن') {
+    return `(
+      ${SQL_ACTIVE_CONDITION} AND (
+        LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('active','ongoing','in_progress','started','delivered','picked_up','running') OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%نشط%' OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%جاري%' OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%مستلم%'
+      )
+    )`;
+  }
+  if (s === 'جاهز للاستلام') {
+    return `(
+      ${SQL_ACTIVE_CONDITION} AND (
+        LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('ready','ready_for_pickup','confirmed','approved','accepted') OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%جاهز%' OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%موكد%' OR
+        TRANSLATE(LOWER(TRIM(COALESCE(r.internal_status, ''))), '${PG_SEARCH_NORM_FROM}', '${PG_SEARCH_NORM_TO}') LIKE '%استلام%'
+      )
+    )`;
+  }
+  if (s === 'متأخر في السداد') {
+    return `(
+      ${SQL_ACTIVE_CONDITION} AND (
+        COALESCE(r.payment_status, '') ILIKE '%unpaid%' OR
+        COALESCE(r.payment_status, '') ILIKE '%late%' OR
+        COALESCE(r.payment_status, '') LIKE '%متأخر%' OR
+        COALESCE(r.payment_status, '') LIKE '%غير مدفوع%' OR
+        COALESCE(r.internal_status, '') LIKE '%متأخر%' OR
+        (COALESCE(r.total_amount, 0) > 0 AND COALESCE(r.paid_amount, 0) < COALESCE(r.total_amount, 0) AND NOT ${SQL_CUST_COMPLETED_OR_INACTIVE})
+      )
+    )`;
+  }
+  if (s === 'بانتظار المتابعة') {
+    return `(
+      ${SQL_ACTIVE_CONDITION} AND (
+        NOT EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) OR
+        COALESCE(r.internal_status, '') LIKE '%متابعة%' OR
+        COALESCE(r.internal_status, '') LIKE '%انتظار%'
+      )
+    )`;
+  }
+  if (s === 'جديد / بانتظار المراجعة') {
+    return `(
+      ${SQL_ACTIVE_CONDITION} AND (
+        LOWER(TRIM(COALESCE(r.original_status_code, ''))) IN ('new','pending','pending_review','waiting','under_review') OR
+        COALESCE(r.internal_status, '') LIKE '%جديد%' OR
+        COALESCE(r.internal_status, '') LIKE '%مراجعة%'
+      )
+    )`;
+  }
+  params.push(s);
+  const idx = params.length;
+  return `(
+    r.internal_status = $${idx} OR
+    r.original_status_ar = $${idx} OR
+    r.original_status_code = $${idx}
+  )`;
+}
+
 function requireCustomersRouteAccess(session: AuthSession): void {
   const canRoute = typeof crmCore.canUserViewRoute === 'function' && crmCore.canUserViewRoute(session.user, 'customers');
   const canPerm = crmCore.canUserPerform(session.user, 'view_customers');
   if (!canRoute && !canPerm) {
     throw new Error('FORBIDDEN: ليس لديك صلاحية الوصول إلى قسم العملاء.');
+  }
+}
+
+async function ensureDefaultCustomerNoteStatuses(client: DbClient): Promise<void> {
+  try {
+    const cntRes = await client.query<{ cnt: string }>(`SELECT COUNT(*)::text AS cnt FROM customer_note_statuses`);
+    if (Number(cntRes.rows[0]?.cnt || 0) > 0) return;
+    const defaults: any[] = Array.isArray(crmCore.CUSTOMER_NOTE_DEFAULT_STATUSES)
+      ? crmCore.CUSTOMER_NOTE_DEFAULT_STATUSES
+      : [];
+    const nowIso = new Date().toISOString();
+    for (const st of defaults) {
+      await client.query(
+        `INSERT INTO customer_note_statuses (
+           id, name, description, color, sort_order, is_active, is_default,
+           allow_agent_select, is_closed_status, created_by_id, created_by_name, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'SYSTEM','النظام',$10::timestamptz,$10::timestamptz)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          str(st.id),
+          str(st.name),
+          str(st.description),
+          str(st.color || '#3B82F6'),
+          num(st.sortOrder, 0),
+          st.isActive !== false,
+          Boolean(st.isDefault),
+          st.allowAgentSelect !== false,
+          Boolean(st.isClosedStatus),
+          nowIso
+        ]
+      );
+    }
+  } catch {
+    // Non-fatal on legacy mock executors without customer_note_statuses table
+  }
+}
+
+function formatCustomerNoteStatusRow(row: any): Record<string, any> {
+  if (typeof crmCore.normalizeCustomerNoteStatusRecord === 'function') {
+    const norm = crmCore.normalizeCustomerNoteStatusRecord(row);
+    return {
+      ...norm,
+      usageCount: num(row.usage_count ?? row.usageCount, 0),
+      createdById: str(row.created_by_id ?? row.createdById),
+      createdByName: str(row.created_by_name ?? row.createdByName),
+      createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at ?? row.createdAt),
+      updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at ?? row.updatedAt)
+    };
+  }
+  return {
+    id: str(row.id),
+    name: str(row.name),
+    description: str(row.description),
+    color: str(row.color || '#3B82F6'),
+    sortOrder: num(row.sort_order ?? row.sortOrder, 0),
+    isActive: row.is_active !== false,
+    isDefault: Boolean(row.is_default),
+    allowAgentSelect: row.allow_agent_select !== false,
+    isClosedStatus: Boolean(row.is_closed_status),
+    usageCount: num(row.usage_count ?? row.usageCount, 0)
+  };
+}
+
+async function loadCustomerNoteStatusesList(client: DbClient, includeCounts = false): Promise<Record<string, any>[]> {
+  try {
+    await ensureDefaultCustomerNoteStatuses(client);
+    const sql = includeCounts
+      ? `SELECT s.*,
+                COALESCE((
+                  SELECT COUNT(*)::int FROM customer_notes cn
+                  WHERE cn.deleted_at IS NULL AND (cn.status_id = s.id OR (COALESCE(cn.status_id, '') = '' AND cn.status_name = s.name))
+                ), 0) AS usage_count
+         FROM customer_note_statuses s
+         ORDER BY s.sort_order ASC, s.created_at ASC`
+      : `SELECT * FROM customer_note_statuses ORDER BY sort_order ASC, created_at ASC`;
+    const res = await client.query(sql);
+    if (res.rows && res.rows.length > 0) {
+      return res.rows.map(formatCustomerNoteStatusRow);
+    }
+  } catch {
+    // Fallback to defaults if table absent in minimal test mocks
+  }
+  return (crmCore.CUSTOMER_NOTE_DEFAULT_STATUSES || []).map((s: any) => ({ ...s, usageCount: 0 }));
+}
+
+function formatCustomerNoteAttachmentRow(row: any): Record<string, any> {
+  return {
+    id: str(row.id),
+    noteId: str(row.note_id ?? row.noteId),
+    fileName: str(row.file_name ?? row.fileName),
+    mimeType: str(row.mime_type ?? row.mimeType),
+    fileSize: num(row.file_size ?? row.fileSize, 0),
+    storageUrl: str(row.storage_url ?? row.storageUrl),
+    uploadedById: str(row.uploaded_by_id ?? row.uploadedById),
+    uploadedByName: str(row.uploaded_by_name ?? row.uploadedByName),
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at ?? row.createdAt)
+  };
+}
+
+function formatCustomerNoteRow(row: any, attachments: any[] = []): Record<string, any> {
+  return {
+    id: str(row.id),
+    customerId: str(row.customer_id ?? row.customerId),
+    customerName: str(row.customer_name ?? row.customerName),
+    customerPhone: str(row.customer_phone ?? row.customerPhone),
+    reservationId: str(row.reservation_id ?? row.reservationId),
+    reservationNumber: str(row.reservation_number ?? row.reservationNumber),
+    problemId: str(row.problem_id ?? row.problemId),
+    problemNumber: str(row.problem_number ?? row.problemNumber),
+    title: str(row.title),
+    noteType: str(row.note_type ?? row.noteType) || 'ملاحظة',
+    statusId: str(row.status_id ?? row.statusId) || 'CNST_NEW',
+    statusName: str(row.status_name ?? row.statusName) || 'جديدة',
+    statusColor: str(row.status_color ?? row.statusColor) || '#3B82F6',
+    statusIsActive: row.status_is_active !== undefined ? Boolean(row.status_is_active) : true,
+    assignedEmployeeId: str(row.assigned_employee_id ?? row.assignedEmployeeId),
+    assignedEmployeeName: str(row.assigned_employee_name ?? row.assignedEmployeeName),
+    isInternal: Boolean(row.is_internal ?? row.isInternal),
+    isClosed: Boolean(row.is_closed ?? row.isClosed),
+    closedAt: row.closed_at instanceof Date ? row.closed_at.toISOString() : str(row.closed_at ?? row.closedAt),
+    closedById: str(row.closed_by_id ?? row.closedById),
+    closedByName: str(row.closed_by_name ?? row.closedByName),
+    sourceSection: str(row.source_section ?? row.sourceSection) || 'customers',
+    content: str(row.content),
+    createdById: str(row.created_by_id ?? row.createdById),
+    createdByName: str(row.created_by_name ?? row.createdByName),
+    updatedById: str(row.updated_by_id ?? row.updatedById),
+    updatedByName: str(row.updated_by_name ?? row.updatedByName),
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at ?? row.createdAt),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : str(row.updated_at ?? row.updatedAt),
+    attachments
+  };
+}
+
+async function enrichCustomerNoteRows(
+  client: DbClient,
+  noteRows: any[],
+  user?: any
+): Promise<Record<string, any>[]> {
+  if (!Array.isArray(noteRows) || noteRows.length === 0) return [];
+  const noteIds = noteRows.map((r) => str(r.id)).filter(Boolean);
+  const attMap = new Map<string, any[]>();
+  const statusMap = new Map<string, any>();
+
+  try {
+    const [attRes, statuses] = await Promise.all([
+      noteIds.length > 0
+        ? client.query(
+            `SELECT * FROM customer_note_attachments WHERE note_id = ANY($1::text[]) AND deleted_at IS NULL ORDER BY created_at ASC`,
+            [noteIds]
+          ).catch(() => ({ rows: [] as any[] }))
+        : Promise.resolve({ rows: [] as any[] }),
+      loadCustomerNoteStatusesList(client, false)
+    ]);
+    for (const a of attRes.rows || []) {
+      const nid = str(a.note_id);
+      const list = attMap.get(nid) || [];
+      list.push(formatCustomerNoteAttachmentRow(a));
+      attMap.set(nid, list);
+    }
+    for (const st of statuses) {
+      statusMap.set(st.id, st);
+      statusMap.set(st.name, st);
+    }
+  } catch {
+    // non-fatal
+  }
+
+  return noteRows.map((r) => {
+    const stObj = statusMap.get(str(r.status_id)) || statusMap.get(str(r.status_name)) || null;
+    const formatted = formatCustomerNoteRow(
+      {
+        ...r,
+        status_name: str(r.status_name || stObj?.name || 'جديدة'),
+        status_color: str(r.status_color || stObj?.color || '#3B82F6'),
+        status_is_active: stObj ? Boolean(stObj.isActive) : true
+      },
+      attMap.get(str(r.id)) || []
+    );
+    if (user && typeof crmCore.redactCustomerSensitiveFields === 'function' && !crmCore.canUserViewCustomerId(user)) {
+      return formatted;
+    }
+    return formatted;
+  });
+}
+
+async function loadCustomerNotesConfigNormalized(client: DbClient): Promise<Record<string, any>> {
+  const settings = isDbExecutorObj(client)
+    ? await getSettingsMap(client).catch(() => ({} as Record<string, any>))
+    : await (async () => {
+        const res = await client.query<{ value: string }>(`SELECT value FROM settings WHERE key = 'customer_notes_config' LIMIT 1`).catch(() => ({ rows: [] as any[] }));
+        return { customer_notes_config: res.rows[0]?.value };
+      })();
+  return typeof crmCore.normalizeCustomerNotesConfig === 'function'
+    ? crmCore.normalizeCustomerNotesConfig(settings.customer_notes_config)
+    : {};
+}
+
+function assertCustomerNoteButtonAllowed(
+  config: Record<string, any>,
+  buttonKey: string,
+  user: any,
+  noteObj?: any
+): void {
+  if (crmCore && typeof crmCore.evaluateCustomerNoteButtonAccess === 'function') {
+    const evalRes = crmCore.evaluateCustomerNoteButtonAccess(user, buttonKey, noteObj || null, config);
+    if (!evalRes.allowed) {
+      throw new Error(`FORBIDDEN: ${evalRes.message || evalRes.reason || 'ليس لديك صلاحية تنفيذ هذا الإجراء.'}`);
+    }
+  }
+}
+
+async function recordCustomerNoteHistory(
+  tx: DbClient,
+  opts: {
+    noteId: string;
+    actionType: string;
+    fieldName?: string;
+    oldValue?: string;
+    newValue?: string;
+    actor: AuthSession['user'];
+  }
+): Promise<void> {
+  await tx.query(
+    `INSERT INTO customer_note_history (
+       id, note_id, action_type, field_name, old_value, new_value, actor_id, actor_name, actor_role, created_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
+    [
+      generateId('CNH'),
+      str(opts.noteId),
+      str(opts.actionType),
+      str(opts.fieldName),
+      str(opts.oldValue),
+      str(opts.newValue),
+      str(opts.actor.id),
+      str(opts.actor.name),
+      str(opts.actor.role)
+    ]
+  ).catch(() => undefined);
+}
+
+async function dispatchCustomerNoteConfigNotifications(
+  tx: DbClient,
+  config: Record<string, any>,
+  trigger: 'onAdd' | 'onStatusChange' | 'onAssign' | 'onReplyUpdate' | 'onClose',
+  opts: {
+    actor: AuthSession['user'];
+    noteId: string;
+    title: string;
+    message: string;
+    customerId?: string;
+    assignedEmployeeId?: string;
+    eventKeySeed?: string;
+  }
+): Promise<void> {
+  const notifCfg = config?.notifications || {};
+  if (!notifCfg[trigger]) return;
+  const targets = Array.isArray(notifCfg.notifyRoles)
+    ? notifCfg.notifyRoles
+    : (Array.isArray(notifCfg.targetRoles) ? notifCfg.targetRoles : ['general_manager', 'supervisor']);
+  const targetEmps = Array.isArray(notifCfg.notifyEmployeeIds) ? notifCfg.notifyEmployeeIds : [];
+  if (trigger === 'onAssign' && opts.assignedEmployeeId && opts.assignedEmployeeId !== opts.actor.id) {
+    await createNotification(tx, {
+      recipientEmployeeId: opts.assignedEmployeeId,
+      type: 'customer_note_assigned',
+      title: opts.title,
+      message: opts.message,
+      entityType: 'Customer',
+      entityId: str(opts.customerId || opts.noteId),
+      eventKey: buildNotificationEventKey(['cnote_notif', trigger, opts.noteId, opts.assignedEmployeeId, opts.eventKeySeed || ''])
+    });
+    return;
+  }
+  for (const empId of targetEmps) {
+    const eid = str(empId);
+    if (!eid || eid === str(opts.actor.id)) continue;
+    await createNotification(tx, {
+      recipientEmployeeId: eid,
+      type: `customer_note_${trigger}`,
+      title: opts.title,
+      message: opts.message,
+      entityType: 'Customer',
+      entityId: str(opts.customerId || opts.noteId),
+      eventKey: buildNotificationEventKey(['cnote_notif', trigger, opts.noteId, eid, opts.eventKeySeed || ''])
+    });
+  }
+  for (const role of targets) {
+    if (str(role) === str(opts.actor.role) && !opts.assignedEmployeeId) continue;
+    await createNotification(tx, {
+      recipientRole: str(role),
+      type: `customer_note_${trigger}`,
+      title: opts.title,
+      message: opts.message,
+      entityType: 'Customer',
+      entityId: str(opts.customerId || opts.noteId),
+      eventKey: buildNotificationEventKey(['cnote_notif', trigger, opts.noteId, role, opts.eventKeySeed || ''])
+    });
   }
 }
 
@@ -7007,8 +7456,9 @@ export async function getCustomers(
   const search = str(payload.search);
   const statusFilter = str(payload.status);
   const companyFilter = str(payload.company);
-  const empFilter = str(payload.assignedEmployeeId || payload.employeeId);
   const problemFilter = str(payload.problemFilter);
+  const dateFrom = str(payload.dateFrom);
+  const dateTo = str(payload.dateTo);
   const kpiFilter = str(payload.kpiFilter || 'all');
 
   const cacheKey = JSON.stringify({
@@ -7020,8 +7470,9 @@ export async function getCustomers(
     search,
     statusFilter,
     companyFilter,
-    empFilter,
     problemFilter,
+    dateFrom,
+    dateTo,
     kpiFilter
   });
 
@@ -7032,13 +7483,10 @@ export async function getCustomers(
       const params: any[] = [];
       let agentScopeSql = '';
       if (scopedAgentId) {
-        params.push(scopedAgentId);
-        const pId = `$${params.length}`;
         params.push(JSON.stringify([scopedAgentId]));
         const pJson = `$${params.length}`;
         agentScopeSql = `AND (
-          c.assigned_employee_id = ${pId}
-          OR EXISTS (SELECT 1 FROM reservations rs WHERE rs.customer_id = c.id AND rs.assigned_employee_ids @> ${pJson}::jsonb)
+          EXISTS (SELECT 1 FROM reservations rs WHERE rs.customer_id = c.id AND rs.assigned_employee_ids @> ${pJson}::jsonb)
           OR EXISTS (SELECT 1 FROM problems ps WHERE ps.customer_id = c.id AND ps.assigned_employee_ids @> ${pJson}::jsonb)
         )`;
       }
@@ -7055,6 +7503,7 @@ export async function getCustomers(
             COALESCE(SUM(COALESCE(r.paid_amount, 0)), 0)::numeric AS paid_amount,
             MAX(COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD'))) AS last_reservation_date,
             (ARRAY_AGG(r.reservation_number ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC) FILTER (WHERE COALESCE(r.reservation_number, '') <> ''))[1] AS last_reservation_number,
+            (ARRAY_AGG(COALESCE(NULLIF(r.internal_status, ''), NULLIF(r.original_status_ar, ''), r.original_status_code) ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC) FILTER (WHERE COALESCE(r.reservation_number, '') <> ''))[1] AS last_reservation_status,
             (ARRAY_AGG(r.company_name ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC) FILTER (WHERE COALESCE(r.company_name, '') <> ''))[1] AS last_company_name,
             COALESCE(ARRAY_AGG(DISTINCT r.company_name) FILTER (WHERE COALESCE(r.company_name, '') <> ''), ARRAY[]::text[]) AS companies,
             COALESCE(STRING_AGG(DISTINCT r.reservation_number, ' '), '') AS all_res_numbers,
@@ -7079,7 +7528,6 @@ export async function getCustomers(
           SELECT
             r.customer_id,
             COUNT(fu.id)::int AS follow_ups_count,
-            MAX(COALESCE(NULLIF(fu.follow_up_date, ''), TO_CHAR(fu.created_at, 'YYYY-MM-DD'))) AS last_fu_contact_at,
             MAX(fu.created_at) AS max_fu_created_at
           FROM follow_ups fu
           JOIN reservations r ON fu.reservation_id = r.id
@@ -7089,8 +7537,8 @@ export async function getCustomers(
         note_agg AS (
           SELECT
             cn.customer_id,
-            COUNT(*)::int AS notes_count,
-            MAX(cn.created_at) AS max_note_created_at
+            COUNT(*) FILTER (WHERE cn.deleted_at IS NULL)::int AS notes_count,
+            MAX(cn.created_at) FILTER (WHERE cn.deleted_at IS NULL) AS max_note_created_at
           FROM customer_notes cn
           GROUP BY cn.customer_id
         ),
@@ -7109,18 +7557,22 @@ export async function getCustomers(
             COALESCE(ra.paid_amount, 0) AS paid_amount,
             COALESCE(ra.last_reservation_number, '') AS last_reservation_number,
             COALESCE(ra.last_reservation_date, '') AS last_reservation_date,
+            COALESCE(ra.last_reservation_status, '') AS last_reservation_status,
             COALESCE(ra.last_company_name, '') AS last_company_name,
             COALESCE(ra.companies, ARRAY[]::text[]) AS companies,
             COALESCE(ra.all_res_numbers, '') AS all_res_numbers,
             COALESCE(ra.all_ref_numbers, '') AS all_ref_numbers,
-            CASE
-              WHEN COALESCE(c.last_contact_at, '') <> '' AND COALESCE(fa.last_fu_contact_at, '') <> ''
-                THEN GREATEST(c.last_contact_at, fa.last_fu_contact_at)
-              WHEN COALESCE(c.last_contact_at, '') <> '' THEN c.last_contact_at
-              WHEN COALESCE(fa.last_fu_contact_at, '') <> '' THEN fa.last_fu_contact_at
-              WHEN na.max_note_created_at IS NOT NULL THEN TO_CHAR(na.max_note_created_at AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD HH24:MI')
-              ELSE ''
-            END AS effective_last_contact_at,
+            NULLIF(GREATEST(
+              COALESCE(
+                c.last_contact_ts,
+                CASE
+                  WHEN COALESCE(c.last_contact_at, '') ~ '^\\d{4}-\\d{2}-\\d{2}' THEN (c.last_contact_at)::timestamptz
+                  ELSE '-infinity'::timestamptz
+                END
+              ),
+              COALESCE(fa.max_fu_created_at, '-infinity'::timestamptz),
+              COALESCE(na.max_note_created_at, '-infinity'::timestamptz)
+            ), '-infinity'::timestamptz) AS effective_last_contact_ts,
             GREATEST(
               c.updated_at,
               COALESCE(ra.max_res_updated_at, c.updated_at),
@@ -7148,7 +7600,7 @@ export async function getCustomers(
            COUNT(*) FILTER (WHERE open_problems_count > 0)::int AS open_problem_customers,
            COUNT(*) FILTER (WHERE open_complaints_count > 0)::int AS complaint_customers,
            COUNT(*) FILTER (WHERE extensions_count > 0)::int AS with_extensions_customers,
-           COUNT(*) FILTER (WHERE follow_ups_count = 0 AND notes_count = 0 AND COALESCE(effective_last_contact_at, '') = '')::int AS unfollowed_customers,
+           COUNT(*) FILTER (WHERE follow_ups_count = 0 AND notes_count = 0 AND effective_last_contact_ts IS NULL)::int AS unfollowed_customers,
            COUNT(*) FILTER (WHERE bookings_count > 1)::int AS repeat_customers,
            COUNT(*) FILTER (WHERE GREATEST(created_at, updated_at) >= NOW() - INTERVAL '7 days')::int AS recent_customers
          FROM customer_summary`,
@@ -7168,7 +7620,7 @@ export async function getCustomers(
         recentCustomers: num(kpiRow.recent_customers)
       };
 
-      // 2) Filter clauses
+      // 2) Filter clauses (Reservation statuses via EXISTS so multi-booking customers never duplicate)
       const filterParams = [...params];
       const clauses: string[] = [];
 
@@ -7179,20 +7631,22 @@ export async function getCustomers(
         if (cond) clauses.push(cond);
       }
       if (statusFilter) {
-        filterParams.push(statusFilter);
-        clauses.push(`status = $${filterParams.length}`);
+        const resCond = buildReservationStatusFilterClause(statusFilter, filterParams);
+        if (resCond) {
+          clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = customer_summary.id AND (${resCond}))`);
+        }
       }
       if (companyFilter) {
         filterParams.push(companyFilter);
         clauses.push(`$${filterParams.length} = ANY(companies)`);
       }
-      if (empFilter) {
-        if (empFilter === 'unassigned') {
-          clauses.push(`COALESCE(assigned_employee_id, '') = ''`);
-        } else {
-          filterParams.push(empFilter);
-          clauses.push(`assigned_employee_id = $${filterParams.length}`);
-        }
+      if (dateFrom) {
+        filterParams.push(dateFrom);
+        clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = customer_summary.id AND COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD')) >= $${filterParams.length})`);
+      }
+      if (dateTo) {
+        filterParams.push(dateTo);
+        clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = customer_summary.id AND COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD')) <= $${filterParams.length})`);
       }
       if (problemFilter === 'open_problems') {
         clauses.push(`open_problems_count > 0`);
@@ -7215,7 +7669,7 @@ export async function getCustomers(
       } else if (kpiFilter === 'extensions') {
         clauses.push(`extensions_count > 0`);
       } else if (kpiFilter === 'unfollowed') {
-        clauses.push(`(follow_ups_count = 0 AND notes_count = 0 AND COALESCE(effective_last_contact_at, '') = '')`);
+        clauses.push(`(follow_ups_count = 0 AND notes_count = 0 AND effective_last_contact_ts IS NULL)`);
       } else if (kpiFilter === 'repeat') {
         clauses.push(`bookings_count > 1`);
       } else if (kpiFilter === 'recent') {
@@ -7242,7 +7696,12 @@ export async function getCustomers(
       const listParams = [...filterParams, pageSize, offset];
       const rowsRes = await executor.query(
         `${cteSql}
-         SELECT *
+         SELECT *,
+                CASE
+                  WHEN effective_last_contact_ts IS NOT NULL
+                    THEN TO_CHAR(effective_last_contact_ts AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD HH24:MI')
+                  ELSE ''
+                END AS effective_last_contact_display
          FROM customer_summary
          ${whereSql}
          ORDER BY ${orderSql}
@@ -7252,22 +7711,37 @@ export async function getCustomers(
 
       const recentRes = await executor.query(
         `${cteSql}
-         SELECT * FROM customer_summary
+         SELECT *,
+                CASE
+                  WHEN effective_last_contact_ts IS NOT NULL
+                    THEN TO_CHAR(effective_last_contact_ts AT TIME ZONE 'Asia/Riyadh', 'YYYY-MM-DD HH24:MI')
+                  ELSE ''
+                END AS effective_last_contact_display
+         FROM customer_summary
          ORDER BY GREATEST(created_at, updated_at) DESC
          LIMIT 6`,
         params
       );
 
-      const facets = await getCachedReservationFacets(executor);
-      const empsRes = await executor.query(`SELECT id, name, role, status FROM employees WHERE status = 'active' ORDER BY name ASC`);
+      const [facets, resStatusesQ] = await Promise.all([
+        getCachedReservationFacets(executor),
+        executor.query<{ st: string }>(
+          `SELECT DISTINCT internal_status AS st FROM reservations WHERE COALESCE(internal_status, '') <> '' ORDER BY internal_status ASC LIMIT 60`
+        ).catch(() => ({ rows: [] as Array<{ st: string }> }))
+      ]);
+
+      const unifiedResStatuses = Array.isArray(crmCore.CUSTOMER_RESERVATION_STATUS_OPTIONS)
+        ? crmCore.CUSTOMER_RESERVATION_STATUS_OPTIONS.map((o: any) => str(o.value)).filter(Boolean)
+        : ['نشط الآن', 'جاهز للاستلام', 'بانتظار المتابعة', 'جديد / بانتظار المراجعة', 'متأخر في السداد', 'منتهي', 'ملغي', 'مرفوض'];
+      const extraDbResStatuses = (resStatusesQ.rows || []).map((r) => str(r.st)).filter((s) => s && !unifiedResStatuses.includes(s));
 
       const items = rowsRes.rows.map((r) => formatCustomerSummaryRow({
         ...r,
-        last_contact_at: r.effective_last_contact_at
+        last_contact_at: r.effective_last_contact_display || r.effective_last_contact_at || str(r.last_contact_at)
       }, session.user));
       const recentCustomers = recentRes.rows.map((r) => formatCustomerSummaryRow({
         ...r,
-        last_contact_at: r.effective_last_contact_at
+        last_contact_at: r.effective_last_contact_display || r.effective_last_contact_at || str(r.last_contact_at)
       }, session.user));
 
       return {
@@ -7276,8 +7750,8 @@ export async function getCustomers(
         recentCustomers,
         facets: {
           companies: facets.companies || [],
-          employees: empsRes.rows.map((e: any) => ({ id: str(e.id), name: str(e.name), role: str(e.role) })),
-          statuses: crmCore.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور']
+          statuses: [...unifiedResStatuses, ...extraDbResStatuses],
+          reservationStatusOptions: crmCore.CUSTOMER_RESERVATION_STATUS_OPTIONS || []
         },
         total,
         page: safePage,
@@ -7357,21 +7831,11 @@ export async function getCustomerDetails(
     [custId]
   );
 
-  let reservations = resQ.rows.map((r) => mapReservationRowToClient(r, false));
-  if (session.user.role === 'agent' && !allowAgentViewAll) {
-    const uid = str(session.user.id);
-    const hasCustAccess =
-      str(custRow.assigned_employee_id) === uid ||
-      reservations.some((r) => Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds.includes(uid));
-    if (!hasCustAccess) {
-      throw new Error('FORBIDDEN: ليس لديك صلاحية عرض ملف هذا العميل.');
-    }
-  }
-
+  const reservations = resQ.rows.map((r) => mapReservationRowToClient(r, false));
   const resIds = reservations.map((r) => str(r.id)).filter(Boolean);
   const resNums = reservations.map((r) => str(r.reservationNumber)).filter(Boolean);
 
-  const [extRes, prbRes, fuRes, notesRes, actRes, empsRes] = await Promise.all([
+  const [extRes, prbRes, fuRes, notesRes, actRes, empsRes, noteStatuses] = await Promise.all([
     (resIds.length || resNums.length)
       ? executor.query(
           `SELECT * FROM extensions WHERE reservation_id = ANY($1::text[]) OR reservation_number = ANY($2::text[]) ORDER BY start_date DESC, sequence_number DESC`,
@@ -7385,12 +7849,16 @@ export async function getCustomerDetails(
     resIds.length
       ? executor.query(`SELECT * FROM follow_ups WHERE reservation_id = ANY($1::text[]) ORDER BY created_at DESC LIMIT 300`, [resIds])
       : Promise.resolve({ rows: [] as any[] }),
-    executor.query(`SELECT * FROM customer_notes WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 300`, [custId]),
+    executor.query(
+      `SELECT * FROM customer_notes WHERE customer_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 300`,
+      [custId]
+    ),
     executor.query(
       `SELECT * FROM activity_log WHERE (entity_type = 'Customer' AND entity_id = $1) OR (entity_type = 'Reservation' AND entity_id = ANY($2::text[])) ORDER BY created_at DESC LIMIT 120`,
       [custId, resNums]
     ),
-    executor.query(`SELECT id, name, role, status FROM employees WHERE status = 'active' ORDER BY name ASC`)
+    executor.query(`SELECT id, name, role, status FROM employees WHERE status = 'active' ORDER BY name ASC`),
+    loadCustomerNoteStatusesList(executor, false)
   ]);
 
   const extensions = extRes.rows.map(mapExtensionRowToClient);
@@ -7409,19 +7877,22 @@ export async function getCustomerDetails(
     }
   }
   const problems = prbRes.rows.map((p) => formatProblemRow(p, prbUpdMap));
+
+  if (session.user.role === 'agent' && !allowAgentViewAll) {
+    const uid = str(session.user.id);
+    const hasCustAccess =
+      reservations.some((r) => Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds.includes(uid)) ||
+      problems.some((p) => Array.isArray(p.assignedEmployeeIds) && p.assignedEmployeeIds.includes(uid));
+    if (!hasCustAccess) {
+      throw new Error('FORBIDDEN: ليس لديك صلاحية عرض ملف هذا العميل.');
+    }
+  }
+
   const followUps = fuRes.rows.map(formatFollowUpRow);
-  const notes = notesRes.rows.map((n: any) => ({
-    id: str(n.id),
-    customerId: str(n.customer_id),
-    reservationId: str(n.reservation_id),
-    reservationNumber: str(n.reservation_number),
-    noteType: str(n.note_type) || 'ملاحظة',
-    content: str(n.content),
-    createdById: str(n.created_by_id),
-    createdByName: str(n.created_by_name),
-    createdAt: n.created_at instanceof Date ? n.created_at.toISOString() : str(n.created_at),
-    updatedAt: n.updated_at instanceof Date ? n.updated_at.toISOString() : str(n.updated_at)
-  }));
+  const notes = await enrichCustomerNoteRows(executor, notesRes.rows || [], session.user);
+  const notesConfig = typeof crmCore.normalizeCustomerNotesConfig === 'function'
+    ? crmCore.normalizeCustomerNotesConfig(settings.customer_notes_config)
+    : {};
 
   let activeCount = 0;
   let pastCount = 0;
@@ -7464,10 +7935,12 @@ export async function getCustomerDetails(
     open_problems_count: openProblems.length,
     open_complaints_count: openComplaints.length,
     follow_ups_count: followUps.length,
+    notes_count: notes.length,
     total_amount: Number(totalAmount.toFixed(2)),
     paid_amount: Number(paidAmount.toFixed(2)),
     last_reservation_number: lastRes ? str(lastRes.reservationNumber) : '',
     last_reservation_date: lastRes ? str(lastRes.startDate || lastRes.createdAt) : '',
+    last_reservation_status: lastRes ? str(lastRes.internalStatus || lastRes.originalStatusAr || lastRes.originalStatusCode) : '',
     last_company_name: lastRes ? str(lastRes.companyName) : ''
   }, session.user);
 
@@ -7542,10 +8015,10 @@ export async function getCustomerDetails(
     timeline.push({
       id: `TL_NOTE_${n.id}`,
       kind: 'note',
-      title: `${n.noteType}${n.reservationNumber ? ` (الحجز ${n.reservationNumber})` : ''}`,
+      title: `${n.noteType}${n.title ? `: ${n.title}` : ''}${n.reservationNumber ? ` (الحجز ${n.reservationNumber})` : ''}`,
       subtitle: str(n.content),
       actor: str(n.createdByName),
-      status: str(n.noteType),
+      status: str(n.statusName || n.noteType),
       at: str(n.createdAt),
       entityId: n.id
     });
@@ -7570,6 +8043,8 @@ export async function getCustomerDetails(
     problems,
     followUps,
     notes,
+    noteStatuses,
+    notesConfig,
     financialSummary,
     timeline: timeline.slice(0, 250),
     employees: empsRes.rows.map((e: any) => ({ id: str(e.id), name: str(e.name), role: str(e.role) }))
@@ -7617,12 +8092,6 @@ export async function createCustomer(
       const statusList: string[] = crmCore.CUSTOMER_STATUS_LIST || ['جديد'];
       const status = statusList.includes(str(payload.status)) ? str(payload.status) : 'جديد';
       const statusOverride = status !== 'جديد';
-      const assignedEmpId = str(payload.assignedEmployeeId);
-      let assignedEmpName = '';
-      if (assignedEmpId) {
-        const empQ = await tx.query<{ name: string }>(`SELECT name FROM employees WHERE id = $1 LIMIT 1`, [assignedEmpId]);
-        assignedEmpName = str(empQ.rows[0]?.name);
-      }
       const notes = str(payload.notes);
       const tags = Array.isArray(payload.tags) ? payload.tags.map((t: any) => str(t)).filter(Boolean) : [];
       const nowIso = new Date().toISOString();
@@ -7631,13 +8100,13 @@ export async function createCustomer(
         `INSERT INTO customers (
            id, customer_key, full_name, phone, country_code, normalized_phone,
            email, id_number, id_type, status, status_override,
-           assigned_employee_id, assigned_employee_name, notes, tags, source,
+           notes, tags, source,
            last_contact_at, created_at, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,'manual',$16,$17::timestamptz,$17::timestamptz)`,
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,'manual',$14,$15::timestamptz,$15::timestamptz)`,
         [
           id, customerKey, fullName, phone, str(payload.countryCode || phoneMeta.countryCode), phoneMeta.normalizedPhone,
           email, idNumber, idType, status, statusOverride,
-          assignedEmpId, assignedEmpName, notes, JSON.stringify(tags), '', nowIso
+          notes, JSON.stringify(tags), '', nowIso
         ]
       );
 
@@ -7736,55 +8205,370 @@ export async function updateCustomerProfile(
   return { customer: out };
 }
 
-export async function assignCustomerEmployee(
+// ---------- CUSTOMER NOTES SYSTEM, STATUSES, ATTACHMENTS & ADMIN SETTINGS ----------
+
+export async function getCustomerNotesConfig(executor: DbExecutor, session: AuthSession) {
+  requireApiAccess(session);
+  const [config, statuses] = await Promise.all([
+    loadCustomerNotesConfigNormalized(executor),
+    loadCustomerNoteStatusesList(executor, true)
+  ]);
+  return { config, statuses };
+}
+
+export async function saveCustomerNotesConfig(
   executor: DbExecutor,
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
-  requirePermission(session, 'assign_customer_employee');
-  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_assign_customer')) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية إسناد العملاء للموظفين.');
+  const canCfg = crmCore.canUserPerform(session.user, 'manage_customer_notes_settings')
+    || crmCore.canUserPerform(session.user, 'manage_customer_notes_buttons')
+    || crmCore.canUserPerform(session.user, 'manage_settings');
+  if (!canCfg) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية تعديل إعدادات ملاحظات العملاء.');
   }
-  const customerId = str(payload.customerId || payload.id);
-  const employeeId = str(payload.employeeId);
-  if (!customerId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
+  const prevConfig = await loadCustomerNotesConfigNormalized(executor);
+  const rawInput = payload.config && typeof payload.config === 'object' ? payload.config : payload;
+  const nextConfig = crmCore.normalizeCustomerNotesConfig(rawInput);
+
+  if (!crmCore.canUserPerform(session.user, 'manage_customer_notes_buttons') && !crmCore.canUserPerform(session.user, 'manage_settings')) {
+    nextConfig.buttons = prevConfig.buttons;
+  }
+
+  nextConfig.updatedAt = new Date().toISOString();
+  nextConfig.updatedBy = session.user.name;
+
+  await executor.withTransaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO settings (key, value, updated_by, updated_at)
+       VALUES ('customer_notes_config', $1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [JSON.stringify(nextConfig), session.user.name]
+    );
+    await logActivity(
+      tx,
+      session.user,
+      'تحديث إعدادات ملاحظات العملاء',
+      'Settings',
+      'customer_notes_config',
+      `تحديث قواعد وإعدادات أزرار قسم ملاحظات العملاء وقسم العملاء`
+    );
+  });
+
+  invalidateScopes(executor, ['settings', 'customers', 'dashboard', 'activity']);
+  return { config: nextConfig };
+}
+
+export async function getCustomerNoteStatuses(executor: DbExecutor, session: AuthSession) {
+  requireApiAccess(session);
+  const items = await loadCustomerNoteStatusesList(executor, true);
+  return { items };
+}
+
+export async function saveCustomerNoteStatus(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_customer_note_statuses');
+  const id = str(payload.id);
+  const name = str(payload.name);
+  const description = str(payload.description);
+  const color = /^#[0-9a-fA-F]{3,8}$/.test(str(payload.color)) ? str(payload.color) : '#3B82F6';
+  const sortOrder = Math.max(0, Math.floor(num(payload.sortOrder, 0)));
+  const isActive = payload.isActive !== false;
+  const isDefault = Boolean(payload.isDefault);
+  const allowAgentSelect = payload.allowAgentSelect !== false;
+  const isClosedStatus = Boolean(payload.isClosedStatus);
+
+  if (!name) {
+    throw new Error('VALIDATION_ERROR: اسم حالة الملاحظة مطلوب.');
+  }
 
   const out = await executor.withTransaction(async (tx) => {
-    const q = await tx.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [customerId]);
-    const cur = q.rows[0];
-    if (!cur) throw new Error('NOT_FOUND: العميل غير موجود.');
-
-    let employeeName = '';
-    if (employeeId) {
-      const empQ = await tx.query<{ name: string }>(`SELECT name FROM employees WHERE id = $1 LIMIT 1`, [employeeId]);
-      if (!empQ.rows[0]) throw new Error('NOT_FOUND: الموظف المحدد غير موجود.');
-      employeeName = str(empQ.rows[0].name);
+    await ensureDefaultCustomerNoteStatuses(tx);
+    const allRes = await tx.query(`SELECT * FROM customer_note_statuses`);
+    const normNew = typeof crmCore.normalizeSearchText === 'function' ? crmCore.normalizeSearchText(name) : name.toLowerCase();
+    const dup = (allRes.rows || []).find((r: any) => {
+      if (id && str(r.id) === id) return false;
+      const rn = typeof crmCore.normalizeSearchText === 'function' ? crmCore.normalizeSearchText(r.name) : str(r.name).toLowerCase();
+      return rn === normNew;
+    });
+    if (dup) {
+      throw new Error(`VALIDATION_ERROR: توجد حالة بنفس الاسم "${str(dup.name)}" بالفعل.`);
     }
 
     const nowIso = new Date().toISOString();
-    await tx.query(
-      `UPDATE customers SET assigned_employee_id = $2, assigned_employee_name = $3, updated_at = $4::timestamptz WHERE id = $1`,
-      [customerId, employeeId, employeeName, nowIso]
-    );
+    const targetId = id || generateId('CNST');
 
-    if (employeeId && employeeId !== session.user.id) {
-      await createNotification(tx, {
-        recipientEmployeeId: employeeId,
-        type: 'customer_assigned',
-        title: `تم إسناد عميل إليك: ${str(cur.full_name)}`,
-        message: `أسند ${session.user.name} ملف العميل ${str(cur.full_name)} إليك للمتابعة.`,
-        entityType: 'Customer',
-        entityId: customerId,
-        eventKey: buildNotificationEventKey(['customer_assigned', str(payload.clientRequestId) || customerId, employeeId])
-      });
+    if (isDefault) {
+      await tx.query(`UPDATE customer_note_statuses SET is_default = FALSE WHERE id <> $1`, [targetId]);
     }
 
-    await logActivity(tx, session.user, 'إسناد عميل', 'Customer', customerId, `${str(cur.full_name)} ← ${employeeName || 'بدون موظف'}`);
-    const updatedQ = await tx.query(`SELECT * FROM customers WHERE id = $1 LIMIT 1`, [customerId]);
-    return formatCustomerSummaryRow(updatedQ.rows[0], session.user);
+    if (id) {
+      const exQ = await tx.query(`SELECT * FROM customer_note_statuses WHERE id = $1 LIMIT 1`, [id]);
+      const prev = exQ.rows[0];
+      if (!prev) throw new Error('NOT_FOUND: الحالة المطلوبة غير موجودة.');
+      await tx.query(
+        `UPDATE customer_note_statuses
+         SET name = $2, description = $3, color = $4, sort_order = $5,
+             is_active = $6, is_default = $7, allow_agent_select = $8, is_closed_status = $9,
+             updated_at = $10::timestamptz
+         WHERE id = $1`,
+        [id, name, description, color, sortOrder, isActive, isDefault, allowAgentSelect, isClosedStatus, nowIso]
+      );
+      await tx.query(
+        `UPDATE customer_notes SET status_name = $2, status_color = $3, updated_at = $4::timestamptz WHERE status_id = $1`,
+        [id, name, color, nowIso]
+      );
+      await logActivity(tx, session.user, 'تعديل حالة ملاحظة عميل', 'CustomerNoteStatus', id, `${str(prev.name)} ← ${name}`);
+    } else {
+      await tx.query(
+        `INSERT INTO customer_note_statuses (
+           id, name, description, color, sort_order, is_active, is_default,
+           allow_agent_select, is_closed_status, created_by_id, created_by_name, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$12::timestamptz)`,
+        [targetId, name, description, color, sortOrder, isActive, isDefault, allowAgentSelect, isClosedStatus, session.user.id, session.user.name, nowIso]
+      );
+      await logActivity(tx, session.user, 'إضافة حالة ملاحظة عميل', 'CustomerNoteStatus', targetId, name);
+    }
+
+    const saved = await tx.query(`SELECT * FROM customer_note_statuses WHERE id = $1 LIMIT 1`, [targetId]);
+    return formatCustomerNoteStatusRow(saved.rows[0]);
   });
 
-  return { customer: out };
+  invalidateScopes(executor, ['customers', 'settings', 'activity']);
+  return { status: out };
+}
+
+export async function toggleCustomerNoteStatus(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_customer_note_statuses');
+  const id = str(payload.id);
+  if (!id) throw new Error('VALIDATION_ERROR: معرف الحالة مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customer_note_statuses WHERE id = $1 LIMIT 1`, [id]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الحالة غير موجودة.');
+    const nextActive = payload.isActive !== undefined ? Boolean(payload.isActive) : !Boolean(cur.is_active);
+    const nowIso = new Date().toISOString();
+    await tx.query(
+      `UPDATE customer_note_statuses SET is_active = $2, updated_at = $3::timestamptz WHERE id = $1`,
+      [id, nextActive, nowIso]
+    );
+    await logActivity(
+      tx,
+      session.user,
+      nextActive ? 'تفعيل حالة ملاحظة عميل' : 'تعطيل حالة ملاحظة عميل',
+      'CustomerNoteStatus',
+      id,
+      str(cur.name)
+    );
+    const updated = await tx.query(`SELECT * FROM customer_note_statuses WHERE id = $1 LIMIT 1`, [id]);
+    return formatCustomerNoteStatusRow(updated.rows[0]);
+  });
+
+  invalidateScopes(executor, ['customers', 'settings', 'activity']);
+  return { status: out };
+}
+
+export async function deleteCustomerNoteStatus(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'manage_customer_note_statuses');
+  const id = str(payload.id);
+  const replacementStatusId = str(payload.replacementStatusId);
+  if (!id) throw new Error('VALIDATION_ERROR: معرف الحالة مطلوب.');
+
+  const out = await executor.withTransaction(async (tx) => {
+    const curQ = await tx.query(`SELECT * FROM customer_note_statuses WHERE id = $1 LIMIT 1`, [id]);
+    const cur = curQ.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الحالة غير موجودة.');
+
+    const cntRes = await tx.query<{ cnt: number }>(
+      `SELECT COUNT(*)::int AS cnt FROM customer_notes WHERE deleted_at IS NULL AND (status_id = $1 OR (COALESCE(status_id, '') = '' AND status_name = $2))`,
+      [id, str(cur.name)]
+    );
+    const linkedNotesCount = num(cntRes.rows[0]?.cnt, 0);
+
+    if (linkedNotesCount > 0 && !replacementStatusId) {
+      throw new Error(`VALIDATION_ERROR: الحالة "${str(cur.name)}" مرتبطة بـ ${linkedNotesCount} ملاحظة حالية. يرجى اختيار حالة بديلة لنقل الملاحظات إليها أو تعطيل الحالة.`);
+    }
+
+    let migratedToName = '';
+    if (linkedNotesCount > 0 && replacementStatusId) {
+      if (replacementStatusId === id) {
+        throw new Error('VALIDATION_ERROR: لا يمكن اختيار نفس الحالة المحذوفة كحالة بديلة.');
+      }
+      const repQ = await tx.query(`SELECT * FROM customer_note_statuses WHERE id = $1 LIMIT 1`, [replacementStatusId]);
+      const rep = repQ.rows[0];
+      if (!rep) throw new Error('NOT_FOUND: الحالة البديلة المحددة غير موجودة.');
+      migratedToName = str(rep.name);
+      const nowIso = new Date().toISOString();
+      await tx.query(
+        `UPDATE customer_notes
+         SET status_id = $2, status_name = $3, status_color = $4,
+             is_closed = $5, updated_at = $6::timestamptz
+         WHERE status_id = $1 OR (COALESCE(status_id, '') = '' AND status_name = $7)`,
+        [id, str(rep.id), str(rep.name), str(rep.color), Boolean(rep.is_closed_status), nowIso, str(cur.name)]
+      );
+    }
+
+    await tx.query(`DELETE FROM customer_note_statuses WHERE id = $1`, [id]);
+    await logActivity(
+      tx,
+      session.user,
+      'حذف حالة ملاحظة عميل',
+      'CustomerNoteStatus',
+      id,
+      migratedToName ? `${str(cur.name)} (نُقلت ${linkedNotesCount} ملاحظة إلى ${migratedToName})` : str(cur.name)
+    );
+    return { deleted: true, id, migratedCount: linkedNotesCount, replacementStatusId };
+  });
+
+  invalidateScopes(executor, ['customers', 'settings', 'activity']);
+  return out;
+}
+
+export async function getCustomerNotes(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  const canView = crmCore.canUserPerform(session.user, 'view_customer_notes')
+    || crmCore.canUserPerform(session.user, 'view_customers');
+  if (!canView) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية عرض ملاحظات العملاء.');
+  }
+
+  const config = await loadCustomerNotesConfigNormalized(executor);
+  if (config.general && config.general.enabled === false && session.user.role !== 'developer') {
+    throw new Error('FORBIDDEN: قسم ملاحظات العملاء معطل حاليًا من إعدادات النظام.');
+  }
+
+  const settings = await getSettingsMap(executor);
+  const allowAgentViewAll = settings.allow_agent_view_all !== false;
+  const canViewAllNotes = crmCore.canUserPerform(session.user, 'view_all_customer_notes') || allowAgentViewAll;
+
+  const customerId = str(payload.customerId);
+  const reservationId = str(payload.reservationId);
+  const problemId = str(payload.problemId);
+  const statusFilter = str(payload.statusId || payload.status);
+  const noteTypeFilter = str(payload.noteType);
+  const sourceSectionFilter = str(payload.sourceSection);
+  const assignedEmpFilter = str(payload.assignedEmployeeId);
+  const dateFrom = str(payload.dateFrom);
+  const dateTo = str(payload.dateTo);
+  const search = str(payload.search);
+  const sortBy = str(payload.sortBy || config.general?.defaultSort || 'newest');
+
+  const maxLimit = Math.max(10, Math.min(500, num(config.general?.maxResults, 200)));
+  const defaultPageSize = Math.max(5, Math.min(100, num(config.general?.pageSize, 25)));
+  const pageSize = Math.min(maxLimit, Math.max(5, Math.floor(num(payload.pageSize, defaultPageSize))));
+  const page = Math.max(1, Math.floor(num(payload.page, 1)));
+
+  const params: any[] = [];
+  const clauses: string[] = [`cn.deleted_at IS NULL`];
+
+  if (session.user.role === 'agent' && !canViewAllNotes) {
+    params.push(session.user.id);
+    const pUid = `$${params.length}`;
+    params.push(JSON.stringify([session.user.id]));
+    const pUidJson = `$${params.length}`;
+    clauses.push(`(
+      cn.created_by_id = ${pUid} OR
+      cn.assigned_employee_id = ${pUid} OR
+      EXISTS (SELECT 1 FROM reservations r WHERE r.id = cn.reservation_id AND r.assigned_employee_ids @> ${pUidJson}::jsonb)
+    )`);
+  }
+
+  if (customerId) { params.push(customerId); clauses.push(`cn.customer_id = $${params.length}`); }
+  if (reservationId) { params.push(reservationId); clauses.push(`(cn.reservation_id = $${params.length} OR cn.reservation_number = $${params.length})`); }
+  if (problemId) { params.push(problemId); clauses.push(`(cn.problem_id = $${params.length} OR cn.problem_number = $${params.length})`); }
+  if (statusFilter) {
+    params.push(statusFilter);
+    const pIdx = `$${params.length}`;
+    clauses.push(`(cn.status_id = ${pIdx} OR cn.status_name = ${pIdx})`);
+  }
+  if (noteTypeFilter) { params.push(noteTypeFilter); clauses.push(`cn.note_type = $${params.length}`); }
+  if (sourceSectionFilter) { params.push(sourceSectionFilter); clauses.push(`cn.source_section = $${params.length}`); }
+  if (assignedEmpFilter) { params.push(assignedEmpFilter); clauses.push(`cn.assigned_employee_id = $${params.length}`); }
+  if (dateFrom) {
+    params.push(dateFrom);
+    clauses.push(`cn.created_at >= ($${params.length}::date)::timestamptz`);
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    clauses.push(`cn.created_at < (($${params.length}::date + INTERVAL '1 day'))::timestamptz`);
+  }
+  if (search) {
+    const cond = buildPgSearchCondition(
+      ['cn.title', 'cn.content', 'cn.reservation_number', 'cn.problem_number', 'cn.status_name', 'cn.created_by_name', 'c.full_name', 'c.phone'],
+      search,
+      params
+    );
+    if (cond) clauses.push(cond);
+  }
+
+  const whereSql = `WHERE ${clauses.join(' AND ')}`;
+  let orderSql = `cn.created_at DESC`;
+  if (sortBy === 'oldest') orderSql = `cn.created_at ASC`;
+  else if (sortBy === 'updated') orderSql = `cn.updated_at DESC`;
+
+  const [countRes, listRes, statsRes, statuses] = await Promise.all([
+    executor.query<{ cnt: number }>(
+      `SELECT COUNT(*)::int AS cnt FROM customer_notes cn LEFT JOIN customers c ON c.id = cn.customer_id ${whereSql}`,
+      params
+    ),
+    executor.query(
+      `SELECT cn.*,
+              COALESCE(c.full_name, '') AS customer_name,
+              COALESCE(c.phone, '') AS customer_phone
+       FROM customer_notes cn
+       LEFT JOIN customers c ON c.id = cn.customer_id
+       ${whereSql}
+       ORDER BY ${orderSql}
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, pageSize, (page - 1) * pageSize]
+    ),
+    executor.query<{ total: number; closed_cnt: number; open_cnt: number; internal_cnt: number }>(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE cn.is_closed = TRUE)::int AS closed_cnt,
+              COUNT(*) FILTER (WHERE cn.is_closed = FALSE)::int AS open_cnt,
+              COUNT(*) FILTER (WHERE cn.is_internal = TRUE)::int AS internal_cnt
+       FROM customer_notes cn
+       LEFT JOIN customers c ON c.id = cn.customer_id
+       ${whereSql}`,
+      params
+    ),
+    loadCustomerNoteStatusesList(executor, false)
+  ]);
+
+  const total = num(countRes.rows[0]?.cnt, 0);
+  const items = await enrichCustomerNoteRows(executor, listRes.rows || [], session.user);
+  const stRow = statsRes.rows[0] || { total: 0, closed_cnt: 0, open_cnt: 0, internal_cnt: 0 };
+
+  return {
+    items,
+    statuses,
+    config,
+    stats: {
+      total: num(stRow.total, 0),
+      open: num(stRow.open_cnt, 0),
+      closed: num(stRow.closed_cnt, 0),
+      internal: num(stRow.internal_cnt, 0)
+    },
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize))
+  };
 }
 
 export async function addCustomerNote(
@@ -7793,71 +8577,683 @@ export async function addCustomerNote(
   payload: Record<string, any> = {}
 ) {
   requirePermission(session, 'add_customer_note');
-  if (crmCore && typeof crmCore.canUserUseActionButton === 'function' && !crmCore.canUserUseActionButton(session.user, 'act_add_customer_note')) {
-    throw new Error('FORBIDDEN: ليس لديك صلاحية إضافة ملاحظات أو تواصل للعميل.');
-  }
-  const customerId = str(payload.customerId);
-  const content = str(payload.content || payload.note);
-  const allowedTypes = ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
-  const noteType = allowedTypes.includes(str(payload.noteType)) ? str(payload.noteType) : 'ملاحظة';
-  const reservationId = str(payload.reservationId) || null;
-  let reservationNumber = str(payload.reservationNumber);
+  const [config, statuses] = await Promise.all([
+    loadCustomerNotesConfigNormalized(executor),
+    loadCustomerNoteStatusesList(executor, false)
+  ]);
+  assertCustomerNoteButtonAllowed(config, 'add_note', session.user);
 
-  if (!customerId) throw new Error('VALIDATION_ERROR: معرف العميل مطلوب.');
-  if (!content) throw new Error('VALIDATION_ERROR: نص الملاحظة أو التواصل مطلوب.');
+  const val = crmCore.validateCustomerNotePayload(payload, config, statuses, session.user);
+  if (!val.valid) {
+    throw new Error(`VALIDATION_ERROR: ${val.message || 'بيانات الملاحظة غير مكتملة.'}`);
+  }
+
+  let customerId = str(payload.customerId);
+  let reservationId = str(payload.reservationId) || null;
+  let reservationNumber = str(payload.reservationNumber);
+  const problemId = str(payload.problemId) || '';
+  let problemNumber = str(payload.problemNumber);
+  const sourceSection = str(payload.sourceSection || (problemId ? 'problems' : reservationId ? 'reservations' : 'customers')) || 'customers';
+  const assignedEmployeeId = str(payload.assignedEmployeeId);
 
   return runWithIdempotency(executor, session.user.id, 'addCustomerNote', str(payload.clientRequestId), async () => {
     const out = await executor.withTransaction(async (tx) => {
-      const custQ = await tx.query(`SELECT id, full_name FROM customers WHERE id = $1 FOR UPDATE`, [customerId]);
-      if (!custQ.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
-
       if (reservationId && !reservationNumber) {
-        const rq = await tx.query<{ reservation_number: string }>(`SELECT reservation_number FROM reservations WHERE id = $1 LIMIT 1`, [reservationId]);
-        reservationNumber = str(rq.rows[0]?.reservation_number);
+        const rq = await tx.query<{ id: string; reservation_number: string; customer_id: string }>(
+          `SELECT id, reservation_number, customer_id FROM reservations WHERE id = $1 OR reservation_number = $1 LIMIT 1`,
+          [reservationId]
+        );
+        if (rq.rows[0]) {
+          reservationId = str(rq.rows[0].id);
+          reservationNumber = str(rq.rows[0].reservation_number);
+          if (!customerId && rq.rows[0].customer_id) customerId = str(rq.rows[0].customer_id);
+        }
+      }
+      if (problemId && !problemNumber) {
+        const pq = await tx.query<{ problem_number: string; reservation_id: string; reservation_number: string; customer_id: string }>(
+          `SELECT problem_number, reservation_id, reservation_number, customer_id FROM problems WHERE id = $1 OR problem_number = $1 LIMIT 1`,
+          [problemId]
+        );
+        if (pq.rows[0]) {
+          problemNumber = str(pq.rows[0].problem_number);
+          if (!reservationId && pq.rows[0].reservation_id) reservationId = str(pq.rows[0].reservation_id);
+          if (!reservationNumber && pq.rows[0].reservation_number) reservationNumber = str(pq.rows[0].reservation_number);
+          if (!customerId && pq.rows[0].customer_id) customerId = str(pq.rows[0].customer_id);
+        }
+      }
+
+      if (!customerId && !config.addNote?.allowStandalone) {
+        throw new Error('VALIDATION_ERROR: يجب ربط الملاحظة بعميل.');
+      }
+
+      let customerName = '';
+      if (customerId) {
+        const custQ = await tx.query<{ id: string; full_name: string }>(
+          `SELECT id, full_name FROM customers WHERE id = $1 FOR UPDATE`,
+          [customerId]
+        );
+        if (!custQ.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
+        customerName = str(custQ.rows[0].full_name);
+      }
+
+      let assignedEmployeeName = '';
+      if (assignedEmployeeId) {
+        const eq = await tx.query<{ name: string }>(`SELECT name FROM employees WHERE id = $1 LIMIT 1`, [assignedEmployeeId]);
+        if (!eq.rows[0]) throw new Error('NOT_FOUND: الموظف المعين لمتابعة الملاحظة غير موجود.');
+        assignedEmployeeName = str(eq.rows[0].name);
+      }
+
+      const incomingAttachments: any[] = Array.isArray(payload.attachments) ? payload.attachments : [];
+      if (incomingAttachments.length > 0) {
+        assertCustomerNoteButtonAllowed(config, 'attach_file', session.user);
+        const maxBytes = Math.max(1, num(config.addNote?.maxAttachmentSizeMb, 5)) * 1024 * 1024;
+        const allowedMime = Array.isArray(config.addNote?.allowedAttachmentTypes) ? config.addNote.allowedAttachmentTypes : [];
+        for (const att of incomingAttachments) {
+          const sz = num(att.fileSize, 0);
+          if (sz > maxBytes) {
+            throw new Error(`VALIDATION_ERROR: حجم المرفق "${str(att.fileName)}" يتجاوز الحد المسموح (${config.addNote?.maxAttachmentSizeMb || 5} MB).`);
+          }
+          if (allowedMime.length > 0 && att.mimeType && !allowedMime.includes(str(att.mimeType))) {
+            throw new Error(`VALIDATION_ERROR: نوع المرفق "${str(att.mimeType)}" غير مسموح به.`);
+          }
+        }
       }
 
       const id = generateId('CNOTE');
       const nowIso = new Date().toISOString();
+      const riyadhParts = getRiyadhDateTimeParts(nowIso);
+      const riyadhText = `${riyadhParts.date} ${riyadhParts.time}`;
+      const stObj = val.status || crmCore.CUSTOMER_NOTE_DEFAULT_STATUSES[0];
+      const isClosed = Boolean(stObj.isClosedStatus);
+
       await tx.query(
-        `INSERT INTO customer_notes (id, customer_id, reservation_id, reservation_number, note_type, content, created_by_id, created_by_name, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$9::timestamptz)`,
-        [id, customerId, reservationId, reservationNumber, noteType, content, session.user.id, session.user.name, nowIso]
+        `INSERT INTO customer_notes (
+           id, customer_id, reservation_id, reservation_number, problem_id, problem_number,
+           title, note_type, content, status_id, status_name, status_color,
+           assigned_employee_id, assigned_employee_name, is_internal, is_closed,
+           closed_at, closed_by_id, closed_by_name, source_section,
+           created_by_id, created_by_name, updated_by_id, updated_by_name, created_at, updated_at
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$21,$22,$23::timestamptz,$23::timestamptz
+         )`,
+        [
+          id, customerId, reservationId, reservationNumber, problemId, problemNumber,
+          val.title, val.noteType, val.content, str(stObj.id), str(stObj.name), str(stObj.color),
+          assignedEmployeeId, assignedEmployeeName, val.isInternal, isClosed,
+          isClosed ? nowIso : null, isClosed ? session.user.id : '', isClosed ? session.user.name : '', sourceSection,
+          session.user.id, session.user.name, nowIso
+        ]
       );
 
-      const isContactType = noteType !== 'ملاحظة';
-      await tx.query(
-        `UPDATE customers
-         SET last_contact_at = CASE WHEN $2::boolean THEN $3::timestamptz ELSE last_contact_at END,
-             updated_at = $3::timestamptz
-         WHERE id = $1`,
-        [customerId, isContactType, nowIso]
-      );
+      const savedAttachments: any[] = [];
+      for (const att of incomingAttachments) {
+        const attId = generateId('CNATT');
+        await tx.query(
+          `INSERT INTO customer_note_attachments (
+             id, note_id, file_name, mime_type, file_size, storage_url, uploaded_by_id, uploaded_by_name, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz)`,
+          [
+            attId,
+            id,
+            str(att.fileName || 'attachment'),
+            str(att.mimeType || 'application/octet-stream'),
+            Math.max(0, Math.floor(num(att.fileSize, 0))),
+            str(att.storageUrl || att.dataUrl || ''),
+            session.user.id,
+            session.user.name,
+            nowIso
+          ]
+        );
+        savedAttachments.push({
+          id: attId,
+          noteId: id,
+          fileName: str(att.fileName || 'attachment'),
+          mimeType: str(att.mimeType || 'application/octet-stream'),
+          fileSize: Math.max(0, Math.floor(num(att.fileSize, 0))),
+          storageUrl: str(att.storageUrl || att.dataUrl || ''),
+          uploadedById: session.user.id,
+          uploadedByName: session.user.name,
+          createdAt: nowIso
+        });
+      }
+
+      if (customerId) {
+        const isContactType = val.noteType !== 'ملاحظة';
+        await tx.query(
+          `UPDATE customers
+           SET last_contact_ts = CASE WHEN $2::boolean THEN GREATEST(COALESCE(last_contact_ts, $3::timestamptz), $3::timestamptz) ELSE last_contact_ts END,
+               last_contact_at = CASE WHEN $2::boolean THEN $4::text ELSE last_contact_at END,
+               updated_at = $3::timestamptz
+           WHERE id = $1`,
+          [customerId, isContactType, nowIso, riyadhText]
+        );
+      }
+
+      await recordCustomerNoteHistory(tx, {
+        noteId: id,
+        actionType: 'إنشاء ملاحظة',
+        fieldName: 'status',
+        oldValue: '',
+        newValue: `${str(stObj.name)} — ${val.content.slice(0, 80)}`,
+        actor: session.user
+      });
 
       await dispatchMentionNotifications(tx, {
-        texts: [content],
+        texts: [val.title, val.content],
         sender: session.user,
         entityType: 'Customer',
-        entityId: customerId,
-        label: str(custQ.rows[0].full_name),
+        entityId: customerId || id,
+        label: customerName || reservationNumber || id,
         sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `cnote:${id}`
       });
 
-      await logActivity(tx, session.user, `${noteType} للعميل`, 'Customer', customerId, content.slice(0, 140));
-      return {
-        id,
+      await dispatchCustomerNoteConfigNotifications(tx, config, 'onAdd', {
+        actor: session.user,
+        noteId: id,
         customerId,
-        reservationId: reservationId || '',
-        reservationNumber,
-        noteType,
-        content,
-        createdById: session.user.id,
-        createdByName: session.user.name,
-        createdAt: nowIso,
-        updatedAt: nowIso
-      };
+        title: `ملاحظة عميل جديدة: ${customerName || reservationNumber || ''}`.trim(),
+        message: `${session.user.name}: ${val.content.slice(0, 120)}`,
+        eventKeySeed: id
+      });
+
+      if (assignedEmployeeId) {
+        await dispatchCustomerNoteConfigNotifications(tx, config, 'onAssign', {
+          actor: session.user,
+          noteId: id,
+          customerId,
+          assignedEmployeeId,
+          title: `تم تعيين ملاحظة عميل لك (${customerName || reservationNumber || id})`,
+          message: `عين لك ${session.user.name} متابعة الملاحظة: "${val.content.slice(0, 100)}"`,
+          eventKeySeed: `${id}:${assignedEmployeeId}`
+        });
+      }
+
+      if (config.activityLog?.enabled !== false && config.activityLog?.trackAdd !== false && config.activityLog?.logAdd !== false && config.buttons?.add_note?.logActivity !== false) {
+        const srcTag = config.activityLog?.includeSourceSection ? ` [المصدر: ${sourceSection}]` : '';
+        await logActivity(tx, session.user, `${val.noteType} للعميل`, 'Customer', customerId || id, `${val.content.slice(0, 140)}${srcTag}`);
+      }
+
+      return formatCustomerNoteRow(
+        {
+          id,
+          customer_id: customerId,
+          customer_name: customerName,
+          reservation_id: reservationId || '',
+          reservation_number: reservationNumber,
+          problem_id: problemId,
+          problem_number: problemNumber,
+          title: val.title,
+          note_type: val.noteType,
+          content: val.content,
+          status_id: str(stObj.id),
+          status_name: str(stObj.name),
+          status_color: str(stObj.color),
+          status_is_active: true,
+          assigned_employee_id: assignedEmployeeId,
+          assigned_employee_name: assignedEmployeeName,
+          is_internal: val.isInternal,
+          is_closed: isClosed,
+          closed_at: isClosed ? nowIso : '',
+          closed_by_id: isClosed ? session.user.id : '',
+          closed_by_name: isClosed ? session.user.name : '',
+          source_section: sourceSection,
+          created_by_id: session.user.id,
+          created_by_name: session.user.name,
+          updated_by_id: session.user.id,
+          updated_by_name: session.user.name,
+          created_at: nowIso,
+          updated_at: nowIso
+        },
+        savedAttachments
+      );
     });
 
     return { note: out };
   });
 }
+
+export async function updateCustomerNote(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'edit_customer_note');
+  const noteId = str(payload.noteId || payload.id);
+  if (!noteId) throw new Error('VALIDATION_ERROR: معرف الملاحظة مطلوب.');
+
+  const [config, statuses] = await Promise.all([
+    loadCustomerNotesConfigNormalized(executor),
+    loadCustomerNoteStatusesList(executor, false)
+  ]);
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [noteId]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الملاحظة غير موجودة.');
+
+    assertOptimisticLock(cur.updated_at instanceof Date ? cur.updated_at.toISOString() : str(cur.updated_at), payload.expectedUpdatedAt);
+
+    const existingObj = formatCustomerNoteRow(cur);
+    assertCustomerNoteButtonAllowed(config, 'edit_note', session.user, existingObj);
+
+    const nextPayload = {
+      ...payload,
+      title: payload.title !== undefined ? payload.title : existingObj.title,
+      content: payload.content !== undefined ? payload.content : existingObj.content,
+      noteType: payload.noteType !== undefined ? payload.noteType : existingObj.noteType,
+      isInternal: payload.isInternal !== undefined ? payload.isInternal : existingObj.isInternal,
+      reservationId: payload.reservationId !== undefined ? payload.reservationId : existingObj.reservationId,
+      statusId: payload.statusId !== undefined ? payload.statusId : existingObj.statusId
+    };
+    const mergedStatuses = statuses.map((s) =>
+      s.id === existingObj.statusId && !payload.statusId ? { ...s, isActive: true } : s
+    );
+    const val = crmCore.validateCustomerNotePayload(nextPayload, config, mergedStatuses, session.user);
+    if (!val.valid) {
+      throw new Error(`VALIDATION_ERROR: ${val.message}`);
+    }
+
+    const nowIso = new Date().toISOString();
+    const stObj = val.status || { id: existingObj.statusId, name: existingObj.statusName, color: existingObj.statusColor, isClosedStatus: existingObj.isClosed };
+    const isClosed = Boolean(stObj.isClosedStatus);
+
+    await tx.query(
+      `UPDATE customer_notes
+       SET title = $2, note_type = $3, content = $4,
+           status_id = $5, status_name = $6, status_color = $7,
+           is_internal = $8, is_closed = $9,
+           closed_at = CASE WHEN $9::boolean AND closed_at IS NULL THEN $12::timestamptz ELSE CASE WHEN NOT $9::boolean THEN NULL::timestamptz ELSE closed_at END END,
+           updated_by_id = $10, updated_by_name = $11, updated_at = $12::timestamptz
+       WHERE id = $1`,
+      [noteId, val.title, val.noteType, val.content, str(stObj.id), str(stObj.name), str(stObj.color), val.isInternal, isClosed, session.user.id, session.user.name, nowIso]
+    );
+
+    const diffs = crmCore.computeAuditFieldDiffs(
+      { title: existingObj.title, noteType: existingObj.noteType, content: existingObj.content, statusName: existingObj.statusName },
+      { title: val.title, noteType: val.noteType, content: val.content, statusName: str(stObj.name) },
+      [
+        { field: 'title', label: 'العنوان' },
+        { field: 'noteType', label: 'النوع' },
+        { field: 'content', label: 'المحتوى' },
+        { field: 'statusName', label: 'الحالة' }
+      ]
+    );
+
+    await recordCustomerNoteHistory(tx, {
+      noteId,
+      actionType: 'تعديل ملاحظة',
+      fieldName: 'content',
+      oldValue: existingObj.content.slice(0, 120),
+      newValue: val.content.slice(0, 120),
+      actor: session.user
+    });
+
+    if (config.activityLog?.enabled !== false && config.activityLog?.trackEdit !== false && config.activityLog?.logEdit !== false && config.buttons?.edit_note?.logActivity !== false) {
+      await logActivity(tx, session.user, 'تعديل ملاحظة عميل', 'Customer', existingObj.customerId || noteId, val.content.slice(0, 140), config.activityLog?.includeOldNewValues !== false ? diffs : []);
+    }
+
+    await dispatchCustomerNoteConfigNotifications(tx, config, 'onReplyUpdate', {
+      actor: session.user,
+      noteId,
+      customerId: existingObj.customerId,
+      title: `تحديث ملاحظة عميل`,
+      message: `${session.user.name}: ${val.content.slice(0, 110)}`,
+      eventKeySeed: `${noteId}:${nowIso}`
+    });
+
+    const refreshed = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [noteId]);
+    const list = await enrichCustomerNoteRows(tx, refreshed.rows, session.user);
+    return list[0];
+  });
+
+  return { note: out };
+}
+
+export async function changeCustomerNoteStatus(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'change_customer_note_status');
+  const noteId = str(payload.noteId || payload.id);
+  const nextStatusId = str(payload.statusId);
+  const nextStatusName = str(payload.statusName || payload.status);
+  if (!noteId) throw new Error('VALIDATION_ERROR: معرف الملاحظة مطلوب.');
+  if (!nextStatusId && !nextStatusName) throw new Error('VALIDATION_ERROR: الحالة الجديدة مطلوبة.');
+
+  const [config, statuses] = await Promise.all([
+    loadCustomerNotesConfigNormalized(executor),
+    loadCustomerNoteStatusesList(executor, false)
+  ]);
+
+  const targetStatus = statuses.find((s) =>
+    (nextStatusId && s.id === nextStatusId) || (nextStatusName && s.name === nextStatusName)
+  );
+  if (!targetStatus) throw new Error('NOT_FOUND: الحالة المحددة غير موجودة.');
+  if (!targetStatus.isActive) {
+    throw new Error(`VALIDATION_ERROR: الحالة "${targetStatus.name}" معطلة ولا يمكن اختيارها لملاحظة.`);
+  }
+  if (session.user.role === 'agent' && targetStatus.allowAgentSelect === false) {
+    throw new Error(`FORBIDDEN: لا يملك الموظف صلاحية اختيار الحالة "${targetStatus.name}".`);
+  }
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [noteId]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الملاحظة غير موجودة.');
+
+    const existingObj = formatCustomerNoteRow(cur);
+    assertCustomerNoteButtonAllowed(config, 'change_status', session.user, existingObj);
+
+    const nowIso = new Date().toISOString();
+    const isClosed = Boolean(targetStatus.isClosedStatus);
+
+    await tx.query(
+      `UPDATE customer_notes
+       SET status_id = $2, status_name = $3, status_color = $4,
+           is_closed = $5,
+           closed_at = CASE WHEN $5::boolean THEN $8::timestamptz ELSE NULL::timestamptz END,
+           closed_by_id = CASE WHEN $5::boolean THEN $6::text ELSE ''::text END,
+           closed_by_name = CASE WHEN $5::boolean THEN $7::text ELSE ''::text END,
+           updated_by_id = $6, updated_by_name = $7, updated_at = $8::timestamptz
+       WHERE id = $1`,
+      [noteId, str(targetStatus.id), str(targetStatus.name), str(targetStatus.color), isClosed, session.user.id, session.user.name, nowIso]
+    );
+
+    await recordCustomerNoteHistory(tx, {
+      noteId,
+      actionType: 'تغيير الحالة',
+      fieldName: 'status',
+      oldValue: existingObj.statusName,
+      newValue: str(targetStatus.name),
+      actor: session.user
+    });
+
+    if (config.activityLog?.enabled !== false && config.activityLog?.trackStatusChange !== false && config.activityLog?.logStatusChange !== false && config.buttons?.change_status?.logActivity !== false) {
+      await logActivity(
+        tx,
+        session.user,
+        'تغيير حالة ملاحظة عميل',
+        'Customer',
+        existingObj.customerId || noteId,
+        `${existingObj.statusName} ← ${str(targetStatus.name)}`,
+        config.activityLog?.includeOldNewValues !== false
+          ? [{ field: 'statusName', label: 'حالة الملاحظة', before: existingObj.statusName, after: str(targetStatus.name) }]
+          : []
+      );
+    }
+
+    await dispatchCustomerNoteConfigNotifications(tx, config, isClosed ? 'onClose' : 'onStatusChange', {
+      actor: session.user,
+      noteId,
+      customerId: existingObj.customerId,
+      title: isClosed ? `تم إغلاق ملاحظة عميل (${str(targetStatus.name)})` : `تغيرت حالة ملاحظة عميل إلى ${str(targetStatus.name)}`,
+      message: `${session.user.name} غير الحالة من "${existingObj.statusName}" إلى "${str(targetStatus.name)}"`,
+      eventKeySeed: `${noteId}:${str(targetStatus.id)}:${nowIso}`
+    });
+
+    const refreshed = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [noteId]);
+    const list = await enrichCustomerNoteRows(tx, refreshed.rows, session.user);
+    return list[0];
+  });
+
+  return { note: out };
+}
+
+export async function assignCustomerNoteEmployee(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'assign_customer_note');
+  const noteId = str(payload.noteId || payload.id);
+  const employeeId = str(payload.employeeId);
+  if (!noteId) throw new Error('VALIDATION_ERROR: معرف الملاحظة مطلوب.');
+
+  const config = await loadCustomerNotesConfigNormalized(executor);
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [noteId]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الملاحظة غير موجودة.');
+
+    const existingObj = formatCustomerNoteRow(cur);
+    assertCustomerNoteButtonAllowed(config, 'assign_note', session.user, existingObj);
+
+    let empName = '';
+    if (employeeId) {
+      const empQ = await tx.query<{ name: string }>(`SELECT name FROM employees WHERE id = $1 LIMIT 1`, [employeeId]);
+      if (!empQ.rows[0]) throw new Error('NOT_FOUND: الموظف المحدد غير موجود.');
+      empName = str(empQ.rows[0].name);
+    }
+
+    const nowIso = new Date().toISOString();
+    await tx.query(
+      `UPDATE customer_notes
+       SET assigned_employee_id = $2, assigned_employee_name = $3, updated_by_id = $4, updated_by_name = $5, updated_at = $6::timestamptz
+       WHERE id = $1`,
+      [noteId, employeeId, empName, session.user.id, session.user.name, nowIso]
+    );
+
+    await recordCustomerNoteHistory(tx, {
+      noteId,
+      actionType: 'تعيين موظف للملاحظة',
+      fieldName: 'assignedEmployee',
+      oldValue: existingObj.assignedEmployeeName || 'غير معين',
+      newValue: empName || 'غير معين',
+      actor: session.user
+    });
+
+    if (config.activityLog?.enabled !== false && config.activityLog?.trackAssign !== false && config.activityLog?.logAssign !== false && config.buttons?.assign_note?.logActivity !== false) {
+      await logActivity(tx, session.user, 'تعيين ملاحظة عميل لموظف', 'Customer', existingObj.customerId || noteId, `${empName || 'إلغاء التعيين'}`);
+    }
+
+    if (employeeId) {
+      await dispatchCustomerNoteConfigNotifications(tx, config, 'onAssign', {
+        actor: session.user,
+        noteId,
+        customerId: existingObj.customerId,
+        assignedEmployeeId: employeeId,
+        title: `تم تعيين ملاحظة عميل لك`,
+        message: `عين لك ${session.user.name} متابعة الملاحظة: "${existingObj.content.slice(0, 100)}"`,
+        eventKeySeed: `${noteId}:${employeeId}:${nowIso}`
+      });
+    }
+
+    const refreshed = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [noteId]);
+    const list = await enrichCustomerNoteRows(tx, refreshed.rows, session.user);
+    return list[0];
+  });
+
+  return { note: out };
+}
+
+export async function deleteCustomerNote(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'delete_customer_note');
+  const noteId = str(payload.noteId || payload.id);
+  if (!noteId) throw new Error('VALIDATION_ERROR: معرف الملاحظة مطلوب.');
+
+  const config = await loadCustomerNotesConfigNormalized(executor);
+
+  const out = await executor.withTransaction(async (tx) => {
+    const q = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [noteId]);
+    const cur = q.rows[0];
+    if (!cur) throw new Error('NOT_FOUND: الملاحظة غير موجودة.');
+
+    const existingObj = formatCustomerNoteRow(cur);
+    assertCustomerNoteButtonAllowed(config, 'delete_note', session.user, existingObj);
+
+    const nowIso = new Date().toISOString();
+    await tx.query(
+      `UPDATE customer_notes
+       SET deleted_at = $2::timestamptz, deleted_by_id = $3, deleted_by_name = $4, updated_at = $2::timestamptz
+       WHERE id = $1`,
+      [noteId, nowIso, session.user.id, session.user.name]
+    );
+    await recordSyncTombstone(tx, 'customer_note', [noteId], { customerId: existingObj.customerId });
+    await recordCustomerNoteHistory(tx, {
+      noteId,
+      actionType: 'حذف ملاحظة',
+      fieldName: 'deleted',
+      oldValue: existingObj.content.slice(0, 100),
+      newValue: 'محذوفة',
+      actor: session.user
+    });
+
+    if (config.activityLog?.enabled !== false && config.activityLog?.trackDelete !== false && config.activityLog?.logDelete !== false && config.buttons?.delete_note?.logActivity !== false) {
+      await logActivity(tx, session.user, 'حذف ملاحظة عميل', 'Customer', existingObj.customerId || noteId, existingObj.content.slice(0, 120));
+    }
+
+    return { deleted: true, id: noteId, customerId: existingObj.customerId };
+  });
+
+  return out;
+}
+
+export async function addCustomerNoteAttachment(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'edit_customer_note');
+  const noteId = str(payload.noteId);
+  const fileName = str(payload.fileName);
+  const mimeType = str(payload.mimeType || 'application/octet-stream');
+  const fileSize = Math.max(0, Math.floor(num(payload.fileSize, 0)));
+  const storageUrl = str(payload.storageUrl || payload.dataUrl);
+  if (!noteId || !fileName || !storageUrl) {
+    throw new Error('VALIDATION_ERROR: بيانات المرفق غير مكتملة.');
+  }
+
+  const config = await loadCustomerNotesConfigNormalized(executor);
+  assertCustomerNoteButtonAllowed(config, 'attach_file', session.user);
+
+  const maxBytes = Math.max(1, num(config.addNote?.maxAttachmentSizeMb, 5)) * 1024 * 1024;
+  if (fileSize > maxBytes) {
+    throw new Error(`VALIDATION_ERROR: حجم الملف يتجاوز الحد الأقصى (${config.addNote?.maxAttachmentSizeMb || 5} MB).`);
+  }
+  const allowedTypes: string[] = Array.isArray(config.addNote?.allowedAttachmentTypes) ? config.addNote.allowedAttachmentTypes : [];
+  if (allowedTypes.length > 0 && !allowedTypes.includes(mimeType)) {
+    throw new Error(`VALIDATION_ERROR: نوع الملف "${mimeType}" غير مدعوم.`);
+  }
+
+  const out = await executor.withTransaction(async (tx) => {
+    const nq = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 AND deleted_at IS NULL LIMIT 1`, [noteId]);
+    if (!nq.rows[0]) throw new Error('NOT_FOUND: الملاحظة غير موجودة.');
+    const noteObj = formatCustomerNoteRow(nq.rows[0]);
+    assertCustomerNoteButtonAllowed(config, 'attach_file', session.user, noteObj);
+
+    const attId = generateId('CNATT');
+    const nowIso = new Date().toISOString();
+    await tx.query(
+      `INSERT INTO customer_note_attachments (id, note_id, file_name, mime_type, file_size, storage_url, uploaded_by_id, uploaded_by_name, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz)`,
+      [attId, noteId, fileName, mimeType, fileSize, storageUrl, session.user.id, session.user.name, nowIso]
+    );
+    await recordCustomerNoteHistory(tx, {
+      noteId,
+      actionType: 'إرفاق ملف',
+      fieldName: 'attachment',
+      oldValue: '',
+      newValue: fileName,
+      actor: session.user
+    });
+    if (config.activityLog?.enabled !== false && config.activityLog?.trackAttachments !== false && config.activityLog?.logAttachments !== false && config.buttons?.attach_file?.logActivity !== false) {
+      await logActivity(tx, session.user, 'إرفاق ملف بملاحظة عميل', 'Customer', noteObj.customerId || noteId, fileName);
+    }
+    return {
+      id: attId,
+      noteId,
+      fileName,
+      mimeType,
+      fileSize,
+      storageUrl,
+      uploadedById: session.user.id,
+      uploadedByName: session.user.name,
+      createdAt: nowIso
+    };
+  });
+
+  return { attachment: out };
+}
+
+export async function deleteCustomerNoteAttachment(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  requirePermission(session, 'edit_customer_note');
+  const attachmentId = str(payload.attachmentId || payload.id);
+  if (!attachmentId) throw new Error('VALIDATION_ERROR: معرف المرفق مطلوب.');
+
+  const config = await loadCustomerNotesConfigNormalized(executor);
+
+  const out = await executor.withTransaction(async (tx) => {
+    const aq = await tx.query(`SELECT * FROM customer_note_attachments WHERE id = $1 AND deleted_at IS NULL LIMIT 1`, [attachmentId]);
+    const att = aq.rows[0];
+    if (!att) throw new Error('NOT_FOUND: المرفق غير موجود.');
+    const nq = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [str(att.note_id)]);
+    const noteObj = nq.rows[0] ? formatCustomerNoteRow(nq.rows[0]) : undefined;
+    assertCustomerNoteButtonAllowed(config, 'delete_attachment', session.user, noteObj);
+
+    const nowIso = new Date().toISOString();
+    await tx.query(`UPDATE customer_note_attachments SET deleted_at = $2::timestamptz WHERE id = $1`, [attachmentId, nowIso]);
+    await recordCustomerNoteHistory(tx, {
+      noteId: str(att.note_id),
+      actionType: 'حذف مرفق',
+      fieldName: 'attachment',
+      oldValue: str(att.file_name),
+      newValue: '',
+      actor: session.user
+    });
+    if (config.activityLog?.enabled !== false && config.activityLog?.trackAttachments !== false && config.activityLog?.logAttachments !== false && config.buttons?.delete_attachment?.logActivity !== false) {
+      await logActivity(tx, session.user, 'حذف مرفق ملاحظة عميل', 'Customer', noteObj?.customerId || str(att.note_id), str(att.file_name));
+    }
+    return { deleted: true, id: attachmentId, noteId: str(att.note_id) };
+  });
+
+  return out;
+}
+
+export async function getCustomerNoteHistory(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {}
+) {
+  const canHist = crmCore.canUserPerform(session.user, 'view_customer_note_history')
+    || crmCore.canUserPerform(session.user, 'view_customer_notes')
+    || crmCore.canUserPerform(session.user, 'view_customers');
+  if (!canHist) {
+    throw new Error('FORBIDDEN: ليس لديك صلاحية عرض سجل تغييرات الملاحظات.');
+  }
+  const config = await loadCustomerNotesConfigNormalized(executor);
+  assertCustomerNoteButtonAllowed(config, 'view_history', session.user);
+
+  const noteId = str(payload.noteId || payload.id);
+  if (!noteId) throw new Error('VALIDATION_ERROR: معرف الملاحظة مطلوب.');
+
+  const res = await executor.query(
+    `SELECT * FROM customer_note_history WHERE note_id = $1 ORDER BY created_at DESC LIMIT 120`,
+    [noteId]
+  );
+  return {
+    items: (res.rows || []).map((r: any) => ({
+      id: str(r.id),
+      noteId: str(r.note_id),
+      actionType: str(r.action_type),
+      fieldName: str(r.field_name),
+      oldValue: str(r.old_value),
+      newValue: str(r.new_value),
+      actorId: str(r.actor_id),
+      actorName: str(r.actor_name),
+      actorRole: str(r.actor_role),
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : str(r.created_at)
+    }))
+  };
+}
+
 

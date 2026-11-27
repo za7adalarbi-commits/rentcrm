@@ -4570,6 +4570,8 @@
                   }).join('') + '</div>') +
             '</div>' +
 
+            '<div id="drawer-customer-notes-host"></div>' +
+
             (d.problems.length ? (
               '<div class="rg-ui-drawer-timeline">' +
                 '<h4 style="margin:0 0 10px;font-size:14px;">المشكلات / التذاكر المرتبطة بالحجز (' + d.problems.length + ')</h4>' +
@@ -5404,6 +5406,25 @@
       }
 
       var drawerCharts = renderDrawerCharts(d);
+
+      var drawerNotesHost = document.getElementById('drawer-customer-notes-host');
+      if (drawerNotesHost && root.RGCustomers && typeof root.RGCustomers.mountCustomerNotesPanel === 'function') {
+        root.RGCustomers.mountCustomerNotesPanel(drawerNotesHost, {
+          sourceSection: 'reservations',
+          customerId: r.customerId || '',
+          reservationId: r.id,
+          reservationNumber: r.reservationNumber,
+          employees: resolvedEmployees,
+          initialNotes: Array.isArray(d.customerNotes) ? d.customerNotes : null,
+          noteStatuses: d.noteStatuses,
+          notesConfig: d.notesConfig,
+          ctx: ctx,
+          onChanged: function () { reopenSelf(null); }
+        });
+      }
+      if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+        root.RGCrmDropdowns.enhanceAll(modalRoot);
+      }
 
       var drawerExportWrap = document.getElementById('drawer-export-wrap');
       if (drawerExportWrap && root.RGExportMenu) {

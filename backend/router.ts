@@ -3,6 +3,7 @@ import { checkMutationSpamLimit, getMutationSyncSpec, invalidateAndBumpVersion, 
 import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
+import * as integrityService from './integrityService.js';
 import * as queries from './queries.js';
 
 export interface CrmApiResponse<T = any> {
@@ -348,11 +349,74 @@ export async function dispatchCrmRequest(
       case 'updateCustomerProfile':
         result = await queries.updateCustomerProfile(executor, session, payload);
         break;
-      case 'assignCustomerEmployee':
-        result = await queries.assignCustomerEmployee(executor, session, payload);
+      case 'getCustomerNotesConfig':
+        result = await queries.getCustomerNotesConfig(executor, session);
+        break;
+      case 'saveCustomerNotesConfig':
+        result = await queries.saveCustomerNotesConfig(executor, session, payload);
+        break;
+      case 'getCustomerNoteStatuses':
+        result = await queries.getCustomerNoteStatuses(executor, session);
+        break;
+      case 'saveCustomerNoteStatus':
+        result = await queries.saveCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'toggleCustomerNoteStatus':
+        result = await queries.toggleCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'deleteCustomerNoteStatus':
+        result = await queries.deleteCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'getCustomerNotes':
+        result = await queries.getCustomerNotes(executor, session, payload);
         break;
       case 'addCustomerNote':
         result = await queries.addCustomerNote(executor, session, payload);
+        break;
+      case 'updateCustomerNote':
+        result = await queries.updateCustomerNote(executor, session, payload);
+        break;
+      case 'changeCustomerNoteStatus':
+        result = await queries.changeCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'assignCustomerNoteEmployee':
+        result = await queries.assignCustomerNoteEmployee(executor, session, payload);
+        break;
+      case 'deleteCustomerNote':
+        result = await queries.deleteCustomerNote(executor, session, payload);
+        break;
+      case 'addCustomerNoteAttachment':
+        result = await queries.addCustomerNoteAttachment(executor, session, payload);
+        break;
+      case 'deleteCustomerNoteAttachment':
+        result = await queries.deleteCustomerNoteAttachment(executor, session, payload);
+        break;
+      case 'getCustomerNoteHistory':
+        result = await queries.getCustomerNoteHistory(executor, session, payload);
+        break;
+      case 'getDataIntegrityReport':
+        result = await integrityService.getDataIntegrityReport(executor, session, payload);
+        break;
+      case 'runDataIntegrityCheck':
+        result = await integrityService.runDataIntegrityCheck(executor, session, payload);
+        break;
+      case 'recheckDataIntegrityRecord':
+        result = await integrityService.recheckDataIntegrityRecord(executor, session, payload);
+        break;
+      case 'resolveDataIntegrityIssue':
+        result = await integrityService.resolveDataIntegrityIssue(executor, session, payload);
+        break;
+      case 'rollbackDataIntegrityAction':
+        result = await integrityService.rollbackDataIntegrityAction(executor, session, payload);
+        break;
+      case 'getDataIntegritySettings':
+        result = await integrityService.getDataIntegritySettings(executor, session);
+        break;
+      case 'saveDataIntegritySettings':
+        result = await integrityService.saveDataIntegritySettings(executor, session, payload);
+        break;
+      case 'controlDataIntegrityMonitor':
+        result = await integrityService.controlDataIntegrityMonitor(executor, session, payload);
         break;
       default:
         return {
@@ -372,6 +436,10 @@ export async function dispatchCrmRequest(
       action === 'deletePermissionDefinition' ||
       action === 'applyUnifiedConnectionSetup' ||
       action === 'updateSettings' ||
+      action === 'saveCustomerNotesConfig' ||
+      action === 'saveCustomerNoteStatus' ||
+      action === 'toggleCustomerNoteStatus' ||
+      action === 'deleteCustomerNoteStatus' ||
       action === 'saveEmployeeUiOverrides' ||
       action === 'saveRoleUiDefaults' ||
       action === 'restoreUiDefaults'

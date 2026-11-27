@@ -1,5 +1,6 @@
 /**
- * RENTAL GATE CRM — Unified Customer Management System & Full Customer Profile
+ * RENTAL GATE CRM — Unified Customer Management System, Full Customer Profile
+ * & Reusable Customer Notes Panel (Customers / Reservations / Problems)
  */
 (function (root) {
   'use strict';
@@ -26,6 +27,37 @@
     return root.RGCrmCore || {};
   }
 
+  function enhanceSelects(scopeEl) {
+    if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+      root.RGCrmDropdowns.enhanceAll(scopeEl || document);
+    }
+  }
+
+  function getCustomerNotesConfigSafe(overrideCfg) {
+    var core = coreFn();
+    var raw = overrideCfg ||
+      (root.RGApp && typeof root.RGApp.getCustomerNotesConfig === 'function' && root.RGApp.getCustomerNotesConfig()) ||
+      {};
+    if (core.normalizeCustomerNotesConfig) {
+      return core.normalizeCustomerNotesConfig(raw);
+    }
+    return raw || {};
+  }
+
+  function getCustomerNoteStatusesSafe(overrideList) {
+    var core = coreFn();
+    var raw = Array.isArray(overrideList) && overrideList.length
+      ? overrideList
+      : ((root.RGApp && typeof root.RGApp.getCustomerNoteStatuses === 'function' && root.RGApp.getCustomerNoteStatuses()) ||
+         core.CUSTOMER_NOTE_DEFAULT_STATUSES ||
+         []);
+    return raw.map(function (st) {
+      return core.normalizeCustomerNoteStatusRecord ? core.normalizeCustomerNoteStatusRecord(st) : Object.assign({}, st);
+    }).sort(function (a, b) {
+      return Number(a.sortOrder || 0) - Number(b.sortOrder || 0);
+    });
+  }
+
   function getCustomersState(ctx) {
     var st = (ctx && ctx.state) || (root.RGApp && root.RGApp.getState && root.RGApp.getState()) || {};
     if (!st.customers || typeof st.customers !== 'object') {
@@ -33,7 +65,8 @@
         search: '',
         status: '',
         company: '',
-        assignedEmployeeId: '',
+        dateFrom: '',
+        dateTo: '',
         problemFilter: '',
         kpiFilter: 'all',
         sortBy: 'last_activity',
@@ -60,10 +93,10 @@
 
   function statusTagClass(st) {
     var s = String(st || '').trim();
-    if (s === 'لديه مشكلة' || s === 'محظور') return 'status-danger';
-    if (s === 'يحتاج متابعة') return 'status-warning';
-    if (s === 'VIP' || s === 'نشط' || s === 'متكرر') return 'status-success';
-    if (s === 'جديد') return 'status-info';
+    if (s === 'لديه مشكلة' || s === 'محظور' || s === 'ملغي' || s === 'مرفوض') return 'status-danger';
+    if (s === 'يحتاج متابعة' || s === 'متأخر في السداد' || s === 'بانتظار المتابعة') return 'status-warning';
+    if (s === 'VIP' || s === 'نشط' || s === 'نشط الآن' || s === 'متكرر' || s === 'مكتمل') return 'status-success';
+    if (s === 'جديد' || s === 'جاهز للاستلام') return 'status-info';
     return 'status-neutral';
   }
 
@@ -86,18 +119,55 @@
     });
   }
 
+  function getSourceSectionLabel(src) {
+    var s = String(src || 'customers').trim();
+    if (s === 'reservations') return 'تفاصيل الحجز';
+    if (s === 'problems') return 'المشاكل والشكاوى';
+    return 'ملف العميل';
+  }
+
+  function showConfirmModal(title, message, confirmLabel, danger, onConfirm) {
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-backdrop';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.style.zIndex = '1450';
+    overlay.innerHTML =
+      '<div class="modal-panel" style="max-width:440px;">' +
+        '<div class="modal-header">' +
+          '<h3 class="modal-title">' + esc(title || 'تأكيد الإجراء') + '</h3>' +
+          '<button type="button" class="btn btn-sm" data-cn-close>إغلاق</button>' +
+        '</div>' +
+        '<p style="margin:0 0 14px;font-size:13.5px;color:var(--text-secondary);line-height:1.6;">' + esc(message || 'هل أنت متأكد من المتابعة؟') + '</p>' +
+        '<div class="modal-footer">' +
+          '<button type="button" class="btn" data-cn-close>إلغاء</button>' +
+          '<button type="button" class="btn ' + (danger ? 'btn-danger' : 'btn-primary') + '" data-cn-ok>' + esc(confirmLabel || 'تأكيد') + '</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+    var close = function () { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+    overlay.querySelectorAll('[data-cn-close]').forEach(function (b) { b.addEventListener('click', close); });
+    overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+    var okBtn = overlay.querySelector('[data-cn-ok]');
+    if (okBtn) {
+      okBtn.addEventListener('click', function () {
+        close();
+        if (typeof onConfirm === 'function') onConfirm();
+      });
+    }
+  }
+
   function openCustomerFormModal(existingCustomer, facets, ctx, onSaved) {
     var modalRoot = document.getElementById('modal-root');
     if (!modalRoot) return;
     var core = coreFn();
     var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
-    var canViewId = core.canUserViewCustomerId ? core.canUserViewCustomerId(user) : false;
-    var statuses = (facets && Array.isArray(facets.statuses) && facets.statuses.length)
-      ? facets.statuses
-      : (core.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور']);
+    var notesCfg = getCustomerNotesConfigSafe();
+    var csCfg = notesCfg.customersSection || {};
+    var canViewId = (core.canUserViewCustomerId ? core.canUserViewCustomerId(user) : false) && csCfg.showSensitiveIds !== false;
+    var statuses = (core.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور']);
     var isEdit = Boolean(existingCustomer && existingCustomer.id);
     var c = existingCustomer || {};
-    var emps = (facets && Array.isArray(facets.employees)) ? facets.employees : [];
 
     modalRoot.innerHTML =
       '<div class="modal-backdrop" id="cust-form-modal" role="dialog" aria-modal="true">' +
@@ -112,7 +182,7 @@
             '<div class="form-group"><label class="form-label" for="cf-cc">مفتاح الدولة</label><input class="input mono" dir="ltr" id="cf-cc" value="' + esc(c.countryCode || '') + '" placeholder="+966"></div>' +
             '<div class="form-group"><label class="form-label" for="cf-email">البريد الإلكتروني</label><input class="input mono" dir="ltr" type="email" id="cf-email" value="' + esc(c.email || '') + '"></div>' +
             '<div class="form-group"><label class="form-label" for="cf-status">حالة العميل</label>' +
-              '<select class="input" id="cf-status">' +
+              '<select class="select" id="cf-status" data-search-placeholder="ابحث عن الحالة...">' +
                 statuses.map(function (st) {
                   return '<option value="' + esc(st) + '"' + (c.status === st ? ' selected' : '') + '>' + esc(st) + '</option>';
                 }).join('') +
@@ -121,7 +191,7 @@
             (canViewId ? (
               '<div class="form-group"><label class="form-label" for="cf-idnum">رقم الهوية / الإقامة / الجواز</label><input class="input mono" dir="ltr" id="cf-idnum" value="' + esc(c.idNumber || '') + '"></div>' +
               '<div class="form-group"><label class="form-label" for="cf-idtype">نوع الهوية</label>' +
-                '<select class="input" id="cf-idtype">' +
+                '<select class="select" id="cf-idtype">' +
                   '<option value="">تحديد تلقائي</option>' +
                   '<option value="هوية وطنية"' + (c.idType === 'هوية وطنية' ? ' selected' : '') + '>هوية وطنية</option>' +
                   '<option value="إقامة"' + (c.idType === 'إقامة' ? ' selected' : '') + '>إقامة</option>' +
@@ -129,16 +199,7 @@
                 '</select>' +
               '</div>'
             ) : '') +
-            (!isEdit && emps.length ? (
-              '<div class="form-group md:col-span-2"><label class="form-label" for="cf-emp">الموظف المسؤول</label>' +
-                '<select class="input" id="cf-emp"><option value="">غير مسند</option>' +
-                emps.map(function (e) {
-                  return '<option value="' + esc(e.id) + '">' + esc(e.name) + '</option>';
-                }).join('') +
-                '</select>' +
-              '</div>'
-            ) : '') +
-            '<div class="form-group md:col-span-2"><label class="form-label" for="cf-notes">ملاحظات داخلية</label><textarea class="input" id="cf-notes" rows="3">' + esc(c.notes || '') + '</textarea></div>' +
+            '<div class="form-group md:col-span-2"><label class="form-label" for="cf-notes">ملاحظات الملف الأساسية</label><textarea class="input" id="cf-notes" rows="3">' + esc(c.notes || '') + '</textarea></div>' +
             '<div class="md:col-span-2 flex justify-end gap-2 pt-2">' +
               '<button type="button" class="btn" id="cf-cancel">إلغاء</button>' +
               '<button type="submit" class="btn btn-primary" id="cf-submit">' + (isEdit ? 'حفظ التعديلات' : 'إنشاء ملف العميل') + '</button>' +
@@ -147,6 +208,7 @@
         '</div>' +
       '</div>';
 
+    enhanceSelects(modalRoot);
     var closeModal = function () { modalRoot.innerHTML = ''; };
     document.getElementById('cf-close').addEventListener('click', closeModal);
     document.getElementById('cf-cancel').addEventListener('click', closeModal);
@@ -175,8 +237,6 @@
           payload.customerId = c.id;
           res = await root.RGApi.callApi('updateCustomerProfile', payload);
         } else {
-          var empInp = document.getElementById('cf-emp');
-          if (empInp) payload.assignedEmployeeId = empInp.value;
           res = await root.RGApi.callApi('createCustomer', payload);
         }
         if (!res || !res.success) {
@@ -210,13 +270,13 @@
           '<form id="cp-form" class="flex flex-col gap-3">' +
             '<div class="grid grid-cols-1 md:grid-cols-2 gap-3">' +
               '<div class="form-group"><label class="form-label" for="cp-type">النوع</label>' +
-                '<select class="input" id="cp-type">' +
+                '<select class="select" id="cp-type">' +
                   '<option value="شكوى">شكوى عميل</option>' +
                   '<option value="مشكلة">مشكلة تشغيلية</option>' +
                 '</select>' +
               '</div>' +
               '<div class="form-group"><label class="form-label" for="cp-prio">الأولوية</label>' +
-                '<select class="input" id="cp-prio">' +
+                '<select class="select" id="cp-prio">' +
                   priorities.map(function (p) {
                     return '<option value="' + esc(p) + '"' + (p === 'مرتفع' ? ' selected' : '') + '>' + esc(p) + '</option>';
                   }).join('') +
@@ -224,7 +284,7 @@
               '</div>' +
             '</div>' +
             '<div class="form-group"><label class="form-label" for="cp-res">ربط بحجز (اختياري)</label>' +
-              '<select class="input" id="cp-res">' +
+              '<select class="select" id="cp-res" data-search-placeholder="ابحث عن الحجز...">' +
                 '<option value="">بدون ربط بحجز محدد</option>' +
                 (reservations || []).map(function (r) {
                   return '<option value="' + esc(r.id) + '" data-num="' + esc(r.reservationNumber) + '">' + esc(r.reservationNumber + ' — ' + (r.carName || r.companyName || '')) + '</option>';
@@ -240,6 +300,7 @@
         '</div>' +
       '</div>';
 
+    enhanceSelects(modalRoot);
     var closeModal = function () { modalRoot.innerHTML = ''; };
     document.getElementById('cp-close').addEventListener('click', closeModal);
     document.getElementById('cp-cancel').addEventListener('click', closeModal);
@@ -277,28 +338,908 @@
     });
   }
 
+  /**
+   * Reusable Customer Notes Panel — Mounts safely inside Customers, Reservations Drawer, or Problems Modal.
+   * IMPORTANT: Never creates <form> or <button type="submit"> tags internally so it nests cleanly inside modals/forms.
+   */
+  function mountCustomerNotesPanel(hostEl, opts) {
+    if (!hostEl) return;
+    var o = opts || {};
+    var ctx = o.ctx || { toast: function () {} };
+    var core = coreFn();
+    var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
+    var cfg = getCustomerNotesConfigSafe(o.notesConfig);
+    var statuses = getCustomerNoteStatusesSafe(o.noteStatuses);
+    var employees = Array.isArray(o.employees) ? o.employees : [];
+    var reservations = Array.isArray(o.reservations) ? o.reservations : [];
+    var sourceSection = o.sourceSection || (o.problemId ? 'problems' : (o.reservationId ? 'reservations' : 'customers'));
+
+    var panelState = {
+      notes: Array.isArray(o.initialNotes) ? o.initialNotes.slice() : [],
+      statuses: statuses,
+      config: cfg,
+      stats: { total: 0, open: 0, closed: 0, internal: 0 },
+      search: '',
+      statusId: '',
+      noteType: '',
+      sourceFilter: '',
+      assignedEmployeeId: '',
+      dateFrom: '',
+      dateTo: '',
+      sortBy: (cfg.general && cfg.general.defaultSort) || 'newest',
+      composerOpen: false,
+      pendingAttachments: [],
+      loading: !Array.isArray(o.initialNotes)
+    };
+
+    function evalBtn(btnKey, noteObj, extraOpts) {
+      if (core.evaluateCustomerNoteButtonAccess) {
+        return core.evaluateCustomerNoteButtonAccess(user, btnKey, noteObj || null, panelState.config, extraOpts);
+      }
+      return { allowed: true, reason: 'OK', message: '', rule: {} };
+    }
+
+    function buildStatusOptionsHtml(selectedId, includeAllLabel, includeInactiveCurrentId) {
+      var html = includeAllLabel ? '<option value="">' + esc(includeAllLabel) + '</option>' : '';
+      var hasSelected = false;
+      var role = user && user.role ? String(user.role) : '';
+      panelState.statuses.forEach(function (st) {
+        if (!st) return;
+        var isSel = selectedId && String(selectedId) === String(st.id);
+        if (!st.isActive) {
+          if (includeInactiveCurrentId && String(includeInactiveCurrentId) === String(st.id)) {
+            hasSelected = true;
+            html += '<option value="' + esc(st.id) + '" selected disabled data-inactive="true" data-color="' + esc(st.color) + '">' + esc(st.name) + ' (معطلة)</option>';
+          }
+          return;
+        }
+        if (role === 'agent' && st.allowAgentSelect === false && !includeAllLabel) {
+          if (isSel) {
+            hasSelected = true;
+            html += '<option value="' + esc(st.id) + '" selected disabled data-inactive="true" data-color="' + esc(st.color) + '">' + esc(st.name) + ' (للمشرف فقط)</option>';
+          }
+          return;
+        }
+        if (isSel) hasSelected = true;
+        html += '<option value="' + esc(st.id) + '" data-color="' + esc(st.color) + '"' + (isSel ? ' selected' : '') + '>' + esc(st.name) + '</option>';
+      });
+      if (includeInactiveCurrentId && !hasSelected) {
+        html += '<option value="' + esc(includeInactiveCurrentId) + '" selected disabled data-inactive="true">حالة أرشيفية</option>';
+      }
+      return html;
+    }
+
+    function recomputeStats() {
+      var openCnt = 0, closedCnt = 0, intCnt = 0;
+      panelState.notes.forEach(function (n) {
+        if (!n) return;
+        if (n.isClosed || n.statusIsClosed) closedCnt += 1;
+        else openCnt += 1;
+        if (n.isInternal) intCnt += 1;
+      });
+      panelState.stats = {
+        total: panelState.notes.length,
+        open: openCnt,
+        closed: closedCnt,
+        internal: intCnt
+      };
+    }
+
+    function openNoteDetailsModal(note) {
+      var overlay = document.createElement('div');
+      overlay.className = 'modal-backdrop';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.style.zIndex = '1420';
+      var atts = Array.isArray(note.attachments) ? note.attachments : [];
+      overlay.innerHTML =
+        '<div class="modal-panel" style="max-width:620px;">' +
+          '<div class="modal-header">' +
+            '<div>' +
+              '<h3 class="modal-title">' + esc(note.title || note.noteType || 'تفاصيل الملاحظة') + '</h3>' +
+              '<div class="meta-inline">' +
+                '<span class="rg-note-status-badge"><span class="rg-note-status-dot" style="background:' + esc(note.statusColor || '#3b82f6') + ';"></span>' + esc(note.statusName || 'جديدة') + '</span>' +
+                '<span>·</span><span>' + esc(getSourceSectionLabel(note.sourceSection)) + '</span>' +
+                (note.reservationNumber ? '<span>·</span><span class="mono" dir="ltr">' + esc(note.reservationNumber) + '</span>' : '') +
+                (note.problemNumber ? '<span>·</span><span class="mono" dir="ltr">' + esc(note.problemNumber) + '</span>' : '') +
+              '</div>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" data-nd-close>إغلاق</button>' +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;gap:12px;">' +
+            '<div style="padding:12px;border-radius:var(--radius-sm);background:var(--bg-surface-subtle);border:1px solid var(--border-hairline);white-space:pre-wrap;line-height:1.7;font-size:13.5px;">' + esc(note.content || '') + '</div>' +
+            '<div class="rg-cust-info-dl">' +
+              '<div class="rg-cust-info-item"><span class="k">نوع التواصل</span><span class="v">' + esc(note.noteType || 'ملاحظة') + (note.isInternal ? ' (داخلية)' : '') + '</span></div>' +
+              '<div class="rg-cust-info-item"><span class="k">الكاتب</span><span class="v">' + esc(note.createdByName || '-') + '</span></div>' +
+              '<div class="rg-cust-info-item"><span class="k">تاريخ الإنشاء</span><span class="v mono" dir="ltr">' + esc(fmtDateTime(note.createdAt, ctx)) + '</span></div>' +
+              '<div class="rg-cust-info-item"><span class="k">آخر تحديث</span><span class="v mono" dir="ltr">' + esc(fmtDateTime(note.updatedAt, ctx)) + '</span></div>' +
+              (note.assignedEmployeeName ? '<div class="rg-cust-info-item"><span class="k">مكلف بالمتابعة</span><span class="v">' + esc(note.assignedEmployeeName) + '</span></div>' : '') +
+            '</div>' +
+            (atts.length ? (
+              '<div><h4 style="margin:0 0 8px;font-size:13px;">المرفقات (' + atts.length + ')</h4>' +
+                '<div class="rg-note-attachments-row">' +
+                  atts.map(function (a) {
+                    var href = a.storageUrl || a.dataUrl || '#';
+                    return '<a class="rg-note-att-chip" href="' + esc(href) + '" download="' + esc(a.fileName || 'file') + '">' + esc(a.fileName || 'مرفق') + '</a>';
+                  }).join('') +
+                '</div>' +
+              '</div>'
+            ) : '') +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+      var close = function () { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+      overlay.querySelectorAll('[data-nd-close]').forEach(function (b) { b.addEventListener('click', close); });
+      overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+    }
+
+    async function openNoteHistoryModal(note) {
+      var overlay = document.createElement('div');
+      overlay.className = 'modal-backdrop';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.style.zIndex = '1420';
+      overlay.innerHTML =
+        '<div class="modal-panel" style="max-width:600px;">' +
+          '<div class="modal-header">' +
+            '<h3 class="modal-title">سجل تغييرات الملاحظة</h3>' +
+            '<button type="button" class="btn btn-sm" data-nh-close>إغلاق</button>' +
+          '</div>' +
+          '<div id="cn-hist-body" style="max-height:60vh;overflow-y:auto;">' +
+            '<div class="empty-state" style="padding:18px;">جاري تحميل سجل التعديلات...</div>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+      var close = function () { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+      overlay.querySelectorAll('[data-nh-close]').forEach(function (b) { b.addEventListener('click', close); });
+      overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+
+      var res = await root.RGApi.callApi('getCustomerNoteHistory', { noteId: note.id });
+      var body = overlay.querySelector('#cn-hist-body');
+      if (!body || !overlay.isConnected) return;
+      if (!res || !res.success) {
+        body.innerHTML = '<div class="form-error">' + esc((res && res.message) || 'تعذر تحميل سجل التغييرات.') + '</div>';
+        return;
+      }
+      var list = (res.data && Array.isArray(res.data.items)) ? res.data.items : [];
+      body.innerHTML = list.length === 0
+        ? '<div class="empty-state" style="padding:18px;">لا توجد تغييرات مسجلة لهذه الملاحظة.</div>'
+        : '<div class="timeline-list">' + list.map(function (h) {
+            return '<div class="timeline-item">' +
+              '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
+                '<strong>' + esc(h.actionType || h.action || 'تحديث') + '</strong>' +
+                '<span class="mono text-xs" dir="ltr" style="color:var(--text-muted);">' + esc(fmtDateTime(h.createdAt, ctx)) + '</span>' +
+              '</div>' +
+              '<div class="text-xs" style="color:var(--text-secondary);">بواسطة: ' + esc(h.actorName || '-') + (h.fieldName ? ' · الحقل: <span class="mono" dir="ltr">' + esc(h.fieldName) + '</span>' : '') + '</div>' +
+              ((h.oldValue || h.newValue) ? '<div class="text-xs mt-1">' + (h.oldValue ? '<span style="color:var(--text-muted);">قبل: ' + esc(h.oldValue) + '</span> ← ' : '') + '<strong>' + esc(h.newValue || h.details || '') + '</strong></div>' : '') +
+            '</div>';
+          }).join('') + '</div>';
+    }
+
+    function openEditNoteModal(note) {
+      var overlay = document.createElement('div');
+      overlay.className = 'modal-backdrop';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.style.zIndex = '1420';
+      var noteTypes = core.CUSTOMER_NOTE_TYPES || ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
+      var allowInt = !(panelState.config.addNote && panelState.config.addNote.allowInternalNotes === false);
+      overlay.innerHTML =
+        '<div class="modal-panel" style="max-width:580px;">' +
+          '<div class="modal-header">' +
+            '<h3 class="modal-title">تعديل الملاحظة</h3>' +
+            '<button type="button" class="btn btn-sm" data-ne-close>إغلاق</button>' +
+          '</div>' +
+          '<div class="flex flex-col gap-3">' +
+            '<div class="form-group"><label class="form-label" for="ne-title">العنوان (اختياري)</label><input class="input" id="ne-title" value="' + esc(note.title || '') + '"></div>' +
+            '<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">' +
+              '<div class="form-group"><label class="form-label" for="ne-type">نوع الملاحظة</label>' +
+                '<select class="select" id="ne-type">' +
+                  noteTypes.map(function (tp) {
+                    return '<option value="' + esc(tp) + '"' + (note.noteType === tp ? ' selected' : '') + '>' + esc(tp) + '</option>';
+                  }).join('') +
+                '</select>' +
+              '</div>' +
+              '<div class="form-group"><label class="form-label" for="ne-status">الحالة</label>' +
+                '<select class="select" id="ne-status" data-search-placeholder="ابحث عن الحالة...">' +
+                  buildStatusOptionsHtml(note.statusId, '', note.statusId) +
+                '</select>' +
+              '</div>' +
+            '</div>' +
+            '<div class="form-group"><label class="form-label" for="ne-content">المحتوى *</label><textarea class="textarea" id="ne-content" rows="4">' + esc(note.content || '') + '</textarea></div>' +
+            (allowInt ? '<label class="checkbox-item"><input type="checkbox" id="ne-internal"' + (note.isInternal ? ' checked' : '') + '> ملاحظة داخلية للفريق فقط</label>' : '') +
+            '<div class="modal-footer">' +
+              '<button type="button" class="btn" data-ne-close>إلغاء</button>' +
+              '<button type="button" class="btn btn-primary" id="ne-save">حفظ التعديلات</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+      enhanceSelects(overlay);
+      var close = function () { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+      overlay.querySelectorAll('[data-ne-close]').forEach(function (b) { b.addEventListener('click', close); });
+      overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+
+      var saveBtn = overlay.querySelector('#ne-save');
+      saveBtn.addEventListener('click', async function () {
+        var doUpdate = async function (confirmed) {
+          saveBtn.disabled = true;
+          try {
+            var payload = {
+              noteId: note.id,
+              expectedUpdatedAt: note.updatedAt || '',
+              title: (overlay.querySelector('#ne-title') || {}).value || '',
+              noteType: (overlay.querySelector('#ne-type') || {}).value || note.noteType,
+              statusId: (overlay.querySelector('#ne-status') || {}).value || note.statusId,
+              content: (overlay.querySelector('#ne-content') || {}).value || '',
+              isInternal: Boolean((overlay.querySelector('#ne-internal') || {}).checked),
+              confirmed: Boolean(confirmed)
+            };
+            var res = await root.RGApi.callApi('updateCustomerNote', payload);
+            if (!res || !res.success) {
+              if (res && res.error === 'CONFIRM_REQUIRED') {
+                saveBtn.disabled = false;
+                showConfirmModal('تأكيد تعديل الملاحظة', res.message || 'يرجى تأكيد حفظ التعديل على هذه الملاحظة.', 'تأكيد الحفظ', false, function () {
+                  doUpdate(true);
+                });
+                return;
+              }
+              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حفظ تعديل الملاحظة.', true);
+              saveBtn.disabled = false;
+              return;
+            }
+            close();
+            if (ctx && ctx.toast && evalBtn('edit_note', note).rule.showSuccessNotification !== false) {
+              ctx.toast('تم تحديث الملاحظة بنجاح.');
+            }
+            await reloadNotesFromServer();
+            if (typeof o.onChanged === 'function') o.onChanged();
+          } catch (err) {
+            if (ctx && ctx.toast) ctx.toast((err && err.message) || 'تعذر حفظ التعديل.', true);
+            saveBtn.disabled = false;
+          }
+        };
+        var ruleEval = evalBtn('edit_note', note, { checkConfirm: true, confirmed: false });
+        if (!ruleEval.allowed && ruleEval.reason === 'CONFIRMATION_REQUIRED') {
+          showConfirmModal('تأكيد تعديل الملاحظة', ruleEval.message || 'هل تريد تأكيد تعديل هذه الملاحظة؟', 'تأكيد', false, function () {
+            doUpdate(true);
+          });
+        } else {
+          doUpdate(false);
+        }
+      });
+    }
+
+    function openAssignNoteModal(note) {
+      var overlay = document.createElement('div');
+      overlay.className = 'modal-backdrop';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.style.zIndex = '1420';
+      overlay.innerHTML =
+        '<div class="modal-panel" style="max-width:440px;">' +
+          '<div class="modal-header">' +
+            '<h3 class="modal-title">إسناد متابعة الملاحظة لموظف</h3>' +
+            '<button type="button" class="btn btn-sm" data-na-close>إغلاق</button>' +
+          '</div>' +
+          '<div class="flex flex-col gap-3">' +
+            '<p style="margin:0;font-size:12.5px;color:var(--text-muted);">اختر الموظف المكلف بمتابعة وتنفيذ هذه الملاحظة (خاص بمتابعة الملاحظة فقط).</p>' +
+            '<div class="form-group"><label class="form-label" for="na-emp">الموظف المكلف</label>' +
+              '<select class="select" id="na-emp" data-search-placeholder="ابحث عن الموظف...">' +
+                '<option value="">بدون تعيين</option>' +
+                employees.map(function (e) {
+                  return '<option value="' + esc(e.id) + '"' + (note.assignedEmployeeId === e.id ? ' selected' : '') + '>' + esc(e.name) + '</option>';
+                }).join('') +
+              '</select>' +
+            '</div>' +
+            '<div class="modal-footer">' +
+              '<button type="button" class="btn" data-na-close>إلغاء</button>' +
+              '<button type="button" class="btn btn-primary" id="na-save">حفظ التعيين</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+      enhanceSelects(overlay);
+      var close = function () { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+      overlay.querySelectorAll('[data-na-close]').forEach(function (b) { b.addEventListener('click', close); });
+      overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+
+      var saveBtn = overlay.querySelector('#na-save');
+      saveBtn.addEventListener('click', async function () {
+        saveBtn.disabled = true;
+        var empId = (overlay.querySelector('#na-emp') || {}).value || '';
+        var res = await root.RGApi.callApi('assignCustomerNoteEmployee', { noteId: note.id, employeeId: empId, confirmed: true });
+        if (!res || !res.success) {
+          if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر إسناد الملاحظة.', true);
+          saveBtn.disabled = false;
+          return;
+        }
+        close();
+        if (ctx && ctx.toast) ctx.toast('تم تحديث الموظف المكلف بمتابعة الملاحظة.');
+        await reloadNotesFromServer();
+        if (typeof o.onChanged === 'function') o.onChanged();
+      });
+    }
+
+    function exportNotesCsv() {
+      var rows = panelState.notes || [];
+      if (!rows.length) {
+        if (ctx && ctx.toast) ctx.toast('لا توجد ملاحظات لتصديرها.', true);
+        return;
+      }
+      var headers = ['المعرف', 'العنوان', 'النوع', 'الحالة', 'المحتوى', 'المصدر', 'رقم الحجز', 'الموظف المكلف', 'الكاتب', 'التاريخ'];
+      var lines = [headers.join(',')];
+      rows.forEach(function (n) {
+        var vals = [
+          n.id, n.title || '', n.noteType || '', n.statusName || '',
+          String(n.content || '').replace(/\r?\n/g, ' '),
+          getSourceSectionLabel(n.sourceSection), n.reservationNumber || '',
+          n.assignedEmployeeName || '', n.createdByName || '', n.createdAt || ''
+        ].map(function (v) {
+          return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+        });
+        lines.push(vals.join(','));
+      });
+      var blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'customer-notes-' + (o.customerId || o.reservationId || 'all') + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () {
+        if (a.parentNode) a.parentNode.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 400);
+      if (ctx && ctx.toast) ctx.toast('تم تصدير الملاحظات بصيغة CSV بنجاح.');
+    }
+
+    function openPrintPreviewModal() {
+      var rows = panelState.notes || [];
+      var overlay = document.createElement('div');
+      overlay.className = 'modal-backdrop';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.style.zIndex = '1440';
+      overlay.innerHTML =
+        '<div class="modal-panel" style="max-width:780px;">' +
+          '<div class="modal-header">' +
+            '<h3 class="modal-title">معاينة طباعة ملاحظات العملاء (' + rows.length + ')</h3>' +
+            '<div style="display:flex;gap:8px;">' +
+              '<button type="button" class="btn btn-sm btn-primary" id="cn-do-print">طباعة الآن</button>' +
+              '<button type="button" class="btn btn-sm" data-np-close>إغلاق</button>' +
+            '</div>' +
+          '</div>' +
+          '<div style="max-height:65vh;overflow-y:auto;">' +
+            '<table class="data-table"><thead><tr><th>النوع</th><th>الحالة</th><th>الملاحظة</th><th>الحجز</th><th>الكاتب</th><th>التاريخ</th></tr></thead><tbody>' +
+              (rows.length ? rows.map(function (n) {
+                return '<tr>' +
+                  '<td>' + esc(n.noteType || 'ملاحظة') + '</td>' +
+                  '<td>' + esc(n.statusName || 'جديدة') + '</td>' +
+                  '<td style="white-space:pre-wrap;max-width:300px;">' + (n.title ? '<strong>' + esc(n.title) + '</strong><br>' : '') + esc(n.content || '') + '</td>' +
+                  '<td class="mono" dir="ltr">' + esc(n.reservationNumber || '-') + '</td>' +
+                  '<td>' + esc(n.createdByName || '-') + '</td>' +
+                  '<td class="mono" dir="ltr">' + esc(fmtDateTime(n.createdAt, ctx)) + '</td>' +
+                '</tr>';
+              }).join('') : '<tr><td colspan="6" class="text-center py-4">لا توجد ملاحظات للطباعة.</td></tr>') +
+            '</tbody></table>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+      var close = function () { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+      overlay.querySelectorAll('[data-np-close]').forEach(function (b) { b.addEventListener('click', close); });
+      overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
+      var printBtn = overlay.querySelector('#cn-do-print');
+      if (printBtn) {
+        printBtn.addEventListener('click', function () {
+          if (typeof window.print === 'function') window.print();
+        });
+      }
+    }
+
+    async function reloadNotesFromServer() {
+      panelState.loading = true;
+      renderPanel();
+      var res = await root.RGApi.callApi('getCustomerNotes', {
+        customerId: o.customerId || '',
+        reservationId: o.reservationId || '',
+        problemId: o.problemId || '',
+        search: panelState.search,
+        statusId: panelState.statusId,
+        noteType: panelState.noteType,
+        sourceSection: panelState.sourceFilter,
+        assignedEmployeeId: panelState.assignedEmployeeId,
+        dateFrom: panelState.dateFrom,
+        dateTo: panelState.dateTo,
+        sortBy: panelState.sortBy,
+        pageSize: (panelState.config.general && panelState.config.general.pageSize) || 50
+      });
+      panelState.loading = false;
+      if (res && res.success && res.data) {
+        panelState.notes = Array.isArray(res.data.items) ? res.data.items : [];
+        if (Array.isArray(res.data.statuses) && res.data.statuses.length) panelState.statuses = res.data.statuses;
+        if (res.data.config) panelState.config = getCustomerNotesConfigSafe(res.data.config);
+        if (res.data.stats) panelState.stats = res.data.stats;
+        else recomputeStats();
+      } else {
+        recomputeStats();
+      }
+      renderPanel();
+    }
+
+    function renderPanel() {
+      if (!hostEl.isConnected) return;
+      recomputeStats();
+      var cfgNow = panelState.config || {};
+      var genCfg = cfgNow.general || {};
+      var addCfg = cfgNow.addNote || {};
+      if (genCfg.enabled === false) {
+        hostEl.innerHTML = '<div class="surface-card"><div class="empty-state" style="padding:16px;">تم تعطيل قسم ملاحظات العملاء مؤقتاً من لوحة الإعدادات.</div></div>';
+        return;
+      }
+
+      var canAdd = evalBtn('add_note').allowed;
+      var canSearch = genCfg.enableSearch !== false && evalBtn('search_notes').allowed;
+      var canFilter = genCfg.enableFilters !== false && evalBtn('filter_notes').allowed;
+      var canExport = evalBtn('export_notes').allowed;
+      var canPrint = evalBtn('print_notes').allowed;
+      var canRefresh = evalBtn('refresh_notes').allowed;
+      var canAttach = evalBtn('attach_file').allowed;
+      var canAssign = evalBtn('assign_note').allowed;
+      var noteTypes = core.CUSTOMER_NOTE_TYPES || ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
+      var defSt = panelState.statuses.find(function (s) { return s.isActive && s.isDefault; }) || panelState.statuses.find(function (s) { return s.isActive; });
+
+      var notesListHtml = panelState.loading
+        ? '<div class="empty-state" style="padding:18px;">جاري تحميل الملاحظات...</div>'
+        : (panelState.notes.length === 0
+            ? '<div class="empty-state" style="padding:18px;">لا توجد ملاحظات عملاء مطابقة للعرض الحالي.</div>'
+            : '<div class="flex flex-col gap-2.5">' + panelState.notes.map(function (n) {
+                var canChgSt = evalBtn('change_status', n).allowed;
+                var canViewDet = evalBtn('view_details', n).allowed;
+                var canHist = evalBtn('view_history', n).allowed;
+                var canEditN = evalBtn('edit_note', n).allowed;
+                var canAsgN = evalBtn('assign_note', n).allowed;
+                var canDelN = evalBtn('delete_note', n).allowed;
+                var canDelAtt = evalBtn('delete_attachment', n).allowed;
+                var atts = Array.isArray(n.attachments) ? n.attachments : [];
+
+                return '<article class="rg-note-card" data-note-id="' + esc(n.id) + '">' +
+                  '<div class="rg-note-card-head">' +
+                    '<div class="flex items-center gap-1.5 flex-wrap">' +
+                      '<span class="status-tag status-info">' + esc(n.noteType || 'ملاحظة') + '</span>' +
+                      '<span class="rg-note-status-badge"><span class="rg-note-status-dot" style="background:' + esc(n.statusColor || '#3b82f6') + ';"></span>' + esc(n.statusName || 'جديدة') + (!n.statusIsActive ? ' (معطلة)' : '') + '</span>' +
+                      (n.isInternal ? '<span class="status-tag status-warning">داخلية</span>' : '') +
+                      '<span class="status-tag status-neutral">' + esc(getSourceSectionLabel(n.sourceSection)) + '</span>' +
+                      (n.reservationNumber ? '<span class="mono text-xs" dir="ltr" style="color:var(--text-muted);">#' + esc(n.reservationNumber) + '</span>' : '') +
+                      (n.assignedEmployeeName ? '<span class="text-xs" style="color:var(--brand-primary);font-weight:600;">متابعة: ' + esc(n.assignedEmployeeName) + '</span>' : '') +
+                    '</div>' +
+                    '<span class="mono text-xs" dir="ltr" style="color:var(--text-muted);">' + esc(fmtDateTime(n.createdAt, ctx)) + '</span>' +
+                  '</div>' +
+                  (n.title ? '<div style="font-weight:700;font-size:13.5px;color:var(--text-primary);">' + esc(n.title) + '</div>' : '') +
+                  '<div style="font-size:13.5px;color:var(--text-primary);white-space:pre-wrap;line-height:1.65;">' + esc(n.content || '') + '</div>' +
+                  (atts.length ? (
+                    '<div class="rg-note-attachments-row">' +
+                      atts.map(function (a) {
+                        var url = a.storageUrl || a.dataUrl || '#';
+                        return '<span class="rg-note-att-chip">' +
+                          '<a href="' + esc(url) + '" download="' + esc(a.fileName || 'file') + '" style="color:inherit;text-decoration:none;">' + esc(a.fileName || 'مرفق') + '</a>' +
+                          (canDelAtt ? '<button type="button" class="rg-dropdown-search-clear cn-del-att-btn" data-note-id="' + esc(n.id) + '" data-att-id="' + esc(a.id) + '" title="حذف المرفق" aria-label="حذف المرفق">&times;</button>' : '') +
+                        '</span>';
+                      }).join('') +
+                    '</div>'
+                  ) : '') +
+                  '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding-top:4px;">' +
+                    '<span class="text-xs" style="color:var(--text-muted);">بواسطة: <strong>' + esc(n.createdByName || '-') + '</strong></span>' +
+                    '<div class="rg-note-actions-row">' +
+                      (canChgSt ? (
+                        '<select class="select quick-status-select cn-quick-status" data-note-id="' + esc(n.id) + '" data-search-placeholder="ابحث عن الحالة..." aria-label="تغيير حالة الملاحظة">' +
+                          buildStatusOptionsHtml(n.statusId, '', !n.statusIsActive ? n.statusId : '') +
+                        '</select>'
+                      ) : '') +
+                      (canViewDet ? '<button type="button" class="btn btn-sm cn-btn-det" data-note-id="' + esc(n.id) + '">التفاصيل</button>' : '') +
+                      (canHist ? '<button type="button" class="btn btn-sm cn-btn-hist" data-note-id="' + esc(n.id) + '">السجل</button>' : '') +
+                      (canEditN ? '<button type="button" class="btn btn-sm cn-btn-edit" data-note-id="' + esc(n.id) + '">تعديل</button>' : '') +
+                      (canAsgN ? '<button type="button" class="btn btn-sm cn-btn-assign" data-note-id="' + esc(n.id) + '">إسناد</button>' : '') +
+                      (canDelN ? '<button type="button" class="btn btn-sm btn-danger cn-btn-del" data-note-id="' + esc(n.id) + '">حذف</button>' : '') +
+                    '</div>' +
+                  '</div>' +
+                '</article>';
+              }).join('') + '</div>');
+
+      hostEl.innerHTML =
+        '<div class="surface-card" style="display:flex;flex-direction:column;gap:12px;">' +
+          '<div class="section-header" style="margin-bottom:0;">' +
+            '<div>' +
+              '<h3 class="section-title">' + esc(genCfg.sectionTitle || 'ملاحظات العملاء') + ' (' + panelState.stats.total + ')</h3>' +
+              '<p class="section-subtitle">مفتوحة: <strong class="tabular-nums">' + panelState.stats.open + '</strong> · مغلقة/محلولة: <strong class="tabular-nums">' + panelState.stats.closed + '</strong> · داخلية: <strong class="tabular-nums">' + panelState.stats.internal + '</strong></p>' +
+            '</div>' +
+            '<div class="flex items-center gap-1.5 flex-wrap">' +
+              (canAdd ? '<button type="button" class="btn btn-sm btn-primary" id="cn-toggle-add-btn">' + (panelState.composerOpen ? 'إغلاق نموذج الإضافة' : '+ إضافة ملاحظة') + '</button>' : '') +
+              (canExport ? '<button type="button" class="btn btn-sm" id="cn-export-btn">تصدير</button>' : '') +
+              (canPrint ? '<button type="button" class="btn btn-sm" id="cn-print-btn">طباعة</button>' : '') +
+              (canRefresh ? '<button type="button" class="btn btn-sm" id="cn-refresh-btn">تحديث</button>' : '') +
+            '</div>' +
+          '</div>' +
+
+          (canAdd && panelState.composerOpen ? (
+            '<div id="cn-composer-box" style="padding:12px;border-radius:var(--radius-sm);background:var(--bg-surface-subtle);border:1px solid var(--border-strong);display:flex;flex-direction:column;gap:10px;">' +
+              '<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">' +
+                '<div class="form-group"><label class="form-label" for="cn-add-title">عنوان الملاحظة' + (addCfg.requiredTitle ? ' *' : ' (اختياري)') + '</label><input class="input" id="cn-add-title" placeholder="ملخص مختصر للملاحظة..."></div>' +
+                '<div class="form-group"><label class="form-label" for="cn-add-type">نوع الملاحظة</label>' +
+                  '<select class="select" id="cn-add-type">' +
+                    noteTypes.map(function (tp) {
+                      return '<option value="' + esc(tp) + '">' + esc(tp) + '</option>';
+                    }).join('') +
+                  '</select>' +
+                '</div>' +
+                '<div class="form-group"><label class="form-label" for="cn-add-status">الحالة</label>' +
+                  '<select class="select" id="cn-add-status" data-search-placeholder="ابحث عن الحالة...">' +
+                    buildStatusOptionsHtml(defSt ? defSt.id : '', '', '') +
+                  '</select>' +
+                '</div>' +
+                ((reservations.length > 0 && !o.reservationId && addCfg.allowReservationLinked !== false) ? (
+                  '<div class="form-group"><label class="form-label" for="cn-add-res">ربط بحجز' + (addCfg.requiredReservation ? ' *' : ' (اختياري)') + '</label>' +
+                    '<select class="select" id="cn-add-res" data-search-placeholder="ابحث عن الحجز...">' +
+                      '<option value="">بدون ربط بحجز</option>' +
+                      reservations.map(function (r) {
+                        return '<option value="' + esc(r.id) + '" data-num="' + esc(r.reservationNumber) + '">' + esc((r.reservationNumber || r.id) + (r.carName ? ' — ' + r.carName : '')) + '</option>';
+                      }).join('') +
+                    '</select>' +
+                  '</div>'
+                ) : '') +
+                (canAssign && employees.length > 0 ? (
+                  '<div class="form-group"><label class="form-label" for="cn-add-emp">إسناد متابعة الملاحظة (اختياري)</label>' +
+                    '<select class="select" id="cn-add-emp" data-search-placeholder="ابحث عن الموظف...">' +
+                      '<option value="">بدون تعيين</option>' +
+                      employees.map(function (e) {
+                        return '<option value="' + esc(e.id) + '">' + esc(e.name) + '</option>';
+                      }).join('') +
+                    '</select>' +
+                  '</div>'
+                ) : '') +
+              '</div>' +
+              '<div class="form-group"><label class="form-label" for="cn-add-content">نص الملاحظة *</label><textarea class="textarea" id="cn-add-content" rows="3" maxlength="' + Number(addCfg.maxLength || 4000) + '" placeholder="اكتب تفاصيل التواصل أو الملاحظة (يدعم الإشارة @)..."></textarea></div>' +
+              '<div class="flex items-center justify-between gap-2 flex-wrap">' +
+                '<div class="flex items-center gap-3 flex-wrap">' +
+                  (addCfg.allowInternalNotes !== false ? '<label class="checkbox-item" style="margin:0;"><input type="checkbox" id="cn-add-internal"> ملاحظة داخلية</label>' : '') +
+                  (canAttach ? '<label class="btn btn-sm" style="cursor:pointer;">إرفاق ملف<input type="file" id="cn-add-file" multiple style="display:none;"></label>' : '') +
+                  '<span id="cn-add-files-info" class="text-xs" style="color:var(--text-muted);">' + (panelState.pendingAttachments.length ? ('مرفقات محددة: ' + panelState.pendingAttachments.length) : '') + '</span>' +
+                '</div>' +
+                '<button type="button" class="btn btn-sm btn-primary" id="cn-save-new-btn">حفظ الملاحظة</button>' +
+              '</div>' +
+            '</div>'
+          ) : '') +
+
+          ((canSearch || canFilter) ? (
+            '<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">' +
+              (canSearch ? '<input class="input" id="cn-filter-search" value="' + esc(panelState.search) + '" placeholder="ابحث في الملاحظات...">' : '') +
+              (canFilter ? (
+                '<select class="select" id="cn-filter-status" data-search-placeholder="ابحث عن الحالة...">' +
+                  buildStatusOptionsHtml(panelState.statusId, 'جميع حالات الملاحظات', '') +
+                '</select>' +
+                '<select class="select" id="cn-filter-type">' +
+                  '<option value="">جميع الأنواع</option>' +
+                  noteTypes.map(function (tp) {
+                    return '<option value="' + esc(tp) + '"' + (panelState.noteType === tp ? ' selected' : '') + '>' + esc(tp) + '</option>';
+                  }).join('') +
+                '</select>' +
+                '<select class="select" id="cn-filter-sort">' +
+                  '<option value="newest"' + (panelState.sortBy === 'newest' ? ' selected' : '') + '>الأحدث أولاً</option>' +
+                  '<option value="oldest"' + (panelState.sortBy === 'oldest' ? ' selected' : '') + '>الأقدم أولاً</option>' +
+                  '<option value="updated"' + (panelState.sortBy === 'updated' ? ' selected' : '') + '>آخر تحديث</option>' +
+                '</select>'
+              ) : '') +
+            '</div>'
+          ) : '') +
+
+          notesListHtml +
+        '</div>';
+
+      enhanceSelects(hostEl);
+
+      // Attach @mentions if available
+      if (root.RGCrmMentions && typeof root.RGCrmMentions.attach === 'function') {
+        var contentInp = hostEl.querySelector('#cn-add-content');
+        if (contentInp) root.RGCrmMentions.attach(contentInp, function () { return employees; });
+      }
+
+      var toggleAddBtn = hostEl.querySelector('#cn-toggle-add-btn');
+      if (toggleAddBtn) {
+        toggleAddBtn.addEventListener('click', function () {
+          panelState.composerOpen = !panelState.composerOpen;
+          panelState.pendingAttachments = [];
+          renderPanel();
+        });
+      }
+
+      var exportBtn = hostEl.querySelector('#cn-export-btn');
+      if (exportBtn) exportBtn.addEventListener('click', exportNotesCsv);
+
+      var printBtn = hostEl.querySelector('#cn-print-btn');
+      if (printBtn) printBtn.addEventListener('click', openPrintPreviewModal);
+
+      var refreshBtn = hostEl.querySelector('#cn-refresh-btn');
+      if (refreshBtn) refreshBtn.addEventListener('click', reloadNotesFromServer);
+
+      var fileInp = hostEl.querySelector('#cn-add-file');
+      if (fileInp) {
+        fileInp.addEventListener('change', function () {
+          var files = Array.from(fileInp.files || []);
+          var maxMb = Number((panelState.config.addNote && panelState.config.addNote.maxAttachmentSizeMb) || 5);
+          var allowedTypes = (panelState.config.addNote && Array.isArray(panelState.config.addNote.allowedAttachmentTypes))
+            ? panelState.config.addNote.allowedAttachmentTypes
+            : [];
+          panelState.pendingAttachments = [];
+          var infoEl = hostEl.querySelector('#cn-add-files-info');
+          files.slice(0, 5).forEach(function (f) {
+            if (f.size > maxMb * 1024 * 1024) {
+              if (ctx && ctx.toast) ctx.toast('الملف "' + f.name + '" يتجاوز الحجم الأقصى (' + maxMb + ' MB).', true);
+              return;
+            }
+            if (allowedTypes.length > 0 && f.type && allowedTypes.indexOf(f.type) === -1) {
+              if (ctx && ctx.toast) ctx.toast('نوع الملف "' + f.name + '" غير مسموح به.', true);
+              return;
+            }
+            var reader = new FileReader();
+            reader.onload = function () {
+              panelState.pendingAttachments.push({
+                fileName: f.name,
+                mimeType: f.type || 'application/octet-stream',
+                fileSize: f.size,
+                storageUrl: String(reader.result || ''),
+                dataUrl: String(reader.result || '')
+              });
+              if (infoEl) infoEl.textContent = 'مرفقات جاهزة: ' + panelState.pendingAttachments.length;
+            };
+            reader.readAsDataURL(f);
+          });
+        });
+      }
+
+      var saveNewBtn = hostEl.querySelector('#cn-save-new-btn');
+      if (saveNewBtn) {
+        saveNewBtn.addEventListener('click', async function () {
+          var submitNew = async function (confirmed) {
+            var contentEl = hostEl.querySelector('#cn-add-content');
+            var titleEl = hostEl.querySelector('#cn-add-title');
+            var typeEl = hostEl.querySelector('#cn-add-type');
+            var stEl = hostEl.querySelector('#cn-add-status');
+            var resEl = hostEl.querySelector('#cn-add-res');
+            var empEl = hostEl.querySelector('#cn-add-emp');
+            var intEl = hostEl.querySelector('#cn-add-internal');
+            var contentVal = contentEl ? contentEl.value.trim() : '';
+            if (!contentVal) {
+              if (ctx && ctx.toast) ctx.toast('يرجى كتابة نص الملاحظة.', true);
+              return;
+            }
+            var resOpt = resEl && resEl.selectedOptions ? resEl.selectedOptions[0] : null;
+            saveNewBtn.disabled = true;
+            try {
+              var resp = await root.RGApi.callApi('addCustomerNote', {
+                customerId: o.customerId || '',
+                reservationId: o.reservationId || (resEl ? resEl.value : ''),
+                reservationNumber: o.reservationNumber || (resOpt ? (resOpt.getAttribute('data-num') || '') : ''),
+                problemId: o.problemId || '',
+                problemNumber: o.problemNumber || '',
+                sourceSection: sourceSection,
+                title: titleEl ? titleEl.value.trim() : '',
+                noteType: typeEl ? typeEl.value : 'ملاحظة',
+                statusId: stEl ? stEl.value : '',
+                assignedEmployeeId: empEl ? empEl.value : '',
+                isInternal: Boolean(intEl && intEl.checked),
+                content: contentVal,
+                attachments: panelState.pendingAttachments.slice(),
+                confirmed: Boolean(confirmed)
+              });
+              if (!resp || !resp.success) {
+                if (resp && resp.error === 'CONFIRM_REQUIRED') {
+                  saveNewBtn.disabled = false;
+                  showConfirmModal('تأكيد إضافة الملاحظة', resp.message || 'يرجى تأكيد إضافة الملاحظة الجديدة.', 'تأكيد الإضافة', false, function () {
+                    submitNew(true);
+                  });
+                  return;
+                }
+                if (ctx && ctx.toast) ctx.toast((resp && resp.message) || 'تعذر حفظ الملاحظة.', true);
+                saveNewBtn.disabled = false;
+                return;
+              }
+              panelState.composerOpen = false;
+              panelState.pendingAttachments = [];
+              if (ctx && ctx.toast && evalBtn('add_note').rule.showSuccessNotification !== false) {
+                ctx.toast('تمت إضافة الملاحظة بنجاح.');
+              }
+              await reloadNotesFromServer();
+              if (typeof o.onChanged === 'function') o.onChanged(resp.data && resp.data.note);
+            } catch (err) {
+              if (ctx && ctx.toast) ctx.toast((err && err.message) || 'تعذر الاتصال بالخادم.', true);
+              saveNewBtn.disabled = false;
+            }
+          };
+          var ruleAdd = evalBtn('add_note', null, { checkConfirm: true, confirmed: false });
+          if (!ruleAdd.allowed && ruleAdd.reason === 'CONFIRMATION_REQUIRED') {
+            showConfirmModal('تأكيد إضافة الملاحظة', ruleAdd.message || 'هل تريد تأكيد إضافة الملاحظة؟', 'تأكيد', false, function () {
+              submitNew(true);
+            });
+          } else {
+            submitNew(false);
+          }
+        });
+      }
+
+      var searchEl = hostEl.querySelector('#cn-filter-search');
+      if (searchEl) {
+        var tm = null;
+        searchEl.addEventListener('input', function () {
+          if (tm) clearTimeout(tm);
+          tm = setTimeout(function () {
+            panelState.search = searchEl.value.trim();
+            reloadNotesFromServer();
+          }, 300);
+        });
+      }
+      var bindFilterSel = function (selId, key) {
+        var el = hostEl.querySelector('#' + selId);
+        if (!el) return;
+        el.addEventListener('change', function () {
+          panelState[key] = el.value;
+          reloadNotesFromServer();
+        });
+      };
+      bindFilterSel('cn-filter-status', 'statusId');
+      bindFilterSel('cn-filter-type', 'noteType');
+      bindFilterSel('cn-filter-sort', 'sortBy');
+
+      hostEl.querySelectorAll('.cn-quick-status').forEach(function (sel) {
+        sel.addEventListener('change', function () {
+          var nid = sel.getAttribute('data-note-id');
+          var note = panelState.notes.find(function (x) { return x && x.id === nid; });
+          var nextStId = sel.value;
+          if (!note || !nextStId || nextStId === note.statusId) return;
+          var doStatusChange = async function (confirmed) {
+            var res = await root.RGApi.callApi('changeCustomerNoteStatus', { noteId: nid, statusId: nextStId, confirmed: Boolean(confirmed) });
+            if (!res || !res.success) {
+              if (res && res.error === 'CONFIRM_REQUIRED') {
+                showConfirmModal('تأكيد تغيير الحالة', res.message || 'هل تريد تأكيد تغيير حالة الملاحظة؟', 'تأكيد', false, function () {
+                  doStatusChange(true);
+                });
+                return;
+              }
+              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر تغيير حالة الملاحظة.', true);
+              sel.value = note.statusId;
+              enhanceSelects(hostEl);
+              return;
+            }
+            if (ctx && ctx.toast && evalBtn('change_status', note).rule.showSuccessNotification !== false) {
+              ctx.toast(res.message || 'تم تحديث حالة الملاحظة.');
+            }
+            await reloadNotesFromServer();
+            if (typeof o.onChanged === 'function') o.onChanged();
+          };
+          var ruleChg = evalBtn('change_status', note, { checkConfirm: true, confirmed: false });
+          if (!ruleChg.allowed && ruleChg.reason === 'CONFIRMATION_REQUIRED') {
+            showConfirmModal('تأكيد تغيير الحالة', ruleChg.message || 'هل تريد تأكيد تغيير حالة الملاحظة؟', 'تأكيد', false, function () {
+              doStatusChange(true);
+            });
+          } else {
+            doStatusChange(false);
+          }
+        });
+      });
+
+      hostEl.querySelectorAll('.cn-btn-det').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var n = panelState.notes.find(function (x) { return x && x.id === btn.getAttribute('data-note-id'); });
+          if (n) openNoteDetailsModal(n);
+        });
+      });
+
+      hostEl.querySelectorAll('.cn-btn-hist').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var n = panelState.notes.find(function (x) { return x && x.id === btn.getAttribute('data-note-id'); });
+          if (n) openNoteHistoryModal(n);
+        });
+      });
+
+      hostEl.querySelectorAll('.cn-btn-edit').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var n = panelState.notes.find(function (x) { return x && x.id === btn.getAttribute('data-note-id'); });
+          if (n) openEditNoteModal(n);
+        });
+      });
+
+      hostEl.querySelectorAll('.cn-btn-assign').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var n = panelState.notes.find(function (x) { return x && x.id === btn.getAttribute('data-note-id'); });
+          if (n) openAssignNoteModal(n);
+        });
+      });
+
+      hostEl.querySelectorAll('.cn-btn-del').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var nid = btn.getAttribute('data-note-id');
+          var n = panelState.notes.find(function (x) { return x && x.id === nid; });
+          if (!n) return;
+          var doDelete = async function (confirmed) {
+            var res = await root.RGApi.callApi('deleteCustomerNote', { noteId: nid, confirmed: Boolean(confirmed) });
+            if (!res || !res.success) {
+              if (res && res.error === 'CONFIRM_REQUIRED') {
+                showConfirmModal('تأكيد حذف الملاحظة', res.message || 'هل أنت متأكد من حذف هذه الملاحظة؟', 'نعم، احذف', true, function () {
+                  doDelete(true);
+                });
+                return;
+              }
+              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف الملاحظة.', true);
+              return;
+            }
+            if (ctx && ctx.toast && evalBtn('delete_note', n).rule.showSuccessNotification !== false) {
+              ctx.toast('تم حذف الملاحظة بنجاح.');
+            }
+            await reloadNotesFromServer();
+            if (typeof o.onChanged === 'function') o.onChanged();
+          };
+          var ruleDel = evalBtn('delete_note', n, { checkConfirm: true, confirmed: false });
+          if (!ruleDel.allowed && ruleDel.reason === 'CONFIRMATION_REQUIRED') {
+            showConfirmModal('تأكيد حذف الملاحظة', 'هل أنت متأكد من حذف هذه الملاحظة؟ لا يمكن التراجع من الواجهة.', 'حذف الملاحظة', true, function () {
+              doDelete(true);
+            });
+          } else {
+            doDelete(false);
+          }
+        });
+      });
+
+      hostEl.querySelectorAll('.cn-del-att-btn').forEach(function (btn) {
+        btn.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var nid = btn.getAttribute('data-note-id');
+          var aid = btn.getAttribute('data-att-id');
+          var n = panelState.notes.find(function (x) { return x && x.id === nid; });
+          showConfirmModal('حذف مرفق الملاحظة', 'هل تريد حذف هذا المرفق من الملاحظة؟', 'حذف المرفق', true, async function () {
+            var res = await root.RGApi.callApi('deleteCustomerNoteAttachment', { noteId: nid, attachmentId: aid, confirmed: true });
+            if (!res || !res.success) {
+              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف المرفق.', true);
+              return;
+            }
+            if (ctx && ctx.toast) ctx.toast('تم حذف المرفق بنجاح.');
+            await reloadNotesFromServer();
+            if (typeof o.onChanged === 'function') o.onChanged();
+          });
+        });
+      });
+    }
+
+    if (panelState.loading) {
+      reloadNotesFromServer();
+    } else {
+      renderPanel();
+    }
+  }
+
   function renderProfileView(container, ctx, data) {
     var core = coreFn();
     var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     var activeUiCtx = root.RGApp && root.RGApp.getActiveUiContext ? root.RGApp.getActiveUiContext() : null;
+    var notesCfg = getCustomerNotesConfigSafe(data && data.notesConfig);
+    var csCfg = notesCfg.customersSection || {};
+
     var cust = (data && data.customer) || {};
     var reservations = (data && Array.isArray(data.reservations)) ? data.reservations : [];
     var extensions = (data && Array.isArray(data.extensions)) ? data.extensions : [];
     var problems = (data && Array.isArray(data.problems)) ? data.problems : [];
     var followUps = (data && Array.isArray(data.followUps)) ? data.followUps : [];
     var notes = (data && Array.isArray(data.notes)) ? data.notes : [];
+    var noteStatuses = (data && Array.isArray(data.noteStatuses)) ? data.noteStatuses : getCustomerNoteStatusesSafe();
     var fin = (data && data.financialSummary) || {};
     var timeline = (data && Array.isArray(data.timeline)) ? data.timeline : [];
     var employees = (data && Array.isArray(data.employees)) ? data.employees : [];
 
-    var canViewId = core.canUserViewCustomerId ? core.canUserViewCustomerId(user) : false;
-    var canEditCust = core.canUserPerform && core.canUserPerform(user, 'edit_customer_details') && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_edit_customer', activeUiCtx));
-    var canAssignCust = core.canUserPerform && core.canUserPerform(user, 'assign_customer_employee') && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_assign_customer', activeUiCtx));
-    var canAddNote = core.canUserPerform && core.canUserPerform(user, 'add_customer_note') && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_add_customer_note', activeUiCtx));
+    var canViewId = (core.canUserViewCustomerId ? core.canUserViewCustomerId(user) : false) && csCfg.showSensitiveIds !== false;
+    var canEditCust = csCfg.enableEditCustomer !== false && core.canUserPerform && core.canUserPerform(user, 'edit_customer_details') && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_edit_customer', activeUiCtx));
     var canCreatePrb = core.canUserPerform && core.canUserPerform(user, 'create_problem');
-    var canExportPdf = !core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_export_pdf', activeUiCtx);
-    var canSeeComplaintsTab = !core.canUserViewSubSection || core.canUserViewSubSection(user, 'sub_view_cust_complaints', activeUiCtx);
-    var canSeeTimelineTab = !core.canUserViewSubSection || core.canUserViewSubSection(user, 'sub_view_cust_timeline', activeUiCtx);
+    var canExportPdf = csCfg.enableExport !== false && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_export_pdf', activeUiCtx));
+    var canSeeComplaintsTab = csCfg.showProblemsTab !== false && (!core.canUserViewSubSection || core.canUserViewSubSection(user, 'sub_view_cust_complaints', activeUiCtx));
+    var canSeeTimelineTab = csCfg.enableActivityLog !== false && (!core.canUserViewSubSection || core.canUserViewSubSection(user, 'sub_view_cust_timeline', activeUiCtx));
 
     var waPhone = core.normalizeWhatsappPhone ? core.normalizeWhatsappPhone(cust.phone) : '';
     var telHref = core.formatDirectCallTelHref ? core.formatDirectCallTelHref(cust.phone, '9') : '';
@@ -374,24 +1315,6 @@
           }).join('') +
         '</div>';
 
-    var notesHtml = notes.length === 0
-      ? '<div class="empty-state" style="padding:18px;">لا توجد ملاحظات أو سجلات تواصل مضافة حتى الآن.</div>'
-      : '<div class="rg-cust-timeline-list">' +
-          notes.map(function (n) {
-            return '<div class="rg-cust-timeline-item">' +
-              '<span class="rg-cust-timeline-dot is-note"></span>' +
-              '<div style="flex:1;min-width:0;">' +
-                '<div class="flex items-center justify-between gap-2 flex-wrap">' +
-                  '<span class="status-tag status-info">' + esc(n.noteType || 'ملاحظة') + '</span>' +
-                  '<span class="mono text-xs" style="color:var(--text-muted);" dir="ltr">' + esc(fmtDateTime(n.createdAt, ctx)) + '</span>' +
-                '</div>' +
-                '<div class="text-sm mt-1.5" style="color:var(--text-primary);white-space:pre-wrap;">' + esc(n.content) + '</div>' +
-                '<div class="text-xs mt-1" style="color:var(--text-muted);">' + esc(n.createdByName || '-') + (n.reservationNumber ? ' · الحجز <span class="mono" dir="ltr">' + esc(n.reservationNumber) + '</span>' : '') + '</div>' +
-              '</div>' +
-            '</div>';
-          }).join('') +
-        '</div>';
-
     var fuRowsHtml = followUps.length === 0
       ? '<div class="empty-state" style="padding:18px;">لا توجد متابعات حجوزات مسجلة حتى الآن.</div>'
       : '<div class="table-wrap"><table class="data-table"><thead><tr><th>رقم الحجز</th><th>الموظف</th><th>الإجراء / الحالة</th><th>الملاحظات</th><th>التاريخ</th></tr></thead><tbody>' +
@@ -439,18 +1362,6 @@
               '</div>' +
             '</div>' +
           '</div>' +
-          '<div id="cust-assign-wrap" style="min-width:220px;">' +
-            '<label class="form-label" for="cust-emp-select" style="font-size:11.5px;">الموظف المسؤول عن العميل</label>' +
-            (canAssignCust
-              ? '<div class="flex gap-1.5"><select class="input" id="cust-emp-select" style="min-height:36px;">' +
-                  '<option value="">غير مسند</option>' +
-                  employees.map(function (e) {
-                    return '<option value="' + esc(e.id) + '"' + (cust.assignedEmployeeId === e.id ? ' selected' : '') + '>' + esc(e.name) + '</option>';
-                  }).join('') +
-                '</select><button type="button" class="btn btn-sm btn-primary" id="cust-assign-save">حفظ</button></div>'
-              : '<div class="font-bold text-sm" style="color:var(--text-primary);">' + esc(cust.assignedEmployeeName || 'غير مسند') + '</div>'
-            ) +
-          '</div>' +
         '</section>' +
 
         '<section class="rg-cust-fin-grid">' +
@@ -465,7 +1376,7 @@
         '<div class="tabs-bar">' +
           '<button type="button" class="tab-btn' + (activeTab === 'overview' ? ' active' : '') + '" data-cust-tab="overview">المعلومات والحجوزات (' + reservations.length + ')</button>' +
           (canSeeComplaintsTab ? '<button type="button" class="tab-btn' + (activeTab === 'complaints' ? ' active' : '') + '" id="cust-tab-complaints" data-cust-tab="complaints">المشاكل والشكاوى (' + problems.length + ')</button>' : '') +
-          '<button type="button" class="tab-btn' + (activeTab === 'followups' ? ' active' : '') + '" data-cust-tab="followups">المتابعات والتواصل (' + (followUps.length + notes.length) + ')</button>' +
+          '<button type="button" class="tab-btn' + (activeTab === 'followups' ? ' active' : '') + '" id="cust-tab-followups" data-cust-tab="followups">الملاحظات والتواصل (' + (notes.length + followUps.length) + ')</button>' +
           (canSeeTimelineTab ? '<button type="button" class="tab-btn' + (activeTab === 'timeline' ? ' active' : '') + '" id="cust-tab-timeline" data-cust-tab="timeline">السجل الزمني الشامل (' + timeline.length + ')</button>' : '') +
         '</div>' +
 
@@ -482,25 +1393,28 @@
                   '<div class="rg-cust-info-item"><span class="k">نوع الهوية</span><span class="v">' + esc(cust.idType || '-') + '</span></div>' +
                   '<div class="rg-cust-info-item"><span class="k">رقم الهوية / الإقامة / الجواز</span><span class="v mono" dir="ltr">' + esc(cust.idNumber || '-') + '</span></div>'
                 ) : '') +
-                '<div class="rg-cust-info-item"><span class="k">الموظف المسؤول</span><span class="v">' + esc(cust.assignedEmployeeName || 'غير مسند') + '</span></div>' +
                 '<div class="rg-cust-info-item"><span class="k">آخر حجز</span><span class="v mono" dir="ltr">' + esc(cust.lastReservationNumber || '-') + '</span></div>' +
                 '<div class="rg-cust-info-item"><span class="k">آخر تواصل</span><span class="v mono" dir="ltr">' + esc(cust.lastContactAt ? fmtDateTime(cust.lastContactAt, ctx) : 'لم يُسجل بعد') + '</span></div>' +
                 '<div class="rg-cust-info-item"><span class="k">ملاحظات الملف</span><span class="v">' + esc(cust.notes || '-') + '</span></div>' +
               '</div>' +
             '</section>' +
             '<div class="flex flex-col gap-4" style="min-width:0;">' +
-              '<section class="surface-card" style="min-width:0;">' +
-                '<div class="section-header" style="margin-bottom:10px;"><h3 class="section-title">الحجوزات الحالية والسابقة (' + reservations.length + ')</h3></div>' +
-                '<div class="table-wrap rg-cust-table-wrap"><table class="data-table rg-cust-table"><thead><tr><th>رقم الحجز</th><th>الشركة</th><th>المركبة</th><th>الاستلام</th><th>الانتهاء</th><th>الإجمالي</th><th>الحالة</th><th>التمديدات</th></tr></thead><tbody>' +
-                  resRowsHtml +
-                '</tbody></table></div>' +
-              '</section>' +
-              '<section class="surface-card" style="min-width:0;">' +
-                '<div class="section-header" style="margin-bottom:10px;"><h3 class="section-title">سجل التمديدات (' + extensions.length + ')</h3></div>' +
-                '<div class="table-wrap rg-cust-table-wrap"><table class="data-table rg-cust-table"><thead><tr><th>رقم التمديد</th><th>الحجز</th><th>المدة</th><th>الفترة</th><th>المبلغ</th><th>الحالة</th></tr></thead><tbody>' +
-                  extRowsHtml +
-                '</tbody></table></div>' +
-              '</section>' +
+              (csCfg.showBookingsTab !== false ? (
+                '<section class="surface-card" style="min-width:0;">' +
+                  '<div class="section-header" style="margin-bottom:10px;"><h3 class="section-title">الحجوزات الحالية والسابقة (' + reservations.length + ')</h3></div>' +
+                  '<div class="table-wrap rg-cust-table-wrap"><table class="data-table rg-cust-table"><thead><tr><th>رقم الحجز</th><th>الشركة</th><th>المركبة</th><th>الاستلام</th><th>الانتهاء</th><th>الإجمالي</th><th>الحالة</th><th>التمديدات</th></tr></thead><tbody>' +
+                    resRowsHtml +
+                  '</tbody></table></div>' +
+                '</section>'
+              ) : '') +
+              (csCfg.showExtensionsTab !== false ? (
+                '<section class="surface-card" style="min-width:0;">' +
+                  '<div class="section-header" style="margin-bottom:10px;"><h3 class="section-title">سجل التمديدات (' + extensions.length + ')</h3></div>' +
+                  '<div class="table-wrap rg-cust-table-wrap"><table class="data-table rg-cust-table"><thead><tr><th>رقم التمديد</th><th>الحجز</th><th>المدة</th><th>الفترة</th><th>المبلغ</th><th>الحالة</th></tr></thead><tbody>' +
+                    extRowsHtml +
+                  '</tbody></table></div>' +
+                '</section>'
+              ) : '') +
             '</div>' +
           '</div>'
         ) : '') +
@@ -519,32 +1433,7 @@
 
         (activeTab === 'followups' ? (
           '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">' +
-            '<section class="surface-card">' +
-              '<h3 class="section-title" style="margin-bottom:10px;">سجل التواصل والملاحظات (' + notes.length + ')</h3>' +
-              (canAddNote ? (
-                '<form id="cust-add-note-form" class="flex flex-col gap-2.5 mb-4 p-3 rounded-lg" style="background:var(--bg-surface-subtle);border:1px solid var(--border-hairline);">' +
-                  '<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">' +
-                    '<select class="input" id="cust-note-type">' +
-                      '<option value="مكالمة">مكالمة هاتفية</option>' +
-                      '<option value="واتساب">تواصل واتساب</option>' +
-                      '<option value="ملاحظة">ملاحظة داخلية</option>' +
-                      '<option value="متابعة">متابعة عميل</option>' +
-                      '<option value="بريد إلكتروني">بريد إلكتروني</option>' +
-                      '<option value="زيارة">زيارة فرع</option>' +
-                    '</select>' +
-                    '<select class="input" id="cust-note-res">' +
-                      '<option value="">ربط بحجز (اختياري)</option>' +
-                      reservations.map(function (r) {
-                        return '<option value="' + esc(r.id) + '" data-num="' + esc(r.reservationNumber) + '">' + esc(r.reservationNumber) + '</option>';
-                      }).join('') +
-                    '</select>' +
-                  '</div>' +
-                  '<textarea class="input" id="cust-note-text" rows="2" placeholder="اكتب ملخص التواصل أو الملاحظة (يدعم الإشارة @)..." required></textarea>' +
-                  '<div class="flex justify-end"><button type="submit" class="btn btn-sm btn-primary" id="cust-add-note-btn">حفظ التواصل / الملاحظة</button></div>' +
-                '</form>'
-              ) : '') +
-              notesHtml +
-            '</section>' +
+            '<div id="cust-notes-panel-host"></div>' +
             '<section class="surface-card">' +
               '<h3 class="section-title" style="margin-bottom:10px;">متابعات الحجوزات المرتبطة (' + followUps.length + ')</h3>' +
               fuRowsHtml +
@@ -559,6 +1448,24 @@
           '</section>'
         ) : '') +
       '</div>';
+
+    // Mount unified searchable Customer Notes panel inside the followups/notes tab
+    var notesHost = document.getElementById('cust-notes-panel-host');
+    if (notesHost) {
+      mountCustomerNotesPanel(notesHost, {
+        customerId: cust.id,
+        sourceSection: 'customers',
+        reservations: reservations,
+        employees: employees,
+        initialNotes: notes,
+        noteStatuses: noteStatuses,
+        notesConfig: notesCfg,
+        ctx: ctx,
+        onChanged: function () {
+          if (root.RGApi && root.RGApi.markScopesStale) root.RGApi.markScopesStale(['customers']);
+        }
+      });
+    }
 
     // Wire Profile Events
     var backBtn = document.getElementById('cust-back-btn');
@@ -608,7 +1515,7 @@
     var editBtn = document.getElementById('cust-edit-btn');
     if (editBtn) {
       editBtn.addEventListener('click', function () {
-        openCustomerFormModal(cust, { employees: employees }, ctx, function () {
+        openCustomerFormModal(cust, {}, ctx, function () {
           render(container, ctx);
         });
       });
@@ -625,58 +1532,6 @@
     if (addCompBtn) addCompBtn.addEventListener('click', openCompHandler);
     if (tabNewPrbBtn) tabNewPrbBtn.addEventListener('click', openCompHandler);
 
-    var assignSaveBtn = document.getElementById('cust-assign-save');
-    if (assignSaveBtn) {
-      assignSaveBtn.addEventListener('click', async function () {
-        var empSel = document.getElementById('cust-emp-select');
-        var empId = empSel ? empSel.value : '';
-        assignSaveBtn.disabled = true;
-        try {
-          var res = await root.RGApi.callApi('assignCustomerEmployee', { customerId: cust.id, employeeId: empId });
-          if (!res || !res.success) {
-            if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حفظ الإسناد.', true);
-          } else {
-            if (ctx && ctx.toast) ctx.toast('تم تحديث الموظف المسؤول عن العميل.');
-            await render(container, ctx);
-          }
-        } finally {
-          assignSaveBtn.disabled = false;
-        }
-      });
-    }
-
-    var noteForm = document.getElementById('cust-add-note-form');
-    if (noteForm) {
-      noteForm.addEventListener('submit', async function (ev) {
-        ev.preventDefault();
-        var noteBtn = document.getElementById('cust-add-note-btn');
-        var noteTextEl = document.getElementById('cust-note-text');
-        var noteTypeEl = document.getElementById('cust-note-type');
-        var noteResEl = document.getElementById('cust-note-res');
-        var content = noteTextEl ? noteTextEl.value.trim() : '';
-        if (!content) return;
-        if (noteBtn) noteBtn.disabled = true;
-        try {
-          var opt = noteResEl && noteResEl.selectedOptions ? noteResEl.selectedOptions[0] : null;
-          var resp = await root.RGApi.callApi('addCustomerNote', {
-            customerId: cust.id,
-            noteType: noteTypeEl ? noteTypeEl.value : 'ملاحظة',
-            reservationId: noteResEl ? noteResEl.value : '',
-            reservationNumber: opt ? (opt.getAttribute('data-num') || '') : '',
-            content: content
-          });
-          if (!resp || !resp.success) {
-            if (ctx && ctx.toast) ctx.toast((resp && resp.message) || 'تعذر حفظ الملاحظة.', true);
-          } else {
-            if (ctx && ctx.toast) ctx.toast('تم إضافة الملاحظة إلى ملف العميل.');
-            await render(container, ctx);
-          }
-        } finally {
-          if (noteBtn) noteBtn.disabled = false;
-        }
-      });
-    }
-
     var exportPdfBtn = document.getElementById('cust-export-pdf-btn');
     if (exportPdfBtn && root.RGReports && typeof root.RGReports.openPdfStudio === 'function') {
       exportPdfBtn.addEventListener('click', function () {
@@ -692,8 +1547,7 @@
           { key: 'extensionsCount', label: 'التمديدات', formatType: 'number' },
           { key: 'openProblemsCount', label: 'المشاكل المفتوحة', formatType: 'number' },
           { key: 'totalAmount', label: 'إجمالي الإنفاق', formatType: 'number' },
-          { key: 'assignedEmployeeName', label: 'الموظف المسؤول' },
-          { key: 'status', label: 'الحالة' }
+          { key: 'status', label: 'حالة العميل' }
         );
         root.RGReports.openPdfStudio({
           ctx: ctx,
@@ -720,21 +1574,34 @@
     var core = coreFn();
     var user = root.RGAuth && root.RGAuth.getUser ? root.RGAuth.getUser() : null;
     var activeUiCtx = root.RGApp && root.RGApp.getActiveUiContext ? root.RGApp.getActiveUiContext() : null;
+    var notesCfg = getCustomerNotesConfigSafe();
+    var csCfg = notesCfg.customersSection || {};
+
     var cSt = getCustomersState(ctx);
     var items = (listData && Array.isArray(listData.items)) ? listData.items : [];
     var kpis = (listData && listData.kpis) || {};
     var recentList = (listData && Array.isArray(listData.recentCustomers)) ? listData.recentCustomers : [];
     var facets = (listData && listData.facets) || {};
     var companies = Array.isArray(facets.companies) ? facets.companies : [];
-    var employees = Array.isArray(facets.employees) ? facets.employees : [];
-    var statuses = Array.isArray(facets.statuses) && facets.statuses.length ? facets.statuses : (core.CUSTOMER_STATUS_LIST || []);
+    var resStatusOpts = (Array.isArray(facets.reservationStatusOptions) && facets.reservationStatusOptions.length)
+      ? facets.reservationStatusOptions
+      : (core.CUSTOMER_RESERVATION_STATUS_OPTIONS || [
+          { value: 'نشط الآن', labelAr: 'نشط الآن', color: '#10b981' },
+          { value: 'جاهز للاستلام', labelAr: 'جاهز للاستلام', color: '#3b82f6' },
+          { value: 'بانتظار المتابعة', labelAr: 'بانتظار المتابعة', color: '#f59e0b' },
+          { value: 'جديد / بانتظار المراجعة', labelAr: 'جديد / بانتظار المراجعة', color: '#8b5cf6' },
+          { value: 'متأخر في السداد', labelAr: 'متأخر في السداد', color: '#f97316' },
+          { value: 'منتهي', labelAr: 'منتهي / مكتمل', color: '#64748b' },
+          { value: 'ملغي', labelAr: 'ملغي', color: '#ef4444' },
+          { value: 'مرفوض', labelAr: 'مرفوض', color: '#dc2626' }
+        ]);
 
-    var canViewId = core.canUserViewCustomerId ? core.canUserViewCustomerId(user) : false;
+    var canViewId = (core.canUserViewCustomerId ? core.canUserViewCustomerId(user) : false) && csCfg.showSensitiveIds !== false;
     var canShowDash = !core.canUserViewSubSection || core.canUserViewSubSection(user, 'sub_view_cust_dashboard', activeUiCtx);
-    var canAddEdit = core.canUserPerform && core.canUserPerform(user, 'edit_customer_details') && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_edit_customer', activeUiCtx));
+    var canAddEdit = csCfg.enableAddCustomer !== false && core.canUserPerform && core.canUserPerform(user, 'edit_customer_details') && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_edit_customer', activeUiCtx));
 
-    var canExportExcel = !core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_export_excel', activeUiCtx);
-    var canExportPdfDir = !core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_export_pdf', activeUiCtx);
+    var canExportExcel = csCfg.enableExport !== false && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_export_excel', activeUiCtx));
+    var canExportPdfDir = csCfg.enableExport !== false && (!core.canUserUseActionButton || core.canUserUseActionButton(user, 'act_export_pdf', activeUiCtx));
     var exportMenuHtml = (root.RGExportMenu && (canExportPdfDir || canExportExcel))
       ? root.RGExportMenu.renderHtml({
           wrapId: 'cust-export-wrap',
@@ -784,8 +1651,8 @@
             '<td class="tabular-nums">' + Number(c.extensionsCount || 0) + '</td>' +
             '<td class="tabular-nums font-bold" style="color:' + (Number(c.openProblemsCount || 0) > 0 ? 'var(--status-danger-text)' : 'var(--text-muted)') + ';">' + Number(c.openProblemsCount || 0) + '</td>' +
             '<td class="mono text-xs rg-cust-nowrap" dir="ltr">' + esc(c.lastReservationNumber || '-') + (c.lastReservationDate ? '<div style="color:var(--text-muted);">' + esc(c.lastReservationDate) + '</div>' : '') + '</td>' +
+            '<td class="rg-cust-nowrap">' + (c.lastReservationStatus ? '<span class="status-tag ' + statusTagClass(c.lastReservationStatus) + '">' + esc(c.lastReservationStatus) + '</span>' : '<span style="color:var(--text-muted);">-</span>') + '</td>' +
             '<td class="mono text-xs rg-cust-nowrap" dir="ltr">' + esc(c.lastContactAt ? fmtDateTime(c.lastContactAt, ctx) : '-') + '</td>' +
-            '<td class="text-xs rg-cust-nowrap">' + esc(c.assignedEmployeeName || 'غير مسند') + '</td>' +
             '<td class="rg-cust-nowrap">' +
               '<span class="status-tag ' + statusTagClass(c.status) + '">' + esc(c.status || 'جديد') + '</span>' +
               '<div class="mono text-[10.5px] mt-1" style="color:var(--text-muted);" dir="ltr">' + esc(fmtDateTime(c.createdAt, ctx).slice(0, 10)) + '</div>' +
@@ -835,54 +1702,62 @@
 
         '<section class="rg-cust-toolbar">' +
           '<div class="rg-cust-toolbar-row">' +
-            '<div class="rg-cust-search-wrap">' +
-              '<label class="rg-inactive-field-lbl" for="cust-search-inp">بحث سريع بالعملاء</label>' +
-              '<input class="input" id="cust-search-inp" value="' + esc(cSt.search || '') + '" placeholder="' + (canViewId ? 'ابحث بالاسم، الجوال، رقم الحجز، الهوية، البريد...' : 'ابحث بالاسم، الجوال، رقم الحجز، البريد...') + '">' +
-            '</div>' +
-            '<div class="rg-cust-filter-field">' +
-              '<label class="rg-inactive-field-lbl" for="cust-status-sel">الحالة</label>' +
-              '<select class="input" id="cust-status-sel"><option value="">جميع الحالات</option>' +
-                statuses.map(function (st) {
-                  return '<option value="' + esc(st) + '"' + (cSt.status === st ? ' selected' : '') + '>' + esc(st) + '</option>';
-                }).join('') +
-              '</select>' +
-            '</div>' +
-            '<div class="rg-cust-filter-field">' +
-              '<label class="rg-inactive-field-lbl" for="cust-comp-sel">شركة التأجير</label>' +
-              '<select class="input" id="cust-comp-sel"><option value="">جميع الشركات</option>' +
-                companies.map(function (co) {
-                  return '<option value="' + esc(co) + '"' + (cSt.company === co ? ' selected' : '') + '>' + esc(co) + '</option>';
-                }).join('') +
-              '</select>' +
-            '</div>' +
-            '<div class="rg-cust-filter-field">' +
-              '<label class="rg-inactive-field-lbl" for="cust-emp-sel">الموظف المسؤول</label>' +
-              '<select class="input" id="cust-emp-sel"><option value="">جميع الموظفين</option><option value="unassigned"' + (cSt.assignedEmployeeId === 'unassigned' ? ' selected' : '') + '>غير مسند</option>' +
-                employees.map(function (e) {
-                  return '<option value="' + esc(e.id) + '"' + (cSt.assignedEmployeeId === e.id ? ' selected' : '') + '>' + esc(e.name) + '</option>';
-                }).join('') +
-              '</select>' +
-            '</div>' +
-            '<div class="rg-cust-filter-field">' +
-              '<label class="rg-inactive-field-lbl" for="cust-prb-sel">المشاكل والشكاوى</label>' +
-              '<select class="input" id="cust-prb-sel">' +
-                '<option value="">الكل</option>' +
-                '<option value="open_problems"' + (cSt.problemFilter === 'open_problems' ? ' selected' : '') + '>لديهم مشاكل مفتوحة</option>' +
-                '<option value="open_complaints"' + (cSt.problemFilter === 'open_complaints' ? ' selected' : '') + '>شكاوى قيد المعالجة</option>' +
-                '<option value="no_problems"' + (cSt.problemFilter === 'no_problems' ? ' selected' : '') + '>بدون مشاكل</option>' +
-              '</select>' +
-            '</div>' +
-            '<div class="rg-cust-filter-field">' +
-              '<label class="rg-inactive-field-lbl" for="cust-sort-sel">الترتيب</label>' +
-              '<select class="input" id="cust-sort-sel">' +
-                '<option value="last_activity"' + (cSt.sortBy === 'last_activity' ? ' selected' : '') + '>آخر نشاط</option>' +
-                '<option value="bookings_desc"' + (cSt.sortBy === 'bookings_desc' ? ' selected' : '') + '>الأكثر حجوزات</option>' +
-                '<option value="active_desc"' + (cSt.sortBy === 'active_desc' ? ' selected' : '') + '>الحجوزات النشطة</option>' +
-                '<option value="amount_desc"' + (cSt.sortBy === 'amount_desc' ? ' selected' : '') + '>أعلى إنفاق</option>' +
-                '<option value="created_desc"' + (cSt.sortBy === 'created_desc' ? ' selected' : '') + '>تاريخ الإنشاء (الأحدث)</option>' +
-                '<option value="name_asc"' + (cSt.sortBy === 'name_asc' ? ' selected' : '') + '>الاسم (أ-ي)</option>' +
-              '</select>' +
-            '</div>' +
+            (csCfg.enableSearch !== false ? (
+              '<div class="rg-cust-search-wrap">' +
+                '<label class="rg-inactive-field-lbl" for="cust-search-inp">بحث سريع بالعملاء</label>' +
+                '<input class="input" id="cust-search-inp" value="' + esc(cSt.search || '') + '" placeholder="' + (canViewId ? 'ابحث بالاسم، الجوال، رقم الحجز، الهوية، البريد...' : 'ابحث بالاسم، الجوال، رقم الحجز، البريد...') + '">' +
+              '</div>'
+            ) : '') +
+            (csCfg.enableFilters !== false ? (
+              '<div class="rg-cust-filter-field">' +
+                '<label class="rg-inactive-field-lbl" for="cust-status-sel">الحالة (حالة الحجز)</label>' +
+                '<select class="select" id="cust-status-sel" data-search-placeholder="ابحث عن الحالة...">' +
+                  '<option value="">جميع حالات الحجوزات</option>' +
+                  resStatusOpts.map(function (opt) {
+                    var val = typeof opt === 'string' ? opt : (opt.value || opt.labelAr || '');
+                    var lbl = typeof opt === 'string' ? opt : (opt.labelAr || opt.value || '');
+                    var col = typeof opt === 'string' ? '' : (opt.color || '');
+                    return '<option value="' + esc(val) + '"' + (col ? ' data-color="' + esc(col) + '"' : '') + (cSt.status === val ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+                  }).join('') +
+                '</select>' +
+              '</div>' +
+              '<div class="rg-cust-filter-field">' +
+                '<label class="rg-inactive-field-lbl" for="cust-comp-sel">شركة التأجير</label>' +
+                '<select class="select" id="cust-comp-sel" data-search-placeholder="ابحث عن الشركة..."><option value="">جميع الشركات</option>' +
+                  companies.map(function (co) {
+                    return '<option value="' + esc(co) + '"' + (cSt.company === co ? ' selected' : '') + '>' + esc(co) + '</option>';
+                  }).join('') +
+                '</select>' +
+              '</div>' +
+              '<div class="rg-cust-filter-field">' +
+                '<label class="rg-inactive-field-lbl" for="cust-date-from">من تاريخ الحجز</label>' +
+                '<input type="date" class="input mono" dir="ltr" id="cust-date-from" value="' + esc(cSt.dateFrom || '') + '">' +
+              '</div>' +
+              '<div class="rg-cust-filter-field">' +
+                '<label class="rg-inactive-field-lbl" for="cust-date-to">إلى تاريخ الحجز</label>' +
+                '<input type="date" class="input mono" dir="ltr" id="cust-date-to" value="' + esc(cSt.dateTo || '') + '">' +
+              '</div>' +
+              '<div class="rg-cust-filter-field">' +
+                '<label class="rg-inactive-field-lbl" for="cust-prb-sel">المشاكل والشكاوى</label>' +
+                '<select class="select" id="cust-prb-sel">' +
+                  '<option value="">الكل</option>' +
+                  '<option value="open_problems"' + (cSt.problemFilter === 'open_problems' ? ' selected' : '') + '>لديهم مشاكل مفتوحة</option>' +
+                  '<option value="open_complaints"' + (cSt.problemFilter === 'open_complaints' ? ' selected' : '') + '>شكاوى قيد المعالجة</option>' +
+                  '<option value="no_problems"' + (cSt.problemFilter === 'no_problems' ? ' selected' : '') + '>بدون مشاكل</option>' +
+                '</select>' +
+              '</div>' +
+              '<div class="rg-cust-filter-field">' +
+                '<label class="rg-inactive-field-lbl" for="cust-sort-sel">الترتيب</label>' +
+                '<select class="select" id="cust-sort-sel">' +
+                  '<option value="last_activity"' + (cSt.sortBy === 'last_activity' ? ' selected' : '') + '>آخر نشاط</option>' +
+                  '<option value="bookings_desc"' + (cSt.sortBy === 'bookings_desc' ? ' selected' : '') + '>الأكثر حجوزات</option>' +
+                  '<option value="active_desc"' + (cSt.sortBy === 'active_desc' ? ' selected' : '') + '>الحجوزات النشطة</option>' +
+                  '<option value="amount_desc"' + (cSt.sortBy === 'amount_desc' ? ' selected' : '') + '>أعلى إنفاق</option>' +
+                  '<option value="created_desc"' + (cSt.sortBy === 'created_desc' ? ' selected' : '') + '>تاريخ الإنشاء (الأحدث)</option>' +
+                  '<option value="name_asc"' + (cSt.sortBy === 'name_asc' ? ' selected' : '') + '>الاسم (أ-ي)</option>' +
+                '</select>' +
+              '</div>'
+            ) : '') +
             '<button type="button" class="btn btn-sm" id="cust-reset-btn">إعادة ضبط</button>' +
           '</div>' +
         '</section>' +
@@ -901,8 +1776,8 @@
                 '<th>التمديدات</th>' +
                 '<th>المشاكل</th>' +
                 '<th>آخر حجز</th>' +
+                '<th>آخر حالة حجز</th>' +
                 '<th>آخر تواصل</th>' +
-                '<th>المسؤول</th>' +
                 '<th>الحالة / الإنشاء</th>' +
               '</tr></thead>' +
               '<tbody>' + rowsHtml + '</tbody>' +
@@ -917,6 +1792,8 @@
           '</div>' +
         '</section>' +
       '</div>';
+
+    enhanceSelects(container);
 
     // Bind unified RGExportMenu (Excel + PDF Studio)
     if (root.RGExportMenu && typeof root.RGExportMenu.bind === 'function' && document.getElementById('cust-export-wrap')) {
@@ -934,8 +1811,8 @@
         { key: 'extensionsCount', label: 'التمديدات', formatType: 'number' },
         { key: 'openProblemsCount', label: 'المشاكل المفتوحة', formatType: 'number' },
         { key: 'lastReservationNumber', label: 'آخر حجز', formatType: 'ltr' },
+        { key: 'lastReservationStatus', label: 'آخر حالة حجز' },
         { key: 'lastContactAt', label: 'آخر تواصل', formatType: 'datetime' },
-        { key: 'assignedEmployeeName', label: 'الموظف المسؤول' },
         { key: 'status', label: 'حالة العميل' },
         { key: 'createdAt', label: 'تاريخ الإنشاء', formatType: 'date' }
       );
@@ -944,7 +1821,8 @@
           search: cSt.search || '',
           status: cSt.status || '',
           company: cSt.company || '',
-          assignedEmployeeId: cSt.assignedEmployeeId || '',
+          dateFrom: cSt.dateFrom || '',
+          dateTo: cSt.dateTo || '',
           problemFilter: cSt.problemFilter || '',
           kpiFilter: cSt.kpiFilter || 'all',
           sortBy: cSt.sortBy || 'last_activity',
@@ -1042,7 +1920,8 @@
     };
     bindSel('cust-status-sel', 'status');
     bindSel('cust-comp-sel', 'company');
-    bindSel('cust-emp-sel', 'assignedEmployeeId');
+    bindSel('cust-date-from', 'dateFrom');
+    bindSel('cust-date-to', 'dateTo');
     bindSel('cust-prb-sel', 'problemFilter');
     bindSel('cust-sort-sel', 'sortBy');
 
@@ -1052,7 +1931,8 @@
         cSt.search = '';
         cSt.status = '';
         cSt.company = '';
-        cSt.assignedEmployeeId = '';
+        cSt.dateFrom = '';
+        cSt.dateTo = '';
         cSt.problemFilter = '';
         cSt.kpiFilter = 'all';
         cSt.sortBy = 'last_activity';
@@ -1122,7 +2002,6 @@
         renderProfileView(container, ctx, detRes.data);
         return;
       }
-      // Fallback back to directory if customer missing
       cSt.selectedCustomerId = '';
       currentProfileState.customerId = '';
       currentProfileState.data = null;
@@ -1133,7 +2012,8 @@
       search: cSt.search || '',
       status: cSt.status || '',
       company: cSt.company || '',
-      assignedEmployeeId: cSt.assignedEmployeeId || '',
+      dateFrom: cSt.dateFrom || '',
+      dateTo: cSt.dateTo || '',
       problemFilter: cSt.problemFilter || '',
       kpiFilter: cSt.kpiFilter || 'all',
       sortBy: cSt.sortBy || 'last_activity',
@@ -1148,6 +2028,7 @@
 
   root.RGCustomers = {
     render: render,
-    openCustomerProfile: openCustomerProfile
+    openCustomerProfile: openCustomerProfile,
+    mountCustomerNotesPanel: mountCustomerNotesPanel
   };
 })(window);

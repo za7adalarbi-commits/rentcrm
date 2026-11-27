@@ -611,29 +611,177 @@ CREATE TABLE IF NOT EXISTS customers (
   tags JSONB NOT NULL DEFAULT '[]'::jsonb,
   source TEXT NOT NULL DEFAULT 'sync',
   last_contact_at TEXT NOT NULL DEFAULT '',
+  last_contact_ts TIMESTAMPTZ DEFAULT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 27. Customer Notes & Direct Interaction Log
-CREATE TABLE IF NOT EXISTS customer_notes (
+-- 27. Dynamic Customer Note Statuses
+CREATE TABLE IF NOT EXISTS customer_note_statuses (
   id TEXT PRIMARY KEY,
-  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-  reservation_id TEXT DEFAULT NULL REFERENCES reservations(id) ON DELETE SET NULL,
-  reservation_number TEXT NOT NULL DEFAULT '',
-  note_type TEXT NOT NULL DEFAULT 'ملاحظة',
-  content TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  color TEXT NOT NULL DEFAULT '#3b82f6',
+  sort_order INTEGER NOT NULL DEFAULT 100,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  allow_agent_select BOOLEAN NOT NULL DEFAULT TRUE,
+  is_closed_status BOOLEAN NOT NULL DEFAULT FALSE,
   created_by_id TEXT NOT NULL DEFAULT '',
   created_by_name TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 28. Customer Notes & Direct Interaction Log
+CREATE TABLE IF NOT EXISTS customer_notes (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  reservation_id TEXT DEFAULT NULL REFERENCES reservations(id) ON DELETE SET NULL,
+  reservation_number TEXT NOT NULL DEFAULT '',
+  problem_id TEXT NOT NULL DEFAULT '',
+  problem_number TEXT NOT NULL DEFAULT '',
+  note_type TEXT NOT NULL DEFAULT 'ملاحظة',
+  title TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  status_id TEXT NOT NULL DEFAULT '',
+  status_name TEXT NOT NULL DEFAULT 'جديدة',
+  status_color TEXT NOT NULL DEFAULT '#3b82f6',
+  assigned_employee_id TEXT NOT NULL DEFAULT '',
+  assigned_employee_name TEXT NOT NULL DEFAULT '',
+  is_internal BOOLEAN NOT NULL DEFAULT FALSE,
+  is_closed BOOLEAN NOT NULL DEFAULT FALSE,
+  closed_at TIMESTAMPTZ DEFAULT NULL,
+  closed_by_id TEXT NOT NULL DEFAULT '',
+  closed_by_name TEXT NOT NULL DEFAULT '',
+  source_section TEXT NOT NULL DEFAULT 'customers',
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  updated_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  deleted_by_id TEXT NOT NULL DEFAULT '',
+  deleted_by_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 29. Customer Note Attachments
+CREATE TABLE IF NOT EXISTS customer_note_attachments (
+  id TEXT PRIMARY KEY,
+  note_id TEXT NOT NULL REFERENCES customer_notes(id) ON DELETE CASCADE,
+  customer_id TEXT NOT NULL DEFAULT '',
+  file_name TEXT NOT NULL DEFAULT '',
+  mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+  file_size INTEGER NOT NULL DEFAULT 0,
+  data_url TEXT NOT NULL DEFAULT '',
+  uploaded_by_id TEXT NOT NULL DEFAULT '',
+  uploaded_by_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 30. Customer Note Audit History
+CREATE TABLE IF NOT EXISTS customer_note_history (
+  id TEXT PRIMARY KEY,
+  note_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL DEFAULT '',
+  action_type TEXT NOT NULL DEFAULT '',
+  field_name TEXT NOT NULL DEFAULT '',
+  old_value TEXT NOT NULL DEFAULT '',
+  new_value TEXT NOT NULL DEFAULT '',
+  details TEXT NOT NULL DEFAULT '',
+  source_section TEXT NOT NULL DEFAULT 'customers',
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 31. Developer-Only Data Integrity Monitor Runs, Issues & Action Rollback Snapshots
+CREATE TABLE IF NOT EXISTS data_integrity_runs (
+  id TEXT PRIMARY KEY,
+  trigger_type TEXT NOT NULL DEFAULT 'manual',
+  status TEXT NOT NULL DEFAULT 'completed',
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at TIMESTAMPTZ DEFAULT NULL,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  rg_total_count INTEGER NOT NULL DEFAULT 0,
+  neon_total_count INTEGER NOT NULL DEFAULT 0,
+  reviewed_count INTEGER NOT NULL DEFAULT 0,
+  discrepancies_count INTEGER NOT NULL DEFAULT 0,
+  summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  scopes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  error_message TEXT NOT NULL DEFAULT '',
+  triggered_by_id TEXT NOT NULL DEFAULT '',
+  triggered_by_name TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS data_integrity_issues (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL DEFAULT '',
+  reservation_id TEXT NOT NULL DEFAULT '',
+  reservation_number TEXT NOT NULL DEFAULT '',
+  discrepancy_type TEXT NOT NULL DEFAULT '',
+  severity TEXT NOT NULL DEFAULT 'medium',
+  source_scope TEXT NOT NULL DEFAULT 'reservations',
+  field_name TEXT NOT NULL DEFAULT '',
+  rg_value TEXT NOT NULL DEFAULT '',
+  neon_value TEXT NOT NULL DEFAULT '',
+  rg_snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  neon_snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  resolution_status TEXT NOT NULL DEFAULT 'open',
+  resolved_by_id TEXT NOT NULL DEFAULT '',
+  resolved_by_name TEXT NOT NULL DEFAULT '',
+  resolved_at TIMESTAMPTZ DEFAULT NULL,
+  resolution_note TEXT NOT NULL DEFAULT '',
+  last_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS data_integrity_actions (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  reservation_id TEXT NOT NULL DEFAULT '',
+  reservation_number TEXT NOT NULL DEFAULT '',
+  action_type TEXT NOT NULL DEFAULT '',
+  before_snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  after_snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  rolled_back BOOLEAN NOT NULL DEFAULT FALSE,
+  rolled_back_at TIMESTAMPTZ DEFAULT NULL,
+  rolled_back_by_id TEXT NOT NULL DEFAULT '',
+  rolled_back_by_name TEXT NOT NULL DEFAULT '',
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE problems ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE problems ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';
+
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS problem_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS problem_number TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_name TEXT NOT NULL DEFAULT 'جديدة';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_color TEXT NOT NULL DEFAULT '#3b82f6';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS assigned_employee_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS assigned_employee_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS is_internal BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS is_closed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ DEFAULT NULL;
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_by_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_by_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS source_section TEXT NOT NULL DEFAULT 'customers';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS updated_by_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS updated_by_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_by_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_by_name TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_customers_name_trgm ON customers USING GIN (full_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_customers_phone_trgm ON customers USING GIN (phone gin_trgm_ops);
@@ -641,8 +789,16 @@ CREATE INDEX IF NOT EXISTS idx_customers_norm_phone ON customers (normalized_pho
 CREATE INDEX IF NOT EXISTS idx_customers_email_lower ON customers (LOWER(email)) WHERE email <> '';
 CREATE INDEX IF NOT EXISTS idx_customers_id_number ON customers (id_number) WHERE id_number <> '';
 CREATE INDEX IF NOT EXISTS idx_customers_status_updated ON customers (status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_customers_assigned_emp ON customers (assigned_employee_id) WHERE assigned_employee_id <> '';
-CREATE INDEX IF NOT EXISTS idx_customer_notes_cust_created ON customer_notes (customer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customer_notes_cust_created ON customer_notes (customer_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_notes_res_id ON customer_notes (reservation_id) WHERE reservation_id IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_notes_prb_id ON customer_notes (problem_id) WHERE problem_id <> '' AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_notes_status ON customer_notes (status_id, status_name) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_note_att_note ON customer_note_attachments (note_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customer_note_hist_note ON customer_note_history (note_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customer_note_statuses_order ON customer_note_statuses (sort_order ASC, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_data_integrity_runs_started ON data_integrity_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_status ON data_integrity_issues (resolution_status, discrepancy_type, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_fk ON reservations (customer_id) WHERE customer_id <> '';
 CREATE INDEX IF NOT EXISTS idx_reservations_customer_email_trgm ON reservations USING GIN (customer_email gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_problems_customer_id_fk ON problems (customer_id) WHERE customer_id <> '';

@@ -148,10 +148,15 @@
       root.RGCrmCore.canUserPerform(user, 'manage_role_ui_defaults')
     ));
     var canManageRoleUiDefaults = canCustomizeUi || canManageSettings;
+    var canManageCustomerNotesAdmin = Boolean(isDeveloperUser || canManageSettings || (root.RGCrmCore && (
+      root.RGCrmCore.canUserPerform(user, 'manage_customer_notes_settings') ||
+      root.RGCrmCore.canUserPerform(user, 'manage_customer_note_statuses') ||
+      root.RGCrmCore.canUserPerform(user, 'manage_customer_notes_buttons')
+    )));
     var cachedEmpData = root.RGApi.getCachedData ? root.RGApi.getCachedData('getEmployees', {}, true) : null;
     var personalCardHtml = buildPersonalAccountCardHtml(user, ctx);
 
-    if (!canAccessApi && !canManageSettings && !canManageRoleUiDefaults) {
+    if (!canAccessApi && !canManageSettings && !canManageRoleUiDefaults && !canManageCustomerNotesAdmin) {
       container.innerHTML =
         personalCardHtml +
         '<div class="surface-card">' +
@@ -286,6 +291,7 @@
       )
     );
     var isDeveloperUser = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.DEVELOPER);
+    var canViewDevIntegrity = Boolean(isDeveloperUser && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'manage_developer_tools'));
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var cacheStats = (root.RGApi && root.RGApi.getLocalCacheStats) ? root.RGApi.getLocalCacheStats() : { reservationsCount: 0, customersCount: 0, detailsCount: 0 };
     var uiPresetsMap = (root.RGCrmCore && root.RGCrmCore.TEAM_UI_PRESETS) || {};
@@ -415,7 +421,19 @@
             '<span class="status-tag status-info">CALL SHORTCUTS</span>' +
           '</div>' +
           '<div id="dev-call-shortcuts-host"></div>' +
-        '</div>'
+        '</div>' +
+        (canViewDevIntegrity ? (
+          '<div class="surface-card" id="dev-integrity-card" style="border-top:3px solid var(--brand-primary);margin-bottom:16px;">' +
+            '<div class="section-header">' +
+              '<div>' +
+                '<h2 class="section-title">مراقبة سلامة البيانات ومقارنة RG API وNeon PostgreSQL</h2>' +
+                '<p class="section-subtitle">أداة مخصصة للمبرمج فقط لمقارنة بيانات الحجوزات والتمديدات والإلغاءات وتعديلات الشركات بين المصدر وقاعدة البيانات، مع معاينة الفروقات والموافقة الصريحة والتراجع.</p>' +
+              '</div>' +
+              '<span class="status-tag status-danger">DEVELOPER ONLY</span>' +
+            '</div>' +
+            '<div id="dev-integrity-host"><div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div></div>' +
+          '</div>'
+        ) : '')
       ) : '') +
       '<div class="surface-card" id="connection-diagnostics-card">' +
         '<div class="section-header">' +
@@ -885,6 +903,18 @@
             '</div>' +
           '</div>' +
         '</form>' +
+        (canManageCustomerNotesAdmin ? (
+          '<div class="surface-card" id="customer-notes-admin-card" style="border-top:3px solid var(--brand-primary);">' +
+            '<div class="section-header">' +
+              '<div>' +
+                '<h2 class="section-title">إدارة قسم ملاحظات العملاء وقسم العملاء (Admin Control)</h2>' +
+                '<p class="section-subtitle">التحكم المركزي في الحالات الديناميكية، مصفوفة الأزرار الـ 14 والصلاحيات، قواعد الإضافة والمرفقات، الإشعارات، سجل النشاط، وخيارات قسم العملاء.</p>' +
+              '</div>' +
+              '<span class="status-tag status-info">NOTES &amp; CUSTOMERS ADMIN</span>' +
+            '</div>' +
+            '<div id="customer-notes-admin-host"><div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div></div>' +
+          '</div>'
+        ) : '') +
         (canManageSettings ? (
           '<div class="surface-card rg-ui-set-danger" id="danger-zone-reservations-card" style="border-top:3px solid var(--status-danger-text, #f43f5e);">' +
             '<div class="section-header" style="margin-bottom:8px;">' +
@@ -899,7 +929,20 @@
             '</div>' +
           '</div>'
         ) : '')
-      ) : '');
+      ) : (
+        canManageCustomerNotesAdmin ? (
+          '<div class="surface-card" id="customer-notes-admin-card" style="border-top:3px solid var(--brand-primary);">' +
+            '<div class="section-header">' +
+              '<div>' +
+                '<h2 class="section-title">إدارة قسم ملاحظات العملاء وقسم العملاء (Admin Control)</h2>' +
+                '<p class="section-subtitle">التحكم المركزي في الحالات الديناميكية، مصفوفة الأزرار الـ 14 والصلاحيات، قواعد الإضافة والمرفقات، الإشعارات، سجل النشاط، وخيارات قسم العملاء.</p>' +
+              '</div>' +
+              '<span class="status-tag status-info">NOTES &amp; CUSTOMERS ADMIN</span>' +
+            '</div>' +
+            '<div id="customer-notes-admin-host"><div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div></div>' +
+          '</div>'
+        ) : ''
+      ));
 
     bindPersonalAccountCard(container, ctx);
 
@@ -959,6 +1002,20 @@
     var devShortcutsHost = document.getElementById('dev-call-shortcuts-host');
     if (isDeveloperUser && devShortcutsHost && root.RGApp && typeof root.RGApp.mountCallShortcutsControlPanel === 'function') {
       root.RGApp.mountCallShortcutsControlPanel(devShortcutsHost, ctx, {});
+    }
+
+    var devIntegrityHost = document.getElementById('dev-integrity-host');
+    if (canViewDevIntegrity && devIntegrityHost) {
+      mountDeveloperIntegrityMonitorPanel(devIntegrityHost, ctx);
+    }
+
+    var notesAdminHost = document.getElementById('customer-notes-admin-host');
+    if (canManageCustomerNotesAdmin && notesAdminHost) {
+      mountCustomerNotesAdminPanel(notesAdminHost, user, ctx);
+    }
+
+    if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+      root.RGCrmDropdowns.enhanceAll(container);
     }
 
     if (root.RGApp && typeof root.RGApp.animateProgressiveReveal === 'function') {
@@ -2744,6 +2801,916 @@
         });
       });
     }
+  }
+
+  async function mountCustomerNotesAdminPanel(hostEl, user, ctx) {
+    if (!hostEl) return;
+    var core = root.RGCrmCore;
+    var isDev = Boolean(user && core && core.ROLES && user.role === core.ROLES.DEVELOPER);
+    var canCfg = Boolean(isDev || (core && (core.canUserPerform(user, 'manage_customer_notes_settings') || core.canUserPerform(user, 'manage_settings'))));
+    var canStatuses = Boolean(isDev || canCfg || (core && core.canUserPerform(user, 'manage_customer_note_statuses')));
+    var canButtons = Boolean(isDev || canCfg || (core && core.canUserPerform(user, 'manage_customer_notes_buttons')));
+
+    var state = {
+      tab: canCfg ? 'general' : (canStatuses ? 'statuses' : 'buttons'),
+      loading: true,
+      config: core && core.normalizeCustomerNotesConfig ? core.normalizeCustomerNotesConfig({}) : {},
+      statuses: core && Array.isArray(core.CUSTOMER_NOTE_DEFAULT_STATUSES) ? core.CUSTOMER_NOTE_DEFAULT_STATUSES.slice() : []
+    };
+
+    var ATT_TYPES = [
+      { mime: 'image/png', label: 'صور PNG' },
+      { mime: 'image/jpeg', label: 'صور JPG / JPEG' },
+      { mime: 'image/webp', label: 'صور WebP' },
+      { mime: 'application/pdf', label: 'ملفات PDF' },
+      { mime: 'text/plain', label: 'ملفات نصية TXT' }
+    ];
+    var ROLES_META = [
+      { key: 'developer', label: 'مبرمج' },
+      { key: 'general_manager', label: 'مدير عام' },
+      { key: 'supervisor', label: 'مشرف' },
+      { key: 'agent', label: 'موظف' }
+    ];
+    var CUST_SECTION_LABELS = [
+      { key: 'enableView', label: 'تفعيل قسم العملاء في النظام' },
+      { key: 'enableAddCustomer', label: 'السماح بإضافة عميل جديد' },
+      { key: 'enableEditCustomer', label: 'السماح بتعديل بيانات العميل' },
+      { key: 'showSensitiveIds', label: 'عرض أرقام الهوية/الجواز للمخولين' },
+      { key: 'showBookingsTab', label: 'إظهار تبويب الحجوزات في ملف العميل' },
+      { key: 'showExtensionsTab', label: 'إظهار تبويب التمديدات في ملف العميل' },
+      { key: 'showProblemsTab', label: 'إظهار تبويب الشكاوى والمشكلات' },
+      { key: 'enableSearch', label: 'تفعيل البحث في دليل العملاء' },
+      { key: 'enableFilters', label: 'تفعيل فلاتر حالات الحجز والتاريخ' },
+      { key: 'enableInternalNotes', label: 'تفعيل الملاحظات الداخلية في ملف العميل' },
+      { key: 'enableActivityLog', label: 'إظهار تبويب الخط الزمني وسجل النشاط' },
+      { key: 'enableExport', label: 'إتاحة تصدير بيانات العملاء (PDF / Excel)' },
+      { key: 'enablePrint', label: 'إتاحة طباعة بطاقة العميل' },
+      { key: 'enableStatusManagement', label: 'إتاحة تغيير حالة العميل' }
+    ];
+
+    function syncDraftFromDom() {
+      if (!hostEl) return;
+      var cfg = state.config;
+      if (state.tab === 'general') {
+        var g = cfg.general;
+        var elEn = hostEl.querySelector('#cna-gen-enabled');
+        var elTitle = hostEl.querySelector('#cna-gen-title');
+        var elPage = hostEl.querySelector('#cna-gen-pagesize');
+        var elSort = hostEl.querySelector('#cna-gen-sort');
+        var elMax = hostEl.querySelector('#cna-gen-maxres');
+        var elSearch = hostEl.querySelector('#cna-gen-search');
+        var elFilt = hostEl.querySelector('#cna-gen-filters');
+        var elRet = hostEl.querySelector('#cna-gen-retention');
+        if (elEn) g.enabled = Boolean(elEn.checked);
+        if (elTitle) g.sectionTitle = String(elTitle.value || '').trim() || 'ملاحظات العملاء';
+        if (elPage) g.pageSize = Math.max(5, Math.min(100, Number(elPage.value || 20)));
+        if (elSort) g.defaultSort = String(elSort.value || 'newest');
+        if (elMax) g.maxResults = Math.max(20, Math.min(1000, Number(elMax.value || 200)));
+        if (elSearch) g.enableSearch = Boolean(elSearch.checked);
+        if (elFilt) g.enableFilters = Boolean(elFilt.checked);
+        if (elRet) g.retentionDays = Math.max(0, Number(elRet.value || 0));
+      } else if (state.tab === 'buttons') {
+        var catalog = (core && core.CUSTOMER_NOTES_BUTTON_CATALOG) || [];
+        catalog.forEach(function (meta) {
+          var b = cfg.buttons[meta.key];
+          if (!b) return;
+          var vis = hostEl.querySelector('.cna-btn-vis[data-key="' + meta.key + '"]');
+          var en = hostEl.querySelector('.cna-btn-en[data-key="' + meta.key + '"]');
+          var conf = hostEl.querySelector('.cna-btn-conf[data-key="' + meta.key + '"]');
+          var logA = hostEl.querySelector('.cna-btn-log[data-key="' + meta.key + '"]');
+          var noti = hostEl.querySelector('.cna-btn-noti[data-key="' + meta.key + '"]');
+          if (vis) b.visible = Boolean(vis.checked);
+          if (en) b.enabled = Boolean(en.checked);
+          if (conf) b.requireConfirmation = Boolean(conf.checked);
+          if (logA) b.logActivity = Boolean(logA.checked);
+          if (noti) b.showSuccessNotification = Boolean(noti.checked);
+          var rolesChecked = Array.prototype.slice.call(hostEl.querySelectorAll('.cna-btn-role[data-key="' + meta.key + '"]:checked')).map(function (c) { return c.value; });
+          if (hostEl.querySelector('.cna-btn-role[data-key="' + meta.key + '"]')) {
+            b.allowedRoles = rolesChecked;
+          }
+          var editClosed = hostEl.querySelector('.cna-btn-edit-closed[data-key="' + meta.key + '"]');
+          var editOther = hostEl.querySelector('.cna-btn-edit-other[data-key="' + meta.key + '"]');
+          var delClosed = hostEl.querySelector('.cna-btn-del-closed[data-key="' + meta.key + '"]');
+          if (editClosed) b.allowEditAfterClose = Boolean(editClosed.checked);
+          if (editOther) b.allowAgentEditOther = Boolean(editOther.checked);
+          if (delClosed) b.allowDeleteAfterClose = Boolean(delClosed.checked);
+        });
+      } else if (state.tab === 'rules') {
+        var an = cfg.addNote;
+        var mapAddBool = {
+          '#cna-add-req-title': 'requiredTitle',
+          '#cna-add-req-res': 'requiredReservation',
+          '#cna-add-standalone': 'allowStandalone',
+          '#cna-add-res-linked': 'allowReservationLinked',
+          '#cna-add-cust-only': 'allowCustomerOnly',
+          '#cna-add-prb-linked': 'allowProblemLinked',
+          '#cna-add-internal': 'allowInternalNotes',
+          '#cna-add-editable': 'editableAfterSave'
+        };
+        Object.keys(mapAddBool).forEach(function (sel) {
+          var el = hostEl.querySelector(sel);
+          if (el) an[mapAddBool[sel]] = Boolean(el.checked);
+        });
+        var elMaxL = hostEl.querySelector('#cna-add-maxlen');
+        var elAttMb = hostEl.querySelector('#cna-add-attmb');
+        if (elMaxL) an.maxLength = Math.max(50, Math.min(20000, Number(elMaxL.value || 4000)));
+        if (elAttMb) an.maxAttachmentSizeMb = Math.max(1, Math.min(25, Number(elAttMb.value || 5)));
+        var attChecks = hostEl.querySelectorAll('.cna-add-atttype');
+        if (attChecks.length) {
+          an.allowedAttachmentTypes = Array.prototype.slice.call(attChecks).filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+        }
+
+        var nf = cfg.notifications;
+        var mapNfBool = {
+          '#cna-nf-add': 'onAdd',
+          '#cna-nf-status': 'onStatusChange',
+          '#cna-nf-assign': 'onAssign',
+          '#cna-nf-reply': 'onReplyUpdate',
+          '#cna-nf-close': 'onClose'
+        };
+        Object.keys(mapNfBool).forEach(function (sel) {
+          var el = hostEl.querySelector(sel);
+          if (el) nf[mapNfBool[sel]] = Boolean(el.checked);
+        });
+        var nfRoles = hostEl.querySelectorAll('.cna-nf-role');
+        if (nfRoles.length) {
+          nf.notifyRoles = Array.prototype.slice.call(nfRoles).filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+        }
+
+        var al = cfg.activityLog;
+        var mapAlBool = {
+          '#cna-al-add': 'trackAdd',
+          '#cna-al-edit': 'trackEdit',
+          '#cna-al-del': 'trackDelete',
+          '#cna-al-status': 'trackStatusChange',
+          '#cna-al-assign': 'trackAssign',
+          '#cna-al-att': 'trackAttachments',
+          '#cna-al-oldnew': 'includeOldNewValues',
+          '#cna-al-src': 'includeSourceSection'
+        };
+        Object.keys(mapAlBool).forEach(function (sel) {
+          var el = hostEl.querySelector(sel);
+          if (el) al[mapAlBool[sel]] = Boolean(el.checked);
+        });
+
+        var cs = cfg.customersSection;
+        hostEl.querySelectorAll('.cna-cs-chk').forEach(function (c) {
+          var k = c.getAttribute('data-cs-key');
+          if (k) cs[k] = Boolean(c.checked);
+        });
+      }
+    }
+
+    function openStatusEditorModal(existingStatus) {
+      var modalRoot = document.getElementById('modal-root');
+      if (!modalRoot) return;
+      var isEdit = Boolean(existingStatus && existingStatus.id);
+      var st = existingStatus || { id: '', name: '', description: '', color: '#3b82f6', sortOrder: 90, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: false };
+      modalRoot.innerHTML =
+        '<div class="modal-backdrop" id="cna-status-modal" role="dialog" aria-modal="true">' +
+          '<form class="modal-panel" id="cna-status-form" style="max-width:520px;">' +
+            '<div class="modal-header">' +
+              '<h3 class="modal-title">' + (isEdit ? 'تعديل حالة ملاحظة' : 'إضافة حالة ملاحظة جديدة') + '</h3>' +
+              '<button type="button" class="btn btn-sm" id="cna-st-close">إغلاق</button>' +
+            '</div>' +
+            '<div class="form-grid-2">' +
+              '<div class="form-group"><label class="form-label" for="cna-st-name">اسم الحالة *</label><input class="input" id="cna-st-name" required value="' + escapeHtml(st.name || '') + '" placeholder="مثال: متابعة عاجلة"></div>' +
+              '<div class="form-group"><label class="form-label" for="cna-st-color">اللون المميز</label><input type="color" class="input" id="cna-st-color" style="height:40px;padding:4px;" value="' + escapeHtml(st.color || '#3b82f6') + '"></div>' +
+              '<div class="form-group"><label class="form-label" for="cna-st-order">ترتيب العرض</label><input type="number" class="input tabular-nums" id="cna-st-order" min="0" max="9999" value="' + Number(st.sortOrder || 100) + '"></div>' +
+              '<div class="form-group" style="justify-content:flex-end;">' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-st-active"' + (st.isActive !== false ? ' checked' : '') + '> <span>حالة نشطة (تظهر للملاحظات الجديدة)</span></label>' +
+              '</div>' +
+            '</div>' +
+            '<div class="form-group"><label class="form-label" for="cna-st-desc">وصف الحالة</label><input class="input" id="cna-st-desc" value="' + escapeHtml(st.description || '') + '" placeholder="وصف موجز لاستخدام هذه الحالة"></div>' +
+            '<div class="checkbox-grid" style="margin-top:8px;">' +
+              '<label class="checkbox-item"><input type="checkbox" id="cna-st-default"' + (st.isDefault ? ' checked' : '') + '> <span>الحالة الافتراضية</span></label>' +
+              '<label class="checkbox-item"><input type="checkbox" id="cna-st-agent"' + (st.allowAgentSelect !== false ? ' checked' : '') + '> <span>متاحة لموظف خدمة العملاء</span></label>' +
+              '<label class="checkbox-item"><input type="checkbox" id="cna-st-closed"' + (st.isClosedStatus ? ' checked' : '') + '> <span>تُعد حالة إغلاق / أرشفة</span></label>' +
+            '</div>' +
+            '<div class="modal-footer">' +
+              '<button type="button" class="btn" id="cna-st-cancel">إلغاء</button>' +
+              '<button type="submit" class="btn btn-primary" id="cna-st-save">حفظ الحالة</button>' +
+            '</div>' +
+          '</form>' +
+        '</div>';
+      var closeM = function () { modalRoot.innerHTML = ''; };
+      modalRoot.querySelector('#cna-st-close').addEventListener('click', closeM);
+      modalRoot.querySelector('#cna-st-cancel').addEventListener('click', closeM);
+      modalRoot.querySelector('#cna-status-form').addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var nameVal = String(modalRoot.querySelector('#cna-st-name').value || '').trim();
+        if (!nameVal) { ctx.toast('اسم الحالة مطلوب.', true); return; }
+        var saveBtn = modalRoot.querySelector('#cna-st-save');
+        runWithLock(saveBtn, 'saveCustomerNoteStatus', async function () {
+          var res = await root.RGApi.callApi('saveCustomerNoteStatus', {
+            id: isEdit ? st.id : '',
+            name: nameVal,
+            description: String(modalRoot.querySelector('#cna-st-desc').value || '').trim(),
+            color: String(modalRoot.querySelector('#cna-st-color').value || '#3b82f6'),
+            sortOrder: Number(modalRoot.querySelector('#cna-st-order').value || 100),
+            isActive: Boolean(modalRoot.querySelector('#cna-st-active').checked),
+            isDefault: Boolean(modalRoot.querySelector('#cna-st-default').checked),
+            allowAgentSelect: Boolean(modalRoot.querySelector('#cna-st-agent').checked),
+            isClosedStatus: Boolean(modalRoot.querySelector('#cna-st-closed').checked)
+          });
+          if (res && res.success) {
+            if (res.data && Array.isArray(res.data.statuses)) state.statuses = res.data.statuses;
+            if (root.RGApp && typeof root.RGApp.setCustomerNoteStatuses === 'function') {
+              root.RGApp.setCustomerNoteStatuses(state.statuses);
+            }
+            closeM();
+            ctx.toast(res.message || 'تم حفظ حالة الملاحظة بنجاح.');
+            renderPanel();
+          } else {
+            ctx.toast((res && res.message) || 'تعذر حفظ الحالة.', true);
+          }
+        });
+      });
+    }
+
+    function openDeleteStatusModal(st) {
+      var modalRoot = document.getElementById('modal-root');
+      if (!modalRoot) return;
+      var alternatives = state.statuses.filter(function (s) { return s.id !== st.id && s.isActive; });
+      if (!alternatives.length) {
+        ctx.toast('يجب إبقاء حالة نشطة واحدة على الأقل كبديل قبل الحذف.', true);
+        return;
+      }
+      var hasLinked = Number(st.notesCount || 0) > 0;
+      modalRoot.innerHTML =
+        '<div class="modal-backdrop" id="cna-del-status-modal" role="dialog" aria-modal="true">' +
+          '<form class="modal-panel" id="cna-del-st-form" style="max-width:480px;">' +
+            '<div class="modal-header">' +
+              '<h3 class="modal-title" style="color:var(--status-danger-text,#f43f5e);">حذف الحالة: ' + escapeHtml(st.name) + '</h3>' +
+              '<button type="button" class="btn btn-sm" id="cna-del-close">إغلاق</button>' +
+            '</div>' +
+            '<p style="font-size:13px;line-height:1.7;">' +
+              (hasLinked
+                ? ('توجد <strong>' + Number(st.notesCount || 0) + '</strong> ملاحظة مرتبطة بهذه الحالة. اختر الحالة البديلة لنقل الملاحظات تلقائياً قبل الحذف:')
+                : 'سيتم حذف هذه الحالة من القائمة. يمكنك أيضاً تحديد حالة بديلة احتياطياً لأي ملاحظات مرتبطة:') +
+            '</p>' +
+            '<div class="form-group">' +
+              '<label class="form-label" for="cna-del-repl">الحالة البديلة للملاحظات المرتبطة *</label>' +
+              '<select class="select" id="cna-del-repl">' +
+                alternatives.map(function (a) {
+                  return '<option value="' + escapeHtml(a.id) + '" data-color="' + escapeHtml(a.color) + '">' + escapeHtml(a.name) + '</option>';
+                }).join('') +
+              '</select>' +
+            '</div>' +
+            '<div class="modal-footer">' +
+              '<button type="button" class="btn" id="cna-del-cancel">إلغاء</button>' +
+              '<button type="submit" class="btn btn-danger" id="cna-del-confirm">تأكيد الحذف والترحيل</button>' +
+            '</div>' +
+          '</form>' +
+        '</div>';
+      if (root.RGCrmDropdowns && root.RGCrmDropdowns.enhanceAll) root.RGCrmDropdowns.enhanceAll(modalRoot);
+      var closeM = function () { modalRoot.innerHTML = ''; };
+      modalRoot.querySelector('#cna-del-close').addEventListener('click', closeM);
+      modalRoot.querySelector('#cna-del-cancel').addEventListener('click', closeM);
+      modalRoot.querySelector('#cna-del-st-form').addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var replId = String(modalRoot.querySelector('#cna-del-repl').value || '');
+        var confBtn = modalRoot.querySelector('#cna-del-confirm');
+        runWithLock(confBtn, 'deleteCustomerNoteStatus:' + st.id, async function () {
+          var res = await root.RGApi.callApi('deleteCustomerNoteStatus', {
+            id: st.id,
+            replacementStatusId: replId
+          });
+          if (res && res.success) {
+            if (res.data && Array.isArray(res.data.statuses)) state.statuses = res.data.statuses;
+            if (root.RGApp && typeof root.RGApp.setCustomerNoteStatuses === 'function') {
+              root.RGApp.setCustomerNoteStatuses(state.statuses);
+            }
+            closeM();
+            ctx.toast(res.message || 'تم حذف الحالة وترحيل الملاحظات المرتبطة.');
+            renderPanel();
+          } else {
+            ctx.toast((res && res.message) || 'تعذر حذف الحالة.', true);
+          }
+        });
+      });
+    }
+
+    function renderPanel() {
+      if (!hostEl.isConnected) return;
+      if (state.loading) {
+        hostEl.innerHTML = '<div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+        return;
+      }
+      var cfg = state.config;
+      var g = cfg.general;
+      var an = cfg.addNote;
+      var nf = cfg.notifications;
+      var al = cfg.activityLog;
+      var cs = cfg.customersSection;
+      var catalog = (core && core.CUSTOMER_NOTES_BUTTON_CATALOG) || [];
+
+      var tabsHtml =
+        '<div class="rg-admin-tabs-bar">' +
+          (canCfg ? '<button type="button" class="btn btn-sm ' + (state.tab === 'general' ? 'btn-primary' : '') + ' cna-tab-btn" data-tab="general">الإعدادات العامة</button>' : '') +
+          (canStatuses ? '<button type="button" class="btn btn-sm ' + (state.tab === 'statuses' ? 'btn-primary' : '') + ' cna-tab-btn" data-tab="statuses">الحالات (' + state.statuses.length + ')</button>' : '') +
+          (canButtons ? '<button type="button" class="btn btn-sm ' + (state.tab === 'buttons' ? 'btn-primary' : '') + ' cna-tab-btn" data-tab="buttons">مصفوفة الأزرار (14)</button>' : '') +
+          (canCfg ? '<button type="button" class="btn btn-sm ' + (state.tab === 'rules' ? 'btn-primary' : '') + ' cna-tab-btn" data-tab="rules">قواعد الإضافة والإشعارات وقسم العملاء</button>' : '') +
+        '</div>';
+
+      var bodyHtml = '';
+      if (state.tab === 'general') {
+        bodyHtml =
+          '<div class="form-grid-3">' +
+            '<div class="form-group"><label class="form-label" for="cna-gen-title">عنوان القسم</label><input class="input" id="cna-gen-title" value="' + escapeHtml(g.sectionTitle) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="cna-gen-sort">الترتيب الافتراضي للملاحظات</label>' +
+              '<select class="select" id="cna-gen-sort">' +
+                '<option value="newest"' + (g.defaultSort === 'newest' ? ' selected' : '') + '>الأحدث أولاً</option>' +
+                '<option value="oldest"' + (g.defaultSort === 'oldest' ? ' selected' : '') + '>الأقدم أولاً</option>' +
+                '<option value="updated"' + (g.defaultSort === 'updated' ? ' selected' : '') + '>آخر تحديث</option>' +
+                '<option value="status"' + (g.defaultSort === 'status' ? ' selected' : '') + '>حسب الحالة</option>' +
+              '</select>' +
+            '</div>' +
+            '<div class="form-group"><label class="form-label" for="cna-gen-pagesize">عدد الملاحظات بالصفحة</label><input type="number" class="input tabular-nums" id="cna-gen-pagesize" min="5" max="100" value="' + g.pageSize + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="cna-gen-maxres">الحد الأقصى للنتائج</label><input type="number" class="input tabular-nums" id="cna-gen-maxres" min="20" max="1000" value="' + g.maxResults + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="cna-gen-retention">مدة الاحتفاظ بالأرشيف (أيام / 0 = دائم)</label><input type="number" class="input tabular-nums" id="cna-gen-retention" min="0" max="3650" value="' + g.retentionDays + '"></div>' +
+          '</div>' +
+          '<div class="checkbox-grid" style="margin-top:8px;">' +
+            '<label class="checkbox-item"><input type="checkbox" id="cna-gen-enabled"' + (g.enabled ? ' checked' : '') + '> <span>تفعيل قسم ملاحظات العملاء على مستوى النظام</span></label>' +
+            '<label class="checkbox-item"><input type="checkbox" id="cna-gen-search"' + (g.enableSearch ? ' checked' : '') + '> <span>تفعيل مربع البحث السريع</span></label>' +
+            '<label class="checkbox-item"><input type="checkbox" id="cna-gen-filters"' + (g.enableFilters ? ' checked' : '') + '> <span>تفعيل الفلاتر المتقدمة</span></label>' +
+          '</div>';
+      } else if (state.tab === 'statuses') {
+        bodyHtml =
+          '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">' +
+            '<span style="font-size:12.5px;color:var(--text-muted);">الحالات غير النشطة تبقى ظاهرة على الملاحظات القديمة لكن يُمنع اختيارها للملاحظات الجديدة.</span>' +
+            '<button type="button" class="btn btn-sm btn-primary" id="cna-add-status-btn">+ إضافة حالة جديدة</button>' +
+          '</div>' +
+          '<div class="table-wrap"><table class="table"><thead><tr><th>الحالة</th><th>الوصف</th><th>الترتيب</th><th>التصنيف</th><th>الملاحظات</th><th>إجراءات</th></tr></thead><tbody>' +
+            state.statuses.map(function (st) {
+              return '<tr>' +
+                '<td><span class="rg-note-status-badge" style="--status-color:' + escapeHtml(st.color) + ';"><span class="rg-note-status-dot" style="background:' + escapeHtml(st.color) + ';"></span>' + escapeHtml(st.name) + '</span>' +
+                  (st.isDefault ? ' <span class="status-tag status-info">افتراضية</span>' : '') +
+                '</td>' +
+                '<td style="font-size:12px;color:var(--text-secondary);">' + escapeHtml(st.description || '-') + '</td>' +
+                '<td class="tabular-nums">' + Number(st.sortOrder || 0) + '</td>' +
+                '<td>' +
+                  '<span class="status-tag ' + (st.isActive ? 'status-success' : 'status-danger') + '">' + (st.isActive ? 'نشطة' : 'معطلة') + '</span> ' +
+                  (st.isClosedStatus ? '<span class="status-tag status-info">إغلاق</span> ' : '') +
+                  (st.allowAgentSelect === false ? '<span class="status-tag status-warning">إدارية فقط</span>' : '') +
+                '</td>' +
+                '<td class="tabular-nums">' + Number(st.notesCount || 0) + '</td>' +
+                '<td><div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+                  '<button type="button" class="btn btn-sm cna-st-edit-btn" data-id="' + escapeHtml(st.id) + '">تعديل</button>' +
+                  '<button type="button" class="btn btn-sm cna-st-toggle-btn" data-id="' + escapeHtml(st.id) + '">' + (st.isActive ? 'تعطيل' : 'تفعيل') + '</button>' +
+                  '<button type="button" class="btn btn-sm btn-danger cna-st-del-btn" data-id="' + escapeHtml(st.id) + '">حذف</button>' +
+                '</div></td>' +
+              '</tr>';
+            }).join('') +
+          '</tbody></table></div>';
+      } else if (state.tab === 'buttons') {
+        bodyHtml =
+          '<div class="table-wrap"><table class="table"><thead><tr><th>الزر / الإجراء</th><th>ظاهر</th><th>مفعل</th><th>تأكيد</th><th>تسجيل سجل</th><th>إشعار</th><th>الأدوار المخولة</th><th>قواعد إضافية</th></tr></thead><tbody>' +
+            catalog.map(function (meta) {
+              var b = cfg.buttons[meta.key] || {};
+              var roles = Array.isArray(b.allowedRoles) ? b.allowedRoles : [];
+              var extraHtml = '-';
+              if (meta.key === 'edit_note') {
+                extraHtml =
+                  '<label class="checkbox-item" style="font-size:11.5px;"><input type="checkbox" class="cna-btn-edit-closed" data-key="edit_note"' + (b.allowEditAfterClose ? ' checked' : '') + '> بعد الإغلاق</label>' +
+                  '<label class="checkbox-item" style="font-size:11.5px;"><input type="checkbox" class="cna-btn-edit-other" data-key="edit_note"' + (b.allowAgentEditOther ? ' checked' : '') + '> تعديل ملاحظة الغير</label>';
+              } else if (meta.key === 'delete_note') {
+                extraHtml = '<label class="checkbox-item" style="font-size:11.5px;"><input type="checkbox" class="cna-btn-del-closed" data-key="delete_note"' + (b.allowDeleteAfterClose ? ' checked' : '') + '> حذف بعد الإغلاق</label>';
+              }
+              return '<tr>' +
+                '<td><strong>' + escapeHtml(meta.labelAr) + '</strong><div class="mono" style="font-size:11px;color:var(--text-muted);">' + escapeHtml(meta.key) + '</div></td>' +
+                '<td><input type="checkbox" class="cna-btn-vis" data-key="' + escapeHtml(meta.key) + '"' + (b.visible !== false ? ' checked' : '') + ' aria-label="إظهار ' + escapeHtml(meta.labelAr) + '"></td>' +
+                '<td><input type="checkbox" class="cna-btn-en" data-key="' + escapeHtml(meta.key) + '"' + (b.enabled !== false ? ' checked' : '') + ' aria-label="تفعيل ' + escapeHtml(meta.labelAr) + '"></td>' +
+                '<td><input type="checkbox" class="cna-btn-conf" data-key="' + escapeHtml(meta.key) + '"' + (b.requireConfirmation ? ' checked' : '') + ' aria-label="تأكيد ' + escapeHtml(meta.labelAr) + '"></td>' +
+                '<td><input type="checkbox" class="cna-btn-log" data-key="' + escapeHtml(meta.key) + '"' + (b.logActivity !== false ? ' checked' : '') + ' aria-label="سجل ' + escapeHtml(meta.labelAr) + '"></td>' +
+                '<td><input type="checkbox" class="cna-btn-noti" data-key="' + escapeHtml(meta.key) + '"' + (b.showSuccessNotification !== false ? ' checked' : '') + ' aria-label="إشعار ' + escapeHtml(meta.labelAr) + '"></td>' +
+                '<td><div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+                  ROLES_META.map(function (rm) {
+                    return '<label class="checkbox-item" style="font-size:11.5px;"><input type="checkbox" class="cna-btn-role" data-key="' + escapeHtml(meta.key) + '" value="' + escapeHtml(rm.key) + '"' + (roles.indexOf(rm.key) !== -1 ? ' checked' : '') + '> ' + escapeHtml(rm.label) + '</label>';
+                  }).join('') +
+                '</div></td>' +
+                '<td>' + extraHtml + '</td>' +
+              '</tr>';
+            }).join('') +
+          '</tbody></table></div>';
+      } else {
+        bodyHtml =
+          '<div style="display:flex;flex-direction:column;gap:14px;">' +
+            '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
+              '<strong style="display:block;margin-bottom:8px;">قواعد الإضافة والمرفقات (addNote)</strong>' +
+              '<div class="form-grid-2" style="margin-bottom:8px;">' +
+                '<div class="form-group"><label class="form-label" for="cna-add-maxlen">أقصى عدد حروف للملاحظة</label><input type="number" class="input tabular-nums" id="cna-add-maxlen" min="50" max="20000" value="' + an.maxLength + '"></div>' +
+                '<div class="form-group"><label class="form-label" for="cna-add-attmb">أقصى حجم للمرفق (MB)</label><input type="number" class="input tabular-nums" id="cna-add-attmb" min="1" max="25" value="' + an.maxAttachmentSizeMb + '"></div>' +
+              '</div>' +
+              '<div class="checkbox-grid">' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-req-title"' + (an.requiredTitle ? ' checked' : '') + '> <span>عنوان الملاحظة إلزامي</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-req-res"' + (an.requiredReservation ? ' checked' : '') + '> <span>الربط بحجز إلزامي</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-standalone"' + (an.allowStandalone ? ' checked' : '') + '> <span>السماح بملاحظات مستقلة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-res-linked"' + (an.allowReservationLinked ? ' checked' : '') + '> <span>السماح بالربط بالحجوزات</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-cust-only"' + (an.allowCustomerOnly ? ' checked' : '') + '> <span>السماح بملاحظات العميل فقط</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-prb-linked"' + (an.allowProblemLinked ? ' checked' : '') + '> <span>السماح بالربط بالمشكلات</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-internal"' + (an.allowInternalNotes ? ' checked' : '') + '> <span>السماح بالملاحظات الداخلية</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-add-editable"' + (an.editableAfterSave ? ' checked' : '') + '> <span>السماح بالتعديل بعد الحفظ</span></label>' +
+              '</div>' +
+              '<div style="margin-top:8px;"><span class="form-label">أنواع المرفقات المسموحة:</span><div class="checkbox-grid">' +
+                ATT_TYPES.map(function (at) {
+                  var chk = (an.allowedAttachmentTypes || []).indexOf(at.mime) !== -1;
+                  return '<label class="checkbox-item"><input type="checkbox" class="cna-add-atttype" value="' + escapeHtml(at.mime) + '"' + (chk ? ' checked' : '') + '> <span>' + escapeHtml(at.label) + '</span></label>';
+                }).join('') +
+              '</div></div>' +
+            '</div>' +
+
+            '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
+              '<strong style="display:block;margin-bottom:8px;">الإشعارات وسجل النشاط (Notifications &amp; Activity Log)</strong>' +
+              '<div class="checkbox-grid">' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-nf-add"' + (nf.onAdd ? ' checked' : '') + '> <span>إشعار عند إضافة ملاحظة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-nf-status"' + (nf.onStatusChange ? ' checked' : '') + '> <span>إشعار عند تغيير الحالة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-nf-assign"' + (nf.onAssign ? ' checked' : '') + '> <span>إشعار عند إسناد مهمة متابعة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-nf-reply"' + (nf.onReplyUpdate ? ' checked' : '') + '> <span>إشعار عند تعديل الملاحظة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-nf-close"' + (nf.onClose ? ' checked' : '') + '> <span>إشعار عند إغلاق الملاحظة</span></label>' +
+              '</div>' +
+              '<div style="margin-top:8px;"><span class="form-label">الأدوار المستلمة للإشعارات:</span><div class="checkbox-grid">' +
+                ROLES_META.map(function (rm) {
+                  var chk = (nf.notifyRoles || []).indexOf(rm.key) !== -1;
+                  return '<label class="checkbox-item"><input type="checkbox" class="cna-nf-role" value="' + escapeHtml(rm.key) + '"' + (chk ? ' checked' : '') + '> <span>' + escapeHtml(rm.label) + '</span></label>';
+                }).join('') +
+              '</div></div>' +
+              '<div class="checkbox-grid" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border-hairline);">' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-add"' + (al.trackAdd ? ' checked' : '') + '> <span>تتبع الإضافة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-edit"' + (al.trackEdit ? ' checked' : '') + '> <span>تتبع التعديل</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-del"' + (al.trackDelete ? ' checked' : '') + '> <span>تتبع الحذف</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-status"' + (al.trackStatusChange ? ' checked' : '') + '> <span>تتبع تغيير الحالة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-assign"' + (al.trackAssign ? ' checked' : '') + '> <span>تتبع الإسناد</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-att"' + (al.trackAttachments ? ' checked' : '') + '> <span>تتبع المرفقات</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-oldnew"' + (al.includeOldNewValues ? ' checked' : '') + '> <span>تسجيل القيمة القديمة والجديدة</span></label>' +
+                '<label class="checkbox-item"><input type="checkbox" id="cna-al-src"' + (al.includeSourceSection ? ' checked' : '') + '> <span>تسجيل القسم المصدر</span></label>' +
+              '</div>' +
+            '</div>' +
+
+            '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);">' +
+              '<strong style="display:block;margin-bottom:8px;">خيارات قسم العملاء (Customers Section)</strong>' +
+              '<div class="checkbox-grid">' +
+                CUST_SECTION_LABELS.map(function (csl) {
+                  return '<label class="checkbox-item"><input type="checkbox" class="cna-cs-chk" data-cs-key="' + escapeHtml(csl.key) + '"' + (cs[csl.key] !== false ? ' checked' : '') + '> <span>' + escapeHtml(csl.label) + '</span></label>';
+                }).join('') +
+              '</div>' +
+            '</div>' +
+          '</div>';
+      }
+
+      var saveBtnHtml = (state.tab !== 'statuses' && (canCfg || canButtons))
+        ? '<div style="margin-top:14px;display:flex;justify-content:flex-end;"><button type="button" class="btn btn-primary" id="cna-save-config-btn">حفظ إعدادات ملاحظات العملاء وقسم العملاء</button></div>'
+        : '';
+
+      hostEl.innerHTML = tabsHtml + bodyHtml + saveBtnHtml;
+
+      if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+        root.RGCrmDropdowns.enhanceAll(hostEl);
+      }
+
+      hostEl.querySelectorAll('.cna-tab-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          syncDraftFromDom();
+          state.tab = btn.getAttribute('data-tab') || 'general';
+          renderPanel();
+        });
+      });
+
+      var addStBtn = hostEl.querySelector('#cna-add-status-btn');
+      if (addStBtn) {
+        addStBtn.addEventListener('click', function () { openStatusEditorModal(null); });
+      }
+      hostEl.querySelectorAll('.cna-st-edit-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var sid = btn.getAttribute('data-id');
+          var stObj = state.statuses.find(function (s) { return s.id === sid; });
+          if (stObj) openStatusEditorModal(stObj);
+        });
+      });
+      hostEl.querySelectorAll('.cna-st-toggle-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var sid = btn.getAttribute('data-id');
+          var stObj = state.statuses.find(function (s) { return s.id === sid; });
+          if (!stObj) return;
+          runWithLock(btn, 'toggleCustomerNoteStatus:' + sid, async function () {
+            var res = await root.RGApi.callApi('toggleCustomerNoteStatus', { id: sid, isActive: !stObj.isActive });
+            if (res && res.success) {
+              if (res.data && Array.isArray(res.data.statuses)) state.statuses = res.data.statuses;
+              if (root.RGApp && typeof root.RGApp.setCustomerNoteStatuses === 'function') {
+                root.RGApp.setCustomerNoteStatuses(state.statuses);
+              }
+              ctx.toast(res.message || 'تم تحديث حالة التفعيل.');
+              renderPanel();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر تحديث الحالة.', true);
+            }
+          });
+        });
+      });
+      hostEl.querySelectorAll('.cna-st-del-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var sid = btn.getAttribute('data-id');
+          var stObj = state.statuses.find(function (s) { return s.id === sid; });
+          if (stObj) openDeleteStatusModal(stObj);
+        });
+      });
+
+      var saveCfgBtn = hostEl.querySelector('#cna-save-config-btn');
+      if (saveCfgBtn) {
+        saveCfgBtn.addEventListener('click', function () {
+          syncDraftFromDom();
+          runWithLock(saveCfgBtn, 'saveCustomerNotesConfig', async function () {
+            var res = await root.RGApi.callApi('saveCustomerNotesConfig', { config: state.config });
+            if (res && res.success) {
+              if (res.data && res.data.config) {
+                state.config = core && core.normalizeCustomerNotesConfig
+                  ? core.normalizeCustomerNotesConfig(res.data.config)
+                  : res.data.config;
+              }
+              if (root.RGApp && typeof root.RGApp.setCustomerNotesConfig === 'function') {
+                root.RGApp.setCustomerNotesConfig(state.config);
+              }
+              ctx.toast(res.message || 'تم حفظ إعدادات ملاحظات العملاء وقسم العملاء بنجاح.');
+              renderPanel();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر حفظ الإعدادات.', true);
+            }
+          });
+        });
+      }
+    }
+
+    renderPanel();
+    try {
+      var res = await root.RGApi.callApi('getCustomerNotesConfig', { abortKey: 'set:notesConfig' });
+      if (res && res.aborted) return;
+      if (res && res.success && res.data) {
+        if (res.data.config) {
+          state.config = core && core.normalizeCustomerNotesConfig
+            ? core.normalizeCustomerNotesConfig(res.data.config)
+            : res.data.config;
+        }
+        if (Array.isArray(res.data.statuses)) {
+          state.statuses = res.data.statuses;
+        }
+      }
+    } catch (_e) {}
+    state.loading = false;
+    renderPanel();
+  }
+
+  async function mountDeveloperIntegrityMonitorPanel(hostEl, ctx) {
+    if (!hostEl) return;
+    var core = root.RGCrmCore;
+    var SCOPES_META = [
+      { key: 'reservations', label: 'الحجوزات' },
+      { key: 'extensions', label: 'التمديدات' },
+      { key: 'cancelled', label: 'الإلغاءات والرفض' },
+      { key: 'company_changes', label: 'تغييرات شركات التأجير' }
+    ];
+    var state = {
+      loading: true,
+      report: null,
+      filters: { discrepancyType: '', resolutionStatus: 'open', search: '' }
+    };
+
+    async function loadReport() {
+      state.loading = true;
+      renderIntegrityPanel();
+      try {
+        var res = await root.RGApi.callApi('getDataIntegrityReport', Object.assign({ abortKey: 'set:integrity' }, state.filters));
+        if (res && res.aborted) return;
+        if (res && res.success && res.data) {
+          state.report = res.data;
+        } else if (ctx && ctx.toast && res && res.message) {
+          ctx.toast(res.message, true);
+        }
+      } catch (_e) {}
+      state.loading = false;
+      renderIntegrityPanel();
+    }
+
+    function openIntegrityDiffModal(issueId) {
+      var modalRoot = document.getElementById('modal-root');
+      if (!modalRoot) return;
+      root.RGApi.callApi('resolveDataIntegrityIssue', { issueId: issueId, previewOnly: true }).then(function (res) {
+        if (!res || !res.success || !res.data) {
+          ctx.toast((res && res.message) || 'تعذر تحميل معاينة الفروقات.', true);
+          return;
+        }
+        var d = res.data;
+        var rgP = d.rgProjection || {};
+        var nP = d.neonProjection || {};
+        var iss = d.issue || {};
+        var COMP_FIELDS = [
+          { key: 'reservationNumber', label: 'رقم الحجز' },
+          { key: 'statusCode', label: 'رمز الحالة الأصلي' },
+          { key: 'statusAr', label: 'الحالة العربية' },
+          { key: 'customerName', label: 'اسم العميل' },
+          { key: 'customerPhone', label: 'رقم الجوال' },
+          { key: 'startDate', label: 'تاريخ الاستلام' },
+          { key: 'endDate', label: 'تاريخ الإرجاع الفعلي' },
+          { key: 'carName', label: 'السيارة' },
+          { key: 'companyName', label: 'شركة التأجير' },
+          { key: 'extensionsCount', label: 'عدد التمديدات' }
+        ];
+        modalRoot.innerHTML =
+          '<div class="modal-backdrop" id="di-diff-modal" role="dialog" aria-modal="true">' +
+            '<form class="modal-panel" id="di-diff-form" style="max-width:740px;">' +
+              '<div class="modal-header">' +
+                '<h3 class="modal-title">معاينة الفروقات وإصلاح السجل: <span class="mono">' + escapeHtml(iss.reservationNumber || iss.reservationId) + '</span></h3>' +
+                '<button type="button" class="btn btn-sm" id="di-diff-close">إغلاق</button>' +
+              '</div>' +
+              '<div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:10px;">نوع التعارض: <strong>' + escapeHtml(iss.typeLabelAr || iss.discrepancyType) + '</strong></div>' +
+              '<div class="table-wrap"><table class="rg-diff-table"><thead><tr><th>الحقل</th><th>قيمة Rental Gate API</th><th>قيمة Neon PostgreSQL</th></tr></thead><tbody>' +
+                COMP_FIELDS.map(function (cf) {
+                  var vRg = String(rgP[cf.key] !== undefined ? rgP[cf.key] : '-');
+                  var vNe = String(nP[cf.key] !== undefined ? nP[cf.key] : '-');
+                  var isDiff = vRg !== vNe;
+                  return '<tr class="' + (isDiff ? 'is-diff' : '') + '"><td><strong>' + escapeHtml(cf.label) + '</strong></td><td>' + escapeHtml(vRg || '-') + '</td><td>' + escapeHtml(vNe || '-') + '</td></tr>';
+                }).join('') +
+              '</tbody></table></div>' +
+              '<div class="form-grid-2" style="margin-top:12px;">' +
+                '<div class="form-group"><label class="form-label" for="di-res-action">إجراء المعالجة</label>' +
+                  '<select class="select" id="di-res-action">' +
+                    '<option value="sync_from_rg">مزامنة وتحديث السجل من Rental Gate API</option>' +
+                    '<option value="update_fields">تحديث الحقول المتعارضة فقط</option>' +
+                    '<option value="mark_resolved">اعتماد السجل كمحلول</option>' +
+                    '<option value="ignore">تجاهل التعارض</option>' +
+                  '</select>' +
+                '</div>' +
+                '<div class="form-group"><label class="form-label" for="di-res-note">ملاحظة المبرمج (اختياري)</label>' +
+                  '<input class="input" id="di-res-note" placeholder="سبب الإجراء أو ملاحظة التوثيق...">' +
+                '</div>' +
+              '</div>' +
+              '<label class="checkbox-item" style="margin-top:8px;font-weight:700;"><input type="checkbox" id="di-approve-chk"> <span>أوافق بصفتي المبرمج على تنفيذ هذا التعديل بعد معاينة الفروقات أعلاه</span></label>' +
+              '<div class="modal-footer">' +
+                '<button type="button" class="btn" id="di-diff-cancel">إلغاء</button>' +
+                '<button type="submit" class="btn btn-primary" id="di-exec-btn" disabled>تنفيذ الإجراء المعتمد</button>' +
+              '</div>' +
+            '</form>' +
+          '</div>';
+        if (root.RGCrmDropdowns && root.RGCrmDropdowns.enhanceAll) root.RGCrmDropdowns.enhanceAll(modalRoot);
+        var closeM = function () { modalRoot.innerHTML = ''; };
+        modalRoot.querySelector('#di-diff-close').addEventListener('click', closeM);
+        modalRoot.querySelector('#di-diff-cancel').addEventListener('click', closeM);
+        var appChk = modalRoot.querySelector('#di-approve-chk');
+        var execBtn = modalRoot.querySelector('#di-exec-btn');
+        appChk.addEventListener('change', function () { execBtn.disabled = !appChk.checked; });
+        modalRoot.querySelector('#di-diff-form').addEventListener('submit', function (ev) {
+          ev.preventDefault();
+          if (!appChk.checked) {
+            ctx.toast('يرجى تحديد موافقة المبرمج الصريحة قبل التنفيذ.', true);
+            return;
+          }
+          var actionVal = String(modalRoot.querySelector('#di-res-action').value || 'sync_from_rg');
+          var noteVal = String(modalRoot.querySelector('#di-res-note').value || '').trim();
+          runWithLock(execBtn, 'resolveDataIntegrityIssue:' + issueId, async function () {
+            var execRes = await root.RGApi.callApi('resolveDataIntegrityIssue', {
+              issueId: issueId,
+              resolutionAction: actionVal,
+              note: noteVal,
+              approved: true
+            });
+            if (execRes && execRes.success) {
+              closeM();
+              ctx.toast(execRes.message || 'تم تنفيذ الإجراء وتسجيل نقطة التراجع.');
+              loadReport();
+            } else {
+              ctx.toast((execRes && execRes.message) || 'تعذر تنفيذ الإجراء.', true);
+            }
+          });
+        });
+      });
+    }
+
+    function renderIntegrityPanel() {
+      if (!hostEl.isConnected) return;
+      if (state.loading && !state.report) {
+        hostEl.innerHTML = '<div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+        return;
+      }
+      var rep = state.report || {};
+      var intSettings = (core && core.normalizeDataIntegritySettings) ? core.normalizeDataIntegritySettings(rep.settings) : (rep.settings || {});
+      var liveStats = rep.liveNeonStats || {};
+      var latestRun = rep.latestRun || null;
+      var issues = Array.isArray(rep.issues) ? rep.issues : [];
+      var actions = Array.isArray(rep.actions) ? rep.actions : [];
+      var typeCatalog = (core && core.DATA_INTEGRITY_DISCREPANCY_TYPES) || {};
+
+      hostEl.innerHTML =
+        '<div class="rg-integrity-summary-grid">' +
+          '<div class="rg-integrity-stat"><span class="k">إجمالي الحجوزات في Neon</span><span class="v tabular-nums">' + Number(liveStats.total || 0) + '</span></div>' +
+          '<div class="rg-integrity-stat"><span class="k">الحجوزات النشطة</span><span class="v tabular-nums">' + Number(liveStats.activeCount || 0) + '</span></div>' +
+          '<div class="rg-integrity-stat"><span class="k">الحجوزات المنتهية</span><span class="v tabular-nums">' + Number(liveStats.completedCount || 0) + '</span></div>' +
+          '<div class="rg-integrity-stat"><span class="k">الملغاة</span><span class="v tabular-nums">' + Number(liveStats.cancelledCount || 0) + '</span></div>' +
+          '<div class="rg-integrity-stat"><span class="k">المرفوضة</span><span class="v tabular-nums">' + Number(liveStats.rejectedCount || 0) + '</span></div>' +
+          '<div class="rg-integrity-stat"><span class="k">التمديدات</span><span class="v tabular-nums">' + Number(liveStats.extensionsCount || 0) + '</span></div>' +
+        '</div>' +
+
+        (latestRun ? (
+          '<div style="padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);margin-bottom:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12.5px;">' +
+            '<span>آخر فحص: <strong dir="ltr">' + escapeHtml(formatSettingDateTime(latestRun.finishedAt || latestRun.startedAt, ctx)) + '</strong> (' + escapeHtml(latestRun.runMode === 'scheduled' ? 'مجدول' : 'يدوي') + ')</span>' +
+            '<span>Rental Gate API: <strong class="tabular-nums">' + Number(latestRun.rgCount || 0) + '</strong> · Neon: <strong class="tabular-nums">' + Number(latestRun.neonCount || 0) + '</strong> · الفروقات المكتشفة: <strong class="tabular-nums">' + Number(latestRun.discrepanciesCount || 0) + '</strong></span>' +
+          '</div>'
+        ) : '') +
+
+        '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);margin-bottom:12px;">' +
+          '<div class="form-grid-4">' +
+            '<div class="form-group"><label class="form-label" for="di-mode">وضع المراقبة</label>' +
+              '<select class="select" id="di-mode">' +
+                '<option value="manual"' + (intSettings.mode === 'manual' ? ' selected' : '') + '>يدوي (عند الطلب فقط)</option>' +
+                '<option value="scheduled"' + (intSettings.mode === 'scheduled' ? ' selected' : '') + '>مجدول تلقائياً</option>' +
+              '</select>' +
+            '</div>' +
+            '<div class="form-group"><label class="form-label" for="di-interval">الفاصل الزمني (دقائق)</label><input type="number" class="input tabular-nums" id="di-interval" min="5" max="1440" value="' + Number(intSettings.intervalMinutes || 60) + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="di-date-from">من تاريخ</label><input type="date" class="input mono" id="di-date-from" dir="ltr" value="' + escapeHtml(intSettings.dateFrom || '') + '"></div>' +
+            '<div class="form-group"><label class="form-label" for="di-date-to">إلى تاريخ</label><input type="date" class="input mono" id="di-date-to" dir="ltr" value="' + escapeHtml(intSettings.dateTo || '') + '"></div>' +
+          '</div>' +
+          '<div class="checkbox-grid" style="margin-top:8px;">' +
+            SCOPES_META.map(function (sc) {
+              var chk = (intSettings.scopes || []).indexOf(sc.key) !== -1;
+              return '<label class="checkbox-item"><input type="checkbox" class="di-scope-chk" value="' + escapeHtml(sc.key) + '"' + (chk ? ' checked' : '') + '> <span>' + escapeHtml(sc.label) + '</span></label>';
+            }).join('') +
+          '</div>' +
+          '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
+            '<button type="button" class="btn btn-primary btn-sm" id="di-run-now-btn">فحص الآن (قراءة فقط)</button>' +
+            '<button type="button" class="btn btn-sm" id="di-save-sched-btn">حفظ الجدولة والنطاق</button>' +
+            '<button type="button" class="btn btn-sm ' + (intSettings.paused ? 'btn-primary' : 'btn-danger') + '" id="di-pause-btn">' + (intSettings.paused ? 'استئناف المراقبة' : 'إيقاف المراقبة مؤقتاً') + '</button>' +
+            '<span class="status-tag ' + (intSettings.paused ? 'status-warning' : 'status-success') + '">' + (intSettings.paused ? 'متوقفة مؤقتاً' : 'نشطة') + '</span>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="toolbar-row" style="margin-bottom:10px;flex-wrap:wrap;">' +
+          '<input type="search" class="input" id="di-filter-search" style="max-width:220px;" placeholder="بحث برقم الحجز..." value="' + escapeHtml(state.filters.search) + '">' +
+          '<select class="select" id="di-filter-type" style="max-width:240px;">' +
+            '<option value="">كل أنواع التعارضات</option>' +
+            Object.keys(typeCatalog).map(function (tk) {
+              return '<option value="' + escapeHtml(tk) + '"' + (state.filters.discrepancyType === tk ? ' selected' : '') + '>' + escapeHtml(typeCatalog[tk].labelAr || tk) + '</option>';
+            }).join('') +
+          '</select>' +
+          '<select class="select" id="di-filter-status" style="max-width:180px;">' +
+            '<option value="open"' + (state.filters.resolutionStatus === 'open' ? ' selected' : '') + '>المفتوحة فقط</option>' +
+            '<option value="resolved"' + (state.filters.resolutionStatus === 'resolved' ? ' selected' : '') + '>المحلولة</option>' +
+            '<option value="ignored"' + (state.filters.resolutionStatus === 'ignored' ? ' selected' : '') + '>المتجاهلة</option>' +
+            '<option value=""' + (state.filters.resolutionStatus === '' ? ' selected' : '') + '>الكل</option>' +
+          '</select>' +
+          '<button type="button" class="btn btn-sm" id="di-apply-filters-btn">تطبيق الفلاتر</button>' +
+        '</div>' +
+
+        '<div class="table-wrap"><table class="table"><thead><tr><th>رقم الحجز</th><th>نوع التعارض</th><th>الحقل</th><th>قيمة RG API</th><th>قيمة Neon</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>' +
+          (issues.length
+            ? issues.map(function (iss) {
+                var stCls = iss.resolutionStatus === 'resolved' ? 'status-success' : (iss.resolutionStatus === 'ignored' ? 'status-info' : 'status-danger');
+                var stLbl = iss.resolutionStatus === 'resolved' ? 'محلولة' : (iss.resolutionStatus === 'ignored' ? 'متجاهلة' : 'مفتوحة');
+                return '<tr>' +
+                  '<td class="mono">' + escapeHtml(iss.reservationNumber || iss.reservationId || '-') + '</td>' +
+                  '<td>' + escapeHtml(iss.typeLabelAr || iss.discrepancyType) + '</td>' +
+                  '<td class="mono" dir="ltr">' + escapeHtml(iss.fieldName || '-') + '</td>' +
+                  '<td style="font-size:12px;">' + escapeHtml(iss.rgValue || '-') + '</td>' +
+                  '<td style="font-size:12px;">' + escapeHtml(iss.neonValue || '-') + '</td>' +
+                  '<td><span class="status-tag ' + stCls + '">' + stLbl + '</span></td>' +
+                  '<td><div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+                    '<button type="button" class="btn btn-sm btn-primary di-preview-btn" data-id="' + escapeHtml(iss.id) + '">معاينة وإصلاح</button>' +
+                    '<button type="button" class="btn btn-sm di-recheck-btn" data-id="' + escapeHtml(iss.id) + '" data-res-id="' + escapeHtml(iss.reservationId || '') + '">إعادة فحص</button>' +
+                  '</div></td>' +
+                '</tr>';
+              }).join('')
+            : '<tr><td colspan="7" class="empty-state">لا توجد فروقات أو تعارضات مطابقة حالياً.</td></tr>') +
+        '</tbody></table></div>' +
+
+        (actions.length ? (
+          '<div style="margin-top:14px;">' +
+            '<h4 style="margin:0 0 8px;font-size:13.5px;">سجل عمليات الإصلاح وإمكانية التراجع (Rollback)</h4>' +
+            '<div class="table-wrap"><table class="table"><thead><tr><th>رقم الحجز</th><th>الإجراء</th><th>بواسطة</th><th>التاريخ</th><th>الحالة / التراجع</th></tr></thead><tbody>' +
+              actions.slice(0, 15).map(function (act) {
+                return '<tr>' +
+                  '<td class="mono">' + escapeHtml(act.reservationNumber || act.reservationId || '-') + '</td>' +
+                  '<td>' + escapeHtml(act.actionType || '-') + '</td>' +
+                  '<td>' + escapeHtml(act.actorName || '-') + '</td>' +
+                  '<td class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(act.createdAt, ctx)) + '</td>' +
+                  '<td>' +
+                    (act.rolledBack
+                      ? '<span class="status-tag status-info">تم التراجع</span>'
+                      : (act.rollbackSupported
+                          ? '<button type="button" class="btn btn-sm btn-danger di-rollback-btn" data-action-id="' + escapeHtml(act.id) + '">تراجع (Rollback)</button>'
+                          : '<span class="status-tag status-success">منفذة</span>')) +
+                  '</td>' +
+                '</tr>';
+              }).join('') +
+            '</tbody></table></div>' +
+          '</div>'
+        ) : '');
+
+      if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+        root.RGCrmDropdowns.enhanceAll(hostEl);
+      }
+
+      var runNowBtn = hostEl.querySelector('#di-run-now-btn');
+      if (runNowBtn) {
+        runNowBtn.addEventListener('click', function () {
+          var selectedScopes = Array.prototype.slice.call(hostEl.querySelectorAll('.di-scope-chk:checked')).map(function (c) { return c.value; });
+          runWithLock(runNowBtn, 'runDataIntegrityCheck', async function () {
+            var res = await root.RGApi.callApi('runDataIntegrityCheck', { runMode: 'manual', scopes: selectedScopes });
+            if (res && res.success) {
+              ctx.toast(res.message || 'اكتمل فحص سلامة البيانات.');
+              loadReport();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر تنفيذ الفحص.', true);
+            }
+          });
+        });
+      }
+
+      var saveSchedBtn = hostEl.querySelector('#di-save-sched-btn');
+      if (saveSchedBtn) {
+        saveSchedBtn.addEventListener('click', function () {
+          var selectedScopes = Array.prototype.slice.call(hostEl.querySelectorAll('.di-scope-chk:checked')).map(function (c) { return c.value; });
+          runWithLock(saveSchedBtn, 'saveDataIntegritySettings', async function () {
+            var res = await root.RGApi.callApi('saveDataIntegritySettings', {
+              mode: String(hostEl.querySelector('#di-mode').value || 'manual'),
+              intervalMinutes: Number(hostEl.querySelector('#di-interval').value || 60),
+              dateFrom: String(hostEl.querySelector('#di-date-from').value || ''),
+              dateTo: String(hostEl.querySelector('#di-date-to').value || ''),
+              scopes: selectedScopes,
+              paused: Boolean(intSettings.paused)
+            });
+            if (res && res.success) {
+              ctx.toast(res.message || 'تم حفظ إعدادات الجدولة.');
+              loadReport();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر حفظ الإعدادات.', true);
+            }
+          });
+        });
+      }
+
+      var pauseBtn = hostEl.querySelector('#di-pause-btn');
+      if (pauseBtn) {
+        pauseBtn.addEventListener('click', function () {
+          runWithLock(pauseBtn, 'controlDataIntegrityMonitor', async function () {
+            var res = await root.RGApi.callApi('controlDataIntegrityMonitor', { paused: !intSettings.paused });
+            if (res && res.success) {
+              ctx.toast(res.message || 'تم تحديث حالة المراقبة.');
+              loadReport();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر تحديث الحالة.', true);
+            }
+          });
+        });
+      }
+
+      var applyFiltBtn = hostEl.querySelector('#di-apply-filters-btn');
+      if (applyFiltBtn) {
+        applyFiltBtn.addEventListener('click', function () {
+          state.filters = {
+            search: String((hostEl.querySelector('#di-filter-search') || {}).value || '').trim(),
+            discrepancyType: String((hostEl.querySelector('#di-filter-type') || {}).value || ''),
+            resolutionStatus: String((hostEl.querySelector('#di-filter-status') || {}).value || '')
+          };
+          loadReport();
+        });
+      }
+
+      hostEl.querySelectorAll('.di-preview-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          openIntegrityDiffModal(btn.getAttribute('data-id') || '');
+        });
+      });
+
+      hostEl.querySelectorAll('.di-recheck-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var iid = btn.getAttribute('data-id') || '';
+          var rid = btn.getAttribute('data-res-id') || '';
+          runWithLock(btn, 'recheckDataIntegrityRecord:' + iid, async function () {
+            var res = await root.RGApi.callApi('recheckDataIntegrityRecord', { issueId: iid, reservationId: rid });
+            if (res && res.success) {
+              ctx.toast(res.data && res.data.matched ? 'تطابق السجلان وتم إغلاق الفارق تلقائياً.' : 'تمت إعادة الفحص وما زال التعارض قائماً.');
+              loadReport();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر إعادة الفحص.', true);
+            }
+          });
+        });
+      });
+
+      hostEl.querySelectorAll('.di-rollback-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var aid = btn.getAttribute('data-action-id') || '';
+          runWithLock(btn, 'rollbackDataIntegrityAction:' + aid, async function () {
+            var res = await root.RGApi.callApi('rollbackDataIntegrityAction', { actionId: aid });
+            if (res && res.success) {
+              ctx.toast(res.message || 'تم التراجع عن التعديل بنجاح.');
+              loadReport();
+            } else {
+              ctx.toast((res && res.message) || 'تعذر التراجع عن العملية.', true);
+            }
+          });
+        });
+      });
+    }
+
+    loadReport();
   }
 
   root.RGSettings = {

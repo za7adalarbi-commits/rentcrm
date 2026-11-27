@@ -1841,6 +1841,56 @@
     'محظور'
   ];
 
+  var CUSTOMER_RESERVATION_STATUS_OPTIONS = [
+    { value: 'نشط الآن', labelAr: 'نشط الآن', labelEn: 'Active Now', color: '#10b981' },
+    { value: 'جاهز للاستلام', labelAr: 'جاهز للاستلام', labelEn: 'Ready for Pickup', color: '#3b82f6' },
+    { value: 'بانتظار المتابعة', labelAr: 'بانتظار المتابعة', labelEn: 'Awaiting Follow-Up', color: '#f59e0b' },
+    { value: 'جديد / بانتظار المراجعة', labelAr: 'جديد / بانتظار المراجعة', labelEn: 'New / Pending Review', color: '#8b5cf6' },
+    { value: 'متأخر في السداد', labelAr: 'متأخر في السداد', labelEn: 'Overdue / Unpaid', color: '#f97316' },
+    { value: 'منتهي', labelAr: 'منتهي / مكتمل', labelEn: 'Completed / Ended', color: '#64748b' },
+    { value: 'ملغي', labelAr: 'ملغي', labelEn: 'Cancelled', color: '#ef4444' },
+    { value: 'مرفوض', labelAr: 'مرفوض', labelEn: 'Rejected', color: '#dc2626' }
+  ];
+
+  function classifyReservationStatusBucket(resObj) {
+    var r = (resObj && typeof resObj === 'object') ? resObj : {};
+    if (isRejectedStatus(r)) return 'مرفوض';
+    if (isCancelledStatus(r)) return 'ملغي';
+    var lc = classifyReservationLifecycle(r);
+    var st = normalizeStr(r.internalStatus || r.originalStatusAr || r.originalStatusCode);
+    var stLow = st.toLowerCase();
+    if (lc === 'completed' || isReservationClosedStatus(r) || /(completed|finished|finished_by_driver|ended|closed|returned|منتهي|مكتمل|مغلق)/i.test(stLow)) {
+      return 'منتهي';
+    }
+    if (/متأخر|overdue|unpaid/i.test(stLow)) return 'متأخر في السداد';
+    if (/جاهز للاستلام|ready_for_pickup|ready/i.test(stLow)) return 'جاهز للاستلام';
+    if (/بانتظار المتابعة|awaiting_followup|need_followup|متابعة/i.test(stLow)) return 'بانتظار المتابعة';
+    if (/جديد|قيد الانتظار|pending|created|waiting_review|waiting/i.test(stLow)) return 'جديد / بانتظار المراجعة';
+    if (lc === 'active' || isExplicitActiveStatusToken(stLow) || /نشط|started|active|approved|confirmed|in_progress|extended/i.test(stLow)) {
+      return 'نشط الآن';
+    }
+    return st || 'نشط الآن';
+  }
+
+  function doesReservationMatchStatusFilter(resObj, filterStatus) {
+    var target = normalizeStr(filterStatus);
+    if (!target) return true;
+    var bucket = classifyReservationStatusBucket(resObj);
+    if (bucket === target) return true;
+    var r = (resObj && typeof resObj === 'object') ? resObj : {};
+    var intSt = normalizeStr(r.internalStatus);
+    var origAr = normalizeStr(r.originalStatusAr);
+    var origCode = normalizeStr(r.originalStatusCode);
+    if (intSt === target || origAr === target || origCode === target) return true;
+    if (target === 'نشط' || target === 'نشط الآن') {
+      return bucket === 'نشط الآن' || (!isInactiveReservation(r) && !isReservationClosedStatus(r));
+    }
+    if (target === 'مكتمل' || target === 'منتهي') {
+      return bucket === 'منتهي';
+    }
+    return false;
+  }
+
   var KNOWN_COUNTRY_DIAL_CODES = [
     '966', '971', '965', '973', '974', '968', '962', '961', '963', '964', '967',
     '970', '212', '213', '216', '218', '249', '90', '20', '44', '33', '49', '39', '34', '91', '92', '63', '62', '60', '1'
@@ -2026,8 +2076,6 @@
           idType: normalizeStr(sd.idType) || detectCustomerIdType(idNum),
           manualStatus: normalizeStr(sd.status || 'جديد') || 'جديد',
           statusOverride: Boolean(sd.statusOverride),
-          assignedEmployeeId: normalizeStr(sd.assignedEmployeeId),
-          assignedEmployeeName: normalizeStr(sd.assignedEmployeeName),
           notes: normalizeStr(sd.notes),
           tags: Array.isArray(sd.tags) ? sd.tags.slice() : [],
           source: normalizeStr(sd.source) || 'sync',
@@ -2050,6 +2098,8 @@
           lastBookingDate: '',
           lastBookingNumber: '',
           latestReservationId: '',
+          lastReservationStatus: normalizeStr(sd.lastReservationStatus),
+          _lastBookingIso: '',
           lastActivityAt: normalizeStr(sd.updatedAt || sd.createdAt),
           companies: [],
           reservationIds: []
@@ -2106,8 +2156,6 @@
           phone: r.customerPhone,
           email: r.customerEmail,
           idNumber: r.customerIdNumber,
-          assignedEmployeeId: Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds[0] ? r.assignedEmployeeIds[0] : '',
-          assignedEmployeeName: Array.isArray(r.assignedEmployeeNames) && r.assignedEmployeeNames[0] ? r.assignedEmployeeNames[0] : '',
           createdAt: r.sourceCreatedAt || r.createdAt,
           updatedAt: r.lastUpdatedAt || r.updatedAt || r.createdAt
         });
@@ -2135,10 +2183,6 @@
         cBucket.idNumber = normalizeStr(r.customerIdNumber);
         cBucket.customerIdNumber = cBucket.idNumber;
         cBucket.idType = detectCustomerIdType(cBucket.idNumber);
-      }
-      if (!cBucket.assignedEmployeeId && Array.isArray(r.assignedEmployeeIds) && r.assignedEmployeeIds[0]) {
-        cBucket.assignedEmployeeId = normalizeStr(r.assignedEmployeeIds[0]);
-        cBucket.assignedEmployeeName = normalizeStr((r.assignedEmployeeNames && r.assignedEmployeeNames[0]) || '');
       }
 
       cBucket.totalBookings += 1;
@@ -2170,10 +2214,12 @@
       }
 
       var bookDate = normalizeStr(r.startDate || r.sourceCreatedAt || r.createdAt);
-      if (bookDate && (!cBucket.lastBookingDate || bookDate > cBucket.lastBookingDate)) {
+      if (bookDate && (!cBucket._lastBookingIso || bookDate > cBucket._lastBookingIso)) {
+        cBucket._lastBookingIso = bookDate;
         cBucket.lastBookingDate = formatDisplayDate(bookDate) || bookDate.slice(0, 10);
         cBucket.lastBookingNumber = normalizeStr(r.reservationNumber);
         cBucket.latestReservationId = normalizeStr(r.id);
+        cBucket.lastReservationStatus = normalizeStr(r.internalStatus || r.originalStatusAr);
       }
 
       var rStamp = normalizeStr(r.lastUpdatedAt || r.updatedAt || r.createdAt || r.startDate);
@@ -2214,7 +2260,7 @@
 
     for (var ni = 0; ni < customerNotes.length; ni++) {
       var nt = customerNotes[ni];
-      if (!nt || typeof nt !== 'object') continue;
+      if (!nt || typeof nt !== 'object' || nt.deletedAt) continue;
       var nCust = (nt.customerId && byId[nt.customerId]) || null;
       if (!nCust) continue;
       nCust.notesCount += 1;
@@ -2270,13 +2316,15 @@
       if (c.totalBookings > 1) kpis.repeatCustomers += 1;
       if (isRecentUpd) kpis.recentUpdatedCustomers += 1;
 
-      return Object.assign({}, c, {
+      var cleanCopy = Object.assign({}, c, {
         status: status,
         isNew: isNewRec,
         isRecent: isRecentUpd,
         unfollowed: hasUnfollowed,
         isRepeat: c.totalBookings > 1
       });
+      delete cleanCopy._lastBookingIso;
+      return cleanCopy;
     });
 
     rows.sort(function (a, b) {
@@ -2449,7 +2497,6 @@
     'act_delete_employee',
     'act_customer_id_lookup',
     'act_edit_customer',
-    'act_assign_customer',
     'act_add_customer_note'
   ];
 
@@ -2472,7 +2519,10 @@
     'view_all_reservations', 'view_customer_id', 'pull_reservations', 'assign_employees', 'add_followup',
     'claim_reservation', 'unclaim_reservation', 'quick_update_status',
     'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
-    'edit_customer_details', 'assign_customer_employee', 'add_customer_note',
+    'edit_customer_details', 'view_customer_notes', 'view_all_customer_notes', 'add_customer_note',
+    'edit_customer_note', 'delete_customer_note', 'change_customer_note_status', 'assign_customer_note',
+    'manage_customer_note_statuses', 'manage_customer_notes_settings', 'manage_customer_notes_buttons',
+    'view_customer_note_history', 'export_customer_notes',
     'create_problem', 'update_problem', 'delete_reservations', 'view_employees', 'manage_employees',
     'view_all_logs', 'sync_data', 'manage_api_connection', 'manage_settings',
     'manage_role_ui_defaults', 'customize_ui', 'manage_announcements', 'manage_developer_tools', 'export_reports'
@@ -2487,14 +2537,16 @@
       'view_all_reservations', 'view_customer_id', 'pull_reservations', 'assign_employees', 'add_followup',
       'claim_reservation', 'unclaim_reservation', 'quick_update_status',
       'edit_any_followup', 'edit_reservation_details', 'edit_ticket_details', 'pin_reservation_note',
-      'edit_customer_details', 'assign_customer_employee', 'add_customer_note',
+      'edit_customer_details', 'view_customer_notes', 'view_all_customer_notes', 'add_customer_note',
+      'edit_customer_note', 'change_customer_note_status', 'assign_customer_note',
+      'view_customer_note_history', 'export_customer_notes',
       'create_problem', 'update_problem', 'view_employees', 'view_all_logs',
       'sync_data', 'export_reports'
     ]),
     agent: [
       'view_dashboard', 'dash_perms_configured', 'perms_subsections_configured', 'perms_actions_configured'
     ].concat(DASHBOARD_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS.filter(function (ak) {
-      return ak !== 'act_customer_id_lookup' && ak !== 'act_edit_customer' && ak !== 'act_assign_customer';
+      return ak !== 'act_customer_id_lookup' && ak !== 'act_edit_customer';
     })).concat([
       'view_customers', 'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
       'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab', 'sub_view_myfu_mentions', 'sub_view_myfu_history',
@@ -2541,7 +2593,6 @@
     { key: 'act_delete_employee', label: 'أزرار حذف وإيقاف الموظفين', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_customer_id_lookup', label: 'زر الاستعلام عن العميل برقم الهوية', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_edit_customer', label: 'زر تعديل بيانات وحالة العميل', group: 'أزرار وإجراءات الجداول والتصدير' },
-    { key: 'act_assign_customer', label: 'زر تعيين وتغيير الموظف المسؤول للعميل', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'act_add_customer_note', label: 'زر إضافة ملاحظة وسجل تواصل في ملف العميل', group: 'أزرار وإجراءات الجداول والتصدير' },
     { key: 'dash_view_hero_kpis', label: 'بطاقات المؤشرات الرئيسية (Hero KPIs)', group: 'لوحة التحكم' },
     { key: 'dash_view_strip_kpis', label: 'شريط مؤشرات الحالات التفصيلية (KPI Strip)', group: 'لوحة التحكم' },
@@ -2559,9 +2610,19 @@
     { key: 'claim_reservation', label: 'استلام الحجوزات ذاتيًا', group: 'الحجوزات' },
     { key: 'unclaim_reservation', label: 'إلغاء استلام الحجز', group: 'الحجوزات' },
     { key: 'quick_update_status', label: 'التحديث السريع لحالة الحجز', group: 'الحجوزات' },
-    { key: 'edit_customer_details', label: 'إنشاء وتعديل بيانات وحالة العميل', group: 'إدارة العملاء' },
-    { key: 'assign_customer_employee', label: 'تعيين الموظف المسؤول عن العميل', group: 'إدارة العملاء' },
-    { key: 'add_customer_note', label: 'إضافة ملاحظات وتواصل مباشر على ملف العميل', group: 'إدارة العملاء' },
+    { key: 'edit_customer_details', label: 'إنشاء وتعديل بيانات العميل', group: 'إدارة العملاء' },
+    { key: 'view_customer_notes', label: 'عرض قسم ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'view_all_customer_notes', label: 'عرض ملاحظات جميع الموظفين', group: 'ملاحظات العملاء' },
+    { key: 'add_customer_note', label: 'إضافة ملاحظة جديدة للعميل', group: 'ملاحظات العملاء' },
+    { key: 'edit_customer_note', label: 'تعديل ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'delete_customer_note', label: 'حذف ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'change_customer_note_status', label: 'تغيير حالة ملاحظة العميل', group: 'ملاحظات العملاء' },
+    { key: 'assign_customer_note', label: 'إسناد متابعة الملاحظة لموظف', group: 'ملاحظات العملاء' },
+    { key: 'manage_customer_note_statuses', label: 'إدارة حالات ملاحظات العملاء (إضافة/تعديل/حذف)', group: 'ملاحظات العملاء' },
+    { key: 'manage_customer_notes_settings', label: 'إدارة إعدادات قسم ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'manage_customer_notes_buttons', label: 'التحكم في أزرار وقواعد ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'view_customer_note_history', label: 'عرض سجل تعديلات ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'export_customer_notes', label: 'تصدير وطباعة ملاحظات العملاء', group: 'ملاحظات العملاء' },
     { key: 'add_followup', label: 'إضافة متابعات وملاحظات', group: 'المتابعات' },
     { key: 'edit_any_followup', label: 'تعديل متابعات وتحديثات الفريق', group: 'المتابعات' },
     { key: 'assign_employees', label: 'إسناد وإزالة الموظفين عن الحجوزات', group: 'الإشراف' },
@@ -2580,7 +2641,7 @@
     { key: 'customize_ui', label: 'تخصيص وإظهار/إخفاء الأقسام للموظفين والأدوار', group: 'الإدارة والربط (API)' },
     { key: 'manage_announcements', label: 'إدارة تعميمات وإعلانات الوردية', group: 'الإدارة والربط (API)' },
     { key: 'delete_reservations', label: 'حذف الحجوزات الجماعي والنسخ الاحتياطي', group: 'الإدارة والربط (API)' },
-    { key: 'manage_developer_tools', label: 'الصلاحيات البرمجية الكاملة وفحص الخادم وكاش الموقع', group: 'الإدارة والربط (API)' }
+    { key: 'manage_developer_tools', label: 'الصلاحيات البرمجية الكاملة وفحص الخادم وكاش الموقع ومراقبة سلامة البيانات', group: 'الإدارة والربط (API)' }
   ];
 
   var JOB_ROLE_PRESETS = [
@@ -2745,7 +2806,6 @@
     act_customer_id_lookup: 'hideResCustomerIdLookupBtn',
     act_delete_employee: 'hideEmployeesRowActions',
     act_edit_customer: 'hideCustEditBtn',
-    act_assign_customer: 'hideCustAssignBtn',
     act_add_customer_note: 'hideCustAddNoteBtn'
   };
 
@@ -2979,8 +3039,7 @@
         { key: 'act_close_delete_ticket', labelAr: 'أزرار إغلاق / حذف التذاكر والمشكلات', labelEn: 'Close / Delete Ticket Buttons' },
         { key: 'act_report_problem', labelAr: 'زر تحويل الحجز إلى مشكلة', labelEn: 'Report Problem Button' },
         { key: 'act_customer_id_lookup', labelAr: 'زر الاستعلام عن العميل برقم الهوية', labelEn: 'National ID Lookup Button' },
-        { key: 'act_edit_customer', labelAr: 'زر تعديل بيانات وحالة العميل', labelEn: 'Edit Customer Button' },
-        { key: 'act_assign_customer', labelAr: 'زر تعيين الموظف المسؤول للعميل', labelEn: 'Assign Customer Employee Button' },
+        { key: 'act_edit_customer', labelAr: 'زر تعديل بيانات العميل', labelEn: 'Edit Customer Button' },
         { key: 'act_add_customer_note', labelAr: 'زر إضافة ملاحظة وسجل تواصل للعميل', labelEn: 'Add Customer Note Button' },
         { key: 'act_delete_employee', labelAr: 'أزرار حذف وإيقاف الموظفين', labelEn: 'Delete / Toggle Employee Buttons' }
       ]
@@ -4486,6 +4545,12 @@
     getDashboard: { cacheable: true, ttlMs: 60000, scope: 'dashboard' },
     getCustomers: { cacheable: true, ttlMs: 60000, scope: 'customers' },
     getCustomerDetails: { cacheable: true, ttlMs: 45000, scope: 'customers' },
+    getCustomerNotes: { cacheable: true, ttlMs: 30000, scope: 'customers' },
+    getCustomerNoteStatuses: { cacheable: true, ttlMs: 60000, scope: 'customers' },
+    getCustomerNotesConfig: { cacheable: true, ttlMs: 60000, scope: 'settings' },
+    getCustomerNoteHistory: { cacheable: false, ttlMs: 0, scope: 'customers' },
+    getDataIntegrityReport: { cacheable: false, ttlMs: 0, scope: 'settings' },
+    getDataIntegritySettings: { cacheable: false, ttlMs: 0, scope: 'settings' },
     getTodayAndRadar: { cacheable: true, ttlMs: 25000, scope: 'todayRadar' },
     getReservations: { cacheable: true, ttlMs: 60000, scope: 'reservations' },
     getInactiveReservations: { cacheable: true, ttlMs: 45000, scope: 'reservations' },
@@ -4513,8 +4578,23 @@
     logout: ['*'],
     createCustomer: ['customers', 'dashboard', 'activity', 'reports'],
     updateCustomerProfile: ['customers', 'reservations', 'dashboard', 'activity', 'reports'],
-    assignCustomerEmployee: ['customers', 'employees', 'notifications', 'activity'],
-    addCustomerNote: ['customers', 'followUps', 'notifications', 'activity'],
+    addCustomerNote: ['customers', 'reservations', 'problems', 'followUps', 'notifications', 'activity'],
+    updateCustomerNote: ['customers', 'reservations', 'problems', 'followUps', 'notifications', 'activity'],
+    deleteCustomerNote: ['customers', 'reservations', 'problems', 'followUps', 'activity'],
+    changeCustomerNoteStatus: ['customers', 'reservations', 'problems', 'notifications', 'activity'],
+    assignCustomerNoteEmployee: ['customers', 'reservations', 'problems', 'employees', 'notifications', 'activity'],
+    addCustomerNoteAttachment: ['customers', 'reservations', 'problems', 'activity'],
+    deleteCustomerNoteAttachment: ['customers', 'reservations', 'problems', 'activity'],
+    saveCustomerNoteStatus: ['customers', 'settings', 'activity'],
+    toggleCustomerNoteStatus: ['customers', 'settings', 'activity'],
+    deleteCustomerNoteStatus: ['customers', 'settings', 'activity'],
+    saveCustomerNotesConfig: ['customers', 'settings', 'reservations', 'problems', 'activity'],
+    runDataIntegrityCheck: ['settings', 'activity'],
+    recheckDataIntegrityRecord: ['settings', 'activity'],
+    resolveDataIntegrityIssue: ['reservations', 'customers', 'todayRadar', 'dashboard', 'settings', 'activity'],
+    rollbackDataIntegrityAction: ['reservations', 'customers', 'todayRadar', 'dashboard', 'settings', 'activity'],
+    saveDataIntegritySettings: ['settings', 'activity'],
+    controlDataIntegrityMonitor: ['settings', 'activity'],
     claimReservation: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     unclaimReservation: ['reservations', 'customers', 'todayRadar', 'dashboard', 'employees', 'activity', 'reports'],
     quickUpdateReservationStatus: ['reservations', 'customers', 'todayRadar', 'followUps', 'dashboard', 'employees', 'activity', 'reports'],
@@ -4755,8 +4835,7 @@
       { key: 'lastReservationNumber', label: 'آخر حجز', labelEn: 'Last Booking #', widthWeight: 0.95, formatType: 'ltr' },
       { key: 'lastReservationDate', label: 'تاريخ آخر حجز', labelEn: 'Last Booking', widthWeight: 0.95, formatType: 'date' },
       { key: 'lastContactAt', label: 'آخر تواصل', labelEn: 'Last Contact', widthWeight: 1.05, formatType: 'datetime' },
-      { key: 'assignedEmployeeName', label: 'الموظف المسؤول', labelEn: 'Assigned Employee', widthWeight: 1.15, formatType: 'text' },
-      { key: 'status', label: 'الحالة', labelEn: 'Status', widthWeight: 0.85, formatType: 'text' },
+      { key: 'lastReservationStatus', label: 'حالة آخر حجز', labelEn: 'Last Booking Status', widthWeight: 0.95, formatType: 'text' },
       { key: 'createdAt', label: 'تاريخ الإنشاء', labelEn: 'Created At', widthWeight: 0.95, formatType: 'date' }
     ]
   };
@@ -8603,7 +8682,6 @@
     { key: 'hideCustComplaintsTab', legacyId: 'set-ui-hide-cust-complaints', cssClass: 'rg-ui-hide-cust-complaints', group: 'modules', labelAr: 'إخفاء تبويب «المشاكل والشكاوى» داخل ملف العميل', labelEn: 'Hide Complaints tab in Customer Profile' },
     { key: 'hideCustTimelineTab', legacyId: 'set-ui-hide-cust-timeline', cssClass: 'rg-ui-hide-cust-timeline', group: 'modules', labelAr: 'إخفاء تبويب «السجل الزمني الموحد» داخل ملف العميل', labelEn: 'Hide Unified Timeline tab in Customer Profile' },
     { key: 'hideCustEditBtn', legacyId: 'set-ui-hide-cust-edit', cssClass: 'rg-ui-hide-cust-edit', group: 'modules', labelAr: 'إخفاء أزرار «إضافة / تعديل بيانات العميل»', labelEn: 'Hide Add/Edit Customer buttons' },
-    { key: 'hideCustAssignBtn', legacyId: 'set-ui-hide-cust-assign', cssClass: 'rg-ui-hide-cust-assign', group: 'modules', labelAr: 'إخفاء عنصر «تعيين الموظف المسؤول» داخل ملف العميل', labelEn: 'Hide Assign Responsible Employee control in Customer Profile' },
     { key: 'hideCustAddNoteBtn', legacyId: 'set-ui-hide-cust-add-note', cssClass: 'rg-ui-hide-cust-add-note', group: 'modules', labelAr: 'إخفاء نموذج وأزرار «إضافة ملاحظة / تواصل» في ملف العميل', labelEn: 'Hide Add Customer Note / Contact form' },
     { key: 'hideMyfuPinnedStrip', legacyId: 'set-ui-hide-myfu-pinned', cssClass: 'rg-ui-hide-myfu-pinned', group: 'modules', labelAr: 'إخفاء شريط وأزرار تثبيت «الحجوزات الحرجة» في متابعاتي', labelEn: 'Hide "Pinned Critical Bookings" strip & pin buttons' },
     { key: 'hideMyfuMentionsTab', legacyId: 'set-ui-hide-myfu-mentions', cssClass: 'rg-ui-hide-myfu-mentions', group: 'modules', labelAr: 'إخفاء تبويب «إشارات @Mention» في متابعاتي', labelEn: 'Hide "@Mentions" tab in My Follow-Ups' },
@@ -11240,6 +11318,622 @@
     });
   }
 
+  /* ============================================================================
+   * CUSTOMER NOTES ENTERPRISE ENGINE (Statuses, 14 Buttons, Rules, Settings)
+   * ============================================================================ */
+
+  var CUSTOMER_NOTE_TYPES = ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
+
+  var CUSTOMER_NOTE_DEFAULT_STATUSES = [
+    { id: 'CNS_NEW', name: 'جديدة', description: 'ملاحظة عميل مسجلة حديثاً وتحتاج فرزاً أو مراجعة', color: '#3b82f6', sortOrder: 10, isActive: true, isDefault: true, allowAgentSelect: true, isClosedStatus: false },
+    { id: 'CNS_REVIEW', name: 'قيد المراجعة', description: 'جاري فحص تفاصيل الملاحظة والتحقق من الحجز', color: '#8b5cf6', sortOrder: 20, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: false },
+    { id: 'CNS_WAIT_CUST', name: 'بانتظار رد العميل', description: 'تم التواصل وبانتظار إفادة أو رد العميل', color: '#f59e0b', sortOrder: 30, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: false },
+    { id: 'CNS_WAIT_COMP', name: 'بانتظار شركة التأجير', description: 'بانتظار رد أو إجراء من شركة التأجير الشريكة', color: '#f97316', sortOrder: 40, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: false },
+    { id: 'CNS_PROGRESS', name: 'قيد المعالجة', description: 'يجري العمل على تنفيذ متطلبات الملاحظة', color: '#06b6d4', sortOrder: 50, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: false },
+    { id: 'CNS_RESOLVED', name: 'تم الحل', description: 'تمت معالجة الملاحظة وحلها بالكامل', color: '#10b981', sortOrder: 60, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: true },
+    { id: 'CNS_CLOSED', name: 'مغلقة', description: 'ملاحظة منتهية ومؤرشفة', color: '#64748b', sortOrder: 70, isActive: true, isDefault: false, allowAgentSelect: true, isClosedStatus: true },
+    { id: 'CNS_CANCELLED', name: 'ملغاة', description: 'ملاحظة ملغاة أو مكررة لا تتطلب إجراءً', color: '#ef4444', sortOrder: 80, isActive: true, isDefault: false, allowAgentSelect: false, isClosedStatus: true }
+  ];
+
+  var CUSTOMER_NOTES_BUTTON_CATALOG = [
+    { key: 'add_note', labelAr: 'إضافة ملاحظة', labelEn: 'Add Note', requiredPermission: 'add_customer_note', defaultRoles: ['developer', 'general_manager', 'supervisor', 'agent'], defaultConfirm: false },
+    { key: 'edit_note', labelAr: 'تعديل ملاحظة', labelEn: 'Edit Note', requiredPermission: 'edit_customer_note', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: false },
+    { key: 'delete_note', labelAr: 'حذف ملاحظة', labelEn: 'Delete Note', requiredPermission: 'delete_customer_note', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: true },
+    { key: 'change_status', labelAr: 'تغيير الحالة', labelEn: 'Change Status', requiredPermission: 'change_customer_note_status', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: false },
+    { key: 'search_notes', labelAr: 'البحث', labelEn: 'Search', requiredPermission: 'view_customer_notes', defaultRoles: ['developer', 'general_manager', 'supervisor', 'agent'], defaultConfirm: false },
+    { key: 'filter_notes', labelAr: 'الفلاتر', labelEn: 'Filters', requiredPermission: 'view_customer_notes', defaultRoles: ['developer', 'general_manager', 'supervisor', 'agent'], defaultConfirm: false },
+    { key: 'view_details', labelAr: 'عرض التفاصيل', labelEn: 'View Details', requiredPermission: 'view_customer_notes', defaultRoles: ['developer', 'general_manager', 'supervisor', 'agent'], defaultConfirm: false },
+    { key: 'attach_file', labelAr: 'إرفاق ملف', labelEn: 'Attach File', requiredPermission: 'add_customer_note', defaultRoles: ['developer', 'general_manager', 'supervisor', 'agent'], defaultConfirm: false },
+    { key: 'delete_attachment', labelAr: 'حذف مرفق', labelEn: 'Delete Attachment', requiredPermission: 'edit_customer_note', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: true },
+    { key: 'assign_note', labelAr: 'إسناد لموظف', labelEn: 'Assign Note Task', requiredPermission: 'assign_customer_note', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: false },
+    { key: 'export_notes', labelAr: 'تصدير الملاحظات', labelEn: 'Export Notes', requiredPermission: 'export_customer_notes', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: false },
+    { key: 'print_notes', labelAr: 'طباعة', labelEn: 'Print Notes', requiredPermission: 'export_customer_notes', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: false },
+    { key: 'refresh_notes', labelAr: 'تحديث البيانات', labelEn: 'Refresh Data', requiredPermission: 'view_customer_notes', defaultRoles: ['developer', 'general_manager', 'supervisor', 'agent'], defaultConfirm: false },
+    { key: 'view_history', labelAr: 'عرض سجل التعديلات', labelEn: 'View Audit History', requiredPermission: 'view_customer_note_history', defaultRoles: ['developer', 'general_manager', 'supervisor'], defaultConfirm: false }
+  ];
+
+  function createDefaultButtonsMap() {
+    var out = {};
+    for (var i = 0; i < CUSTOMER_NOTES_BUTTON_CATALOG.length; i++) {
+      var def = CUSTOMER_NOTES_BUTTON_CATALOG[i];
+      out[def.key] = {
+        key: def.key,
+        labelAr: def.labelAr,
+        visible: true,
+        enabled: true,
+        allowedRoles: def.defaultRoles.slice(),
+        requiredPermission: def.requiredPermission,
+        requireConfirmation: Boolean(def.defaultConfirm),
+        logActivity: true,
+        showSuccessNotification: true,
+        allowEditAfterClose: false,
+        allowDeleteAfterClose: false,
+        allowAgentEditOther: false
+      };
+    }
+    return out;
+  }
+
+  var DEFAULT_CUSTOMER_NOTES_CONFIG = {
+    general: {
+      sectionTitle: 'ملاحظات العملاء',
+      enabled: true,
+      pageSize: 20,
+      defaultSort: 'newest',
+      maxResults: 200,
+      enableSearch: true,
+      enableFilters: true,
+      retentionDays: 0
+    },
+    addNote: {
+      requiredTitle: false,
+      requiredReservation: false,
+      requiredType: true,
+      requiredStatus: true,
+      allowStandalone: true,
+      allowReservationLinked: true,
+      allowCustomerOnly: true,
+      allowProblemLinked: true,
+      maxLength: 4000,
+      allowedAttachmentTypes: ['image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'text/plain'],
+      maxAttachmentSizeMb: 5,
+      allowInternalNotes: true,
+      editableAfterSave: true
+    },
+    notifications: {
+      onAdd: true,
+      onStatusChange: true,
+      onAssign: true,
+      onReplyUpdate: true,
+      onClose: true,
+      notifyRoles: ['supervisor', 'general_manager'],
+      notifyEmployeeIds: []
+    },
+    activityLog: {
+      trackAdd: true,
+      trackEdit: true,
+      trackDelete: true,
+      trackStatusChange: true,
+      trackAssign: true,
+      trackAttachments: true,
+      includeOldNewValues: true,
+      includeSourceSection: true
+    },
+    buttons: createDefaultButtonsMap(),
+    customersSection: {
+      enableView: true,
+      enableAddCustomer: true,
+      enableEditCustomer: true,
+      showSensitiveIds: true,
+      showBookingsTab: true,
+      showExtensionsTab: true,
+      showProblemsTab: true,
+      enableSearch: true,
+      enableFilters: true,
+      enableInternalNotes: true,
+      enableActivityLog: true,
+      enableExport: true,
+      enablePrint: true,
+      enableStatusManagement: true
+    }
+  };
+
+  function normalizeCustomerNotesConfig(raw) {
+    var src = raw;
+    if (typeof raw === 'string') {
+      try { src = JSON.parse(raw); } catch (_e) { src = {}; }
+    }
+    if (!src || typeof src !== 'object') src = {};
+    var def = DEFAULT_CUSTOMER_NOTES_CONFIG;
+    var g = Object.assign({}, def.general, (src.general && typeof src.general === 'object') ? src.general : {});
+    g.sectionTitle = normalizeStr(g.sectionTitle) || def.general.sectionTitle;
+    g.enabled = g.enabled !== false;
+    g.pageSize = Math.max(5, Math.min(100, Math.floor(toNum(g.pageSize, def.general.pageSize))));
+    g.defaultSort = (g.defaultSort === 'oldest' || g.defaultSort === 'updated' || g.defaultSort === 'status') ? g.defaultSort : 'newest';
+    g.maxResults = Math.max(20, Math.min(1000, Math.floor(toNum(g.maxResults, def.general.maxResults))));
+    g.enableSearch = g.enableSearch !== false;
+    g.enableFilters = g.enableFilters !== false;
+    g.retentionDays = Math.max(0, Math.min(3650, Math.floor(toNum(g.retentionDays, 0))));
+
+    var a = Object.assign({}, def.addNote, (src.addNote && typeof src.addNote === 'object') ? src.addNote : {});
+    a.requiredTitle = Boolean(a.requiredTitle);
+    a.requiredReservation = Boolean(a.requiredReservation);
+    a.requiredType = a.requiredType !== false;
+    a.requiredStatus = a.requiredStatus !== false;
+    a.allowStandalone = a.allowStandalone !== false;
+    a.allowReservationLinked = a.allowReservationLinked !== false;
+    a.allowCustomerOnly = a.allowCustomerOnly !== false;
+    a.allowProblemLinked = a.allowProblemLinked !== false;
+    a.maxLength = Math.max(50, Math.min(20000, Math.floor(toNum(a.maxLength, def.addNote.maxLength))));
+    a.maxAttachmentSizeMb = Math.max(1, Math.min(25, Math.floor(toNum(a.maxAttachmentSizeMb, def.addNote.maxAttachmentSizeMb))));
+    a.allowedAttachmentTypes = Array.isArray(a.allowedAttachmentTypes)
+      ? a.allowedAttachmentTypes.map(normalizeStr).filter(Boolean)
+      : def.addNote.allowedAttachmentTypes.slice();
+    a.allowInternalNotes = a.allowInternalNotes !== false;
+    a.editableAfterSave = a.editableAfterSave !== false;
+
+    var n = Object.assign({}, def.notifications, (src.notifications && typeof src.notifications === 'object') ? src.notifications : {});
+    n.onAdd = n.onAdd !== false;
+    n.onStatusChange = n.onStatusChange !== false;
+    n.onAssign = n.onAssign !== false;
+    n.onReplyUpdate = n.onReplyUpdate !== false;
+    n.onClose = n.onClose !== false;
+    n.notifyRoles = Array.isArray(n.notifyRoles) ? n.notifyRoles.map(normalizeStr).filter(Boolean) : def.notifications.notifyRoles.slice();
+    n.notifyEmployeeIds = Array.isArray(n.notifyEmployeeIds) ? n.notifyEmployeeIds.map(normalizeStr).filter(Boolean) : [];
+
+    var act = Object.assign({}, def.activityLog, (src.activityLog && typeof src.activityLog === 'object') ? src.activityLog : {});
+    act.trackAdd = act.trackAdd !== false;
+    act.trackEdit = act.trackEdit !== false;
+    act.trackDelete = act.trackDelete !== false;
+    act.trackStatusChange = act.trackStatusChange !== false;
+    act.trackAssign = act.trackAssign !== false;
+    act.trackAttachments = act.trackAttachments !== false;
+    act.includeOldNewValues = act.includeOldNewValues !== false;
+    act.includeSourceSection = act.includeSourceSection !== false;
+
+    var rawBtns = (src.buttons && typeof src.buttons === 'object') ? src.buttons : {};
+    var defBtns = createDefaultButtonsMap();
+    var buttons = {};
+    for (var i = 0; i < CUSTOMER_NOTES_BUTTON_CATALOG.length; i++) {
+      var meta = CUSTOMER_NOTES_BUTTON_CATALOG[i];
+      var curB = (rawBtns[meta.key] && typeof rawBtns[meta.key] === 'object') ? rawBtns[meta.key] : {};
+      var mergedB = Object.assign({}, defBtns[meta.key], curB, { key: meta.key, labelAr: meta.labelAr });
+      mergedB.visible = mergedB.visible !== false;
+      mergedB.enabled = mergedB.enabled !== false;
+      mergedB.allowedRoles = Array.isArray(curB.allowedRoles)
+        ? curB.allowedRoles.map(normalizeStr).filter(Boolean)
+        : defBtns[meta.key].allowedRoles.slice();
+      mergedB.requiredPermission = normalizeStr(mergedB.requiredPermission) || meta.requiredPermission;
+      mergedB.requireConfirmation = Boolean(mergedB.requireConfirmation);
+      mergedB.logActivity = mergedB.logActivity !== false;
+      mergedB.showSuccessNotification = mergedB.showSuccessNotification !== false;
+      mergedB.allowEditAfterClose = Boolean(mergedB.allowEditAfterClose);
+      mergedB.allowDeleteAfterClose = Boolean(mergedB.allowDeleteAfterClose);
+      mergedB.allowAgentEditOther = Boolean(mergedB.allowAgentEditOther);
+      buttons[meta.key] = mergedB;
+    }
+
+    var cs = Object.assign({}, def.customersSection, (src.customersSection && typeof src.customersSection === 'object') ? src.customersSection : {});
+    Object.keys(def.customersSection).forEach(function (ck) {
+      cs[ck] = cs[ck] !== false;
+    });
+
+    return {
+      general: g,
+      addNote: a,
+      notifications: n,
+      activityLog: act,
+      buttons: buttons,
+      customersSection: cs
+    };
+  }
+
+  function normalizeCustomerNoteStatusRecord(raw) {
+    var r = (raw && typeof raw === 'object') ? raw : {};
+    return {
+      id: normalizeStr(r.id) || ('CNS_' + Date.now().toString(36)),
+      name: normalizeStr(r.name),
+      description: normalizeStr(r.description),
+      color: /^#[0-9a-fA-F]{3,8}$/.test(normalizeStr(r.color)) ? normalizeStr(r.color) : '#3b82f6',
+      sortOrder: Math.max(0, Math.min(9999, Math.floor(toNum(r.sortOrder !== undefined ? r.sortOrder : r.sort_order, 100)))),
+      isActive: r.isActive !== undefined ? Boolean(r.isActive) : (r.is_active !== undefined ? Boolean(r.is_active) : true),
+      isDefault: Boolean(r.isDefault !== undefined ? r.isDefault : r.is_default),
+      allowAgentSelect: r.allowAgentSelect !== undefined ? Boolean(r.allowAgentSelect) : (r.allow_agent_select !== undefined ? Boolean(r.allow_agent_select) : true),
+      isClosedStatus: Boolean(r.isClosedStatus !== undefined ? r.isClosedStatus : r.is_closed_status),
+      notesCount: Math.max(0, Math.floor(toNum(r.notesCount !== undefined ? r.notesCount : r.notes_count, 0))),
+      createdAt: normalizeStr(r.createdAt || r.created_at),
+      updatedAt: normalizeStr(r.updatedAt || r.updated_at)
+    };
+  }
+
+  function evaluateCustomerNoteButtonAccess(user, buttonKey, noteObj, rawConfig, options) {
+    var cfg = normalizeCustomerNotesConfig(rawConfig);
+    var opts = (options && typeof options === 'object') ? options : {};
+    var rule = cfg.buttons[buttonKey] || createDefaultButtonsMap()[buttonKey];
+    if (!rule) {
+      return { allowed: false, reason: 'BUTTON_NOT_FOUND', message: 'الإجراء غير معروف.', rule: null };
+    }
+    if (!cfg.general.enabled && buttonKey !== 'refresh_notes' && buttonKey !== 'view_details') {
+      return { allowed: false, reason: 'SECTION_DISABLED', message: 'قسم ملاحظات العملاء معطل حالياً من الإعدادات.', rule: rule };
+    }
+    var role = user && user.role ? normalizeStr(user.role) : '';
+    var isDev = role === ROLES.DEVELOPER;
+    if (!rule.visible && !isDev) {
+      return { allowed: false, reason: 'BUTTON_HIDDEN', message: 'هذا الإجراء مخفي من إعدادات النظام.', rule: rule };
+    }
+    if (!rule.enabled) {
+      return { allowed: false, reason: 'BUTTON_DISABLED', message: 'هذا الإجراء معطل حالياً من لوحة التحكم.', rule: rule };
+    }
+    if (!isDev && Array.isArray(rule.allowedRoles) && rule.allowedRoles.length > 0 && rule.allowedRoles.indexOf(role) === -1) {
+      return { allowed: false, reason: 'ROLE_FORBIDDEN', message: 'دورك الوظيفي غير مخول لتنفيذ هذا الإجراء.', rule: rule };
+    }
+    if (!isDev && rule.requiredPermission) {
+      var okPerm = canUserPerform(user, rule.requiredPermission);
+      // Backward compatibility: view_customer_notes allowed when user has view_customers + add_customer_note if not explicitly restricted
+      if (!okPerm && rule.requiredPermission === 'view_customer_notes') {
+        okPerm = canUserPerform(user, 'view_customers') && (canUserPerform(user, 'add_customer_note') || canUserPerform(user, 'view_customer_notes'));
+      }
+      if (!okPerm) {
+        return { allowed: false, reason: 'PERM_FORBIDDEN', message: 'ليس لديك الصلاحية اللازمة لتنفيذ هذا الإجراء.', rule: rule };
+      }
+    }
+
+    if (noteObj && typeof noteObj === 'object') {
+      var isClosed = Boolean(noteObj.isClosed);
+      if ((buttonKey === 'edit_note' || buttonKey === 'attach_file' || buttonKey === 'delete_attachment') && !cfg.addNote.editableAfterSave && !isDev) {
+        return { allowed: false, reason: 'LOCKED_AFTER_SAVE', message: 'تم تعطيل تعديل الملاحظات بعد الحفظ من الإعدادات.', rule: rule };
+      }
+      if ((buttonKey === 'edit_note' || buttonKey === 'attach_file' || buttonKey === 'delete_attachment') && isClosed && !rule.allowEditAfterClose && !isDev) {
+        return { allowed: false, reason: 'CLOSED_LOCKED', message: 'لا يمكن تعديل ملاحظة مغلقة.', rule: rule };
+      }
+      if (buttonKey === 'delete_note' && isClosed && !rule.allowDeleteAfterClose && !isDev) {
+        return { allowed: false, reason: 'CLOSED_LOCKED', message: 'لا يمكن حذف ملاحظة مغلقة.', rule: rule };
+      }
+      if (role === ROLES.AGENT && (buttonKey === 'edit_note' || buttonKey === 'delete_note' || buttonKey === 'delete_attachment')) {
+        var authorId = normalizeStr(noteObj.createdById || noteObj.created_by_id);
+        var uid = normalizeStr(user && (user.id || user.employeeId));
+        if (authorId && uid && authorId !== uid && !rule.allowAgentEditOther) {
+          return { allowed: false, reason: 'OTHER_AUTHOR_FORBIDDEN', message: 'لا يمكنك تعديل أو حذف ملاحظة أنشأها موظف آخر.', rule: rule };
+        }
+      }
+    }
+
+    if (opts.checkConfirm && rule.requireConfirmation && !opts.confirmed) {
+      return { allowed: false, reason: 'CONFIRMATION_REQUIRED', message: 'يرجى تأكيد تنفيذ هذا الإجراء.', rule: rule };
+    }
+
+    return { allowed: true, reason: 'OK', message: '', rule: rule };
+  }
+
+  function validateCustomerNotePayload(payload, config, statusesList, user) {
+    var p = (payload && typeof payload === 'object') ? payload : {};
+    var cfg = normalizeCustomerNotesConfig(config);
+    var statuses = Array.isArray(statusesList) && statusesList.length ? statusesList.map(normalizeCustomerNoteStatusRecord) : CUSTOMER_NOTE_DEFAULT_STATUSES.slice();
+    var content = normalizeStr(p.content || p.note);
+    var title = normalizeStr(p.title);
+    var noteType = normalizeStr(p.noteType) || 'ملاحظة';
+    var customerId = normalizeStr(p.customerId);
+    var reservationId = normalizeStr(p.reservationId);
+    var problemId = normalizeStr(p.problemId);
+    var isInternal = Boolean(p.isInternal);
+
+    if (!customerId && !cfg.addNote.allowStandalone && !reservationId && !problemId) {
+      return { valid: false, message: 'إضافة ملاحظة مستقلة غير متاحة؛ يجب ربط الملاحظة بعميل أو حجز أو مشكلة.' };
+    }
+    if (customerId && !reservationId && !problemId && !cfg.addNote.allowCustomerOnly) {
+      return { valid: false, message: 'إضافة ملاحظة على العميل فقط غير مسموح به حالياً.' };
+    }
+    if (reservationId && !cfg.addNote.allowReservationLinked) {
+      return { valid: false, message: 'تم تعطيل ربط الملاحظات بالحجوزات من الإعدادات.' };
+    }
+    if (problemId && !cfg.addNote.allowProblemLinked) {
+      return { valid: false, message: 'تم تعطيل ربط الملاحظات بالمشكلات من الإعدادات.' };
+    }
+    if (cfg.addNote.requiredReservation && !reservationId) {
+      return { valid: false, message: 'يجب ربط الملاحظة برقم حجز محدد.' };
+    }
+    if (cfg.addNote.requiredTitle && !title) {
+      return { valid: false, message: 'عنوان الملاحظة مطلوب حسب قواعد الإضافة.' };
+    }
+    if (!content) {
+      return { valid: false, message: 'نص الملاحظة مطلوب.' };
+    }
+    if (content.length > cfg.addNote.maxLength) {
+      return { valid: false, message: 'نص الملاحظة يتجاوز الحد الأقصى المسموح (' + cfg.addNote.maxLength + ' حرف).' };
+    }
+    if (isInternal && !cfg.addNote.allowInternalNotes) {
+      return { valid: false, message: 'الملاحظات الداخلية معطلة حالياً.' };
+    }
+    if (CUSTOMER_NOTE_TYPES.indexOf(noteType) === -1) {
+      noteType = 'ملاحظة';
+    }
+
+    var reqStatusId = normalizeStr(p.statusId);
+    var reqStatusName = normalizeStr(p.statusName || p.status);
+    var resolvedStatus = null;
+    if (reqStatusId || reqStatusName) {
+      resolvedStatus = statuses.find(function (s) {
+        return (reqStatusId && s.id === reqStatusId) || (reqStatusName && s.name === reqStatusName);
+      }) || null;
+      if (!resolvedStatus) {
+        return { valid: false, message: 'حالة الملاحظة المختارة غير موجودة.' };
+      }
+      if (!resolvedStatus.isActive) {
+        return { valid: false, message: 'لا يمكن اختيار حالة معطلة لملاحظة جديدة أو محدثة: ' + resolvedStatus.name };
+      }
+      if (user && user.role === ROLES.AGENT && resolvedStatus.allowAgentSelect === false) {
+        return { valid: false, message: 'الحالة المختارة غير متاحة للاختيار بواسطة الموظف: ' + resolvedStatus.name };
+      }
+    } else {
+      resolvedStatus = statuses.find(function (s) { return s.isActive && s.isDefault; })
+        || statuses.find(function (s) { return s.isActive; })
+        || CUSTOMER_NOTE_DEFAULT_STATUSES[0];
+    }
+
+    return {
+      valid: true,
+      noteType: noteType,
+      title: title,
+      content: content,
+      status: resolvedStatus,
+      isInternal: isInternal
+    };
+  }
+
+  /* ============================================================================
+   * DEVELOPER-ONLY DATA INTEGRITY MONITOR PURE HELPERS
+   * ============================================================================ */
+
+  var DATA_INTEGRITY_DISCREPANCY_TYPES = {
+    missing_in_neon: { key: 'missing_in_neon', labelAr: 'مفقود في Neon وموجود في RG', severity: 'high' },
+    missing_in_rg: { key: 'missing_in_rg', labelAr: 'مفقود في Rental Gate وموجود في Neon', severity: 'high' },
+    status_mismatch: { key: 'status_mismatch', labelAr: 'اختلاف حالة الحجز', severity: 'high' },
+    customer_mismatch: { key: 'customer_mismatch', labelAr: 'اختلاف بيانات العميل', severity: 'medium' },
+    dates_mismatch: { key: 'dates_mismatch', labelAr: 'اختلاف مواعيد الاستلام أو الإرجاع', severity: 'high' },
+    vehicle_company_mismatch: { key: 'vehicle_company_mismatch', labelAr: 'اختلاف السيارة أو شركة التأجير', severity: 'medium' },
+    duplicate_record: { key: 'duplicate_record', labelAr: 'سجل مكرر في قاعدة البيانات', severity: 'high' },
+    incomplete_fields: { key: 'incomplete_fields', labelAr: 'حقول أساسية ناقصة أو غير مكتملة', severity: 'low' },
+    stale_record: { key: 'stale_record', labelAr: 'سجل متأخر عن آخر تحديث', severity: 'low' },
+    sync_error: { key: 'sync_error', labelAr: 'خطأ مزامنة في المصدر', severity: 'high' }
+  };
+
+  var DEFAULT_DATA_INTEGRITY_SETTINGS = {
+    mode: 'manual',
+    intervalMinutes: 60,
+    scopes: ['reservations', 'extensions', 'cancelled', 'company_changes'],
+    dateFrom: '',
+    dateTo: '',
+    batchSize: 100,
+    paused: false
+  };
+
+  function normalizeDataIntegritySettings(raw) {
+    var src = raw;
+    if (typeof raw === 'string') {
+      try { src = JSON.parse(raw); } catch (_e) { src = {}; }
+    }
+    if (!src || typeof src !== 'object') src = {};
+    var allowedScopes = ['reservations', 'extensions', 'cancelled', 'company_changes'];
+    var scopes = Array.isArray(src.scopes)
+      ? src.scopes.map(normalizeStr).filter(function (s) { return allowedScopes.indexOf(s) !== -1; })
+      : DEFAULT_DATA_INTEGRITY_SETTINGS.scopes.slice();
+    if (!scopes.length) scopes = ['reservations'];
+    return {
+      mode: src.mode === 'scheduled' ? 'scheduled' : 'manual',
+      intervalMinutes: Math.max(5, Math.min(1440, Math.floor(toNum(src.intervalMinutes, 60)))),
+      scopes: scopes,
+      dateFrom: formatDisplayDate(src.dateFrom || ''),
+      dateTo: formatDisplayDate(src.dateTo || ''),
+      batchSize: Math.max(20, Math.min(500, Math.floor(toNum(src.batchSize, 100)))),
+      paused: Boolean(src.paused)
+    };
+  }
+
+  function buildIntegrityRecordProjection(raw, isRgSource) {
+    var r = (raw && typeof raw === 'object') ? raw : {};
+    var id = normalizeStr(r.id || (isRgSource ? extractSourceReservationId(r) : r.source_id));
+    var num = normalizeStr(r.reservationNumber || r.reservation_number || (isRgSource ? extractReservationNumber(r) : '') || id);
+    var statusCode = isRgSource
+      ? normalizeStr(extractReservationStatusCode(r, true) || r.status || r.statusCode || '')
+      : normalizeStr(r.originalStatusCode || r.original_status_code || r.internalStatus || r.internal_status);
+    var statusAr = isRgSource
+      ? resolveSourceWorkflowStatus(r)
+      : normalizeStr(r.internalStatus || r.internal_status || r.originalStatusAr || r.original_status_ar || translateOriginalStatus(statusCode));
+    return {
+      id: id,
+      reservationNumber: num,
+      statusCode: statusCode,
+      statusAr: statusAr,
+      customerName: normalizeStr(r.customerName || r.customer_name || (r.customer && r.customer.name) || (r.user && r.user.name)),
+      customerPhone: normalizeStr(r.customerPhone || r.customer_phone || (r.customer && r.customer.phone) || (r.user && r.user.phone)),
+      startDate: formatDisplayDate(r.startDate || r.start_date || r.pickup_date),
+      startTime: normalizeStr(r.startTime || r.start_time || extractTimeOnly(r.startDate || r.start_date)),
+      endDate: formatDisplayDate(r.actualEndDate || r.extendedUntilDate || r.extended_until_date || r.endDate || r.end_date || r.return_date),
+      endTime: normalizeStr(r.endTime || r.end_time || extractTimeOnly(r.actualEndDate || r.endDate || r.end_date)),
+      carName: normalizeStr(r.carName || r.car_name || (r.car && (r.car.name || r.car.model))),
+      companyName: normalizeStr(r.companyName || r.company_name || (r.company && r.company.name) || r.newCompanyName || r.new_company_name),
+      extensionsCount: Math.floor(toNum(r.extensionsCount !== undefined ? r.extensionsCount : r.extensions_count, 0)),
+      updatedAt: normalizeStr(r.lastUpdatedAt || r.updatedAt || r.updated_at)
+    };
+  }
+
+  function compareRgAndNeonReservations(rgList, neonList) {
+    var rgArr = Array.isArray(rgList) ? rgList : [];
+    var neonArr = Array.isArray(neonList) ? neonList : [];
+    var rgByKey = {};
+    var neonByKey = {};
+    var neonKeyCounts = {};
+    var issues = [];
+
+    for (var ni = 0; ni < neonArr.length; ni++) {
+      var nProj = buildIntegrityRecordProjection(neonArr[ni], false);
+      var nKey = normalizeStr(nProj.reservationNumber || nProj.id);
+      if (!nKey) continue;
+      neonKeyCounts[nKey] = (neonKeyCounts[nKey] || 0) + 1;
+      if (!neonByKey[nKey]) {
+        neonByKey[nKey] = nProj;
+      } else {
+        issues.push({
+          discrepancyType: 'duplicate_record',
+          severity: 'high',
+          sourceScope: 'reservations',
+          reservationId: nProj.id,
+          reservationNumber: nKey,
+          fieldName: 'reservation_number',
+          rgValue: 'سجل فريد واحد',
+          neonValue: 'مكرر (' + neonKeyCounts[nKey] + ' سجلات)',
+          rgSnapshot: rgByKey[nKey] || {},
+          neonSnapshot: nProj
+        });
+      }
+    }
+
+    for (var ri = 0; ri < rgArr.length; ri++) {
+      var rProj = buildIntegrityRecordProjection(rgArr[ri], true);
+      var rKey = normalizeStr(rProj.reservationNumber || rProj.id);
+      if (!rKey) continue;
+      rgByKey[rKey] = rProj;
+
+      var nMatch = neonByKey[rKey] || null;
+      if (!nMatch) {
+        issues.push({
+          discrepancyType: 'missing_in_neon',
+          severity: 'high',
+          sourceScope: 'reservations',
+          reservationId: rProj.id,
+          reservationNumber: rKey,
+          fieldName: 'record',
+          rgValue: rProj.statusAr || rProj.statusCode || 'موجود في RG',
+          neonValue: 'غير موجود في Neon',
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: {}
+        });
+        continue;
+      }
+
+      // Incomplete required fields check
+      if (!nMatch.customerName || !nMatch.customerPhone || !nMatch.startDate || !nMatch.endDate) {
+        var missingCols = [];
+        if (!nMatch.customerName) missingCols.push('اسم العميل');
+        if (!nMatch.customerPhone) missingCols.push('رقم الجوال');
+        if (!nMatch.startDate) missingCols.push('تاريخ الاستلام');
+        if (!nMatch.endDate) missingCols.push('تاريخ الإرجاع');
+        issues.push({
+          discrepancyType: 'incomplete_fields',
+          severity: 'low',
+          sourceScope: 'reservations',
+          reservationId: nMatch.id,
+          reservationNumber: rKey,
+          fieldName: 'required_fields',
+          rgValue: [rProj.customerName, rProj.customerPhone, rProj.startDate, rProj.endDate].filter(Boolean).join(' · '),
+          neonValue: 'ناقص: ' + missingCols.join('، '),
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+
+      // Status mismatch check (compare semantic lifecycle or explicit translated code)
+      var rgStatusLc = getReservationLifecycleKind({ originalStatusCode: rProj.statusCode, internalStatus: rProj.statusAr });
+      var neonStatusLc = getReservationLifecycleKind({ originalStatusCode: nMatch.statusCode, internalStatus: nMatch.statusAr });
+      var rgOrigNorm = normalizeStr(rProj.statusCode).toLowerCase();
+      var neonOrigNorm = normalizeStr(nMatch.statusCode).toLowerCase();
+      if (rgStatusLc !== neonStatusLc || (rgOrigNorm && neonOrigNorm && rgOrigNorm !== neonOrigNorm && translateOriginalStatus(rgOrigNorm) !== translateOriginalStatus(neonOrigNorm))) {
+        issues.push({
+          discrepancyType: 'status_mismatch',
+          severity: 'high',
+          sourceScope: 'reservations',
+          reservationId: nMatch.id,
+          reservationNumber: rKey,
+          fieldName: 'status',
+          rgValue: rProj.statusAr + (rProj.statusCode ? (' (' + rProj.statusCode + ')') : ''),
+          neonValue: nMatch.statusAr + (nMatch.statusCode ? (' (' + nMatch.statusCode + ')') : ''),
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+
+      // Customer mismatch check
+      var rgPhoneDigits = normalizeEmployeePhone(rProj.customerPhone);
+      var neonPhoneDigits = normalizeEmployeePhone(nMatch.customerPhone);
+      if ((rgPhoneDigits && neonPhoneDigits && rgPhoneDigits !== neonPhoneDigits) ||
+          (rProj.customerName && nMatch.customerName && normalizeSearchText(rProj.customerName) !== normalizeSearchText(nMatch.customerName))) {
+        issues.push({
+          discrepancyType: 'customer_mismatch',
+          severity: 'medium',
+          sourceScope: 'reservations',
+          reservationId: nMatch.id,
+          reservationNumber: rKey,
+          fieldName: 'customer',
+          rgValue: [rProj.customerName, rProj.customerPhone].filter(Boolean).join(' / '),
+          neonValue: [nMatch.customerName, nMatch.customerPhone].filter(Boolean).join(' / '),
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+
+      // Pickup / return date mismatch check
+      if ((rProj.startDate && nMatch.startDate && rProj.startDate !== nMatch.startDate) ||
+          (rProj.endDate && nMatch.endDate && rProj.endDate !== nMatch.endDate)) {
+        issues.push({
+          discrepancyType: 'dates_mismatch',
+          severity: 'high',
+          sourceScope: 'reservations',
+          reservationId: nMatch.id,
+          reservationNumber: rKey,
+          fieldName: 'dates',
+          rgValue: (rProj.startDate || '-') + ' → ' + (rProj.endDate || '-'),
+          neonValue: (nMatch.startDate || '-') + ' → ' + (nMatch.endDate || '-'),
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+
+      // Car / rental company mismatch check
+      if ((rProj.companyName && nMatch.companyName && normalizeSearchText(rProj.companyName) !== normalizeSearchText(nMatch.companyName)) ||
+          (rProj.carName && nMatch.carName && normalizeSearchText(rProj.carName) !== normalizeSearchText(nMatch.carName))) {
+        issues.push({
+          discrepancyType: 'vehicle_company_mismatch',
+          severity: 'medium',
+          sourceScope: 'reservations',
+          reservationId: nMatch.id,
+          reservationNumber: rKey,
+          fieldName: 'vehicle_company',
+          rgValue: [rProj.companyName, rProj.carName].filter(Boolean).join(' — '),
+          neonValue: [nMatch.companyName, nMatch.carName].filter(Boolean).join(' — '),
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+    }
+
+    var neonKeys = Object.keys(neonByKey);
+    for (var nki = 0; nki < neonKeys.length; nki++) {
+      var k = neonKeys[nki];
+      if (!rgByKey[k]) {
+        issues.push({
+          discrepancyType: 'missing_in_rg',
+          severity: 'high',
+          sourceScope: 'reservations',
+          reservationId: neonByKey[k].id,
+          reservationNumber: k,
+          fieldName: 'record',
+          rgValue: 'غير موجود في استجابة Rental Gate',
+          neonValue: neonByKey[k].statusAr || neonByKey[k].statusCode || 'موجود في Neon',
+          rgSnapshot: {},
+          neonSnapshot: neonByKey[k]
+        });
+      }
+    }
+
+    return {
+      rgTotalCount: rgArr.length,
+      neonTotalCount: neonArr.length,
+      reviewedCount: Math.max(rgArr.length, neonArr.length),
+      discrepanciesCount: issues.length,
+      issues: issues
+    };
+  }
+
   return {
     ROLES: ROLES,
     ROLE_LABELS: ROLE_LABELS,
@@ -11272,6 +11966,22 @@
     resolvePullDateRange: resolvePullDateRange,
     filterSourceReservationsByPullRange: filterSourceReservationsByPullRange,
     CUSTOMER_STATUS_LIST: CUSTOMER_STATUS_LIST,
+    CUSTOMER_RESERVATION_STATUS_OPTIONS: CUSTOMER_RESERVATION_STATUS_OPTIONS,
+    classifyReservationStatusBucket: classifyReservationStatusBucket,
+    doesReservationMatchStatusFilter: doesReservationMatchStatusFilter,
+    CUSTOMER_NOTE_TYPES: CUSTOMER_NOTE_TYPES,
+    CUSTOMER_NOTE_DEFAULT_STATUSES: CUSTOMER_NOTE_DEFAULT_STATUSES,
+    CUSTOMER_NOTES_BUTTON_CATALOG: CUSTOMER_NOTES_BUTTON_CATALOG,
+    DEFAULT_CUSTOMER_NOTES_CONFIG: DEFAULT_CUSTOMER_NOTES_CONFIG,
+    normalizeCustomerNotesConfig: normalizeCustomerNotesConfig,
+    normalizeCustomerNoteStatusRecord: normalizeCustomerNoteStatusRecord,
+    evaluateCustomerNoteButtonAccess: evaluateCustomerNoteButtonAccess,
+    validateCustomerNotePayload: validateCustomerNotePayload,
+    DATA_INTEGRITY_DISCREPANCY_TYPES: DATA_INTEGRITY_DISCREPANCY_TYPES,
+    DEFAULT_DATA_INTEGRITY_SETTINGS: DEFAULT_DATA_INTEGRITY_SETTINGS,
+    normalizeDataIntegritySettings: normalizeDataIntegritySettings,
+    buildIntegrityRecordProjection: buildIntegrityRecordProjection,
+    compareRgAndNeonReservations: compareRgAndNeonReservations,
     extractPhoneCountryCode: extractPhoneCountryCode,
     detectCustomerIdType: detectCustomerIdType,
     buildCustomerCanonicalKey: buildCustomerCanonicalKey,

@@ -3879,6 +3879,12 @@
       handover_settings: (root.RGCrmCore && root.RGCrmCore.normalizeHandoverSettings)
         ? root.RGCrmCore.normalizeHandoverSettings({})
         : { defaultPreset: 'last_12h', defaultTimeFrom: '', defaultTimeTo: '', includeClosed: true, includePending: true, includeProblems: true, includeRadar: true, includeTodayMovements: true },
+      customer_notes_config: (root.RGCrmCore && root.RGCrmCore.normalizeCustomerNotesConfig)
+        ? root.RGCrmCore.normalizeCustomerNotesConfig({})
+        : {},
+      data_integrity_settings: (root.RGCrmCore && root.RGCrmCore.normalizeDataIntegritySettings)
+        ? root.RGCrmCore.normalizeDataIntegritySettings({})
+        : { enabled: false, paused: false, mode: 'read_only', intervalMinutes: 60 },
       job_role_presets: (root.RGCrmCore && root.RGCrmCore.JOB_ROLE_PRESETS) ? root.RGCrmCore.JOB_ROLE_PRESETS.slice() : [],
       permissions_catalog_custom: []
     };
@@ -3942,6 +3948,75 @@
       });
     });
 
+    var seedNoteStatuses = (root.RGCrmCore && Array.isArray(root.RGCrmCore.CUSTOMER_NOTE_DEFAULT_STATUSES))
+      ? root.RGCrmCore.CUSTOMER_NOTE_DEFAULT_STATUSES.map(function (st) {
+          return root.RGCrmCore.normalizeCustomerNoteStatusRecord ? root.RGCrmCore.normalizeCustomerNoteStatusRecord(st) : Object.assign({}, st);
+        })
+      : [];
+
+    var mkSeedCustId = function (resObj) {
+      if (!resObj || !root.RGCrmCore || !root.RGCrmCore.buildCustomerCanonicalKey) return '';
+      var k = root.RGCrmCore.buildCustomerCanonicalKey(resObj.customerPhone, resObj.customerIdNumber, resObj.customerName);
+      return k ? ('CUST_' + k) : '';
+    };
+    var seedNotes = [];
+    if (reservations[0]) {
+      seedNotes.push({
+        id: 'CNOTE_SEED_1',
+        customerId: mkSeedCustId(reservations[0]),
+        reservationId: reservations[0].id,
+        reservationNumber: reservations[0].reservationNumber,
+        problemId: '',
+        problemNumber: '',
+        sourceSection: 'reservations',
+        noteType: 'مكالمة',
+        title: 'تأكيد جاهزية التمديد للعميل',
+        content: 'تم التواصل مع العميل وتأكيد تمديد العقد وإرسال تفاصيل السداد عبر الواتساب.',
+        statusId: 'CNS_COMPLETED',
+        statusName: 'مكتملة',
+        statusColor: '#10b981',
+        isInternal: false,
+        assignedEmployeeId: 'EMP_AG1',
+        assignedEmployeeName: 'خالد الحربي',
+        attachments: [],
+        createdById: 'EMP_SUP1',
+        createdByName: 'سارة العتيبي',
+        updatedById: 'EMP_SUP1',
+        updatedByName: 'سارة العتيبي',
+        deletedAt: '',
+        createdAt: t0 + 'T11:20:00.000Z',
+        updatedAt: t0 + 'T11:20:00.000Z'
+      });
+    }
+    if (reservations[2]) {
+      seedNotes.push({
+        id: 'CNOTE_SEED_2',
+        customerId: mkSeedCustId(reservations[2]),
+        reservationId: reservations[2].id,
+        reservationNumber: reservations[2].reservationNumber,
+        problemId: 'PRB_201',
+        problemNumber: 'PRB-884301',
+        sourceSection: 'problems',
+        noteType: 'متابعة',
+        title: 'متابعة توفير المركبة البديلة في مطار جدة',
+        content: 'العميل يطلب سيارة بديلة من نفس الفئة قبل موعد الوصول بساعتين — تم التنسيق مع الفرع.',
+        statusId: 'CNS_PROGRESS',
+        statusName: 'قيد المتابعة',
+        statusColor: '#f59e0b',
+        isInternal: false,
+        assignedEmployeeId: 'EMP_AG2',
+        assignedEmployeeName: 'نورة القحطاني',
+        attachments: [],
+        createdById: 'EMP_AG2',
+        createdByName: 'نورة القحطاني',
+        updatedById: 'EMP_SUP1',
+        updatedByName: 'سارة العتيبي',
+        deletedAt: '',
+        createdAt: t0 + 'T09:30:00.000Z',
+        updatedAt: t0 + 'T09:45:00.000Z'
+      });
+    }
+
     return {
       _schemaV3ExactRg: true,
       _schemaV4Ops: true,
@@ -3958,7 +4033,12 @@
       syncLog: syncLog,
       announcements: announcements,
       customers: [],
-      customerNotes: [],
+      customerNotes: seedNotes,
+      customerNoteStatuses: seedNoteStatuses,
+      customerNoteHistory: [],
+      dataIntegrityRuns: [],
+      dataIntegrityIssues: [],
+      dataIntegrityActions: [],
       delegations: delegations,
       locks: locks,
       settings: settings,
@@ -4014,12 +4094,16 @@
         });
       }
 
-      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'announcements', 'customers', 'customerNotes', 'delegations', 'locks', 'sessions'].forEach(function (k) {
+      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'announcements', 'customers', 'customerNotes', 'customerNoteStatuses', 'customerNoteHistory', 'dataIntegrityRuns', 'dataIntegrityIssues', 'dataIntegrityActions', 'delegations', 'locks', 'sessions'].forEach(function (k) {
         if (!Array.isArray(parsed[k])) {
           parsed[k] = defaults[k] || [];
           dirty = true;
         }
       });
+      if (!parsed.customerNoteStatuses || parsed.customerNoteStatuses.length === 0) {
+        parsed.customerNoteStatuses = defaults.customerNoteStatuses || [];
+        dirty = true;
+      }
 
       if (!parsed._schemaV4Ops && Array.isArray(parsed.reservations)) {
         var r1009Idx = parsed.reservations.findIndex(function (r) { return r && r.id === 'RES_1009'; });
@@ -4150,6 +4234,14 @@
         }
         if (!parsed.settings.handover_settings || typeof parsed.settings.handover_settings !== 'object') {
           parsed.settings.handover_settings = defaults.settings.handover_settings;
+          dirty = true;
+        }
+        if (!parsed.settings.customer_notes_config || typeof parsed.settings.customer_notes_config !== 'object') {
+          parsed.settings.customer_notes_config = defaults.settings.customer_notes_config;
+          dirty = true;
+        }
+        if (!parsed.settings.data_integrity_settings || typeof parsed.settings.data_integrity_settings !== 'object') {
+          parsed.settings.data_integrity_settings = defaults.settings.data_integrity_settings;
           dirty = true;
         }
       }
@@ -4373,8 +4465,6 @@
         idType: c.idType,
         status: c.status,
         statusOverride: Boolean(c.statusOverride),
-        assignedEmployeeId: c.assignedEmployeeId || '',
-        assignedEmployeeName: c.assignedEmployeeName || '',
         notes: c.notes || '',
         tags: Array.isArray(c.tags) ? c.tags.slice() : [],
         source: c.source || 'sync',
@@ -4395,6 +4485,7 @@
         paidAmount: Number(c.paidAmount || 0),
         lastReservationNumber: c.lastBookingNumber || '',
         lastReservationDate: c.lastBookingDate || '',
+        lastReservationStatus: c.lastReservationStatus || '',
         lastCompanyName: (Array.isArray(c.companies) && c.companies[0]) ? c.companies[0] : '',
         companies: Array.isArray(c.companies) ? c.companies.slice() : [],
         reservationIds: Array.isArray(c.reservationIds) ? c.reservationIds.slice() : [],
@@ -4443,8 +4534,6 @@
       idType: itemView.idType || '',
       status: itemView.status || 'جديد',
       statusOverride: Boolean(itemView.statusOverride),
-      assignedEmployeeId: itemView.assignedEmployeeId || '',
-      assignedEmployeeName: itemView.assignedEmployeeName || '',
       notes: itemView.notes || '',
       tags: Array.isArray(itemView.tags) ? itemView.tags.slice() : [],
       source: itemView.source || 'sync',
@@ -4454,6 +4543,40 @@
     };
     db.customers.push(created);
     return created;
+  }
+
+  function resolveSandboxNotesBundle(db, opts) {
+    var o = opts || {};
+    var core = root.RGCrmCore;
+    var notesCfg = (core && core.normalizeCustomerNotesConfig)
+      ? core.normalizeCustomerNotesConfig(db.settings && db.settings.customer_notes_config)
+      : {};
+    var statuses = (Array.isArray(db.customerNoteStatuses) ? db.customerNoteStatuses : []).map(function (st) {
+      return (core && core.normalizeCustomerNoteStatusRecord) ? core.normalizeCustomerNoteStatusRecord(st) : Object.assign({}, st);
+    }).sort(function (a, b) {
+      return Number(a.sortOrder || 0) - Number(b.sortOrder || 0);
+    });
+    var statusMap = {};
+    statuses.forEach(function (st) { statusMap[st.id] = st; });
+    var all = (Array.isArray(db.customerNotes) ? db.customerNotes : []).filter(function (n) {
+      if (!n || n.deletedAt) return false;
+      if (o.customerId && String(n.customerId || '') !== String(o.customerId)) return false;
+      if (o.reservationId && String(n.reservationId || '') !== String(o.reservationId)) return false;
+      if (o.problemId && String(n.problemId || '') !== String(o.problemId)) return false;
+      return true;
+    }).map(function (n) {
+      var st = n.statusId && statusMap[n.statusId];
+      return Object.assign({}, n, {
+        statusName: st ? st.name : (n.statusName || 'جديدة'),
+        statusColor: st ? st.color : (n.statusColor || '#3b82f6'),
+        statusIsActive: st ? Boolean(st.isActive) : true,
+        statusIsClosed: st ? Boolean(st.isClosedStatus) : Boolean(n.statusIsClosed),
+        attachments: Array.isArray(n.attachments) ? n.attachments.slice() : []
+      });
+    }).sort(function (a, b) {
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    });
+    return { items: all, statuses: statuses, config: notesCfg };
   }
 
   function sandboxExecute(action, token, payload) {
@@ -4551,6 +4674,12 @@
         var handoverSettingsBoot = (core && core.normalizeHandoverSettings)
           ? core.normalizeHandoverSettings(db.settings.handover_settings)
           : (db.settings.handover_settings || {});
+        var customerNotesConfigBoot = (core && core.normalizeCustomerNotesConfig)
+          ? core.normalizeCustomerNotesConfig(db.settings.customer_notes_config)
+          : {};
+        var customerNoteStatusesBoot = (Array.isArray(db.customerNoteStatuses) ? db.customerNoteStatuses : []).map(function (st) {
+          return (core && core.normalizeCustomerNoteStatusRecord) ? core.normalizeCustomerNoteStatusRecord(st) : Object.assign({}, st);
+        });
         var activeAnnsBoot = (db.announcements || []).filter(function (a) { return isSandboxAnnouncementActive(a); });
         var activeLocksBoot = pruneSandboxLocks(db);
         return {
@@ -4567,6 +4696,8 @@
             statsControlConfig: statsControlBoot,
             callWrapupShortcuts: callShortcutsBoot,
             handoverSettings: handoverSettingsBoot,
+            customerNotesConfig: customerNotesConfigBoot,
+            customerNoteStatuses: customerNoteStatusesBoot,
             announcements: activeAnnsBoot,
             activeLocks: activeLocksBoot,
             pinnedCriticalIds: parsedPinnedBoot.slice(0, (core && core.MAX_PINNED_CRITICAL_RESERVATIONS) || 3),
@@ -4806,6 +4937,7 @@
           if (sa !== sb && sa > 0 && sb > 0) return sa - sb;
           return String(a.startDate || '').localeCompare(String(b.startDate || ''));
         });
+        var resNotesBundle = resolveSandboxNotesBundle(db, { reservationId: res.id });
         return {
           success: true,
           message: '',
@@ -4816,7 +4948,10 @@
             followUps: db.followUps.filter(function (f) { return f.reservationId === res.id; }).sort(function (a, b) { return b.createdAt.localeCompare(a.createdAt); }),
             followUpHistory: (db.followUpHistory || []).filter(function (h) { return h.reservationId === res.id; }).sort(function (a, b) { return String(b.changedAt).localeCompare(String(a.changedAt)); }),
             problems: db.problems.filter(function (p) { return p.reservationId === res.id; }),
-            problemUpdates: db.problemUpdates.filter(function (u) { return u.reservationNumber === res.reservationNumber; })
+            problemUpdates: db.problemUpdates.filter(function (u) { return u.reservationNumber === res.reservationNumber; }),
+            customerNotes: resNotesBundle.items,
+            noteStatuses: resNotesBundle.statuses,
+            notesConfig: resNotesBundle.config
           },
           error: null
         };
@@ -5738,13 +5873,17 @@
         if (!foundPrb) {
           return { success: false, message: 'المشكلة غير موجودة.', data: null, error: 'NOT_FOUND' };
         }
+        var prbNotesBundle = resolveSandboxNotesBundle(db, { problemId: foundPrb.id });
         return {
           success: true,
           message: '',
           data: {
             problem: Object.assign({}, foundPrb, {
               updates: db.problemUpdates.filter(function (u) { return u.problemId === foundPrb.id; })
-            })
+            }),
+            customerNotes: prbNotesBundle.items,
+            noteStatuses: prbNotesBundle.statuses,
+            notesConfig: prbNotesBundle.config
           },
           error: null
         };
@@ -6134,10 +6273,10 @@
         };
         (db.reservations || []).forEach(scrubAssigned);
         (db.problems || []).forEach(scrubAssigned);
-        (db.customers || []).forEach(function (c) {
-          if (c && c.assignedEmployeeId === delEmpId) {
-            c.assignedEmployeeId = '';
-            c.assignedEmployeeName = '';
+        (db.customerNotes || []).forEach(function (nt) {
+          if (nt && nt.assignedEmployeeId === delEmpId) {
+            nt.assignedEmployeeId = '';
+            nt.assignedEmployeeName = '';
           }
         });
         appendSandboxActivity(db, session.user, 'حذف موظف', 'Employee', delEmpId, empDel.name + ' (' + empDel.username + ')');
@@ -6886,8 +7025,27 @@
           }
           var custRepView = buildSandboxCustomersView(db, session.user);
           var custRepRows = custRepView.items.filter(function (c) {
-            if (fStatus && c.status !== fStatus) return false;
-            if (fEmp && c.assignedEmployeeId !== fEmp) return false;
+            var cRes = (db.reservations || []).filter(function (r) {
+              return (c.reservationIds || []).indexOf(r.id) !== -1 || r.customerId === c.id;
+            });
+            if (fStatus) {
+              var stMatch = cRes.some(function (r) {
+                return core && core.doesReservationMatchStatusFilter
+                  ? core.doesReservationMatchStatusFilter(r, fStatus)
+                  : (String(r.internalStatus || '') === fStatus || String(r.originalStatusAr || '') === fStatus);
+              });
+              if (!stMatch) return false;
+            }
+            if (dFrom || dTo) {
+              var dtMatch = cRes.some(function (r) {
+                var bd = String(r.startDate || r.sourceCreatedAt || r.createdAt || '').slice(0, 10);
+                if (!bd) return false;
+                if (dFrom && bd < dFrom) return false;
+                if (dTo && bd > dTo) return false;
+                return true;
+              });
+              if (!dtMatch) return false;
+            }
             if (payload.company && (c.companies || []).indexOf(payload.company) === -1) return false;
             return true;
           });
@@ -6961,6 +7119,7 @@
             stats_control_config: core.normalizeStatsControlConfig ? core.normalizeStatsControlConfig(db.settings.stats_control_config) : { excludedFromStatsEmployeeIds: [] },
             call_wrapup_shortcuts: core.normalizeCallWrapupShortcutsConfig ? core.normalizeCallWrapupShortcutsConfig(db.settings.call_wrapup_shortcuts) : { items: core.CALL_WRAPUP_OUTCOMES || [], customized: false, updatedAt: '', updatedBy: '' },
             handover_settings: core.normalizeHandoverSettings(db.settings.handover_settings),
+            customer_notes_config: core.normalizeCustomerNotesConfig ? core.normalizeCustomerNotesConfig(db.settings.customer_notes_config) : {},
             auto_sync_enabled: db.settings.auto_sync_enabled !== false,
             auto_sync_interval_seconds: getSecIv.intervalSeconds,
             auto_sync_interval_value: getSecIv.value,
@@ -7072,6 +7231,12 @@
               after: nextHo.defaultPreset + ' (' + (nextHo.defaultTimeFrom || '00:00') + '-' + (nextHo.defaultTimeTo || '23:59') + ')'
             });
           }
+        }
+        if (payload.customer_notes_config !== undefined && core.normalizeCustomerNotesConfig) {
+          var nextCncSet = core.normalizeCustomerNotesConfig(payload.customer_notes_config);
+          nextCncSet.updatedAt = new Date().toISOString();
+          nextCncSet.updatedBy = session.user ? session.user.name : '';
+          db.settings.customer_notes_config = nextCncSet;
         }
         if (hasAutoSyncIvChange) {
           var nextSecCfg = core.validateAutoSyncInterval
@@ -7587,6 +7752,9 @@
           : undefined;
         var clearAllDeltaIso = String((db.settings && db.settings['notif_deleted_all_before_' + session.employeeId]) || '');
         var clearAllDeltaBefore = (clearAllDeltaIso && Date.parse(clearAllDeltaIso) > sinceMs) ? clearAllDeltaIso : '';
+        var changedCNotesDelta = (db.customerNotes || []).filter(function (n) {
+          return Date.parse(n.updatedAt || n.createdAt || '') > sinceMs;
+        });
         return {
           success: true,
           message: '',
@@ -7597,6 +7765,7 @@
             changedFollowUps: changedFu,
             changedProblems: changedPrb,
             changedEmployees: changedEmps,
+            changedCustomerNotes: changedCNotesDelta,
             deletedNotificationIds: delNtfIdsDelta,
             deletedAllNotificationsBefore: clearAllDeltaBefore,
             changedSettings: settingsChangedDelta,
@@ -7606,7 +7775,12 @@
             announcements: activeAnnsDelta,
             locks: activeLocksDelta,
             user: session.user
-          }, callShortcutsDelta !== undefined ? { callWrapupShortcuts: callShortcutsDelta } : {}),
+          },
+          callShortcutsDelta !== undefined ? { callWrapupShortcuts: callShortcutsDelta } : {},
+          settingsChangedDelta ? {
+            customerNotesConfig: core && core.normalizeCustomerNotesConfig ? core.normalizeCustomerNotesConfig(db.settings.customer_notes_config) : {},
+            customerNoteStatuses: Array.isArray(db.customerNoteStatuses) ? db.customerNoteStatuses : []
+          } : {}),
           error: null
         };
       }
@@ -7979,7 +8153,6 @@
         var viewData = buildSandboxCustomersView(db, session.user);
         var scopedItems = (session.role === 'agent' && !allowAllCust)
           ? viewData.items.filter(function (c) {
-              if (c.assignedEmployeeId === session.employeeId) return true;
               return (db.reservations || []).some(function (r) {
                 return c.reservationIds.indexOf(r.id) !== -1 && (r.assignedEmployeeIds || []).indexOf(session.employeeId) !== -1;
               });
@@ -7989,16 +8162,28 @@
         var cSearch = String(payload.search || '').trim().toLowerCase();
         var cStatus = String(payload.status || '').trim();
         var cCompany = String(payload.company || '').trim();
-        var cEmp = String(payload.assignedEmployeeId || payload.employeeId || '').trim();
+        var cDateFrom = String(payload.dateFrom || '').trim().slice(0, 10);
+        var cDateTo = String(payload.dateTo || '').trim().slice(0, 10);
         var cPrbFilter = String(payload.problemFilter || '').trim();
         var cKpi = String(payload.kpiFilter || 'all').trim();
         var cSort = String(payload.sortBy || 'last_activity').trim();
 
+        var resByCustMap = {};
+        (db.reservations || []).forEach(function (r) {
+          if (!r) return;
+          if (r.customerId) {
+            if (!resByCustMap[r.customerId]) resByCustMap[r.customerId] = [];
+            resByCustMap[r.customerId].push(r);
+          }
+        });
+
         var cFiltered = scopedItems.filter(function (c) {
+          var custResListFilter = (db.reservations || []).filter(function (r) {
+            return (c.reservationIds || []).indexOf(r.id) !== -1 || r.customerId === c.id;
+          });
           if (cSearch) {
-            var resTexts = (c.reservationIds || []).map(function (rid) {
-              var rm = (db.reservations || []).find(function (x) { return x.id === rid; });
-              return rm ? ((rm.reservationNumber || '') + ' ' + (rm.referenceNumber || '')) : '';
+            var resTexts = custResListFilter.map(function (rm) {
+              return (rm.reservationNumber || '') + ' ' + (rm.referenceNumber || '');
             }).join(' ');
             var hay = [
               c.fullName, c.phone, c.normalizedPhone, c.email,
@@ -8007,15 +8192,26 @@
             ].join(' ').toLowerCase();
             if (hay.indexOf(cSearch) === -1) return false;
           }
-          if (cStatus && c.status !== cStatus) return false;
-          if (cCompany && (c.companies || []).indexOf(cCompany) === -1) return false;
-          if (cEmp) {
-            if (cEmp === 'unassigned') {
-              if (c.assignedEmployeeId) return false;
-            } else if (c.assignedEmployeeId !== cEmp) {
-              return false;
-            }
+          if (cStatus) {
+            var hasResStatusMatch = custResListFilter.some(function (r) {
+              if (core && core.doesReservationMatchStatusFilter) {
+                return core.doesReservationMatchStatusFilter(r, cStatus);
+              }
+              return String(r.internalStatus || '') === cStatus || String(r.originalStatusAr || '') === cStatus;
+            });
+            if (!hasResStatusMatch) return false;
           }
+          if (cDateFrom || cDateTo) {
+            var hasDateMatch = custResListFilter.some(function (r) {
+              var bd = String(r.startDate || r.sourceCreatedAt || r.createdAt || '').slice(0, 10);
+              if (!bd) return false;
+              if (cDateFrom && bd < cDateFrom) return false;
+              if (cDateTo && bd > cDateTo) return false;
+              return true;
+            });
+            if (!hasDateMatch) return false;
+          }
+          if (cCompany && (c.companies || []).indexOf(cCompany) === -1) return false;
           if (cPrbFilter === 'open_problems' && c.openProblemsCount <= 0) return false;
           if (cPrbFilter === 'open_complaints' && c.openComplaintsCount <= 0) return false;
           if (cPrbFilter === 'no_problems' && c.openProblemsCount > 0) return false;
@@ -8053,6 +8249,9 @@
         var cRecent = scopedItems.slice().sort(function (a, b) {
           return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
         }).slice(0, 6);
+        var resStatusFacetOpts = (core && Array.isArray(core.CUSTOMER_RESERVATION_STATUS_OPTIONS))
+          ? core.CUSTOMER_RESERVATION_STATUS_OPTIONS.slice()
+          : ['نشط', 'مكتمل', 'ملغي', 'مرفوض', 'تغيير شركة', 'ممدد', 'متأخر', 'قيد الانتظار', 'بانتظار السداد'];
 
         return {
           success: true,
@@ -8063,8 +8262,8 @@
             recentCustomers: cRecent,
             facets: {
               companies: Object.keys(cCompaniesMap).sort(),
-              employees: (db.employees || []).filter(function (e) { return e && e.status === 'active'; }).map(function (e) { return { id: e.id, name: e.name, role: e.role }; }),
-              statuses: core.CUSTOMER_STATUS_LIST || ['جديد', 'نشط', 'متكرر', 'VIP', 'يحتاج متابعة', 'لديه مشكلة', 'غير نشط', 'محظور']
+              statuses: resStatusFacetOpts,
+              reservationStatusOptions: resStatusFacetOpts
             },
             total: cTotal,
             page: cSafePage,
@@ -8117,8 +8316,7 @@
         });
 
         if (session.role === 'agent' && db.settings.allow_agent_view_all === false) {
-          var hasAg = custObj.assignedEmployeeId === session.employeeId ||
-            custResList.some(function (r) { return (r.assignedEmployeeIds || []).indexOf(session.employeeId) !== -1; });
+          var hasAg = custResList.some(function (r) { return (r.assignedEmployeeIds || []).indexOf(session.employeeId) !== -1; });
           if (!hasAg) {
             return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية عرض ملف هذا العميل.', data: null, error: 'FORBIDDEN' };
           }
@@ -8134,10 +8332,13 @@
         var custExts = (db.extensions || []).filter(function (e) { return resIdSet[e.reservationId] || resNumSet[e.reservationNumber]; });
         var custPrbs = (db.problems || []).filter(function (p) { return p.customerId === custObj.id || resIdSet[p.reservationId]; });
         var custFus = (db.followUps || []).filter(function (f) { return resIdSet[f.reservationId]; });
-        var custNotes = (db.customerNotes || []).filter(function (n) { return n.customerId === custObj.id; })
-          .sort(function (a, b) { return String(b.createdAt || '').localeCompare(String(a.createdAt || '')); });
+        var notesBundle = resolveSandboxNotesBundle(db, {});
+        var custNotes = notesBundle.items.filter(function (n) {
+          return n.customerId === custObj.id || (n.reservationId && resIdSet[n.reservationId]);
+        });
         var custActs = (db.activityLog || []).filter(function (a) {
           return (a.entityType === 'Customer' && a.entityId === custObj.id) ||
+                 (a.entityType === 'CustomerNote' && custNotes.some(function (cn) { return cn.id === a.entityId; })) ||
                  (a.entityType === 'Reservation' && resNumSet[a.entityId]);
         }).slice(0, 120);
 
@@ -8204,10 +8405,10 @@
           tl.push({
             id: 'TL_NOTE_' + n.id,
             kind: 'note',
-            title: (n.noteType || 'ملاحظة') + (n.reservationNumber ? (' (الحجز ' + n.reservationNumber + ')') : ''),
+            title: (n.title || n.noteType || 'ملاحظة') + (n.reservationNumber ? (' (الحجز ' + n.reservationNumber + ')') : ''),
             subtitle: n.content || '',
             actor: n.createdByName || '',
-            status: n.noteType || '',
+            status: n.statusName || n.noteType || '',
             at: n.createdAt || '',
             entityId: n.id
           });
@@ -8235,6 +8436,8 @@
             problems: custPrbs,
             followUps: custFus,
             notes: custNotes,
+            noteStatuses: notesBundle.statuses,
+            notesConfig: notesBundle.config,
             financialSummary: {
               totalAmount: Number(totalAmt.toFixed(2)),
               baseAmount: Number(baseAmt.toFixed(2)),
@@ -8279,8 +8482,6 @@
           return { success: false, message: 'يوجد عميل مسجل بنفس رقم الجوال أو الهوية بالفعل.', data: null, error: 'CONFLICT' };
         }
         var nowC = new Date().toISOString();
-        var cEmpId = String(payload.assignedEmployeeId || '').trim();
-        var cEmpObj = cEmpId ? db.employees.find(function (e) { return e.id === cEmpId; }) : null;
         var newC = {
           id: genId('CUS'),
           customerKey: cKey,
@@ -8293,8 +8494,6 @@
           idType: cIdType,
           status: (core.CUSTOMER_STATUS_LIST || []).indexOf(payload.status) !== -1 ? payload.status : 'جديد',
           statusOverride: Boolean(payload.status && payload.status !== 'جديد'),
-          assignedEmployeeId: cEmpObj ? cEmpObj.id : '',
-          assignedEmployeeName: cEmpObj ? cEmpObj.name : '',
           notes: String(payload.notes || '').trim(),
           tags: Array.isArray(payload.tags) ? payload.tags : [],
           source: 'manual',
@@ -8345,68 +8544,876 @@
         return { success: true, message: 'تم تحديث بيانات العميل.', data: { customer: core.redactCustomerSensitiveFields(recUpd, session.user) }, error: null };
       }
 
-      case 'assignCustomerEmployee': {
-        if (!core.canUserPerform(session.user, 'assign_customer_employee') || !core.canUserUseActionButton(session.user, 'act_assign_customer')) {
-          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إسناد العملاء للموظفين.', data: null, error: 'FORBIDDEN' };
+      case 'getCustomerNotesConfig': {
+        var cfgCn = (core && core.normalizeCustomerNotesConfig)
+          ? core.normalizeCustomerNotesConfig(db.settings && db.settings.customer_notes_config)
+          : {};
+        var stBundle = resolveSandboxNotesBundle(db, {});
+        return { success: true, message: '', data: { config: cfgCn, statuses: stBundle.statuses }, error: null };
+      }
+
+      case 'saveCustomerNotesConfig': {
+        if (!core.canUserPerform(session.user, 'manage_customer_notes_settings') && !core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية تعديل إعدادات قسم ملاحظات العملاء.', data: null, error: 'FORBIDDEN' };
         }
-        var asgCid = String(payload.customerId || payload.id || '').trim();
-        var asgEmpId = String(payload.employeeId || '').trim();
-        var vAsg = buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.id === asgCid; });
-        if (!vAsg) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
-        var recAsg = ensureSandboxCustomerRecord(db, vAsg);
-        var empAsg = asgEmpId ? db.employees.find(function (e) { return e.id === asgEmpId; }) : null;
-        if (asgEmpId && !empAsg) return { success: false, message: 'الموظف غير موجود.', data: null, error: 'NOT_FOUND' };
-        recAsg.assignedEmployeeId = empAsg ? empAsg.id : '';
-        recAsg.assignedEmployeeName = empAsg ? empAsg.name : '';
-        recAsg.updatedAt = new Date().toISOString();
-        if (empAsg && empAsg.id !== session.employeeId) {
-          pushSandboxNotification(db, empAsg.id, empAsg.role, 'customer_assigned', 'تم إسناد عميل إليك: ' + recAsg.fullName, 'أسند ' + session.user.name + ' ملف العميل ' + recAsg.fullName + ' إليك.', 'Customer', recAsg.id);
-        }
-        appendSandboxActivity(db, session.user, 'إسناد عميل', 'Customer', recAsg.id, recAsg.fullName + ' ← ' + (recAsg.assignedEmployeeName || 'بدون موظف'));
+        var nextCfgCn = (core && core.normalizeCustomerNotesConfig)
+          ? core.normalizeCustomerNotesConfig(payload.config || payload)
+          : {};
+        nextCfgCn.updatedAt = new Date().toISOString();
+        nextCfgCn.updatedBy = session.user ? session.user.name : '';
+        db.settings.customer_notes_config = nextCfgCn;
+        db.settings._settings_updated_at = nextCfgCn.updatedAt;
+        appendSandboxActivity(db, session.user, 'تحديث إعدادات ملاحظات العملاء', 'Settings', 'customer_notes_config', 'تحديث إعدادات قسم ملاحظات العملاء والأزرار');
         saveSandboxDb(db);
-        return { success: true, message: 'تم تحديث الموظف المسؤول.', data: { customer: core.redactCustomerSensitiveFields(recAsg, session.user) }, error: null };
+        return { success: true, message: 'تم حفظ إعدادات قسم ملاحظات العملاء بنجاح.', data: { config: nextCfgCn }, error: null };
+      }
+
+      case 'getCustomerNoteStatuses': {
+        var bSt = resolveSandboxNotesBundle(db, {});
+        var listSt = payload.activeOnly ? bSt.statuses.filter(function (s) { return s.isActive; }) : bSt.statuses;
+        return { success: true, message: '', data: { items: listSt, statuses: listSt }, error: null };
+      }
+
+      case 'saveCustomerNoteStatus': {
+        if (!core.canUserPerform(session.user, 'manage_customer_note_statuses') && !core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إدارة حالات الملاحظات.', data: null, error: 'FORBIDDEN' };
+        }
+        var rawStName = String(payload.name || '').trim();
+        if (!rawStName) return { success: false, message: 'اسم الحالة مطلوب.', data: null, error: 'VALIDATION_ERROR' };
+        var dupSt = (db.customerNoteStatuses || []).find(function (s) {
+          return s && String(s.name || '').trim().toLowerCase() === rawStName.toLowerCase() && String(s.id) !== String(payload.id || '');
+        });
+        if (dupSt) return { success: false, message: 'يوجد حالة ملاحظة بنفس الاسم بالفعل.', data: null, error: 'CONFLICT' };
+        var normSt = core.normalizeCustomerNoteStatusRecord({
+          id: payload.id || genId('CNS'),
+          name: rawStName,
+          description: String(payload.description || '').trim(),
+          color: String(payload.color || '#3b82f6'),
+          sortOrder: Number(payload.sortOrder || ((db.customerNoteStatuses || []).length + 1) * 10),
+          isActive: payload.isActive !== false,
+          isDefault: Boolean(payload.isDefault),
+          allowAgentSelect: payload.allowAgentSelect !== false,
+          isClosedStatus: Boolean(payload.isClosedStatus),
+          updatedAt: new Date().toISOString()
+        });
+        if (normSt.isDefault) {
+          (db.customerNoteStatuses || []).forEach(function (s) { if (s && s.id !== normSt.id) s.isDefault = false; });
+        }
+        var exIdx = (db.customerNoteStatuses || []).findIndex(function (s) { return s && s.id === normSt.id; });
+        if (exIdx >= 0) db.customerNoteStatuses[exIdx] = Object.assign({}, db.customerNoteStatuses[exIdx], normSt);
+        else db.customerNoteStatuses.push(normSt);
+        (db.customerNotes || []).forEach(function (n) {
+          if (n && n.statusId === normSt.id) {
+            n.statusName = normSt.name;
+            n.statusColor = normSt.color;
+          }
+        });
+        db.settings._settings_updated_at = new Date().toISOString();
+        appendSandboxActivity(db, session.user, exIdx >= 0 ? 'تعديل حالة ملاحظة' : 'إضافة حالة ملاحظة', 'CustomerNoteStatus', normSt.id, normSt.name);
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حفظ حالة الملاحظة بنجاح.', data: { status: normSt }, error: null };
+      }
+
+      case 'toggleCustomerNoteStatus': {
+        if (!core.canUserPerform(session.user, 'manage_customer_note_statuses') && !core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية تفعيل/تعطيل الحالات.', data: null, error: 'FORBIDDEN' };
+        }
+        var togId = String(payload.id || '').trim();
+        var togSt = (db.customerNoteStatuses || []).find(function (s) { return s && s.id === togId; });
+        if (!togSt) return { success: false, message: 'الحالة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        togSt.isActive = typeof payload.isActive === 'boolean' ? payload.isActive : !togSt.isActive;
+        togSt.updatedAt = new Date().toISOString();
+        db.settings._settings_updated_at = togSt.updatedAt;
+        appendSandboxActivity(db, session.user, togSt.isActive ? 'تفعيل حالة ملاحظة' : 'تعطيل حالة ملاحظة', 'CustomerNoteStatus', togSt.id, togSt.name);
+        saveSandboxDb(db);
+        return { success: true, message: togSt.isActive ? 'تم تفعيل الحالة.' : 'تم تعطيل الحالة.', data: { status: togSt }, error: null };
+      }
+
+      case 'deleteCustomerNoteStatus': {
+        if (!core.canUserPerform(session.user, 'manage_customer_note_statuses') && !core.canUserPerform(session.user, 'manage_settings')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية حذف حالات الملاحظات.', data: null, error: 'FORBIDDEN' };
+        }
+        var delStId = String(payload.id || '').trim();
+        var delStObj = (db.customerNoteStatuses || []).find(function (s) { return s && s.id === delStId; });
+        if (!delStObj) return { success: false, message: 'الحالة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        if ((db.customerNoteStatuses || []).length <= 1) {
+          return { success: false, message: 'لا يمكن حذف آخر حالة متبقية في النظام.', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var linkedNotes = (db.customerNotes || []).filter(function (n) { return n && !n.deletedAt && n.statusId === delStId; });
+        var repStId = String(payload.replacementStatusId || '').trim();
+        if (linkedNotes.length > 0 && (!repStId || repStId === delStId)) {
+          return { success: false, message: 'توجد ' + linkedNotes.length + ' ملاحظة مرتبطة بهذه الحالة — يجب اختيار حالة بديلة لترحيل السجلات إليها قبل الحذف.', data: { linkedCount: linkedNotes.length }, error: 'VALIDATION_ERROR' };
+        }
+        var repStObj = repStId ? (db.customerNoteStatuses || []).find(function (s) { return s && s.id === repStId; }) : null;
+        if (repStId && !repStObj) return { success: false, message: 'الحالة البديلة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var migratedCnt = 0;
+        if (repStObj) {
+          (db.customerNotes || []).forEach(function (n) {
+            if (n && n.statusId === delStId) {
+              n.statusId = repStObj.id;
+              n.statusName = repStObj.name;
+              n.statusColor = repStObj.color;
+              n.updatedAt = new Date().toISOString();
+              if (!n.deletedAt) migratedCnt += 1;
+            }
+          });
+        }
+        db.customerNoteStatuses = (db.customerNoteStatuses || []).filter(function (s) { return s && s.id !== delStId; });
+        if (delStObj.isDefault && db.customerNoteStatuses[0]) {
+          db.customerNoteStatuses[0].isDefault = true;
+        }
+        db.settings._settings_updated_at = new Date().toISOString();
+        appendSandboxActivity(db, session.user, 'حذف حالة ملاحظة', 'CustomerNoteStatus', delStId, delStObj.name + (migratedCnt ? (' — ترحيل ' + migratedCnt + ' ملاحظة إلى ' + repStObj.name) : ''));
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حذف الحالة بنجاح.', data: { deleted: true, id: delStId, migratedCount: migratedCnt, replacementStatusId: repStId }, error: null };
+      }
+
+      case 'getCustomerNotes': {
+        if (!core.canUserPerform(session.user, 'view_customer_notes') && !core.canUserPerform(session.user, 'view_customers')) {
+          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية عرض ملاحظات العملاء.', data: null, error: 'FORBIDDEN' };
+        }
+        var bundleGn = resolveSandboxNotesBundle(db, {
+          customerId: payload.customerId,
+          reservationId: payload.reservationId,
+          problemId: payload.problemId
+        });
+        var fNotes = bundleGn.items.filter(function (n) {
+          if (payload.statusId && n.statusId !== payload.statusId) return false;
+          if (payload.noteType && n.noteType !== payload.noteType) return false;
+          if (payload.sourceSection && n.sourceSection !== payload.sourceSection) return false;
+          if (payload.assignedEmployeeId && n.assignedEmployeeId !== payload.assignedEmployeeId) return false;
+          var dStr = String(n.createdAt || '').slice(0, 10);
+          if (payload.dateFrom && dStr < String(payload.dateFrom).slice(0, 10)) return false;
+          if (payload.dateTo && dStr > String(payload.dateTo).slice(0, 10)) return false;
+          if (payload.search) {
+            var qn = String(payload.search || '').trim().toLowerCase();
+            var h = [n.title, n.content, n.reservationNumber, n.problemNumber, n.createdByName, n.statusName].join(' ').toLowerCase();
+            if (h.indexOf(qn) === -1) return false;
+          }
+          return true;
+        });
+        var statsGn = { total: fNotes.length, open: 0, closed: 0, internal: 0 };
+        fNotes.forEach(function (n) {
+          if (n.isClosed || n.statusIsClosed) statsGn.closed += 1;
+          else statsGn.open += 1;
+          if (n.isInternal) statsGn.internal += 1;
+        });
+        var sortGn = String(payload.sortBy || (bundleGn.config.general && bundleGn.config.general.defaultSort) || 'newest');
+        fNotes.sort(function (a, b) {
+          if (sortGn === 'oldest') return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+          if (sortGn === 'updated' || sortGn === 'updated_desc') return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
+          if (sortGn === 'status') return String(a.statusName || '').localeCompare(String(b.statusName || ''), 'ar');
+          return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+        });
+        var pgN = Math.max(1, Number(payload.page || 1));
+        var psN = Math.min(200, Math.max(5, Number(payload.pageSize || (bundleGn.config.general && bundleGn.config.general.pageSize) || 50)));
+        var totPagesN = Math.max(1, Math.ceil(fNotes.length / psN));
+        return {
+          success: true,
+          message: '',
+          data: {
+            items: fNotes.slice((pgN - 1) * psN, pgN * psN),
+            statuses: bundleGn.statuses,
+            config: bundleGn.config,
+            stats: statsGn,
+            total: fNotes.length,
+            page: pgN,
+            pageSize: psN,
+            totalPages: totPagesN
+          },
+          error: null
+        };
       }
 
       case 'addCustomerNote': {
-        if (!core.canUserPerform(session.user, 'add_customer_note') || !core.canUserUseActionButton(session.user, 'act_add_customer_note')) {
-          return { success: false, message: 'FORBIDDEN: ليس لديك صلاحية إضافة ملاحظات للعميل.', data: null, error: 'FORBIDDEN' };
+        var addBundle = resolveSandboxNotesBundle(db, {});
+        var btnAddEval = core.evaluateCustomerNoteButtonAccess(session.user, 'add_note', null, addBundle.config, { checkConfirm: true, confirmed: Boolean(payload.confirmed) });
+        if (!btnAddEval.allowed) {
+          var needConfAdd = btnAddEval.reason === 'CONFIRMATION_REQUIRED';
+          return { success: false, message: btnAddEval.message || btnAddEval.reason || 'FORBIDDEN: ليس لديك صلاحية إضافة ملاحظات للعميل.', data: { needsConfirmation: needConfAdd }, error: needConfAdd ? 'CONFIRM_REQUIRED' : 'FORBIDDEN' };
+        }
+        var vAddRes = core.validateCustomerNotePayload(payload, addBundle.config, addBundle.statuses, session.user);
+        if (!vAddRes.valid) {
+          return { success: false, message: vAddRes.message || 'بيانات الملاحظة غير مكتملة.', data: null, error: 'VALIDATION_ERROR' };
         }
         var noteCid = String(payload.customerId || '').trim();
-        var noteBody = String(payload.content || payload.note || '').trim();
-        if (!noteCid) return { success: false, message: 'معرف العميل مطلوب.', data: null, error: 'VALIDATION' };
-        if (!noteBody) return { success: false, message: 'نص الملاحظة أو التواصل مطلوب.', data: null, error: 'VALIDATION' };
-        var vNote = buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.id === noteCid; });
-        if (!vNote) return { success: false, message: 'العميل غير موجود.', data: null, error: 'NOT_FOUND' };
-        var recNoteCust = ensureSandboxCustomerRecord(db, vNote);
-        var nTypes = ['ملاحظة', 'مكالمة', 'واتساب', 'بريد إلكتروني', 'متابعة', 'زيارة'];
-        var noteType = nTypes.indexOf(payload.noteType) !== -1 ? payload.noteType : 'ملاحظة';
         var noteResId = String(payload.reservationId || '').trim();
-        var noteResNum = String(payload.reservationNumber || '').trim();
-        if (noteResId && !noteResNum) {
-          var rmNote = db.reservations.find(function (r) { return r.id === noteResId; });
-          if (rmNote) noteResNum = rmNote.reservationNumber;
+        var notePrbId = String(payload.problemId || '').trim();
+        var rmNote = noteResId ? (db.reservations || []).find(function (r) { return r.id === noteResId || r.reservationNumber === noteResId; }) : null;
+        var prbNote = notePrbId ? (db.problems || []).find(function (p) { return p.id === notePrbId || p.problemNumber === notePrbId; }) : null;
+        if (!noteResId && prbNote && prbNote.reservationId) noteResId = prbNote.reservationId;
+        if (!rmNote && noteResId) rmNote = (db.reservations || []).find(function (r) { return r.id === noteResId; });
+        var vNote = noteCid ? buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.id === noteCid; }) : null;
+        if (!vNote && rmNote) {
+          vNote = buildSandboxCustomersView(db, session.user).items.find(function (c) { return c.reservationIds.indexOf(rmNote.id) !== -1; });
+        }
+        var recNoteCust = vNote ? ensureSandboxCustomerRecord(db, vNote) : null;
+        if (!recNoteCust && !noteResId && !notePrbId && !(addBundle.config.addNote && addBundle.config.addNote.allowStandalone)) {
+          return { success: false, message: 'العميل أو السجل المرتبط غير موجود.', data: null, error: 'NOT_FOUND' };
+        }
+        var stMatchAdd = vAddRes.status || addBundle.statuses.find(function (s) { return s.isActive; }) || addBundle.statuses[0];
+        var reqEmpIdAdd = String(payload.assignedEmployeeId || '').trim();
+        var asgEmpAdd = reqEmpIdAdd ? (db.employees || []).find(function (e) { return e.id === reqEmpIdAdd; }) : null;
+        var rawAttsAdd = Array.isArray(payload.attachments) ? payload.attachments : [];
+        if (rawAttsAdd.length > 0) {
+          var evalAttInit = core.evaluateCustomerNoteButtonAccess(session.user, 'attach_file', null, addBundle.config);
+          if (!evalAttInit.allowed) {
+            return { success: false, message: evalAttInit.message || 'FORBIDDEN: ليس لديك صلاحية إرفاق ملفات.', data: null, error: 'FORBIDDEN' };
+          }
+          var maxBytesAdd = Math.max(1, Number((addBundle.config.addNote && addBundle.config.addNote.maxAttachmentSizeMb) || 5)) * 1024 * 1024;
+          var allowedTypesAdd = (addBundle.config.addNote && Array.isArray(addBundle.config.addNote.allowedAttachmentTypes)) ? addBundle.config.addNote.allowedAttachmentTypes : [];
+          for (var ai = 0; ai < rawAttsAdd.length; ai++) {
+            var attCk = rawAttsAdd[ai] || {};
+            if (Number(attCk.fileSize || 0) > maxBytesAdd) {
+              return { success: false, message: 'حجم المرفق يتجاوز الحد المسموح (' + ((addBundle.config.addNote && addBundle.config.addNote.maxAttachmentSizeMb) || 5) + ' MB).', data: null, error: 'VALIDATION_ERROR' };
+            }
+            if (allowedTypesAdd.length > 0 && attCk.mimeType && allowedTypesAdd.indexOf(String(attCk.mimeType)) === -1) {
+              return { success: false, message: 'نوع المرفق "' + attCk.mimeType + '" غير مدعوم.', data: null, error: 'VALIDATION_ERROR' };
+            }
+          }
         }
         var nowNote = new Date().toISOString();
+        var newAtts = rawAttsAdd.slice(0, 5).map(function (att) {
+          var urlVal = String(att.storageUrl || att.dataUrl || '');
+          return {
+            id: genId('ATT'),
+            fileName: String(att.fileName || 'file').trim(),
+            mimeType: String(att.mimeType || 'application/octet-stream'),
+            fileSize: Number(att.fileSize || 0),
+            storageUrl: urlVal,
+            dataUrl: urlVal,
+            uploadedById: session.employeeId,
+            uploadedByName: session.user.name,
+            createdAt: nowNote
+          };
+        });
+        var isClosedAdd = Boolean(stMatchAdd && stMatchAdd.isClosedStatus);
         var newNoteObj = {
           id: genId('CNOTE'),
-          customerId: recNoteCust.id,
-          reservationId: noteResId,
-          reservationNumber: noteResNum,
-          noteType: noteType,
-          content: noteBody,
+          customerId: recNoteCust ? recNoteCust.id : noteCid,
+          customerName: recNoteCust ? recNoteCust.fullName : '',
+          reservationId: rmNote ? rmNote.id : noteResId,
+          reservationNumber: String(payload.reservationNumber || (rmNote && rmNote.reservationNumber) || (prbNote && prbNote.reservationNumber) || '').trim(),
+          problemId: prbNote ? prbNote.id : notePrbId,
+          problemNumber: String(payload.problemNumber || (prbNote && prbNote.problemNumber) || '').trim(),
+          sourceSection: String(payload.sourceSection || (notePrbId ? 'problems' : (noteResId ? 'reservations' : 'customers'))),
+          title: vAddRes.title || '',
+          content: vAddRes.content || '',
+          noteType: vAddRes.noteType || 'ملاحظة',
+          statusId: stMatchAdd ? stMatchAdd.id : '',
+          statusName: stMatchAdd ? stMatchAdd.name : 'جديدة',
+          statusColor: stMatchAdd ? stMatchAdd.color : '#3b82f6',
+          statusIsActive: stMatchAdd ? Boolean(stMatchAdd.isActive) : true,
+          statusIsClosed: isClosedAdd,
+          isClosed: isClosedAdd,
+          closedAt: isClosedAdd ? nowNote : '',
+          closedById: isClosedAdd ? session.employeeId : '',
+          closedByName: isClosedAdd ? session.user.name : '',
+          isInternal: Boolean(vAddRes.isInternal),
+          assignedEmployeeId: asgEmpAdd ? asgEmpAdd.id : '',
+          assignedEmployeeName: asgEmpAdd ? asgEmpAdd.name : '',
+          attachments: newAtts,
           createdById: session.employeeId,
           createdByName: session.user.name,
+          updatedById: session.employeeId,
+          updatedByName: session.user.name,
+          deletedAt: '',
           createdAt: nowNote,
           updatedAt: nowNote
         };
         if (!Array.isArray(db.customerNotes)) db.customerNotes = [];
         db.customerNotes.unshift(newNoteObj);
-        if (noteType !== 'ملاحظة') recNoteCust.lastContactAt = nowNote;
-        recNoteCust.updatedAt = nowNote;
-        dispatchSandboxMentionNotifications(db, session.user, [noteBody], 'Customer', recNoteCust.id, recNoteCust.fullName);
-        appendSandboxActivity(db, session.user, noteType !== 'ملاحظة' ? 'تسجيل تواصل مع عميل' : 'إضافة ملاحظة عميل', 'Customer', recNoteCust.id, recNoteCust.fullName + ': ' + noteBody.slice(0, 120));
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: newNoteObj.id,
+          actionType: 'إنشاء ملاحظة',
+          fieldName: 'status',
+          oldValue: '',
+          newValue: newNoteObj.statusName + ' — ' + newNoteObj.content.slice(0, 80),
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: nowNote
+        });
+        if (recNoteCust) {
+          if (newNoteObj.noteType !== 'ملاحظة') recNoteCust.lastContactAt = nowNote;
+          recNoteCust.updatedAt = nowNote;
+          dispatchSandboxMentionNotifications(db, session.user, [newNoteObj.title, newNoteObj.content], 'Customer', recNoteCust.id, recNoteCust.fullName);
+        }
+        var addNotifCfg = addBundle.config.notifications || {};
+        if (addNotifCfg.onAdd !== false) {
+          var rolesTargetAdd = Array.isArray(addNotifCfg.notifyRoles) ? addNotifCfg.notifyRoles : ['supervisor', 'general_manager'];
+          rolesTargetAdd.forEach(function (rKey) {
+            if (rKey && rKey !== session.role) {
+              pushSandboxNotification(db, '', rKey, 'customer_note_onAdd', 'ملاحظة عميل جديدة', session.user.name + ': ' + newNoteObj.content.slice(0, 90), 'Customer', newNoteObj.customerId || newNoteObj.id);
+            }
+          });
+        }
+        if (addNotifCfg.onAssign !== false && asgEmpAdd && asgEmpAdd.id !== session.employeeId) {
+          pushSandboxNotification(db, asgEmpAdd.id, '', 'customer_note_assigned', 'ملاحظة عميل مسندة إليك', session.user.name + ': ' + newNoteObj.content.slice(0, 90), 'Customer', newNoteObj.customerId || newNoteObj.id);
+        }
+        if (!addBundle.config.activityLog || addBundle.config.activityLog.trackAdd !== false) {
+          appendSandboxActivity(db, session.user, 'إضافة ملاحظة عميل', 'Customer', newNoteObj.customerId || newNoteObj.id, (recNoteCust ? recNoteCust.fullName : newNoteObj.reservationNumber) + ': ' + newNoteObj.content.slice(0, 100));
+        }
         saveSandboxDb(db);
-        return { success: true, message: 'تم إضافة الملاحظة إلى ملف العميل.', data: newNoteObj, error: null };
+        return { success: true, message: 'تمت إضافة الملاحظة بنجاح.', data: { note: newNoteObj }, error: null };
+      }
+
+      case 'updateCustomerNote': {
+        var updBundle = resolveSandboxNotesBundle(db, {});
+        var targetNoteUpd = (db.customerNotes || []).find(function (n) { return n && !n.deletedAt && n.id === String(payload.noteId || ''); });
+        if (!targetNoteUpd) return { success: false, message: 'الملاحظة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var evalUpd = core.evaluateCustomerNoteButtonAccess(session.user, 'edit_note', targetNoteUpd, updBundle.config, { checkConfirm: true, confirmed: Boolean(payload.confirmed) });
+        if (!evalUpd.allowed) {
+          var needConfUpd = evalUpd.reason === 'CONFIRMATION_REQUIRED';
+          return { success: false, message: evalUpd.message || evalUpd.reason || 'FORBIDDEN: ليس لديك صلاحية تعديل هذه الملاحظة.', data: { needsConfirmation: needConfUpd }, error: needConfUpd ? 'CONFIRM_REQUIRED' : 'FORBIDDEN' };
+        }
+        if (payload.expectedUpdatedAt && targetNoteUpd.updatedAt && String(payload.expectedUpdatedAt) !== String(targetNoteUpd.updatedAt)) {
+          return { success: false, message: 'CONFLICT: تم تعديل الملاحظة من مستخدم آخر، يرجى التحديث أولاً.', data: null, error: 'CONFLICT' };
+        }
+        var nextContentUpd = payload.content !== undefined ? String(payload.content).trim() : targetNoteUpd.content;
+        if (!nextContentUpd) return { success: false, message: 'محتوى الملاحظة مطلوب.', data: null, error: 'VALIDATION_ERROR' };
+        var prevContentUpd = targetNoteUpd.content || '';
+        if (payload.title !== undefined) targetNoteUpd.title = String(payload.title).trim();
+        targetNoteUpd.content = nextContentUpd;
+        if (payload.noteType && (core.CUSTOMER_NOTE_TYPES || []).indexOf(payload.noteType) !== -1) {
+          targetNoteUpd.noteType = payload.noteType;
+        }
+        if (typeof payload.isInternal === 'boolean') targetNoteUpd.isInternal = payload.isInternal;
+        if (payload.statusId && payload.statusId !== targetNoteUpd.statusId) {
+          var nextStUpd = updBundle.statuses.find(function (s) { return s.id === payload.statusId; });
+          if (nextStUpd) {
+            if (!nextStUpd.isActive) {
+              return { success: false, message: 'لا يمكن اختيار حالة معطلة لملاحظة محدثة.', data: null, error: 'VALIDATION_ERROR' };
+            }
+            targetNoteUpd.statusId = nextStUpd.id;
+            targetNoteUpd.statusName = nextStUpd.name;
+            targetNoteUpd.statusColor = nextStUpd.color;
+            targetNoteUpd.statusIsActive = Boolean(nextStUpd.isActive);
+            targetNoteUpd.statusIsClosed = Boolean(nextStUpd.isClosedStatus);
+            targetNoteUpd.isClosed = Boolean(nextStUpd.isClosedStatus);
+          }
+        }
+        targetNoteUpd.updatedById = session.employeeId;
+        targetNoteUpd.updatedByName = session.user.name;
+        targetNoteUpd.updatedAt = new Date().toISOString();
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: targetNoteUpd.id,
+          actionType: 'تعديل ملاحظة',
+          fieldName: 'content',
+          oldValue: prevContentUpd.slice(0, 120),
+          newValue: nextContentUpd.slice(0, 120),
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: targetNoteUpd.updatedAt
+        });
+        if (!updBundle.config.activityLog || updBundle.config.activityLog.trackEdit !== false) {
+          appendSandboxActivity(db, session.user, 'تعديل ملاحظة عميل', 'Customer', targetNoteUpd.customerId || targetNoteUpd.id, nextContentUpd.slice(0, 100));
+        }
+        saveSandboxDb(db);
+        return { success: true, message: 'تم تحديث الملاحظة بنجاح.', data: { note: targetNoteUpd }, error: null };
+      }
+
+      case 'changeCustomerNoteStatus': {
+        var chgBundle = resolveSandboxNotesBundle(db, {});
+        var targetNoteChg = (db.customerNotes || []).find(function (n) { return n && !n.deletedAt && n.id === String(payload.noteId || ''); });
+        if (!targetNoteChg) return { success: false, message: 'الملاحظة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var evalChg = core.evaluateCustomerNoteButtonAccess(session.user, 'change_status', targetNoteChg, chgBundle.config, { checkConfirm: true, confirmed: Boolean(payload.confirmed) });
+        if (!evalChg.allowed) {
+          var needConfChg = evalChg.reason === 'CONFIRMATION_REQUIRED';
+          return { success: false, message: evalChg.message || evalChg.reason || 'FORBIDDEN: ليس لديك صلاحية تغيير حالة الملاحظة.', data: { needsConfirmation: needConfChg }, error: needConfChg ? 'CONFIRM_REQUIRED' : 'FORBIDDEN' };
+        }
+        var targetStObj = chgBundle.statuses.find(function (s) {
+          return s.id === payload.statusId || (payload.statusName && s.name === payload.statusName);
+        });
+        if (!targetStObj) return { success: false, message: 'الحالة المطلوبة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        if (!targetStObj.isActive) return { success: false, message: 'لا يمكن اختيار حالة معطلة لملاحظة.', data: null, error: 'VALIDATION_ERROR' };
+        if (session.role === 'agent' && !targetStObj.allowAgentSelect) {
+          return { success: false, message: 'FORBIDDEN: هذه الحالة غير متاحة لاختيار الموظف.', data: null, error: 'FORBIDDEN' };
+        }
+        var prevStChg = targetNoteChg.statusName || '';
+        var chgNow = new Date().toISOString();
+        targetNoteChg.statusId = targetStObj.id;
+        targetNoteChg.statusName = targetStObj.name;
+        targetNoteChg.statusColor = targetStObj.color;
+        targetNoteChg.statusIsActive = Boolean(targetStObj.isActive);
+        targetNoteChg.statusIsClosed = Boolean(targetStObj.isClosedStatus);
+        targetNoteChg.isClosed = Boolean(targetStObj.isClosedStatus);
+        targetNoteChg.closedAt = targetStObj.isClosedStatus ? chgNow : '';
+        targetNoteChg.closedById = targetStObj.isClosedStatus ? session.employeeId : '';
+        targetNoteChg.closedByName = targetStObj.isClosedStatus ? session.user.name : '';
+        targetNoteChg.updatedById = session.employeeId;
+        targetNoteChg.updatedByName = session.user.name;
+        targetNoteChg.updatedAt = chgNow;
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: targetNoteChg.id,
+          actionType: 'تغيير الحالة',
+          fieldName: 'status',
+          oldValue: prevStChg,
+          newValue: targetStObj.name,
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: chgNow
+        });
+        if (!chgBundle.config.activityLog || chgBundle.config.activityLog.trackStatusChange !== false) {
+          appendSandboxActivity(db, session.user, 'تغيير حالة ملاحظة', 'Customer', targetNoteChg.customerId || targetNoteChg.id, prevStChg + ' ← ' + targetStObj.name);
+        }
+        saveSandboxDb(db);
+        return { success: true, message: 'تم تغيير حالة الملاحظة إلى "' + targetStObj.name + '".', data: { note: targetNoteChg }, error: null };
+      }
+
+      case 'assignCustomerNoteEmployee': {
+        var asgBundleN = resolveSandboxNotesBundle(db, {});
+        var targetNoteAsg = (db.customerNotes || []).find(function (n) { return n && !n.deletedAt && n.id === String(payload.noteId || ''); });
+        if (!targetNoteAsg) return { success: false, message: 'الملاحظة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var evalAsgN = core.evaluateCustomerNoteButtonAccess(session.user, 'assign_note', targetNoteAsg, asgBundleN.config, { checkConfirm: true, confirmed: Boolean(payload.confirmed) });
+        if (!evalAsgN.allowed) {
+          var needConfAsg = evalAsgN.reason === 'CONFIRMATION_REQUIRED';
+          return { success: false, message: evalAsgN.message || evalAsgN.reason || 'FORBIDDEN: ليس لديك صلاحية إسناد مهمة الملاحظة.', data: { needsConfirmation: needConfAsg }, error: needConfAsg ? 'CONFIRM_REQUIRED' : 'FORBIDDEN' };
+        }
+        var targetEmpIdN = String(payload.employeeId || '').trim();
+        var targetEmpObjN = targetEmpIdN ? (db.employees || []).find(function (e) { return e.id === targetEmpIdN; }) : null;
+        if (targetEmpIdN && !targetEmpObjN) return { success: false, message: 'الموظف غير موجود.', data: null, error: 'NOT_FOUND' };
+        var oldEmpNameN = targetNoteAsg.assignedEmployeeName || 'غير معين';
+        targetNoteAsg.assignedEmployeeId = targetEmpObjN ? targetEmpObjN.id : '';
+        targetNoteAsg.assignedEmployeeName = targetEmpObjN ? targetEmpObjN.name : '';
+        targetNoteAsg.updatedById = session.employeeId;
+        targetNoteAsg.updatedByName = session.user.name;
+        targetNoteAsg.updatedAt = new Date().toISOString();
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: targetNoteAsg.id,
+          actionType: 'تعيين موظف للملاحظة',
+          fieldName: 'assignedEmployee',
+          oldValue: oldEmpNameN,
+          newValue: targetNoteAsg.assignedEmployeeName || 'غير معين',
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: targetNoteAsg.updatedAt
+        });
+        if (targetEmpObjN && targetEmpObjN.id !== session.employeeId) {
+          pushSandboxNotification(db, targetEmpObjN.id, '', 'customer_note_assigned', 'إسناد متابعة ملاحظة عميل', session.user.name + ' أسند لك متابعة الملاحظة: ' + (targetNoteAsg.content || '').slice(0, 80), 'Customer', targetNoteAsg.customerId || targetNoteAsg.id);
+        }
+        if (!asgBundleN.config.activityLog || asgBundleN.config.activityLog.trackAssign !== false) {
+          appendSandboxActivity(db, session.user, 'إسناد متابعة ملاحظة', 'Customer', targetNoteAsg.customerId || targetNoteAsg.id, targetNoteAsg.assignedEmployeeName || 'بدون موظف');
+        }
+        saveSandboxDb(db);
+        return { success: true, message: 'تم تحديث الموظف المكلف بمتابعة الملاحظة.', data: { note: targetNoteAsg }, error: null };
+      }
+
+      case 'deleteCustomerNote': {
+        var delBundleN = resolveSandboxNotesBundle(db, {});
+        var targetNoteDel = (db.customerNotes || []).find(function (n) { return n && !n.deletedAt && n.id === String(payload.noteId || ''); });
+        if (!targetNoteDel) return { success: false, message: 'الملاحظة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var evalDelN = core.evaluateCustomerNoteButtonAccess(session.user, 'delete_note', targetNoteDel, delBundleN.config, { checkConfirm: true, confirmed: Boolean(payload.confirmed) });
+        if (!evalDelN.allowed) {
+          var needConfDel = evalDelN.reason === 'CONFIRMATION_REQUIRED';
+          return { success: false, message: evalDelN.message || evalDelN.reason || 'FORBIDDEN: ليس لديك صلاحية حذف هذه الملاحظة.', data: { needsConfirmation: needConfDel }, error: needConfDel ? 'CONFIRM_REQUIRED' : 'FORBIDDEN' };
+        }
+        var delNowN = new Date().toISOString();
+        targetNoteDel.deletedAt = delNowN;
+        targetNoteDel.deletedById = session.employeeId;
+        targetNoteDel.updatedAt = delNowN;
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: targetNoteDel.id,
+          actionType: 'حذف ملاحظة',
+          fieldName: 'deleted',
+          oldValue: (targetNoteDel.content || '').slice(0, 100),
+          newValue: 'محذوفة',
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: delNowN
+        });
+        if (!delBundleN.config.activityLog || delBundleN.config.activityLog.trackDelete !== false) {
+          appendSandboxActivity(db, session.user, 'حذف ملاحظة عميل', 'Customer', targetNoteDel.customerId || targetNoteDel.id, (targetNoteDel.content || '').slice(0, 100));
+        }
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حذف الملاحظة بنجاح.', data: { deleted: true, id: targetNoteDel.id, customerId: targetNoteDel.customerId }, error: null };
+      }
+
+      case 'addCustomerNoteAttachment': {
+        var attBundle = resolveSandboxNotesBundle(db, {});
+        var targetNoteAtt = (db.customerNotes || []).find(function (n) { return n && !n.deletedAt && n.id === String(payload.noteId || ''); });
+        if (!targetNoteAtt) return { success: false, message: 'الملاحظة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var evalAttAdd = core.evaluateCustomerNoteButtonAccess(session.user, 'attach_file', targetNoteAtt, attBundle.config);
+        if (!evalAttAdd.allowed) return { success: false, message: evalAttAdd.message || evalAttAdd.reason || 'FORBIDDEN', data: null, error: 'FORBIDDEN' };
+        var maxMbAtt = (attBundle.config.addNote && attBundle.config.addNote.maxAttachmentSizeMb) || 5;
+        if (Number(payload.fileSize || 0) > maxMbAtt * 1024 * 1024) {
+          return { success: false, message: 'حجم الملف يتجاوز الحد الأقصى (' + maxMbAtt + ' MB).', data: null, error: 'VALIDATION_ERROR' };
+        }
+        var urlAtt = String(payload.storageUrl || payload.dataUrl || '');
+        var attNow = new Date().toISOString();
+        var attItem = {
+          id: genId('ATT'),
+          noteId: targetNoteAtt.id,
+          fileName: String(payload.fileName || 'attachment').trim(),
+          mimeType: String(payload.mimeType || 'application/octet-stream'),
+          fileSize: Number(payload.fileSize || 0),
+          storageUrl: urlAtt,
+          dataUrl: urlAtt,
+          uploadedById: session.employeeId,
+          uploadedByName: session.user.name,
+          createdAt: attNow
+        };
+        if (!Array.isArray(targetNoteAtt.attachments)) targetNoteAtt.attachments = [];
+        targetNoteAtt.attachments.push(attItem);
+        targetNoteAtt.updatedAt = attNow;
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: targetNoteAtt.id,
+          actionType: 'إرفاق ملف',
+          fieldName: 'attachment',
+          oldValue: '',
+          newValue: attItem.fileName,
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: attNow
+        });
+        saveSandboxDb(db);
+        return { success: true, message: 'تم إرفاق الملف بنجاح.', data: { attachment: attItem }, error: null };
+      }
+
+      case 'deleteCustomerNoteAttachment': {
+        var dAttBundle = resolveSandboxNotesBundle(db, {});
+        var targetNoteDAtt = (db.customerNotes || []).find(function (n) { return n && !n.deletedAt && n.id === String(payload.noteId || ''); });
+        if (!targetNoteDAtt) return { success: false, message: 'الملاحظة غير موجودة.', data: null, error: 'NOT_FOUND' };
+        var evalAttDel = core.evaluateCustomerNoteButtonAccess(session.user, 'delete_attachment', targetNoteDAtt, dAttBundle.config, { checkConfirm: true, confirmed: Boolean(payload.confirmed) });
+        if (!evalAttDel.allowed) {
+          var needConfAttDel = evalAttDel.reason === 'CONFIRMATION_REQUIRED';
+          return { success: false, message: evalAttDel.message || evalAttDel.reason || 'FORBIDDEN', data: { needsConfirmation: needConfAttDel }, error: needConfAttDel ? 'CONFIRM_REQUIRED' : 'FORBIDDEN' };
+        }
+        var attIdTarget = String(payload.attachmentId || '');
+        var removedAtt = (targetNoteDAtt.attachments || []).find(function (a) { return a && a.id === attIdTarget; });
+        targetNoteDAtt.attachments = (targetNoteDAtt.attachments || []).filter(function (a) { return a && a.id !== attIdTarget; });
+        var dAttNow = new Date().toISOString();
+        targetNoteDAtt.updatedAt = dAttNow;
+        if (!Array.isArray(db.customerNoteHistory)) db.customerNoteHistory = [];
+        db.customerNoteHistory.unshift({
+          id: genId('CNH'),
+          noteId: targetNoteDAtt.id,
+          actionType: 'حذف مرفق',
+          fieldName: 'attachment',
+          oldValue: (removedAtt && removedAtt.fileName) || attIdTarget,
+          newValue: '',
+          actorId: session.employeeId,
+          actorName: session.user.name,
+          actorRole: session.role,
+          createdAt: dAttNow
+        });
+        saveSandboxDb(db);
+        return { success: true, message: 'تم حذف المرفق.', data: { deleted: true, attachmentId: attIdTarget }, error: null };
+      }
+
+      case 'getCustomerNoteHistory': {
+        var histBundle = resolveSandboxNotesBundle(db, {});
+        var evalHist = core.evaluateCustomerNoteButtonAccess(session.user, 'view_history', null, histBundle.config);
+        if (!evalHist.allowed) return { success: false, message: evalHist.message || evalHist.reason || 'FORBIDDEN', data: null, error: 'FORBIDDEN' };
+        var hNoteId = String(payload.noteId || '').trim();
+        var hItems = (db.customerNoteHistory || []).filter(function (h) { return h && h.noteId === hNoteId; })
+          .sort(function (a, b) { return String(b.createdAt || '').localeCompare(String(a.createdAt || '')); });
+        return { success: true, message: '', data: { items: hItems }, error: null };
+      }
+
+      case 'getDataIntegritySettings':
+      case 'saveDataIntegritySettings':
+      case 'controlDataIntegrityMonitor':
+      case 'getDataIntegrityReport':
+      case 'runDataIntegrityCheck':
+      case 'recheckDataIntegrityRecord':
+      case 'resolveDataIntegrityIssue':
+      case 'rollbackDataIntegrityAction': {
+        if (session.role !== 'developer' || !core.canUserPerform(session.user, 'manage_developer_tools')) {
+          return { success: false, message: 'FORBIDDEN: أداة مراقبة سلامة البيانات متاحة لحساب المبرمج (Developer) فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var normIntSettings = (core && core.normalizeDataIntegritySettings)
+          ? core.normalizeDataIntegritySettings(db.settings.data_integrity_settings)
+          : { mode: 'manual', intervalMinutes: 60, scopes: ['reservations', 'extensions', 'cancelled', 'company_changes'], dateFrom: '', dateTo: '', batchSize: 100, paused: false };
+        if (action === 'getDataIntegritySettings') {
+          return { success: true, message: '', data: { settings: normIntSettings }, error: null };
+        }
+        if (action === 'saveDataIntegritySettings') {
+          var nextIntSet = core.normalizeDataIntegritySettings(payload.settings || payload);
+          nextIntSet.updatedAt = new Date().toISOString();
+          nextIntSet.updatedBy = session.user.name;
+          db.settings.data_integrity_settings = nextIntSet;
+          saveSandboxDb(db);
+          return { success: true, message: 'تم حفظ إعدادات مراقبة سلامة البيانات.', data: { settings: nextIntSet }, error: null };
+        }
+        if (action === 'controlDataIntegrityMonitor') {
+          var ctrlInt = Object.assign({}, normIntSettings);
+          if (typeof payload.paused === 'boolean') ctrlInt.paused = payload.paused;
+          if (payload.mode) ctrlInt.mode = payload.mode;
+          if (payload.intervalMinutes) ctrlInt.intervalMinutes = Number(payload.intervalMinutes);
+          ctrlInt = core.normalizeDataIntegritySettings(ctrlInt);
+          ctrlInt.updatedAt = new Date().toISOString();
+          ctrlInt.updatedBy = session.user.name;
+          db.settings.data_integrity_settings = ctrlInt;
+          saveSandboxDb(db);
+          return { success: true, message: ctrlInt.paused ? 'تم إيقاف المراقبة مؤقتاً.' : 'تم استئناف مراقبة سلامة البيانات.', data: { settings: ctrlInt }, error: null };
+        }
+        var resAllInt = db.reservations || [];
+        var liveStatsObj = {
+          total: resAllInt.length,
+          reservations: resAllInt.length,
+          extensions: (db.extensions || []).length,
+          extensionsCount: (db.extensions || []).length,
+          activeCount: resAllInt.filter(function (r) { return core && core.classifyReservationLifecycle && core.classifyReservationLifecycle(r) === 'active'; }).length,
+          completedCount: resAllInt.filter(function (r) { return core && core.classifyReservationLifecycle && core.classifyReservationLifecycle(r) === 'completed'; }).length,
+          cancelledCount: resAllInt.filter(function (r) { return Boolean(r && r.isSourceCancelled); }).length,
+          rejectedCount: resAllInt.filter(function (r) { return Boolean(r && r.isSourceRejected); }).length,
+          companyChanges: resAllInt.filter(function (r) { return Boolean(r && r.newCompanyName); }).length
+        };
+        if (action === 'runDataIntegrityCheck') {
+          var runNow = new Date().toISOString();
+          var freshIssues = [];
+          var typeMeta = (core && core.DATA_INTEGRITY_DISCREPANCY_TYPES) || {};
+          resAllInt.forEach(function (r) {
+            if (!r) return;
+            if (!r.customerName || !r.customerPhone || !r.startDate || !r.endDate) {
+              freshIssues.push({
+                id: genId('DISS'),
+                runId: '',
+                discrepancyType: 'incomplete_fields',
+                typeLabelAr: (typeMeta.incomplete_fields && typeMeta.incomplete_fields.labelAr) || 'حقول أساسية ناقصة أو غير مكتملة',
+                severity: 'low',
+                sourceScope: 'reservations',
+                resolutionStatus: 'open',
+                reservationId: r.id,
+                reservationNumber: r.reservationNumber,
+                fieldName: 'required_fields',
+                rgValue: [r.customerName, r.customerPhone, r.startDate, r.endDate].filter(Boolean).join(' · '),
+                neonValue: 'حقول أساسية غير مكتملة',
+                rgSnapshot: r,
+                neonSnapshot: core.buildIntegrityRecordProjection ? core.buildIntegrityRecordProjection(r, false) : r,
+                resolvedById: '',
+                resolvedByName: '',
+                resolvedAt: '',
+                resolutionNote: '',
+                createdAt: runNow,
+                updatedAt: runNow
+              });
+            }
+          });
+          if (freshIssues.length === 0 && resAllInt[0]) {
+            var sampleR = resAllInt[0];
+            freshIssues.push({
+              id: genId('DISS'),
+              runId: '',
+              discrepancyType: 'status_mismatch',
+              typeLabelAr: (typeMeta.status_mismatch && typeMeta.status_mismatch.labelAr) || 'اختلاف حالة الحجز',
+              severity: 'high',
+              sourceScope: 'reservations',
+              resolutionStatus: 'open',
+              reservationId: sampleR.id,
+              reservationNumber: sampleR.reservationNumber,
+              fieldName: 'status',
+              rgValue: 'مكتمل (finished)',
+              neonValue: (sampleR.internalStatus || 'نشط') + ' (' + (sampleR.originalStatusCode || 'active') + ')',
+              rgSnapshot: Object.assign({}, sampleR, { internalStatus: 'منتهي', status: 'finished', originalStatusCode: 'finished', originalStatusAr: 'مكتمل' }),
+              neonSnapshot: core.buildIntegrityRecordProjection ? core.buildIntegrityRecordProjection(sampleR, false) : sampleR,
+              resolvedById: '',
+              resolvedByName: '',
+              resolvedAt: '',
+              resolutionNote: '',
+              createdAt: runNow,
+              updatedAt: runNow
+            });
+          }
+          var newRun = {
+            id: genId('DIRUN'),
+            runMode: payload.runMode || 'manual',
+            scopes: Array.isArray(payload.scopes) && payload.scopes.length ? payload.scopes : normIntSettings.scopes,
+            status: 'completed',
+            rgCount: resAllInt.length,
+            neonCount: resAllInt.length,
+            discrepanciesCount: freshIssues.length,
+            summary: { rg: liveStatsObj, neon: liveStatsObj, byType: {} },
+            triggeredById: session.employeeId,
+            triggeredByName: session.user.name,
+            startedAt: runNow,
+            finishedAt: runNow
+          };
+          freshIssues.forEach(function (iss) { iss.runId = newRun.id; });
+          db.dataIntegrityRuns.unshift(newRun);
+          db.dataIntegrityIssues = freshIssues.concat(db.dataIntegrityIssues || []).slice(0, 200);
+          saveSandboxDb(db);
+          return {
+            success: true,
+            message: 'اكتمل فحص سلامة البيانات (قراءة فقط).',
+            data: {
+              run: newRun,
+              latestRun: newRun,
+              runs: (db.dataIntegrityRuns || []).slice(0, 20),
+              issues: freshIssues,
+              actions: (db.dataIntegrityActions || []).slice(0, 50),
+              settings: normIntSettings,
+              liveNeonStats: liveStatsObj
+            },
+            error: null
+          };
+        }
+        if (action === 'recheckDataIntegrityRecord') {
+          var recIss = (db.dataIntegrityIssues || []).find(function (x) { return x.id === payload.issueId; });
+          var recRes = (db.reservations || []).find(function (r) {
+            return (payload.reservationId && r.id === payload.reservationId) ||
+              (payload.reservationNumber && r.reservationNumber === payload.reservationNumber) ||
+              (recIss && r.id === recIss.reservationId);
+          });
+          var rgP = recIss && recIss.rgSnapshot ? (core.buildIntegrityRecordProjection ? core.buildIntegrityRecordProjection(recIss.rgSnapshot, true) : recIss.rgSnapshot) : (recRes ? core.buildIntegrityRecordProjection(recRes, true) : null);
+          var neonP = recRes && core.buildIntegrityRecordProjection ? core.buildIntegrityRecordProjection(recRes, false) : (recIss ? recIss.neonSnapshot : null);
+          var freshRecheck = (recIss && recIss.resolutionStatus === 'open' && core.compareRgAndNeonReservations && recIss.rgSnapshot && recRes)
+            ? (core.compareRgAndNeonReservations([recIss.rgSnapshot], [recRes]).issues || [])
+            : [];
+          if (recIss && freshRecheck.length === 0 && recIss.resolutionStatus === 'open') {
+            recIss.resolutionStatus = 'resolved';
+            recIss.resolvedById = session.employeeId;
+            recIss.resolvedByName = session.user.name;
+            recIss.resolvedAt = new Date().toISOString();
+            recIss.resolutionNote = 'تم التحقق وإغلاق الفارق تلقائيًا بعد تطابق السجلين';
+            saveSandboxDb(db);
+          }
+          return {
+            success: true,
+            message: 'تمت إعادة الفحص بنجاح.',
+            data: {
+              matched: freshRecheck.length === 0,
+              freshIssues: freshRecheck,
+              rgProjection: rgP,
+              neonProjection: neonP
+            },
+            error: null
+          };
+        }
+        if (action === 'resolveDataIntegrityIssue') {
+          var issTarget = (db.dataIntegrityIssues || []).find(function (x) { return x.id === payload.issueId; });
+          if (!issTarget) return { success: false, message: 'السجل غير موجود.', data: null, error: 'NOT_FOUND' };
+          var resTarget = (db.reservations || []).find(function (r) { return r.id === issTarget.reservationId || r.reservationNumber === issTarget.reservationNumber; });
+          var rgProjPrev = issTarget.rgSnapshot && Object.keys(issTarget.rgSnapshot).length
+            ? (core.buildIntegrityRecordProjection ? core.buildIntegrityRecordProjection(issTarget.rgSnapshot, true) : issTarget.rgSnapshot)
+            : {};
+          var neonProjPrev = resTarget && core.buildIntegrityRecordProjection
+            ? core.buildIntegrityRecordProjection(resTarget, false)
+            : (issTarget.neonSnapshot || {});
+          if (payload.previewOnly || payload.resolutionAction === 'preview') {
+            return {
+              success: true,
+              message: '',
+              data: {
+                previewOnly: true,
+                issue: issTarget,
+                rgProjection: rgProjPrev,
+                neonProjection: neonProjPrev,
+                beforeSnapshot: resTarget ? Object.assign({}, resTarget) : (issTarget.neonSnapshot || {})
+              },
+              error: null
+            };
+          }
+          if (!payload.approved) {
+            return { success: false, message: 'يتطلب تنفيذ الإجراء موافقة المبرمج الصريحة بعد معاينة الفروقات.', data: null, error: 'APPROVAL_REQUIRED' };
+          }
+          var actNow = new Date().toISOString();
+          var beforeSnap = resTarget ? JSON.parse(JSON.stringify(resTarget)) : {};
+          if ((payload.resolutionAction === 'sync_from_rg' || payload.resolutionAction === 'update_fields') && resTarget && issTarget.rgSnapshot) {
+            if (rgProjPrev.statusCode) resTarget.originalStatusCode = rgProjPrev.statusCode;
+            if (rgProjPrev.statusAr) resTarget.internalStatus = rgProjPrev.statusAr;
+            if (rgProjPrev.customerName) resTarget.customerName = rgProjPrev.customerName;
+            if (rgProjPrev.customerPhone) resTarget.customerPhone = rgProjPrev.customerPhone;
+            if (rgProjPrev.startDate) resTarget.startDate = rgProjPrev.startDate;
+            if (rgProjPrev.endDate) resTarget.endDate = rgProjPrev.endDate;
+            if (rgProjPrev.carName) resTarget.carName = rgProjPrev.carName;
+            if (rgProjPrev.companyName) resTarget.companyName = rgProjPrev.companyName;
+            resTarget.updatedAt = actNow;
+          }
+          issTarget.resolutionStatus = payload.resolutionAction === 'ignore' ? 'ignored' : 'resolved';
+          issTarget.resolvedById = session.employeeId;
+          issTarget.resolvedByName = session.user.name;
+          issTarget.resolvedAt = actNow;
+          issTarget.resolutionNote = String(payload.note || '');
+          issTarget.updatedAt = actNow;
+          var actionRec = {
+            id: genId('DIACT'),
+            issueId: issTarget.id,
+            runId: issTarget.runId || '',
+            reservationId: issTarget.reservationId,
+            reservationNumber: issTarget.reservationNumber,
+            actionType: payload.resolutionAction || 'mark_resolved',
+            beforeSnapshot: beforeSnap,
+            afterSnapshot: resTarget ? JSON.parse(JSON.stringify(resTarget)) : {},
+            rollbackSupported: Boolean(resTarget && (payload.resolutionAction === 'sync_from_rg' || payload.resolutionAction === 'update_fields')),
+            rolledBack: false,
+            actorId: session.employeeId,
+            actorName: session.user.name,
+            note: String(payload.note || ''),
+            createdAt: actNow
+          };
+          db.dataIntegrityActions.unshift(actionRec);
+          appendSandboxActivity(db, session.user, 'معالجة تعارض سلامة بيانات', 'DataIntegrity', issTarget.reservationNumber || issTarget.id, payload.resolutionAction);
+          saveSandboxDb(db);
+          return {
+            success: true,
+            message: 'تمت معالجة التعارض وتسجيل العملية بنجاح.',
+            data: { resolved: true, actionId: actionRec.id, rollbackSupported: actionRec.rollbackSupported, issueId: issTarget.id, resolutionStatus: issTarget.resolutionStatus },
+            error: null
+          };
+        }
+        if (action === 'rollbackDataIntegrityAction') {
+          var actTarget = (db.dataIntegrityActions || []).find(function (a) { return a.id === payload.actionId; });
+          if (!actTarget || !actTarget.beforeSnapshot || actTarget.rolledBack) {
+            return { success: false, message: 'تعذر التراجع عن هذه العملية.', data: null, error: 'VALIDATION_ERROR' };
+          }
+          var rbRes = (db.reservations || []).find(function (r) { return r.id === actTarget.reservationId || r.id === (actTarget.beforeSnapshot && actTarget.beforeSnapshot.id); });
+          if (rbRes) {
+            Object.assign(rbRes, actTarget.beforeSnapshot, { updatedAt: new Date().toISOString() });
+          }
+          actTarget.rolledBack = true;
+          actTarget.rolledBackAt = new Date().toISOString();
+          actTarget.rolledBackByName = session.user.name;
+          var rbIssue = (db.dataIntegrityIssues || []).find(function (x) { return x.id === actTarget.issueId; });
+          if (rbIssue) {
+            rbIssue.resolutionStatus = 'open';
+            rbIssue.resolutionNote = 'تم التراجع عن المعالجة السابقة';
+          }
+          saveSandboxDb(db);
+          return { success: true, message: 'تم التراجع عن الإصلاح واستعادة اللقطة السابقة.', data: { rolledBack: true, actionId: actTarget.id, reservationId: actTarget.reservationId }, error: null };
+        }
+        var repIssues = (db.dataIntegrityIssues || []).filter(function (iss) {
+          if (payload.runId && iss.runId !== payload.runId) return false;
+          if (payload.discrepancyType && iss.discrepancyType !== payload.discrepancyType) return false;
+          if (payload.resolutionStatus && iss.resolutionStatus !== payload.resolutionStatus) return false;
+          if (payload.search) {
+            var q = String(payload.search || '').trim().toLowerCase();
+            var h = [iss.reservationNumber, iss.rgValue, iss.neonValue, iss.discrepancyType, iss.typeLabelAr].join(' ').toLowerCase();
+            if (h.indexOf(q) === -1) return false;
+          }
+          return true;
+        });
+        return {
+          success: true,
+          message: '',
+          data: {
+            settings: normIntSettings,
+            latestRun: (db.dataIntegrityRuns || [])[0] || null,
+            runs: (db.dataIntegrityRuns || []).slice(0, 20),
+            issues: repIssues,
+            actions: (db.dataIntegrityActions || []).slice(0, 50),
+            liveNeonStats: liveStatsObj
+          },
+          error: null
+        };
       }
 
       default:

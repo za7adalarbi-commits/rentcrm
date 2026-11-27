@@ -893,6 +893,7 @@
               }).join('') || '<div class="empty-state" style="padding:12px;">لا توجد تحديثات إضافية.</div>') +
             '</div>' +
           '</div>' +
+          '<div id="prb-customer-notes-host"></div>' +
           '<div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
               ((!isAlreadyClosed && canCloseTicketModalBtn) ? '<button type="button" class="btn btn-danger" id="prb-close-ticket-btn">إغلاق المشكلة</button>' : '') +
@@ -908,6 +909,27 @@
       var getPool = function () { return empList; };
       if (canEditTicket) root.RGCrmMentions.attach(document.getElementById('pu-desc'), getPool);
       root.RGCrmMentions.attach(document.getElementById('pu-note'), getPool);
+    }
+
+    var prbNotesHost = document.getElementById('prb-customer-notes-host');
+    if (prbNotesHost && root.RGCustomers && typeof root.RGCustomers.mountCustomerNotesPanel === 'function') {
+      root.RGCustomers.mountCustomerNotesPanel(prbNotesHost, {
+        sourceSection: 'problems',
+        problemId: problem.id,
+        problemNumber: problem.problemNumber,
+        reservationId: problem.reservationId || '',
+        reservationNumber: problem.reservationNumber || '',
+        customerId: problem.customerId || '',
+        employees: empList,
+        initialNotes: Array.isArray(problem.customerNotes) ? problem.customerNotes : null,
+        noteStatuses: problem.noteStatuses,
+        notesConfig: problem.notesConfig,
+        ctx: ctx,
+        onChanged: function () { if (onSaved) onSaved(null); }
+      });
+    }
+    if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+      root.RGCrmDropdowns.enhanceAll(modalRoot);
     }
 
     var handledSubmit = false;

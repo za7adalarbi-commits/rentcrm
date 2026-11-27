@@ -311,8 +311,6 @@ export function formatCustomerSummaryRow(row: Record<string, any>, user?: any): 
     idType: str(row.id_type ?? row.idType),
     status: str(row.status) || 'جديد',
     statusOverride: Boolean(row.status_override ?? row.statusOverride),
-    assignedEmployeeId: str(row.assigned_employee_id ?? row.assignedEmployeeId),
-    assignedEmployeeName: str(row.assigned_employee_name ?? row.assignedEmployeeName),
     notes: str(row.notes),
     tags,
     source: str(row.source) || 'sync',
@@ -326,10 +324,12 @@ export function formatCustomerSummaryRow(row: Record<string, any>, user?: any): 
     openProblemsCount: Number(row.open_problems_count ?? row.openProblemsCount ?? 0),
     openComplaintsCount: Number(row.open_complaints_count ?? row.openComplaintsCount ?? 0),
     followUpsCount: Number(row.follow_ups_count ?? row.followUpsCount ?? 0),
+    notesCount: Number(row.notes_count ?? row.notesCount ?? 0),
     totalAmount: Number(row.total_amount ?? row.totalAmount ?? 0),
     paidAmount: Number(row.paid_amount ?? row.paidAmount ?? 0),
     lastReservationNumber: str(row.last_reservation_number ?? row.lastReservationNumber),
     lastReservationDate: str(row.last_reservation_date ?? row.lastReservationDate),
+    lastReservationStatus: str(row.last_reservation_status ?? row.lastReservationStatus),
     lastCompanyName: str(row.last_company_name ?? row.lastCompanyName)
   };
 

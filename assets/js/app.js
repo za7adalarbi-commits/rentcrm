@@ -100,7 +100,8 @@
           search: state.customers.search || '',
           status: state.customers.status || '',
           company: state.customers.company || '',
-          assignedEmployeeId: state.customers.assignedEmployeeId || '',
+          dateFrom: state.customers.dateFrom || '',
+          dateTo: state.customers.dateTo || '',
           problemFilter: state.customers.problemFilter || '',
           kpiFilter: state.customers.kpiFilter || 'all',
           sortBy: state.customers.sortBy || 'last_activity',
@@ -150,10 +151,11 @@
       }
       if (f.customers && typeof f.customers === 'object' && !state.customers) {
         state.customers = Object.assign({
-          search: '', status: '', company: '', assignedEmployeeId: '',
+          search: '', status: '', company: '', dateFrom: '', dateTo: '',
           problemFilter: '', kpiFilter: 'all', sortBy: 'last_activity',
           page: 1, pageSize: 50, selectedCustomerId: ''
         }, f.customers);
+        delete state.customers.assignedEmployeeId;
       }
     } catch (_eRfLoad) {}
   }
@@ -412,6 +414,8 @@
     activeLocks: [],
     handoverSettings: normalizeHandoverSettingsSafe({}),
     callWrapupShortcutsConfig: null,
+    customerNotesConfig: null,
+    customerNoteStatuses: [],
     lastDeltaSyncAt: '',
     offlineQueue: { count: 0, items: [] },
     deferredInstallPrompt: null,
@@ -817,6 +821,49 @@
       openCallWrapUpBar(lastOpenCallInfo);
     }
     return state.callWrapupShortcutsConfig;
+  }
+
+  function getCustomerNotesConfig() {
+    if (root.RGCrmCore && root.RGCrmCore.normalizeCustomerNotesConfig) {
+      state.customerNotesConfig = root.RGCrmCore.normalizeCustomerNotesConfig(state.customerNotesConfig || {});
+      return state.customerNotesConfig;
+    }
+    return state.customerNotesConfig || {};
+  }
+
+  function setCustomerNotesConfig(rawCfg) {
+    state.customerNotesConfig = (root.RGCrmCore && root.RGCrmCore.normalizeCustomerNotesConfig)
+      ? root.RGCrmCore.normalizeCustomerNotesConfig(rawCfg || {})
+      : (rawCfg && typeof rawCfg === 'object' ? rawCfg : {});
+    try {
+      document.dispatchEvent(new CustomEvent('rg:customernoteschange', { detail: { config: state.customerNotesConfig } }));
+    } catch (_eCn) {}
+    return state.customerNotesConfig;
+  }
+
+  function getCustomerNoteStatuses() {
+    if (Array.isArray(state.customerNoteStatuses) && state.customerNoteStatuses.length) {
+      return state.customerNoteStatuses.slice();
+    }
+    if (root.RGCrmCore && Array.isArray(root.RGCrmCore.CUSTOMER_NOTE_DEFAULT_STATUSES)) {
+      return root.RGCrmCore.CUSTOMER_NOTE_DEFAULT_STATUSES.map(function (st) {
+        return root.RGCrmCore.normalizeCustomerNoteStatusRecord ? root.RGCrmCore.normalizeCustomerNoteStatusRecord(st) : Object.assign({}, st);
+      });
+    }
+    return [];
+  }
+
+  function setCustomerNoteStatuses(rawList) {
+    if (!Array.isArray(rawList)) return getCustomerNoteStatuses();
+    state.customerNoteStatuses = rawList.map(function (st) {
+      return (root.RGCrmCore && root.RGCrmCore.normalizeCustomerNoteStatusRecord)
+        ? root.RGCrmCore.normalizeCustomerNoteStatusRecord(st)
+        : Object.assign({}, st);
+    });
+    try {
+      document.dispatchEvent(new CustomEvent('rg:customernoteschange', { detail: { statuses: state.customerNoteStatuses } }));
+    } catch (_eCns) {}
+    return state.customerNoteStatuses.slice();
   }
 
   function getActiveUiContext() {
@@ -3367,7 +3414,8 @@
             search: custSt.search || '',
             status: custSt.status || '',
             company: custSt.company || '',
-            assignedEmployeeId: custSt.assignedEmployeeId || '',
+            dateFrom: custSt.dateFrom || '',
+            dateTo: custSt.dateTo || '',
             problemFilter: custSt.problemFilter || '',
             kpiFilter: custSt.kpiFilter || 'all',
             sortBy: custSt.sortBy || 'last_activity',
@@ -4825,6 +4873,8 @@
         resetEmployeesState();
         state.roleUiDefaults = {};
         state.statsControlConfig = { excludedFromStatsEmployeeIds: [] };
+        state.customerNotesConfig = null;
+        state.customerNoteStatuses = [];
         state.uiSimplification = normalizeUiSimpFallback({});
         clearUiSimplificationClasses();
         if (root.RGApi && typeof root.RGApi.clearCache === 'function') {
@@ -5262,6 +5312,9 @@
       if (sData.handover_settings) {
         setHandoverSettings(sData.handover_settings);
       }
+      if (sData.customer_notes_config) {
+        setCustomerNotesConfig(sData.customer_notes_config);
+      }
       if (curUser) {
         refreshSidebarNavDom(curUser);
       }
@@ -5383,6 +5436,12 @@
       if (d.callWrapupShortcuts) {
         setCallWrapupShortcutsConfig(d.callWrapupShortcuts);
       }
+      if (d.customerNotesConfig) {
+        setCustomerNotesConfig(d.customerNotesConfig);
+      }
+      if (Array.isArray(d.customerNoteStatuses)) {
+        setCustomerNoteStatuses(d.customerNoteStatuses);
+      }
       if (d.changedSettings) {
         syncSettingsChangesSilently(d.user || curUser).catch(function () {});
       }
@@ -5412,11 +5471,17 @@
         });
       }
 
+      var hasCustomerNoteChanges = Boolean(
+        (Array.isArray(d.changedCustomerNotes) && d.changedCustomerNotes.length > 0) ||
+        Boolean(d.customerNotesConfig) ||
+        Boolean(Array.isArray(d.customerNoteStatuses) && d.customerNoteStatuses.length > 0)
+      );
+
       var prevDeltaMeta = {
         todayRadarCounts: lastDeltaRadarCountsSnap,
         announcementsFp: lastFingerprints.announcements
       };
-      var hasChanges = (root.RGCrmCore && typeof root.RGCrmCore.hasMeaningfulDeltaChanges === 'function')
+      var hasChanges = ((root.RGCrmCore && typeof root.RGCrmCore.hasMeaningfulDeltaChanges === 'function')
         ? root.RGCrmCore.hasMeaningfulDeltaChanges(d, prevDeltaMeta)
         : Boolean(
             (Array.isArray(d.changedReservations) && d.changedReservations.length > 0) ||
@@ -5429,7 +5494,7 @@
             Boolean(d.changedSettings) ||
             Boolean(d.deletedAllReservationsBefore) ||
             (Array.isArray(d.deletedAnnouncementIds) && d.deletedAnnouncementIds.length > 0)
-          );
+          )) || hasCustomerNoteChanges;
       if (d.todayRadarCounts && typeof d.todayRadarCounts === 'object') {
         lastDeltaRadarCountsSnap = Object.assign({}, d.todayRadarCounts);
       }
@@ -5442,16 +5507,20 @@
       if (hasChanges && root.RGApi) {
         var scopesToInvalidate = ['dashboard', 'activity', 'reports', 'todayRadar', 'followUps', 'sync'];
         if ((Array.isArray(d.changedReservations) && d.changedReservations.length > 0) || (Array.isArray(d.deletedReservationIds) && d.deletedReservationIds.length > 0) || d.deletedAllReservationsBefore) {
-          scopesToInvalidate.push('employees', 'reservations', 'followUps', 'problems');
+          scopesToInvalidate.push('employees', 'reservations', 'followUps', 'problems', 'customers');
         }
         if ((Array.isArray(d.deletedProblemIds) && d.deletedProblemIds.length > 0)) {
-          scopesToInvalidate.push('problems', 'reservations', 'notifications');
+          scopesToInvalidate.push('problems', 'reservations', 'notifications', 'customers');
+        }
+        if (hasCustomerNoteChanges) {
+          scopesToInvalidate.push('customers', 'reservations', 'problems');
+          try { document.dispatchEvent(new CustomEvent('rg:customernoteschange', { detail: { notes: d.changedCustomerNotes || [] } })); } catch (_eNc) {}
         }
         if ((Array.isArray(d.deletedEmployeeIds) && d.deletedEmployeeIds.length > 0) || d.changedDelegations || d.changedRoles) {
           scopesToInvalidate.push('employees');
         }
         if (d.changedSettings) {
-          scopesToInvalidate.push('settings', 'employees', 'sync');
+          scopesToInvalidate.push('settings', 'employees', 'sync', 'customers');
         }
         if (d.deletedAllReservationsBefore && root.RGApi.clearCache) {
           root.RGApi.clearCache(scopesToInvalidate);
@@ -5794,6 +5863,14 @@
     } else if (bData.settings && bData.settings.handover_settings) {
       setHandoverSettings(bData.settings.handover_settings);
     }
+    if (bData.customerNotesConfig) {
+      setCustomerNotesConfig(bData.customerNotesConfig);
+    } else if (bData.settings && bData.settings.customer_notes_config) {
+      setCustomerNotesConfig(bData.settings.customer_notes_config);
+    }
+    if (Array.isArray(bData.customerNoteStatuses)) {
+      setCustomerNoteStatuses(bData.customerNoteStatuses);
+    }
     if (Array.isArray(bData.announcements)) {
       setAnnouncements(bData.announcements);
     }
@@ -6031,6 +6108,10 @@
     getCallWrapupShortcutsConfig: getCallWrapupShortcutsConfig,
     setCallWrapupShortcutsConfig: setCallWrapupShortcutsConfig,
     getActiveCallWrapupShortcuts: getActiveCallWrapupShortcuts,
+    getCustomerNotesConfig: getCustomerNotesConfig,
+    setCustomerNotesConfig: setCustomerNotesConfig,
+    getCustomerNoteStatuses: getCustomerNoteStatuses,
+    setCustomerNoteStatuses: setCustomerNoteStatuses,
     mountCallShortcutsControlPanel: mountCallShortcutsControlPanel,
     openDeveloperCallShortcutsModal: openDeveloperCallShortcutsModal,
     getState: function () { return state; },

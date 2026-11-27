@@ -3792,3 +3792,197 @@ export async function retryFailedSyncRecords(
     activePullInFlight = false;
   }
 }
+
+export interface IntegrityRgSnapshotResult {
+  reservations: Record<string, any>[];
+  extensions: Record<string, any>[];
+  cancelledIdsCount: number;
+  companyChangesCount: number;
+  incompleteEndpoints: string[];
+  pagesFetched: number;
+}
+
+export async function fetchRentalGateSnapshotReadOnly(
+  executor: DbExecutor,
+  opts: { scopes?: string[]; dateFrom?: string; dateTo?: string; maxPages?: number; singleSourceId?: string } = {},
+  fetchFn: typeof fetch = fetch
+): Promise<IntegrityRgSnapshotResult> {
+  const serverCfg = await resolveServerConfig(executor);
+  const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
+  if (!rgToken) {
+    throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم) لتشغيل فحص سلامة البيانات.');
+  }
+
+  const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
+  const fetchJsonWithRetry = async (targetUrl: string): Promise<any> => {
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 20000) : null;
+      try {
+        const resp = await fetchFn(targetUrl, {
+          method: 'GET',
+          signal: ctrl?.signal,
+          headers: {
+            Authorization: `Bearer ${rgToken}`,
+            Accept: 'application/json',
+            lang: 'ar'
+          }
+        });
+        if (timer) clearTimeout(timer);
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '');
+          if ((resp.status >= 500 || resp.status === 429) && attempt < 3) {
+            await new Promise((r) => setTimeout(r, 150 * attempt));
+            continue;
+          }
+          throw new Error(`RG_API_HTTP_${resp.status}: ${text.slice(0, 140)}`);
+        }
+        return await resp.json().catch(() => null);
+      } catch (err: any) {
+        if (timer) clearTimeout(timer);
+        lastErr = err;
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 150 * attempt));
+      }
+    }
+    throw lastErr || new Error('RG_API_FETCH_FAILED');
+  };
+
+  if (opts.singleSourceId) {
+    const sid = str(opts.singleSourceId).replace(/^#+/, '').trim();
+    const rawJson = await fetchJsonWithRetry(`${baseApi}/reservations/${encodeURIComponent(sid)}`);
+    const inner =
+      (rawJson?.data?.reservation && typeof rawJson.data.reservation === 'object' ? rawJson.data.reservation : null) ||
+      (rawJson?.reservation && typeof rawJson.reservation === 'object' ? rawJson.reservation : null) ||
+      (rawJson?.data && typeof rawJson.data === 'object' && !Array.isArray(rawJson.data) ? rawJson.data : null) ||
+      (rawJson?.result && typeof rawJson.result === 'object' && !Array.isArray(rawJson.result) ? rawJson.result : null) ||
+      rawJson;
+    if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
+      return {
+        reservations: [],
+        extensions: [],
+        cancelledIdsCount: 0,
+        companyChangesCount: 0,
+        incompleteEndpoints: [],
+        pagesFetched: 1
+      };
+    }
+    const item = {
+      ...inner,
+      reservationId: inner.reservationId ?? inner.reservation_id ?? inner.id ?? sid,
+      clientName: inner.client?.name ?? inner.customer?.name ?? inner.clientName ?? inner.customer_name,
+      clientMobile: inner.client?.mobile ?? inner.client?.phone ?? inner.customer?.mobile ?? inner.customer?.phone ?? inner.clientMobile ?? inner.customer_phone,
+      companyArName: inner.companyCar?.company?.arabicName ?? inner.companyCar?.company?.name ?? inner.company?.arabicName ?? inner.company?.name ?? inner.companyArName,
+      companyEnName: inner.companyCar?.company?.englishName ?? inner.company?.englishName ?? inner.companyEnName,
+      carNameEn: inner.companyCar?.car?.carNameEn ?? inner.car?.carNameEn ?? inner.carNameEn,
+      carNameAr: inner.companyCar?.car?.carNameAr ?? inner.car?.carNameAr ?? inner.carNameAr
+    };
+    return {
+      reservations: [item],
+      extensions: [],
+      cancelledIdsCount: 0,
+      companyChangesCount: 0,
+      incompleteEndpoints: [],
+      pagesFetched: 1
+    };
+  }
+
+  const pageSize = 100;
+  const maxPages = Math.min(200, Math.max(1, num(opts.maxPages, 80)));
+  const scopes = new Set(Array.isArray(opts.scopes) && opts.scopes.length ? opts.scopes : ['reservations', 'extensions', 'cancelled', 'company_changes']);
+  const incompleteEndpoints: string[] = [];
+  let totalPagesFetched = 0;
+
+  const fetchPagedRo = async (endpoint: string, optional: boolean) => {
+    const rows: any[] = [];
+    const seen = new Set<string>();
+    const visited = new Set<string>();
+    let complete = true;
+    for (let step = 0; step < maxPages; step++) {
+      const url = `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
+      if (visited.has(url)) break;
+      visited.add(url);
+      let json: any;
+      try {
+        json = await fetchJsonWithRetry(url);
+      } catch (err: any) {
+        if (!optional) throw err;
+        incompleteEndpoints.push(`${endpoint} (${str(err?.message).slice(0, 80)})`);
+        complete = false;
+        break;
+      }
+      totalPagesFetched++;
+      const parsed = extractRentalGatePagePayload(json, step, pageSize);
+      let added = 0;
+      for (const r of parsed.rows) {
+        const ek = str(r?.extendId || r?.extensionNumber || r?.extension_number);
+        const rn = str(crmCore.extractReservationNumber(r)).replace(/^#+/, '').trim();
+        const si = str(crmCore.extractSourceReservationId(r)).replace(/^#+/, '').trim();
+        const key = ek || (si && rn && rn !== si ? `${si}::${rn}` : (si || rn));
+        if (key) {
+          if (seen.has(key)) continue;
+          seen.add(key);
+        }
+        rows.push(r);
+        added++;
+      }
+      if (parsed.isLast || (parsed.rows.length > 0 && added === 0) || parsed.rows.length === 0) break;
+    }
+    return { rows, complete };
+  };
+
+  const [resPaged, extPaged, canPaged, rccPaged] = await Promise.all([
+    scopes.has('reservations') ? fetchPagedRo('reservations/filter', false) : Promise.resolve({ rows: [] as any[], complete: true }),
+    scopes.has('extensions') ? fetchPagedRo('reservation-extends/filter', true) : Promise.resolve({ rows: [] as any[], complete: true }),
+    scopes.has('cancelled') ? fetchPagedRo('admin/cancelled-reservations', true) : Promise.resolve({ rows: [] as any[], complete: true }),
+    scopes.has('company_changes') ? fetchPagedRo('reservation-company-changes/admin/filter', true) : Promise.resolve({ rows: [] as any[], complete: true })
+  ]);
+
+  const extractSid = (row: any) => str(row?.reservationId ?? row?.reservation_id ?? row?.sourceReservationId ?? row?.source_reservation_id ?? row?.reservation?.id ?? row?.id);
+  const canMap = new Map<string, any>();
+  for (const c of canPaged.rows) {
+    const sid = extractSid(c);
+    if (sid && !canMap.has(sid)) canMap.set(sid, c);
+  }
+  const rccMap = new Map<string, any>();
+  for (const rc of rccPaged.rows) {
+    const sid = extractSid(rc);
+    if (sid && !rccMap.has(sid)) rccMap.set(sid, rc);
+  }
+
+  const enriched = resPaged.rows.map((rawItem: any) => {
+    const sid = str(crmCore.extractSourceReservationId(rawItem) || crmCore.extractReservationNumber(rawItem));
+    const cleanSid = sid.replace(/^#+/, '').trim();
+    const canRec = (sid ? canMap.get(sid) : null) || (cleanSid ? canMap.get(cleanSid) : null);
+    const rccRec = (sid ? rccMap.get(sid) : null) || (cleanSid ? rccMap.get(cleanSid) : null);
+    const copy: Record<string, any> = { ...rawItem };
+    if (canRec) copy.isSourceCancelled = true;
+    if (rccRec) {
+      copy.rccStatus = str(rccRec.status);
+      copy.rccReason = str(rccRec.reason);
+      if (rccRec.targetCompanyName) copy.newCompanyName = str(rccRec.targetCompanyName);
+      if (!canRec) copy.isSourceRejected = true;
+    }
+    return copy;
+  });
+
+  const dedupedRes = crmCore.dedupeReservationsByNumber(enriched);
+  const filteredRes = (opts.dateFrom || opts.dateTo)
+    ? crmCore.filterSourceReservationsByPullRange(dedupedRes, {
+        hasCustomRange: true,
+        dateFrom: str(opts.dateFrom),
+        dateTo: str(opts.dateTo)
+      })
+    : dedupedRes;
+  const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.rows);
+
+  return {
+    reservations: filteredRes,
+    extensions: dedupedExt,
+    cancelledIdsCount: canMap.size,
+    companyChangesCount: rccMap.size,
+    incompleteEndpoints,
+    pagesFetched: totalPagesFetched
+  };
+}
+
