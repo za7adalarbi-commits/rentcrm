@@ -593,7 +593,15 @@ CREATE INDEX IF NOT EXISTS idx_notification_dismissals_emp ON notification_dismi
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower_unique ON users (LOWER(username));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_username_lower_unique ON employees (LOWER(username));
 
--- 26. Unified Customers Directory (CRM Customer Profile Master)
+-- 26. Schema Migration History
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id TEXT PRIMARY KEY,
+  description TEXT NOT NULL DEFAULT '',
+  checksum TEXT NOT NULL DEFAULT '',
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 27. Customers & Customer Notes Tables (aligned with Neon production schema)
 CREATE TABLE IF NOT EXISTS customers (
   id TEXT PRIMARY KEY,
   customer_key TEXT NOT NULL UNIQUE,
@@ -617,7 +625,6 @@ CREATE TABLE IF NOT EXISTS customers (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 27. Dynamic Customer Note Statuses
 CREATE TABLE IF NOT EXISTS customer_note_statuses (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -634,17 +641,20 @@ CREATE TABLE IF NOT EXISTS customer_note_statuses (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 28. Customer Notes & Direct Interaction Log
 CREATE TABLE IF NOT EXISTS customer_notes (
   id TEXT PRIMARY KEY,
   customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-  reservation_id TEXT DEFAULT NULL REFERENCES reservations(id) ON DELETE SET NULL,
+  reservation_id TEXT REFERENCES reservations(id) ON DELETE SET NULL,
   reservation_number TEXT NOT NULL DEFAULT '',
+  note_type TEXT NOT NULL DEFAULT 'ملاحظة',
+  content TEXT NOT NULL DEFAULT '',
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   problem_id TEXT NOT NULL DEFAULT '',
   problem_number TEXT NOT NULL DEFAULT '',
-  note_type TEXT NOT NULL DEFAULT 'ملاحظة',
   title TEXT NOT NULL DEFAULT '',
-  content TEXT NOT NULL DEFAULT '',
   status_id TEXT NOT NULL DEFAULT '',
   status_name TEXT NOT NULL DEFAULT 'جديدة',
   status_color TEXT NOT NULL DEFAULT '#3b82f6',
@@ -656,51 +666,45 @@ CREATE TABLE IF NOT EXISTS customer_notes (
   closed_by_id TEXT NOT NULL DEFAULT '',
   closed_by_name TEXT NOT NULL DEFAULT '',
   source_section TEXT NOT NULL DEFAULT 'customers',
-  created_by_id TEXT NOT NULL DEFAULT '',
-  created_by_name TEXT NOT NULL DEFAULT '',
   updated_by_id TEXT NOT NULL DEFAULT '',
   updated_by_name TEXT NOT NULL DEFAULT '',
   deleted_at TIMESTAMPTZ DEFAULT NULL,
   deleted_by_id TEXT NOT NULL DEFAULT '',
-  deleted_by_name TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  deleted_by_name TEXT NOT NULL DEFAULT ''
 );
 
--- 29. Customer Note Attachments
 CREATE TABLE IF NOT EXISTS customer_note_attachments (
   id TEXT PRIMARY KEY,
   note_id TEXT NOT NULL REFERENCES customer_notes(id) ON DELETE CASCADE,
-  customer_id TEXT NOT NULL DEFAULT '',
+  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
   file_name TEXT NOT NULL DEFAULT '',
   mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-  file_size INTEGER NOT NULL DEFAULT 0,
-  data_url TEXT NOT NULL DEFAULT '',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  data_base64 TEXT NOT NULL DEFAULT '',
   uploaded_by_id TEXT NOT NULL DEFAULT '',
   uploaded_by_name TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 30. Customer Note Audit History
 CREATE TABLE IF NOT EXISTS customer_note_history (
   id TEXT PRIMARY KEY,
-  note_id TEXT NOT NULL,
-  customer_id TEXT NOT NULL DEFAULT '',
-  action_type TEXT NOT NULL DEFAULT '',
+  note_id TEXT NOT NULL REFERENCES customer_notes(id) ON DELETE CASCADE,
+  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  action_type TEXT NOT NULL DEFAULT 'update',
   field_name TEXT NOT NULL DEFAULT '',
   old_value TEXT NOT NULL DEFAULT '',
   new_value TEXT NOT NULL DEFAULT '',
-  details TEXT NOT NULL DEFAULT '',
-  source_section TEXT NOT NULL DEFAULT 'customers',
+  note TEXT NOT NULL DEFAULT '',
   actor_id TEXT NOT NULL DEFAULT '',
   actor_name TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 31. Developer-Only Data Integrity Monitor Runs, Issues & Action Rollback Snapshots
+-- 28. Data Integrity Monitor Tables
 CREATE TABLE IF NOT EXISTS data_integrity_runs (
   id TEXT PRIMARY KEY,
   trigger_type TEXT NOT NULL DEFAULT 'manual',
+  run_mode TEXT NOT NULL DEFAULT 'manual',
   status TEXT NOT NULL DEFAULT 'completed',
   started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   finished_at TIMESTAMPTZ DEFAULT NULL,
@@ -757,50 +761,12 @@ CREATE TABLE IF NOT EXISTS data_integrity_actions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;
+ALTER TABLE data_integrity_runs ADD COLUMN IF NOT EXISTS run_mode TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE reservations ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE problems ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE problems ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';
-ALTER TABLE issues ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE issues ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;
 
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS problem_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS problem_number TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_name TEXT NOT NULL DEFAULT 'جديدة';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_color TEXT NOT NULL DEFAULT '#3b82f6';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS assigned_employee_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS assigned_employee_name TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS is_internal BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS is_closed BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ DEFAULT NULL;
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_by_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_by_name TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS source_section TEXT NOT NULL DEFAULT 'customers';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS updated_by_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS updated_by_name TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_by_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_by_name TEXT NOT NULL DEFAULT '';
-
-CREATE INDEX IF NOT EXISTS idx_customers_name_trgm ON customers USING GIN (full_name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_customers_phone_trgm ON customers USING GIN (phone gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_customers_norm_phone ON customers (normalized_phone) WHERE normalized_phone <> '';
-CREATE INDEX IF NOT EXISTS idx_customers_email_lower ON customers (LOWER(email)) WHERE email <> '';
-CREATE INDEX IF NOT EXISTS idx_customers_id_number ON customers (id_number) WHERE id_number <> '';
-CREATE INDEX IF NOT EXISTS idx_customers_status_updated ON customers (status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_customer_notes_cust_created ON customer_notes (customer_id, created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_customer_notes_res_id ON customer_notes (reservation_id) WHERE reservation_id IS NOT NULL AND deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_customer_notes_prb_id ON customer_notes (problem_id) WHERE problem_id <> '' AND deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_customer_notes_status ON customer_notes (status_id, status_name) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_customer_note_att_note ON customer_note_attachments (note_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_customer_note_hist_note ON customer_note_history (note_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_customer_note_statuses_order ON customer_note_statuses (sort_order ASC, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_data_integrity_runs_started ON data_integrity_runs (started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_status ON data_integrity_issues (resolution_status, discrepancy_type, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_fk ON reservations (customer_id) WHERE customer_id <> '';
-CREATE INDEX IF NOT EXISTS idx_reservations_customer_email_trgm ON reservations USING GIN (customer_email gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_problems_customer_id_fk ON problems (customer_id) WHERE customer_id <> '';
 `;
+

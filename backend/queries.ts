@@ -20,7 +20,7 @@ import {
   invalidateScopes,
   runWithIdempotency
 } from './cache.js';
-import { getDatabaseUrl, type DbClient, type DbExecutor } from './db.js';
+import { getDatabaseUrl, runWithSavepoint, type DbClient, type DbExecutor } from './db.js';
 import { isCoreFilesystemWritable, maskDatabaseUrl } from './coreBinding.js';
 import {
   encryptServerSecret,
@@ -243,26 +243,7 @@ async function runTxOptional<T>(
   fn: () => Promise<T>,
   fallback: T
 ): Promise<T> {
-  const safeSp = `sp_${savepointLabel.replace(/[^a-zA-Z0-9_]/g, '_')}`;
-  let hasSavepoint = false;
-  try {
-    await tx.query(`SAVEPOINT ${safeSp}`);
-    hasSavepoint = true;
-  } catch {
-    hasSavepoint = false;
-  }
-  try {
-    const res = await fn();
-    if (hasSavepoint) {
-      await tx.query(`RELEASE SAVEPOINT ${safeSp}`).catch(() => undefined);
-    }
-    return res;
-  } catch {
-    if (hasSavepoint) {
-      await tx.query(`ROLLBACK TO SAVEPOINT ${safeSp}`).catch(() => undefined);
-    }
-    return fallback;
-  }
+  return runWithSavepoint(tx, savepointLabel, fn, fallback);
 }
 
 async function recordSyncTombstone(
@@ -1558,7 +1539,11 @@ export async function getReservations(
 
   const resNumberQuery = str(payload.reservationNumber).replace(/^#+/, '').trim();
   if (resNumberQuery) {
-    const resNumCond = buildPgSearchCondition(['r.reservation_number'], resNumberQuery, params);
+    const resNumCond = buildPgSearchCondition(
+      ['r.reservation_number', 'r.source_reservation_id', 'r.reference_number'],
+      resNumberQuery,
+      params
+    );
     if (resNumCond) clauses.push(resNumCond);
   }
 
@@ -2924,7 +2909,12 @@ export async function deleteFollowUp(executor: DbExecutor, session: AuthSession,
         throw new Error('FORBIDDEN: لا يمكنك حذف متابعة موظف آخر.');
       }
 
-      await tx.query(`DELETE FROM follow_up_history WHERE follow_up_id = $1`, [followUpId]).catch(() => undefined);
+      await runTxOptional(
+        tx,
+        'del_fuh_by_fu',
+        () => tx.query(`DELETE FROM follow_up_history WHERE follow_up_id = $1`, [followUpId]),
+        undefined
+      );
       await tx.query(`DELETE FROM follow_ups WHERE id = $1`, [followUpId]);
 
       const nowIso = new Date().toISOString();
@@ -4912,20 +4902,23 @@ export async function deleteAllReservations(
     const deletedCount = targetIds.length;
 
     if (scopeInfo.scope === 'all') {
-      await tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id IS NOT NULL`).catch(() => undefined);
-      await tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id IS NOT NULL`).catch(() => undefined);
+      await runTxOptional(tx, 'clr_prb_all', () => tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id IS NOT NULL`), undefined);
+      await runTxOptional(tx, 'clr_iss_all', () => tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id IS NOT NULL`), undefined);
       await tx.query(`DELETE FROM follow_up_history`);
       await tx.query(`DELETE FROM follow_ups`);
       await tx.query(`DELETE FROM assignments`);
       await tx.query(`DELETE FROM extensions`);
       await tx.query(`DELETE FROM reservations`);
-      await tx.query(
-        `UPDATE sync_checkpoints SET last_cursor = '', last_batch_count = 0, last_status = 'cleared', meta = '{}'::jsonb, updated_at = NOW()`
-      ).catch(() => undefined);
+      await runTxOptional(
+        tx,
+        'clr_sync_cp',
+        () => tx.query(`UPDATE sync_checkpoints SET last_cursor = '', last_batch_count = 0, last_status = 'cleared', meta = '{}'::jsonb, updated_at = NOW()`),
+        undefined
+      );
       await recordSyncTombstone(tx, 'reservation_clear_all', ['ALL'], { scope: 'all', deletedCount });
     } else if (deletedCount > 0) {
-      await tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]).catch(() => undefined);
-      await tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]).catch(() => undefined);
+      await runTxOptional(tx, 'clr_prb_scope', () => tx.query(`UPDATE problems SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]), undefined);
+      await runTxOptional(tx, 'clr_iss_scope', () => tx.query(`UPDATE issues SET reservation_id = NULL WHERE reservation_id = ANY($1::text[])`, [targetIds]), undefined);
       await tx.query(`DELETE FROM follow_up_history WHERE reservation_id = ANY($1::text[])`, [targetIds]);
       await tx.query(`DELETE FROM follow_ups WHERE reservation_id = ANY($1::text[])`, [targetIds]);
       await tx.query(`DELETE FROM assignments WHERE reservation_id = ANY($1::text[])`, [targetIds]);
@@ -6699,7 +6692,11 @@ export async function getInactiveReservations(
 
   const resNumberQuery = str(payload.reservationNumber).replace(/^#+/, '').trim();
   if (resNumberQuery) {
-    const cond = buildPgSearchCondition(['r.reservation_number'], resNumberQuery, params);
+    const cond = buildPgSearchCondition(
+      ['r.reservation_number', 'r.source_reservation_id', 'r.reference_number'],
+      resNumberQuery,
+      params
+    );
     if (cond) clauses.push(cond);
   }
   if (payload.companyNumber) {

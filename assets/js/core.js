@@ -3415,7 +3415,9 @@
       }
 
       if (reservationNumberQuery && !matchesSearchFields([
-        r.reservationNumber
+        r.reservationNumber,
+        r.sourceReservationId,
+        r.referenceNumber
       ], reservationNumberQuery)) {
         continue;
       }

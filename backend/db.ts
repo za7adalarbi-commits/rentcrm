@@ -4,7 +4,6 @@ import { createRequire } from 'node:module';
 import pg from 'pg';
 import { FIXED_SERVER_CONFIG } from './fixedConfig.js';
 import { SCHEMA_SQL } from './schemaSql.js';
-import { backfillCustomersFromReservations } from './customerHelpers.js';
 
 const require = createRequire(import.meta.url);
 const crmCore = require('./coreBridge.cjs');
@@ -120,6 +119,48 @@ export function getPool(): pg.Pool {
   return cachedPool;
 }
 
+function isSavepointControlSql(text: string): boolean {
+  return /^\s*(SAVEPOINT|RELEASE\s+SAVEPOINT|ROLLBACK\s+TO\s+SAVEPOINT|ROLLBACK|COMMIT)\b/i.test(String(text || ''));
+}
+
+export async function runWithSavepoint<T>(
+  client: DbClient,
+  label: string,
+  fn: () => Promise<T>,
+  fallback?: T
+): Promise<T> {
+  const safeSp = `sp_${String(label || 'step').replace(/[^a-zA-Z0-9_]/g, '_')}`;
+  let hasSavepoint = false;
+  try {
+    await client.query(`SAVEPOINT ${safeSp}`);
+    hasSavepoint = true;
+  } catch (spErr: any) {
+    // 25P01 = SAVEPOINT can only be used in transaction blocks (safe to execute directly).
+    // 25P02 = current transaction is aborted (cannot recover inside this tx).
+    if (String(spErr?.code || '') === '25P02') {
+      if (arguments.length >= 4) return fallback as T;
+      throw spErr;
+    }
+    hasSavepoint = false;
+  }
+
+  try {
+    const out = await fn();
+    if (hasSavepoint) {
+      await client.query(`RELEASE SAVEPOINT ${safeSp}`).catch(() => undefined);
+    }
+    return out;
+  } catch (err) {
+    if (hasSavepoint) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${safeSp}`).catch(() => undefined);
+    }
+    if (arguments.length >= 4) {
+      return fallback as T;
+    }
+    throw err;
+  }
+}
+
 export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
   const pool = poolInstance || getPool();
   return {
@@ -129,28 +170,80 @@ export function createPgExecutor(poolInstance?: pg.Pool): DbExecutor {
     },
     async withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
       const client = await pool.connect();
+      let inTx = false;
+      let txAborted = false;
+      let releaseErr: Error | undefined;
       try {
         await client.query('BEGIN');
+        inTx = true;
         const txClient: DbClient = {
-          query<R extends QueryResultRow = any>(text: string, params?: any[]) {
-            return client.query<R>(text, params).then((r) => ({ rows: r.rows, rowCount: r.rowCount }));
+          async query<R extends QueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<R>> {
+            const control = isSavepointControlSql(text);
+            if (txAborted && !control) {
+              throw new Error('TRANSACTION_ABORTED: لا يمكن تنفيذ استعلام بعد فشل استعلام سابق داخل نفس المعاملة؛ تم إيقاف المعاملة لتنفيذ ROLLBACK.');
+            }
+            try {
+              const res = await client.query<R>(text, params);
+              if (/^\s*ROLLBACK\s+TO\s+SAVEPOINT\b/i.test(String(text || ''))) {
+                txAborted = false;
+              }
+              return { rows: res.rows, rowCount: res.rowCount };
+            } catch (qErr: any) {
+              const isSpAttemptOutsideTx = /^\s*SAVEPOINT\b/i.test(String(text || '')) && String(qErr?.code || '') === '25P01';
+              if (!isSpAttemptOutsideTx && !/^\s*(SAVEPOINT|RELEASE\s+SAVEPOINT)\b/i.test(String(text || ''))) {
+                txAborted = true;
+              }
+              throw qErr;
+            }
           }
         };
         const out = await fn(txClient);
+        if (txAborted) {
+          throw new Error('TRANSACTION_ABORTED: المعاملة في حالة فشل ويجب التراجع عنها (ROLLBACK) بدلاً من الحفظ (COMMIT).');
+        }
         await client.query('COMMIT');
+        inTx = false;
         return out;
       } catch (err) {
-        try {
-          await client.query('ROLLBACK');
-        } catch (_rbErr) {
-          // ignore rollback error
+        if (inTx) {
+          try {
+            await client.query('ROLLBACK');
+          } catch (rbErr: any) {
+            // Destroy connection rather than returning an open/aborted transaction socket to pg.Pool
+            releaseErr = rbErr instanceof Error ? rbErr : new Error(String(rbErr || 'ROLLBACK_FAILED'));
+          } finally {
+            inTx = false;
+          }
         }
         throw err;
       } finally {
-        client.release();
+        client.release(releaseErr);
       }
     }
   };
+}
+
+export function ensureDbExecutor(executor: DbClient | DbExecutor | null | undefined): DbExecutor {
+  if (executor && typeof (executor as DbExecutor).withTransaction === 'function') {
+    return executor as DbExecutor;
+  }
+  if (executor && typeof executor.query === 'function') {
+    // Wrap a plain DbClient without .withTransaction cleanly so callers never crash with "is not a function"
+    if (isDatabaseConfigured()) {
+      const poolExec = createPgExecutor();
+      return {
+        query: executor.query.bind(executor),
+        withTransaction: poolExec.withTransaction.bind(poolExec)
+      };
+    }
+    return {
+      query: executor.query.bind(executor),
+      async withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
+        return fn(executor);
+      }
+    };
+  }
+  return createPgExecutor();
 }
 
 function loadSchemaSql(): string {
@@ -408,122 +501,16 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
     worker_heartbeat_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`,
-  `CREATE TABLE IF NOT EXISTS customers (
+  `CREATE TABLE IF NOT EXISTS schema_migrations (
     id TEXT PRIMARY KEY,
-    customer_key TEXT NOT NULL UNIQUE,
-    full_name TEXT NOT NULL DEFAULT '',
-    phone TEXT NOT NULL DEFAULT '',
-    country_code TEXT NOT NULL DEFAULT '+966',
-    normalized_phone TEXT NOT NULL DEFAULT '',
-    email TEXT NOT NULL DEFAULT '',
-    id_number TEXT NOT NULL DEFAULT '',
-    id_type TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'جديد',
-    status_override BOOLEAN NOT NULL DEFAULT FALSE,
-    assigned_employee_id TEXT NOT NULL DEFAULT '',
-    assigned_employee_name TEXT NOT NULL DEFAULT '',
-    notes TEXT NOT NULL DEFAULT '',
-    tags JSONB NOT NULL DEFAULT '[]'::jsonb,
-    source TEXT NOT NULL DEFAULT 'sync',
-    last_contact_at TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );`,
-  `ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;`,
-  `CREATE TABLE IF NOT EXISTS customer_note_statuses (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
-    color TEXT NOT NULL DEFAULT '#3b82f6',
-    sort_order INTEGER NOT NULL DEFAULT 100,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    is_default BOOLEAN NOT NULL DEFAULT FALSE,
-    allow_agent_select BOOLEAN NOT NULL DEFAULT TRUE,
-    is_closed_status BOOLEAN NOT NULL DEFAULT FALSE,
-    created_by_id TEXT NOT NULL DEFAULT '',
-    created_by_name TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );`,
-  `CREATE TABLE IF NOT EXISTS customer_notes (
-    id TEXT PRIMARY KEY,
-    customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-    reservation_id TEXT DEFAULT NULL REFERENCES reservations(id) ON DELETE SET NULL,
-    reservation_number TEXT NOT NULL DEFAULT '',
-    problem_id TEXT NOT NULL DEFAULT '',
-    problem_number TEXT NOT NULL DEFAULT '',
-    note_type TEXT NOT NULL DEFAULT 'ملاحظة',
-    title TEXT NOT NULL DEFAULT '',
-    content TEXT NOT NULL DEFAULT '',
-    status_id TEXT NOT NULL DEFAULT '',
-    status_name TEXT NOT NULL DEFAULT 'جديدة',
-    status_color TEXT NOT NULL DEFAULT '#3b82f6',
-    assigned_employee_id TEXT NOT NULL DEFAULT '',
-    assigned_employee_name TEXT NOT NULL DEFAULT '',
-    is_internal BOOLEAN NOT NULL DEFAULT FALSE,
-    is_closed BOOLEAN NOT NULL DEFAULT FALSE,
-    closed_at TIMESTAMPTZ DEFAULT NULL,
-    closed_by_id TEXT NOT NULL DEFAULT '',
-    closed_by_name TEXT NOT NULL DEFAULT '',
-    source_section TEXT NOT NULL DEFAULT 'customers',
-    created_by_id TEXT NOT NULL DEFAULT '',
-    created_by_name TEXT NOT NULL DEFAULT '',
-    updated_by_id TEXT NOT NULL DEFAULT '',
-    updated_by_name TEXT NOT NULL DEFAULT '',
-    deleted_at TIMESTAMPTZ DEFAULT NULL,
-    deleted_by_id TEXT NOT NULL DEFAULT '',
-    deleted_by_name TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS problem_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS problem_number TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_name TEXT NOT NULL DEFAULT 'جديدة';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS status_color TEXT NOT NULL DEFAULT '#3b82f6';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS assigned_employee_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS assigned_employee_name TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS is_internal BOOLEAN NOT NULL DEFAULT FALSE;`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS is_closed BOOLEAN NOT NULL DEFAULT FALSE;`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ DEFAULT NULL;`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_by_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS closed_by_name TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS source_section TEXT NOT NULL DEFAULT 'customers';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS updated_by_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS updated_by_name TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_by_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE customer_notes ADD COLUMN IF NOT EXISTS deleted_by_name TEXT NOT NULL DEFAULT '';`,
-  `CREATE TABLE IF NOT EXISTS customer_note_attachments (
-    id TEXT PRIMARY KEY,
-    note_id TEXT NOT NULL REFERENCES customer_notes(id) ON DELETE CASCADE,
-    customer_id TEXT NOT NULL DEFAULT '',
-    file_name TEXT NOT NULL DEFAULT '',
-    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-    file_size INTEGER NOT NULL DEFAULT 0,
-    data_url TEXT NOT NULL DEFAULT '',
-    uploaded_by_id TEXT NOT NULL DEFAULT '',
-    uploaded_by_name TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );`,
-  `CREATE TABLE IF NOT EXISTS customer_note_history (
-    id TEXT PRIMARY KEY,
-    note_id TEXT NOT NULL,
-    customer_id TEXT NOT NULL DEFAULT '',
-    action_type TEXT NOT NULL DEFAULT '',
-    field_name TEXT NOT NULL DEFAULT '',
-    old_value TEXT NOT NULL DEFAULT '',
-    new_value TEXT NOT NULL DEFAULT '',
-    details TEXT NOT NULL DEFAULT '',
-    source_section TEXT NOT NULL DEFAULT 'customers',
-    actor_id TEXT NOT NULL DEFAULT '',
-    actor_name TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    checksum TEXT NOT NULL DEFAULT '',
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`,
   `CREATE TABLE IF NOT EXISTS data_integrity_runs (
     id TEXT PRIMARY KEY,
     trigger_type TEXT NOT NULL DEFAULT 'manual',
+    run_mode TEXT NOT NULL DEFAULT 'manual',
     status TEXT NOT NULL DEFAULT 'completed',
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at TIMESTAMPTZ DEFAULT NULL,
@@ -577,30 +564,12 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
     actor_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`,
+  `ALTER TABLE data_integrity_runs ADD COLUMN IF NOT EXISTS run_mode TEXT NOT NULL DEFAULT 'manual';`,
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE problems ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE problems ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';`,
-  `ALTER TABLE issues ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';`,
-  `ALTER TABLE issues ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'مشكلة';`,
-  `CREATE INDEX IF NOT EXISTS idx_customers_name_trgm ON customers USING GIN (full_name gin_trgm_ops);`,
-  `CREATE INDEX IF NOT EXISTS idx_customers_phone_trgm ON customers USING GIN (phone gin_trgm_ops);`,
-  `CREATE INDEX IF NOT EXISTS idx_customers_norm_phone ON customers (normalized_phone) WHERE normalized_phone <> '';`,
-  `CREATE INDEX IF NOT EXISTS idx_customers_email_lower ON customers (LOWER(email)) WHERE email <> '';`,
-  `CREATE INDEX IF NOT EXISTS idx_customers_id_number ON customers (id_number) WHERE id_number <> '';`,
-  `CREATE INDEX IF NOT EXISTS idx_customers_status_updated ON customers (status, updated_at DESC);`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_notes_cust_created ON customer_notes (customer_id, created_at DESC) WHERE deleted_at IS NULL;`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_notes_res_id ON customer_notes (reservation_id) WHERE reservation_id IS NOT NULL AND deleted_at IS NULL;`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_notes_prb_id ON customer_notes (problem_id) WHERE problem_id <> '' AND deleted_at IS NULL;`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_notes_status ON customer_notes (status_id, status_name) WHERE deleted_at IS NULL;`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_note_att_note ON customer_note_attachments (note_id, created_at DESC);`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_note_hist_note ON customer_note_history (note_id, created_at DESC);`,
-  `CREATE INDEX IF NOT EXISTS idx_customer_note_statuses_order ON customer_note_statuses (sort_order ASC, created_at ASC);`,
+  `ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;`,
   `CREATE INDEX IF NOT EXISTS idx_data_integrity_runs_started ON data_integrity_runs (started_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_status ON data_integrity_issues (resolution_status, discrepancy_type, updated_at DESC);`,
-  `CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);`,
-  `CREATE INDEX IF NOT EXISTS idx_reservations_customer_id_fk ON reservations (customer_id) WHERE customer_id <> '';`,
-  `CREATE INDEX IF NOT EXISTS idx_reservations_customer_email_trgm ON reservations USING GIN (customer_email gin_trgm_ops);`,
-  `CREATE INDEX IF NOT EXISTS idx_problems_customer_id_fk ON problems (customer_id) WHERE customer_id <> '';`
+  `CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);`
 ];
 
 export async function ensureNotificationsSchemaAndIndexes(executor: DbClient): Promise<{
@@ -741,13 +710,100 @@ export async function ensureNotificationsSchemaAndIndexes(executor: DbClient): P
   return { deduplicatedGroups, removedDuplicateRows };
 }
 
+export interface SchemaMigrationDef {
+  id: string;
+  description: string;
+  run: (tx: DbClient) => Promise<void>;
+}
+
+const VERSIONED_SCHEMA_MIGRATIONS: SchemaMigrationDef[] = [
+  {
+    id: '2026_11_27_001_data_integrity_run_mode',
+    description: 'Ensure data_integrity_runs, data_integrity_issues, data_integrity_actions and run_mode column exist with indexes',
+    async run(tx) {
+      await tx.query(`
+        CREATE TABLE IF NOT EXISTS data_integrity_runs (
+          id TEXT PRIMARY KEY,
+          trigger_type TEXT NOT NULL DEFAULT 'manual',
+          run_mode TEXT NOT NULL DEFAULT 'manual',
+          status TEXT NOT NULL DEFAULT 'completed',
+          started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          finished_at TIMESTAMPTZ DEFAULT NULL,
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          rg_total_count INTEGER NOT NULL DEFAULT 0,
+          neon_total_count INTEGER NOT NULL DEFAULT 0,
+          reviewed_count INTEGER NOT NULL DEFAULT 0,
+          discrepancies_count INTEGER NOT NULL DEFAULT 0,
+          summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+          scopes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+          error_message TEXT NOT NULL DEFAULT '',
+          triggered_by_id TEXT NOT NULL DEFAULT '',
+          triggered_by_name TEXT NOT NULL DEFAULT ''
+        );
+      `);
+      await tx.query(`ALTER TABLE data_integrity_runs ADD COLUMN IF NOT EXISTS run_mode TEXT NOT NULL DEFAULT 'manual';`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_data_integrity_runs_started ON data_integrity_runs (started_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_status ON data_integrity_issues (resolution_status, discrepancy_type, updated_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);`);
+    }
+  },
+  {
+    id: '2026_11_27_002_normalize_rg_reservation_numbers',
+    description: 'Restore numeric booking numbers on active reservations whose reservation_number held RG reference strings (e.g. #474)',
+    async run(tx) {
+      await normalizeSwappedRgReservationNumbers(tx);
+    }
+  }
+];
+
+export async function runVersionedMigrations(executor: DbExecutor): Promise<string[]> {
+  const safeExec = ensureDbExecutor(executor);
+  const appliedIds: string[] = [];
+  await runOptionalDdl(
+    safeExec,
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY,
+      description TEXT NOT NULL DEFAULT '',
+      checksum TEXT NOT NULL DEFAULT '',
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  let alreadyApplied = new Set<string>();
+  try {
+    const res = await safeExec.query<{ id: string }>(`SELECT id FROM schema_migrations`);
+    alreadyApplied = new Set((res?.rows || []).map((r) => String(r.id || '')));
+  } catch {
+    return appliedIds;
+  }
+
+  for (const mig of VERSIONED_SCHEMA_MIGRATIONS) {
+    if (alreadyApplied.has(mig.id)) continue;
+    try {
+      await safeExec.withTransaction(async (tx) => {
+        await mig.run(tx);
+        await tx.query(
+          `INSERT INTO schema_migrations (id, description, checksum, applied_at)
+           VALUES ($1, $2, 'v1', NOW())
+           ON CONFLICT (id) DO NOTHING`,
+          [mig.id, mig.description]
+        );
+      });
+      appliedIds.push(mig.id);
+    } catch (err: any) {
+      console.warn(`Migration ${mig.id} deferred:`, String(err?.message || err).slice(0, 200));
+    }
+  }
+  return appliedIds;
+}
+
 export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {
   if (schemaInitialized) return;
   if (schemaInitPromise) return schemaInitPromise;
 
+  const safeExec = ensureDbExecutor(executor);
   schemaInitPromise = (async () => {
     try {
-      const check = await executor.query<{ reg: string | null; all_ok?: boolean }>(
+      const check = await safeExec.query<{ reg: string | null; all_ok?: boolean }>(
         `SELECT
           to_regclass('public.employees') AS reg,
           (
@@ -763,15 +819,16 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
       const exists = Boolean(row && row.reg && row.all_ok !== false);
       if (!exists) {
         const schemaSql = loadSchemaSql();
-        await executor.query(schemaSql);
+        await safeExec.query(schemaSql);
       } else {
-        await ensureUiOverridesColumns(executor);
+        await ensureUiOverridesColumns(safeExec);
         for (const ddl of INCREMENTAL_EXISTING_DB_MIGRATIONS) {
-          await runOptionalDdl(executor, ddl);
+          await runOptionalDdl(safeExec, ddl);
         }
       }
-      await ensureNotificationsSchemaAndIndexes(executor);
-      await runLifecycleAndNationalIdMaintenance(executor);
+      await runVersionedMigrations(safeExec);
+      await ensureNotificationsSchemaAndIndexes(safeExec);
+      await runLifecycleAndNationalIdMaintenance(safeExec);
       schemaInitialized = true;
     } finally {
       schemaInitPromise = null;
@@ -806,6 +863,71 @@ const NEVER_EXCLUDED_LIFECYCLE = new Set([
 const EXPLICIT_ACTIVE_SOURCE_CODES = `('confirmed','completed','finished','finished_by_driver','closed','ended','active','started','in_progress','booked','reserved','delivered','picked_up','received','on_rent','rented','car_received','ongoing','returned','extended','automatically_extended','approved','accepted','admin_approved','paid','wallet_paid','paid_by_wallet','paid_wallet','hold','on_hold','onhold','pending','new','created')`;
 const EXPLICIT_CANCELLED_SOURCE_CODES = `('cancelled','canceled','cancelled_by_customer','canceled_by_customer','cancelled_by_client','canceled_by_client','cancelled_by_user','canceled_by_user','cancelled_by_admin','canceled_by_admin','cancelled_by_provider','canceled_by_provider','cancelled_by_company','canceled_by_company','customer_cancelled','customer_canceled','user_cancelled','user_canceled','client_cancelled','client_canceled','admin_cancelled','admin_canceled','provider_cancelled','provider_canceled','company_cancelled','company_canceled','system_cancelled','system_canceled','auto_cancelled','auto_canceled')`;
 const EXPLICIT_REJECTED_SOURCE_CODES = `('rejected','declined','refused','rejected_by_admin','rejected_by_company','rejected_by_provider','rejected_by_customer','rejected_by_client','rejected_by_user','provider_rejected','company_rejected','admin_rejected','customer_rejected','client_rejected','user_rejected','auto_rejected','system_rejected','declined_by_admin','declined_by_company','declined_by_provider','declined_by_user','declined_by_client','declined_by_customer','refused_by_admin','refused_by_company','refused_by_provider','refused_by_user','refused_by_client','refused_by_customer')`;
+
+export async function normalizeSwappedRgReservationNumbers(client: DbClient): Promise<number> {
+  let repairedCount = 0;
+  try {
+    const candRes = await client.query<{
+      id: string;
+      source_reservation_id: string;
+      reservation_number: string;
+      reference_number: string;
+    }>(
+      `SELECT id, source_reservation_id, reservation_number, reference_number
+       FROM reservations
+       WHERE COALESCE(source_reservation_id, '') <> ''
+         AND reservation_number <> source_reservation_id
+         AND UPPER(TRIM(COALESCE(reservation_number, ''))) LIKE 'RG-%'
+         AND (
+           COALESCE(reference_number, '') = ''
+           OR reference_number = reservation_number
+           OR reference_number = source_reservation_id
+         )`
+    );
+    const candidates = candRes?.rows || [];
+    if (candidates.length === 0) return 0;
+
+    const existingNumsRes = await client.query<{ reservation_number: string }>(`SELECT reservation_number FROM reservations`);
+    const usedNums = new Set((existingNumsRes?.rows || []).map((r) => String(r.reservation_number || '').trim()).filter(Boolean));
+
+    for (const c of candidates) {
+      const oldNum = String(c.reservation_number || '').trim();
+      const targetNum = String(c.source_reservation_id || '').trim();
+      const targetRef = oldNum.toUpperCase().startsWith('RG-') ? oldNum : String(c.reference_number || '').trim();
+      if (!oldNum || !targetNum || oldNum === targetNum || usedNums.has(targetNum)) continue;
+
+      await runWithSavepoint(client, `norm_rg_${targetNum}`, async () => {
+        await client.query(
+          `UPDATE reservations
+           SET reservation_number = $2,
+               reference_number = CASE WHEN COALESCE(reference_number, '') IN ('', $2) AND $3 <> '' THEN $3 ELSE reference_number END,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [c.id, targetNum, targetRef]
+        );
+        const crmChildTables = ['assignments', 'follow_ups', 'follow_up_history', 'problems', 'issues', 'problem_updates', 'customer_notes'];
+        for (const tbl of crmChildTables) {
+          await runWithSavepoint(client, `norm_rg_child_${tbl}_${targetNum}`, async () => {
+            if (tbl === 'problem_updates') {
+              await client.query(`UPDATE problem_updates SET reservation_number = $1 WHERE reservation_number = $2`, [targetNum, oldNum]);
+            } else {
+              await client.query(
+                `UPDATE ${tbl} SET reservation_number = $2 WHERE reservation_id = $1 OR reservation_number = $3`,
+                [c.id, targetNum, oldNum]
+              );
+            }
+          }, undefined);
+        }
+        usedNums.delete(oldNum);
+        usedNums.add(targetNum);
+        repairedCount++;
+      }, undefined);
+    }
+  } catch {
+    // Non-fatal in mock/unit environments
+  }
+  return repairedCount;
+}
 
 export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor): Promise<void> {
   // 1) Remove rejected/cancelled statuses from settings.excluded_statuses if seeded earlier
@@ -1067,8 +1189,10 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
     // Non-fatal
   }
 
-  // 4) Repair historical swapped / duplicated booking vs. reference numbers exclusively on Rejected & Cancelled rows
+  // 4) Repair historical swapped / duplicated booking vs. reference numbers
   try {
+    await normalizeSwappedRgReservationNumbers(executor);
+
     const lifecycleRes = await executor.query<{
       id: string;
       source_reservation_id: string;
@@ -1157,7 +1281,7 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
           // Malformed raw_json: fall back to column-level repair below
           if (effSrcId && curResNum && curRefNum && curResNum === curRefNum && curResNum !== effSrcId) {
             targetResNum = effSrcId;
-            targetRefNum = curRefNum;
+            targetRefNum = curResNum;
           } else if (effSrcId && curRefNum === effSrcId && curResNum && curResNum !== effSrcId) {
             targetResNum = effSrcId;
             targetRefNum = curResNum;
@@ -1168,7 +1292,7 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
       } else {
         if (effSrcId && curResNum && curRefNum && curResNum === curRefNum && curResNum !== effSrcId) {
           targetResNum = effSrcId;
-          targetRefNum = curRefNum;
+          targetRefNum = curResNum;
         } else if (effSrcId && curRefNum === effSrcId && curResNum && curResNum !== effSrcId) {
           targetResNum = effSrcId;
           targetRefNum = curResNum;
@@ -1206,13 +1330,6 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
     }
   } catch {
     // Non-fatal
-  }
-
-  // 5) Backfill unified customers profiles & link reservations/problems cleanly
-  try {
-    await backfillCustomersFromReservations(executor);
-  } catch {
-    // Non-fatal in mock/unit environments
   }
 }
 

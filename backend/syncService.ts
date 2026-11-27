@@ -5,11 +5,30 @@ import {
   normalizeAutoSyncConfig
 } from './autoSyncLogic.js';
 import { invalidateAndBumpVersion } from './cache.js';
-import type { DbClient, DbExecutor } from './db.js';
+import { ensureDbExecutor, runWithSavepoint, type DbClient, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
 import { resolveServerConfig } from './serverConfig.js';
 import { upsertCustomersFromReservationsTx } from './customerHelpers.js';
+
+export function extractSyncReservationNumber(raw: any): string {
+  const srcId = raw && typeof raw === 'object' ? String(crmCore.extractSourceReservationId(raw) || '').trim() : '';
+  const extracted = raw && typeof raw === 'object' ? String(crmCore.extractReservationNumber(raw) || '').trim() : '';
+  if (!raw || typeof raw !== 'object') return extracted || srcId;
+  const hasExplicitBookingCode = Boolean(
+    raw.reservationNumber || raw.reservation_number || raw.reservationNo || raw.reservation_no ||
+    raw.reservationCode || raw.reservation_code || raw.bookingNumber || raw.booking_number ||
+    raw.bookingCode || raw.booking_code || raw.contractNumber || raw.contract_number ||
+    raw.orderNumber || raw.order_number || raw.code || raw.serialNumber || raw.serial_number || raw.number
+  );
+  const explicitRefNum = String(raw.referenceNumber || raw.reference_number || raw.refNumber || raw.ref_number || '').trim();
+  // Active Rental Gate bookings enriched via RCC endpoint carry referenceNumber='RG-...' while reservationNumber is absent;
+  // keep numeric sourceReservationId (e.g. '474') as reservationNumber and 'RG-...' in referenceNumber.
+  if (!hasExplicitBookingCode && srcId && explicitRefNum && extracted === explicitRefNum && /^RG-/i.test(explicitRefNum)) {
+    return srcId;
+  }
+  return extracted || srcId;
+}
 
 export interface SyncActor {
   id: string;
@@ -365,7 +384,7 @@ function normalizeIncomingReservation(
 ): { record: Record<string, any>; followUpHistoryEntry: Record<string, any> | null } {
   const isNormalizedCrmShape = Boolean(raw.reservationNumber && raw.customerName !== undefined && raw.originalStatusCode !== undefined);
   const srcResId = str(crmCore.extractSourceReservationId(raw));
-  const resNumber = str(crmCore.extractReservationNumber(raw) || srcResId);
+  const resNumber = str(extractSyncReservationNumber(raw) || srcResId);
   const resId = existingClient?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${resNumber.replace(/[^A-Za-z0-9_-]/g, '')}`);
 
   const rawCode = str(crmCore.extractReservationStatusCode(raw, true));
@@ -697,8 +716,11 @@ function chunkList<T>(arr: T[], size: number): T[][] {
 async function trySavepoint(tx: DbClient, name: string): Promise<void> {
   try {
     await tx.query(`SAVEPOINT ${name}`);
-  } catch {
-    // Ignore when executor does not support savepoints
+  } catch (err: any) {
+    if (String(err?.code || '') === '25P02') {
+      throw err;
+    }
+    // Ignore 25P01 or mock executors that do not implement savepoints
   }
 }
 
@@ -1046,16 +1068,18 @@ export async function ingestIncrementalSyncBatch(
     ? Array.from(new Set(payload.expectedEligibleSourceIds.map((s) => str(s)).filter(Boolean)))
     : [];
 
+  const safeExec = ensureDbExecutor(executor);
   try {
-    await executor.withTransaction(async (tx) => {
+    await safeExec.withTransaction(async (tx) => {
       const normLookupKey = (val: unknown) => str(val).replace(/^#+/, '').trim();
       const lookupNums = Array.from(new Set([
-        ...incomingRes.map((r) => str(crmCore.extractReservationNumber(r))),
-        ...incomingRes.map((r) => normLookupKey(crmCore.extractReservationNumber(r))),
+        ...incomingRes.map((r) => str(extractSyncReservationNumber(r))),
+        ...incomingRes.map((r) => normLookupKey(extractSyncReservationNumber(r))),
         ...incomingRes.map((r) => {
-          const clean = normLookupKey(crmCore.extractReservationNumber(r));
+          const clean = normLookupKey(extractSyncReservationNumber(r));
           return clean ? `#${clean}` : '';
         }),
+        ...incomingRes.map((r) => str(crmCore.extractReservationNumber(r))),
         ...incomingRes.map((r) => str(crmCore.extractSourceReservationId(r))),
         ...incomingRes.map((r) => normLookupKey(crmCore.extractSourceReservationId(r))),
         ...incomingExt.map((e) => str(e.reservationNumber || e.reservation_number || e.reservationId)),
@@ -1105,7 +1129,7 @@ export async function ingestIncrementalSyncBatch(
       }
 
       const resolveExistingAndTargetNum = (raw: any) => {
-        const extractedNum = str(crmCore.extractReservationNumber(raw));
+        const extractedNum = str(extractSyncReservationNumber(raw));
         const rawSrcId = str(crmCore.extractSourceReservationId(raw));
         const srcId = rawSrcId || extractedNum;
         const cleanSrc = normLookupKey(srcId);
@@ -1170,7 +1194,7 @@ export async function ingestIncrementalSyncBatch(
       // Pre-resolve reservation IDs for incoming reservations before linking extensions
       for (const raw of incomingRes) {
         try {
-          const resNum = str(crmCore.extractReservationNumber(raw));
+          const resNum = str(extractSyncReservationNumber(raw));
           if (!resNum) continue;
           const { existing, targetResNum, srcId } = resolveExistingAndTargetNum(raw);
           const candidateId = existing?.id || (str(raw.id).startsWith('RES_') ? str(raw.id) : `RES_${targetResNum.replace(/[^A-Za-z0-9_-]/g, '')}`);
@@ -1234,7 +1258,7 @@ export async function ingestIncrementalSyncBatch(
         const rawSrcId = str(crmCore.extractSourceReservationId(raw) || raw?.id);
         let rawResNum = '';
         try {
-          rawResNum = str(crmCore.extractReservationNumber(raw));
+          rawResNum = str(extractSyncReservationNumber(raw));
           if (!rawResNum) {
             failedRecords.push({
               identifier: rawSrcId || `row#${seqIdx}`,
@@ -1251,15 +1275,25 @@ export async function ingestIncrementalSyncBatch(
           const targetResNum = resolved.targetResNum;
 
           if (existing && existing.reservationNumber && existing.reservationNumber !== targetResNum && !existingByNumber.has(targetResNum) && !existingByNumber.has(normLookupKey(targetResNum))) {
-            await tx.query(
-              `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
-              [existing.id, targetResNum]
-            ).catch(() => undefined);
-            existingByNumber.delete(existing.reservationNumber);
-            existingByNumber.delete(normLookupKey(existing.reservationNumber));
-            existing.reservationNumber = targetResNum;
-            existingByNumber.set(targetResNum, existing);
-            existingByNumber.set(normLookupKey(targetResNum), existing);
+            const renamed = await runWithSavepoint(
+              tx,
+              `pre_rename_${seqIdx}`,
+              async () => {
+                await tx.query(
+                  `UPDATE reservations SET reservation_number = $2 WHERE id = $1`,
+                  [existing.id, targetResNum]
+                );
+                return true;
+              },
+              false
+            );
+            if (renamed) {
+              existingByNumber.delete(existing.reservationNumber);
+              existingByNumber.delete(normLookupKey(existing.reservationNumber));
+              existing.reservationNumber = targetResNum;
+              existingByNumber.set(targetResNum, existing);
+              existingByNumber.set(normLookupKey(targetResNum), existing);
+            }
           }
           const seenExtNums = new Set<string>();
           const relExts: any[] = [];
@@ -1512,18 +1546,25 @@ export async function ingestIncrementalSyncBatch(
       if (reservationBatch.length > 0) {
         const batchResIds = reservationBatch.map((r) => r.id).filter(Boolean);
         if (batchResIds.length > 0) {
-          await tx.query(
-            `UPDATE extensions e
-             SET reservation_id = r.id
-             FROM reservations r
-             WHERE e.reservation_id IS NULL
-               AND r.id = ANY($1::text[])
-               AND (
-                 (e.reservation_number <> '' AND e.reservation_number = r.reservation_number)
-                 OR (e.source_reservation_id <> '' AND e.source_reservation_id = r.source_reservation_id)
-               )`,
-            [batchResIds]
-          ).catch(() => undefined);
+          await runWithSavepoint(
+            tx,
+            'ext_orphan_backfill',
+            async () => {
+              await tx.query(
+                `UPDATE extensions e
+                 SET reservation_id = r.id
+                 FROM reservations r
+                 WHERE e.reservation_id IS NULL
+                   AND r.id = ANY($1::text[])
+                   AND (
+                     (e.reservation_number <> '' AND e.reservation_number = r.reservation_number)
+                     OR (e.source_reservation_id <> '' AND e.source_reservation_id = r.source_reservation_id)
+                   )`,
+                [batchResIds]
+              );
+            },
+            undefined
+          );
         }
       }
 
@@ -1628,7 +1669,12 @@ export async function ingestIncrementalSyncBatch(
         }
       }
 
-      const dbCountRes = await tx.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM reservations`).catch(() => ({ rows: [{ cnt: verifiedNums.size }] }));
+      const dbCountRes = await runWithSavepoint(
+        tx,
+        'res_total_count',
+        () => tx.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM reservations`),
+        { rows: [{ cnt: verifiedNums.size }], rowCount: 1 }
+      );
       dbTotalReservations = num(dbCountRes.rows?.[0]?.cnt, verifiedNums.size);
 
       const missingSet = new Set<string>();
@@ -2035,13 +2081,13 @@ export async function ingestIncrementalSyncBatch(
     };
   } catch (err: any) {
     const finishedAt = new Date().toISOString();
-    await logBackendError(executor, 'syncService', 'ingestIncrementalSyncBatch', err, {
+    await logBackendError(safeExec, 'syncService', 'ingestIncrementalSyncBatch', err, {
       sourceName,
       reservationsCount: incomingRes.length,
       extensionsCount: incomingExt.length
     });
     try {
-      await executor.query(
+      await safeExec.query(
         `INSERT INTO sync_log (
            id, triggered_by_id, triggered_by_name, status, imported_count, updated_count,
            extensions_count, pages_fetched, error_message, duration_ms, started_at, finished_at
@@ -2052,7 +2098,7 @@ export async function ingestIncrementalSyncBatch(
           Date.now() - startMs, startedAt, finishedAt
         ]
       );
-      await executor.query(
+      await safeExec.query(
         `INSERT INTO sync_checkpoints (source, last_sync_at, last_status, last_error, updated_at)
          VALUES ($1,$2::timestamptz,'error',$3,$2::timestamptz)
          ON CONFLICT (source) DO UPDATE SET
@@ -2076,16 +2122,19 @@ export async function enqueueSheetsMirror(
   action: string,
   payload: Record<string, any>
 ): Promise<void> {
-  try {
-    await client.query(
-      `INSERT INTO sheets_mirror_outbox (
-         id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, created_at
-       ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), NOW())`,
-      [generateId('MIR'), entityType, entityId, action, JSON.stringify(payload || {})]
-    );
-  } catch {
-    // Non-blocking mirror enqueue
-  }
+  await runWithSavepoint(
+    client,
+    'enqueue_sheets_mirror',
+    async () => {
+      await client.query(
+        `INSERT INTO sheets_mirror_outbox (
+           id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, created_at
+         ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), NOW())`,
+        [generateId('MIR'), entityType, entityId, action, JSON.stringify(payload || {})]
+      );
+    },
+    undefined
+  );
 }
 
 export async function flushSheetsMirrorOutbox(
@@ -3301,7 +3350,7 @@ export async function pullFromRentalGateDirect(
     }));
     const existingCheckNums = dedupedAllRes
       .filter((item: any) => !item.isSourceCancelled && !item.isSourceRejected && excludedSet.has(crmCore.extractReservationStatusCode(item, false)))
-      .map((item: any) => str(crmCore.extractReservationNumber(item)))
+      .map((item: any) => str(extractSyncReservationNumber(item)))
       .filter(Boolean);
     let existingNumsSet = new Set<string>();
     if (existingCheckNums.length > 0) {
@@ -3316,7 +3365,7 @@ export async function pullFromRentalGateDirect(
       if (item.isSourceCancelled || item.isSourceRejected) return true;
       const code = crmCore.extractReservationStatusCode(item, false);
       if (!excludedSet.has(code)) return true;
-      const numKey = str(crmCore.extractReservationNumber(item));
+      const numKey = str(extractSyncReservationNumber(item));
       if (existingNumsSet.has(numKey)) return true;
       const exId = str(crmCore.extractSourceReservationId(item) || numKey);
       if (exId) excludedSourceIds.push(exId);
