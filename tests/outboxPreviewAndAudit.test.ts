@@ -399,16 +399,17 @@ test('getOutboxCleanupPreview and getSheetsSyncControlStatus enforce developer R
   }
 });
 
-test('static schema timestamp audit explicitly documents customer_notes.closed_at TIMESTAMPTZ vs ::text root cause', () => {
+test('static schema timestamp audit verifies customer_notes.closed_at uses TIMESTAMPTZ ($17::timestamptz)', () => {
   const findings = getStaticSchemaTimestampAuditFindings();
   const closedAtFinding = findings.find((f) => f.id === 'TS_AUDIT_CUSTOMER_NOTES_CLOSED_AT');
   assert.ok(closedAtFinding);
-  assert.equal(closedAtFinding.severity, 'critical');
+  assert.equal(closedAtFinding.severity, 'info');
   assert.equal(closedAtFinding.tableName, 'customer_notes');
   assert.equal(closedAtFinding.columnName, 'closed_at');
 
   const queriesTs = fs.readFileSync(path.join(process.cwd(), 'backend', 'queries.ts'), 'utf8');
-  assert.match(queriesTs, /closed_at[\s\S]{0,600}\$17::text/, 'Expected audited Phase 1 bug evidence at backend/queries.ts addCustomerNote');
+  assert.match(queriesTs, /closed_at[\s\S]{0,600}\$17::timestamptz/, 'Expected fixed addCustomerNote INSERT to cast $17::timestamptz');
+  assert.doesNotMatch(queriesTs, /closed_at[\s\S]{0,600}\$17::text/, 'addCustomerNote INSERT must not cast closed_at as ::text');
 
   const schemaSql = fs.readFileSync(path.join(process.cwd(), 'database', 'schema.sql'), 'utf8');
   assert.match(schemaSql, /closed_at\s+TIMESTAMPTZ\s+DEFAULT\s+NULL/i);

@@ -263,7 +263,17 @@ function createKbMockExecutor(store?: KbMemStore): { executor: DbExecutor; store
       return { rows: [], rowCount: 1 } as unknown as QueryResult<T>;
     }
     if (clean.startsWith('INSERT INTO activity_log')) {
-      db.activities.push({ id: params[0], employeeId: params[1], actionType: params[3], entityType: params[4], entityId: params[5] });
+      assert.ok(clean.includes('user_id') && clean.includes('user_name') && clean.includes('user_role'), `activity_log INSERT must use real schema columns: ${clean}`);
+      assert.equal(clean.includes('employee_id'), false, 'activity_log has no employee_id column');
+      db.activities.push({
+        id: params[0],
+        userId: params[1],
+        userName: params[2],
+        userRole: params[3],
+        actionType: params[4],
+        entityType: params[5],
+        entityId: params[6]
+      });
       return { rows: [], rowCount: 1 } as unknown as QueryResult<T>;
     }
 

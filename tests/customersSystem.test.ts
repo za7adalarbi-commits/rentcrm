@@ -580,3 +580,160 @@ test('backend dispatchCrmRequest enforces granular RBAC on customer & follow-up/
   assert.equal(noteAdded.success, true);
   assert.equal(noteAdded.data.note.noteType, 'مكالمة');
 });
+
+test('customer_notes.closed_at normalization & SQL parameter types strictly enforce TIMESTAMPTZ / real NULL', async () => {
+  const { normalizeOptionalTimestamptz, addCustomerNote, updateCustomerNote } = await import('../backend/queries.js');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  assert.equal(normalizeOptionalTimestamptz(null), null);
+  assert.equal(normalizeOptionalTimestamptz(undefined), null);
+  assert.equal(normalizeOptionalTimestamptz(''), null);
+  assert.equal(normalizeOptionalTimestamptz('   '), null);
+  assert.equal(normalizeOptionalTimestamptz('null'), null);
+  assert.equal(normalizeOptionalTimestamptz('NULL'), null);
+  assert.equal(normalizeOptionalTimestamptz('undefined'), null);
+  const dt = new Date('2026-11-27T12:30:00.000Z');
+  assert.equal(normalizeOptionalTimestamptz(dt), '2026-11-27T12:30:00.000Z');
+  assert.equal(normalizeOptionalTimestamptz('2026-11-27T15:30:00+03:00'), '2026-11-27T12:30:00.000Z');
+  assert.throws(() => normalizeOptionalTimestamptz('not-a-valid-date'), /VALIDATION_ERROR/);
+
+  const capturedQueries: Array<{ sql: string; params: any[] }> = [];
+  const notesRows: Record<string, any> = {};
+  const statusRows = [
+    {
+      id: 'CNST_NEW',
+      name: 'جديدة',
+      description: 'جديدة',
+      color: '#3B82F6',
+      sort_order: 1,
+      is_active: true,
+      is_default: true,
+      allow_agent_select: true,
+      is_closed_status: false
+    },
+    {
+      id: 'CNST_CLOSED',
+      name: 'مغلقة',
+      description: 'مغلقة',
+      color: '#10B981',
+      sort_order: 2,
+      is_active: true,
+      is_default: false,
+      allow_agent_select: true,
+      is_closed_status: true
+    }
+  ];
+
+  const mockDb: any = {
+    async query(sql: string, params: any[] = []) {
+      const clean = sql.replace(/\s+/g, ' ').trim();
+      capturedQueries.push({ sql: clean, params });
+      if (clean.includes('FROM settings')) return { rows: [], rowCount: 0 };
+      if (clean.includes('SELECT COUNT(*)::text AS cnt FROM customer_note_statuses')) return { rows: [{ cnt: '2' }], rowCount: 1 };
+      if (clean.includes('FROM customer_note_statuses')) return { rows: statusRows, rowCount: statusRows.length };
+      if (clean.includes('FROM customers WHERE id = $1')) return { rows: [{ id: 'CUS_1', full_name: 'عميل تجريبي' }], rowCount: 1 };
+      if (clean.startsWith('INSERT INTO customer_notes')) {
+        assert.match(clean, /\$17::timestamptz/, 'addCustomerNote INSERT must cast closed_at ($17) as ::timestamptz');
+        assert.doesNotMatch(clean, /\$17::text/, 'addCustomerNote INSERT must never cast closed_at ($17) as ::text');
+        const row = {
+          id: params[0],
+          customer_id: params[1],
+          reservation_id: params[2],
+          reservation_number: params[3],
+          problem_id: params[4],
+          problem_number: params[5],
+          title: params[6],
+          note_type: params[7],
+          content: params[8],
+          status_id: params[9],
+          status_name: params[10],
+          status_color: params[11],
+          assigned_employee_id: params[12],
+          assigned_employee_name: params[13],
+          is_internal: params[14],
+          is_closed: params[15],
+          closed_at: params[16],
+          closed_by_id: params[17],
+          closed_by_name: params[18],
+          source_section: params[19],
+          created_by_id: params[20],
+          created_by_name: params[21],
+          updated_by_id: params[20],
+          updated_by_name: params[21],
+          created_at: params[22],
+          updated_at: params[22]
+        };
+        notesRows[row.id] = row;
+        return { rows: [row], rowCount: 1 };
+      }
+      if (clean.startsWith('SELECT * FROM customer_notes WHERE id = $1')) {
+        const hit = notesRows[params[0]];
+        return hit ? { rows: [hit], rowCount: 1 } : { rows: [], rowCount: 0 };
+      }
+      if (clean.startsWith('UPDATE customer_notes SET title = $2')) {
+        assert.match(clean, /closed_at = CASE[\s\S]*\$13::timestamptz/, 'updateCustomerNote must cast closed_at as ::timestamptz');
+        const hit = notesRows[params[0]];
+        if (hit) {
+          hit.title = params[1];
+          hit.note_type = params[2];
+          hit.content = params[3];
+          hit.status_id = params[4];
+          hit.status_name = params[5];
+          hit.status_color = params[6];
+          hit.is_internal = params[7];
+          hit.is_closed = params[8];
+          hit.closed_at = params[8] ? (params[12] || hit.closed_at || params[11]) : null;
+          hit.closed_by_id = params[8] ? (hit.closed_by_id || params[9]) : '';
+          hit.closed_by_name = params[8] ? (hit.closed_by_name || params[10]) : '';
+          hit.updated_by_id = params[9];
+          hit.updated_by_name = params[10];
+          hit.updated_at = params[11];
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    async withTransaction(fn: (tx: any) => Promise<any>) {
+      return fn(mockDb);
+    }
+  };
+
+  const session: any = {
+    token: 'tok-1',
+    user: { id: 'EMP_ADM', name: 'مشرف النظام', role: 'general_manager', permissions: core.ROLE_PERMISSION_MATRIX.general_manager.slice() }
+  };
+
+  // 1) Open note -> closed_at param ($17, index 16) is real null
+  const openRes = await addCustomerNote(mockDb, session, {
+    customerId: 'CUS_1',
+    title: 'ملاحظة مفتوحة',
+    content: 'متابعة حجز العميل',
+    noteType: 'ملاحظة',
+    statusId: 'CNST_NEW',
+    closedAt: 'null',
+    isInternal: true
+  });
+  const openInsert = capturedQueries.find((q) => q.sql.startsWith('INSERT INTO customer_notes'));
+  assert.ok(openInsert);
+  assert.equal(openInsert.params[16], null);
+  assert.equal(openRes.note.isClosed, false);
+  assert.equal(openRes.note.closedAt, '');
+  assert.equal(openRes.note.isInternal, true);
+
+  // 2) Update note to Closed -> closed_at gets valid ISO timestamp & closed_by_* populated
+  const updClosed = await updateCustomerNote(mockDb, session, {
+    noteId: openRes.note.id,
+    statusId: 'CNST_CLOSED',
+    content: 'تم إغلاق المتابعة بنجاح'
+  });
+  assert.equal(updClosed.note.isClosed, true);
+  assert.ok(updClosed.note.closedAt && !Number.isNaN(Date.parse(updClosed.note.closedAt)));
+  assert.equal(updClosed.note.closedById, 'EMP_ADM');
+
+  // 3) Check frontend knowledgeBase.js uses RGApi.callApi and zero RGApi.call(
+  const kbJs = fs.readFileSync(path.join(process.cwd(), 'assets', 'js', 'knowledgeBase.js'), 'utf8');
+  assert.equal(/\bRGApi\.call\s*\(/.test(kbJs), false, 'knowledgeBase.js must never call nonexistent RGApi.call(');
+  assert.match(kbJs, /\bRGApi\.callApi\s*\(/, 'knowledgeBase.js must invoke RGApi.callApi(');
+});
+
