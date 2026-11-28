@@ -189,8 +189,9 @@
   }
 
   function toast(ctx, msg, type) {
-    if (ctx && typeof ctx.toast === 'function') ctx.toast(msg, type || 'info');
-    else if (root.RGApp && typeof root.RGApp.toast === 'function') root.RGApp.toast(msg, type || 'info');
+    var isErr = type === true || type === 'error' || type === 'warning';
+    if (ctx && typeof ctx.toast === 'function') ctx.toast(msg, isErr);
+    else if (root.RGApp && typeof root.RGApp.toast === 'function') root.RGApp.toast(msg, isErr);
   }
 
   function openModal(opts) {
@@ -221,8 +222,10 @@
   }
 
   async function callApi(action, payload) {
-    var token = root.RGAuth && root.RGAuth.getToken ? root.RGAuth.getToken() : '';
-    var res = await root.RGApi.call(action, token, payload || {});
+    if (!root.RGApi || typeof root.RGApi.callApi !== 'function') {
+      throw new Error('عميل الاتصال بمركز المعرفة (RGApi) غير محمل بشكل صحيح.');
+    }
+    var res = await root.RGApi.callApi(action, payload || {});
     if (!res || !res.success) {
       throw new Error((res && res.message) || 'تعذر تنفيذ الطلب.');
     }
@@ -984,6 +987,7 @@
                             '<span>' + (en ? 'Copy Text' : 'نسخ النص') + '</span></button>' +
                           '<div class="rg-kb-row-actions">' +
                             (canEdit ? '<button type="button" class="btn btn-xs btn-ghost" data-kb-edit-policy="' + esc(p.id) + '">' + (en ? 'Edit' : 'تعديل') + '</button>' : '') +
+                            (canEdit && canPerm(ctx, 'kb_publish_content') && p.publishStatus !== 'archived' ? '<button type="button" class="btn btn-xs btn-ghost" data-kb-archive-policy="' + esc(p.id) + '">' + (en ? 'Archive' : 'أرشفة') + '</button>' : '') +
                             (canDel ? '<button type="button" class="btn btn-xs btn-danger-ghost" data-kb-delete-policy="' + esc(p.id) + '">' + (en ? 'Delete' : 'حذف') + '</button>' : '') +
                           '</div>' +
                         '</div>' +
@@ -1312,7 +1316,7 @@
               companies.map(function (c) { return '<option value="' + esc(c.id) + '"' + (targetCompId === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>'; }).join('') +
             '</select></label>' +
           '<label class="rg-kb-field"><span>' + (en ? 'Branch Name *' : 'اسم الفرع *') + '</span><input type="text" id="kb-br-name" class="input" required value="' + esc(b.branchName || '') + '" /></label>' +
-          '<label class="rg-kb-field"><span>' + (en ? 'City *' : 'المدينة *') + '</span><input type="text" id="kb-br-city" class="input" required value="' + esc(b.city || '') + '" /></label>' +
+          '<label class="rg-kb-field"><span>' + (en ? 'City *' : 'المدينة *') + '</span><input type="text" id="kb-br-m-city" class="input" required value="' + esc(b.city || '') + '" /></label>' +
           '<label class="rg-kb-field"><span>' + (en ? 'District' : 'الحي') + '</span><input type="text" id="kb-br-district" class="input" value="' + esc(b.district || '') + '" /></label>' +
           '<label class="rg-kb-field"><span>' + (en ? 'Phone' : 'رقم التواصل') + '</span><input type="text" id="kb-br-phone" class="input" value="' + esc(b.phone || '') + '" /></label>' +
           '<label class="rg-kb-field"><span>' + (en ? 'Working Hours' : 'مواعيد العمل') + '</span><input type="text" id="kb-br-hours" class="input" placeholder="السبت - الخميس 8 ص - 11 م" value="' + esc(b.workingHours || '') + '" /></label>' +
@@ -1348,9 +1352,9 @@
         try {
           await callApi('saveKbBranch', {
             id: b.id || '',
-            companyId: document.getElementById('kb-br-cmp').value,
-            branchName: document.getElementById('kb-br-name').value,
-            city: document.getElementById('kb-br-city').value,
+            companyId: (form.querySelector('#kb-br-cmp') || {}).value || '',
+            branchName: (form.querySelector('#kb-br-name') || {}).value || '',
+            city: (form.querySelector('#kb-br-m-city') || {}).value || '',
             district: document.getElementById('kb-br-district').value,
             fullAddress: document.getElementById('kb-br-addr').value,
             googleMapsUrl: document.getElementById('kb-br-maps').value,
@@ -1907,7 +1911,10 @@
         var nextTab = btn.getAttribute('data-kb-tab');
         if (!nextTab) return;
         kbState.tab = nextTab;
-        if (nextTab !== 'companies') kbState.selectedCompanyId = '';
+        if (nextTab !== 'companies') {
+          kbState.selectedCompanyId = '';
+          kbState.selectedCompanyDetail = null;
+        }
         kbState.highlightEntityId = '';
         await render(slot, ctx);
       });
@@ -2065,8 +2072,13 @@
     slot.querySelectorAll('[data-kb-edit-branch]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var bid = btn.getAttribute('data-kb-edit-branch');
-        var list = (kbState.selectedCompanyDetail && kbState.selectedCompanyDetail.branches) || kbState.branches.items || [];
-        var found = list.find(function (x) { return x.id === bid; });
+        var primaryList = (kbState.tab === 'companies' && kbState.selectedCompanyDetail && Array.isArray(kbState.selectedCompanyDetail.branches))
+          ? kbState.selectedCompanyDetail.branches
+          : (kbState.branches.items || []);
+        var fallbackList = (kbState.tab === 'companies')
+          ? (kbState.branches.items || [])
+          : ((kbState.selectedCompanyDetail && kbState.selectedCompanyDetail.branches) || []);
+        var found = primaryList.find(function (x) { return x.id === bid; }) || fallbackList.find(function (x) { return x.id === bid; });
         openBranchModal(found, '', ctx);
       });
     });
@@ -2119,6 +2131,34 @@
         var pid = btn.getAttribute('data-kb-edit-policy');
         var found = (kbState.policies.items || []).find(function (x) { return x.id === pid; });
         openPolicyModal(found, ctx);
+      });
+    });
+    slot.querySelectorAll('[data-kb-archive-policy]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        var pid = btn.getAttribute('data-kb-archive-policy');
+        var found = (kbState.policies.items || []).find(function (x) { return x.id === pid; });
+        if (!found) return;
+        btn.disabled = true;
+        try {
+          await callApi('saveKbPolicy', {
+            id: found.id,
+            title: found.title,
+            category: found.category,
+            sectionKey: found.sectionKey,
+            companyId: found.companyId || '',
+            city: found.city || '',
+            keywords: found.keywords || [],
+            publishStatus: 'archived',
+            descriptionHtml: found.descriptionHtml || found.descriptionText || '',
+            descriptionText: found.descriptionText || '',
+            attachments: found.attachments || []
+          });
+          toast(ctx, en ? 'Policy archived successfully' : 'تمت أرشفة السياسة بنجاح', 'success');
+          await refreshCurrentView(ctx, true);
+        } catch (err) {
+          toast(ctx, err.message, 'error');
+          btn.disabled = false;
+        }
       });
     });
     slot.querySelectorAll('[data-kb-delete-policy]').forEach(function (btn) {

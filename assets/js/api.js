@@ -8916,6 +8916,15 @@
             targetNoteUpd.statusIsActive = Boolean(nextStUpd.isActive);
             targetNoteUpd.statusIsClosed = Boolean(nextStUpd.isClosedStatus);
             targetNoteUpd.isClosed = Boolean(nextStUpd.isClosedStatus);
+            if (nextStUpd.isClosedStatus) {
+              targetNoteUpd.closedAt = targetNoteUpd.closedAt || new Date().toISOString();
+              targetNoteUpd.closedById = targetNoteUpd.closedById || session.employeeId;
+              targetNoteUpd.closedByName = targetNoteUpd.closedByName || session.user.name;
+            } else {
+              targetNoteUpd.closedAt = '';
+              targetNoteUpd.closedById = '';
+              targetNoteUpd.closedByName = '';
+            }
           }
         }
         targetNoteUpd.updatedById = session.employeeId;
@@ -9878,15 +9887,15 @@
             timestampAuditFindings: [
               {
                 id: 'TS_AUDIT_CUSTOMER_NOTES_CLOSED_AT',
-                severity: 'critical',
+                severity: 'info',
                 tableName: 'customer_notes',
                 columnName: 'closed_at',
                 schemaType: 'TIMESTAMPTZ DEFAULT NULL',
-                codeLocation: 'backend/queries.ts:8793 (addCustomerNote INSERT)',
-                issueTitleAr: 'تضارب نوع closed_at عند إضافة ملاحظة عميل ($17::text داخل عمود TIMESTAMPTZ)',
-                detailAr: 'العمود closed_at في جدول customer_notes نوعه TIMESTAMPTZ بينما INSERT في addCustomerNote يمرره كـ $17::text.',
-                recommendedFixAr: 'في المرحلة 3 (بعد الاعتماد): تعديل المعامل إلى $17::timestamptz أسوة بـ updateCustomerNote وchangeCustomerNoteStatus.',
-                statusAr: 'تم التوثيق في المرحلة 1 — بانتظار اعتماد المرحلة 3 للتعديل'
+                codeLocation: 'backend/queries.ts (addCustomerNote INSERT)',
+                issueTitleAr: 'تم إصلاح تضارب نوع closed_at ($17::timestamptz)',
+                detailAr: 'العمود closed_at في جدول customer_notes نوعه TIMESTAMPTZ، ويتم تمريره الآن في addCustomerNote وupdateCustomerNote كـ $::timestamptz أو NULL الحقيقي.',
+                recommendedFixAr: 'لا يلزم تعديل إضافي.',
+                statusAr: 'تم الإصلاح — متطابق مع TIMESTAMPTZ'
               },
               {
                 id: 'TS_AUDIT_TEXT_LEGACY_DATES',

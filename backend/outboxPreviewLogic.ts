@@ -477,17 +477,17 @@ export function getStaticSchemaTimestampAuditFindings(): StaticTimestampAuditFin
   return [
     {
       id: 'TS_AUDIT_CUSTOMER_NOTES_CLOSED_AT',
-      severity: 'critical',
+      severity: 'info',
       tableName: 'customer_notes',
       columnName: 'closed_at',
       schemaType: 'TIMESTAMPTZ DEFAULT NULL',
-      codeLocation: 'backend/queries.ts:8793 (addCustomerNote INSERT)',
-      issueTitleAr: 'تضارب نوع closed_at عند إضافة ملاحظة عميل ($17::text داخل عمود TIMESTAMPTZ)',
+      codeLocation: 'backend/queries.ts (addCustomerNote INSERT)',
+      issueTitleAr: 'تم إصلاح تضارب نوع closed_at عند إضافة ملاحظة عميل ($17::timestamptz)',
       detailAr:
-        'الجدول customer_notes يعرّف العمود closed_at من نوع TIMESTAMPTZ في database/schema.sql:693 وbackend/schemaSql.ts:694، بينما استعلام INSERT في addCustomerNote يمرر المعامل $17::text، مما يسبب رفض PostgreSQL بالخطأ: column "closed_at" is of type timestamp with time zone but expression is of type text.',
+        'الجدول customer_notes يعرّف العمود closed_at من نوع TIMESTAMPTZ في database/schema.sql:693، وقد تم تعديل استعلام INSERT في addCustomerNote ليمرر المعامل كـ $17::timestamptz أو NULL الحقيقي مع دالة normalizeOptionalTimestamptz.',
       recommendedFixAr:
-        'في المرحلة 3 (بعد الاعتماد): تعديل كود الاستعلام إلى $17::timestamptz أسوة بـ updateCustomerNote (سطر 9006) وchangeCustomerNoteStatus (سطر 9104)، مع إبقاء العمود TIMESTAMPTZ في قاعدة البيانات كما هو.',
-      statusAr: 'تم التوثيق في المرحلة 1 — بانتظار اعتماد المرحلة 3 للتعديل'
+        'تم الإصلاح بالكامل مع الإبقاء على نوع العمود TIMESTAMPTZ في PostgreSQL كما هو.',
+      statusAr: 'تم الإصلاح — متطابق مع TIMESTAMPTZ'
     },
     {
       id: 'TS_AUDIT_TEXT_LEGACY_DATES',

@@ -73,6 +73,28 @@ function str(v: unknown, fallback = ''): string {
   return String(v).trim();
 }
 
+export function normalizeOptionalTimestamptz(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) {
+      throw new Error('VALIDATION_ERROR: صيغة التاريخ والوقت غير صالحة.');
+    }
+    return raw.toISOString();
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const lowered = trimmed.toLowerCase();
+    if (lowered === 'null' || lowered === 'undefined') return null;
+    const parsed = new Date(trimmed);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error('VALIDATION_ERROR: صيغة التاريخ والوقت غير صالحة.');
+    }
+    return parsed.toISOString();
+  }
+  throw new Error('VALIDATION_ERROR: صيغة التاريخ والوقت غير صالحة.');
+}
+
 const PG_SEARCH_NORM_FROM = '٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹أإآٱىةـًٌٍَُِّْ';
 const PG_SEARCH_NORM_TO   = '01234567890123456789اااايه';
 
@@ -8525,12 +8547,26 @@ export async function deleteCustomerNoteStatus(
       if (!rep) throw new Error('NOT_FOUND: الحالة البديلة المحددة غير موجودة.');
       migratedToName = str(rep.name);
       const nowIso = new Date().toISOString();
+      const repIsClosed = Boolean(rep.is_closed_status);
       await tx.query(
         `UPDATE customer_notes
          SET status_id = $2, status_name = $3, status_color = $4,
-             is_closed = $5, updated_at = $6::timestamptz
+             is_closed = $5::boolean,
+             closed_at = CASE
+               WHEN $5::boolean THEN COALESCE(closed_at, $6::timestamptz)
+               ELSE NULL::timestamptz
+             END,
+             closed_by_id = CASE
+               WHEN $5::boolean THEN CASE WHEN COALESCE(closed_by_id, '') = '' THEN $8::text ELSE closed_by_id END
+               ELSE ''::text
+             END,
+             closed_by_name = CASE
+               WHEN $5::boolean THEN CASE WHEN COALESCE(closed_by_name, '') = '' THEN $9::text ELSE closed_by_name END
+               ELSE ''::text
+             END,
+             updated_at = $6::timestamptz
          WHERE status_id = $1 OR (COALESCE(status_id, '') = '' AND status_name = $7)`,
-        [id, str(rep.id), str(rep.name), str(rep.color), Boolean(rep.is_closed_status), nowIso, str(cur.name)]
+        [id, str(rep.id), str(rep.name), str(rep.color), repIsClosed, nowIso, str(cur.name), session.user.id, session.user.name]
       );
     }
 
@@ -8781,6 +8817,8 @@ export async function addCustomerNote(
       const riyadhText = `${riyadhParts.date} ${riyadhParts.time}`;
       const stObj = val.status || crmCore.CUSTOMER_NOTE_DEFAULT_STATUSES[0];
       const isClosed = Boolean(stObj.isClosedStatus);
+      const explicitClosedAt = normalizeOptionalTimestamptz(payload.closedAt);
+      const closedAtVal: string | null = isClosed ? (explicitClosedAt || nowIso) : null;
 
       await tx.query(
         `INSERT INTO customer_notes (
@@ -8790,13 +8828,13 @@ export async function addCustomerNote(
            closed_at, closed_by_id, closed_by_name, source_section,
            created_by_id, created_by_name, updated_by_id, updated_by_name, created_at, updated_at
          ) VALUES (
-           $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,$15::boolean,$16::boolean,$17::text,$18::text,$19::text,$20::text,$21::text,$22::text,$21::text,$22::text,$23::timestamptz,$23::timestamptz
+           $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,$15::boolean,$16::boolean,$17::timestamptz,$18::text,$19::text,$20::text,$21::text,$22::text,$21::text,$22::text,$23::timestamptz,$23::timestamptz
          )`,
         [
           id, customerId, reservationId, reservationNumber, problemId, problemNumber,
           val.title, val.noteType, val.content, str(stObj.id), str(stObj.name), str(stObj.color),
           assignedEmployeeId, assignedEmployeeName, val.isInternal, isClosed,
-          isClosed ? nowIso : null, isClosed ? session.user.id : '', isClosed ? session.user.name : '', sourceSection,
+          closedAtVal, isClosed ? session.user.id : '', isClosed ? session.user.name : '', sourceSection,
           session.user.id, session.user.name, nowIso
         ]
       );
@@ -8885,7 +8923,7 @@ export async function addCustomerNote(
           assigned_employee_name: assignedEmployeeName,
           is_internal: val.isInternal,
           is_closed: isClosed,
-          closed_at: isClosed ? nowIso : '',
+          closed_at: closedAtVal || '',
           closed_by_id: isClosed ? session.user.id : '',
           closed_by_name: isClosed ? session.user.name : '',
           source_section: sourceSection,
@@ -8997,16 +9035,28 @@ export async function updateCustomerNote(
     const nowIso = new Date().toISOString();
     const stObj = val.status || { id: existingObj.statusId, name: existingObj.statusName, color: existingObj.statusColor, isClosedStatus: existingObj.isClosed };
     const isClosed = Boolean(stObj.isClosedStatus);
+    const explicitClosedAt = isClosed ? normalizeOptionalTimestamptz(payload.closedAt) : null;
 
     await tx.query(
       `UPDATE customer_notes
        SET title = $2, note_type = $3, content = $4,
            status_id = $5, status_name = $6, status_color = $7,
            is_internal = $8, is_closed = $9::boolean,
-           closed_at = CASE WHEN $9::boolean AND closed_at IS NULL THEN $12::timestamptz ELSE CASE WHEN NOT $9::boolean THEN NULL::timestamptz ELSE closed_at END END,
+           closed_at = CASE
+             WHEN $9::boolean THEN COALESCE($13::timestamptz, closed_at, $12::timestamptz)
+             ELSE NULL::timestamptz
+           END,
+           closed_by_id = CASE
+             WHEN $9::boolean THEN CASE WHEN COALESCE(closed_by_id, '') = '' THEN $10::text ELSE closed_by_id END
+             ELSE ''::text
+           END,
+           closed_by_name = CASE
+             WHEN $9::boolean THEN CASE WHEN COALESCE(closed_by_name, '') = '' THEN $11::text ELSE closed_by_name END
+             ELSE ''::text
+           END,
            updated_by_id = $10, updated_by_name = $11, updated_at = $12::timestamptz
        WHERE id = $1`,
-      [noteId, val.title, val.noteType, val.content, str(stObj.id), str(stObj.name), str(stObj.color), val.isInternal, isClosed, session.user.id, session.user.name, nowIso]
+      [noteId, val.title, val.noteType, val.content, str(stObj.id), str(stObj.name), str(stObj.color), val.isInternal, isClosed, session.user.id, session.user.name, nowIso, explicitClosedAt]
     );
 
     const diffs = crmCore.computeAuditFieldDiffs(

@@ -1,4 +1,4 @@
-import { crmCore, generateId, type AuthSession } from './auth.js';
+import { crmCore, generateId, getRiyadhDateTimeParts, type AuthSession } from './auth.js';
 import type { DbClient, DbExecutor } from './db.js';
 import {
   KB_DYNAMIC_VARIABLES,
@@ -104,10 +104,13 @@ async function logKbAudit(
     afterJson?: Record<string, any> | null;
   }
 ): Promise<void> {
-  const actorId = str(session?.user?.id);
+  const actorId = str(session?.user?.id || 'SYSTEM');
   const actorName = str(session?.user?.name || session?.user?.username || 'System');
+  const actorRole = str(session?.user?.role || 'system');
   const revId = generateId('KBREV');
   const actId = generateId('ACT');
+  const nowDate = new Date();
+  const riyadhNow = getRiyadhDateTimeParts(nowDate);
 
   await db.query(
     `INSERT INTO kb_revisions (id, entity_type, entity_id, action_type, title_snapshot, before_json, after_json, actor_id, actor_name, created_at)
@@ -126,16 +129,20 @@ async function logKbAudit(
   );
 
   await db.query(
-    `INSERT INTO activity_log (id, employee_id, employee_name, action_type, entity_type, entity_id, details, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+    `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, changes, log_date, log_time, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, NOW())`,
     [
       actId,
       actorId,
       actorName,
+      actorRole,
       opts.actionType,
       opts.entityType,
       opts.entityId,
-      opts.details.slice(0, 500)
+      opts.details.slice(0, 500),
+      '[]',
+      riyadhNow.date,
+      riyadhNow.time
     ]
   );
 }

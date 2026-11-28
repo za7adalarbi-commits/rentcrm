@@ -498,11 +498,18 @@
       overlay.querySelectorAll('[data-nh-close]').forEach(function (b) { b.addEventListener('click', close); });
       overlay.addEventListener('click', function (ev) { if (ev.target === overlay) close(); });
 
-      var res = await root.RGApi.callApi('getCustomerNoteHistory', { noteId: note.id });
       var body = overlay.querySelector('#cn-hist-body');
-      if (!body || !overlay.isConnected) return;
-      if (!res || !res.success) {
-        body.innerHTML = '<div class="form-error">' + esc((res && res.message) || 'تعذر تحميل سجل التغييرات.') + '</div>';
+      try {
+        var res = await root.RGApi.callApi('getCustomerNoteHistory', { noteId: note.id });
+        if (!body || !overlay.isConnected) return;
+        if (!res || !res.success) {
+          body.innerHTML = '<div class="form-error">' + esc((res && res.message) || 'تعذر تحميل سجل التغييرات.') + '</div>';
+          return;
+        }
+      } catch (errHist) {
+        if (body && overlay.isConnected) {
+          body.innerHTML = '<div class="form-error">' + esc((errHist && errHist.message) || 'تعذر تحميل سجل التغييرات.') + '</div>';
+        }
         return;
       }
       var list = (res.data && Array.isArray(res.data.items)) ? res.data.items : [];
@@ -651,17 +658,22 @@
       var saveBtn = overlay.querySelector('#na-save');
       saveBtn.addEventListener('click', async function () {
         saveBtn.disabled = true;
-        var empId = (overlay.querySelector('#na-emp') || {}).value || '';
-        var res = await root.RGApi.callApi('assignCustomerNoteEmployee', { noteId: note.id, employeeId: empId, confirmed: true });
-        if (!res || !res.success) {
-          if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر إسناد الملاحظة.', true);
+        try {
+          var empId = (overlay.querySelector('#na-emp') || {}).value || '';
+          var res = await root.RGApi.callApi('assignCustomerNoteEmployee', { noteId: note.id, employeeId: empId, confirmed: true });
+          if (!res || !res.success) {
+            if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر إسناد الملاحظة.', true);
+            saveBtn.disabled = false;
+            return;
+          }
+          close();
+          if (ctx && ctx.toast) ctx.toast('تم تحديث الموظف المكلف بمتابعة الملاحظة.');
+          await reloadNotesFromServer();
+          if (typeof o.onChanged === 'function') o.onChanged();
+        } catch (errAsg) {
+          if (ctx && ctx.toast) ctx.toast((errAsg && errAsg.message) || 'تعذر الاتصال بالخادم أثناء الإسناد.', true);
           saveBtn.disabled = false;
-          return;
         }
-        close();
-        if (ctx && ctx.toast) ctx.toast('تم تحديث الموظف المكلف بمتابعة الملاحظة.');
-        await reloadNotesFromServer();
-        if (typeof o.onChanged === 'function') o.onChanged();
       });
     }
 
@@ -744,31 +756,38 @@
     async function reloadNotesFromServer() {
       panelState.loading = true;
       renderPanel();
-      var res = await root.RGApi.callApi('getCustomerNotes', {
-        customerId: o.customerId || '',
-        reservationId: o.reservationId || '',
-        problemId: o.problemId || '',
-        search: panelState.search,
-        statusId: panelState.statusId,
-        noteType: panelState.noteType,
-        sourceSection: panelState.sourceFilter,
-        assignedEmployeeId: panelState.assignedEmployeeId,
-        dateFrom: panelState.dateFrom,
-        dateTo: panelState.dateTo,
-        sortBy: panelState.sortBy,
-        pageSize: (panelState.config.general && panelState.config.general.pageSize) || 50
-      });
-      panelState.loading = false;
-      if (res && res.success && res.data) {
-        panelState.notes = Array.isArray(res.data.items) ? res.data.items : [];
-        if (Array.isArray(res.data.statuses) && res.data.statuses.length) panelState.statuses = res.data.statuses;
-        if (res.data.config) panelState.config = getCustomerNotesConfigSafe(res.data.config);
-        if (res.data.stats) panelState.stats = res.data.stats;
-        else recomputeStats();
-      } else {
+      try {
+        var res = await root.RGApi.callApi('getCustomerNotes', {
+          customerId: o.customerId || '',
+          reservationId: o.reservationId || '',
+          problemId: o.problemId || '',
+          search: panelState.search,
+          statusId: panelState.statusId,
+          noteType: panelState.noteType,
+          sourceSection: panelState.sourceFilter,
+          assignedEmployeeId: panelState.assignedEmployeeId,
+          dateFrom: panelState.dateFrom,
+          dateTo: panelState.dateTo,
+          sortBy: panelState.sortBy,
+          pageSize: (panelState.config.general && panelState.config.general.pageSize) || 50
+        });
+        if (res && res.success && res.data) {
+          panelState.notes = Array.isArray(res.data.items) ? res.data.items : [];
+          if (Array.isArray(res.data.statuses) && res.data.statuses.length) panelState.statuses = res.data.statuses;
+          if (res.data.config) panelState.config = getCustomerNotesConfigSafe(res.data.config);
+          if (res.data.stats) panelState.stats = res.data.stats;
+          else recomputeStats();
+        } else {
+          if (res && res.message && ctx && ctx.toast) ctx.toast(res.message, true);
+          recomputeStats();
+        }
+      } catch (errLoad) {
+        if (ctx && ctx.toast) ctx.toast((errLoad && errLoad.message) || 'تعذر تحميل ملاحظات العميل.', true);
         recomputeStats();
+      } finally {
+        panelState.loading = false;
+        renderPanel();
       }
-      renderPanel();
     }
 
     function renderPanel() {
@@ -1100,24 +1119,30 @@
           var nextStId = sel.value;
           if (!note || !nextStId || nextStId === note.statusId) return;
           var doStatusChange = async function (confirmed) {
-            var res = await root.RGApi.callApi('changeCustomerNoteStatus', { noteId: nid, statusId: nextStId, confirmed: Boolean(confirmed) });
-            if (!res || !res.success) {
-              if (res && res.error === 'CONFIRM_REQUIRED') {
-                showConfirmModal('تأكيد تغيير الحالة', res.message || 'هل تريد تأكيد تغيير حالة الملاحظة؟', 'تأكيد', false, function () {
-                  doStatusChange(true);
-                });
+            try {
+              var res = await root.RGApi.callApi('changeCustomerNoteStatus', { noteId: nid, statusId: nextStId, confirmed: Boolean(confirmed) });
+              if (!res || !res.success) {
+                if (res && res.error === 'CONFIRM_REQUIRED') {
+                  showConfirmModal('تأكيد تغيير الحالة', res.message || 'هل تريد تأكيد تغيير حالة الملاحظة؟', 'تأكيد', false, function () {
+                    doStatusChange(true);
+                  });
+                  return;
+                }
+                if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر تغيير حالة الملاحظة.', true);
+                sel.value = note.statusId;
+                enhanceSelects(hostEl);
                 return;
               }
-              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر تغيير حالة الملاحظة.', true);
+              if (ctx && ctx.toast && evalBtn('change_status', note).rule.showSuccessNotification !== false) {
+                ctx.toast(res.message || 'تم تحديث حالة الملاحظة.');
+              }
+              await reloadNotesFromServer();
+              if (typeof o.onChanged === 'function') o.onChanged();
+            } catch (errSt) {
+              if (ctx && ctx.toast) ctx.toast((errSt && errSt.message) || 'تعذر تحديث حالة الملاحظة.', true);
               sel.value = note.statusId;
               enhanceSelects(hostEl);
-              return;
             }
-            if (ctx && ctx.toast && evalBtn('change_status', note).rule.showSuccessNotification !== false) {
-              ctx.toast(res.message || 'تم تحديث حالة الملاحظة.');
-            }
-            await reloadNotesFromServer();
-            if (typeof o.onChanged === 'function') o.onChanged();
           };
           var ruleChg = evalBtn('change_status', note, { checkConfirm: true, confirmed: false });
           if (!ruleChg.allowed && ruleChg.reason === 'CONFIRMATION_REQUIRED') {
@@ -1164,22 +1189,26 @@
           var n = panelState.notes.find(function (x) { return x && x.id === nid; });
           if (!n) return;
           var doDelete = async function (confirmed) {
-            var res = await root.RGApi.callApi('deleteCustomerNote', { noteId: nid, confirmed: Boolean(confirmed) });
-            if (!res || !res.success) {
-              if (res && res.error === 'CONFIRM_REQUIRED') {
-                showConfirmModal('تأكيد حذف الملاحظة', res.message || 'هل أنت متأكد من حذف هذه الملاحظة؟', 'نعم، احذف', true, function () {
-                  doDelete(true);
-                });
+            try {
+              var res = await root.RGApi.callApi('deleteCustomerNote', { noteId: nid, confirmed: Boolean(confirmed) });
+              if (!res || !res.success) {
+                if (res && res.error === 'CONFIRM_REQUIRED') {
+                  showConfirmModal('تأكيد حذف الملاحظة', res.message || 'هل أنت متأكد من حذف هذه الملاحظة؟', 'نعم، احذف', true, function () {
+                    doDelete(true);
+                  });
+                  return;
+                }
+                if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف الملاحظة.', true);
                 return;
               }
-              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف الملاحظة.', true);
-              return;
+              if (ctx && ctx.toast && evalBtn('delete_note', n).rule.showSuccessNotification !== false) {
+                ctx.toast('تم حذف الملاحظة بنجاح.');
+              }
+              await reloadNotesFromServer();
+              if (typeof o.onChanged === 'function') o.onChanged();
+            } catch (errDel) {
+              if (ctx && ctx.toast) ctx.toast((errDel && errDel.message) || 'تعذر حذف الملاحظة.', true);
             }
-            if (ctx && ctx.toast && evalBtn('delete_note', n).rule.showSuccessNotification !== false) {
-              ctx.toast('تم حذف الملاحظة بنجاح.');
-            }
-            await reloadNotesFromServer();
-            if (typeof o.onChanged === 'function') o.onChanged();
           };
           var ruleDel = evalBtn('delete_note', n, { checkConfirm: true, confirmed: false });
           if (!ruleDel.allowed && ruleDel.reason === 'CONFIRMATION_REQUIRED') {
@@ -1200,14 +1229,18 @@
           var aid = btn.getAttribute('data-att-id');
           var n = panelState.notes.find(function (x) { return x && x.id === nid; });
           showConfirmModal('حذف مرفق الملاحظة', 'هل تريد حذف هذا المرفق من الملاحظة؟', 'حذف المرفق', true, async function () {
-            var res = await root.RGApi.callApi('deleteCustomerNoteAttachment', { noteId: nid, attachmentId: aid, confirmed: true });
-            if (!res || !res.success) {
-              if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف المرفق.', true);
-              return;
+            try {
+              var res = await root.RGApi.callApi('deleteCustomerNoteAttachment', { noteId: nid, attachmentId: aid, confirmed: true });
+              if (!res || !res.success) {
+                if (ctx && ctx.toast) ctx.toast((res && res.message) || 'تعذر حذف المرفق.', true);
+                return;
+              }
+              if (ctx && ctx.toast) ctx.toast('تم حذف المرفق بنجاح.');
+              await reloadNotesFromServer();
+              if (typeof o.onChanged === 'function') o.onChanged();
+            } catch (errAtt) {
+              if (ctx && ctx.toast) ctx.toast((errAtt && errAtt.message) || 'تعذر حذف المرفق.', true);
             }
-            if (ctx && ctx.toast) ctx.toast('تم حذف المرفق بنجاح.');
-            await reloadNotesFromServer();
-            if (typeof o.onChanged === 'function') o.onChanged();
           });
         });
       });
