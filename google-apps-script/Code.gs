@@ -275,6 +275,9 @@ function handleApiRequest(e, method) {
       case 'syncRentalGate':
         result = syncRentalGate(session, payload);
         break;
+      case 'syncKbCompaniesFromApi':
+        result = syncKbCompaniesFromApi(session, payload);
+        break;
       case 'testConnection':
         result = testRentalGateConnection(session);
         break;

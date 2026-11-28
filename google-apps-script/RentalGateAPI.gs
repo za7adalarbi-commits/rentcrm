@@ -9,6 +9,11 @@ var RG_EXTENDS_API = 'https://api.rentalgate.net/api/reservation-extends/filter'
 var RG_CANCELLED_API = 'https://api.rentalgate.net/api/admin/cancelled-reservations';
 var RG_COMPANY_CHANGES_API = 'https://api.rentalgate.net/api/reservation-company-changes/admin/filter';
 var RG_RESERVATION_DETAIL_BASE = 'https://api.rentalgate.net/api/reservations/';
+var RG_COMPANIES_API = 'https://api.rentalgate.net/api/companies';
+var RG_COMPANIES_ALL_API = 'https://api.rentalgate.net/api/companies/all';
+var RG_COMPANY_CARS_API = 'https://api.rentalgate.net/api/company-cars';
+var RG_COMPANY_CARS_LEGACY_API = 'https://api.rentalgate.net/api/company/cars';
+var RG_COMPANY_CARS_ADMIN_API = 'https://admin.rentalgate.net/api/company/cars';
 
 function normalizeRgTokenGs_(raw) {
   var clean = normalizeStr(raw).replace(/[\r\n]+/g, '');
@@ -308,6 +313,12 @@ function rowPageDedupKey_(row, kind) {
   if (!row || typeof row !== 'object') return '';
   if (kind === 'ext') {
     return normalizeStr(row.extendId || row.extensionNumber || row.extension_number || row.id || row.code);
+  }
+  if (kind === 'company') {
+    return normalizeStr(row.companyId || row.company_id || row.id || row.arabicName || row.name);
+  }
+  if (kind === 'company_car') {
+    return normalizeStr(row.ccId || row.companyCarId || row.company_car_id || row.id);
   }
   var srcId = extractSourceReservationId_(row);
   var resNum = extractReservationNumber_(row).replace(/^#+/, '').trim();
@@ -1631,5 +1642,188 @@ function getSyncStatus(session) {
     autoSyncIntervalMinutes: interval.minutes,
     lastSync: logs.length > 0 ? logs[0] : null,
     logs: logs.slice(0, 20)
+  };
+}
+
+function isAllowedRgExternalHostGs_(rawUrl) {
+  var u = normalizeStr(rawUrl);
+  if (!u) return false;
+  var m = u.match(/^https:\/\/([a-z0-9.-]+)(?::\d+)?(\/|$)/i);
+  if (!m || !m[1]) return false;
+  var host = m[1].toLowerCase();
+  return host === 'api.rentalgate.net' || host === 'admin.rentalgate.net';
+}
+
+function fetchRgListFromCandidatesGs_(candidates, token, kind) {
+  var errors = [];
+  for (var i = 0; i < candidates.length; i++) {
+    var candidateUrl = normalizeStr(candidates[i]);
+    if (!candidateUrl || !isAllowedRgExternalHostGs_(candidateUrl)) continue;
+    try {
+      var tokenCheck = validateRgTokenGs_(token);
+      if (!tokenCheck.valid) {
+        throw new Error('RG_API_HTTP_401: ' + tokenCheck.message);
+      }
+      var probeRes = UrlFetchApp.fetch(candidateUrl, {
+        method: 'get',
+        headers: { Authorization: 'Bearer ' + tokenCheck.token, Accept: 'application/json', lang: 'ar' },
+        muteHttpExceptions: true
+      });
+      var code = probeRes.getResponseCode();
+      var txt = normalizeStr(probeRes.getContentText());
+      if (code === 401 || code === 403) {
+        throw new Error('RG_API_HTTP_' + code + ': توكن Rental Gate مرفوض أو منتهي الصلاحية (' + code + ').');
+      }
+      if (code < 200 || code >= 300) {
+        errors.push(candidateUrl + ' -> HTTP ' + code);
+        continue;
+      }
+      if (!txt || txt.charAt(0) === '<') {
+        errors.push(candidateUrl + ' -> HTML response');
+        continue;
+      }
+      var parsedProbe = safeJsonParse(txt, null);
+      if (!parsedProbe || typeof parsedProbe !== 'object') {
+        errors.push(candidateUrl + ' -> invalid JSON');
+        continue;
+      }
+      if (candidateUrl.indexOf('/companies/all') !== -1 || Array.isArray(parsedProbe)) {
+        var directInfo = extractPagePayload_(parsedProbe, 0, 500);
+        return { rows: directInfo.rows || [], endpointUsed: candidateUrl, warning: '' };
+      }
+      var pulled = fetchAllRentalGatePages(candidateUrl, token, kind);
+      return { rows: pulled.items || [], endpointUsed: candidateUrl, warning: pulled.errorNote || '' };
+    } catch (err) {
+      var msg = String(err && err.message ? err.message : err);
+      if (msg.indexOf('RG_API_HTTP_401') !== -1 || msg.indexOf('RG_API_HTTP_403') !== -1) {
+        throw err;
+      }
+      errors.push(msg);
+    }
+  }
+  return { rows: [], endpointUsed: candidates[0] || '', warning: errors.join(' | ').substring(0, 300) };
+}
+
+function mergeRgCompaniesWithCarsGs_(rawCompanies, rawCars) {
+  var bySrcId = {};
+  var byNorm = {};
+  var out = [];
+
+  function ensureComp(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    var srcId = normalizeStr(obj.companyId || obj.company_id || obj.id);
+    var name = normalizeStr(obj.arabicName || obj.nameAr || obj.companyNameAr || obj.companyArName || obj.name || obj.companyName || obj.englishName);
+    if (!name) return null;
+    var norm = name.toLowerCase().replace(/\s+/g, ' ').trim();
+    var target = (srcId && bySrcId[srcId]) || byNorm[norm];
+    if (!target) {
+      var cities = [];
+      if (Array.isArray(obj.cities)) {
+        for (var ci = 0; ci < obj.cities.length; ci++) {
+          var ct = obj.cities[ci];
+          var cName = typeof ct === 'string' ? normalizeStr(ct) : normalizeStr(ct && (ct.arabicName || ct.name || ct.cityName));
+          if (cName && cities.indexOf(cName) === -1) cities.push(cName);
+        }
+      }
+      var stRaw = normalizeStr(obj.status || (obj.active === false ? 'inactive' : 'active')).toLowerCase();
+      target = {
+        sourceCompanyId: srcId,
+        name: name,
+        logoUrl: normalizeStr(obj.logoUrl || obj.logo || obj.image || ''),
+        shortDescription: normalizeStr(obj.description || obj.shortDescription || obj.englishName || ''),
+        phone: normalizeStr(obj.phone || obj.mobile || obj.contactPhone || ''),
+        email: normalizeStr(obj.email || obj.contactEmail || ''),
+        website: normalizeStr(obj.website || obj.websiteUrl || ''),
+        status: (stRaw === 'inactive' || stRaw === 'disabled') ? 'inactive' : 'active',
+        cities: cities,
+        serviceTypes: [],
+        cars: [],
+        carsCount: 0
+      };
+      if (srcId) bySrcId[srcId] = target;
+      if (norm) byNorm[norm] = target;
+      out.push(target);
+    }
+    return target;
+  }
+
+  for (var i = 0; i < (rawCompanies || []).length; i++) {
+    ensureComp(rawCompanies[i]);
+  }
+  for (var j = 0; j < (rawCars || []).length; j++) {
+    var row = rawCars[j];
+    if (!row || typeof row !== 'object') continue;
+    var comp = row.company && typeof row.company === 'object' ? row.company : null;
+    var cid = normalizeStr((comp && (comp.companyId || comp.id)) || row.companyId || row.company_id);
+    var cName = normalizeStr((comp && (comp.arabicName || comp.name)) || row.companyArName || row.companyName);
+    var target = (cid && bySrcId[cid]) || (cName && byNorm[cName.toLowerCase().replace(/\s+/g, ' ').trim()]) || ensureComp(comp || { id: cid, name: cName });
+    if (!target) continue;
+    var carObj = row.car && typeof row.car === 'object' ? row.car : row;
+    var carName = normalizeStr(row.carNameAr || carObj.carNameAr || carObj.arabicName || carObj.name || row.name);
+    if (!carName) continue;
+    var dailyPrice = (row.dailyPrice !== undefined && row.dailyPrice !== null) ? Number(row.dailyPrice) : ((row.pricePerDay !== undefined && row.pricePerDay !== null) ? Number(row.pricePerDay) : null);
+    target.cars.push({
+      id: normalizeStr(row.ccId || row.companyCarId || row.id || ('CAR_' + (target.cars.length + 1))),
+      carName: carName,
+      carNameEn: normalizeStr(carObj.carNameEn || carObj.englishName || row.carNameEn || ''),
+      brand: normalizeStr((carObj.brand && (carObj.brand.arabicName || carObj.brand.name)) || row.brandName || ''),
+      category: normalizeStr((carObj.category && (carObj.category.arabicName || carObj.category.name)) || row.categoryName || ''),
+      year: normalizeStr(row.modelYear || carObj.modelYear || row.year || ''),
+      dailyPrice: (dailyPrice !== null && !isNaN(dailyPrice)) ? dailyPrice : null,
+      status: row.active === false || row.isAvailable === false ? 'inactive' : 'active',
+      imageUrl: normalizeStr(row.imageUrl || carObj.imageUrl || row.image || '')
+    });
+    target.carsCount = target.cars.length;
+  }
+  return out;
+}
+
+function fetchRentalGateCompaniesAndCars_(token) {
+  var compRes = fetchRgListFromCandidatesGs_([RG_COMPANIES_API, RG_COMPANIES_ALL_API], token, 'company');
+  var carsRes = fetchRgListFromCandidatesGs_([RG_COMPANY_CARS_API, RG_COMPANY_CARS_LEGACY_API, RG_COMPANY_CARS_ADMIN_API], token, 'company_car');
+  var companies = mergeRgCompaniesWithCarsGs_(compRes.rows, carsRes.rows);
+  var totalCars = 0;
+  for (var i = 0; i < companies.length; i++) {
+    totalCars += companies[i].carsCount || 0;
+  }
+  return {
+    companies: companies,
+    sourceCompaniesCount: compRes.rows.length,
+    sourceCarsCount: carsRes.rows.length,
+    totalCompanies: companies.length,
+    totalCars: totalCars,
+    endpointsUsed: {
+      companies: compRes.endpointUsed,
+      companyCars: carsRes.endpointUsed
+    },
+    warnings: [compRes.warning, carsRes.warning].filter(Boolean)
+  };
+}
+
+function syncKbCompaniesFromApi(session, payload) {
+  requirePermission(session, 'kb_manage_companies');
+  var token = getRgToken();
+  var pulled = fetchRentalGateCompaniesAndCars_(token);
+  var props = PropertiesService.getScriptProperties();
+  var cacheKey = 'RG_KB_SYNCED_COMPANIES';
+  var nowStr = nowIso();
+  props.setProperty(cacheKey, JSON.stringify({
+    syncedAt: nowStr,
+    companies: pulled.companies
+  }));
+  logActivity(session.user, 'مزامنة شركات التأجير', 'KbCompany', 'RG_COMPANIES_SYNC',
+    'سحب شركات التأجير والسيارات من Rental Gate API: ' + pulled.totalCompanies + ' شركة، ' + pulled.totalCars + ' سيارة');
+  return {
+    insertedCount: pulled.totalCompanies,
+    updatedCount: 0,
+    totalCompanies: pulled.totalCompanies,
+    totalCars: pulled.totalCars,
+    branchesSyncedCount: 0,
+    sourceCompaniesCount: pulled.sourceCompaniesCount,
+    sourceCarsCount: pulled.sourceCarsCount,
+    endpointsUsed: pulled.endpointsUsed,
+    warnings: pulled.warnings,
+    syncedAt: nowStr,
+    companies: pulled.companies
   };
 }
