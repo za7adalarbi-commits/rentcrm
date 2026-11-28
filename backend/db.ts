@@ -597,6 +597,11 @@ const INCREMENTAL_EXISTING_DB_MIGRATIONS: string[] = [
   `ALTER TABLE data_integrity_runs ADD COLUMN IF NOT EXISTS run_mode TEXT NOT NULL DEFAULT 'manual';`,
   `ALTER TABLE reservations ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';`,
   `ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;`,
+  `ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS source_company_id TEXT NOT NULL DEFAULT '';`,
+  `ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS cars_json JSONB NOT NULL DEFAULT '[]'::jsonb;`,
+  `ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS cars_count INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ DEFAULT NULL;`,
+  `CREATE INDEX IF NOT EXISTS idx_kb_companies_source_id_active ON kb_companies (source_company_id) WHERE deleted_at IS NULL AND source_company_id <> '';`,
   `CREATE INDEX IF NOT EXISTS idx_data_integrity_runs_started ON data_integrity_runs (started_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_status ON data_integrity_issues (resolution_status, discrepancy_type, updated_at DESC);`,
   `CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);`
@@ -1390,6 +1395,24 @@ export const AUDIT_AND_HEALTH_MIGRATIONS: SchemaMigrationDef[] = [
           for (const ddl of ddls) {
             await tx.query(ddl);
           }
+        },
+        undefined
+      );
+    }
+  },
+  {
+    id: '2026_11_28_015_kb_companies_source_cars',
+    description: 'Add source_company_id, cars_json, cars_count, and last_synced_at columns and index on kb_companies',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig015_kb_companies_source_cars',
+        async () => {
+          await tx.query(`ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS source_company_id TEXT NOT NULL DEFAULT ''`);
+          await tx.query(`ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS cars_json JSONB NOT NULL DEFAULT '[]'::jsonb`);
+          await tx.query(`ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS cars_count INTEGER NOT NULL DEFAULT 0`);
+          await tx.query(`ALTER TABLE kb_companies ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ DEFAULT NULL`);
+          await tx.query(`CREATE INDEX IF NOT EXISTS idx_kb_companies_source_id_active ON kb_companies (source_company_id) WHERE deleted_at IS NULL AND source_company_id <> ''`);
         },
         undefined
       );

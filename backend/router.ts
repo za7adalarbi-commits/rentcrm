@@ -472,6 +472,9 @@ export async function dispatchCrmRequest(
       case 'saveKbCompany':
         result = await kbService.saveKbCompany(executor, session, payload);
         break;
+      case 'syncKbCompaniesFromApi':
+        result = await kbService.syncKbCompaniesFromApi(executor, session, payload);
+        break;
       case 'deleteKbCompany':
         result = await kbService.deleteKbCompany(executor, session, payload);
         break;

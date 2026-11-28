@@ -9552,6 +9552,69 @@ html[data-theme="dark"] .rg-hc-banner {
   font-size: 0.78rem;
 }
 
+.rg-kb-cars-section {
+  padding: 15px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.rg-kb-cars-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
+  gap: 10px;
+}
+
+.rg-kb-car-card {
+  padding: 11px 12px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rg-kb-car-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.rg-kb-car-thumb {
+  width: 44px;
+  height: 36px;
+  border-radius: var(--radius-xs);
+  object-fit: cover;
+  border: 1px solid var(--border-hairline);
+  background: #ffffff;
+  flex-shrink: 0;
+}
+
+.rg-kb-car-thumb.is-empty {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  background: var(--bg-surface);
+}
+
+.rg-kb-car-name {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rg-kb-car-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
 .rg-kb-branches-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));

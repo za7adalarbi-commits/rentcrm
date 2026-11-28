@@ -457,3 +457,301 @@ export function scoreKbTextMatch(
   }
   return score;
 }
+
+export interface KbCompanyCar {
+  id: string;
+  carName: string;
+  carNameEn: string;
+  brand: string;
+  category: string;
+  year: string;
+  dailyPrice: number | null;
+  transmission: string;
+  seats: number | null;
+  status: 'active' | 'inactive';
+  imageUrl: string;
+  branches: string[];
+}
+
+export interface NormalizedRgCompany {
+  sourceCompanyId: string;
+  name: string;
+  englishName: string;
+  normalizedName: string;
+  logoUrl: string;
+  shortDescription: string;
+  phone: string;
+  email: string;
+  website: string;
+  status: 'active' | 'inactive';
+  cities: string[];
+  serviceTypes: string[];
+  cars: KbCompanyCar[];
+  carsCount: number;
+  branches: Array<{
+    branchName: string;
+    city: string;
+    district: string;
+    fullAddress: string;
+    phone: string;
+    workingHours: string;
+    googleMapsUrl: string;
+    status: 'active' | 'inactive';
+    services: string[];
+  }>;
+}
+
+function cleanTxt(v: unknown): string {
+  if (v === null || v === undefined) return '';
+  return String(v).trim();
+}
+
+function parseFiniteNum(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : null;
+}
+
+export function normalizeCompanyCarsList(raw: unknown): KbCompanyCar[] {
+  let list: any[] = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === 'string' && raw.trim().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {
+      list = [];
+    }
+  }
+  const out: KbCompanyCar[] = [];
+  const seen = new Set<string>();
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const carObj = item.car && typeof item.car === 'object' ? item.car : item;
+    const brandObj = carObj.brand && typeof carObj.brand === 'object' ? carObj.brand : (item.brand && typeof item.brand === 'object' ? item.brand : null);
+    const catObj = carObj.category && typeof carObj.category === 'object' ? carObj.category : (item.category && typeof item.category === 'object' ? item.category : null);
+
+    const id = cleanTxt(item.ccId || item.companyCarId || item.company_car_id || item.id || carObj.carId || carObj.id);
+    const carName = cleanTxt(
+      item.carName || item.carNameAr || item.car_name_ar ||
+      carObj.carNameAr || carObj.arabicName || carObj.nameAr || carObj.name ||
+      item.arabicName || item.name || carObj.modelName || item.model
+    );
+    const carNameEn = cleanTxt(
+      item.carNameEn || item.car_name_en ||
+      carObj.carNameEn || carObj.englishName || carObj.nameEn || item.englishName || ''
+    );
+    const displayName = carName || carNameEn;
+    if (!displayName) continue;
+
+    const brand = cleanTxt(
+      item.brandNameAr || item.brandName || (typeof item.brand === 'string' ? item.brand : '') ||
+      (brandObj && (brandObj.arabicName || brandObj.nameAr || brandObj.name || brandObj.englishName)) ||
+      carObj.brandNameAr || carObj.brandName || carObj.make
+    );
+    const category = cleanTxt(
+      item.categoryNameAr || item.categoryName || (typeof item.category === 'string' ? item.category : '') ||
+      (catObj && (catObj.arabicName || catObj.nameAr || catObj.name || catObj.englishName)) ||
+      carObj.categoryNameAr || carObj.categoryName || item.carType
+    );
+    const year = cleanTxt(item.modelYear || item.year || carObj.modelYear || carObj.year || '');
+    const dailyPrice = parseFiniteNum(
+      item.dailyPrice ?? item.daily_price ?? item.pricePerDay ?? item.price_per_day ?? item.dailyRate ?? item.price ?? carObj.dailyPrice
+    );
+    const transmission = cleanTxt(item.transmission || item.gearType || carObj.transmission || carObj.gearType || '');
+    const rawSeats = parseFiniteNum(item.seats ?? item.seatsCount ?? item.passengerCount ?? carObj.seats ?? carObj.seatsCount);
+    const seats = rawSeats !== null && rawSeats > 0 ? Math.round(rawSeats) : null;
+    const rawStatus = cleanTxt(item.status || (item.active === false || item.isAvailable === false || item.available === false ? 'inactive' : 'active')).toLowerCase();
+    const status: 'active' | 'inactive' = (rawStatus === 'inactive' || rawStatus === 'disabled' || rawStatus === 'suspended' || rawStatus === 'unavailable') ? 'inactive' : 'active';
+    const imageUrl = sanitizeUrl(item.imageUrl || item.image || item.photoUrl || carObj.imageUrl || carObj.image || carObj.photo || '', true);
+
+    const branchListRaw = Array.isArray(item.branches)
+      ? item.branches
+      : (Array.isArray(item.companyCarBranches) ? item.companyCarBranches : []);
+    const branches = normalizeStringList(
+      branchListRaw.map((b: any) => {
+        if (typeof b === 'string') return b;
+        if (!b || typeof b !== 'object') return '';
+        const inner = b.branch && typeof b.branch === 'object' ? b.branch : b;
+        return cleanTxt(inner.arabicName || inner.name || inner.branchName || (inner.city && (inner.city.arabicName || inner.city.name)) || '');
+      })
+    );
+
+    const dedupKey = id || `${normalizeArabicSearchText(displayName)}|${year}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+
+    out.push({
+      id: id || `CAR_${out.length + 1}`,
+      carName: displayName,
+      carNameEn,
+      brand,
+      category,
+      year,
+      dailyPrice,
+      transmission,
+      seats,
+      status,
+      imageUrl,
+      branches
+    });
+  }
+  return out;
+}
+
+function extractEntityId(v: any): string {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string' || typeof v === 'number') return String(v).trim();
+  if (typeof v === 'object') {
+    return cleanTxt(v.companyId || v.company_id || v.id);
+  }
+  return '';
+}
+
+function extractCityName(c: any): string {
+  if (typeof c === 'string') return c.trim();
+  if (c && typeof c === 'object') {
+    return cleanTxt(c.arabicName || c.nameAr || c.cityNameAr || c.cityName || c.name || c.englishName);
+  }
+  return '';
+}
+
+export function mergeSyncedCompaniesWithCars(
+  rawCompanies: any[] = [],
+  rawCompanyCars: any[] = []
+): NormalizedRgCompany[] {
+  const bySourceId = new Map<string, NormalizedRgCompany>();
+  const byNormName = new Map<string, NormalizedRgCompany>();
+  const ordered: NormalizedRgCompany[] = [];
+
+  const ensureCompanyEntry = (compObj: any): NormalizedRgCompany | null => {
+    if (!compObj || typeof compObj !== 'object') return null;
+    const srcId = cleanTxt(compObj.companyId || compObj.company_id || compObj.id);
+    const arName = cleanTxt(compObj.arabicName || compObj.nameAr || compObj.companyNameAr || compObj.companyArName || compObj.name || compObj.companyName);
+    const enName = cleanTxt(compObj.englishName || compObj.nameEn || compObj.companyNameEn || '');
+    const name = arName || enName;
+    if (!name) return null;
+    const norm = buildCompanyNormalizedName(name);
+
+    let entry = (srcId ? bySourceId.get(srcId) : undefined) || byNormName.get(norm);
+    if (!entry) {
+      const rawStatus = cleanTxt(compObj.status || (compObj.active === false || compObj.isActive === false ? 'inactive' : 'active')).toLowerCase();
+      const status: 'active' | 'inactive' = (rawStatus === 'inactive' || rawStatus === 'disabled' || rawStatus === 'suspended' || rawStatus === 'blocked') ? 'inactive' : 'active';
+
+      const citiesRaw: string[] = [];
+      if (Array.isArray(compObj.cities)) {
+        compObj.cities.forEach((ct: any) => { const s = extractCityName(ct); if (s) citiesRaw.push(s); });
+      }
+      if (compObj.city) {
+        const s = extractCityName(compObj.city);
+        if (s) citiesRaw.push(s);
+      }
+
+      const rawBranches = Array.isArray(compObj.branches) ? compObj.branches : [];
+      const branches = rawBranches
+        .map((br: any) => {
+          if (!br || typeof br !== 'object') return null;
+          const bName = cleanTxt(br.arabicName || br.branchName || br.name || br.englishName);
+          const bCity = extractCityName(br.city || br.cityNameAr || br.cityName || '');
+          if (bCity) citiesRaw.push(bCity);
+          if (!bName && !bCity) return null;
+          const bRawSt = cleanTxt(br.status || (br.active === false ? 'inactive' : 'active')).toLowerCase();
+          return {
+            branchName: bName || bCity,
+            city: bCity,
+            district: cleanTxt(br.district || br.neighborhood || ''),
+            fullAddress: cleanTxt(br.fullAddress || br.address || br.street || ''),
+            phone: cleanTxt(br.phone || br.mobile || br.contactPhone || ''),
+            workingHours: cleanTxt(br.workingHours || br.working_hours || ''),
+            googleMapsUrl: sanitizeUrl(br.googleMapsUrl || br.mapsUrl || br.locationUrl || '', false),
+            status: (bRawSt === 'inactive' || bRawSt === 'disabled') ? 'inactive' as const : 'active' as const,
+            services: normalizeStringList(br.services || br.serviceTypes || [])
+          };
+        })
+        .filter((x: NormalizedRgCompany['branches'][number] | null): x is NormalizedRgCompany['branches'][number] => Boolean(x));
+
+      const serviceTypesRaw: string[] = [];
+      if (Array.isArray(compObj.serviceTypes)) serviceTypesRaw.push(...compObj.serviceTypes.map(cleanTxt));
+      if (Array.isArray(compObj.services)) {
+        compObj.services.forEach((sv: any) => {
+          if (typeof sv === 'string') serviceTypesRaw.push(sv);
+          else if (sv && typeof sv === 'object') serviceTypesRaw.push(cleanTxt(sv.arabicName || sv.name || sv.serviceName));
+        });
+      }
+      if (compObj.companyType) serviceTypesRaw.push(cleanTxt(compObj.companyType));
+
+      entry = {
+        sourceCompanyId: srcId,
+        name,
+        englishName: enName,
+        normalizedName: norm,
+        logoUrl: sanitizeUrl(compObj.logoUrl || compObj.logo || compObj.image || compObj.avatar || '', true),
+        shortDescription: cleanTxt(compObj.description || compObj.shortDescription || compObj.bio || (enName && enName !== name ? enName : '')),
+        phone: cleanTxt(compObj.phone || compObj.mobile || compObj.contactPhone || compObj.hotline || ''),
+        email: cleanTxt(compObj.email || compObj.contactEmail || ''),
+        website: sanitizeUrl(compObj.website || compObj.websiteUrl || '', false),
+        status,
+        cities: normalizeStringList(citiesRaw),
+        serviceTypes: normalizeStringList(serviceTypesRaw),
+        cars: normalizeCompanyCarsList(compObj.cars || compObj.companyCars || []),
+        carsCount: 0,
+        branches
+      };
+      entry.carsCount = entry.cars.length;
+      if (srcId) bySourceId.set(srcId, entry);
+      if (norm) byNormName.set(norm, entry);
+      ordered.push(entry);
+    }
+    return entry;
+  };
+
+  for (const c of rawCompanies || []) {
+    ensureCompanyEntry(c);
+  }
+
+  for (const row of rawCompanyCars || []) {
+    if (!row || typeof row !== 'object') continue;
+    const nestedComp = row.company && typeof row.company === 'object' ? row.company : null;
+    const cid = extractEntityId(nestedComp || row.companyId || row.company_id);
+    const cName = cleanTxt(
+      (nestedComp && (nestedComp.arabicName || nestedComp.nameAr || nestedComp.name || nestedComp.englishName)) ||
+      row.companyArName || row.companyName || row.company_name
+    );
+    let target = cid ? bySourceId.get(cid) : undefined;
+    if (!target && cName) {
+      target = byNormName.get(buildCompanyNormalizedName(cName));
+    }
+    if (!target && (nestedComp || cName)) {
+      target = ensureCompanyEntry(nestedComp || { id: cid, name: cName, arabicName: cName }) || undefined;
+    }
+    if (!target) continue;
+
+    const parsedCars = normalizeCompanyCarsList([row]);
+    if (parsedCars.length) {
+      const mergedCars = normalizeCompanyCarsList([...target.cars, ...parsedCars]);
+      target.cars = mergedCars;
+      target.carsCount = mergedCars.length;
+      // Extract cities from car branches if present
+      const extraCities: string[] = [];
+      for (const pc of parsedCars) {
+        if (pc.category) target.serviceTypes = normalizeStringList([...target.serviceTypes, pc.category]);
+        for (const b of pc.branches) {
+          if (b && b.length < 40) extraCities.push(b);
+        }
+      }
+      if (row.city) {
+        const ct = extractCityName(row.city);
+        if (ct) extraCities.push(ct);
+      }
+      if (extraCities.length && target.cities.length === 0) {
+        target.cities = normalizeStringList(extraCities);
+      }
+    }
+  }
+
+  for (const entry of ordered) {
+    entry.carsCount = entry.cars.length;
+  }
+  return ordered;
+}

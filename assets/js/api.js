@@ -9984,6 +9984,7 @@
       case 'getKnowledgeBaseDashboard':
       case 'getKbCompanies':
       case 'saveKbCompany':
+      case 'syncKbCompaniesFromApi':
       case 'deleteKbCompany':
       case 'getKbBranches':
       case 'saveKbBranch':
@@ -10192,7 +10193,12 @@
     function enrichCompany(c, includeBranches) {
       var brs = activeBranches().filter(function (b) { return b.companyId === c.id; });
       var cities = kbList((c.cities || []).concat(brs.map(function (b) { return b.city; })));
+      var cars = Array.isArray(c.cars) ? c.cars : [];
       var out = Object.assign({}, c, {
+        sourceCompanyId: String(c.sourceCompanyId || ''),
+        cars: cars,
+        carsCount: Number(cars.length || c.carsCount || 0),
+        lastSyncedAt: String(c.lastSyncedAt || ''),
         cities: cities,
         citiesCount: cities.length,
         branchesCount: brs.length,
@@ -10339,6 +10345,119 @@
         var enrichedC = enrichCompany(objC, false);
         kbLog('KbCompany', objC.id, existingC ? 'kb_company_updated' : 'kb_company_created', objC.name, (existingC ? 'تحديث شركة تأجير: ' : 'إضافة شركة تأجير: ') + objC.name, beforeC, enrichedC);
         return { success: true, mutated: true, data: { company: enrichedC } };
+      }
+
+      case 'syncKbCompaniesFromApi': {
+        if (!kbCan('kb_manage_companies')) return kbErr('FORBIDDEN', 'لا تملك صلاحية سحب ومزامنة شركات التأجير.');
+        var nowS = new Date().toISOString();
+        var sActorId = String(user.id || '');
+        var sActorName = String(user.name || user.username || '');
+        if (!Array.isArray(db.kbCompanies)) db.kbCompanies = [];
+        var samplePartnerCompanies = [
+          {
+            sourceCompanyId: 'RG_CMP_101',
+            name: 'الوفاق لتأجير السيارات (Yelo)',
+            logoUrl: '',
+            shortDescription: 'شريك رئيسي — تغطية المطارات والمدن الرئيسية',
+            phone: '920002909',
+            email: 'partners@iyelo.com',
+            website: 'https://www.iyelo.com',
+            status: 'active',
+            cities: ['الرياض', 'جدة', 'الدمام', 'المدينة المنورة'],
+            serviceTypes: ['سيدان', 'SUV', 'استلام مطار'],
+            cars: [
+              { id: 'CC_101_1', carName: 'تويوتا كامري 2025', carNameEn: 'Toyota Camry', brand: 'تويوتا', category: 'سيدان', year: '2025', dailyPrice: 240, transmission: 'أوتوماتيك', seats: 5, status: 'active', imageUrl: '', branches: ['مطار الملك خالد'] },
+              { id: 'CC_101_2', carName: 'هيونداي إلنترا 2025', carNameEn: 'Hyundai Elantra', brand: 'هيونداي', category: 'اقتصادية', year: '2025', dailyPrice: 145, transmission: 'أوتوماتيك', seats: 5, status: 'active', imageUrl: '', branches: ['الرياض', 'جدة'] }
+            ]
+          },
+          {
+            sourceCompanyId: 'RG_CMP_102',
+            name: 'ذيب لتأجير السيارات (Theeb)',
+            logoUrl: '',
+            shortDescription: 'أسطول متنوع وسيارات عائلية حديثة',
+            phone: '920000572',
+            email: 'care@theeb.sa',
+            website: 'https://www.theeb.sa',
+            status: 'active',
+            cities: ['الرياض', 'جدة', 'مكة المكرمة', 'أبها'],
+            serviceTypes: ['SUV', 'عائلية', 'توصيل'],
+            cars: [
+              { id: 'CC_102_1', carName: 'فورد تورس 2025', carNameEn: 'Ford Taurus', brand: 'فورد', category: 'سيدان فاخرة', year: '2025', dailyPrice: 265, transmission: 'أوتوماتيك', seats: 5, status: 'active', imageUrl: '', branches: ['مطار الملك عبدالعزيز'] }
+            ]
+          }
+        ];
+        var insC = 0;
+        var updC = 0;
+        var totCars = 0;
+        var outComps = [];
+        samplePartnerCompanies.forEach(function (sc) {
+          totCars += sc.cars.length;
+          var normName = kbNorm(sc.name);
+          var ex = activeCompanies().find(function (x) {
+            return (x.sourceCompanyId && x.sourceCompanyId === sc.sourceCompanyId) || kbNorm(x.name) === normName;
+          });
+          if (ex) {
+            ex.sourceCompanyId = sc.sourceCompanyId;
+            ex.cities = kbList((ex.cities || []).concat(sc.cities));
+            ex.serviceTypes = kbList((ex.serviceTypes || []).concat(sc.serviceTypes));
+            ex.cars = sc.cars;
+            ex.carsCount = sc.cars.length;
+            ex.lastSyncedAt = nowS;
+            ex.updatedAt = nowS;
+            ex.updatedById = sActorId;
+            ex.updatedByName = sActorName;
+            updC++;
+            outComps.push(enrichCompany(ex, false));
+          } else {
+            var newC = {
+              id: 'KBCMP_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+              sourceCompanyId: sc.sourceCompanyId,
+              name: sc.name,
+              logoUrl: sc.logoUrl,
+              shortDescription: sc.shortDescription,
+              images: [],
+              phone: sc.phone,
+              email: sc.email,
+              website: sc.website,
+              status: sc.status,
+              cities: sc.cities,
+              serviceTypes: sc.serviceTypes,
+              cars: sc.cars,
+              carsCount: sc.cars.length,
+              lastSyncedAt: nowS,
+              internalNotes: '',
+              createdById: sActorId,
+              createdByName: sActorName,
+              updatedById: sActorId,
+              updatedByName: sActorName,
+              createdAt: nowS,
+              updatedAt: nowS,
+              deletedAt: ''
+            };
+            db.kbCompanies.unshift(newC);
+            insC++;
+            outComps.push(enrichCompany(newC, false));
+          }
+        });
+        kbLog('KbCompany', 'RG_COMPANIES_SYNC', 'kb_companies_synced', 'مزامنة شركات التأجير (' + samplePartnerCompanies.length + ')', 'سحب بيانات الشركات والسيارات (الوضع التجريبي): إضافة ' + insC + '، تحديث ' + updC + '، سيارات ' + totCars, {}, { insertedCount: insC, updatedCount: updC, totalCars: totCars });
+        return {
+          success: true,
+          mutated: true,
+          data: {
+            insertedCount: insC,
+            updatedCount: updC,
+            totalCompanies: samplePartnerCompanies.length,
+            totalCars: totCars,
+            branchesSyncedCount: 0,
+            endpointsUsed: {
+              companies: 'https://api.rentalgate.net/api/companies',
+              companyCars: 'https://api.rentalgate.net/api/company-cars'
+            },
+            warnings: [],
+            syncedAt: nowS,
+            companies: outComps
+          }
+        };
       }
 
       case 'deleteKbCompany': {
@@ -11223,6 +11342,7 @@
   var FOREGROUND_SYNC_ACTIONS = {
     syncRentalGate: true,
     pullReservations: true,
+    syncKbCompaniesFromApi: true,
     retryFailedSyncRecords: true,
     syncLocalCache: true,
     applyUnifiedConnectionSetup: true,

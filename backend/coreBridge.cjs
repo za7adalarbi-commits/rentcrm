@@ -4624,6 +4624,7 @@
     login: ['*'],
     logout: ['*'],
     saveKbCompany: ['knowledgeBase', 'activity'],
+    syncKbCompaniesFromApi: ['knowledgeBase', 'activity'],
     deleteKbCompany: ['knowledgeBase', 'activity'],
     saveKbBranch: ['knowledgeBase', 'activity'],
     deleteKbBranch: ['knowledgeBase', 'activity'],

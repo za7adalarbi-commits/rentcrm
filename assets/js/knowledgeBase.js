@@ -83,6 +83,8 @@
     selectedCompanyDetail: null,
     companyBranchCityFilter: '',
     companyBranchSearch: '',
+    companyCarSearch: '',
+    syncingCompanies: false,
     expandedPolicyIds: {},
     expandedFaqIds: {},
     quickVarValues: {
@@ -668,7 +670,12 @@
         '</div>' +
         '<div class="rg-kb-toolbar-actions">' +
           (canEdit
-            ? '<button type="button" class="btn btn-sm btn-primary" data-kb-action="add-company">' +
+            ? '<button type="button" class="btn btn-sm btn-ghost" data-kb-action="sync-rg-companies"' + (kbState.syncingCompanies ? ' disabled' : '') + '>' +
+                renderIcon('M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15', 15) +
+                '<span>' + (kbState.syncingCompanies
+                  ? (en ? 'Syncing Companies & Cars...' : 'جاري سحب الشركات والسيارات...')
+                  : (en ? 'Sync Companies & Cars' : 'سحب الشركات والسيارات')) + '</span></button>' +
+              '<button type="button" class="btn btn-sm btn-primary" data-kb-action="add-company">' +
                 renderIcon('M12 5v14M5 12h14', 15) + '<span>' + (en ? 'Add Company' : 'إضافة شركة تأجير') + '</span></button>'
             : '') +
         '</div>' +
@@ -685,6 +692,7 @@
               ? visibleCities.map(function (ct) { return '<span class="rg-kb-city-tag">' + esc(ct) + '</span>'; }).join('') +
                 (extraCount ? '<span class="rg-kb-city-tag is-more">+' + extraCount + '</span>' : '')
               : '<span class="rg-kb-muted-txt">' + (en ? 'No cities assigned yet' : 'لم تحدد مدن بعد') + '</span>';
+            var carsCount = Number((c.cars && c.cars.length) || c.carsCount || 0);
 
             return (
               '<article class="surface-card rg-kb-company-card" data-kb-company-id="' + esc(c.id) + '">' +
@@ -699,10 +707,15 @@
                         '<span>' + esc(c.branchesCount || 0) + ' ' + (en ? 'Branches' : 'فرع') + '</span>' +
                         '<span>·</span>' +
                         '<span>' + esc(c.citiesCount || (c.cities || []).length) + ' ' + (en ? 'Cities' : 'مدينة') + '</span>' +
+                        '<span>·</span>' +
+                        '<span>' + esc(carsCount) + ' ' + (en ? 'Cars' : 'سيارة') + '</span>' +
                       '</div>' +
                     '</div>' +
                   '</div>' +
-                  statusBadgeHtml(c.status, ctx) +
+                  '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">' +
+                    statusBadgeHtml(c.status, ctx) +
+                    (c.sourceCompanyId ? '<span class="rg-kb-badge is-info">Rental Gate</span>' : '') +
+                  '</div>' +
                 '</div>' +
                 (c.shortDescription ? '<p class="rg-kb-company-desc" data-kb-open-company="' + esc(c.id) + '">' + esc(c.shortDescription) + '</p>' : '') +
                 '<div class="rg-kb-company-cities-block" data-kb-open-company="' + esc(c.id) + '">' +
@@ -710,7 +723,7 @@
                   '<div class="rg-kb-cities-wrap">' + citiesMarkup + '</div>' +
                 '</div>' +
                 '<div class="rg-kb-company-card-foot">' +
-                  '<button type="button" class="btn btn-xs btn-ghost" data-kb-open-company="' + esc(c.id) + '">' + (en ? 'View Details & Branches' : 'التفاصيل والفروع') + '</button>' +
+                  '<button type="button" class="btn btn-xs btn-ghost" data-kb-open-company="' + esc(c.id) + '">' + (en ? 'View Details & Fleet' : 'التفاصيل والفروع والسيارات') + '</button>' +
                   '<div class="rg-kb-row-actions">' +
                     (canEdit ? '<button type="button" class="btn btn-xs btn-ghost" data-kb-edit-company="' + esc(c.id) + '">' + (en ? 'Edit' : 'تعديل') + '</button>' : '') +
                     (canDel ? '<button type="button" class="btn btn-xs btn-danger-ghost" data-kb-delete-company="' + esc(c.id) + '">' + (en ? 'Delete' : 'حذف') + '</button>' : '') +
@@ -746,6 +759,61 @@
       if (b.city && branchCities.indexOf(b.city) === -1) branchCities.push(b.city);
     });
 
+    var allCars = Array.isArray(c.cars) ? c.cars : [];
+    var carSearchQ = String(kbState.companyCarSearch || '').trim().toLowerCase();
+    var visibleCars = allCars.filter(function (car) {
+      if (!carSearchQ) return true;
+      var txt = [car.carName, car.carNameEn, car.brand, car.category, car.year, (car.branches || []).join(' ')].join(' ').toLowerCase();
+      return txt.indexOf(carSearchQ) !== -1;
+    });
+
+    var carsSectionHtml =
+      '<div class="surface-card rg-kb-cars-section">' +
+        '<div class="rg-kb-toolbar" style="padding:0 0 10px 0;">' +
+          '<div>' +
+            '<h4 style="margin:0;font-size:1rem;">' + (en ? 'Company Cars Fleet' : 'أسطول سيارات الشركة') + ' (' + esc(allCars.length) + ')</h4>' +
+            (c.lastSyncedAt ? '<div class="rg-kb-muted-txt" style="margin-top:2px;">' + (en ? 'Last API Sync: ' : 'آخر سحب من Rental Gate: ') + esc(fmtDate(c.lastSyncedAt, ctx)) + '</div>' : '') +
+          '</div>' +
+          (allCars.length
+            ? '<div class="rg-kb-toolbar-inputs" style="max-width:300px;min-width:200px;flex:0 1 280px;">' +
+                '<input type="search" id="kb-comp-car-search" class="input" value="' + esc(kbState.companyCarSearch) + '" placeholder="' + (en ? 'Filter cars by model or brand...' : 'بحث في سيارات الشركة...') + '" />' +
+              '</div>'
+            : '') +
+        '</div>' +
+        (!allCars.length
+          ? '<div class="empty-state" style="padding:18px 12px;">' + (en ? 'No cars synced for this company yet. Use "Sync Companies & Cars" to pull fleet data.' : 'لا توجد سيارات مسحوبة لهذه الشركة بعد. استخدم زر "سحب الشركات والسيارات" لسحب الأسطول.') + '</div>'
+          : (!visibleCars.length
+              ? '<div class="empty-state" style="padding:18px 12px;">' + (en ? 'No cars match your search.' : 'لا توجد سيارات مطابقة للبحث.') + '</div>'
+              : '<div class="rg-kb-cars-grid">' +
+                  visibleCars.slice(0, 60).map(function (car) {
+                    return (
+                      '<div class="rg-kb-car-card">' +
+                        '<div class="rg-kb-car-head">' +
+                          (car.imageUrl
+                            ? '<img src="' + esc(car.imageUrl) + '" alt="' + esc(car.carName) + '" class="rg-kb-car-thumb" loading="lazy" />'
+                            : '<div class="rg-kb-car-thumb is-empty">' + renderIcon('M5 17H3v-5l2-5h14l2 5v5h-2M6 17a2 2 0 1 0 4 0M14 17a2 2 0 1 0 4 0', 18) + '</div>') +
+                          '<div style="min-width:0;flex:1;">' +
+                            '<div class="rg-kb-car-name">' + esc(car.carName) + '</div>' +
+                            (car.carNameEn && car.carNameEn !== car.carName ? '<div class="rg-kb-muted-txt" dir="ltr">' + esc(car.carNameEn) + '</div>' : '') +
+                          '</div>' +
+                          statusBadgeHtml(car.status || 'active', ctx) +
+                        '</div>' +
+                        '<div class="rg-kb-car-meta">' +
+                          (car.brand ? '<span class="rg-kb-meta-chip">' + esc(car.brand) + '</span>' : '') +
+                          (car.category ? '<span class="rg-kb-meta-chip">' + esc(car.category) + '</span>' : '') +
+                          (car.year ? '<span class="rg-kb-meta-chip">' + esc(car.year) + '</span>' : '') +
+                          (car.transmission ? '<span class="rg-kb-meta-chip">' + esc(car.transmission) + '</span>' : '') +
+                          (car.seats ? '<span class="rg-kb-meta-chip">' + esc(car.seats) + ' ' + (en ? 'Seats' : 'مقاعد') + '</span>' : '') +
+                          (car.dailyPrice !== null && car.dailyPrice !== undefined
+                            ? '<span class="rg-kb-city-tag">' + esc(car.dailyPrice) + ' ' + (en ? 'SAR/day' : 'ر.س/يوم') + '</span>'
+                            : '') +
+                        '</div>' +
+                      '</div>'
+                    );
+                  }).join('') +
+                '</div>')) +
+      '</div>';
+
     return (
       '<div class="rg-kb-company-detail">' +
         '<div class="surface-card rg-kb-detail-header">' +
@@ -759,10 +827,12 @@
                 '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
                   '<h3 style="margin:0;">' + esc(c.name) + '</h3>' +
                   statusBadgeHtml(c.status, ctx) +
+                  (c.sourceCompanyId ? '<span class="rg-kb-badge is-info">ID #' + esc(c.sourceCompanyId) + '</span>' : '') +
                 '</div>' +
                 '<div class="rg-kb-muted-txt" style="margin-top:4px;">' +
                   esc(c.branchesCount || allBranches.length) + ' ' + (en ? 'Branches' : 'فرع') + ' · ' +
-                  esc((c.cities || []).length) + ' ' + (en ? 'Cities' : 'مدينة') +
+                  esc((c.cities || []).length) + ' ' + (en ? 'Cities' : 'مدينة') + ' · ' +
+                  esc(allCars.length) + ' ' + (en ? 'Cars' : 'سيارة') +
                 '</div>' +
               '</div>' +
             '</div>' +
@@ -797,6 +867,7 @@
             ? '<div class="rg-kb-internal-note"><strong>' + (en ? 'Internal Staff Notes:' : 'ملاحظات داخلية للموظفين:') + '</strong> ' + esc(c.internalNotes) + '</div>'
             : '') +
         '</div>' +
+        carsSectionHtml +
         '<div class="surface-card rg-kb-toolbar">' +
           '<div class="rg-kb-toolbar-inputs">' +
             '<input type="search" id="kb-comp-branch-search" class="input" value="' + esc(kbState.companyBranchSearch) + '" placeholder="' + (en ? 'Search branch by name or address...' : 'بحث في الفروع بالاسم أو الحي...') + '" />' +
@@ -1997,12 +2068,44 @@
     if (compStatus) compStatus.addEventListener('change', function () { kbState.companies.status = compStatus.value; kbState.companies.page = 1; refreshCurrentView(ctx, false); });
     var addCompBtn = slot.querySelector('[data-kb-action="add-company"]');
     if (addCompBtn) addCompBtn.addEventListener('click', function () { openCompanyModal(null, ctx); });
+    var syncCompBtn = slot.querySelector('[data-kb-action="sync-rg-companies"]');
+    if (syncCompBtn) {
+      syncCompBtn.addEventListener('click', async function () {
+        if (kbState.syncingCompanies) return;
+        kbState.syncingCompanies = true;
+        renderPanelOnly(slot, ctx);
+        try {
+          var syncRes = await callApi('syncKbCompaniesFromApi', {});
+          var totComp = Number(syncRes && syncRes.totalCompanies || 0);
+          var totCars = Number(syncRes && syncRes.totalCars || 0);
+          var insC = Number(syncRes && syncRes.insertedCount || 0);
+          var updC = Number(syncRes && syncRes.updatedCount || 0);
+          toast(
+            ctx,
+            en
+              ? ('Synced ' + totComp + ' companies & ' + totCars + ' cars (added ' + insC + ', updated ' + updC + ').')
+              : ('تم سحب ' + totComp + ' شركة و ' + totCars + ' سيارة بنجاح (إضافة: ' + insC + '، تحديث: ' + updC + ').'),
+            'success'
+          );
+          if (syncRes && Array.isArray(syncRes.warnings) && syncRes.warnings.length) {
+            toast(ctx, syncRes.warnings.join(' | '), 'warning');
+          }
+          await refreshCurrentView(ctx, true);
+        } catch (err) {
+          toast(ctx, (err && err.message) ? err.message : String(err || 'فشل سحب بيانات الشركات'), 'error');
+        } finally {
+          kbState.syncingCompanies = false;
+          renderPanelOnly(slot, ctx);
+        }
+      });
+    }
 
     slot.querySelectorAll('[data-kb-open-company]').forEach(function (el) {
       el.addEventListener('click', async function () {
         kbState.selectedCompanyId = el.getAttribute('data-kb-open-company') || '';
         kbState.companyBranchCityFilter = '';
         kbState.companyBranchSearch = '';
+        kbState.companyCarSearch = '';
         await refreshCurrentView(ctx, false);
       });
     });
@@ -2011,6 +2114,7 @@
       backCompBtn.addEventListener('click', async function () {
         kbState.selectedCompanyId = '';
         kbState.selectedCompanyDetail = null;
+        kbState.companyCarSearch = '';
         await refreshCurrentView(ctx, false);
       });
     }
@@ -2033,6 +2137,15 @@
         openBranchModal(null, btn.getAttribute('data-kb-add-branch-for'), ctx);
       });
     });
+    var cbCarSearch = document.getElementById('kb-comp-car-search');
+    if (cbCarSearch) {
+      cbCarSearch.addEventListener('input', function () {
+        kbState.companyCarSearch = cbCarSearch.value;
+        renderPanelOnly(slot, ctx);
+        var nextCarInp = document.getElementById('kb-comp-car-search');
+        if (nextCarInp) { nextCarInp.focus(); nextCarInp.setSelectionRange(nextCarInp.value.length, nextCarInp.value.length); }
+      });
+    }
     var cbSearch = document.getElementById('kb-comp-branch-search');
     if (cbSearch) {
       cbSearch.addEventListener('input', function () {

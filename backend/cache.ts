@@ -357,6 +357,7 @@ const ACTION_SCOPE_MAP: Record<string, { eventType: 'delta' | 'announcement' | '
   acquireReservationLock: { eventType: 'lock', scopes: [], persistVersion: false },
   releaseReservationLock: { eventType: 'lock', scopes: [], persistVersion: false },
   saveKbCompany: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  syncKbCompaniesFromApi: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
   deleteKbCompany: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
   saveKbBranch: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
   deleteKbBranch: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },

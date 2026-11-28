@@ -20,7 +20,7 @@ export interface PersistCoreFilesResult {
 
 export const DEFAULT_RG_API_BASE_URL = 'https://api.rentalgate.net/api';
 
-const RG_KNOWN_ENDPOINT_SUFFIX_RE = /(\/(?:reservations\/filter|reservation-extends\/filter|admin\/cancelled-reservations|reservation-company-changes\/admin\/filter|reservations(?:\/[^/?#]+)?))+$/i;
+const RG_KNOWN_ENDPOINT_SUFFIX_RE = /(\/(?:reservations\/filter|reservation-extends\/filter|admin\/cancelled-reservations|reservation-company-changes\/admin\/filter|reservations(?:\/[^/?#]+)?|companies(?:\/all)?|company-cars|company\/cars))+$/i;
 
 export function normalizeRgApiBaseUrl(raw?: unknown): string {
   let clean = String(raw || '').trim();

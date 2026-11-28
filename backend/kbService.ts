@@ -14,14 +14,17 @@ import {
   extractPlainTextFromHtml,
   getSectionForPolicyCategory,
   mergeCompanyAndBranchCities,
+  mergeSyncedCompaniesWithCars,
   normalizeArabicSearchText,
   normalizeAttachments,
+  normalizeCompanyCarsList,
   normalizeStringList,
   sanitizeKbRichHtml,
   sanitizeUrl,
   scoreKbTextMatch,
   type KbUnifiedSearchResultItem
 } from './kbLogic.js';
+import { fetchRgCompaniesAndCars } from './rgApiClient.js';
 
 function str(v: unknown, fallback = ''): string {
   if (v === null || v === undefined) return fallback;
@@ -150,8 +153,12 @@ async function logKbAudit(
 function mapCompanyRow(row: any, branchCities: string[] = [], branchesCount = 0, activeBranchesCount = 0) {
   const explicitCities = normalizeStringList(parseJsonVal(row.cities_json, []));
   const cities = mergeCompanyAndBranchCities(explicitCities, branchCities);
+  const cars = normalizeCompanyCarsList(parseJsonVal(row.cars_json, []));
+  const storedCarsCount = num(row.cars_count, 0);
+  const carsCount = cars.length || storedCarsCount;
   return {
     id: str(row.id),
+    sourceCompanyId: str(row.source_company_id),
     name: str(row.name),
     logoUrl: sanitizeUrl(row.logo_url, true),
     shortDescription: str(row.short_description),
@@ -167,6 +174,9 @@ function mapCompanyRow(row: any, branchCities: string[] = [], branchesCount = 0,
     branchesCount: Number(branchesCount || 0),
     activeBranchesCount: Number(activeBranchesCount || 0),
     serviceTypes: normalizeStringList(parseJsonVal(row.service_types_json, [])),
+    cars,
+    carsCount,
+    lastSyncedAt: toIso(row.last_synced_at),
     internalNotes: str(row.internal_notes),
     createdById: str(row.created_by_id),
     createdByName: str(row.created_by_name),
@@ -547,13 +557,15 @@ export async function getKbCompanies(executor: DbExecutor, session: AuthSession,
   if (search) {
     const normQ = normalizeArabicSearchText(search);
     mapped = mapped.filter((c) => {
+      const carsHay = (c.cars || []).map((car) => `${car.carName} ${car.carNameEn} ${car.brand} ${car.category} ${car.year}`).join(' ');
       const hay = normalizeArabicSearchText([
         c.name,
         c.shortDescription,
         c.phone,
         c.email,
         c.cities.join(' '),
-        c.serviceTypes.join(' ')
+        c.serviceTypes.join(' '),
+        carsHay
       ].join(' '));
       return hay.includes(normQ);
     });
@@ -696,6 +708,232 @@ export async function saveKbCompany(executor: DbExecutor, session: AuthSession, 
       afterJson: mapped
     });
     return { company: mapped };
+  });
+}
+
+export async function syncKbCompaniesFromApi(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {},
+  deps: {
+    fetchFn?: typeof fetch;
+    fetchRgFn?: typeof fetchRgCompaniesAndCars;
+  } = {}
+) {
+  assertKbPerm(session, 'kb_manage_companies', 'لا تملك صلاحية سحب ومزامنة شركات التأجير.');
+  const fetchCompaniesFn = deps.fetchRgFn || fetchRgCompaniesAndCars;
+  const pulled = await fetchCompaniesFn(executor, {
+    fetchFn: deps.fetchFn,
+    companiesUrl: str(payload.companiesUrl) || undefined,
+    companyCarsUrl: str(payload.companyCarsUrl) || undefined
+  });
+
+  const normalizedCompanies = mergeSyncedCompaniesWithCars(pulled.rawCompanies, pulled.rawCars);
+  const actorId = str(session.user.id);
+  const actorName = str(session.user.name || session.user.username);
+  const syncedAt = new Date().toISOString();
+
+  return executor.withTransaction(async (tx) => {
+    const existingRes = await tx.query(`SELECT * FROM kb_companies WHERE deleted_at IS NULL`);
+    const existingBySrcId = new Map<string, any>();
+    const existingByNorm = new Map<string, any>();
+    for (const row of existingRes.rows || []) {
+      const srcId = str(row.source_company_id);
+      const norm = str(row.normalized_name);
+      if (srcId) existingBySrcId.set(srcId, row);
+      if (norm) existingByNorm.set(norm, row);
+    }
+
+    let insertedCount = 0;
+    let updatedCount = 0;
+    let branchesSyncedCount = 0;
+    let totalCars = 0;
+    const syncedCompanies: any[] = [];
+
+    for (const item of normalizedCompanies) {
+      totalCars += item.carsCount;
+      const existing =
+        (item.sourceCompanyId ? existingBySrcId.get(item.sourceCompanyId) : undefined) ||
+        existingByNorm.get(item.normalizedName);
+
+      const mergedCities = existing
+        ? normalizeStringList([...parseJsonVal<string[]>(existing.cities_json, []), ...item.cities])
+        : item.cities;
+      const mergedServices = existing
+        ? normalizeStringList([...parseJsonVal<string[]>(existing.service_types_json, []), ...item.serviceTypes])
+        : item.serviceTypes;
+      const effectiveLogo = item.logoUrl || (existing ? str(existing.logo_url) : '');
+      const effectiveDesc = item.shortDescription || (existing ? str(existing.short_description) : '');
+      const effectivePhone = item.phone || (existing ? str(existing.phone) : '');
+      const effectiveEmail = item.email || (existing ? str(existing.email) : '');
+      const effectiveWeb = item.website || (existing ? str(existing.website) : '');
+      const effectiveNotes = existing ? str(existing.internal_notes) : '';
+
+      let savedRow: any = null;
+      if (existing) {
+        const updRes = await tx.query(
+          `UPDATE kb_companies
+           SET source_company_id = $2,
+               name = $3,
+               normalized_name = $4,
+               logo_url = $5,
+               short_description = $6,
+               phone = $7,
+               email = $8,
+               website = $9,
+               status = $10,
+               cities_json = $11::jsonb,
+               service_types_json = $12::jsonb,
+               cars_json = $13::jsonb,
+               cars_count = $14,
+               internal_notes = $15,
+               last_synced_at = NOW(),
+               updated_by_id = $16,
+               updated_by_name = $17,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [
+            str(existing.id),
+            item.sourceCompanyId || str(existing.source_company_id),
+            item.name,
+            item.normalizedName,
+            effectiveLogo,
+            effectiveDesc,
+            effectivePhone,
+            effectiveEmail,
+            effectiveWeb,
+            item.status,
+            JSON.stringify(mergedCities),
+            JSON.stringify(mergedServices),
+            JSON.stringify(item.cars),
+            item.carsCount,
+            effectiveNotes,
+            actorId,
+            actorName
+          ]
+        );
+        savedRow = updRes.rows[0];
+        updatedCount++;
+      } else {
+        const newId = generateId('KBCMP');
+        const insRes = await tx.query(
+          `INSERT INTO kb_companies (
+            id, source_company_id, name, normalized_name, logo_url, short_description, images_json,
+            phone, email, website, status, cities_json, service_types_json,
+            cars_json, cars_count, internal_notes, last_synced_at,
+            created_by_id, created_by_name, updated_by_id, updated_by_name, created_at, updated_at
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, '[]'::jsonb,
+            $7, $8, $9, $10, $11::jsonb, $12::jsonb,
+            $13::jsonb, $14, $15, NOW(),
+            $16, $17, $16, $17, NOW(), NOW()
+          ) RETURNING *`,
+          [
+            newId,
+            item.sourceCompanyId,
+            item.name,
+            item.normalizedName,
+            effectiveLogo,
+            effectiveDesc,
+            effectivePhone,
+            effectiveEmail,
+            effectiveWeb,
+            item.status,
+            JSON.stringify(mergedCities),
+            JSON.stringify(mergedServices),
+            JSON.stringify(item.cars),
+            item.carsCount,
+            effectiveNotes,
+            actorId,
+            actorName
+          ]
+        );
+        savedRow = insRes.rows[0];
+        insertedCount++;
+      }
+
+      const compId = str(savedRow?.id || existing?.id);
+      if (compId) {
+        existingByNorm.set(item.normalizedName, savedRow);
+        if (item.sourceCompanyId) existingBySrcId.set(item.sourceCompanyId, savedRow);
+
+        for (const br of item.branches || []) {
+          if (!br.branchName && !br.city) continue;
+          const bKey = buildBranchNormalizedKey(compId, br.city || 'عام', br.branchName || br.city);
+          const brDup = await tx.query<{ id: string }>(
+            `SELECT id FROM kb_branches WHERE normalized_key = $1 AND deleted_at IS NULL LIMIT 1`,
+            [bKey]
+          );
+          if (!brDup.rows.length) {
+            await tx.query(
+              `INSERT INTO kb_branches (
+                id, company_id, branch_name, normalized_key, city, district, full_address,
+                google_maps_url, phone, working_hours, status, services_json, notes,
+                created_by_id, created_by_name, updated_by_id, updated_by_name, created_at, updated_at
+              ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, $12::jsonb, '',
+                $13, $14, $13, $14, NOW(), NOW()
+              )`,
+              [
+                generateId('KBBR'),
+                compId,
+                br.branchName,
+                bKey,
+                br.city,
+                br.district,
+                br.fullAddress,
+                br.googleMapsUrl,
+                br.phone,
+                br.workingHours,
+                br.status,
+                JSON.stringify(br.services || []),
+                actorId,
+                actorName
+              ]
+            );
+            branchesSyncedCount++;
+          }
+        }
+      }
+
+      if (savedRow) {
+        syncedCompanies.push(mapCompanyRow(savedRow));
+      }
+    }
+
+    await logKbAudit(tx, session, {
+      entityType: 'KbCompany',
+      entityId: 'RG_COMPANIES_SYNC',
+      actionType: 'kb_companies_synced',
+      titleSnapshot: `مزامنة شركات التأجير (${normalizedCompanies.length})`,
+      details: `سحب شركات التأجير والسيارات من Rental Gate API: إضافة ${insertedCount}، تحديث ${updatedCount}، سيارات ${totalCars}، فروع ${branchesSyncedCount}`,
+      beforeJson: { sourceCompanies: pulled.companiesCount, sourceCars: pulled.carsCount },
+      afterJson: {
+        insertedCount,
+        updatedCount,
+        totalCompanies: normalizedCompanies.length,
+        totalCars,
+        branchesSyncedCount,
+        endpointsUsed: pulled.endpointsUsed,
+        warnings: pulled.warnings
+      }
+    });
+
+    return {
+      insertedCount,
+      updatedCount,
+      totalCompanies: normalizedCompanies.length,
+      totalCars,
+      branchesSyncedCount,
+      sourceCompaniesCount: pulled.companiesCount,
+      sourceCarsCount: pulled.carsCount,
+      endpointsUsed: pulled.endpointsUsed,
+      warnings: pulled.warnings,
+      syncedAt,
+      companies: syncedCompanies
+    };
   });
 }
 
@@ -1616,7 +1854,8 @@ export async function searchKnowledgeBase(executor: DbExecutor, session: AuthSes
     if (companyId && c.id !== companyId) continue;
     if (normCityFilter && !c.cities.some((ct) => normalizeArabicSearchText(ct) === normCityFilter)) continue;
     if (category) continue;
-    const score = scoreKbTextMatch(queryText, c.name, [c.shortDescription, c.cities.join(' '), c.serviceTypes.join(' '), c.phone], c.cities);
+    const carsHay = (c.cars || []).map((car) => `${car.carName} ${car.carNameEn} ${car.brand} ${car.category} ${car.year}`).join(' ');
+    const score = scoreKbTextMatch(queryText, c.name, [c.shortDescription, c.cities.join(' '), c.serviceTypes.join(' '), c.phone, carsHay], c.cities);
     if (score <= 0) continue;
     results.push({
       id: c.id,
