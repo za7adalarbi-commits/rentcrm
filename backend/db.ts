@@ -1106,6 +1106,294 @@ export const AUDIT_AND_HEALTH_MIGRATIONS: SchemaMigrationDef[] = [
         undefined
       );
     }
+  },
+  {
+    id: '2026_11_27_009_reclassify_outbox_auth_and_quarantine_bulk_delete',
+    description: 'Reclassify historical outbox auth/frozen/bulk-delete errors cleanly without losing error text or timestamps',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig009_outbox_reclassify',
+        async () => {
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET error_category = CASE
+               WHEN COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|HTTP_401|HTTP_403|INVALID_SECRET|غير صالح|غير متطابق|مفتاح المزامنة|accounts\\.google\\.com|ServiceLogin' THEN 'auth'
+               WHEN COALESCE(last_error, '') ~* 'non-frozen|delete all non-frozen|الصفوف المجمدة|cannot delete all' THEN 'sheet_frozen'
+               WHEN COALESCE(action, '') = 'deleteAllReservations' OR COALESCE(last_error, '') ~* 'VALIDATION_ERROR|INVALID_GAS_URL|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|GAS_NOT_FOUND|HTTP_400|HTTP_404|HTTP_422' THEN 'validation'
+               WHEN COALESCE(last_error, '') ~* 'AbortError|timeout|ETIMEDOUT|aborted' THEN 'timeout'
+               WHEN COALESCE(last_error, '') ~* '429|RATE_LIMIT|TOO MANY REQUESTS' THEN 'rate_limit'
+               WHEN COALESCE(last_error, '') ~* 'GAS HTTP 5' THEN 'upstream_5xx'
+               WHEN COALESCE(last_error, '') ~* 'ECONN|ENOTFOUND|FETCH|NETWORK' THEN 'network'
+               ELSE COALESCE(NULLIF(TRIM(error_category), ''), 'unknown')
+             END
+             WHERE status IN ('failed', 'retry')`
+          );
+        },
+        undefined
+      );
+    }
+  },
+  {
+    id: '2026_11_28_010_outbox_lifecycle_and_classification_repair',
+    description: 'Add Outbox lifecycle columns (started_at, finished_at, last_success_at, last_error_details_json), fix timeout misclassified as validation, and annotate empty stale-lock retries',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig010_outbox_lifecycle_cols',
+        async () => {
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT NULL;`);
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ DEFAULT NULL;`);
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ DEFAULT NULL;`);
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS last_error_details_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+          // Fix rows where AbortError / 'This operation was aborted' was misclassified as validation
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET error_category = 'timeout',
+                 updated_at = NOW()
+             WHERE status IN ('failed', 'dead_letter', 'retry')
+               AND COALESCE(last_error, '') ~* 'AbortError|timeout|ETIMEDOUT|aborted|TimeoutError|LOCK_TIMEOUT_RECOVERED|operation was aborted'
+               AND COALESCE(error_category, '') <> 'timeout'`
+          );
+          // Backfill last_success_at on already sent/completed rows
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET last_success_at = COALESCE(last_success_at, synced_at, processed_at, updated_at),
+                 finished_at = COALESCE(finished_at, synced_at, processed_at, updated_at)
+             WHERE status IN ('sent', 'completed')
+               AND (last_success_at IS NULL OR finished_at IS NULL)`
+          );
+          // Annotate existing stale-lock 'retry' rows that were recovered with empty last_error & retry_count=0
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET last_error = 'LOCK_TIMEOUT_RECOVERED: تعثرت عملية المعالجة السابقة (انتهاء مهلة الخادم/القفل) قبل تسجيل النتيجة؛ تمت جدولتها لإعادة المحاولة بأمان.',
+                 error_category = 'timeout',
+                 retry_count = GREATEST(COALESCE(retry_count, 0), 1),
+                 last_attempt_at = COALESCE(last_attempt_at, locked_at, updated_at, NOW()),
+                 finished_at = COALESCE(finished_at, updated_at, NOW()),
+                 updated_at = NOW()
+             WHERE status = 'retry'
+               AND COALESCE(TRIM(last_error), '') = ''`
+          );
+        },
+        undefined
+      );
+    }
+  },
+  {
+    id: '2026_11_28_011_outbox_correlation_batch_and_canonical_status',
+    description: 'Add correlation_id and batch_id to sheets_mirror_outbox, canonicalize sent/failed statuses to completed/dead_letter without deleting rows, and quarantine any deleteAllReservations entries',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig011_outbox_corr_canonical',
+        async () => {
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS correlation_id TEXT NOT NULL DEFAULT '';`);
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS batch_id TEXT NOT NULL DEFAULT '';`);
+          await tx.query(`CREATE INDEX IF NOT EXISTS idx_sheets_outbox_corr_id ON sheets_mirror_outbox (correlation_id) WHERE COALESCE(correlation_id, '') <> '';`);
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET status = 'dead_letter',
+                 error_category = 'validation',
+                 locked_at = NULL,
+                 worker_id = '',
+                 last_error = CASE
+                   WHEN COALESCE(NULLIF(TRIM(last_error), ''), '') <> '' THEN last_error
+                   ELSE 'QUARANTINED_BULK_DELETE: عملية deleteAllReservations محظورة لحماية بيانات Google Sheets.'
+                 END,
+                 updated_at = NOW()
+             WHERE COALESCE(action, '') = 'deleteAllReservations'
+               AND status IN ('pending', 'processing', 'retry', 'failed')`
+          );
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET status = 'completed',
+                 updated_at = NOW()
+             WHERE status = 'sent'`
+          );
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET status = 'dead_letter',
+                 updated_at = NOW()
+             WHERE status = 'failed'`
+          );
+        },
+        undefined
+      );
+    }
+  },
+  {
+    id: '2026_11_28_012_outbox_idempotency_backfill',
+    description: 'Backfill deterministic unique idempotency_key on all sheets_mirror_outbox rows with missing keys without altering retry_count or status',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig012_outbox_idempotency_backfill',
+        async () => {
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET idempotency_key = LEFT(
+                   COALESCE(NULLIF(TRIM(entity_type), ''), 'Record') || ':' ||
+                   COALESCE(NULLIF(TRIM(entity_id), ''), id) || ':' ||
+                   COALESCE(NULLIF(TRIM(action), ''), 'unknown') || ':legacy:' || id,
+                   180
+                 ),
+                 updated_at = NOW()
+             WHERE COALESCE(TRIM(idempotency_key), '') = ''`
+          );
+        },
+        undefined
+      );
+    }
+  },
+  {
+    id: '2026_11_28_013_knowledge_base_module',
+    description: 'Create Knowledge Base normalized tables (kb_companies, kb_branches, kb_policies, kb_faqs, kb_quick_replies, kb_revisions) and indexes idempotently',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig013_knowledge_base_module',
+        async () => {
+          const ddls = [
+            `CREATE TABLE IF NOT EXISTS kb_companies (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL DEFAULT '',
+              normalized_name TEXT NOT NULL DEFAULT '',
+              logo_url TEXT NOT NULL DEFAULT '',
+              short_description TEXT NOT NULL DEFAULT '',
+              images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              phone TEXT NOT NULL DEFAULT '',
+              email TEXT NOT NULL DEFAULT '',
+              website TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active',
+              cities_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              service_types_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              internal_notes TEXT NOT NULL DEFAULT '',
+              created_by_id TEXT NOT NULL DEFAULT '',
+              created_by_name TEXT NOT NULL DEFAULT '',
+              updated_by_id TEXT NOT NULL DEFAULT '',
+              updated_by_name TEXT NOT NULL DEFAULT '',
+              deleted_at TIMESTAMPTZ DEFAULT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`,
+            `CREATE TABLE IF NOT EXISTS kb_branches (
+              id TEXT PRIMARY KEY,
+              company_id TEXT NOT NULL REFERENCES kb_companies(id) ON DELETE CASCADE,
+              branch_name TEXT NOT NULL DEFAULT '',
+              normalized_key TEXT NOT NULL DEFAULT '',
+              city TEXT NOT NULL DEFAULT '',
+              district TEXT NOT NULL DEFAULT '',
+              full_address TEXT NOT NULL DEFAULT '',
+              google_maps_url TEXT NOT NULL DEFAULT '',
+              phone TEXT NOT NULL DEFAULT '',
+              working_hours TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active',
+              services_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              notes TEXT NOT NULL DEFAULT '',
+              created_by_id TEXT NOT NULL DEFAULT '',
+              created_by_name TEXT NOT NULL DEFAULT '',
+              updated_by_id TEXT NOT NULL DEFAULT '',
+              updated_by_name TEXT NOT NULL DEFAULT '',
+              deleted_at TIMESTAMPTZ DEFAULT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`,
+            `CREATE TABLE IF NOT EXISTS kb_policies (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL DEFAULT '',
+              normalized_key TEXT NOT NULL DEFAULT '',
+              description_html TEXT NOT NULL DEFAULT '',
+              description_text TEXT NOT NULL DEFAULT '',
+              section_key TEXT NOT NULL DEFAULT 'rental_gate_policies',
+              category TEXT NOT NULL DEFAULT 'rental_gate',
+              company_id TEXT NOT NULL DEFAULT '',
+              city TEXT NOT NULL DEFAULT '',
+              keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              publish_status TEXT NOT NULL DEFAULT 'published',
+              usage_count INTEGER NOT NULL DEFAULT 0,
+              search_hit_count INTEGER NOT NULL DEFAULT 0,
+              created_by_id TEXT NOT NULL DEFAULT '',
+              created_by_name TEXT NOT NULL DEFAULT '',
+              updated_by_id TEXT NOT NULL DEFAULT '',
+              updated_by_name TEXT NOT NULL DEFAULT '',
+              deleted_at TIMESTAMPTZ DEFAULT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`,
+            `CREATE TABLE IF NOT EXISTS kb_faqs (
+              id TEXT PRIMARY KEY,
+              question TEXT NOT NULL DEFAULT '',
+              normalized_key TEXT NOT NULL DEFAULT '',
+              answer_html TEXT NOT NULL DEFAULT '',
+              answer_text TEXT NOT NULL DEFAULT '',
+              category TEXT NOT NULL DEFAULT 'general',
+              company_id TEXT NOT NULL DEFAULT '',
+              keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              publish_status TEXT NOT NULL DEFAULT 'published',
+              usage_count INTEGER NOT NULL DEFAULT 0,
+              search_hit_count INTEGER NOT NULL DEFAULT 0,
+              created_by_id TEXT NOT NULL DEFAULT '',
+              created_by_name TEXT NOT NULL DEFAULT '',
+              updated_by_id TEXT NOT NULL DEFAULT '',
+              updated_by_name TEXT NOT NULL DEFAULT '',
+              deleted_at TIMESTAMPTZ DEFAULT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`,
+            `CREATE TABLE IF NOT EXISTS kb_quick_replies (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL DEFAULT '',
+              normalized_key TEXT NOT NULL DEFAULT '',
+              message_text TEXT NOT NULL DEFAULT '',
+              category TEXT NOT NULL DEFAULT 'greeting',
+              keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              language TEXT NOT NULL DEFAULT 'ar',
+              company_id TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active',
+              usage_count INTEGER NOT NULL DEFAULT 0,
+              created_by_id TEXT NOT NULL DEFAULT '',
+              created_by_name TEXT NOT NULL DEFAULT '',
+              updated_by_id TEXT NOT NULL DEFAULT '',
+              updated_by_name TEXT NOT NULL DEFAULT '',
+              deleted_at TIMESTAMPTZ DEFAULT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`,
+            `CREATE TABLE IF NOT EXISTS kb_revisions (
+              id TEXT PRIMARY KEY,
+              entity_type TEXT NOT NULL DEFAULT '',
+              entity_id TEXT NOT NULL DEFAULT '',
+              action_type TEXT NOT NULL DEFAULT '',
+              title_snapshot TEXT NOT NULL DEFAULT '',
+              before_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+              after_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+              actor_id TEXT NOT NULL DEFAULT '',
+              actor_name TEXT NOT NULL DEFAULT '',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_companies_norm_name_active ON kb_companies (normalized_name) WHERE deleted_at IS NULL AND normalized_name <> ''`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_companies_status_upd ON kb_companies (status, updated_at DESC) WHERE deleted_at IS NULL`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_branches_norm_key_active ON kb_branches (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> ''`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_branches_company_city ON kb_branches (company_id, city, status) WHERE deleted_at IS NULL`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_policies_norm_key_active ON kb_policies (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> ''`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_policies_sec_cat ON kb_policies (section_key, category, publish_status, updated_at DESC) WHERE deleted_at IS NULL`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_policies_company ON kb_policies (company_id, city) WHERE deleted_at IS NULL`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_faqs_norm_key_active ON kb_faqs (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> ''`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_faqs_cat_usage ON kb_faqs (category, publish_status, usage_count DESC, updated_at DESC) WHERE deleted_at IS NULL`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_quick_replies_norm_key_active ON kb_quick_replies (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> ''`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_quick_replies_cat_lang ON kb_quick_replies (category, language, status, usage_count DESC) WHERE deleted_at IS NULL`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_revisions_entity_created ON kb_revisions (entity_type, entity_id, created_at DESC)`,
+            `CREATE INDEX IF NOT EXISTS idx_kb_revisions_created ON kb_revisions (created_at DESC)`
+          ];
+          for (const ddl of ddls) {
+            await tx.query(ddl);
+          }
+        },
+        undefined
+      );
+    }
   }
 ];
 

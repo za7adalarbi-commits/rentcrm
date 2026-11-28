@@ -7,7 +7,7 @@
   var PREFS_KEY = 'rg_crm_user_prefs';
   var UI_SIMP_STORAGE_KEY = 'rg_crm_ui_simplification_v1';
   var ROUTE_FILTERS_STORAGE_KEY = 'rg_crm_route_filters_v1';
-  var VALID_ROUTES = ['dashboard', 'reservations', 'customers', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var VALID_ROUTES = ['dashboard', 'reservations', 'customers', 'knowledge-base', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
 
   function saveRouteFilters(userOverride) {
     try {
@@ -2200,6 +2200,7 @@
       nav_dashboard: 'لوحة التحكم',
       nav_reservations: 'الحجوزات',
       nav_customers: 'العملاء',
+      nav_knowledge_base: 'مركز المعرفة',
       nav_inactive_reservations: 'الحجوزات غير الفعالة',
       nav_my_followups: 'متابعاتي',
       nav_team_followups: 'متابعات الفريق',
@@ -2284,6 +2285,7 @@
       nav_dashboard: 'Dashboard',
       nav_reservations: 'Reservations',
       nav_customers: 'Customers',
+      nav_knowledge_base: 'Knowledge Base',
       nav_inactive_reservations: 'Inactive Reservations',
       nav_my_followups: 'My Follow-Ups',
       nav_team_followups: 'Team Follow-Ups',
@@ -3271,6 +3273,7 @@
     { id: 'dashboard', key: 'nav_dashboard', group: 'ops', icon: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z' },
     { id: 'reservations', key: 'nav_reservations', group: 'ops', icon: 'M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 16H5V9h14v11z' },
     { id: 'customers', key: 'nav_customers', group: 'ops', icon: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm13 14v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' },
+    { id: 'knowledge-base', key: 'nav_knowledge_base', group: 'ops', icon: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z' },
     { id: 'my-followups', key: 'nav_my_followups', group: 'ops', icon: 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' },
     { id: 'team-followups', key: 'nav_team_followups', group: 'ops', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm14 14v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' },
     { id: 'problems', key: 'nav_problems', group: 'ops', icon: 'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01' },
@@ -3424,6 +3427,8 @@
           }
         };
       }
+      case 'knowledge-base':
+        return { action: 'getKnowledgeBaseDashboard', payload: {} };
       case 'my-followups':
         return { action: 'getMyFollowUps', payload: {} };
       case 'team-followups':
@@ -3492,6 +3497,11 @@
       case 'customers':
         if (root.RGCustomers && typeof root.RGCustomers.render === 'function') {
           await root.RGCustomers.render(slot, ctx);
+        }
+        break;
+      case 'knowledge-base':
+        if (root.RGKnowledgeBase && typeof root.RGKnowledgeBase.render === 'function') {
+          await root.RGKnowledgeBase.render(slot, ctx);
         }
         break;
       case 'my-followups':

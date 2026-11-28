@@ -32,6 +32,7 @@ import {
   type VercelEnvChecklistItem,
   type VercelEnvSyncResult
 } from './vercelEnv.js';
+import { postGasMirrorJson } from './syncService.js';
 
 export interface SetupCapabilitiesResponse {
   writableCoreFiles: boolean;
@@ -242,15 +243,10 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
   let autoBoundGas = false;
   let autoBindNote = '';
   if (gasUrl && mode !== 'sandbox') {
-    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000) : null;
     try {
-      const resp = await fetchFn(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        signal: ctrl?.signal,
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
+      const callRes = await postGasMirrorJson(
+        gasUrl,
+        {
           action: 'autoBindFromServer',
           payload: {
             syncSecret: nextSyncSecret,
@@ -258,29 +254,18 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
             rgToken: nextRgToken,
             autoEveryMinute: mode === 'neon'
           }
-        })
-      });
-      const text = await resp.text();
-      let parsed: any = null;
-      const trimmed = String(text || '').trim();
-      if (crmCore && typeof crmCore.parseGasResponseText === 'function') {
-        parsed = crmCore.parseGasResponseText(trimmed, resp.status);
-      } else if (trimmed && !trimmed.startsWith('<')) {
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch {
-          parsed = null;
-        }
-      }
-      if (resp.ok && parsed && parsed.success) {
+        },
+        fetchFn,
+        8000
+      );
+      const parsed = callRes.parsed;
+      if (callRes.httpOk && parsed && parsed.success) {
         autoBoundGas = true;
       } else {
-        autoBindNote = str(parsed?.message || `HTTP ${resp.status}`);
+        autoBindNote = str(callRes.errorMessage || parsed?.message || `HTTP ${callRes.statusCode}`);
       }
     } catch (err: any) {
       autoBindNote = str(err?.message || 'NETWORK');
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 

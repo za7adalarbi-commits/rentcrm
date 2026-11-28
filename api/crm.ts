@@ -23,8 +23,6 @@ import { attachAppVersionHeaders } from '../backend/versionManifest.js';
 async function resolveServerFallbackGasUrl(explicitUrl: unknown): Promise<string> {
   const direct = String(explicitUrl || '').trim();
   if (direct) return direct;
-  const envUrl = String(process.env.GAS_WEBAPP_URL || FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
-  if (envUrl) return envUrl;
   if (isDatabaseConfigured()) {
     try {
       const cfg = await resolveServerConfig(createPgExecutor());
@@ -33,7 +31,8 @@ async function resolveServerFallbackGasUrl(explicitUrl: unknown): Promise<string
       // Non-fatal fallback
     }
   }
-  return '';
+  const envUrl = String(process.env.GAS_WEBAPP_URL || FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
+  return envUrl;
 }
 
 function verifySetupEnvSecret(candidate: string): { configured: boolean; valid: boolean } {

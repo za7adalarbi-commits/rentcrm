@@ -37,9 +37,16 @@ function deriveEncryptionKey(): Buffer {
   return crypto.createHash('sha256').update(`RG_AES_KEY::${seed}`, 'utf8').digest();
 }
 
+import { normalizeAndValidateGasTarget } from './gasProxy.js';
+
+export function hasInvisibleChars(raw: unknown): boolean {
+  if (typeof raw !== 'string') return false;
+  return /[\u200B-\u200D\uFEFF\u00A0]/.test(raw);
+}
+
 export function hasWrappingQuotes(raw: unknown): boolean {
   if (typeof raw !== 'string') return false;
-  const trimmed = raw.replace(/[\r\n]+/g, '').trim();
+  const trimmed = raw.replace(/[\r\n\u200B-\u200D\uFEFF]+/g, '').trim();
   if (trimmed.length < 2) return false;
   const first = trimmed[0];
   const last = trimmed[trimmed.length - 1];
@@ -49,13 +56,17 @@ export function hasWrappingQuotes(raw: unknown): boolean {
 export function hasInternalOrOuterWhitespace(raw: unknown, allowBearerSpace = false): boolean {
   if (typeof raw !== 'string') return false;
   if (raw !== raw.trim()) return true;
-  if (/[\r\n\t]/.test(raw)) return true;
+  if (/[\r\n\t\u00A0]/.test(raw)) return true;
   const checkTarget = allowBearerSpace ? raw.trim().replace(/^(?:Bearer\s+)+/i, '').trim() : raw.trim();
   return /\s/.test(checkTarget);
 }
 
 export function sanitizeSecretToken(raw: unknown): string {
-  let clean = String(raw ?? '').replace(/[\r\n]+/g, '').trim();
+  let clean = String(raw ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\r\n]+/g, '')
+    .trim();
   while (clean.length >= 2) {
     const first = clean[0];
     const last = clean[clean.length - 1];
@@ -161,8 +172,51 @@ export interface SyncSecretDiagnostics {
   source: 'env' | 'db_encrypted' | 'db_plain' | 'fixed_config' | 'none';
   length: number;
   hasEnvWhitespace: boolean;
+  hasLeadingOrTrailingWhitespace?: boolean;
+  hasNewlines?: boolean;
+  hasInvisibleChars?: boolean;
   hasQuotes: boolean;
   hasWhitespace: boolean;
+  envPresent?: boolean;
+  envLength?: number;
+  dbEncryptedPresent?: boolean;
+  dbDecryptFailed?: boolean;
+  dbPlainPresent?: boolean;
+  fixedPresent?: boolean;
+  envVsDbConflict?: boolean;
+}
+
+export interface GasAuthFlowDiagnostics {
+  secret: SyncSecretDiagnostics;
+  gasUrl: {
+    configured: boolean;
+    source: 'db' | 'env' | 'fixed_config' | 'none';
+    valid: boolean;
+    wasNormalized: boolean;
+    validationError: string;
+    host: string;
+    deploymentIdHint: string;
+    envPresent: boolean;
+    dbPresent: boolean;
+    fixedPresent: boolean;
+    envVsDbConflict: boolean;
+  };
+  environment: {
+    isVercel: boolean;
+    isCloudRun: boolean;
+    vercelEnv: string;
+    runtimePlatform: 'vercel' | 'cloud_run' | 'node_production' | 'local';
+    nodeEnv: string;
+    region: string;
+    hasRgEncryptionKey: boolean;
+    resolvedMode: FixedConnectionMode | '';
+  };
+  requestContract: {
+    sendMethod: string;
+    sendContentType: string;
+    sendLocation: string;
+    gasAcceptedLocations: string[];
+  };
 }
 
 export interface RgTokenDiagnostics {
@@ -174,60 +228,121 @@ export interface RgTokenDiagnostics {
   hasBearerPrefix: boolean;
 }
 
+function sha256DigestForCompare(val: string): string {
+  return val ? crypto.createHash('sha256').update(val, 'utf8').digest('hex') : '';
+}
+
+function extractDeploymentIdHint(urlStr: string): string {
+  const m = String(urlStr || '').match(/\/macros\/(?:u\/\d+\/)?s\/([^/?#]+)/i);
+  if (!m || !m[1]) return '';
+  const id = m[1];
+  if (id.length <= 10) return `len=${id.length}`;
+  return `${id.slice(0, 4)}...${id.slice(-4)} (len=${id.length})`;
+}
+
 export async function getSyncSecretDiagnostics(executor?: DbClient): Promise<SyncSecretDiagnostics> {
   const rawEnv = process.env.SYNC_API_SECRET;
   const trimmedEnv = sanitizeSecretToken(rawEnv);
   const hasEnvWhitespace = hasInternalOrOuterWhitespace(rawEnv, false);
+  const envHasLeadTrail = typeof rawEnv === 'string' && rawEnv !== rawEnv.trim();
+  const envHasNewlines = typeof rawEnv === 'string' && /[\r\n]/.test(rawEnv);
+  const envHasInvis = hasInvisibleChars(rawEnv);
+
+  let dbEncryptedRaw = '';
+  let dbDecrypted = '';
+  let dbPlainRaw = '';
+  let dbPlainClean = '';
+  let dbDecryptFailed = false;
+
+  if (executor) {
+    const map = await readSettingsRows(executor, ['sync_api_secret_enc', 'sync_api_secret']).catch(
+      () => ({} as Record<string, string>)
+    );
+    dbEncryptedRaw = String(map.sync_api_secret_enc || '').trim();
+    if (dbEncryptedRaw) {
+      dbDecrypted = decryptServerSecret(dbEncryptedRaw);
+      if (!dbDecrypted) dbDecryptFailed = true;
+    }
+    dbPlainRaw = String(map.sync_api_secret || '');
+    dbPlainClean = sanitizeSecretToken(dbPlainRaw);
+  }
+
+  const rawFixed = FIXED_SERVER_CONFIG.syncApiSecret;
+  const fixedClean = sanitizeSecretToken(rawFixed);
+  const effectiveDbSecret = dbDecrypted || dbPlainClean;
+  const envVsDbConflict = Boolean(
+    trimmedEnv &&
+    effectiveDbSecret &&
+    sha256DigestForCompare(trimmedEnv) !== sha256DigestForCompare(effectiveDbSecret)
+  );
+
+  const sharedMeta = {
+    envPresent: Boolean(trimmedEnv),
+    envLength: trimmedEnv.length,
+    dbEncryptedPresent: Boolean(dbEncryptedRaw),
+    dbDecryptFailed,
+    dbPlainPresent: Boolean(dbPlainClean),
+    fixedPresent: Boolean(fixedClean),
+    envVsDbConflict
+  };
+
   if (trimmedEnv) {
     return {
       configured: true,
       source: 'env',
       length: trimmedEnv.length,
       hasEnvWhitespace,
+      hasLeadingOrTrailingWhitespace: envHasLeadTrail,
+      hasNewlines: envHasNewlines,
+      hasInvisibleChars: envHasInvis,
       hasQuotes: hasWrappingQuotes(rawEnv),
-      hasWhitespace: hasEnvWhitespace
+      hasWhitespace: hasEnvWhitespace,
+      ...sharedMeta
     };
   }
 
-  if (executor) {
-    const map = await readSettingsRows(executor, ['sync_api_secret_enc', 'sync_api_secret']).catch(
-      () => ({} as Record<string, string>)
-    );
-    const decrypted = decryptServerSecret(map.sync_api_secret_enc || '');
-    if (decrypted) {
-      return {
-        configured: true,
-        source: 'db_encrypted',
-        length: decrypted.length,
-        hasEnvWhitespace,
-        hasQuotes: false,
-        hasWhitespace: /\s/.test(decrypted)
-      };
-    }
-    const rawPlain = map.sync_api_secret;
-    const plain = sanitizeSecretToken(rawPlain);
-    if (plain) {
-      return {
-        configured: true,
-        source: 'db_plain',
-        length: plain.length,
-        hasEnvWhitespace,
-        hasQuotes: hasWrappingQuotes(rawPlain),
-        hasWhitespace: hasInternalOrOuterWhitespace(rawPlain, false)
-      };
-    }
+  if (dbDecrypted) {
+    return {
+      configured: true,
+      source: 'db_encrypted',
+      length: dbDecrypted.length,
+      hasEnvWhitespace,
+      hasLeadingOrTrailingWhitespace: false,
+      hasNewlines: false,
+      hasInvisibleChars: false,
+      hasQuotes: false,
+      hasWhitespace: /\s/.test(dbDecrypted),
+      ...sharedMeta
+    };
   }
 
-  const rawFixed = FIXED_SERVER_CONFIG.syncApiSecret;
-  const fixed = sanitizeSecretToken(rawFixed);
-  if (fixed) {
+  if (dbPlainClean) {
+    return {
+      configured: true,
+      source: 'db_plain',
+      length: dbPlainClean.length,
+      hasEnvWhitespace,
+      hasLeadingOrTrailingWhitespace: dbPlainRaw !== dbPlainRaw.trim(),
+      hasNewlines: /[\r\n]/.test(dbPlainRaw),
+      hasInvisibleChars: hasInvisibleChars(dbPlainRaw),
+      hasQuotes: hasWrappingQuotes(dbPlainRaw),
+      hasWhitespace: hasInternalOrOuterWhitespace(dbPlainRaw, false),
+      ...sharedMeta
+    };
+  }
+
+  if (fixedClean) {
     return {
       configured: true,
       source: 'fixed_config',
-      length: fixed.length,
+      length: fixedClean.length,
       hasEnvWhitespace,
+      hasLeadingOrTrailingWhitespace: typeof rawFixed === 'string' && rawFixed !== rawFixed.trim(),
+      hasNewlines: typeof rawFixed === 'string' && /[\r\n]/.test(rawFixed),
+      hasInvisibleChars: hasInvisibleChars(rawFixed),
       hasQuotes: hasWrappingQuotes(rawFixed),
-      hasWhitespace: hasInternalOrOuterWhitespace(rawFixed, false)
+      hasWhitespace: hasInternalOrOuterWhitespace(rawFixed, false),
+      ...sharedMeta
     };
   }
 
@@ -236,8 +351,96 @@ export async function getSyncSecretDiagnostics(executor?: DbClient): Promise<Syn
     source: 'none',
     length: 0,
     hasEnvWhitespace,
+    hasLeadingOrTrailingWhitespace: envHasLeadTrail,
+    hasNewlines: envHasNewlines,
+    hasInvisibleChars: envHasInvis,
     hasQuotes: false,
-    hasWhitespace: false
+    hasWhitespace: false,
+    ...sharedMeta
+  };
+}
+
+export async function getGasAuthFlowDiagnostics(executor?: DbClient): Promise<GasAuthFlowDiagnostics> {
+  const secret = await getSyncSecretDiagnostics(executor);
+  const envGasUrl = sanitizeSecretToken(process.env.GAS_WEBAPP_URL);
+  const fixedGasUrl = sanitizeSecretToken(FIXED_SERVER_CONFIG.gasWebAppUrl);
+  let dbGasUrl = '';
+  let dbMode: FixedConnectionMode = '';
+
+  if (executor) {
+    const map = await readSettingsRows(executor, ['connection_mode', 'gas_webapp_url']).catch(
+      () => ({} as Record<string, string>)
+    );
+    dbMode = normalizeMode(map.connection_mode);
+    dbGasUrl = sanitizeSecretToken(map.gas_webapp_url);
+  }
+
+  const gasUrlSource: 'db' | 'env' | 'fixed_config' | 'none' =
+    dbMode === 'sandbox'
+      ? 'none'
+      : (dbGasUrl ? 'db' : (envGasUrl ? 'env' : (fixedGasUrl ? 'fixed_config' : 'none')));
+  const activeUrlRaw =
+    dbMode === 'sandbox' ? '' : (dbGasUrl || envGasUrl || fixedGasUrl);
+
+  const activeCheck = activeUrlRaw ? normalizeAndValidateGasTarget(activeUrlRaw) : null;
+  const normEnvUrl = envGasUrl ? normalizeAndValidateGasTarget(envGasUrl).normalized : '';
+  const normDbUrl = dbGasUrl ? normalizeAndValidateGasTarget(dbGasUrl).normalized : '';
+  const envVsDbUrlConflict = Boolean(normEnvUrl && normDbUrl && normEnvUrl !== normDbUrl);
+
+  let host = '';
+  if (activeCheck?.normalized) {
+    try {
+      host = new URL(activeCheck.normalized).hostname;
+    } catch {
+      host = '';
+    }
+  }
+
+  return {
+    secret,
+    gasUrl: {
+      configured: Boolean(activeUrlRaw),
+      source: gasUrlSource,
+      valid: Boolean(activeCheck?.valid),
+      wasNormalized: Boolean(activeCheck?.valid && activeCheck.normalized !== activeUrlRaw),
+      validationError: activeCheck && !activeCheck.valid ? String(activeCheck.message || 'INVALID_GAS_URL') : '',
+      host,
+      deploymentIdHint: extractDeploymentIdHint(activeCheck?.normalized || activeUrlRaw),
+      envPresent: Boolean(envGasUrl),
+      dbPresent: Boolean(dbGasUrl),
+      fixedPresent: Boolean(fixedGasUrl),
+      envVsDbConflict: envVsDbUrlConflict
+    },
+    environment: (() => {
+      const vercelFlag = String(process.env.VERCEL || '').trim().toLowerCase();
+      const vercelEnvRaw = String(process.env.VERCEL_ENV || '').trim();
+      const kService = String(process.env.K_SERVICE || '').trim();
+      const kRev = String(process.env.K_REVISION || '').trim();
+      const cloudRunJob = String(process.env.CLOUD_RUN_JOB || '').trim();
+      const nodeEnv = String(process.env.NODE_ENV || '').trim() || 'development';
+      const isVercel = vercelFlag === '1' || vercelFlag === 'true' || Boolean(vercelEnvRaw) || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) || Boolean(process.env.VERCEL_URL);
+      const isCloudRun = Boolean(kService || kRev || cloudRunJob);
+      const runtimePlatform: 'vercel' | 'cloud_run' | 'node_production' | 'local' = isVercel
+        ? 'vercel'
+        : (isCloudRun ? 'cloud_run' : (nodeEnv === 'production' ? 'node_production' : 'local'));
+      const resolvedEnvLabel = vercelEnvRaw || (isVercel ? 'vercel' : (isCloudRun ? 'cloud-run' : (nodeEnv === 'production' ? 'production' : 'local')));
+      return {
+        isVercel,
+        isCloudRun,
+        runtimePlatform,
+        nodeEnv,
+        vercelEnv: resolvedEnvLabel,
+        region: String(process.env.VERCEL_REGION || process.env.CLOUD_RUN_REGION || process.env.FUNCTION_REGION || '').trim(),
+        hasRgEncryptionKey: Boolean(String(process.env.RG_ENCRYPTION_KEY || '').trim()),
+        resolvedMode: dbMode || normalizeMode(FIXED_SERVER_CONFIG.mode || process.env.CONNECTION_MODE) || (getDatabaseUrl() ? 'neon' : '')
+      };
+    })(),
+    requestContract: {
+      sendMethod: 'POST (manual 302 redirect follow for script.googleusercontent.com)',
+      sendContentType: 'text/plain;charset=utf-8',
+      sendLocation: 'JSON body.payload.syncSecret (+ correlationId)',
+      gasAcceptedLocations: ['payload.syncSecret', 'body.syncSecret', 'params.syncSecret']
+    }
   };
 }
 

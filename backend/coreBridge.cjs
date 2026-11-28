@@ -2474,6 +2474,7 @@
 
   var SECTION_VIEW_PERMISSION_KEYS = [
     'view_customers',
+    'view_knowledge_base',
     'view_reservations',
     'view_my_followups',
     'view_team_followups',
@@ -2523,6 +2524,7 @@
   var ROUTE_PERMISSION_MAP = {
     dashboard: 'view_dashboard',
     customers: 'view_customers',
+    'knowledge-base': 'view_knowledge_base',
     reservations: 'view_reservations',
     'my-followups': 'view_my_followups',
     'team-followups': 'view_team_followups',
@@ -2543,6 +2545,8 @@
     'edit_customer_note', 'delete_customer_note', 'change_customer_note_status', 'assign_customer_note',
     'manage_customer_note_statuses', 'manage_customer_notes_settings', 'manage_customer_notes_buttons',
     'view_customer_note_history', 'export_customer_notes',
+    'kb_manage_companies', 'kb_manage_policies', 'kb_manage_faqs', 'kb_manage_quick_replies',
+    'kb_publish_content', 'kb_delete_content',
     'create_problem', 'update_problem', 'delete_reservations', 'view_employees', 'manage_employees',
     'view_all_logs', 'sync_data', 'manage_api_connection', 'manage_settings',
     'manage_role_ui_defaults', 'customize_ui', 'manage_announcements', 'manage_developer_tools', 'export_reports'
@@ -2560,6 +2564,7 @@
       'edit_customer_details', 'view_customer_notes', 'view_all_customer_notes', 'add_customer_note',
       'edit_customer_note', 'change_customer_note_status', 'assign_customer_note',
       'view_customer_note_history', 'export_customer_notes',
+      'kb_manage_companies', 'kb_manage_policies', 'kb_manage_faqs', 'kb_manage_quick_replies', 'kb_publish_content',
       'create_problem', 'update_problem', 'view_employees', 'view_all_logs',
       'sync_data', 'export_reports'
     ]),
@@ -2568,9 +2573,10 @@
     ].concat(DASHBOARD_PERMISSION_KEYS).concat(ACTION_BUTTON_PERMISSION_KEYS.filter(function (ak) {
       return ak !== 'act_customer_id_lookup' && ak !== 'act_edit_customer';
     })).concat([
-      'view_customers', 'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
+      'view_customers', 'view_knowledge_base', 'view_reservations', 'view_my_followups', 'view_team_followups', 'view_problems', 'view_reports', 'view_activity',
       'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab', 'sub_view_myfu_mentions', 'sub_view_myfu_history',
       'sub_view_prb_rates', 'sub_view_rep_charts', 'sub_view_cust_dashboard', 'sub_view_cust_complaints', 'sub_view_cust_timeline',
+      'kb_manage_faqs', 'kb_manage_quick_replies',
       'pull_reservations', 'add_followup', 'add_customer_note', 'claim_reservation', 'unclaim_reservation',
       'quick_update_status', 'create_problem', 'update_problem', 'export_reports'
     ])
@@ -2579,6 +2585,7 @@
   var PERMISSIONS_CATALOG = [
     { key: 'view_dashboard', label: 'عرض قسم: لوحة التحكم والإحصائيات', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_customers', label: 'عرض قسم: إدارة العملاء وملفاتهم', group: 'إظهار وإخفاء الأقسام والصفحات' },
+    { key: 'view_knowledge_base', label: 'عرض قسم: مركز المعرفة (Knowledge Base)', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_reservations', label: 'عرض قسم: الحجوزات', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_my_followups', label: 'عرض قسم: متابعاتي', group: 'إظهار وإخفاء الأقسام والصفحات' },
     { key: 'view_team_followups', label: 'عرض قسم: متابعات الفريق', group: 'إظهار وإخفاء الأقسام والصفحات' },
@@ -2643,6 +2650,12 @@
     { key: 'manage_customer_notes_buttons', label: 'التحكم في أزرار وقواعد ملاحظات العملاء', group: 'ملاحظات العملاء' },
     { key: 'view_customer_note_history', label: 'عرض سجل تعديلات ملاحظات العملاء', group: 'ملاحظات العملاء' },
     { key: 'export_customer_notes', label: 'تصدير وطباعة ملاحظات العملاء', group: 'ملاحظات العملاء' },
+    { key: 'kb_manage_companies', label: 'إضافة وتعديل شركات التأجير والفروع', group: 'مركز المعرفة' },
+    { key: 'kb_manage_policies', label: 'إضافة وتعديل السياسات والشروط', group: 'مركز المعرفة' },
+    { key: 'kb_manage_faqs', label: 'إضافة وتعديل الأسئلة الشائعة', group: 'مركز المعرفة' },
+    { key: 'kb_manage_quick_replies', label: 'إضافة وتعديل الردود الجاهزة', group: 'مركز المعرفة' },
+    { key: 'kb_publish_content', label: 'نشر وأرشفة محتوى مركز المعرفة', group: 'مركز المعرفة' },
+    { key: 'kb_delete_content', label: 'حذف سجلات مركز المعرفة', group: 'مركز المعرفة' },
     { key: 'add_followup', label: 'إضافة متابعات وملاحظات', group: 'المتابعات' },
     { key: 'edit_any_followup', label: 'تعديل متابعات وتحديثات الفريق', group: 'المتابعات' },
     { key: 'assign_employees', label: 'إسناد وإزالة الموظفين عن الحجوزات', group: 'الإشراف' },
@@ -2693,7 +2706,7 @@
         'dash_view_hero_kpis', 'dash_view_strip_kpis', 'dash_view_daily_chart',
         'dash_view_recent_activity', 'dash_view_charts_grid', 'dash_view_radar',
         'dash_view_heatmap', 'dash_view_leaderboard', 'dash_view_bottom_bento',
-        'view_customers', 'view_reservations', 'view_reports', 'view_activity',
+        'view_customers', 'view_knowledge_base', 'view_reservations', 'view_reports', 'view_activity',
         'sub_view_today_tab', 'sub_view_radar_tab', 'sub_view_rejected_tab', 'sub_view_cancelled_tab',
         'sub_view_prb_rates', 'sub_view_rep_charts', 'sub_view_cust_dashboard', 'sub_view_cust_complaints', 'sub_view_cust_timeline',
         'view_all_reservations', 'view_employees', 'view_all_logs', 'export_reports'
@@ -2776,6 +2789,7 @@
 
   var UI_ROUTE_HIDE_KEYS = {
     customers: 'hideNavCustomers',
+    'knowledge-base': 'hideNavKnowledgeBase',
     'team-followups': 'hideNavTeamFollowups',
     problems: 'hideNavProblems',
     reports: 'hideNavReports',
@@ -2993,6 +3007,7 @@
       items: [
         { key: 'view_dashboard', routeId: 'dashboard', labelAr: 'لوحة التحكم والإحصائيات', labelEn: 'Dashboard & KPIs' },
         { key: 'view_customers', routeId: 'customers', labelAr: 'إدارة العملاء وملفاتهم', labelEn: 'Customers Management' },
+        { key: 'view_knowledge_base', routeId: 'knowledge-base', labelAr: 'مركز المعرفة (Knowledge Base)', labelEn: 'Knowledge Base' },
         { key: 'view_reservations', routeId: 'reservations', labelAr: 'الحجوزات', labelEn: 'Reservations' },
         { key: 'view_my_followups', routeId: 'my-followups', labelAr: 'متابعاتي', labelEn: 'My Follow-Ups' },
         { key: 'view_team_followups', routeId: 'team-followups', labelAr: 'متابعات الفريق', labelEn: 'Team Follow-Ups' },
@@ -4593,12 +4608,34 @@
     getAnnouncements: { cacheable: true, ttlMs: 15000, scope: 'announcements' },
     getDelegations: { cacheable: true, ttlMs: 30000, scope: 'employees' },
     getReservationLocks: { cacheable: false, ttlMs: 0, scope: 'reservations' },
-    getDeltaSync: { cacheable: false, ttlMs: 0, scope: 'sync' }
+    getDeltaSync: { cacheable: false, ttlMs: 0, scope: 'sync' },
+    getKnowledgeBaseDashboard: { cacheable: true, ttlMs: 30000, scope: 'knowledgeBase' },
+    getKbCompanies: { cacheable: true, ttlMs: 30000, scope: 'knowledgeBase' },
+    getKbBranches: { cacheable: true, ttlMs: 30000, scope: 'knowledgeBase' },
+    getKbPolicies: { cacheable: true, ttlMs: 30000, scope: 'knowledgeBase' },
+    getKbFaqs: { cacheable: true, ttlMs: 30000, scope: 'knowledgeBase' },
+    getKbQuickReplies: { cacheable: true, ttlMs: 30000, scope: 'knowledgeBase' },
+    searchKnowledgeBase: { cacheable: false, ttlMs: 0, scope: 'knowledgeBase' },
+    getKbAuditHistory: { cacheable: false, ttlMs: 0, scope: 'knowledgeBase' },
+    exportKbBackup: { cacheable: false, ttlMs: 0, scope: 'knowledgeBase' }
   };
 
   var MUTATION_INVALIDATIONS = {
     login: ['*'],
     logout: ['*'],
+    saveKbCompany: ['knowledgeBase', 'activity'],
+    deleteKbCompany: ['knowledgeBase', 'activity'],
+    saveKbBranch: ['knowledgeBase', 'activity'],
+    deleteKbBranch: ['knowledgeBase', 'activity'],
+    saveKbPolicy: ['knowledgeBase', 'activity'],
+    deleteKbPolicy: ['knowledgeBase', 'activity'],
+    recordKbPolicyView: ['knowledgeBase'],
+    saveKbFaq: ['knowledgeBase', 'activity'],
+    deleteKbFaq: ['knowledgeBase', 'activity'],
+    recordKbFaqUsage: ['knowledgeBase'],
+    saveKbQuickReply: ['knowledgeBase', 'activity'],
+    deleteKbQuickReply: ['knowledgeBase', 'activity'],
+    recordKbQuickReplyUsage: ['knowledgeBase'],
     createCustomer: ['customers', 'dashboard', 'activity', 'reports'],
     updateCustomerProfile: ['customers', 'reservations', 'dashboard', 'activity', 'reports'],
     addCustomerNote: ['customers', 'reservations', 'problems', 'followUps', 'notifications', 'activity'],
@@ -9301,13 +9338,27 @@
     getSettings: true,
     getSyncStatus: true,
     getTriggerStatus: true,
+    getOutboxCleanupPreview: true,
+    getSheetsSyncControlStatus: true,
     getAnnouncements: true,
     getDelegations: true,
     getReservationLocks: true,
     getDeltaSync: true,
     heartbeatReservationLock: true,
     releaseReservationLock: true,
-    saveUserLayoutPrefs: true
+    saveUserLayoutPrefs: true,
+    getKnowledgeBaseDashboard: true,
+    getKbCompanies: true,
+    getKbBranches: true,
+    getKbPolicies: true,
+    getKbFaqs: true,
+    getKbQuickReplies: true,
+    searchKnowledgeBase: true,
+    getKbAuditHistory: true,
+    exportKbBackup: true,
+    recordKbPolicyView: true,
+    recordKbFaqUsage: true,
+    recordKbQuickReplyUsage: true
   };
 
   function evaluateSpamGuard(stateObj, action, signature, opts) {
@@ -9742,7 +9793,7 @@
     return visible ? 'إخفاء مؤشر نسبة المشكلات' : 'إظهار مؤشر نسبة المشكلات';
   }
 
-  var NAV_ROUTE_IDS = ['dashboard', 'customers', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
+  var NAV_ROUTE_IDS = ['dashboard', 'customers', 'knowledge-base', 'reservations', 'my-followups', 'team-followups', 'problems', 'reports', 'employees', 'activity', 'settings'];
   var PROTECTED_NAV_ROUTES = ['dashboard', 'settings'];
 
   var DASHBOARD_SECTION_DEFS = [

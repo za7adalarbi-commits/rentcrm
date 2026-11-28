@@ -6,6 +6,8 @@ import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
 import * as dataIntegrity from './dataIntegrity.js';
 import * as integrityService from './integrityService.js';
 import * as healthCenter from './healthCenter.js';
+import * as kbService from './kbService.js';
+import * as outboxPreview from './outboxPreviewService.js';
 import * as queries from './queries.js';
 
 export interface CrmApiResponse<T = any> {
@@ -383,6 +385,27 @@ export async function dispatchCrmRequest(
       case 'verifyGasMirrorAuth':
         result = await healthCenter.verifyGasMirrorAuthAction(executor, session);
         break;
+      case 'probeGasSheetsMirror':
+        result = await healthCenter.probeGasSheetsMirrorAction(executor, session, payload);
+        break;
+      case 'testOutboxSingleUpsert':
+        result = await healthCenter.testOutboxSingleUpsertAction(executor, session, payload);
+        break;
+      case 'testOutboxThreeWaySuite':
+        result = await healthCenter.testOutboxThreeWaySuiteAction(executor, session, payload);
+        break;
+      case 'verifyGasFrozenRowsProtection':
+        result = await healthCenter.verifyGasFrozenRowsProtectionAction(executor, session);
+        break;
+      case 'backfillOutboxIdempotencyKeys':
+        result = await healthCenter.backfillOutboxIdempotencyKeysAction(executor, session);
+        break;
+      case 'getOutboxCleanupPreview':
+        result = await outboxPreview.getOutboxCleanupPreview(executor, session, payload);
+        break;
+      case 'getSheetsSyncControlStatus':
+        result = await outboxPreview.getSheetsSyncControlStatus(executor, session);
+        break;
       case 'getCustomers':
         result = await queries.getCustomers(executor, session, payload);
         break;
@@ -439,6 +462,72 @@ export async function dispatchCrmRequest(
         break;
       case 'getCustomerNoteHistory':
         result = await queries.getCustomerNoteHistory(executor, session, payload);
+        break;
+      case 'getKnowledgeBaseDashboard':
+        result = await kbService.getKnowledgeBaseDashboard(executor, session);
+        break;
+      case 'getKbCompanies':
+        result = await kbService.getKbCompanies(executor, session, payload);
+        break;
+      case 'saveKbCompany':
+        result = await kbService.saveKbCompany(executor, session, payload);
+        break;
+      case 'deleteKbCompany':
+        result = await kbService.deleteKbCompany(executor, session, payload);
+        break;
+      case 'getKbBranches':
+        result = await kbService.getKbBranches(executor, session, payload);
+        break;
+      case 'saveKbBranch':
+        result = await kbService.saveKbBranch(executor, session, payload);
+        break;
+      case 'deleteKbBranch':
+        result = await kbService.deleteKbBranch(executor, session, payload);
+        break;
+      case 'getKbPolicies':
+        result = await kbService.getKbPolicies(executor, session, payload);
+        break;
+      case 'saveKbPolicy':
+        result = await kbService.saveKbPolicy(executor, session, payload);
+        break;
+      case 'deleteKbPolicy':
+        result = await kbService.deleteKbPolicy(executor, session, payload);
+        break;
+      case 'recordKbPolicyView':
+        result = await kbService.recordKbPolicyView(executor, session, payload);
+        break;
+      case 'getKbFaqs':
+        result = await kbService.getKbFaqs(executor, session, payload);
+        break;
+      case 'saveKbFaq':
+        result = await kbService.saveKbFaq(executor, session, payload);
+        break;
+      case 'deleteKbFaq':
+        result = await kbService.deleteKbFaq(executor, session, payload);
+        break;
+      case 'recordKbFaqUsage':
+        result = await kbService.recordKbFaqUsage(executor, session, payload);
+        break;
+      case 'getKbQuickReplies':
+        result = await kbService.getKbQuickReplies(executor, session, payload);
+        break;
+      case 'saveKbQuickReply':
+        result = await kbService.saveKbQuickReply(executor, session, payload);
+        break;
+      case 'deleteKbQuickReply':
+        result = await kbService.deleteKbQuickReply(executor, session, payload);
+        break;
+      case 'recordKbQuickReplyUsage':
+        result = await kbService.recordKbQuickReplyUsage(executor, session, payload);
+        break;
+      case 'searchKnowledgeBase':
+        result = await kbService.searchKnowledgeBase(executor, session, payload);
+        break;
+      case 'getKbAuditHistory':
+        result = await kbService.getKbAuditHistory(executor, session, payload);
+        break;
+      case 'exportKbBackup':
+        result = await kbService.exportKbBackup(executor, session);
         break;
       default:
         return {
@@ -505,7 +594,7 @@ export async function dispatchCrmRequest(
   } catch (err: any) {
     const msg = String(err?.message || 'حدث خطأ غير متوقع.');
     const errorCode = msg.includes(':') ? msg.split(':')[0].trim() : 'SERVER_ERROR';
-    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA|RATE_LIMITED|DUPLICATE_SUBMISSION|SYNC_IN_PROGRESS)/.test(errorCode);
+    const isExpectedClientErr = /^(UNAUTHORIZED|FORBIDDEN|VALIDATION_ERROR|NOT_FOUND|INVALID_CREDENTIALS|ACCOUNT_DISABLED|DUPLICATE_USERNAME|DUPLICATE_ENTRY|NO_RG_TOKEN|DATABASE_CONNECTION_ERROR|CONFLICT_STALE_DATA|RATE_LIMITED|DUPLICATE_SUBMISSION|SYNC_IN_PROGRESS)/.test(errorCode);
     if (!isExpectedClientErr) {
       await logBackendError(executor, 'router', action, err, { payload });
     }

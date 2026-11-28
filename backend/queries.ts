@@ -57,7 +57,9 @@ import {
   pullFromRentalGateDirect,
   readWorkerStateRow,
   retryFailedSyncRecords,
-  sanitizeExcludedStatusesList
+  sanitizeExcludedStatusesList,
+  triggerGasIncrementalSyncAction,
+  callGasMirrorAction
 } from './syncService.js';
 import {
   backfillCustomersFromReservations,
@@ -5025,14 +5027,9 @@ export async function deleteAllReservations(
       scopeInfo.scope === 'all' ? 'حذف جميع الحجوزات' : `حذف حجوزات (${scopeInfo.periodLabelAr})`,
       'Reservation',
       scopeEntityKey,
-      `حذف حجوزات (${scopeInfo.periodLabelAr}) نهائياً (${deletedCount} حجز) بواسطة ${session.user.name}`
+      `حذف حجوزات (${scopeInfo.periodLabelAr}) نهائياً (${deletedCount} حجز) بواسطة ${session.user.name} (مع حماية نسخة Google Sheets من الحذف الشامل)`
     );
-    await enqueueSheetsMirror(tx, 'Reservation', scopeEntityKey, 'deleteAllReservations', {
-      deletedBy: session.user.name,
-      deletedCount,
-      scope: scopeInfo.scope,
-      periodLabel: scopeInfo.periodLabelAr
-    });
+    // Security & Mirror Protection: NEVER enqueue deleteAllReservations into Google Sheets mirror Outbox.
 
     return {
       deleted: true,
@@ -5042,12 +5039,12 @@ export async function deleteAllReservations(
       ym: scopeInfo.ym,
       periodLabelAr: scopeInfo.periodLabelAr,
       deletedReservationsCount: deletedCount,
+      sheetsMirrorProtected: true,
       exportedRows: targets
     };
   });
 
   facetsCacheByExec.delete(executor);
-  void flushSheetsMirrorOutbox(executor).catch(() => undefined);
   return out;
 }
 
@@ -5623,29 +5620,8 @@ export async function pullOrSyncReservations(
   // Fallback delegation to Google Apps Script Web App if configured in DB or env
   const gasUrl = str(serverCfg.gasWebAppUrl);
   if (gasUrl) {
-    const syncSecret = await ensureSyncApiSecret(executor, session.user.name);
-    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 50000) : null;
-    try {
-      const resp = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        signal: ctrl?.signal,
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'triggerNeonIncrementalSync',
-          payload: { syncSecret, ...rangePayload, actor: { id: session.user.id, name: session.user.name, role: session.user.role } }
-        })
-      });
-      const text = await resp.text();
-      const parsed = safeParseGasJson(text, resp.status);
-      if (!parsed?.success) {
-        throw new Error(parsed?.message || 'فشلت المزامنة عبر Google Apps Script.');
-      }
-      return parsed.data;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    await ensureSyncApiSecret(executor, session.user.name);
+    return triggerGasIncrementalSyncAction(executor, session.user, rangePayload);
   }
 
   throw new Error('NO_RG_TOKEN: يرجى ضبط متغير RG_TOKEN أو GAS_WEBAPP_URL في إعدادات بيئة الخادم (.env / Vercel).');
@@ -5700,36 +5676,28 @@ export async function saveGlobalConnectionSettings(
   let autoBindMessage = '';
 
   if (gasUrl) {
-    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000) : null;
     try {
-      const resp = await fetch(gasUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        signal: ctrl?.signal,
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'autoBindFromServer',
-          payload: {
-            syncSecret,
-            neonSyncUrl,
-            rgToken: serverCfg.rgToken || '',
-            autoEveryMinute: true
-          }
-        })
-      });
-      const text = await resp.text();
-      const parsed = safeParseGasJson(text, resp.status);
-      if (resp.ok && parsed && parsed.success) {
+      const bindDispatch = await callGasMirrorAction(
+        executor,
+        'autoBindFromServer',
+        {
+          neonSyncUrl,
+          rgToken: serverCfg.rgToken || '',
+          autoEveryMinute: true
+        },
+        fetch,
+        8000
+      );
+      const callRes = bindDispatch.callRes;
+      const parsed = callRes?.parsed;
+      if (callRes?.httpOk && parsed && parsed.success) {
         autoBoundGas = true;
         autoBindMessage = 'تم حفظ الرابط في القاعدة وربط Google Apps Script تلقائيًا للجميع.';
       } else {
-        autoBindMessage = str(parsed?.message || 'تم حفظ الرابط في القاعدة. لإكمال الربط التلقائي مع Apps Script احفظ RG_TOKEN أولًا أو نفّذ setNeonSyncProperties.');
+        autoBindMessage = str(bindDispatch.missingConfigError || bindDispatch.urlError || callRes?.errorMessage || parsed?.message || 'تم حفظ الرابط في القاعدة. لإكمال الربط التلقائي مع Apps Script احفظ RG_TOKEN أولًا أو نفّذ setNeonSyncProperties.');
       }
     } catch (err: any) {
       autoBindMessage = `تم حفظ الرابط عالميًا لكل المستخدمين؛ تعذر الوصول التلقائي لـ Apps Script حاليًا (${str(err?.message || 'NETWORK')}).`;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   } else {
     autoBindMessage = 'تم مسح رابط Apps Script العام من إعدادات الخادم.';
@@ -5774,20 +5742,17 @@ export async function saveApiToken(executor: DbExecutor, session: AuthSession, p
   const neonSyncUrl = rawOrigin ? `${rawOrigin}/api/sync` : '';
 
   if (gasUrl && syncSecret) {
-    await fetch(gasUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'autoBindFromServer',
-        payload: {
-          syncSecret,
-          neonSyncUrl,
-          rgToken: rawToken,
-          autoEveryMinute: true
-        }
-      })
-    }).catch(() => undefined);
+    await callGasMirrorAction(
+      executor,
+      'autoBindFromServer',
+      {
+        neonSyncUrl,
+        rgToken: rawToken,
+        autoEveryMinute: true
+      },
+      fetch,
+      8000
+    ).catch(() => undefined);
   }
 
   let connection: any = null;

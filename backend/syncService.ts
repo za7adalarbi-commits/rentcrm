@@ -23,7 +23,14 @@ import {
   rgFetchWithRetry,
   validateRgToken
 } from './rgApiClient.js';
-import { buildRentalGateEndpointUrl, normalizeRgApiBaseUrl, resolveServerConfig } from './serverConfig.js';
+import { isAllowedGasRedirectHost, normalizeAndValidateGasTarget } from './gasProxy.js';
+import {
+  buildRentalGateEndpointUrl,
+  getGasAuthFlowDiagnostics,
+  normalizeRgApiBaseUrl,
+  resolveServerConfig,
+  type GasAuthFlowDiagnostics
+} from './serverConfig.js';
 import { upsertCustomersFromReservationsTx } from './customerHelpers.js';
 
 export { buildRgHttpError };
@@ -2164,31 +2171,69 @@ function buildOutboxIdempotencyKey(
   return `${entityType}:${entityId}:${action}:${digest}`;
 }
 
+export const OUTBOX_CANONICAL_STATUSES = ['pending', 'processing', 'retry', 'completed', 'dead_letter'] as const;
+export const OUTBOX_DEFAULT_BATCH_SIZE = 8;
+export const OUTBOX_MAX_BATCH_SIZE = 10;
+export const OUTBOX_DEFAULT_EXECUTION_BUDGET_MS = 22000;
+
+export function computeOutboxBackoffSeconds(retryCount: number, randomVal: number = Math.random()): number {
+  const safeCount = Math.max(1, Math.floor(Number(retryCount) || 1));
+  const base = Math.min(1800, Math.pow(2, safeCount) * 15);
+  const clampedRand = Math.max(0, Math.min(0.9999, Number.isFinite(randomVal) ? randomVal : 0.5));
+  const maxJitter = Math.max(5, Math.floor(base * 0.25));
+  const jitter = Math.floor(clampedRand * maxJitter);
+  return base + jitter;
+}
+
 export async function enqueueSheetsMirror(
   client: DbClient,
   entityType: string,
   entityId: string,
   action: string,
   payload: Record<string, any>
-): Promise<void> {
-  const idempotencyKey = buildOutboxIdempotencyKey(entityType, entityId, action, payload);
+): Promise<{ enqueued: boolean; blocked?: boolean; reason?: string; outboxId?: string }> {
+  const cleanAction = str(action);
+  // Mandatory protection: NEVER auto-enqueue deleteAllReservations or bulk-wipe operations into Google Sheets Outbox
+  if (cleanAction === 'deleteAllReservations' || /^bulk.*delete/i.test(cleanAction)) {
+    return {
+      enqueued: false,
+      blocked: true,
+      reason: 'BLOCKED_BULK_DELETE: عملية الحذف الشامل محظورة على مرآة Google Sheets لحماية البيانات الاحتياطية.'
+    };
+  }
+  const idempotencyKey = buildOutboxIdempotencyKey(entityType, entityId, cleanAction, payload);
+  const outboxId = generateId('MIR');
+  const correlationId = str(payload?.correlationId);
   await runWithSavepoint(
     client,
     'enqueue_sheets_mirror',
     async () => {
       await client.query(
         `INSERT INTO sheets_mirror_outbox (
-           id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, idempotency_key, created_at
-         ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), $6, NOW())
+           id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, idempotency_key, correlation_id, created_at
+         ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), $6, $7, NOW())
          ON CONFLICT (idempotency_key) WHERE COALESCE(idempotency_key, '') <> ''
          DO UPDATE SET
            payload = EXCLUDED.payload,
+           correlation_id = COALESCE(NULLIF(EXCLUDED.correlation_id, ''), sheets_mirror_outbox.correlation_id),
            updated_at = NOW()`,
-        [generateId('MIR'), entityType, entityId, action, JSON.stringify(payload || {}), idempotencyKey]
-      );
+        [outboxId, entityType, entityId, cleanAction, JSON.stringify(payload || {}), idempotencyKey, correlationId]
+      ).catch(async () => {
+        await client.query(
+          `INSERT INTO sheets_mirror_outbox (
+             id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, idempotency_key, created_at
+           ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), $6, NOW())
+           ON CONFLICT (idempotency_key) WHERE COALESCE(idempotency_key, '') <> ''
+           DO UPDATE SET
+             payload = EXCLUDED.payload,
+             updated_at = NOW()`,
+          [outboxId, entityType, entityId, cleanAction, JSON.stringify(payload || {}), idempotencyKey]
+        );
+      });
     },
     undefined
   );
+  return { enqueued: true, outboxId };
 }
 
 export interface OutboxErrorClassification {
@@ -2198,13 +2243,29 @@ export interface OutboxErrorClassification {
 
 export function classifyOutboxMirrorError(errMessage: unknown, httpStatus = 0): OutboxErrorClassification {
   const msg = String(errMessage || '');
-  if (httpStatus === 401 || httpStatus === 403 || /UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN/i.test(msg)) {
+  if (
+    httpStatus === 401 ||
+    httpStatus === 403 ||
+    /UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|HTTP_401|HTTP_403|INVALID_SECRET|غير صالح|غير متطابق|مفتاح المزامنة|accounts\.google\.com|ServiceLogin/i.test(msg)
+  ) {
     return { permanent: true, category: 'auth' };
   }
-  if (/non-frozen/i.test(msg)) {
+  if (/non-frozen|delete all non-frozen|الصفوف المجمدة|cannot delete all/i.test(msg)) {
     return { permanent: true, category: 'sheet_frozen' };
   }
-  if (httpStatus === 400 || /VALIDATION_ERROR|INVALID_GAS_URL|BLOCKED_BULK_DELETE/i.test(msg)) {
+  if (
+    httpStatus === 408 ||
+    httpStatus === 504 ||
+    /AbortError|TimeoutError|LOCK_TIMEOUT_RECOVERED|operation was aborted|This operation was aborted|timeout|ETIMEDOUT|aborted/i.test(msg)
+  ) {
+    return { permanent: false, category: 'timeout' };
+  }
+  if (
+    httpStatus === 400 ||
+    httpStatus === 404 ||
+    httpStatus === 422 ||
+    /VALIDATION_ERROR|INVALID_GAS_URL|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|GAS_NOT_FOUND|HTTP_400|HTTP_404|HTTP_422/i.test(msg)
+  ) {
     return { permanent: true, category: 'validation' };
   }
   if (httpStatus === 429 || /RATE_LIMIT|TOO MANY REQUESTS/i.test(msg)) {
@@ -2213,13 +2274,124 @@ export function classifyOutboxMirrorError(errMessage: unknown, httpStatus = 0): 
   if (httpStatus >= 500 || /GAS HTTP 5\d{2}/i.test(msg)) {
     return { permanent: false, category: 'upstream_5xx' };
   }
-  if (/AbortError|timeout|ETIMEDOUT|aborted/i.test(msg)) {
-    return { permanent: false, category: 'timeout' };
-  }
   if (/ECONN|ENOTFOUND|FETCH|NETWORK/i.test(msg)) {
     return { permanent: false, category: 'network' };
   }
   return { permanent: false, category: 'unknown' };
+}
+
+export interface DetailedOutboxError {
+  errorName: string;
+  errorMessage: string;
+  formattedMessage: string;
+  errorStack: string;
+  httpStatus: number;
+  responseBody: string;
+  correlationId: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  timestamp: string;
+}
+
+export function extractDetailedOutboxError(
+  err: unknown,
+  ctx: {
+    httpStatus?: number;
+    responseBody?: string;
+    correlationId?: string;
+    action?: string;
+    entityType?: string;
+    entityId?: string;
+    timestamp?: string;
+  } = {}
+): DetailedOutboxError {
+  const timestamp = ctx.timestamp || new Date().toISOString();
+  const action = str(ctx.action);
+  const entityType = str(ctx.entityType);
+  const entityId = str(ctx.entityId);
+  const correlationId = str(ctx.correlationId);
+
+  let errorName = 'Error';
+  let rawMessage = '';
+  let rawStack = '';
+  let derivedStatus = Number(ctx.httpStatus || 0);
+  let derivedBody = str(ctx.responseBody);
+
+  if (err instanceof Error) {
+    errorName = str(err.name) || 'Error';
+    rawMessage = str(err.message);
+    rawStack = str(err.stack);
+    const anyErr = err as any;
+    if (!derivedStatus && Number.isFinite(Number(anyErr.httpStatus || anyErr.statusCode || anyErr.status))) {
+      derivedStatus = Number(anyErr.httpStatus || anyErr.statusCode || anyErr.status);
+    }
+    if (!derivedBody && (anyErr.responseBody || anyErr.rawText)) {
+      derivedBody = str(anyErr.responseBody || anyErr.rawText);
+    }
+  } else if (typeof err === 'string') {
+    errorName = 'StringError';
+    rawMessage = err.trim();
+  } else if (err && typeof err === 'object') {
+    const anyObj = err as Record<string, any>;
+    const explicitName = str(anyObj.name || anyObj.errorName);
+    const codeName = typeof anyObj.code === 'string' && !/^\d+$/.test(anyObj.code.trim()) ? str(anyObj.code) : '';
+    errorName = explicitName || codeName || 'ObjectError';
+    rawMessage = str(anyObj.message || anyObj.error || anyObj.reason);
+    rawStack = str(anyObj.stack);
+    if (!derivedStatus && Number.isFinite(Number(anyObj.httpStatus || anyObj.statusCode || anyObj.status || anyObj.code))) {
+      derivedStatus = Number(anyObj.httpStatus || anyObj.statusCode || anyObj.status || anyObj.code);
+    }
+    if (!derivedBody && (anyObj.responseBody || anyObj.rawText || anyObj.body)) {
+      derivedBody = str(anyObj.responseBody || anyObj.rawText || anyObj.body);
+    }
+    if (!rawMessage) {
+      try {
+        rawMessage = JSON.stringify(anyObj);
+      } catch {
+        rawMessage = Object.prototype.toString.call(anyObj);
+      }
+    }
+  } else if (err === null) {
+    errorName = 'NullException';
+    rawMessage = `UNSPECIFIED_OUTBOX_ERROR (NON_ERROR_THROWN: null${action ? ` on ${action}` : ''})`;
+  } else if (err === undefined) {
+    errorName = 'UndefinedException';
+    rawMessage = `UNSPECIFIED_OUTBOX_ERROR (NON_ERROR_THROWN: undefined${action ? ` on ${action}` : ''})`;
+  } else {
+    errorName = typeof err;
+    rawMessage = String(err);
+  }
+
+  const cleanMsg = redactSensitiveText(rawMessage || `${errorName}: empty failure detail`).slice(0, 320);
+  const cleanStack = redactSensitiveText(rawStack).slice(0, 600);
+  const cleanBody = redactSensitiveText(derivedBody).slice(0, 500);
+  const ctxTags = [
+    derivedStatus > 0 ? `HTTP ${derivedStatus}` : '',
+    correlationId ? `cid=${correlationId}` : '',
+    action ? `action=${action}` : ''
+  ].filter(Boolean).join(' · ');
+
+  const prefix = errorName && !cleanMsg.toLowerCase().includes(errorName.toLowerCase()) && errorName !== 'Error' && errorName !== 'StringError'
+    ? `${errorName}: `
+    : '';
+  const formattedMessage = redactSensitiveText(
+    `${prefix}${cleanMsg}${ctxTags ? ` [${ctxTags}]` : ''}`
+  ).slice(0, 400);
+
+  return {
+    errorName,
+    errorMessage: cleanMsg,
+    formattedMessage: formattedMessage || `${errorName}: mirror dispatch failed`,
+    errorStack: cleanStack,
+    httpStatus: Number.isFinite(derivedStatus) ? derivedStatus : 0,
+    responseBody: cleanBody,
+    correlationId,
+    action,
+    entityType,
+    entityId,
+    timestamp
+  };
 }
 
 export interface GasAuthVerificationResult {
@@ -2230,6 +2402,397 @@ export interface GasAuthVerificationResult {
   legacyGasScript: boolean;
   networkError?: boolean;
   message: string;
+  correlationId?: string;
+  diagnostics?: {
+    flow?: GasAuthFlowDiagnostics | null;
+    gasDiagnostics?: Record<string, any> | null;
+    httpStatus?: number;
+    responseFormat?: 'json' | 'html' | 'empty' | 'text';
+    correlationId?: string;
+    authSource?: string;
+    deploymentVersion?: string;
+    deploymentIdHint?: string;
+    requestMethod?: string;
+    receivedVia?: string;
+    secretMatch?: boolean | null;
+  };
+}
+
+interface GasJsonCallResult {
+  httpOk: boolean;
+  statusCode: number;
+  rawText: string;
+  parsed: any;
+  responseFormat: 'json' | 'html' | 'empty' | 'text';
+  errorCode: string;
+  errorMessage: string;
+  message?: string;
+  redirectedToLogin?: boolean;
+  correlationId: string;
+  requestMethod: string;
+}
+
+function sanitizeGasSafeDiagnostics(raw: any): Record<string, any> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const allowedKeys = [
+    'hasScriptSecret',
+    'scriptSecretLength',
+    'rawScriptSecretLength',
+    'scriptSecretHadWhitespace',
+    'scriptSecretHadQuotes',
+    'scriptSecretHadInvisibleChars',
+    'providedPresent',
+    'providedLength',
+    'providedHadWhitespace',
+    'providedHadQuotes',
+    'providedHadInvisibleChars',
+    'secretMatch',
+    'receivedVia',
+    'parsedPostBody',
+    'requestMethod',
+    'gasScriptVersion',
+    'correlationId',
+    'authSource'
+  ];
+  const safe: Record<string, any> = {};
+  for (const k of allowedKeys) {
+    if (Object.prototype.hasOwnProperty.call(raw, k)) {
+      const v = raw[k];
+      if (typeof v === 'boolean' || typeof v === 'number') {
+        safe[k] = v;
+      } else if (typeof v === 'string') {
+        safe[k] = redactSensitiveText(v).slice(0, 120);
+      }
+    }
+  }
+  return Object.keys(safe).length > 0 ? safe : null;
+}
+
+function resolveGasMirrorTimeoutMs(explicitMs?: number, defaultMs = 25000): number {
+  const envRaw = Number(process.env.GAS_MIRROR_TIMEOUT_MS || '');
+  const chosen = explicitMs !== undefined && Number.isFinite(explicitMs) && explicitMs > 0
+    ? explicitMs
+    : (Number.isFinite(envRaw) && envRaw > 0 ? envRaw : defaultMs);
+  return Math.min(60000, Math.max(2000, Math.floor(chosen)));
+}
+
+export async function postGasMirrorJson(
+  normalizedGasUrl: string,
+  bodyObj: Record<string, any>,
+  fetchFn: typeof fetch,
+  timeoutMs = 12000
+): Promise<GasJsonCallResult> {
+  const correlationId = str(bodyObj?.payload?.correlationId || bodyObj?.correlationId) || generateId('COR');
+  const enrichedBody: Record<string, any> = (bodyObj && typeof bodyObj === 'object')
+    ? {
+        ...bodyObj,
+        payload: {
+          ...(bodyObj.payload && typeof bodyObj.payload === 'object' ? bodyObj.payload : {}),
+          correlationId
+        }
+      }
+    : bodyObj;
+  const headerSyncSecret = str(enrichedBody?.payload?.syncSecret || enrichedBody?.syncSecret);
+  const payloadStr = JSON.stringify(enrichedBody);
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let timedOut = false;
+  const timer = ctrl ? setTimeout(() => { timedOut = true; try { ctrl.abort(); } catch {} }, timeoutMs) : null;
+  let currentUrl = normalizedGasUrl;
+  let currentMethod: 'POST' | 'GET' = 'POST';
+  let currentBody: string | undefined = payloadStr;
+  let redirectFollowed = false;
+
+  try {
+    for (let hop = 0; hop < 6; hop++) {
+      let resp: Response;
+      try {
+        resp = await fetchFn(currentUrl, {
+          method: currentMethod,
+          redirect: 'manual',
+          signal: ctrl?.signal,
+          headers: currentMethod === 'POST'
+            ? {
+                'Content-Type': 'text/plain;charset=utf-8',
+                Accept: 'application/json, text/plain, */*',
+                ...(headerSyncSecret ? { 'X-RG-Sync-Secret': headerSyncSecret } : {})
+              }
+            : { Accept: 'application/json, text/plain, */*' },
+          ...(currentMethod === 'POST' ? { body: currentBody } : {})
+        });
+      } catch (fetchErr: any) {
+        if (timedOut || fetchErr?.name === 'AbortError' || /aborted/i.test(String(fetchErr?.message || ''))) {
+          const timeoutErr: any = new Error(
+            str(fetchErr?.message) || `This operation was aborted (GAS request timed out after ${timeoutMs}ms)`
+          );
+          timeoutErr.name = fetchErr?.name || 'AbortError';
+          timeoutErr.correlationId = correlationId;
+          timeoutErr.httpStatus = 0;
+          throw timeoutErr;
+        }
+        if (fetchErr && typeof fetchErr === 'object') {
+          fetchErr.correlationId = correlationId;
+          throw fetchErr;
+        }
+        const wrapped: any = new Error(String(fetchErr ?? 'FETCH_ERROR'));
+        wrapped.correlationId = correlationId;
+        throw wrapped;
+      }
+
+      if (resp.status >= 300 && resp.status < 400) {
+        const loc = typeof resp.headers?.get === 'function' ? (resp.headers.get('location') || '') : '';
+        if (!loc) break;
+        const nextUrl = new URL(loc, currentUrl);
+        if (nextUrl.hostname.toLowerCase().includes('accounts.google.com')) {
+          return {
+            httpOk: false,
+            statusCode: 401,
+            rawText: '',
+            parsed: null,
+            responseFormat: 'html',
+            errorCode: 'GAS_AUTH_REQUIRED',
+            errorMessage: 'GAS_AUTH_REQUIRED: رابط Google Apps Script يعيد التوجيه إلى صفحة تسجيل دخول Google (Who has access يجب أن يكون Anyone).',
+            redirectedToLogin: true,
+            correlationId,
+            requestMethod: redirectFollowed ? `POST->${currentMethod}` : currentMethod
+          };
+        }
+        if (!isAllowedGasRedirectHost(nextUrl.hostname)) {
+          return {
+            httpOk: false,
+            statusCode: resp.status,
+            rawText: '',
+            parsed: null,
+            responseFormat: 'text',
+            errorCode: 'GAS_UNEXPECTED_REDIRECT',
+            errorMessage: `GAS_UNEXPECTED_REDIRECT: إعادة توجيه غير متوقعة إلى ${nextUrl.hostname}`,
+            correlationId,
+            requestMethod: redirectFollowed ? `POST->${currentMethod}` : currentMethod
+          };
+        }
+        currentUrl = nextUrl.toString();
+        redirectFollowed = true;
+        if (resp.status === 301 || resp.status === 302 || resp.status === 303) {
+          currentMethod = 'GET';
+          currentBody = undefined;
+        }
+        continue;
+      }
+
+      const rawText = await resp.text().catch(() => '');
+      const cleanText = String(rawText || '').replace(/^\uFEFF/, '').trim();
+      const methodLabel = redirectFollowed ? `POST->${currentMethod}` : currentMethod;
+      if (!cleanText) {
+        return {
+          httpOk: Boolean(resp.ok),
+          statusCode: resp.status,
+          rawText,
+          parsed: null,
+          responseFormat: 'empty',
+          errorCode: resp.status >= 400 ? `GAS_HTTP_${resp.status}` : 'EMPTY_RESPONSE',
+          errorMessage: `استجابة فارغة من Google Apps Script (HTTP ${resp.status}).`,
+          correlationId,
+          requestMethod: methodLabel
+        };
+      }
+      if (cleanText.startsWith('<') || /^<!doctype/i.test(cleanText)) {
+        const missingFn = cleanText.match(/Script function not found:\s*([A-Za-z0-9_]+)/i);
+        if (missingFn) {
+          return {
+            httpOk: false,
+            statusCode: resp.status,
+            rawText: cleanText,
+            parsed: null,
+            responseFormat: 'html',
+            errorCode: 'GAS_MISSING_HANDLER',
+            errorMessage: `GAS_MISSING_HANDLER: الدالة ${missingFn[1]} غير موجودة في النشر الحالي على /exec.`,
+            correlationId,
+            requestMethod: methodLabel
+          };
+        }
+        if (/accounts\.google\.com|ServiceLogin/i.test(cleanText)) {
+          return {
+            httpOk: false,
+            statusCode: 401,
+            rawText: cleanText,
+            parsed: null,
+            responseFormat: 'html',
+            errorCode: 'GAS_AUTH_REQUIRED',
+            errorMessage: 'GAS_AUTH_REQUIRED: رابط Apps Script محمي بتسجيل دخول Google (اضبط Who has access إلى Anyone).',
+            redirectedToLogin: true,
+            correlationId,
+            requestMethod: methodLabel
+          };
+        }
+        return {
+          httpOk: false,
+          statusCode: resp.status,
+          rawText: cleanText,
+          parsed: null,
+          responseFormat: 'html',
+          errorCode: 'HTML_RESPONSE',
+          errorMessage: `HTML_RESPONSE: أعاد Google Apps Script صفحة HTML بدلاً من JSON (HTTP ${resp.status}).`,
+          correlationId,
+          requestMethod: methodLabel
+        };
+      }
+
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(cleanText);
+      } catch {
+        parsed = null;
+      }
+
+      const isJsonObj = Boolean(parsed && typeof parsed === 'object');
+      const isAppSuccess = Boolean(resp.ok && isJsonObj && parsed.success === true);
+      const parsedMessage = isJsonObj ? str(parsed.message || parsed.error) : '';
+
+      return {
+        httpOk: Boolean(resp.ok),
+        statusCode: resp.status,
+        rawText: cleanText,
+        parsed,
+        responseFormat: isJsonObj ? 'json' : 'text',
+        errorCode: isAppSuccess ? '' : (isJsonObj ? str(parsed.error || (parsed.success === false ? 'GAS_APP_ERROR' : '')) : `INVALID_JSON_HTTP_${resp.status}`),
+        errorMessage: isAppSuccess ? '' : (parsedMessage || (!resp.ok ? `GAS HTTP ${resp.status}` : '')),
+        message: parsedMessage,
+        correlationId,
+        requestMethod: methodLabel
+      };
+    }
+
+    return {
+      httpOk: false,
+      statusCode: 0,
+      rawText: '',
+      parsed: null,
+      responseFormat: 'text',
+      errorCode: 'TOO_MANY_REDIRECTS',
+      errorMessage: 'TOO_MANY_REDIRECTS: تجاوز رابط Apps Script الحد الأقصى لإعادة التوجيه.',
+      correlationId,
+      requestMethod: redirectFollowed ? `POST->${currentMethod}` : currentMethod
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function callGasMirrorAction(
+  executor: DbExecutor,
+  action: string,
+  actionPayload: Record<string, any> = {},
+  fetchFn: typeof fetch = fetch,
+  timeoutMs = 25000
+): Promise<{
+  callRes: GasJsonCallResult | null;
+  flowDiag: GasAuthFlowDiagnostics | null;
+  serverCfg: Awaited<ReturnType<typeof resolveServerConfig>>;
+  urlError?: string;
+  missingConfigError?: string;
+}> {
+  const safeExec = ensureDbExecutor(executor);
+  const [serverCfg, flowDiag] = await Promise.all([
+    resolveServerConfig(safeExec),
+    getGasAuthFlowDiagnostics(safeExec).catch(() => null)
+  ]);
+  const gasUrl = str(serverCfg.gasWebAppUrl);
+  const syncSecret = str(serverCfg.syncApiSecret);
+
+  if (!gasUrl || !syncSecret) {
+    const missingConfigError = !gasUrl
+      ? 'GAS_NOT_CONFIGURED: رابط Google Apps Script غير مضبوط.'
+      : (flowDiag?.secret?.dbDecryptFailed
+        ? 'SYNC_API_SECRET_DECRYPT_FAILED: فشل فك تشفير sync_api_secret_enc في القاعدة (تأكد من RG_ENCRYPTION_KEY / DATABASE_URL) ولم يُضبط SYNC_API_SECRET في البيئة.'
+        : 'SYNC_API_SECRET_MISSING: مفتاح SYNC_API_SECRET غير مضبوط في الخادم.');
+    return { callRes: null, flowDiag, serverCfg, missingConfigError };
+  }
+
+  const urlCheck = normalizeAndValidateGasTarget(gasUrl);
+  if (!urlCheck.valid) {
+    return {
+      callRes: null,
+      flowDiag,
+      serverCfg,
+      urlError: `INVALID_GAS_URL: ${urlCheck.message || 'رابط Google Apps Script غير صالح.'}`
+    };
+  }
+
+  const correlationId = str(actionPayload?.correlationId) || generateId('COR');
+  const callRes = await postGasMirrorJson(
+    urlCheck.normalized,
+    {
+      action,
+      payload: {
+        ...actionPayload,
+        syncSecret,
+        correlationId
+      }
+    },
+    fetchFn,
+    resolveGasMirrorTimeoutMs(timeoutMs, timeoutMs)
+  );
+  if (action !== 'verifyMirrorAuth') {
+    const bodyMsg = redactSensitiveText(callRes.errorMessage || callRes.parsed?.message || callRes.parsed?.error || '');
+    const isAuthRejected = Boolean(
+      callRes.statusCode === 401 ||
+      callRes.statusCode === 403 ||
+      callRes.redirectedToLogin ||
+      /UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|INVALID_SECRET|غير صالح|غير متطابق/i.test(bodyMsg)
+    );
+    if (isAuthRejected || (callRes.httpOk && callRes.parsed?.success === true)) {
+      await upsertSyncCheckpointSafe(
+        safeExec,
+        'google_apps_script_outbox_auth',
+        isAuthRejected ? 'error' : 'ok',
+        isAuthRejected ? 0 : (Array.isArray(actionPayload?.items) ? actionPayload.items.length : 1),
+        isAuthRejected ? (bodyMsg || `UNAUTHORIZED_GAS_ACTION:${action}`) : '',
+        {
+          action,
+          httpStatus: callRes.statusCode,
+          correlationId,
+          authSource: str(flowDiag?.secret?.source || 'unknown'),
+          gasUrlSource: str(flowDiag?.gasUrl?.source || 'unknown'),
+          deploymentIdHint: str(flowDiag?.gasUrl?.deploymentIdHint || ''),
+          receivedVia: str(callRes.parsed?.data?.receivedVia || 'payload.syncSecret'),
+          gasScriptVersion: str(callRes.parsed?.data?.gasScriptVersion || callRes.parsed?.gasScriptVersion),
+          requestMethod: callRes.requestMethod,
+          authValid: !isAuthRejected
+        }
+      );
+    }
+  }
+  return { callRes, flowDiag, serverCfg };
+}
+
+export async function triggerGasIncrementalSyncAction(
+  executor: DbExecutor,
+  actor: { id: string; name: string; role?: string },
+  rangePayload: Record<string, any> = {},
+  fetchFn: typeof fetch = fetch,
+  timeoutMs = 50000
+): Promise<any> {
+  const safeExec = ensureDbExecutor(executor);
+  const res = await callGasMirrorAction(
+    safeExec,
+    'triggerNeonIncrementalSync',
+    {
+      ...rangePayload,
+      actor: {
+        id: str(actor?.id || 'SYSTEM'),
+        name: str(actor?.name || 'System Sync'),
+        role: str(actor?.role || 'system')
+      }
+    },
+    fetchFn,
+    timeoutMs
+  );
+  if (res.missingConfigError) throw new Error(res.missingConfigError);
+  if (res.urlError) throw new Error(res.urlError);
+  const callRes = res.callRes;
+  if (!callRes || !callRes.httpOk || !callRes.parsed?.success) {
+    throw new Error(callRes?.errorMessage || callRes?.parsed?.message || 'فشلت المزامنة عبر Google Apps Script.');
+  }
+  return callRes.parsed.data;
 }
 
 async function upsertSyncCheckpointSafe(
@@ -2238,25 +2801,28 @@ async function upsertSyncCheckpointSafe(
   status: string,
   batchCount: number,
   errorMsg: string,
-  meta: Record<string, any> = {}
+  meta: Record<string, any> = {},
+  cursor = ''
 ): Promise<void> {
   try {
     const cleanErr = redactSensitiveText(errorMsg || '').slice(0, 400);
+    const cleanCursor = str(cursor);
     await executor.query(
       `INSERT INTO sync_checkpoints (
          source, last_sync_at, last_successful_at, last_cursor, last_batch_count, last_status, last_error, meta, updated_at
        ) VALUES (
-         $1, NOW(), CASE WHEN $2 = 'ok' THEN NOW() ELSE NULL END, '', $3, $2, $4, $5::jsonb, NOW()
+         $1, NOW(), CASE WHEN $2 IN ('ok', 'success') THEN NOW() ELSE NULL END, $6, $3, $2, $4, $5::jsonb, NOW()
        )
        ON CONFLICT (source) DO UPDATE SET
          last_sync_at = NOW(),
-         last_successful_at = CASE WHEN EXCLUDED.last_status = 'ok' THEN NOW() ELSE sync_checkpoints.last_successful_at END,
+         last_successful_at = CASE WHEN EXCLUDED.last_status IN ('ok', 'success') THEN NOW() ELSE sync_checkpoints.last_successful_at END,
+         last_cursor = CASE WHEN COALESCE(EXCLUDED.last_cursor, '') <> '' THEN EXCLUDED.last_cursor ELSE sync_checkpoints.last_cursor END,
          last_batch_count = EXCLUDED.last_batch_count,
          last_status = EXCLUDED.last_status,
          last_error = EXCLUDED.last_error,
          meta = COALESCE(sync_checkpoints.meta, '{}'::jsonb) || EXCLUDED.meta,
          updated_at = NOW()`,
-      [source, status, Math.max(0, Math.floor(batchCount)), cleanErr, JSON.stringify(meta)]
+      [source, status, Math.max(0, Math.floor(batchCount)), cleanErr, JSON.stringify(meta), cleanCursor]
     );
   } catch {
     // Non-fatal on minimal mock executors
@@ -2268,122 +2834,243 @@ export async function verifyGasMirrorAuth(
   fetchFn: typeof fetch = fetch
 ): Promise<GasAuthVerificationResult> {
   const safeExec = ensureDbExecutor(executor);
-  const serverCfg = await resolveServerConfig(safeExec);
-  const gasUrl = str(serverCfg.gasWebAppUrl);
-  const syncSecret = str(serverCfg.syncApiSecret);
+  const correlationId = generateId('COR');
 
-  if (!gasUrl || !syncSecret) {
-    const msg = !gasUrl
-      ? 'GAS_NOT_CONFIGURED: رابط Google Apps Script غير مضبوط.'
-      : 'SYNC_API_SECRET_MISSING: مفتاح SYNC_API_SECRET غير مضبوط في الخادم.';
-    return {
-      ok: false,
-      authValid: false,
-      statusCode: 0,
-      configured: false,
-      legacyGasScript: false,
-      message: msg
-    };
-  }
-  if (!/^https?:\/\//i.test(gasUrl)) {
-    return {
-      ok: false,
-      authValid: false,
-      statusCode: 400,
-      configured: true,
-      legacyGasScript: false,
-      message: 'INVALID_GAS_URL: رابط Google Apps Script غير صالح.'
-    };
-  }
-
-  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 12000) : null;
   try {
-    const resp = await fetchFn(gasUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      signal: ctrl?.signal,
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'verifyMirrorAuth',
-        payload: { syncSecret }
-      })
-    });
-    if (timer) clearTimeout(timer);
-    const rawText = await resp.text().catch(() => '');
-    let parsed: any = null;
-    try {
-      parsed = rawText ? JSON.parse(String(rawText).trim()) : null;
-    } catch {
-      parsed = null;
+    const dispatch = await callGasMirrorAction(
+      safeExec,
+      'verifyMirrorAuth',
+      { correlationId },
+      fetchFn,
+      12000
+    );
+    const { flowDiag } = dispatch;
+    const authSource = str(flowDiag?.secret?.source || 'none');
+    const deploymentIdHint = str(flowDiag?.gasUrl?.deploymentIdHint);
+
+    if (dispatch.missingConfigError) {
+      return {
+        ok: false,
+        authValid: false,
+        statusCode: 0,
+        configured: false,
+        legacyGasScript: false,
+        message: dispatch.missingConfigError,
+        correlationId,
+        diagnostics: {
+          flow: flowDiag,
+          gasDiagnostics: null,
+          httpStatus: 0,
+          correlationId,
+          authSource,
+          deploymentIdHint
+        }
+      };
     }
 
-    const msgText = str(parsed?.message || parsed?.error || '');
+    if (dispatch.urlError || !dispatch.callRes) {
+      return {
+        ok: false,
+        authValid: false,
+        statusCode: 400,
+        configured: true,
+        legacyGasScript: false,
+        message: dispatch.urlError || 'INVALID_GAS_URL',
+        correlationId,
+        diagnostics: {
+          flow: flowDiag,
+          gasDiagnostics: null,
+          httpStatus: 400,
+          correlationId,
+          authSource,
+          deploymentIdHint
+        }
+      };
+    }
+
+    const callRes = dispatch.callRes;
+    const parsed = callRes.parsed;
+    const gasSafeDiag = sanitizeGasSafeDiagnostics(parsed?.data?.diagnostics || parsed?.data);
+    const deploymentVersion = str(gasSafeDiag?.gasScriptVersion);
+    const receivedVia = str(gasSafeDiag?.receivedVia || 'payload.syncSecret');
+    const secretMatch = typeof gasSafeDiag?.secretMatch === 'boolean' ? gasSafeDiag.secretMatch : null;
+    const requestMethod = str(gasSafeDiag?.requestMethod || callRes.requestMethod || 'POST');
+    const msgText = str(callRes.errorMessage || (parsed && parsed.success !== true ? (parsed.message || parsed.error) : '') || parsed?.error || '');
+
+    const buildDiag = () => ({
+      flow: flowDiag,
+      gasDiagnostics: gasSafeDiag,
+      httpStatus: callRes.statusCode,
+      responseFormat: callRes.responseFormat,
+      correlationId: str(gasSafeDiag?.correlationId || callRes.correlationId || correlationId),
+      authSource,
+      deploymentVersion,
+      deploymentIdHint,
+      requestMethod,
+      receivedVia,
+      secretMatch
+    });
+
+    // 1. Transport / Google Login / HTTP 401/403 failures
     if (
-      resp.status === 401 ||
-      resp.status === 403 ||
-      /UNAUTHORIZED|SYNC_API_SECRET/i.test(msgText)
+      callRes.redirectedToLogin ||
+      callRes.errorCode === 'GAS_AUTH_REQUIRED' ||
+      callRes.statusCode === 401 ||
+      callRes.statusCode === 403
     ) {
-      const authAlert = 'UNAUTHORIZED: SYNC_API_SECRET غير متطابق بين Backend (Vercel/.env) وGoogle Apps Script — أوقفت المزامنة لحماية Outbox. حدّث Script Properties أو متغير SYNC_API_SECRET.';
+      const authAlert = callRes.redirectedToLogin || callRes.errorCode === 'GAS_AUTH_REQUIRED'
+        ? (callRes.errorMessage || 'GAS_AUTH_REQUIRED: رابط Apps Script يعيد التوجيه لتسجيل الدخول.')
+        : `UNAUTHORIZED: رفض Google Apps Script الطلب (HTTP ${callRes.statusCode}).`;
       await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'error', 0, authAlert, {
-        httpStatus: resp.status
+        httpStatus: callRes.statusCode,
+        correlationId,
+        authSource,
+        deploymentVersion,
+        deploymentIdHint,
+        gasDiagnostics: gasSafeDiag || undefined
       });
       return {
         ok: false,
         authValid: false,
-        statusCode: resp.status,
+        statusCode: callRes.statusCode,
         configured: true,
         legacyGasScript: false,
-        message: authAlert
+        message: authAlert,
+        correlationId,
+        diagnostics: buildDiag()
       };
     }
 
-    if (/UNKNOWN_ACTION/i.test(str(parsed?.error || msgText))) {
-      const legacyWarn = 'تحذير: نسخة Google Apps Script المنشورة حالياً قديمة ولا تحتوي verifyMirrorAuth — يرجى إعادة نشر Code.gs وNeonSync.gs.';
-      await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'warning', 0, legacyWarn, {
-        legacyGasScript: true,
-        httpStatus: resp.status
-      });
-      return {
-        ok: true,
-        authValid: null,
-        statusCode: resp.status,
-        configured: true,
-        legacyGasScript: true,
-        message: legacyWarn
-      };
-    }
-
-    if (resp.ok && parsed?.success) {
+    // 2. Strict positive verification BEFORE checking error regexes (fixes Arabic success messages mentioning SYNC_API_SECRET!)
+    const bodyExplicitlyVerified = Boolean(
+      callRes.httpOk &&
+      parsed &&
+      parsed.success === true &&
+      (parsed.data?.verified === true || parsed.data?.authValid === true) &&
+      secretMatch !== false
+    );
+    if (bodyExplicitlyVerified) {
       await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'ok', 0, '', {
-        httpStatus: resp.status,
-        verifiedAt: new Date().toISOString()
+        httpStatus: callRes.statusCode,
+        verifiedAt: new Date().toISOString(),
+        correlationId,
+        authSource,
+        deploymentVersion,
+        deploymentIdHint,
+        receivedVia,
+        requestMethod,
+        secretMatch: true
       });
       return {
         ok: true,
         authValid: true,
-        statusCode: resp.status,
+        statusCode: callRes.statusCode,
         configured: true,
         legacyGasScript: false,
-        message: 'تم التحقق من تطابق SYNC_API_SECRET مع Google Apps Script بنجاح.'
+        message: 'تم التحقق من تطابق SYNC_API_SECRET مع Google Apps Script بنجاح.',
+        correlationId,
+        diagnostics: buildDiag()
       };
     }
 
-    const failMsg = msgText || `GAS_AUTH_PROBE_HTTP_${resp.status}`;
+    // 3. Legacy script missing verifyMirrorAuth handler
+    if (/UNKNOWN_ACTION/i.test(str(parsed?.error || parsed?.message || msgText)) || callRes.errorCode === 'GAS_MISSING_HANDLER') {
+      const legacyWarn = 'تحذير: نسخة Google Apps Script المنشورة حالياً قديمة ولا تحتوي verifyMirrorAuth — يرجى إعادة نشر Code.gs وNeonSync.gs.';
+      await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'warning', 0, legacyWarn, {
+        legacyGasScript: true,
+        httpStatus: callRes.statusCode,
+        correlationId,
+        authSource
+      });
+      return {
+        ok: true,
+        authValid: null,
+        statusCode: callRes.statusCode,
+        configured: true,
+        legacyGasScript: true,
+        message: legacyWarn,
+        correlationId,
+        diagnostics: buildDiag()
+      };
+    }
+
+    // 4. Explicit auth mismatch / failure reported in response body or diagnostics
+    const explicitAuthFailure = Boolean(
+      secretMatch === false ||
+      (parsed && parsed.success === false && /UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|INVALID_SECRET|غير صالح|غير متطابق|مفتاح المزامنة/i.test(str(parsed.message || parsed.error))) ||
+      (!parsed?.success && /UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|INVALID_SECRET|غير صالح|غير متطابق|مفتاح المزامنة/i.test(msgText))
+    );
+    if (explicitAuthFailure) {
+      const hintParts: string[] = [];
+      if (flowDiag?.secret?.envVsDbConflict) {
+        hintParts.push('تعارض بين SYNC_API_SECRET في البيئة والقاعدة (DB)');
+      }
+      if (flowDiag?.gasUrl?.envVsDbConflict) {
+        hintParts.push(`تعارض في رابط GAS_WEBAPP_URL بين البيئة والقاعدة (الرابط النشط من ${flowDiag.gasUrl.source})`);
+      }
+      if (flowDiag?.secret?.dbDecryptFailed) {
+        hintParts.push('فشل فك تشفير secret المخزن في DB');
+      }
+      if (gasSafeDiag && gasSafeDiag.hasScriptSecret === false) {
+        hintParts.push('خاصية SYNC_API_SECRET غير مضبوطة داخل GAS Script Properties');
+      } else if (
+        gasSafeDiag &&
+        typeof gasSafeDiag.scriptSecretLength === 'number' &&
+        typeof gasSafeDiag.providedLength === 'number' &&
+        gasSafeDiag.scriptSecretLength !== gasSafeDiag.providedLength
+      ) {
+        hintParts.push(`اختلاف طول السر (Backend=${gasSafeDiag.providedLength} vs GAS=${gasSafeDiag.scriptSecretLength})`);
+      }
+      if (gasSafeDiag?.scriptSecretHadWhitespace || gasSafeDiag?.scriptSecretHadQuotes || gasSafeDiag?.scriptSecretHadInvisibleChars) {
+        hintParts.push('القيمة داخل GAS تحتوي على مسافات أو علامات اقتباس أو محارف غير مرئية');
+      }
+      const extraHint = hintParts.length ? ` [${hintParts.join(' · ')}]` : '';
+      const authAlert = `UNAUTHORIZED: SYNC_API_SECRET غير متطابق بين Backend (${authSource}) وGoogle Apps Script — أوقفت المزامنة لحماية Outbox.${extraHint} حدّث Script Properties أو متغير SYNC_API_SECRET وأعد النشر.`;
+
+      await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'error', 0, authAlert, {
+        httpStatus: callRes.statusCode,
+        correlationId,
+        authSource,
+        deploymentVersion,
+        deploymentIdHint,
+        receivedVia,
+        secretMatch,
+        envVsDbConflict: Boolean(flowDiag?.secret?.envVsDbConflict),
+        envVsDbUrlConflict: Boolean(flowDiag?.gasUrl?.envVsDbConflict),
+        gasDiagnostics: gasSafeDiag || undefined
+      });
+      return {
+        ok: false,
+        authValid: false,
+        statusCode: callRes.statusCode,
+        configured: true,
+        legacyGasScript: false,
+        message: authAlert,
+        correlationId,
+        diagnostics: buildDiag()
+      };
+    }
+
+    const failMsg = msgText || (callRes.httpOk && parsed?.success ? 'GAS_AUTH_UNVERIFIED_RESPONSE: استجابة HTTP 200 لم تؤكد verified=true.' : `GAS_AUTH_PROBE_HTTP_${callRes.statusCode}`);
     await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'warning', 0, failMsg, {
-      httpStatus: resp.status
+      httpStatus: callRes.statusCode,
+      responseFormat: callRes.responseFormat,
+      correlationId,
+      authSource,
+      deploymentVersion
     });
     return {
       ok: false,
-      authValid: null,
-      statusCode: resp.status,
+      authValid: callRes.httpOk ? false : (parsed?.success === false ? false : null),
+      statusCode: callRes.statusCode,
       configured: true,
-      legacyGasScript: false,
-      networkError: resp.status >= 500 || resp.status === 429,
-      message: redactSensitiveText(failMsg).slice(0, 260)
+      legacyGasScript: Boolean(callRes.httpOk && parsed?.success === true),
+      networkError: callRes.statusCode >= 500 || callRes.statusCode === 429,
+      message: redactSensitiveText(failMsg).slice(0, 260),
+      correlationId,
+      diagnostics: buildDiag()
     };
   } catch (err: any) {
-    if (timer) clearTimeout(timer);
     const errMsg = redactSensitiveText(err?.message || 'GAS_AUTH_NETWORK_ERROR').slice(0, 260);
     return {
       ok: false,
@@ -2392,14 +3079,151 @@ export async function verifyGasMirrorAuth(
       configured: true,
       legacyGasScript: false,
       networkError: true,
-      message: errMsg
+      message: errMsg,
+      correlationId,
+      diagnostics: { flow: null, gasDiagnostics: null, httpStatus: 0, correlationId }
     };
   }
 }
 
 export interface FlushOutboxOptions {
   verifyAuthBeforeSend?: boolean;
+  verifyReceiptOnAbort?: boolean;
   batchSize?: number;
+  maxBatches?: number;
+  budgetMs?: number;
+  allowBulkDelete?: boolean;
+  timeoutMs?: number;
+  targetOutboxId?: string;
+  targetOutboxIds?: string[];
+  correlationId?: string;
+}
+
+const activeOutboxFlushByExecutor = new WeakMap<object, Promise<any>>();
+
+async function acquireOutboxDistributedLease(
+  safeExec: DbExecutor,
+  workerId: string
+): Promise<boolean> {
+  try {
+    const existingQ = await safeExec.query<{ id: string; is_syncing: boolean; stale: boolean }>(
+      `SELECT id,
+              COALESCE(is_syncing, FALSE) AS is_syncing,
+              (worker_heartbeat_at IS NULL OR worker_heartbeat_at < NOW() - INTERVAL '3 minutes') AS stale
+       FROM sync_worker_state
+       WHERE id = 'outbox_mirror'
+       LIMIT 1`
+    );
+    const existing = existingQ.rows?.[0];
+    if (existing && existing.is_syncing === true && existing.stale === false) {
+      return false;
+    }
+
+    const leaseQ = await safeExec.query<{ id: string }>(
+      `INSERT INTO sync_worker_state (
+         id, status, is_syncing, last_trigger_type, worker_heartbeat_at, last_error, updated_at
+       ) VALUES (
+         'outbox_mirror', 'running', TRUE, $1, NOW(), '', NOW()
+       )
+       ON CONFLICT (id) DO UPDATE SET
+         status = 'running',
+         is_syncing = TRUE,
+         last_trigger_type = EXCLUDED.last_trigger_type,
+         worker_heartbeat_at = NOW(),
+         updated_at = NOW()
+       WHERE sync_worker_state.is_syncing = FALSE
+          OR sync_worker_state.worker_heartbeat_at IS NULL
+          OR sync_worker_state.worker_heartbeat_at < NOW() - INTERVAL '3 minutes'
+       RETURNING id`,
+      [workerId]
+    );
+    // Real Postgres enforces RETURNING id when lease row existed; minimal test mocks return [] with existing === undefined
+    if (existing && (!leaseQ.rows || leaseQ.rows.length === 0)) {
+      return false;
+    }
+    return true;
+  } catch {
+    // Non-fatal when sync_worker_state doesn't exist in partial mock executors; advisory lock + SKIP LOCKED remain active
+    return true;
+  }
+}
+
+async function releaseOutboxDistributedLease(safeExec: DbExecutor, workerId: string): Promise<void> {
+  try {
+    await safeExec.query(
+      `UPDATE sync_worker_state
+       SET status = 'idle',
+           is_syncing = FALSE,
+           updated_at = NOW()
+       WHERE id = 'outbox_mirror'
+         AND last_trigger_type = $1`,
+      [workerId]
+    );
+  } catch {
+    // Non-fatal
+  }
+}
+
+async function verifyOutboxReceiptInGas(
+  safeExec: DbExecutor,
+  fetchFn: typeof fetch,
+  candidateRows: any[],
+  correlationId: string,
+  batchId: string,
+  timeoutMs: number
+): Promise<Set<string>> {
+  const verifiedIds = new Set<string>();
+  if (!candidateRows.length) return verifiedIds;
+  try {
+    const items = candidateRows.map((r: any) => {
+      const payload = typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {});
+      return {
+        id: str(r.id),
+        idempotencyKey: str(r.idempotency_key) || buildOutboxIdempotencyKey(str(r.entity_type), str(r.entity_id), str(r.action), payload),
+        entityType: str(r.entity_type),
+        entityId: str(r.entity_id),
+        action: str(r.action)
+      };
+    });
+    const idempotencyKeys = items.map((x) => x.idempotencyKey).filter(Boolean);
+    const res = await callGasMirrorAction(
+      safeExec,
+      'verifyOutboxReceipt',
+      { correlationId, batchId, items, idempotencyKeys },
+      fetchFn,
+      Math.min(10000, Math.max(3000, timeoutMs))
+    );
+    const parsed = res.callRes?.parsed;
+    if (!res.callRes?.httpOk || !parsed?.success) return verifiedIds;
+    const data = parsed.data || parsed;
+    const appliedIds: string[] = Array.isArray(data.appliedIds) ? data.appliedIds.map((x: any) => str(x)) : [];
+    const appliedKeys = new Set<string>(
+      [
+        ...(Array.isArray(data.appliedKeys) ? data.appliedKeys.map((x: any) => str(x)) : []),
+        ...(Array.isArray(data.found) ? data.found.map((x: any) => str(x)) : []),
+        ...(data.receipts && typeof data.receipts === 'object' ? Object.keys(data.receipts).map((x) => str(x)) : [])
+      ].filter(Boolean)
+    );
+    for (const id of appliedIds) {
+      if (id) verifiedIds.add(id);
+    }
+    if (Array.isArray(data.results)) {
+      for (const r of data.results) {
+        if (r && (r.applied === true || r.found === true || r.status === 'completed' || r.status === 'applied')) {
+          const rid = str(r.id);
+          if (rid) verifiedIds.add(rid);
+        }
+      }
+    }
+    for (const item of items) {
+      if (appliedKeys.has(item.idempotencyKey)) {
+        verifiedIds.add(item.id);
+      }
+    }
+  } catch {
+    // Receipt verification failed silently — caller will handle normally
+  }
+  return verifiedIds;
 }
 
 export async function flushSheetsMirrorOutbox(
@@ -2410,21 +3234,92 @@ export async function flushSheetsMirrorOutbox(
   sent: number;
   failed: number;
   skipped: boolean;
+  skippedByLock?: boolean;
+  skippedReason?: string;
   permanentFailed?: number;
   haltedByAuth?: boolean;
+  haltedBySheetError?: boolean;
+  stoppedByBudget?: boolean;
+  batchesCompleted?: number;
+  lastCursor?: string;
+  batchId?: string;
+  errorCategory?: OutboxErrorClassification['category'];
   authError?: string;
+  correlationId?: string;
+  durationMs?: number;
+  receipt?: {
+    at: string;
+    batchId: string;
+    correlationId: string;
+    gasScriptVersion: string;
+    protectedMode: boolean;
+    count: number;
+  } | null;
 }> {
   const fetchFn: typeof fetch = typeof fetchFnOrOpts === 'function' ? fetchFnOrOpts : fetch;
   const opts: FlushOutboxOptions = (typeof fetchFnOrOpts === 'function' ? maybeOpts : fetchFnOrOpts) || {};
   const safeExec = ensureDbExecutor(executor);
+  const lockKeyObj: object = (executor && typeof executor === 'object') ? (executor as unknown as object) : safeExec;
+
+  const priorFlight = activeOutboxFlushByExecutor.get(lockKeyObj);
+  const hasExplicitTargets = Boolean(opts.targetOutboxId || (Array.isArray(opts.targetOutboxIds) && opts.targetOutboxIds.length > 0));
+  if (priorFlight && !hasExplicitTargets) {
+    // Coalesce parallel same-process calls so overlapping triggers never double-send or race on the same batch
+    return await priorFlight;
+  }
+
+  const runPromise = flushSheetsMirrorOutboxInternal(safeExec, fetchFn, opts);
+  if (!hasExplicitTargets) {
+    activeOutboxFlushByExecutor.set(lockKeyObj, runPromise);
+  }
+  try {
+    return await runPromise;
+  } finally {
+    if (!hasExplicitTargets && activeOutboxFlushByExecutor.get(lockKeyObj) === runPromise) {
+      activeOutboxFlushByExecutor.delete(lockKeyObj);
+    }
+  }
+}
+
+async function flushSheetsMirrorOutboxInternal(
+  safeExec: DbExecutor,
+  fetchFn: typeof fetch,
+  opts: FlushOutboxOptions
+): Promise<{
+  sent: number;
+  failed: number;
+  skipped: boolean;
+  skippedByLock?: boolean;
+  skippedReason?: string;
+  permanentFailed?: number;
+  haltedByAuth?: boolean;
+  haltedBySheetError?: boolean;
+  stoppedByBudget?: boolean;
+  batchesCompleted?: number;
+  lastCursor?: string;
+  batchId?: string;
+  errorCategory?: OutboxErrorClassification['category'];
+  authError?: string;
+  correlationId?: string;
+  durationMs?: number;
+  receipt?: {
+    at: string;
+    batchId: string;
+    correlationId: string;
+    gasScriptVersion: string;
+    protectedMode: boolean;
+    count: number;
+  } | null;
+}> {
+  const flushStartedMs = Date.now();
   const serverCfg = await resolveServerConfig(safeExec);
   const gasUrl = str(serverCfg.gasWebAppUrl);
   const syncSecret = str(serverCfg.syncApiSecret);
   if (!gasUrl || !syncSecret) {
-    return { sent: 0, failed: 0, skipped: true };
+    return { sent: 0, failed: 0, skipped: true, skippedReason: 'GAS_NOT_CONFIGURED' };
   }
 
-  // Pre-flight GAS auth verification in live environments (or when explicitly enabled) so invalid secrets never burn retries or mutate outbox
+  const correlationId = str(opts.correlationId) || generateId('COR');
   const shouldVerifyAuth = opts.verifyAuthBeforeSend === true || (opts.verifyAuthBeforeSend !== false && fetchFn === fetch);
   if (shouldVerifyAuth) {
     const authCheck = await verifyGasMirrorAuth(safeExec, fetchFn);
@@ -2433,326 +3328,1406 @@ export async function flushSheetsMirrorOutbox(
         sent: 0,
         failed: 0,
         skipped: true,
+        skippedReason: 'GAS_AUTH_INVALID',
         haltedByAuth: true,
-        authError: authCheck.message
+        errorCategory: 'auth',
+        authError: authCheck.message,
+        correlationId: authCheck.correlationId || correlationId,
+        durationMs: Math.max(1, Date.now() - flushStartedMs)
       };
     }
   }
 
-  const batchLimit = Math.min(25, Math.max(1, num(opts.batchSize, 15)));
+  const targetIdsList = Array.isArray(opts.targetOutboxIds)
+    ? opts.targetOutboxIds.map((x) => str(x)).filter(Boolean)
+    : [];
+  const hasExplicitTargets = Boolean(opts.targetOutboxId || targetIdsList.length > 0);
   const workerId = generateId('OBX_W');
-  const claimedRows = await safeExec.withTransaction(async (tx) => {
-    await runWithSavepoint(
-      tx,
-      'obx_release_stale_locks',
-      () =>
-        tx.query(
-          `UPDATE sheets_mirror_outbox
-           SET status = 'retry',
-               locked_at = NULL,
-               worker_id = '',
-               updated_at = NOW()
-           WHERE status = 'processing'
-             AND locked_at IS NOT NULL
-             AND locked_at < NOW() - INTERVAL '5 minutes'`
-        ),
-      undefined
-    );
-
-    const claimQ = await tx.query(
-      `WITH candidate AS (
-         SELECT o.id
-         FROM sheets_mirror_outbox o
-         WHERE o.status IN ('pending', 'retry')
-           AND o.next_retry_at <= NOW()
-           AND NOT EXISTS (
-             SELECT 1
-             FROM sheets_mirror_outbox prev
-             WHERE prev.entity_type = o.entity_type
-               AND prev.entity_id = o.entity_id
-               AND prev.status IN ('pending', 'retry', 'processing')
-               AND (prev.created_at < o.created_at OR (prev.created_at = o.created_at AND prev.id < o.id))
-           )
-         ORDER BY o.created_at ASC, o.id ASC
-         LIMIT $2
-         FOR UPDATE SKIP LOCKED
-       )
-       UPDATE sheets_mirror_outbox o
-       SET status = 'processing',
-           locked_at = NOW(),
-           worker_id = $1,
-           updated_at = NOW()
-       FROM candidate
-       WHERE o.id = candidate.id
-       RETURNING o.*`,
-      [workerId, batchLimit]
-    );
-    return claimQ.rows || [];
-  });
-
-  if (claimedRows.length === 0) {
-    return { sent: 0, failed: 0, skipped: false };
+  const hasLease = hasExplicitTargets ? true : await acquireOutboxDistributedLease(safeExec, workerId);
+  if (!hasLease) {
+    return {
+      sent: 0,
+      failed: 0,
+      skipped: true,
+      skippedByLock: true,
+      skippedReason: 'WORKER_LEASE_ACTIVE',
+      correlationId,
+      durationMs: Math.max(1, Date.now() - flushStartedMs)
+    };
   }
 
-  // Chronological order after RETURNING
-  const orderedRows = [...claimedRows].sort((a: any, b: any) => {
-    const ta = a.created_at instanceof Date ? a.created_at.getTime() : Date.parse(String(a.created_at || '')) || 0;
-    const tb = b.created_at instanceof Date ? b.created_at.getTime() : Date.parse(String(b.created_at || '')) || 0;
-    return ta !== tb ? ta - tb : str(a.id).localeCompare(str(b.id));
-  });
+  // Enforce strict safe batch sizing (default 8, max 10) to avoid serverless / GAS execution timeouts
+  const batchLimit = Math.min(OUTBOX_MAX_BATCH_SIZE, Math.max(1, num(opts.batchSize, OUTBOX_DEFAULT_BATCH_SIZE)));
+  const executionBudgetMs = Math.min(55000, Math.max(2000, num(opts.budgetMs, OUTBOX_DEFAULT_EXECUTION_BUDGET_MS)));
+  const maxBatches = hasExplicitTargets
+    ? 1
+    : Math.min(25, Math.max(1, num(opts.maxBatches, fetchFn === fetch ? 5 : 1)));
+  const shouldVerifyReceiptOnAbort = opts.verifyReceiptOnAbort === true || (opts.verifyReceiptOnAbort !== false && fetchFn === fetch);
+  const bulkFilterSql = opts.allowBulkDelete === true ? '' : `AND COALESCE(o.action, '') <> 'deleteAllReservations'`;
+  const targetFilterSql = opts.targetOutboxId
+    ? `AND o.id = $3`
+    : (targetIdsList.length > 0 ? `AND o.id = ANY($3::text[])` : '');
 
-  const items = orderedRows.map((r: any) => ({
-    id: r.id,
-    idempotencyKey: str(r.idempotency_key),
-    entityType: r.entity_type,
-    entityId: r.entity_id,
-    action: r.action,
-    payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {})
-  }));
+  let cumulativeSent = 0;
+  let cumulativeFailed = 0;
+  let cumulativePermanentFailed = 0;
+  let batchesCompleted = 0;
+  let lastCursor = '';
+  let lastBatchId = '';
+  let haltedByAuth = false;
+  let haltedBySheetError = false;
+  let stoppedByBudget = false;
+  let lastErrorCategory: OutboxErrorClassification['category'] | undefined;
+  let lastAuthError = '';
+  let latestReceiptMeta: {
+    at: string;
+    batchId: string;
+    correlationId: string;
+    gasScriptVersion: string;
+    protectedMode: boolean;
+    count: number;
+  } | null = null;
 
-  const recordRowFailure = async (row: any, errMsg: string, httpStatus: number): Promise<boolean> => {
-    const cleanErr = redactSensitiveText(String(errMsg || 'MIRROR_FAILED')).slice(0, 400);
-    const cls = classifyOutboxMirrorError(cleanErr, httpStatus);
-    const nextRetryCount = num(row.retry_count, 0) + 1;
-    const maxRetries = Math.max(1, num(row.max_retries, 8));
-    const isPermanent = cls.permanent;
-    const dead = isPermanent || nextRetryCount >= maxRetries;
-    const jitter = Math.floor(Math.random() * 8);
-    const delaySeconds = isPermanent ? 0 : Math.min(1800, Math.pow(2, nextRetryCount) * 15) + jitter;
-    const historyEntry = JSON.stringify([
-      {
-        at: new Date().toISOString(),
-        attempt: nextRetryCount,
-        error: cleanErr,
-        category: cls.category,
-        permanent: isPermanent,
-        httpStatus
-      }
-    ]);
+  const markIdsCompleted = async (targetIds: string[], batchId: string) => {
+    if (!targetIds.length) return;
     await safeExec.query(
       `UPDATE sheets_mirror_outbox
-       SET status = $2::text,
-           retry_count = $3::int,
-           last_error = $4::text,
-           error_category = $7::text,
-           last_attempt_at = NOW(),
-           locked_at = NULL,
-           worker_id = '',
-           updated_at = NOW(),
-           error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $6::jsonb,
-           next_retry_at = CASE WHEN $2::text = 'failed' THEN NOW() ELSE NOW() + ($5::text || ' seconds')::interval END
-       WHERE id = $1::text`,
-      [row.id, dead ? 'failed' : 'retry', nextRetryCount, cleanErr, String(delaySeconds), historyEntry, cls.category]
-    ).catch(async () => {
-      // Fallback for older schemas before migration 008
-      await safeExec.query(
-        `UPDATE sheets_mirror_outbox
-         SET status = $2::text,
-             retry_count = $3::int,
-             last_error = $4::text,
-             locked_at = NULL,
-             worker_id = '',
-             updated_at = NOW(),
-             error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $6::jsonb,
-             next_retry_at = CASE WHEN $2::text = 'failed' THEN NOW() ELSE NOW() + ($5::text || ' seconds')::interval END
-         WHERE id = $1::text`,
-        [row.id, dead ? 'failed' : 'retry', nextRetryCount, cleanErr, String(delaySeconds), historyEntry]
-      ).catch(() => undefined);
-    });
-    return isPermanent;
-  };
-
-  if (!/^https?:\/\//i.test(gasUrl)) {
-    let permanentFailed = 0;
-    for (const row of orderedRows) {
-      if (await recordRowFailure(row, 'INVALID_GAS_URL: رابط Google Apps Script غير صالح', 400)) {
-        permanentFailed++;
-      }
-    }
-    return { sent: 0, failed: orderedRows.length, skipped: false, permanentFailed };
-  }
-
-  let lastHttpStatus = 0;
-  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 25000) : null;
-  try {
-    const resp = await fetchFn(gasUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      signal: ctrl?.signal,
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'syncFromNeonMirror',
-        payload: { syncSecret, items }
-      })
-    });
-    if (timer) clearTimeout(timer);
-    lastHttpStatus = resp.status;
-    const text = await resp.text();
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(String(text || '').trim());
-    } catch {
-      parsed = null;
-    }
-    if (!resp.ok || !parsed?.success) {
-      throw new Error(parsed?.message || `GAS HTTP ${resp.status}`);
-    }
-
-    // Check per-item partial batch results or failedItems when returned by GAS
-    const rawResults = Array.isArray(parsed.results)
-      ? parsed.results
-      : (Array.isArray(parsed.data?.results) ? parsed.data.results : null);
-    const rawFailedItems = Array.isArray(parsed.failedItems)
-      ? parsed.failedItems
-      : (Array.isArray(parsed.data?.failedItems) ? parsed.data.failedItems : null);
-
-    if (rawResults || rawFailedItems) {
-      const failedById = new Map<string, string>();
-      if (rawFailedItems) {
-        for (const fi of rawFailedItems) {
-          if (!fi || typeof fi !== 'object') continue;
-          const targetId = str(fi.id) || (typeof fi.index === 'number' && orderedRows[fi.index] ? str(orderedRows[fi.index].id) : '');
-          if (targetId) {
-            failedById.set(targetId, str(fi.error || fi.message || 'GAS_ITEM_FAILED'));
-          }
-        }
-      }
-      if (rawResults) {
-        for (let idx = 0; idx < rawResults.length; idx++) {
-          const r = rawResults[idx];
-          if (!r || typeof r !== 'object') continue;
-          const targetId = str(r.id) || (typeof r.index === 'number' && orderedRows[r.index] ? str(orderedRows[r.index].id) : (orderedRows[idx] ? str(orderedRows[idx].id) : ''));
-          if (!targetId) continue;
-          const itemOk = r.ok === true || r.success === true || r.status === 'sent' || r.status === 'applied' || r.status === 'ok';
-          if (!itemOk && (r.ok === false || r.success === false || r.status === 'failed' || r.status === 'error' || r.error)) {
-            failedById.set(targetId, str(r.error || r.message || 'GAS_ITEM_FAILED'));
-          }
-        }
-      }
-
-      const succeededIds = orderedRows.map((r: any) => str(r.id)).filter((id) => id && !failedById.has(id));
-      const failedRows = orderedRows.filter((r: any) => failedById.has(str(r.id)));
-
-      if (succeededIds.length > 0) {
-        await safeExec.query(
-          `UPDATE sheets_mirror_outbox
-           SET status = 'sent',
-               processed_at = NOW(),
-               synced_at = NOW(),
-               last_attempt_at = NOW(),
-               updated_at = NOW(),
-               locked_at = NULL,
-               worker_id = '',
-               last_error = '',
-               error_category = ''
-           WHERE id = ANY($1::text[])`,
-          [succeededIds]
-        ).catch(async () => {
-          await safeExec.query(
-            `UPDATE sheets_mirror_outbox
-             SET status = 'sent',
-                 processed_at = NOW(),
-                 synced_at = NOW(),
-                 updated_at = NOW(),
-                 locked_at = NULL,
-                 worker_id = '',
-                 last_error = ''
-             WHERE id = ANY($1::text[])`,
-            [succeededIds]
-          );
-        });
-        await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'ok', succeededIds.length, '', {
-          lastBatchSucceeded: succeededIds.length
-        });
-      }
-
-      let permanentFailed = 0;
-      for (const row of failedRows) {
-        const msg = failedById.get(str(row.id)) || 'GAS_ITEM_FAILED';
-        if (await recordRowFailure(row, msg, lastHttpStatus)) {
-          permanentFailed++;
-        }
-      }
-
-      return {
-        sent: succeededIds.length,
-        failed: failedRows.length,
-        skipped: false,
-        ...(failedRows.length > 0 ? { permanentFailed } : {})
-      };
-    }
-
-    const ids = items.map((x) => x.id);
-    await safeExec.query(
-      `UPDATE sheets_mirror_outbox
-       SET status = 'sent',
+       SET status = 'completed',
            processed_at = NOW(),
            synced_at = NOW(),
+           finished_at = NOW(),
+           last_success_at = NOW(),
            last_attempt_at = NOW(),
            updated_at = NOW(),
            locked_at = NULL,
            worker_id = '',
            last_error = '',
-           error_category = ''
+           error_category = '',
+           correlation_id = COALESCE(NULLIF($2::text, ''), correlation_id),
+           batch_id = COALESCE(NULLIF($3::text, ''), batch_id)
        WHERE id = ANY($1::text[])`,
-      [ids]
+      [targetIds, correlationId, batchId]
     ).catch(async () => {
       await safeExec.query(
         `UPDATE sheets_mirror_outbox
-         SET status = 'sent',
+         SET status = 'completed',
              processed_at = NOW(),
              synced_at = NOW(),
+             last_attempt_at = NOW(),
              updated_at = NOW(),
              locked_at = NULL,
              worker_id = '',
-             last_error = ''
+             last_error = '',
+             error_category = ''
          WHERE id = ANY($1::text[])`,
-        [ids]
-      );
+        [targetIds]
+      ).catch(async () => {
+        await safeExec.query(
+          `UPDATE sheets_mirror_outbox
+           SET status = 'completed',
+               processed_at = NOW(),
+               synced_at = NOW(),
+               updated_at = NOW(),
+               locked_at = NULL,
+               worker_id = '',
+               last_error = ''
+           WHERE id = ANY($1::text[])`,
+          [targetIds]
+        );
+      });
     });
-    await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'ok', ids.length, '', {
-      lastBatchSucceeded: ids.length
-    });
-    return { sent: ids.length, failed: 0, skipped: false };
-  } catch (err: any) {
-    if (timer) clearTimeout(timer);
-    const errMsg = redactSensitiveText(String(err?.message || 'MIRROR_FAILED')).slice(0, 400);
-    const cls = classifyOutboxMirrorError(errMsg, lastHttpStatus);
-    let permanentFailed = 0;
+  };
 
-    for (const row of orderedRows) {
-      if (await recordRowFailure(row, errMsg, lastHttpStatus)) {
-        permanentFailed++;
+  const recordRowFailure = async (
+    row: any,
+    errOrMsg: unknown,
+    httpStatus: number,
+    batchId: string,
+    responseBody = ''
+  ): Promise<OutboxErrorClassification> => {
+    const detail = extractDetailedOutboxError(errOrMsg, {
+      httpStatus,
+      responseBody,
+      correlationId,
+      action: str(row.action),
+      entityType: str(row.entity_type),
+      entityId: str(row.entity_id)
+    });
+    const cls = classifyOutboxMirrorError(detail.formattedMessage, detail.httpStatus);
+    const nextRetryCount = num(row.retry_count, 0) + 1;
+    const maxRetries = Math.max(1, num(row.max_retries, 8));
+    const isPermanent = cls.permanent;
+    const dead = isPermanent || nextRetryCount >= maxRetries;
+    const nextStatus = dead ? 'dead_letter' : 'retry';
+    const delaySeconds = isPermanent ? 0 : computeOutboxBackoffSeconds(nextRetryCount);
+    const detailsPayload = JSON.stringify({
+      ...detail,
+      category: cls.category,
+      permanent: isPermanent,
+      attempt: nextRetryCount,
+      batchId
+    });
+    const historyEntry = JSON.stringify([
+      {
+        at: detail.timestamp,
+        attempt: nextRetryCount,
+        error: detail.formattedMessage,
+        errorName: detail.errorName,
+        category: cls.category,
+        permanent: isPermanent,
+        httpStatus: detail.httpStatus,
+        correlationId,
+        batchId,
+        action: detail.action,
+        entityType: detail.entityType,
+        entityId: detail.entityId
+      }
+    ]);
+    // Parameter order matches production diagnostics contract:
+    // $1=id, $2=status, $3=retryCount, $4=delaySeconds, $5=last_error, $6=error_category, $7=history, $8=details, $9=correlationId, $10=batchId
+    await safeExec.query(
+      `UPDATE sheets_mirror_outbox
+       SET status = $2::text,
+           retry_count = $3::int,
+           last_error = $5::text,
+           error_category = $6::text,
+           last_attempt_at = NOW(),
+           finished_at = NOW(),
+           last_error_details_json = $8::jsonb,
+           locked_at = NULL,
+           worker_id = '',
+           updated_at = NOW(),
+           correlation_id = COALESCE(NULLIF($9::text, ''), correlation_id),
+           batch_id = COALESCE(NULLIF($10::text, ''), batch_id),
+           error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $7::jsonb,
+           next_retry_at = CASE WHEN $2::text IN ('failed', 'dead_letter') THEN NOW() ELSE NOW() + ($4::text || ' seconds')::interval END
+       WHERE id = $1::text`,
+      [row.id, nextStatus, nextRetryCount, String(delaySeconds), detail.formattedMessage, cls.category, historyEntry, detailsPayload, correlationId, batchId]
+    ).catch(async () => {
+      await safeExec.query(
+        `UPDATE sheets_mirror_outbox
+         SET status = $2::text,
+             retry_count = $3::int,
+             last_error = $5::text,
+             error_category = $6::text,
+             last_attempt_at = NOW(),
+             finished_at = NOW(),
+             last_error_details_json = $8::jsonb,
+             locked_at = NULL,
+             worker_id = '',
+             updated_at = NOW(),
+             error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $7::jsonb,
+             next_retry_at = CASE WHEN $2::text IN ('failed', 'dead_letter') THEN NOW() ELSE NOW() + ($4::text || ' seconds')::interval END
+         WHERE id = $1::text`,
+        [row.id, nextStatus, nextRetryCount, String(delaySeconds), detail.formattedMessage, cls.category, historyEntry, detailsPayload]
+      ).catch(async () => {
+        await safeExec.query(
+          `UPDATE sheets_mirror_outbox
+           SET status = $2::text,
+               retry_count = $3::int,
+               last_error = $5::text,
+               locked_at = NULL,
+               worker_id = '',
+               updated_at = NOW(),
+               error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $7::jsonb,
+               next_retry_at = CASE WHEN $2::text IN ('failed', 'dead_letter') THEN NOW() ELSE NOW() + ($4::text || ' seconds')::interval END
+           WHERE id = $1::text`,
+          [row.id, nextStatus, nextRetryCount, String(delaySeconds), detail.formattedMessage, cls.category, historyEntry]
+        ).catch(() => undefined);
+      });
+    });
+    return cls;
+  };
+
+  try {
+    for (let batchIdx = 0; batchIdx < maxBatches; batchIdx++) {
+      const elapsedMs = Date.now() - flushStartedMs;
+      if (batchIdx > 0 && elapsedMs >= executionBudgetMs) {
+        stoppedByBudget = true;
+        await upsertSyncCheckpointSafe(
+          safeExec,
+          'google_sheets_mirror',
+          cumulativeFailed > 0 ? 'warning' : 'ok',
+          cumulativeSent,
+          `TIME_BUDGET_PAUSE: توقف آمن بعد ${batchesCompleted} دفعة قبل انتهاء مهلة الخادم (${elapsedMs}ms).`,
+          { batchId: lastBatchId, correlationId, batchesCompleted, cumulativeSent, pausedByBudget: true },
+          lastCursor
+        );
+        break;
+      }
+
+      const batchId = generateId('OBX_B');
+      lastBatchId = batchId;
+      const remainingBudgetMs = Math.max(3000, executionBudgetMs - elapsedMs);
+      const mirrorTimeoutMs = Math.min(resolveGasMirrorTimeoutMs(opts.timeoutMs, 18000), remainingBudgetMs);
+
+      const claimedRows = await safeExec.withTransaction(async (tx) => {
+        // PostgreSQL transaction-level advisory lock serializes overlapping Vercel/Cron/manual flush claims cleanly
+        await runWithSavepoint(
+          tx,
+          'obx_advisory_lock',
+          () => tx.query(`SELECT pg_advisory_xact_lock(92847109)`),
+          undefined
+        );
+
+        if (batchIdx === 0) {
+          await runWithSavepoint(
+            tx,
+            'obx_release_stale_locks',
+            () =>
+              tx.query(
+                `UPDATE sheets_mirror_outbox
+                 SET retry_count = COALESCE(retry_count, 0) + 1,
+                     status = CASE
+                       WHEN COALESCE(retry_count, 0) + 1 >= GREATEST(1, COALESCE(max_retries, 8)) THEN 'dead_letter'
+                       ELSE 'retry'
+                     END,
+                     last_error=CASE
+                       WHEN COALESCE(NULLIF(TRIM(last_error), ''), '') <> '' THEN last_error
+                       ELSE 'LOCK_TIMEOUT_RECOVERED: انتهت مهلة قفل المعالجة (>5 دقائق) قبل اكتمال الاستجابة من Apps Script.'
+                     END,
+                     error_category = 'timeout',
+                     last_attempt_at = COALESCE(last_attempt_at, locked_at, NOW()),
+                     finished_at = NOW(),
+                     next_retry_at = NOW() + INTERVAL '30 seconds',
+                     locked_at = NULL,
+                     worker_id = '',
+                     updated_at = NOW(),
+                     last_error_details_json = jsonb_build_object(
+                       'errorName', 'LockTimeoutError',
+                       'errorMessage', 'LOCK_TIMEOUT_RECOVERED: stale processing lock exceeded 5 minutes',
+                       'category', 'timeout',
+                       'correlationId', $1::text,
+                       'timestamp', NOW()::text
+                     ),
+                     error_history_json = COALESCE(error_history_json, '[]'::jsonb) || jsonb_build_array(
+                       jsonb_build_object(
+                         'at', NOW()::text,
+                         'attempt', COALESCE(retry_count, 0) + 1,
+                         'error', 'LOCK_TIMEOUT_RECOVERED: stale processing lock exceeded 5 minutes',
+                         'category', 'timeout',
+                         'permanent', false,
+                         'correlationId', $1::text
+                       )
+                     )
+                 WHERE status = 'processing'
+                   AND locked_at IS NOT NULL
+                   AND locked_at < NOW() - INTERVAL '5 minutes'`,
+                [correlationId]
+              ).catch(() =>
+                tx.query(
+                  `UPDATE sheets_mirror_outbox
+                   SET retry_count = COALESCE(retry_count, 0) + 1,
+                       status = CASE
+                         WHEN COALESCE(retry_count, 0) + 1 >= GREATEST(1, COALESCE(max_retries, 8)) THEN 'dead_letter'
+                         ELSE 'retry'
+                       END,
+                       last_error=CASE
+                         WHEN COALESCE(NULLIF(TRIM(last_error), ''), '') <> '' THEN last_error
+                         ELSE 'LOCK_TIMEOUT_RECOVERED: stale processing lock exceeded 5 minutes'
+                       END,
+                       next_retry_at = NOW() + INTERVAL '30 seconds',
+                       locked_at = NULL,
+                       worker_id = '',
+                       updated_at = NOW()
+                   WHERE status = 'processing'
+                     AND locked_at IS NOT NULL
+                     AND locked_at < NOW() - INTERVAL '5 minutes'`
+                )
+              ),
+            undefined
+          );
+        }
+
+        const claimParams = opts.targetOutboxId
+          ? [workerId, batchLimit, opts.targetOutboxId]
+          : (targetIdsList.length > 0 ? [workerId, batchLimit, targetIdsList] : [workerId, batchLimit]);
+        const claimQ = await runWithSavepoint(
+          tx,
+          'obx_claim_rows_full',
+          () =>
+            tx.query(
+              `WITH candidate AS (
+                 SELECT o.id
+                 FROM sheets_mirror_outbox o
+                 WHERE o.status IN ('pending', 'retry')
+                   AND o.next_retry_at <= NOW()
+                   ${bulkFilterSql}
+                   ${targetFilterSql}
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM sheets_mirror_outbox prev
+                     WHERE prev.entity_type = o.entity_type
+                       AND prev.entity_id = o.entity_id
+                       AND prev.status IN ('pending', 'retry', 'processing')
+                       ${opts.allowBulkDelete === true ? '' : `AND COALESCE(prev.action, '') <> 'deleteAllReservations'`}
+                       AND (prev.created_at < o.created_at OR (prev.created_at = o.created_at AND prev.id < o.id))
+                   )
+                 ORDER BY o.created_at ASC, o.id ASC
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+               )
+               UPDATE sheets_mirror_outbox o
+               SET status = 'processing',
+                   started_at = NOW(),
+                   locked_at = NOW(),
+                   worker_id = $1,
+                   updated_at = NOW()
+               FROM candidate
+               WHERE o.id = candidate.id
+               RETURNING o.*`,
+              claimParams
+            ),
+          null as any
+        );
+        if (claimQ && Array.isArray(claimQ.rows)) {
+          return claimQ.rows;
+        }
+
+        const legacyClaimQ = await tx.query(
+          `WITH candidate AS (
+             SELECT o.id
+             FROM sheets_mirror_outbox o
+             WHERE o.status IN ('pending', 'retry')
+               AND o.next_retry_at <= NOW()
+               ${bulkFilterSql}
+               ${targetFilterSql}
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM sheets_mirror_outbox prev
+                 WHERE prev.entity_type = o.entity_type
+                   AND prev.entity_id = o.entity_id
+                   AND prev.status IN ('pending', 'retry', 'processing')
+                   ${opts.allowBulkDelete === true ? '' : `AND COALESCE(prev.action, '') <> 'deleteAllReservations'`}
+                   AND (prev.created_at < o.created_at OR (prev.created_at = o.created_at AND prev.id < o.id))
+               )
+             ORDER BY o.created_at ASC, o.id ASC
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+           )
+           UPDATE sheets_mirror_outbox o
+           SET status = 'processing',
+               locked_at = NOW(),
+               worker_id = $1,
+               updated_at = NOW()
+           FROM candidate
+           WHERE o.id = candidate.id
+           RETURNING o.*`,
+          claimParams
+        );
+        return legacyClaimQ.rows || [];
+      });
+
+      if (claimedRows.length === 0) {
+        break;
+      }
+
+      const allOrdered = [...claimedRows].sort((a: any, b: any) => {
+        const ta = a.created_at instanceof Date ? a.created_at.getTime() : Date.parse(String(a.created_at || '')) || 0;
+        const tb = b.created_at instanceof Date ? b.created_at.getTime() : Date.parse(String(b.created_at || '')) || 0;
+        return ta !== tb ? ta - tb : str(a.id).localeCompare(str(b.id));
+      });
+
+      const orderedRows: any[] = [];
+      let batchPreQuarantined = 0;
+      for (const row of allOrdered) {
+        if (opts.allowBulkDelete !== true && str(row.action) === 'deleteAllReservations') {
+          await recordRowFailure(row, 'QUARANTINED_BULK_DELETE: deleteAllReservations محجور ولا يُنفذ تلقائياً لحماية البيانات.', 400, batchId);
+          batchPreQuarantined++;
+          cumulativePermanentFailed++;
+          lastErrorCategory = 'validation';
+        } else {
+          orderedRows.push(row);
+        }
+      }
+      cumulativeFailed += batchPreQuarantined;
+
+      if (orderedRows.length === 0) {
+        if (claimedRows.length < batchLimit) break;
+        continue;
+      }
+
+      // Check prior uncertain/timed-out rows against GAS receipt ledger BEFORE re-sending to prevent duplicates
+      let rowsToDispatch = orderedRows;
+      if (shouldVerifyReceiptOnAbort) {
+        const uncertainRows = orderedRows.filter(
+          (r: any) => num(r.retry_count, 0) > 0 || str(r.error_category) === 'timeout' || /abort|timeout/i.test(str(r.last_error))
+        );
+        if (uncertainRows.length > 0) {
+          const alreadyApplied = await verifyOutboxReceiptInGas(safeExec, fetchFn, uncertainRows, correlationId, batchId, mirrorTimeoutMs);
+          if (alreadyApplied.size > 0) {
+            const verifiedList = Array.from(alreadyApplied);
+            await markIdsCompleted(verifiedList, batchId);
+            cumulativeSent += verifiedList.length;
+            rowsToDispatch = orderedRows.filter((r: any) => !alreadyApplied.has(str(r.id)));
+            lastCursor = verifiedList[verifiedList.length - 1] || lastCursor;
+          }
+        }
+      }
+
+      if (rowsToDispatch.length === 0) {
+        batchesCompleted++;
+        await upsertSyncCheckpointSafe(
+          safeExec,
+          'google_apps_script_sheets',
+          'ok',
+          cumulativeSent,
+          '',
+          { lastBatchSucceeded: cumulativeSent, durationMs: Math.max(1, Date.now() - flushStartedMs), correlationId, batchId, verifiedByReceipt: true },
+          lastCursor
+        );
+        await upsertSyncCheckpointSafe(
+          safeExec,
+          'google_sheets_mirror',
+          'ok',
+          cumulativeSent,
+          '',
+          { lastBatchSucceeded: cumulativeSent, correlationId, batchId, batchesCompleted },
+          lastCursor
+        );
+        if (claimedRows.length < batchLimit) break;
+        continue;
+      }
+
+      const items = rowsToDispatch.map((r: any) => {
+        const parsedPayload = typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {});
+        return {
+          id: str(r.id),
+          idempotencyKey: str(r.idempotency_key) || buildOutboxIdempotencyKey(str(r.entity_type), str(r.entity_id), str(r.action), parsedPayload),
+          entityType: str(r.entity_type),
+          entityId: str(r.entity_id),
+          action: str(r.action),
+          payload: parsedPayload
+        };
+      });
+
+      let lastHttpStatus = 0;
+      let lastRawBody = '';
+      try {
+        const dispatch = await callGasMirrorAction(
+          safeExec,
+          'syncFromNeonMirror',
+          { correlationId, batchId, items },
+          fetchFn,
+          mirrorTimeoutMs
+        );
+
+        if (dispatch.missingConfigError || dispatch.urlError || !dispatch.callRes) {
+          const cfgErrMsg = dispatch.urlError || dispatch.missingConfigError || 'INVALID_GAS_URL';
+          for (const row of rowsToDispatch) {
+            const cls = await recordRowFailure(row, cfgErrMsg, 400, batchId);
+            cumulativeFailed++;
+            if (cls.permanent) cumulativePermanentFailed++;
+          }
+          lastErrorCategory = 'validation';
+          break;
+        }
+
+        const callRes = dispatch.callRes;
+        lastHttpStatus = callRes.statusCode;
+        lastRawBody = callRes.rawText;
+        const parsed = callRes.parsed;
+        if (!callRes.httpOk || !parsed?.success) {
+          const errMsg = callRes.errorMessage || parsed?.message || parsed?.error || `GAS HTTP ${callRes.statusCode}`;
+          const callErr: any = new Error(errMsg);
+          callErr.httpStatus = callRes.statusCode;
+          callErr.responseBody = callRes.rawText;
+          throw callErr;
+        }
+
+        const rawResults = Array.isArray(parsed.results)
+          ? parsed.results
+          : (Array.isArray(parsed.data?.results) ? parsed.data.results : null);
+        const rawFailedItems = Array.isArray(parsed.failedItems)
+          ? parsed.failedItems
+          : (Array.isArray(parsed.data?.failedItems) ? parsed.data.failedItems : null);
+
+        if (rawResults || rawFailedItems) {
+          const failedById = new Map<string, string>();
+          if (rawFailedItems) {
+            for (const fi of rawFailedItems) {
+              if (!fi || typeof fi !== 'object') continue;
+              const targetId = str(fi.id) || (typeof fi.index === 'number' && rowsToDispatch[fi.index] ? str(rowsToDispatch[fi.index].id) : '');
+              if (targetId) {
+                failedById.set(targetId, str(fi.error || fi.message || 'GAS_ITEM_FAILED'));
+              }
+            }
+          }
+          if (rawResults) {
+            for (let idx = 0; idx < rawResults.length; idx++) {
+              const r = rawResults[idx];
+              if (!r || typeof r !== 'object') continue;
+              const targetId = str(r.id) || (typeof r.index === 'number' && rowsToDispatch[r.index] ? str(rowsToDispatch[r.index].id) : (rowsToDispatch[idx] ? str(rowsToDispatch[idx].id) : ''));
+              if (!targetId) continue;
+              const itemOk = r.ok === true || r.success === true || r.status === 'sent' || r.status === 'completed' || r.status === 'applied' || r.status === 'ok' || r.status === 'deduplicated';
+              if (!itemOk && (r.ok === false || r.success === false || r.status === 'failed' || r.status === 'dead_letter' || r.status === 'error' || r.error)) {
+                failedById.set(targetId, str(r.error || r.message || 'GAS_ITEM_FAILED'));
+              }
+            }
+          }
+
+          const succeededIds = rowsToDispatch.map((r: any) => str(r.id)).filter((id) => id && !failedById.has(id));
+          const failedRows = rowsToDispatch.filter((r: any) => failedById.has(str(r.id)));
+
+          if (succeededIds.length > 0) {
+            await markIdsCompleted(succeededIds, batchId);
+            cumulativeSent += succeededIds.length;
+            batchesCompleted++;
+            lastCursor = succeededIds[succeededIds.length - 1] || lastCursor;
+            const gasVer = str(parsed?.data?.gasScriptVersion);
+            const hasUpsertRes = rowsToDispatch.some((r: any) => str(r.action) === 'upsertReservation' && succeededIds.includes(str(r.id)));
+            const receiptAt = str(parsed?.data?.lastReceiptAt) || new Date().toISOString();
+            const protectedModeFlag = Boolean(parsed?.data?.protectedMode ?? parsed?.data?.frozenRowsProtected);
+            latestReceiptMeta = {
+              at: receiptAt,
+              batchId,
+              correlationId,
+              gasScriptVersion: gasVer,
+              protectedMode: protectedModeFlag,
+              count: succeededIds.length
+            };
+            await upsertSyncCheckpointSafe(
+              safeExec,
+              'google_apps_script_sheets',
+              'ok',
+              succeededIds.length,
+              '',
+              {
+                lastBatchSucceeded: succeededIds.length,
+                cumulativeSent,
+                batchesCompleted,
+                durationMs: Math.max(1, Date.now() - flushStartedMs),
+                correlationId,
+                batchId,
+                gasScriptVersion: gasVer,
+                authSource: str(dispatch.flowDiag?.secret?.source || ''),
+                gasUrlSource: str(dispatch.flowDiag?.gasUrl?.source || ''),
+                ...(hasUpsertRes ? { lastSuccessfulUpsertAt: receiptAt } : {})
+              },
+              lastCursor
+            );
+            await upsertSyncCheckpointSafe(
+              safeExec,
+              'google_sheets_mirror',
+              'ok',
+              cumulativeSent,
+              '',
+              {
+                lastBatchSucceeded: succeededIds.length,
+                cumulativeSent,
+                batchesCompleted,
+                correlationId,
+                batchId,
+                gasScriptVersion: gasVer,
+                ...(hasUpsertRes ? { lastSuccessfulUpsertAt: receiptAt } : {})
+              },
+              lastCursor
+            );
+            await upsertSyncCheckpointSafe(
+              safeExec,
+              'google_apps_script_outbox_receipt',
+              'ok',
+              succeededIds.length,
+              '',
+              {
+                receiptAt,
+                batchId,
+                correlationId,
+                gasScriptVersion: gasVer,
+                protectedMode: protectedModeFlag,
+                receiptCount: num(parsed?.data?.receiptCount, succeededIds.length),
+                authSource: str(dispatch.flowDiag?.secret?.source || ''),
+                gasUrlSource: str(dispatch.flowDiag?.gasUrl?.source || ''),
+                receivedVia: str(parsed?.data?.receivedVia || 'payload.syncSecret')
+              },
+              lastCursor
+            );
+          }
+
+          for (const row of failedRows) {
+            const msg = failedById.get(str(row.id)) || 'GAS_ITEM_FAILED';
+            const cls = await recordRowFailure(row, msg, lastHttpStatus, batchId, lastRawBody);
+            cumulativeFailed++;
+            lastErrorCategory = cls.category;
+            if (cls.permanent) cumulativePermanentFailed++;
+            if (cls.category === 'auth') {
+              haltedByAuth = true;
+              lastAuthError = msg;
+            }
+            if (cls.category === 'sheet_frozen') haltedBySheetError = true;
+          }
+
+          if (haltedByAuth || haltedBySheetError || failedRows.length > 0) {
+            break;
+          }
+          if (claimedRows.length < batchLimit) break;
+          continue;
+        }
+
+        const ids = items.map((x) => x.id);
+        await markIdsCompleted(ids, batchId);
+        cumulativeSent += ids.length;
+        batchesCompleted++;
+        lastCursor = ids[ids.length - 1] || lastCursor;
+        const gasVer = str(parsed?.data?.gasScriptVersion);
+        const hasUpsertRes = items.some((x) => x.action === 'upsertReservation');
+        const receiptAt = str(parsed?.data?.lastReceiptAt) || new Date().toISOString();
+        const protectedModeFlag = Boolean(parsed?.data?.protectedMode ?? parsed?.data?.frozenRowsProtected);
+        latestReceiptMeta = {
+          at: receiptAt,
+          batchId,
+          correlationId,
+          gasScriptVersion: gasVer,
+          protectedMode: protectedModeFlag,
+          count: ids.length
+        };
+        await upsertSyncCheckpointSafe(
+          safeExec,
+          'google_apps_script_sheets',
+          'ok',
+          ids.length,
+          '',
+          {
+            lastBatchSucceeded: ids.length,
+            cumulativeSent,
+            batchesCompleted,
+            durationMs: Math.max(1, Date.now() - flushStartedMs),
+            correlationId,
+            batchId,
+            gasScriptVersion: gasVer,
+            authSource: str(dispatch.flowDiag?.secret?.source || ''),
+            gasUrlSource: str(dispatch.flowDiag?.gasUrl?.source || ''),
+            ...(hasUpsertRes ? { lastSuccessfulUpsertAt: receiptAt } : {})
+          },
+          lastCursor
+        );
+        await upsertSyncCheckpointSafe(
+          safeExec,
+          'google_sheets_mirror',
+          'ok',
+          cumulativeSent,
+          '',
+          {
+            lastBatchSucceeded: ids.length,
+            cumulativeSent,
+            batchesCompleted,
+            correlationId,
+            batchId,
+            gasScriptVersion: gasVer,
+            ...(hasUpsertRes ? { lastSuccessfulUpsertAt: receiptAt } : {})
+          },
+          lastCursor
+        );
+        await upsertSyncCheckpointSafe(
+          safeExec,
+          'google_apps_script_outbox_receipt',
+          'ok',
+          ids.length,
+          '',
+          {
+            receiptAt,
+            batchId,
+            correlationId,
+            gasScriptVersion: gasVer,
+            protectedMode: protectedModeFlag,
+            receiptCount: num(parsed?.data?.receiptCount, ids.length),
+            authSource: str(dispatch.flowDiag?.secret?.source || ''),
+            gasUrlSource: str(dispatch.flowDiag?.gasUrl?.source || ''),
+            receivedVia: str(parsed?.data?.receivedVia || 'payload.syncSecret')
+          },
+          lastCursor
+        );
+
+        if (claimedRows.length < batchLimit) {
+          break;
+        }
+      } catch (err: any) {
+        const firstRow = rowsToDispatch[0] || {};
+        const detail = extractDetailedOutboxError(err, {
+          httpStatus: lastHttpStatus || Number(err?.httpStatus || err?.statusCode || 0),
+          responseBody: lastRawBody || str(err?.responseBody || err?.rawText),
+          correlationId,
+          action: str(firstRow.action || 'syncFromNeonMirror'),
+          entityType: str(firstRow.entity_type || 'Batch'),
+          entityId: str(firstRow.entity_id || `${rowsToDispatch.length}_items`)
+        });
+        const cls = classifyOutboxMirrorError(detail.formattedMessage, detail.httpStatus);
+        lastErrorCategory = cls.category;
+
+        // Before marking a timeout/abort/network batch failed, verify with GAS whether records were actually written
+        let remainingFailedRows = rowsToDispatch;
+        if (shouldVerifyReceiptOnAbort && (cls.category === 'timeout' || cls.category === 'network')) {
+          const verifiedApplied = await verifyOutboxReceiptInGas(safeExec, fetchFn, rowsToDispatch, correlationId, batchId, mirrorTimeoutMs);
+          if (verifiedApplied.size > 0) {
+            const confirmedIds = Array.from(verifiedApplied);
+            await markIdsCompleted(confirmedIds, batchId);
+            cumulativeSent += confirmedIds.length;
+            batchesCompleted++;
+            lastCursor = confirmedIds[confirmedIds.length - 1] || lastCursor;
+            remainingFailedRows = rowsToDispatch.filter((r: any) => !verifiedApplied.has(str(r.id)));
+          }
+        }
+
+        for (const row of remainingFailedRows) {
+          const rowCls = await recordRowFailure(row, err, detail.httpStatus, batchId, detail.responseBody);
+          cumulativeFailed++;
+          if (rowCls.permanent) cumulativePermanentFailed++;
+        }
+
+        if (remainingFailedRows.length > 0) {
+          await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'error', remainingFailedRows.length, detail.formattedMessage, {
+            category: cls.category,
+            permanent: cls.permanent,
+            httpStatus: detail.httpStatus,
+            durationMs: Math.max(1, Date.now() - flushStartedMs),
+            correlationId,
+            batchId
+          }, lastCursor);
+          await upsertSyncCheckpointSafe(safeExec, 'google_sheets_mirror', 'error', remainingFailedRows.length, detail.formattedMessage, {
+            category: cls.category,
+            correlationId,
+            batchId
+          }, lastCursor);
+          await logBackendError(safeExec, 'syncService', 'flushSheetsMirrorOutbox', err instanceof Error ? err : new Error(detail.formattedMessage), {
+            batchSize: remainingFailedRows.length,
+            permanent: cls.permanent,
+            category: cls.category,
+            httpStatus: detail.httpStatus,
+            errorName: detail.errorName,
+            responseBody: detail.responseBody.slice(0, 240),
+            correlationId,
+            batchId
+          }).catch(() => undefined);
+        }
+
+        if (cls.category === 'auth') {
+          haltedByAuth = true;
+          lastAuthError = detail.formattedMessage;
+        }
+        if (cls.category === 'sheet_frozen') {
+          haltedBySheetError = true;
+        }
+        break;
       }
     }
-    await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'error', orderedRows.length, errMsg, {
-      category: cls.category,
-      permanent: cls.permanent,
-      httpStatus: lastHttpStatus
-    });
-    await logBackendError(safeExec, 'syncService', 'flushSheetsMirrorOutbox', err, {
-      batchSize: orderedRows.length,
-      permanent: cls.permanent,
-      category: cls.category,
-      httpStatus: lastHttpStatus
-    }).catch(() => undefined);
+  } finally {
+    if (!hasExplicitTargets) {
+      await releaseOutboxDistributedLease(safeExec, workerId);
+    }
+  }
+
+  return {
+    sent: cumulativeSent,
+    failed: cumulativeFailed,
+    skipped: false,
+    batchesCompleted,
+    ...(lastCursor ? { lastCursor } : {}),
+    ...(lastBatchId ? { batchId: lastBatchId } : {}),
+    ...(latestReceiptMeta ? { receipt: latestReceiptMeta } : {}),
+    ...(stoppedByBudget ? { stoppedByBudget } : {}),
+    ...(cumulativeFailed > 0 ? { permanentFailed: cumulativePermanentFailed, errorCategory: lastErrorCategory } : {}),
+    ...(haltedByAuth ? { haltedByAuth: true, authError: lastAuthError } : {}),
+    ...(haltedBySheetError ? { haltedBySheetError: true } : {}),
+    correlationId,
+    durationMs: Math.max(1, Date.now() - flushStartedMs)
+  };
+}
+
+export async function testOutboxSingleUpsert(
+  executor: DbExecutor,
+  opts: {
+    reservationNumber?: string;
+    reservationId?: string;
+    reservationPayload?: Record<string, any>;
+  } = {},
+  fetchFn: typeof fetch = fetch
+): Promise<{
+  ok: boolean;
+  correlationId: string;
+  outboxId: string;
+  reservationNumber: string;
+  entityId: string;
+  outboxStatus: string;
+  sent: number;
+  failed: number;
+  haltedByAuth: boolean;
+  errorMessage: string;
+  durationMs: number;
+}> {
+  const startedMs = Date.now();
+  const safeExec = ensureDbExecutor(executor);
+  const correlationId = generateId('COR');
+
+  const authCheck = await verifyGasMirrorAuth(safeExec, fetchFn);
+  if (authCheck.authValid === false) {
     return {
+      ok: false,
+      correlationId: authCheck.correlationId || correlationId,
+      outboxId: '',
+      reservationNumber: str(opts.reservationNumber),
+      entityId: str(opts.reservationId),
+      outboxStatus: 'halted_auth',
       sent: 0,
-      failed: orderedRows.length,
-      skipped: false,
-      permanentFailed,
-      ...(cls.category === 'auth' ? { haltedByAuth: true, authError: errMsg } : {})
+      failed: 0,
+      haltedByAuth: true,
+      errorMessage: authCheck.message,
+      durationMs: Math.max(1, Date.now() - startedMs)
     };
   }
+
+  let sampleRes: any = opts.reservationPayload || null;
+  if (!sampleRes) {
+    const resNumFilter = str(opts.reservationNumber);
+    const resIdFilter = str(opts.reservationId);
+    const resQ = await safeExec.query(
+      resNumFilter
+        ? `SELECT * FROM reservations WHERE deleted_at IS NULL AND reservation_number = $1 LIMIT 1`
+        : (resIdFilter
+          ? `SELECT * FROM reservations WHERE deleted_at IS NULL AND id = $1 LIMIT 1`
+          : `SELECT * FROM reservations WHERE deleted_at IS NULL ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 1`),
+      resNumFilter ? [resNumFilter] : (resIdFilter ? [resIdFilter] : [])
+    ).catch(() => ({ rows: [] as any[] }));
+    const row = resQ.rows?.[0];
+    if (!row) {
+      return {
+        ok: false,
+        correlationId,
+        outboxId: '',
+        reservationNumber: resNumFilter,
+        entityId: resIdFilter,
+        outboxStatus: 'no_sample_reservation',
+        sent: 0,
+        failed: 0,
+        haltedByAuth: false,
+        errorMessage: 'NO_RESERVATION_FOUND: لا يوجد حجز نشط في Neon PostgreSQL لاختبار upsertReservation عبر Outbox.',
+        durationMs: Math.max(1, Date.now() - startedMs)
+      };
+    }
+    sampleRes = {
+      id: str(row.id),
+      reservationNumber: str(row.reservation_number),
+      sourceReservationId: str(row.source_reservation_id || row.reservation_number),
+      referenceNumber: str(row.reference_number),
+      customerName: str(row.customer_name),
+      customerPhone: str(row.customer_phone),
+      customerIdNumber: str(row.customer_id_number),
+      carType: str(row.car_type),
+      pickupBranch: str(row.pickup_branch),
+      returnBranch: str(row.return_branch),
+      pickupDate: row.pickup_date instanceof Date ? row.pickup_date.toISOString() : str(row.pickup_date),
+      returnDate: row.return_date instanceof Date ? row.return_date.toISOString() : str(row.return_date),
+      originalStatusAr: str(row.original_status_ar),
+      internalStatus: str(row.internal_status),
+      totalAmount: num(row.total_amount, 0),
+      extensionsCount: num(row.extensions_count, 0),
+      updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : (str(row.updated_at) || new Date().toISOString())
+    };
+  }
+
+  const reservationNumber = str(sampleRes.reservationNumber || sampleRes.sourceReservationId || sampleRes.id);
+  const entityId = str(sampleRes.id || reservationNumber);
+  const idempotencyKey = `outbox-real-upsert-test:${reservationNumber}:${correlationId}`;
+
+  const enq = await enqueueSheetsMirror(
+    safeExec as unknown as DbClient,
+    'Reservation',
+    entityId,
+    'upsertReservation',
+    {
+      ...sampleRes,
+      reservationNumber,
+      idempotencyKey,
+      correlationId
+    }
+  );
+  const outboxId = str(enq.outboxId);
+
+  const flushRes = await flushSheetsMirrorOutbox(safeExec, fetchFn, {
+    targetOutboxId: outboxId,
+    batchSize: 1,
+    maxBatches: 1,
+    verifyAuthBeforeSend: false,
+    correlationId
+  });
+
+  const rowQ = await safeExec.query<{ status: string; last_error: string }>(
+    `SELECT status, last_error FROM sheets_mirror_outbox WHERE id = $1 LIMIT 1`,
+    [outboxId]
+  ).catch(() => ({ rows: [] as Array<{ status: string; last_error: string }> }));
+
+  const outboxStatus = str(rowQ.rows?.[0]?.status) || (flushRes.sent > 0 ? 'completed' : (flushRes.haltedByAuth ? 'dead_letter' : 'retry'));
+  const ok = Boolean(flushRes.sent > 0 && !flushRes.haltedByAuth);
+  const errorMessage = ok
+    ? ''
+    : redactSensitiveText(flushRes.authError || rowQ.rows?.[0]?.last_error || `OUTBOX_UPSERT_TEST_FAILED:${flushRes.errorCategory || 'unknown'}`);
+
+  return {
+    ok,
+    correlationId: flushRes.correlationId || correlationId,
+    outboxId,
+    reservationNumber,
+    entityId,
+    outboxStatus,
+    sent: flushRes.sent,
+    failed: flushRes.failed,
+    haltedByAuth: Boolean(flushRes.haltedByAuth),
+    errorMessage,
+    durationMs: Math.max(1, Date.now() - startedMs)
+  };
+}
+
+export async function testOutboxThreeWaySuite(
+  executor: DbExecutor,
+  opts: {
+    verifyReceiptWithGas?: boolean;
+  } = {},
+  fetchFn: typeof fetch = fetch
+): Promise<{
+  ok: boolean;
+  correlationId: string;
+  httpStatus: number;
+  gasScriptVersion: string;
+  authSource: string;
+  gasUrlSource: string;
+  sent: number;
+  failed: number;
+  receiptVerifiedCount: number;
+  haltedByAuth: boolean;
+  errorMessage: string;
+  items: Array<{
+    action: string;
+    entityType: string;
+    entityId: string;
+    outboxId: string;
+    idempotencyKey: string;
+    outboxStatus: string;
+    receiptConfirmed: boolean;
+  }>;
+  durationMs: number;
+}> {
+  const startedMs = Date.now();
+  const safeExec = ensureDbExecutor(executor);
+  const correlationId = generateId('COR');
+
+  const authCheck = await verifyGasMirrorAuth(safeExec, fetchFn);
+  const authSource = str(authCheck.diagnostics?.authSource || authCheck.diagnostics?.flow?.secret?.source || 'unknown');
+  const gasUrlSource = str(authCheck.diagnostics?.flow?.gasUrl?.source || 'unknown');
+  const gasScriptVersion = str(authCheck.diagnostics?.deploymentVersion || authCheck.diagnostics?.gasDiagnostics?.gasScriptVersion);
+
+  if (authCheck.authValid === false) {
+    return {
+      ok: false,
+      correlationId: authCheck.correlationId || correlationId,
+      httpStatus: num(authCheck.statusCode, 0),
+      gasScriptVersion,
+      authSource,
+      gasUrlSource,
+      sent: 0,
+      failed: 0,
+      receiptVerifiedCount: 0,
+      haltedByAuth: true,
+      errorMessage: authCheck.message,
+      items: [],
+      durationMs: Math.max(1, Date.now() - startedMs)
+    };
+  }
+
+  const nowIsoStr = new Date().toISOString();
+  const resKey = `outbox-3way-test:res:RG-HEALTH-TEST-1:${correlationId}`;
+  const fuKey = `outbox-3way-test:fu:FU_HEALTH_TEST_1:${correlationId}`;
+  const setKey = `outbox-3way-test:set:__mirror_outbox_test_setting:${correlationId}`;
+
+  const testSpecs = [
+    {
+      entityType: 'Reservation',
+      entityId: 'RG-HEALTH-TEST-1',
+      action: 'upsertReservation',
+      idempotencyKey: resKey,
+      payload: {
+        id: 'RG-HEALTH-TEST-1',
+        reservationNumber: 'RG-HEALTH-TEST-1',
+        sourceReservationId: 'RG-HEALTH-TEST-1',
+        referenceNumber: 'RG-HEALTH-TEST-1',
+        customerName: '__OUTBOX_TEST_RECORD__',
+        customerPhone: '0000000000',
+        carType: 'TEST_ONLY',
+        originalStatusCode: 'TEST',
+        originalStatusAr: 'اختبار آمن',
+        internalStatus: 'test',
+        totalAmount: 0,
+        extensionsCount: 0,
+        updatedAt: nowIsoStr,
+        idempotencyKey: resKey,
+        correlationId
+      }
+    },
+    {
+      entityType: 'FollowUp',
+      entityId: 'FU_HEALTH_TEST_1',
+      action: 'appendFollowUp',
+      idempotencyKey: fuKey,
+      payload: {
+        id: 'FU_HEALTH_TEST_1',
+        reservationId: 'RG-HEALTH-TEST-1',
+        reservationNumber: 'RG-HEALTH-TEST-1',
+        employeeId: 'SYSTEM_TEST',
+        employeeName: 'HealthCenterTest',
+        followUpType: 'outbox_test',
+        status: 'test',
+        note: `__OUTBOX_TEST_FOLLOWUP__:${correlationId}`,
+        createdAt: nowIsoStr,
+        updatedAt: nowIsoStr,
+        idempotencyKey: fuKey,
+        correlationId
+      }
+    },
+    {
+      entityType: 'Setting',
+      entityId: '__mirror_outbox_test_setting',
+      action: 'upsertSetting',
+      idempotencyKey: setKey,
+      payload: {
+        key: '__mirror_outbox_test_setting',
+        value: `${correlationId}@${nowIsoStr}`,
+        updatedBy: 'HealthCenterThreeWayTest',
+        idempotencyKey: setKey,
+        correlationId
+      }
+    }
+  ];
+
+  const enqueuedRows: Array<{
+    outboxId: string;
+    entityType: string;
+    entityId: string;
+    action: string;
+    idempotencyKey: string;
+    payload: Record<string, any>;
+  }> = [];
+
+  for (const spec of testSpecs) {
+    const enq = await enqueueSheetsMirror(
+      safeExec as unknown as DbClient,
+      spec.entityType,
+      spec.entityId,
+      spec.action,
+      spec.payload
+    );
+    enqueuedRows.push({
+      outboxId: str(enq.outboxId),
+      entityType: spec.entityType,
+      entityId: spec.entityId,
+      action: spec.action,
+      idempotencyKey: spec.idempotencyKey,
+      payload: spec.payload
+    });
+  }
+
+  const targetIds = enqueuedRows.map((x) => x.outboxId).filter(Boolean);
+  const flushRes = await flushSheetsMirrorOutbox(safeExec, fetchFn, {
+    targetOutboxIds: targetIds,
+    batchSize: targetIds.length || 3,
+    maxBatches: 1,
+    verifyAuthBeforeSend: false,
+    verifyReceiptOnAbort: true,
+    correlationId
+  });
+
+  const receiptCandidateRows = enqueuedRows.map((x) => ({
+    id: x.outboxId,
+    entity_type: x.entityType,
+    entity_id: x.entityId,
+    action: x.action,
+    idempotency_key: x.idempotencyKey,
+    payload: x.payload
+  }));
+
+  const verifiedIds = (opts.verifyReceiptWithGas !== false && flushRes.sent > 0)
+    ? await verifyOutboxReceiptInGas(
+        safeExec,
+        fetchFn,
+        receiptCandidateRows,
+        correlationId,
+        str(flushRes.batchId || 'OBX_3WAY'),
+        10000
+      )
+    : new Set<string>();
+
+  const statusQ = await safeExec.query<{ id: string; status: string; last_error: string }>(
+    `SELECT id, status, last_error FROM sheets_mirror_outbox WHERE id = ANY($1::text[])`,
+    [targetIds]
+  ).catch(() => ({ rows: [] as Array<{ id: string; status: string; last_error: string }> }));
+  const statusMap = new Map<string, { status: string; lastError: string }>();
+  for (const r of statusQ.rows || []) {
+    statusMap.set(str(r.id), { status: str(r.status), lastError: str(r.last_error) });
+  }
+
+  const resultItems = enqueuedRows.map((x) => {
+    const dbState = statusMap.get(x.outboxId);
+    const outboxStatus = dbState?.status || (flushRes.sent > 0 ? 'completed' : (flushRes.haltedByAuth ? 'dead_letter' : 'retry'));
+    const receiptConfirmed = Boolean(
+      verifiedIds.has(x.outboxId) ||
+      (flushRes.receipt && flushRes.receipt.count >= enqueuedRows.length && outboxStatus === 'completed')
+    );
+    return {
+      action: x.action,
+      entityType: x.entityType,
+      entityId: x.entityId,
+      outboxId: x.outboxId,
+      idempotencyKey: x.idempotencyKey,
+      outboxStatus,
+      receiptConfirmed
+    };
+  });
+
+  const allCompleted = resultItems.every((i) => i.outboxStatus === 'completed' || i.outboxStatus === 'sent');
+  const receiptVerifiedCount = resultItems.filter((i) => i.receiptConfirmed).length;
+  const ok = Boolean(flushRes.sent === 3 && flushRes.failed === 0 && !flushRes.haltedByAuth && allCompleted);
+  const firstDbErr = Array.from(statusMap.values()).map((v) => v.lastError).find(Boolean) || '';
+  const errorMessage = ok
+    ? ''
+    : redactSensitiveText(flushRes.authError || firstDbErr || `OUTBOX_3WAY_TEST_FAILED:${flushRes.errorCategory || 'unknown'}`);
+
+  return {
+    ok,
+    correlationId: flushRes.correlationId || correlationId,
+    httpStatus: ok ? 200 : num(authCheck.statusCode, 0),
+    gasScriptVersion: str(flushRes.receipt?.gasScriptVersion || gasScriptVersion),
+    authSource,
+    gasUrlSource,
+    sent: flushRes.sent,
+    failed: flushRes.failed,
+    receiptVerifiedCount,
+    haltedByAuth: Boolean(flushRes.haltedByAuth),
+    errorMessage,
+    items: resultItems,
+    durationMs: Math.max(1, Date.now() - startedMs)
+  };
+}
+
+export async function verifyGasFrozenRowsProtection(
+  executor: DbExecutor,
+  fetchFn: typeof fetch = fetch
+): Promise<{
+  ok: boolean;
+  protectedMode: boolean;
+  actualFrozenRowsTestPassed: boolean;
+  deleteRowCallsBlocked: boolean;
+  clearContentOnly: boolean;
+  sheets: any[];
+  gasScriptVersion: string;
+  correlationId: string;
+  message: string;
+  checkedAt: string;
+}> {
+  const safeExec = ensureDbExecutor(executor);
+  const correlationId = generateId('COR');
+  const checkedAt = new Date().toISOString();
+
+  const dispatch = await callGasMirrorAction(
+    safeExec,
+    'verifyFrozenRowsProtection',
+    { correlationId },
+    fetchFn,
+    15000
+  );
+
+  if (dispatch.missingConfigError || dispatch.urlError || !dispatch.callRes) {
+    const errMsg = dispatch.missingConfigError || dispatch.urlError || 'GAS_NOT_CONFIGURED';
+    await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_frozen_protection', 'error', 0, errMsg, {
+      protectedMode: false,
+      actualFrozenRowsTestPassed: false,
+      correlationId,
+      checkedAt
+    });
+    return {
+      ok: false,
+      protectedMode: false,
+      actualFrozenRowsTestPassed: false,
+      deleteRowCallsBlocked: false,
+      clearContentOnly: false,
+      sheets: [],
+      gasScriptVersion: '',
+      correlationId,
+      message: errMsg,
+      checkedAt
+    };
+  }
+
+  const callRes = dispatch.callRes;
+  const parsed = callRes.parsed;
+  const data = (parsed && typeof parsed === 'object' ? (parsed.data || parsed) : {}) as Record<string, any>;
+  const actualPassed = Boolean(
+    callRes.httpOk &&
+    parsed?.success === true &&
+    (data.actualFrozenRowsTestPassed === true || data.ok === true) &&
+    data.protectedMode === true
+  );
+  const gasVersion = str(data.gasScriptVersion);
+  const sheets = Array.isArray(data.sheets) ? data.sheets : [];
+  const message = actualPassed
+    ? 'نجح الاختبار الفعلي لحماية الصفوف المجمدة (clearContent بدون deleteRow) على جميع الأوراق.'
+    : redactSensitiveText(callRes.errorMessage || parsed?.message || 'FROZEN_ROWS_PROTECTION_TEST_FAILED');
+
+  await upsertSyncCheckpointSafe(
+    safeExec,
+    'google_apps_script_frozen_protection',
+    actualPassed ? 'ok' : 'error',
+    sheets.length,
+    actualPassed ? '' : message,
+    {
+      protectedMode: actualPassed,
+      actualFrozenRowsTestPassed: actualPassed,
+      deleteRowCallsBlocked: Boolean(data.deleteRowCallsBlocked ?? actualPassed),
+      clearContentOnly: Boolean(data.clearContentOnly ?? actualPassed),
+      gasScriptVersion: gasVersion,
+      sheetsSummary: sheets.slice(0, 8),
+      correlationId,
+      checkedAt
+    }
+  );
+
+  return {
+    ok: actualPassed,
+    protectedMode: actualPassed,
+    actualFrozenRowsTestPassed: actualPassed,
+    deleteRowCallsBlocked: Boolean(data.deleteRowCallsBlocked ?? actualPassed),
+    clearContentOnly: Boolean(data.clearContentOnly ?? actualPassed),
+    sheets,
+    gasScriptVersion: gasVersion,
+    correlationId,
+    message,
+    checkedAt
+  };
+}
+
+export async function backfillMissingOutboxIdempotencyKeys(
+  executor: DbExecutor
+): Promise<{
+  updatedCount: number;
+  remainingMissingTotal: number;
+  remainingMissingActive: number;
+}> {
+  const safeExec = ensureDbExecutor(executor);
+  const updQ = await safeExec.query<{ id: string }>(
+    `UPDATE sheets_mirror_outbox
+     SET idempotency_key = LEFT(
+           COALESCE(NULLIF(TRIM(entity_type), ''), 'Record') || ':' ||
+           COALESCE(NULLIF(TRIM(entity_id), ''), id) || ':' ||
+           COALESCE(NULLIF(TRIM(action), ''), 'unknown') || ':legacy:' || id,
+           180
+         ),
+         updated_at = NOW()
+     WHERE COALESCE(TRIM(idempotency_key), '') = ''
+     RETURNING id`
+  ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+
+  const checkQ = await safeExec.query<{ total_missing: number; active_missing: number }>(
+    `SELECT
+       COUNT(*) FILTER (WHERE COALESCE(TRIM(idempotency_key), '') = '')::int AS total_missing,
+       COUNT(*) FILTER (WHERE status IN ('pending', 'processing', 'retry') AND COALESCE(TRIM(idempotency_key), '') = '')::int AS active_missing
+     FROM sheets_mirror_outbox`
+  ).catch(() => ({ rows: [{ total_missing: 0, active_missing: 0 }] }));
+
+  const row = checkQ.rows?.[0] || { total_missing: 0, active_missing: 0 };
+  return {
+    updatedCount: (updQ.rows || []).length,
+    remainingMissingTotal: num(row.total_missing, 0),
+    remainingMissingActive: num(row.active_missing, 0)
+  };
+}
+
+export async function probeGasMirrorSafe(
+  executor: DbExecutor,
+  opts: { writeProbe?: boolean } = {},
+  fetchFn: typeof fetch = fetch
+): Promise<{
+  ok: boolean;
+  authValid: boolean | null;
+  readOk: boolean;
+  writeProbeOk: boolean | null;
+  message: string;
+  authCheck: GasAuthVerificationResult;
+}> {
+  const safeExec = ensureDbExecutor(executor);
+  const authCheck = await verifyGasMirrorAuth(safeExec, fetchFn);
+  if (authCheck.authValid !== true) {
+    return {
+      ok: false,
+      authValid: authCheck.authValid,
+      readOk: false,
+      writeProbeOk: null,
+      message: authCheck.message,
+      authCheck
+    };
+  }
+  if (!opts.writeProbe) {
+    return {
+      ok: true,
+      authValid: true,
+      readOk: true,
+      writeProbeOk: null,
+      message: authCheck.message,
+      authCheck
+    };
+  }
+
+  const probeTimestamp = new Date().toISOString();
+  const dispatch = await callGasMirrorAction(
+    safeExec,
+    'syncFromNeonMirror',
+    {
+      items: [
+        {
+          id: 'HEALTH_PROBE_SETTING',
+          action: 'upsertSetting',
+          payload: {
+            key: '__mirror_health_probe',
+            value: probeTimestamp,
+            updatedBy: 'HealthCenterSafeProbe'
+          }
+        }
+      ]
+    },
+    fetchFn,
+    12000
+  );
+  if (dispatch.missingConfigError || dispatch.urlError || !dispatch.callRes) {
+    return {
+      ok: false,
+      authValid: false,
+      readOk: false,
+      writeProbeOk: false,
+      message: dispatch.missingConfigError || dispatch.urlError || 'SYNC_API_SECRET_MISSING',
+      authCheck
+    };
+  }
+
+  const callRes = dispatch.callRes;
+  const writeOk = Boolean(
+    callRes.httpOk &&
+    callRes.parsed?.success === true &&
+    !(callRes.parsed?.data?.failedItems?.length || callRes.parsed?.failedItems?.length)
+  );
+  return {
+    ok: writeOk,
+    authValid: true,
+    readOk: true,
+    writeProbeOk: writeOk,
+    message: writeOk
+      ? 'نجح فحص القراءة والكتابة الآمنة (Upsert Setting) على Google Sheets دون تعديل أي حجوزات.'
+      : redactSensitiveText(callRes.errorMessage || callRes.parsed?.message || 'SAFE_PROBE_FAILED'),
+    authCheck
+  };
 }
 
 export async function reprocessFailedOutboxBatch(
   executor: DbExecutor,
   opts: {
-    mode?: 'transient' | 'auth' | 'sheet_frozen' | 'all';
+    mode?: 'transient' | 'auth' | 'sheet_frozen' | 'timeout' | 'validation' | 'all';
     batchSize?: number;
     maxBatches?: number;
+    timeoutMs?: number;
   } = {},
   fetchFn: typeof fetch = fetch
 ): Promise<{
@@ -2761,6 +4736,9 @@ export async function reprocessFailedOutboxBatch(
   sent: number;
   failed: number;
   haltedByAuth: boolean;
+  haltedBySheetError?: boolean;
+  haltedByValidation?: boolean;
+  effectiveBatchSize?: number;
 }> {
   const safeExec = ensureDbExecutor(executor);
   // Step 1: Always verify GAS authentication BEFORE touching/requeuing any failed outbox records
@@ -2776,22 +4754,36 @@ export async function reprocessFailedOutboxBatch(
   }
 
   const mode = opts.mode || 'transient';
-  const batchSize = Math.min(25, Math.max(1, num(opts.batchSize, 15)));
+  // Enforce safe 8-10 record ceiling per gradual recovery batch (default 8, max 10)
+  const initialBatchSize = Math.min(OUTBOX_MAX_BATCH_SIZE, Math.max(1, num(opts.batchSize, OUTBOX_DEFAULT_BATCH_SIZE)));
   const maxBatches = Math.min(5, Math.max(1, num(opts.maxBatches, 1)));
+  // Mandatory protection: deleteAllReservations MUST NEVER be auto-requeued or auto-executed in any mode
+  const excludeBulkDelete = `COALESCE(action, '') <> 'deleteAllReservations'`;
+  const authRegex = `'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|HTTP_401|HTTP_403|INVALID_SECRET|غير صالح|غير متطابق|مفتاح المزامنة'`;
+  const frozenRegex = `'non-frozen|delete all non-frozen|الصفوف المجمدة|cannot delete all'`;
+  const timeoutRegex = `'AbortError|TimeoutError|LOCK_TIMEOUT_RECOVERED|operation was aborted|This operation was aborted|timeout|ETIMEDOUT|aborted'`;
+  const validationRegex = `'VALIDATION_ERROR|INVALID_GAS_URL|GAS_NOT_FOUND|HTTP_400|HTTP_404|HTTP_422'`;
 
-  let whereClause = `status IN ('failed', 'retry') AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'`;
+  let whereClause = `status IN ('failed', 'dead_letter', 'retry') AND ${excludeBulkDelete} AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|non-frozen|الصفوف المجمدة|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422|غير صالح|غير متطابق|مفتاح المزامنة'`;
   if (mode === 'auth') {
-    whereClause = `status IN ('failed', 'retry') AND COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|HTTP_401|HTTP_403'`;
+    whereClause = `status IN ('failed', 'dead_letter', 'retry') AND ${excludeBulkDelete} AND COALESCE(last_error, '') ~* ${authRegex}`;
   } else if (mode === 'sheet_frozen') {
-    whereClause = `status IN ('failed', 'retry') AND COALESCE(last_error, '') ~* 'non-frozen'`;
+    whereClause = `status IN ('failed', 'dead_letter', 'retry') AND ${excludeBulkDelete} AND COALESCE(last_error, '') ~* ${frozenRegex}`;
+  } else if (mode === 'timeout') {
+    whereClause = `status IN ('failed', 'dead_letter', 'retry') AND ${excludeBulkDelete} AND (COALESCE(last_error, '') ~* ${timeoutRegex} OR COALESCE(error_category, '') = 'timeout')`;
+  } else if (mode === 'validation') {
+    whereClause = `status IN ('failed', 'dead_letter', 'retry') AND ${excludeBulkDelete} AND COALESCE(last_error, '') !~* ${timeoutRegex} AND (COALESCE(error_category, '') = 'validation' OR COALESCE(last_error, '') ~* ${validationRegex})`;
   } else if (mode === 'all') {
-    whereClause = `status IN ('failed', 'retry')`;
+    whereClause = `status IN ('failed', 'dead_letter', 'retry') AND ${excludeBulkDelete}`;
   }
 
+  let currentBatchSize = mode === 'timeout' ? Math.min(initialBatchSize, OUTBOX_DEFAULT_BATCH_SIZE) : initialBatchSize;
   let totalRequeued = 0;
   let totalSent = 0;
   let totalFailed = 0;
   let haltedByAuth = false;
+  let haltedBySheetError = false;
+  let haltedByValidation = false;
 
   for (let b = 0; b < maxBatches; b++) {
     const pickedQ = await safeExec.query<{ id: string }>(
@@ -2803,7 +4795,7 @@ export async function reprocessFailedOutboxBatch(
        )
        UPDATE sheets_mirror_outbox o
        SET status = 'pending',
-           retry_count = 0,
+           max_retries = GREATEST(COALESCE(o.max_retries, 8), COALESCE(o.retry_count, 0) + 3),
            next_retry_at = NOW(),
            locked_at = NULL,
            worker_id = '',
@@ -2811,7 +4803,7 @@ export async function reprocessFailedOutboxBatch(
        FROM picked
        WHERE o.id = picked.id
        RETURNING o.id`,
-      [batchSize]
+      [currentBatchSize]
     );
     const count = (pickedQ.rows || []).length;
     if (count === 0) break;
@@ -2819,7 +4811,9 @@ export async function reprocessFailedOutboxBatch(
 
     const flushRes = await flushSheetsMirrorOutbox(safeExec, fetchFn, {
       verifyAuthBeforeSend: false, // verified right above
-      batchSize
+      batchSize: currentBatchSize,
+      maxBatches: 1,
+      timeoutMs: opts.timeoutMs
     });
     totalSent += num(flushRes.sent, 0);
     totalFailed += num(flushRes.failed, 0);
@@ -2827,7 +4821,20 @@ export async function reprocessFailedOutboxBatch(
       haltedByAuth = true;
       break;
     }
-    if (count < batchSize) break;
+    if (flushRes.haltedBySheetError) {
+      haltedBySheetError = true;
+      break;
+    }
+    if (flushRes.errorCategory === 'validation') {
+      haltedByValidation = true;
+      break;
+    }
+    if (flushRes.errorCategory === 'timeout') {
+      if (currentBatchSize <= 2) break;
+      currentBatchSize = Math.max(2, Math.floor(currentBatchSize / 2));
+      continue;
+    }
+    if (count < currentBatchSize) break;
   }
 
   return {
@@ -2835,7 +4842,10 @@ export async function reprocessFailedOutboxBatch(
     requeuedCount: totalRequeued,
     sent: totalSent,
     failed: totalFailed,
-    haltedByAuth
+    haltedByAuth,
+    effectiveBatchSize: currentBatchSize,
+    ...(haltedBySheetError ? { haltedBySheetError } : {}),
+    ...(haltedByValidation ? { haltedByValidation } : {})
   };
 }
 

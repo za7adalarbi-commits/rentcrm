@@ -4039,6 +4039,12 @@
       dataIntegrityRuns: [],
       dataIntegrityIssues: [],
       dataIntegrityActions: [],
+      kbCompanies: [],
+      kbBranches: [],
+      kbPolicies: [],
+      kbFaqs: [],
+      kbQuickReplies: [],
+      kbRevisions: [],
       delegations: delegations,
       locks: locks,
       settings: settings,
@@ -4094,7 +4100,7 @@
         });
       }
 
-      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'announcements', 'customers', 'customerNotes', 'customerNoteStatuses', 'customerNoteHistory', 'dataIntegrityRuns', 'dataIntegrityIssues', 'dataIntegrityActions', 'delegations', 'locks', 'sessions'].forEach(function (k) {
+      ['reservations', 'extensions', 'assignments', 'followUps', 'followUpHistory', 'problems', 'problemUpdates', 'activityLog', 'notifications', 'syncLog', 'announcements', 'customers', 'customerNotes', 'customerNoteStatuses', 'customerNoteHistory', 'dataIntegrityRuns', 'dataIntegrityIssues', 'dataIntegrityActions', 'kbCompanies', 'kbBranches', 'kbPolicies', 'kbFaqs', 'kbQuickReplies', 'kbRevisions', 'delegations', 'locks', 'sessions'].forEach(function (k) {
         if (!Array.isArray(parsed[k])) {
           parsed[k] = defaults[k] || [];
           dirty = true;
@@ -9446,6 +9452,11 @@
       }
 
       case 'verifyGasMirrorAuth':
+      case 'probeGasSheetsMirror':
+      case 'testOutboxSingleUpsert':
+      case 'testOutboxThreeWaySuite':
+      case 'verifyGasFrozenRowsProtection':
+      case 'backfillOutboxIdempotencyKeys':
       case 'getDatabaseHealthCenterReport':
       case 'runDatabaseHealthCenterScan':
       case 'saveHealthCenterSettings':
@@ -9453,17 +9464,31 @@
         if (session.role !== 'developer' || !core.canUserPerform(session.user, 'manage_developer_tools')) {
           return { success: false, message: 'FORBIDDEN: مركز صحة قاعدة البيانات متاح للمبرمج (Developer) فقط.', data: null, error: 'FORBIDDEN' };
         }
-        if (action === 'verifyGasMirrorAuth') {
+        if (action === 'backfillOutboxIdempotencyKeys') {
           return {
             success: true,
-            message: 'يتطلب فحص SYNC_API_SECRET الحي اتصال الخادم السحابي وGAS_WEBAPP_URL.',
+            message: 'وضع المعاينة المحلية: لا توجد سجلات ناقصة في قاعدة البيانات المحلية.',
+            data: { updatedCount: 0, remainingMissingTotal: 0, remainingMissingActive: 0 },
+            error: null
+          };
+        }
+        if (action === 'verifyGasMirrorAuth' || action === 'probeGasSheetsMirror' || action === 'testOutboxSingleUpsert' || action === 'testOutboxThreeWaySuite' || action === 'verifyGasFrozenRowsProtection') {
+          return {
+            success: true,
+            message: 'يتطلب هذا الفحص اتصال الخادم السحابي وNeon PostgreSQL وGAS_WEBAPP_URL.',
             data: {
               ok: false,
               authValid: null,
               statusCode: 0,
               configured: false,
               legacyGasScript: false,
-              message: 'المعاينة المحلية غير متصلة بالخادم السحابي للتحقق من SYNC_API_SECRET.'
+              protectedMode: false,
+              actualFrozenRowsTestPassed: false,
+              receiptVerifiedCount: 0,
+              sent: 0,
+              failed: 0,
+              outboxStatus: 'local_preview',
+              message: 'المعاينة المحلية غير متصلة بالخادم السحابي لتنفيذ اختبار Google Apps Script / Outbox الحقيقي.'
             },
             error: null
           };
@@ -9594,6 +9619,18 @@
             };
           }
           if (hcScope === 'all' || hcScope === 'sync_health') {
+            var sandboxTenChecks = [
+              { number: 1, key: 'outbox_queue_health', title: 'Outbox Queue Health', status: 'warning', summary: 'وضع المعاينة المحلية — يتطلب فحص الخادم السحابي وقائمة sheets_mirror_outbox الفعلية.' },
+              { number: 2, key: 'outbox_retry_health', title: 'Outbox Retry & Backoff Health', status: 'healthy', summary: 'سياسة Exponential Backoff + Jitter وحدود المحاولات مهيأة.' },
+              { number: 3, key: 'outbox_auth_health', title: 'Outbox Auth vs Direct Auth', status: 'warning', summary: 'فحص المصادقة الحقيقية يتطلب GAS_WEBAPP_URL وSYNC_API_SECRET على الخادم.' },
+              { number: 4, key: 'sheets_mirror_health', title: 'Sheets Mirror Health', status: 'warning', summary: 'مرآة Google Sheets معطلة في وضع المعاينة المحلية.' },
+              { number: 5, key: 'frozen_rows_protection', title: 'Frozen Rows Protection', status: 'healthy', summary: 'حماية الصفوف المجمدة (ensureSheetCapacity_ / clearContent) مفعلة في Apps Script.' },
+              { number: 6, key: 'full_refresh_safety', title: 'Full Refresh Safety', status: 'healthy', summary: 'منع الحذف الجماعي deleteAllReservations مفعل تلقائياً.' },
+              { number: 7, key: 'batch_processing_health', title: 'Batch Processing Health (8–10)', status: 'healthy', summary: 'حجم الدفعة الآمن مقيد بين 8 و10 سجلات مع ميزانية زمنية.' },
+              { number: 8, key: 'checkpoint_recovery_health', title: 'Checkpoint Recovery Health', status: 'healthy', summary: 'حفظ نقطة الاستكمال (cursor) بعد كل دفعة ناجحة مفعل.' },
+              { number: 9, key: 'duplicate_prevention', title: 'Duplicate Prevention & Idempotency', status: 'healthy', summary: 'منع التكرار عبر idempotency_key وverifyOutboxReceipt مفعل.' },
+              { number: 10, key: 'last_successful_upsert', title: 'Last Successful Upsert', status: 'warning', summary: 'لم يُسجل Upsert فعلي في المعاينة المحلية.' }
+            ];
             newSecs.sync_health = {
               status: 'warning',
               checkedAt: hcNow,
@@ -9601,11 +9638,33 @@
               liveChecks: { checked: false, rentalGateAuth: null, gasMirrorAuth: null },
               deploySkewWarning: '',
               lastSuccessBySource: { rentalGateApi: '', neonPostgres: '', googleAppsScriptSheets: '' },
+              lastSuccessfulUpsert: null,
+              tenPointChecks: sandboxTenChecks,
+              tenPointSummary: { total: 10, healthy: 6, warning: 4, critical: 0 },
               worker: null,
               latestSync: (db.syncLog || [])[0] || null,
               recentLogs: (db.syncLog || []).slice(0, 15),
               checkpoints: [],
-              outbox: { total: 0, sent: 0, pending: 0, retry: 0, failed: 0, categoryBreakdown: [], errorBreakdown: [], recentErrors: [] }
+              outbox: {
+                total: 0,
+                sent: 0,
+                completed: 0,
+                pending: 0,
+                processing: 0,
+                retry: 0,
+                failed: 0,
+                deadLetter: 0,
+                permanentFailed: 0,
+                missingIdempotencyKeys: 0,
+                missingIdempotencyActive: 0,
+                recoveryProgress: { total: 0, completed: 0, pending: 0, processing: 0, retry: 0, deadLetter: 0, quarantinedBulkDelete: 0, recoverableRemaining: 0, completionPercent: 100 },
+                frozenRowsProtection: { protectedMode: false, actualTestPassed: null, frozenRowsErrorCount: 0, deleteRowCallsBlocked: true },
+                lastSuccessfulGasReceipt: { at: '', correlationId: '', batchId: '', gasScriptVersion: '', receiptCount: 0, protectedMode: false },
+                actualOutboxAuth: { valid: null, liveValid: null, activeAuthErrors: 0, message: 'يتطلب فحص Outbox الفعلي عبر الخادم.' },
+                categoryBreakdown: [],
+                errorBreakdown: [],
+                recentErrors: []
+              }
             };
           }
           var allSt = ['database_health', 'schema_integrity', 'data_integrity', 'sync_health'].map(function (k) { return (newSecs[k] && newSecs[k].status) || 'unknown'; });
@@ -9655,8 +9714,1104 @@
         };
       }
 
+      case 'getOutboxCleanupPreview': {
+        if (session.role !== 'developer' || !core.canUserPerform(session.user, 'manage_developer_tools')) {
+          return { success: false, message: 'FORBIDDEN: معاينة Outbox متاحة للمبرمج (Developer) فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        var sbOutbox = Array.isArray(db.sheetsMirrorOutbox) ? db.sheetsMirrorOutbox : [];
+        var sbPageSize = Math.min(100, Math.max(10, Math.round(Number(payload.pageSize || 25))));
+        var sbPage = Math.max(1, Math.round(Number(payload.page || 1)));
+        var sbStatusFilter = String(payload.status || 'all').toLowerCase();
+        var sbClassFilter = String(payload.classification || 'all').toLowerCase();
+        var sbActionFilter = String(payload.actionType || '');
+        var sbSearch = String(payload.search || '').trim().toLowerCase();
+        var sbClassified = sbOutbox.map(function (row) {
+          var st = String(row.status || '').toLowerCase();
+          var canonical = st === 'sent' ? 'completed' : (st === 'failed' ? 'dead_letter' : (st || 'unknown'));
+          var compTs = String(row.lastSuccessAt || row.syncedAt || row.processedAt || row.finishedAt || '');
+          var hasRcpt = Boolean(compTs);
+          var cls = 'manual_review';
+          var clsLabel = 'مراجعة يدوية';
+          var uncertain = false;
+          var reason = 'تستلزم مراجعة المبرمج.';
+          if (canonical === 'completed' && hasRcpt && row.action !== 'deleteAllReservations') {
+            cls = 'safe_to_archive';
+            clsLabel = 'آمن للأرشفة (المرحلة 3)';
+            reason = 'عملية مكتملة ومؤكدة بإيصال نجاح.';
+          } else if (canonical === 'completed' && !hasRcpt) {
+            uncertain = true;
+            clsLabel = 'نتيجة غير مؤكدة';
+            reason = 'مكتملة بدون طابع إيصال نجاح.';
+          } else if (canonical === 'pending' || canonical === 'processing' || canonical === 'retry') {
+            cls = 'keep_active';
+            clsLabel = 'تبقى نشطة في الطابور';
+            uncertain = canonical === 'processing';
+            reason = 'عملية نشطة في الطابور.';
+          }
+          var pStr = typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload || {});
+          return Object.assign({}, row, {
+            canonicalStatus: canonical,
+            rawStatus: st,
+            classification: cls,
+            classificationLabelAr: clsLabel,
+            uncertainResult: uncertain,
+            hasVerifiedReceipt: hasRcpt,
+            completionTimestamp: compTs,
+            reasonAr: reason,
+            estimatedPayloadBytes: pStr.length
+          });
+        });
+        var sbFiltered = sbClassified.filter(function (r) {
+          if (sbStatusFilter && sbStatusFilter !== 'all' && r.canonicalStatus !== sbStatusFilter && r.rawStatus !== sbStatusFilter) return false;
+          if (sbClassFilter && sbClassFilter !== 'all') {
+            if (sbClassFilter === 'uncertain_result') { if (!r.uncertainResult) return false; }
+            else if (r.classification !== sbClassFilter) return false;
+          }
+          if (sbActionFilter && sbActionFilter !== 'all' && r.action !== sbActionFilter) return false;
+          if (sbSearch) {
+            var hay = [r.id, r.entityId, r.action, r.lastError, r.correlationId].join(' ').toLowerCase();
+            if (hay.indexOf(sbSearch) === -1) return false;
+          }
+          return true;
+        });
+        var sbTotalPages = Math.max(1, Math.ceil(sbFiltered.length / sbPageSize));
+        var sbCurPage = Math.min(sbTotalPages, sbPage);
+        var sbPaged = sbFiltered.slice((sbCurPage - 1) * sbPageSize, sbCurPage * sbPageSize);
+        var sbCreatedDates = sbClassified.map(function (r) { return String(r.createdAt || ''); }).filter(Boolean).sort();
+        var sbSuccessDates = sbClassified.map(function (r) { return String(r.completionTimestamp || ''); }).filter(Boolean).sort();
+        var sbBdMap = {};
+        var sbActionsMap = {};
+        var sbEntitiesMap = {};
+        sbClassified.forEach(function (r) {
+          var act = r.action || 'unknown';
+          var ent = r.entityType || 'unknown';
+          if (r.action) sbActionsMap[r.action] = true;
+          if (r.entityType) sbEntitiesMap[r.entityType] = true;
+          var bk = act + '::' + ent;
+          if (!sbBdMap[bk]) {
+            sbBdMap[bk] = {
+              action: act,
+              entityType: ent,
+              totalCount: 0,
+              completedCount: 0,
+              deadLetterCount: 0,
+              retryCount: 0,
+              pendingCount: 0,
+              processingCount: 0,
+              safeToArchiveCount: 0,
+              manualReviewCount: 0,
+              estimatedPayloadBytes: 0
+            };
+          }
+          var b = sbBdMap[bk];
+          b.totalCount += 1;
+          if (r.canonicalStatus === 'completed') b.completedCount += 1;
+          else if (r.canonicalStatus === 'dead_letter') b.deadLetterCount += 1;
+          else if (r.canonicalStatus === 'retry') b.retryCount += 1;
+          else if (r.canonicalStatus === 'pending') b.pendingCount += 1;
+          else if (r.canonicalStatus === 'processing') b.processingCount += 1;
+          if (r.classification === 'safe_to_archive') b.safeToArchiveCount += 1;
+          else if (r.classification === 'manual_review') b.manualReviewCount += 1;
+          b.estimatedPayloadBytes += Number(r.estimatedPayloadBytes || 0);
+        });
+        return {
+          success: true,
+          message: '',
+          data: {
+            previewOnly: true,
+            isSandboxMode: true,
+            databaseConnected: false,
+            mutationsDisabledReason: 'المرحلة 1 و2 مخصصة للتدقيق والمعاينة غير التعديلية فقط — لا يتم حذف أو أرشفة أي سجل حتى موافقة المبرمج على المرحلة 3.',
+            sandboxNotice: 'التطبيق يعمل محلياً بوضع المعاينة (Sandbox) لعدم ضبط DATABASE_URL — أرقام Neon الفعلية ستُقرأ تلقائياً فور الاتصال بقاعدة البيانات السحابية.',
+            spaceEstimationNote: 'الحجم المعروض هو الحجم المقدّر لبيانات JSON القابلة للأرشفة (Payload Size)، ولا يساوي مساحة القرص الفعلية المستردة من PostgreSQL إلا بعد الحذف الفعلي وتشغيل VACUUM.',
+            generatedAt: new Date().toISOString(),
+            olderThanDays: Number(payload.olderThanDays || 0),
+            summary: {
+              total: sbClassified.length,
+              statusCounts: {
+                completed: sbClassified.filter(function (r) { return r.canonicalStatus === 'completed'; }).length,
+                canonicalCompleted: sbClassified.filter(function (r) { return r.rawStatus === 'completed'; }).length,
+                legacySent: sbClassified.filter(function (r) { return r.rawStatus === 'sent'; }).length,
+                dead_letter: sbClassified.filter(function (r) { return r.canonicalStatus === 'dead_letter'; }).length,
+                canonicalDeadLetter: sbClassified.filter(function (r) { return r.rawStatus === 'dead_letter'; }).length,
+                legacyFailed: sbClassified.filter(function (r) { return r.rawStatus === 'failed'; }).length,
+                retry: sbClassified.filter(function (r) { return r.canonicalStatus === 'retry'; }).length,
+                pending: sbClassified.filter(function (r) { return r.canonicalStatus === 'pending'; }).length,
+                processing: sbClassified.filter(function (r) { return r.canonicalStatus === 'processing'; }).length,
+                unknown: 0
+              },
+              classificationCounts: {
+                safeToArchive: sbClassified.filter(function (r) { return r.classification === 'safe_to_archive'; }).length,
+                keepActive: sbClassified.filter(function (r) { return r.classification === 'keep_active'; }).length,
+                manualReview: sbClassified.filter(function (r) { return r.classification === 'manual_review'; }).length,
+                uncertainResult: sbClassified.filter(function (r) { return r.uncertainResult; }).length
+              },
+              estimatedTotalPayloadBytes: sbClassified.reduce(function (a, b) { return a + Number(b.estimatedPayloadBytes || 0); }, 0),
+              estimatedSafeArchivePayloadBytes: sbClassified.filter(function (r) { return r.classification === 'safe_to_archive'; }).reduce(function (a, b) { return a + Number(b.estimatedPayloadBytes || 0); }, 0),
+              tableTotalBytes: null,
+              tableHeapBytes: null,
+              oldestCreatedAt: sbCreatedDates[0] || '',
+              newestCreatedAt: sbCreatedDates[sbCreatedDates.length - 1] || '',
+              oldestSafeArchiveAt: sbSuccessDates[0] || '',
+              newestSafeArchiveAt: sbSuccessDates[sbSuccessDates.length - 1] || '',
+              lastSuccessAt: sbSuccessDates[sbSuccessDates.length - 1] || '',
+              lastAttemptAt: ''
+            },
+            breakdown: Object.keys(sbBdMap).map(function (k) { return sbBdMap[k]; }),
+            facets: { actions: Object.keys(sbActionsMap).sort(), entityTypes: Object.keys(sbEntitiesMap).sort() },
+            pagination: {
+              page: sbCurPage,
+              pageSize: sbPageSize,
+              totalFiltered: sbFiltered.length,
+              totalPages: sbTotalPages
+            },
+            items: sbPaged,
+            dataBaselineCounts: {
+              reservations: (db.reservations || []).length,
+              customers: (db.customers || []).length,
+              extensions: (db.extensions || []).length,
+              followUps: (db.followUps || []).length,
+              problems: (db.problems || []).length,
+              customerNotes: (db.customerNotes || []).length,
+              notifications: (db.notifications || []).length
+            },
+            timestampAuditFindings: [
+              {
+                id: 'TS_AUDIT_CUSTOMER_NOTES_CLOSED_AT',
+                severity: 'critical',
+                tableName: 'customer_notes',
+                columnName: 'closed_at',
+                schemaType: 'TIMESTAMPTZ DEFAULT NULL',
+                codeLocation: 'backend/queries.ts:8793 (addCustomerNote INSERT)',
+                issueTitleAr: 'تضارب نوع closed_at عند إضافة ملاحظة عميل ($17::text داخل عمود TIMESTAMPTZ)',
+                detailAr: 'العمود closed_at في جدول customer_notes نوعه TIMESTAMPTZ بينما INSERT في addCustomerNote يمرره كـ $17::text.',
+                recommendedFixAr: 'في المرحلة 3 (بعد الاعتماد): تعديل المعامل إلى $17::timestamptz أسوة بـ updateCustomerNote وchangeCustomerNoteStatus.',
+                statusAr: 'تم التوثيق في المرحلة 1 — بانتظار اعتماد المرحلة 3 للتعديل'
+              },
+              {
+                id: 'TS_AUDIT_TEXT_LEGACY_DATES',
+                severity: 'info',
+                tableName: 'reservations / follow_ups / delegations',
+                columnName: 'rejected_at, cancelled_at, follow_up_date, starts_at, expires_at',
+                schemaType: 'TEXT',
+                codeLocation: 'database/schema.sql & backend/queries.ts',
+                issueTitleAr: 'أعمدة التواريخ النصية المقصودة في المخطط (متوافقة بدون أخطاء نوع)',
+                detailAr: 'معرّفة كـ TEXT في المخطط وتستقبل معاملات ::text بشكل متسق.',
+                recommendedFixAr: 'لا يلزم تعديل.',
+                statusAr: 'سليم ومتطابق'
+              },
+              {
+                id: 'TS_AUDIT_OUTBOX_TIMESTAMPS',
+                severity: 'info',
+                tableName: 'sheets_mirror_outbox',
+                columnName: 'created_at, updated_at, last_attempt_at, last_success_at, synced_at, processed_at, finished_at',
+                schemaType: 'TIMESTAMPTZ',
+                codeLocation: 'database/schema.sql:388-417',
+                issueTitleAr: 'طوابع دورة حياة Outbox متسقة (TIMESTAMPTZ)',
+                detailAr: 'جميع طوابع الإيصال والمحاولات والأقفال من نوع TIMESTAMPTZ.',
+                recommendedFixAr: 'يُحافظ عليها في جدول الأرشيف عند المرحلة 3.',
+                statusAr: 'سليم ومتطابق'
+              }
+            ],
+            queryErrors: []
+          },
+          error: null
+        };
+      }
+
+      case 'getSheetsSyncControlStatus': {
+        if (session.role !== 'developer' || !core.canUserPerform(session.user, 'manage_developer_tools')) {
+          return { success: false, message: 'FORBIDDEN: حالة تحكم مزامنة Google Sheets متاحة للمبرمج (Developer) فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        return {
+          success: true,
+          message: '',
+          data: {
+            previewOnly: true,
+            isSandboxMode: true,
+            databaseConnected: false,
+            generatedAt: new Date().toISOString(),
+            controlsLockedNote: 'وضع المعاينة المحلية (Sandbox): متصل بالبيانات المحلية فقط؛ أزرار الإيقاف والاستئناف مفعّلة بعد اعتماد المرحلة 3 عند الربط بـ Neon.',
+            rentalGateSync: {
+              independentFromSheetsMirror: true,
+              autoSyncEnabled: Boolean(db.settings && db.settings.auto_sync_enabled),
+              rgTokenConfigured: false,
+              workerRunning: false,
+              consecutiveErrors: 0,
+              lastSuccessAt: '',
+              lastAttemptAt: '',
+              lastError: '',
+              pullInterval: (db.settings && db.settings.rg_pull_interval_value ? db.settings.rg_pull_interval_value : '5') + ' ' + (db.settings && db.settings.rg_pull_interval_unit ? db.settings.rg_pull_interval_unit : 'minutes'),
+              latestLog: (db.syncLog || [])[0] || null
+            },
+            googleSheetsSync: {
+              state: 'sandbox',
+              stateLabelAr: 'وضع المعاينة المحلية (بدون اتصال Neon/GAS)',
+              paused: false,
+              pausedAt: '',
+              pausedBy: '',
+              pauseReason: '',
+              gasUrlConfigured: false,
+              syncSecretConfigured: false,
+              pendingCount: 0,
+              pendingOnlyCount: 0,
+              processingCount: 0,
+              retryCount: 0,
+              completedCount: 0,
+              failedCount: 0,
+              totalOutboxCount: 0,
+              accumulatedDuringPause: 0,
+              lastAttemptAt: '',
+              lastSuccessAt: '',
+              lastError: '',
+              lastErrorAt: ''
+            },
+            checkpoints: []
+          },
+          error: null
+        };
+      }
+
+      case 'getKnowledgeBaseDashboard':
+      case 'getKbCompanies':
+      case 'saveKbCompany':
+      case 'deleteKbCompany':
+      case 'getKbBranches':
+      case 'saveKbBranch':
+      case 'deleteKbBranch':
+      case 'getKbPolicies':
+      case 'saveKbPolicy':
+      case 'deleteKbPolicy':
+      case 'recordKbPolicyView':
+      case 'getKbFaqs':
+      case 'saveKbFaq':
+      case 'deleteKbFaq':
+      case 'recordKbFaqUsage':
+      case 'getKbQuickReplies':
+      case 'saveKbQuickReply':
+      case 'deleteKbQuickReply':
+      case 'recordKbQuickReplyUsage':
+      case 'searchKnowledgeBase':
+      case 'getKbAuditHistory':
+      case 'exportKbBackup': {
+        var kbRes = executeSandboxKnowledgeBase(db, session, action, payload);
+        if (kbRes && kbRes.mutated) {
+          saveSandboxDb(db);
+        }
+        return {
+          success: kbRes.success,
+          message: kbRes.message || '',
+          data: kbRes.data !== undefined ? kbRes.data : null,
+          error: kbRes.error || null
+        };
+      }
+
       default:
         return { success: false, message: 'الإجراء غير مدعوم.', data: null, error: 'UNKNOWN_ACTION' };
+    }
+  }
+
+  function executeSandboxKnowledgeBase(db, session, action, payload) {
+    var p = (payload && typeof payload === 'object') ? payload : {};
+    var core = root.RGCrmCore || {};
+    var user = session && session.user ? session.user : {};
+    function kbCan(perm) {
+      if (!user) return false;
+      if (String(user.role || '').toLowerCase() === 'developer') return true;
+      return core.canUserPerform ? Boolean(core.canUserPerform(user, perm)) : String(user.role || '').toLowerCase() === 'general_manager';
+    }
+    function kbCanView() {
+      return kbCan('view_knowledge_base') || kbCan('kb_manage_companies') || kbCan('kb_manage_policies') || kbCan('kb_manage_faqs') || kbCan('kb_manage_quick_replies');
+    }
+    function kbErr(code, msg) {
+      return { success: false, message: code + ': ' + msg, data: null, error: code };
+    }
+    function kbNorm(raw) {
+      return String(raw == null ? '' : raw)
+        .trim()
+        .toLowerCase()
+        .replace(/[\u064B-\u065F\u0670]/g, '')
+        .replace(/[أإآٱ]/g, 'ا')
+        .replace(/ى/g, 'ي')
+        .replace(/ة/g, 'ه')
+        .replace(/\s+/g, ' ');
+    }
+    function kbList(raw) {
+      var arr = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw.trim() ? raw.split(/[,\n،]+/) : []);
+      var seen = {};
+      var out = [];
+      arr.forEach(function (x) {
+        var s = String(x == null ? '' : x).trim();
+        var n = kbNorm(s);
+        if (!s || !n || seen[n]) return;
+        seen[n] = true;
+        out.push(s);
+      });
+      return out;
+    }
+    function kbUrl(raw, allowImg) {
+      var v = String(raw == null ? '' : raw).trim();
+      if (!v) return '';
+      var compact = v.replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+      if (compact.indexOf('javascript:') === 0 || compact.indexOf('vbscript:') === 0 || compact.indexOf('data:text/') === 0) return '';
+      if (allowImg && /^data:image\/(?:png|jpeg|jpg|webp|gif);base64,[a-z0-9+/=]+$/i.test(compact)) return v;
+      if (compact.indexOf('https://') === 0 || compact.indexOf('http://') === 0 || compact.indexOf('mailto:') === 0 || compact.indexOf('tel:') === 0 || v.indexOf('/') === 0 || v.indexOf('./') === 0) return v;
+      if (/^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(v)) return 'https://' + v;
+      return '';
+    }
+    function kbSanitizeHtml(rawHtml) {
+      var s = String(rawHtml == null ? '' : rawHtml).trim();
+      if (!s) return '';
+      s = s.replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<\s*(script|style|iframe|object|embed|svg|math|noscript|template)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
+        .replace(/<\s*(script|style|iframe|object|embed|svg|math|meta|link|base|form|input|button|textarea)\b[^>]*\/?>/gi, '');
+      if (!/<[a-z][\s\S]*>/i.test(s)) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').split(/\n{2,}/).map(function (para) {
+          return '<p>' + para.replace(/\n/g, '<br />') + '</p>';
+        }).join('');
+      }
+      var allowed = { p: 1, br: 1, b: 1, strong: 1, i: 1, em: 1, u: 1, s: 1, del: 1, h3: 1, h4: 1, h5: 1, ul: 1, ol: 1, li: 1, blockquote: 1, code: 1, pre: 1, hr: 1, a: 1, span: 1, div: 1, img: 1 };
+      return s.replace(/<\s*(\/?)\s*([a-zA-Z0-9]+)([^>]*)>/g, function (_m, slash, rawTag, rawAttrs) {
+        var tag = String(rawTag || '').toLowerCase();
+        if (!allowed[tag]) return '';
+        if (slash) return (tag === 'br' || tag === 'hr' || tag === 'img') ? '' : '</' + tag + '>';
+        var attrsStr = String(rawAttrs || '');
+        var parts = [];
+        if (tag === 'a') {
+          var hm = attrsStr.match(/href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+          var href = kbUrl((hm && (hm[1] || hm[2] || hm[3])) || '', false);
+          if (href) {
+            parts.push('href="' + href.replace(/"/g, '&quot;') + '"');
+            if (href.indexOf('http://') === 0 || href.indexOf('https://') === 0) parts.push('target="_blank" rel="noopener noreferrer"');
+          }
+        } else if (tag === 'img') {
+          var sm = attrsStr.match(/src\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+          var src = kbUrl((sm && (sm[1] || sm[2] || sm[3])) || '', true);
+          if (!src) return '';
+          parts.push('src="' + src.replace(/"/g, '&quot;') + '" loading="lazy"');
+          return '<img ' + parts.join(' ') + ' />';
+        }
+        if (tag === 'br' || tag === 'hr') return '<' + tag + ' />';
+        return parts.length ? '<' + tag + ' ' + parts.join(' ') + '>' : '<' + tag + '>';
+      });
+    }
+    function kbPlainText(html) {
+      return String(html == null ? '' : html)
+        .replace(/<\s*br\s*\/?>/gi, '\n')
+        .replace(/<\/\s*(p|div|li|h3|h4|h5|blockquote)\s*>/gi, '\n')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"')
+        .replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    }
+    function kbScore(q, primary, secs, kws) {
+      var nq = kbNorm(q);
+      if (!nq) return 1;
+      var toks = nq.split(' ').filter(Boolean);
+      var np = kbNorm(primary);
+      var ns = kbNorm((secs || []).join(' '));
+      var nk = kbNorm((kws || []).join(' '));
+      var sc = 0;
+      if (np === nq) sc += 120;
+      else if (np.indexOf(nq) === 0) sc += 90;
+      else if (np.indexOf(nq) !== -1) sc += 65;
+      if (nk.indexOf(nq) !== -1) sc += 55;
+      if (ns.indexOf(nq) !== -1) sc += 30;
+      var hit = 0;
+      toks.forEach(function (tk) {
+        if (np.indexOf(tk) !== -1) { sc += 20; hit += 1; }
+        else if (nk.indexOf(tk) !== -1) { sc += 15; hit += 1; }
+        else if (ns.indexOf(tk) !== -1) { sc += 10; hit += 1; }
+      });
+      if (!hit) return 0;
+      return (toks.length > 1 && hit < toks.length) ? Math.round(sc * (hit / toks.length)) : sc;
+    }
+    function kbPolicySection(cat, sec) {
+      var map = {
+        rental_gate: 'rental_gate_policies',
+        company_policy: 'company_policies',
+        booking_terms: 'booking_pickup_terms',
+        pickup_return_terms: 'booking_pickup_terms',
+        age_license_terms: 'booking_pickup_terms',
+        mileage_policy: 'booking_pickup_terms',
+        delivery_pickup_policy: 'booking_pickup_terms',
+        delay_extension_policy: 'booking_pickup_terms',
+        cancellation_policy: 'cancellation_refunds',
+        refund_policy: 'cancellation_refunds',
+        wallet_points_policy: 'cancellation_refunds'
+      };
+      return map[cat] || sec || 'rental_gate_policies';
+    }
+    function kbLog(entityType, entityId, actionType, title, details, beforeObj, afterObj) {
+      var actorId = String(user.id || '');
+      var actorName = String(user.name || user.username || 'System');
+      var nowIso = new Date().toISOString();
+      if (!Array.isArray(db.kbRevisions)) db.kbRevisions = [];
+      db.kbRevisions.unshift({
+        id: 'KBREV_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        entityType: entityType,
+        entityId: entityId,
+        actionType: actionType,
+        titleSnapshot: String(title || '').slice(0, 220),
+        before: beforeObj || {},
+        after: afterObj || {},
+        actorId: actorId,
+        actorName: actorName,
+        createdAt: nowIso
+      });
+      if (!Array.isArray(db.activityLog)) db.activityLog = [];
+      db.activityLog.unshift({
+        id: 'ACT_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        employeeId: actorId,
+        employeeName: actorName,
+        actionType: actionType,
+        entityType: entityType,
+        entityId: entityId,
+        details: details,
+        createdAt: nowIso
+      });
+    }
+    function activeCompanies() { return (db.kbCompanies || []).filter(function (c) { return c && !c.deletedAt; }); }
+    function activeBranches() { return (db.kbBranches || []).filter(function (b) { return b && !b.deletedAt; }); }
+    function activePolicies() { return (db.kbPolicies || []).filter(function (x) { return x && !x.deletedAt; }); }
+    function activeFaqs() { return (db.kbFaqs || []).filter(function (x) { return x && !x.deletedAt; }); }
+    function activeReplies() { return (db.kbQuickReplies || []).filter(function (x) { return x && !x.deletedAt; }); }
+    function companyNameById(cid) {
+      if (!cid) return '';
+      var f = activeCompanies().find(function (c) { return c.id === cid; });
+      return f ? f.name : '';
+    }
+    function enrichCompany(c, includeBranches) {
+      var brs = activeBranches().filter(function (b) { return b.companyId === c.id; });
+      var cities = kbList((c.cities || []).concat(brs.map(function (b) { return b.city; })));
+      var out = Object.assign({}, c, {
+        cities: cities,
+        citiesCount: cities.length,
+        branchesCount: brs.length,
+        activeBranchesCount: brs.filter(function (b) { return b.status === 'active'; }).length
+      });
+      if (includeBranches) {
+        out.branches = brs.map(function (b) { return Object.assign({}, b, { companyName: c.name }); });
+      }
+      return out;
+    }
+
+    if (!kbCanView()) {
+      return kbErr('FORBIDDEN', 'لا تملك صلاحية الوصول إلى مركز المعرفة.');
+    }
+
+    switch (action) {
+      case 'getKnowledgeBaseDashboard': {
+        var comps = activeCompanies().map(function (c) { return enrichCompany(c, false); });
+        var brs = activeBranches();
+        var pols = activePolicies();
+        var faqs = activeFaqs();
+        var qrs = activeReplies();
+        var allCities = kbList([].concat.apply([], comps.map(function (c) { return c.cities; })).concat(brs.map(function (b) { return b.city; })));
+        var feedAll = []
+          .concat(comps.map(function (c) { return { id: c.id, entityType: 'company', title: c.name, sectionKey: 'companies', actorName: c.updatedByName, createdAt: c.createdAt, updatedAt: c.updatedAt, usageCount: 0, searchHitCount: 0, category: '' }; }))
+          .concat(brs.map(function (b) { return { id: b.id, entityType: 'branch', title: b.branchName + ' (' + b.city + ')', sectionKey: 'branches', actorName: b.updatedByName, createdAt: b.createdAt, updatedAt: b.updatedAt, usageCount: 0, searchHitCount: 0, category: '' }; }))
+          .concat(pols.map(function (x) { return { id: x.id, entityType: 'policy', title: x.title, sectionKey: x.sectionKey, actorName: x.updatedByName, createdAt: x.createdAt, updatedAt: x.updatedAt, usageCount: x.usageCount || 0, searchHitCount: x.searchHitCount || 0, category: x.category }; }))
+          .concat(faqs.map(function (x) { return { id: x.id, entityType: 'faq', title: x.question, sectionKey: 'faq', actorName: x.updatedByName, createdAt: x.createdAt, updatedAt: x.updatedAt, usageCount: x.usageCount || 0, searchHitCount: x.searchHitCount || 0, category: x.category }; }))
+          .concat(qrs.map(function (x) { return { id: x.id, entityType: 'quick_reply', title: x.title, sectionKey: 'quick_replies', actorName: x.updatedByName, createdAt: x.createdAt, updatedAt: x.updatedAt, usageCount: x.usageCount || 0, searchHitCount: 0, category: x.category }; }));
+        return {
+          success: true,
+          data: {
+            kpis: {
+              totalCompanies: comps.length,
+              activeCompanies: comps.filter(function (c) { return c.status === 'active'; }).length,
+              totalBranches: brs.length,
+              coveredCitiesCount: allCities.length,
+              totalPolicies: pols.length,
+              publishedPolicies: pols.filter(function (x) { return x.publishStatus === 'published'; }).length,
+              totalFaqs: faqs.length,
+              publishedFaqs: faqs.filter(function (x) { return x.publishStatus === 'published'; }).length,
+              totalQuickReplies: qrs.length,
+              activeQuickReplies: qrs.filter(function (x) { return x.status === 'active'; }).length
+            },
+            coveredCities: allCities.sort(function (a, b) { return a.localeCompare(b, 'ar'); }),
+            companiesSummary: comps.map(function (c) {
+              return { id: c.id, name: c.name, logoUrl: c.logoUrl, status: c.status, cities: c.cities, branchesCount: c.branchesCount };
+            }),
+            latestAdded: feedAll.slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); }).slice(0, 8).map(function (x) {
+              return { id: x.id, entityType: x.entityType, title: x.title, sectionKey: x.sectionKey, actorName: x.actorName, at: x.createdAt, usageCount: x.usageCount };
+            }),
+            latestUpdated: feedAll.slice().sort(function (a, b) { return String(b.updatedAt).localeCompare(String(a.updatedAt)); }).slice(0, 8).map(function (x) {
+              return { id: x.id, entityType: x.entityType, title: x.title, sectionKey: x.sectionKey, actorName: x.actorName, at: x.updatedAt, usageCount: x.usageCount };
+            }),
+            mostUsed: feedAll.filter(function (x) { return x.usageCount > 0; }).sort(function (a, b) { return b.usageCount - a.usageCount; }).slice(0, 8),
+            mostSearched: feedAll.filter(function (x) { return (x.entityType === 'faq' || x.entityType === 'policy') && (x.searchHitCount > 0 || x.usageCount > 0); }).sort(function (a, b) { return (b.searchHitCount - a.searchHitCount) || (b.usageCount - a.usageCount); }).slice(0, 8)
+          }
+        };
+      }
+
+      case 'getKbCompanies': {
+        var compsList = activeCompanies().map(function (c) { return enrichCompany(c, String(p.companyId || '') === c.id); });
+        var allC = kbList([].concat.apply([], compsList.map(function (c) { return c.cities; })));
+        if (p.companyId) {
+          var one = compsList.find(function (c) { return c.id === String(p.companyId); }) || null;
+          return {
+            success: true,
+            data: {
+              company: one,
+              items: one ? [one] : [],
+              branches: one ? (one.branches || []) : [],
+              cities: allC,
+              pagination: { page: 1, pageSize: 1, total: one ? 1 : 0, totalPages: 1 }
+            }
+          };
+        }
+        var filteredC = compsList.slice();
+        if (p.status === 'active' || p.status === 'inactive') filteredC = filteredC.filter(function (c) { return c.status === p.status; });
+        if (p.city) {
+          var nc = kbNorm(p.city);
+          filteredC = filteredC.filter(function (c) { return c.cities.some(function (ct) { return kbNorm(ct) === nc; }); });
+        }
+        if (p.search) {
+          var nqC = kbNorm(p.search);
+          filteredC = filteredC.filter(function (c) {
+            return kbNorm([c.name, c.shortDescription, c.phone, c.email, c.cities.join(' '), c.serviceTypes.join(' ')].join(' ')).indexOf(nqC) !== -1;
+          });
+        }
+        var pgC = Math.max(1, Number(p.page || 1));
+        var psC = Math.max(6, Math.min(100, Number(p.pageSize || 24)));
+        return {
+          success: true,
+          data: {
+            items: filteredC.slice((pgC - 1) * psC, pgC * psC),
+            cities: allC.sort(function (a, b) { return a.localeCompare(b, 'ar'); }),
+            pagination: { page: pgC, pageSize: psC, total: filteredC.length, totalPages: Math.max(1, Math.ceil(filteredC.length / psC)) }
+          }
+        };
+      }
+
+      case 'saveKbCompany': {
+        if (!kbCan('kb_manage_companies')) return kbErr('FORBIDDEN', 'لا تملك صلاحية إضافة أو تعديل شركات التأجير.');
+        var cname = String(p.name || '').trim();
+        if (!cname) return kbErr('VALIDATION_ERROR', 'اسم شركة التأجير مطلوب.');
+        var cid = String(p.id || '').trim();
+        var normC = kbNorm(cname);
+        if (activeCompanies().some(function (c) { return kbNorm(c.name) === normC && c.id !== cid; })) {
+          return kbErr('DUPLICATE_ENTRY', 'توجد شركة تأجير مسجلة مسبقاً بنفس الاسم.');
+        }
+        var nowC = new Date().toISOString();
+        var actorIdC = String(user.id || '');
+        var actorNameC = String(user.name || user.username || '');
+        var existingC = cid ? activeCompanies().find(function (c) { return c.id === cid; }) : null;
+        if (cid && !existingC) return kbErr('NOT_FOUND', 'شركة التأجير المطلوبة غير موجودة.');
+        var beforeC = existingC ? Object.assign({}, existingC) : null;
+        var brCities = cid ? activeBranches().filter(function (b) { return b.companyId === cid; }).map(function (b) { return b.city; }) : [];
+        var objC = {
+          id: cid || ('KBCMP_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+          name: cname,
+          logoUrl: kbUrl(p.logoUrl, true),
+          shortDescription: String(p.shortDescription || '').trim(),
+          images: kbList(p.images).map(function (u) { return kbUrl(u, true); }).filter(Boolean),
+          phone: String(p.phone || '').trim(),
+          email: String(p.email || '').trim(),
+          website: kbUrl(p.website, false),
+          status: p.status === 'inactive' ? 'inactive' : 'active',
+          cities: kbList(kbList(p.cities).concat(brCities)),
+          serviceTypes: kbList(p.serviceTypes),
+          internalNotes: String(p.internalNotes || '').trim(),
+          createdById: existingC ? existingC.createdById : actorIdC,
+          createdByName: existingC ? existingC.createdByName : actorNameC,
+          updatedById: actorIdC,
+          updatedByName: actorNameC,
+          createdAt: existingC ? existingC.createdAt : nowC,
+          updatedAt: nowC,
+          deletedAt: ''
+        };
+        if (existingC) {
+          var idxC = db.kbCompanies.findIndex(function (c) { return c.id === cid; });
+          db.kbCompanies[idxC] = objC;
+        } else {
+          db.kbCompanies.unshift(objC);
+        }
+        var enrichedC = enrichCompany(objC, false);
+        kbLog('KbCompany', objC.id, existingC ? 'kb_company_updated' : 'kb_company_created', objC.name, (existingC ? 'تحديث شركة تأجير: ' : 'إضافة شركة تأجير: ') + objC.name, beforeC, enrichedC);
+        return { success: true, mutated: true, data: { company: enrichedC } };
+      }
+
+      case 'deleteKbCompany': {
+        if (!kbCan('kb_delete_content')) return kbErr('FORBIDDEN', 'لا تملك صلاحية حذف شركات التأجير.');
+        var delCid = String(p.id || '').trim();
+        var tgtC = activeCompanies().find(function (c) { return c.id === delCid; });
+        if (!tgtC) return kbErr('NOT_FOUND', 'الشركة غير موجودة.');
+        var nowDc = new Date().toISOString();
+        tgtC.deletedAt = nowDc;
+        tgtC.updatedAt = nowDc;
+        activeBranches().forEach(function (b) { if (b.companyId === delCid) b.deletedAt = nowDc; });
+        kbLog('KbCompany', delCid, 'kb_company_deleted', tgtC.name, 'حذف شركة تأجير: ' + tgtC.name, tgtC, { deleted: true });
+        return { success: true, mutated: true, data: { deletedId: delCid } };
+      }
+
+      case 'getKbBranches': {
+        var brList = activeBranches().map(function (b) { return Object.assign({}, b, { companyName: companyNameById(b.companyId) }); });
+        var allBrCities = kbList(brList.map(function (b) { return b.city; })).sort(function (a, b) { return a.localeCompare(b, 'ar'); });
+        if (p.companyId) brList = brList.filter(function (b) { return b.companyId === String(p.companyId); });
+        if (p.city) {
+          var nbCity = kbNorm(p.city);
+          brList = brList.filter(function (b) { return kbNorm(b.city) === nbCity; });
+        }
+        if (p.status === 'active' || p.status === 'inactive') brList = brList.filter(function (b) { return b.status === p.status; });
+        if (p.search) {
+          var nqB = kbNorm(p.search);
+          brList = brList.filter(function (b) {
+            return kbNorm([b.branchName, b.companyName, b.city, b.district, b.fullAddress, b.phone, (b.services || []).join(' ')].join(' ')).indexOf(nqB) !== -1;
+          });
+        }
+        var pgB = Math.max(1, Number(p.page || 1));
+        var psB = Math.max(6, Math.min(150, Number(p.pageSize || 30)));
+        return {
+          success: true,
+          data: {
+            items: brList.slice((pgB - 1) * psB, pgB * psB),
+            cities: allBrCities,
+            pagination: { page: pgB, pageSize: psB, total: brList.length, totalPages: Math.max(1, Math.ceil(brList.length / psB)) }
+          }
+        };
+      }
+
+      case 'saveKbBranch': {
+        if (!kbCan('kb_manage_companies')) return kbErr('FORBIDDEN', 'لا تملك صلاحية إضافة أو تعديل الفروع.');
+        var bid = String(p.id || '').trim();
+        var bcid = String(p.companyId || '').trim();
+        var bname = String(p.branchName || '').trim();
+        var bcity = String(p.city || '').trim();
+        if (!bcid) return kbErr('VALIDATION_ERROR', 'يجب اختيار شركة التأجير.');
+        if (!bname) return kbErr('VALIDATION_ERROR', 'اسم الفرع مطلوب.');
+        if (!bcity) return kbErr('VALIDATION_ERROR', 'المدينة مطلوبة.');
+        var parentC = activeCompanies().find(function (c) { return c.id === bcid; });
+        if (!parentC) return kbErr('NOT_FOUND', 'شركة التأجير المحددة غير موجودة.');
+        var dupB = activeBranches().some(function (b) {
+          return b.id !== bid && b.companyId === bcid && kbNorm(b.city) === kbNorm(bcity) && kbNorm(b.branchName) === kbNorm(bname);
+        });
+        if (dupB) return kbErr('DUPLICATE_ENTRY', 'يوجد فرع بنفس الاسم في نفس المدينة لهذه الشركة.');
+        var existingB = bid ? activeBranches().find(function (b) { return b.id === bid; }) : null;
+        if (bid && !existingB) return kbErr('NOT_FOUND', 'الفرع غير موجود.');
+        var nowB = new Date().toISOString();
+        var actorIdB = String(user.id || '');
+        var actorNameB = String(user.name || user.username || '');
+        var objB = {
+          id: bid || ('KBBR_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+          companyId: bcid,
+          companyName: parentC.name,
+          branchName: bname,
+          city: bcity,
+          district: String(p.district || '').trim(),
+          fullAddress: String(p.fullAddress || '').trim(),
+          googleMapsUrl: kbUrl(p.googleMapsUrl, false),
+          phone: String(p.phone || '').trim(),
+          workingHours: String(p.workingHours || '').trim(),
+          status: p.status === 'inactive' ? 'inactive' : 'active',
+          services: kbList(p.services),
+          notes: String(p.notes || '').trim(),
+          createdById: existingB ? existingB.createdById : actorIdB,
+          createdByName: existingB ? existingB.createdByName : actorNameB,
+          updatedById: actorIdB,
+          updatedByName: actorNameB,
+          createdAt: existingB ? existingB.createdAt : nowB,
+          updatedAt: nowB,
+          deletedAt: ''
+        };
+        if (existingB) {
+          var idxB = db.kbBranches.findIndex(function (b) { return b.id === bid; });
+          db.kbBranches[idxB] = objB;
+        } else {
+          db.kbBranches.unshift(objB);
+        }
+        parentC.cities = kbList((parentC.cities || []).concat([bcity]));
+        parentC.updatedAt = nowB;
+        kbLog('KbBranch', objB.id, existingB ? 'kb_branch_updated' : 'kb_branch_created', parentC.name + ' — ' + bname, (existingB ? 'تحديث فرع: ' : 'إضافة فرع: ') + bname + ' (' + bcity + ')', existingB, objB);
+        return { success: true, mutated: true, data: { branch: objB } };
+      }
+
+      case 'deleteKbBranch': {
+        if (!kbCan('kb_delete_content')) return kbErr('FORBIDDEN', 'لا تملك صلاحية حذف الفروع.');
+        var delBid = String(p.id || '').trim();
+        var tgtB = activeBranches().find(function (b) { return b.id === delBid; });
+        if (!tgtB) return kbErr('NOT_FOUND', 'الفرع غير موجود.');
+        tgtB.deletedAt = new Date().toISOString();
+        kbLog('KbBranch', delBid, 'kb_branch_deleted', tgtB.branchName, 'حذف فرع: ' + tgtB.branchName, tgtB, { deleted: true });
+        return { success: true, mutated: true, data: { deletedId: delBid } };
+      }
+
+      case 'getKbPolicies': {
+        var canEditP = kbCan('kb_manage_policies') || kbCan('kb_publish_content');
+        var polList = activePolicies().map(function (x) { return Object.assign({}, x, { companyName: companyNameById(x.companyId) }); });
+        if (!canEditP) polList = polList.filter(function (x) { return x.publishStatus === 'published'; });
+        else if (p.publishStatus && p.publishStatus !== 'all') polList = polList.filter(function (x) { return x.publishStatus === p.publishStatus; });
+        if (p.sectionKey && p.sectionKey !== 'all') polList = polList.filter(function (x) { return x.sectionKey === p.sectionKey; });
+        if (p.category && p.category !== 'all') polList = polList.filter(function (x) { return x.category === p.category; });
+        if (p.companyId) polList = polList.filter(function (x) { return x.companyId === String(p.companyId); });
+        if (p.city) polList = polList.filter(function (x) { return kbNorm(x.city) === kbNorm(p.city); });
+        if (p.search) {
+          polList = polList.map(function (x) {
+            return { x: x, s: kbScore(p.search, x.title, [x.descriptionText, x.companyName, x.city, x.category], x.keywords) };
+          }).filter(function (r) { return r.s > 0; }).sort(function (a, b) { return b.s - a.s; }).map(function (r) { return r.x; });
+        }
+        var pgP = Math.max(1, Number(p.page || 1));
+        var psP = Math.max(6, Math.min(100, Number(p.pageSize || 20)));
+        return {
+          success: true,
+          data: {
+            items: polList.slice((pgP - 1) * psP, pgP * psP),
+            pagination: { page: pgP, pageSize: psP, total: polList.length, totalPages: Math.max(1, Math.ceil(polList.length / psP)) }
+          }
+        };
+      }
+
+      case 'saveKbPolicy': {
+        if (!kbCan('kb_manage_policies')) return kbErr('FORBIDDEN', 'لا تملك صلاحية إضافة أو تعديل السياسات.');
+        var pid = String(p.id || '').trim();
+        var ptitle = String(p.title || '').trim();
+        if (!ptitle) return kbErr('VALIDATION_ERROR', 'عنوان السياسة مطلوب.');
+        var pHtml = kbSanitizeHtml(p.descriptionHtml !== undefined ? p.descriptionHtml : p.descriptionText);
+        var pText = kbPlainText(pHtml);
+        if (!pText) return kbErr('VALIDATION_ERROR', 'محتوى السياسة مطلوب.');
+        var pCat = String(p.category || 'rental_gate').trim();
+        var pSec = kbPolicySection(pCat, String(p.sectionKey || ''));
+        var pCid = String(p.companyId || '').trim();
+        var pCity = String(p.city || '').trim();
+        var pStatus = String(p.publishStatus || 'published').trim();
+        if (['published', 'draft', 'archived'].indexOf(pStatus) === -1) pStatus = 'published';
+        if ((pStatus === 'published' || pStatus === 'archived') && !kbCan('kb_publish_content')) pStatus = 'draft';
+        var dupP = activePolicies().some(function (x) {
+          return x.id !== pid && x.sectionKey === pSec && x.category === pCat && x.companyId === pCid && kbNorm(x.city) === kbNorm(pCity) && kbNorm(x.title) === kbNorm(ptitle);
+        });
+        if (dupP) return kbErr('DUPLICATE_ENTRY', 'توجد سياسة مسجلة مسبقاً بنفس العنوان في هذا القسم.');
+        var existingP = pid ? activePolicies().find(function (x) { return x.id === pid; }) : null;
+        if (pid && !existingP) return kbErr('NOT_FOUND', 'السياسة المطلوبة غير موجودة.');
+        var nowP = new Date().toISOString();
+        var actorIdP = String(user.id || '');
+        var actorNameP = String(user.name || user.username || '');
+        var atts = Array.isArray(p.attachments) ? p.attachments.map(function (a) {
+          var u = kbUrl((a && (a.url || a.href)) || a, true);
+          return u ? { label: String((a && a.label) || u).slice(0, 120), url: u, kind: (a && a.kind) || 'link' } : null;
+        }).filter(Boolean) : [];
+        var objP = {
+          id: pid || ('KBPOL_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+          title: ptitle,
+          descriptionHtml: pHtml,
+          descriptionText: pText,
+          sectionKey: pSec,
+          category: pCat,
+          companyId: pCid,
+          companyName: companyNameById(pCid),
+          city: pCity,
+          keywords: kbList(p.keywords),
+          attachments: atts,
+          publishStatus: pStatus,
+          usageCount: existingP ? (existingP.usageCount || 0) : 0,
+          searchHitCount: existingP ? (existingP.searchHitCount || 0) : 0,
+          createdById: existingP ? existingP.createdById : actorIdP,
+          createdByName: existingP ? existingP.createdByName : actorNameP,
+          updatedById: actorIdP,
+          updatedByName: actorNameP,
+          createdAt: existingP ? existingP.createdAt : nowP,
+          updatedAt: nowP,
+          deletedAt: ''
+        };
+        if (existingP) db.kbPolicies[db.kbPolicies.findIndex(function (x) { return x.id === pid; })] = objP;
+        else db.kbPolicies.unshift(objP);
+        kbLog('KbPolicy', objP.id, existingP ? 'kb_policy_updated' : 'kb_policy_created', objP.title, (existingP ? 'تحديث سياسة: ' : 'إضافة سياسة: ') + objP.title, existingP, objP);
+        return { success: true, mutated: true, data: { policy: objP } };
+      }
+
+      case 'deleteKbPolicy': {
+        if (!kbCan('kb_delete_content')) return kbErr('FORBIDDEN', 'لا تملك صلاحية حذف السياسات.');
+        var delPid = String(p.id || '').trim();
+        var tgtP = activePolicies().find(function (x) { return x.id === delPid; });
+        if (!tgtP) return kbErr('NOT_FOUND', 'السياسة غير موجودة.');
+        tgtP.deletedAt = new Date().toISOString();
+        kbLog('KbPolicy', delPid, 'kb_policy_deleted', tgtP.title, 'حذف سياسة: ' + tgtP.title, tgtP, { deleted: true });
+        return { success: true, mutated: true, data: { deletedId: delPid } };
+      }
+
+      case 'recordKbPolicyView': {
+        var pv = activePolicies().find(function (x) { return x.id === String(p.id || ''); });
+        if (pv) {
+          pv.usageCount = Number(pv.usageCount || 0) + 1;
+          if (p.fromSearch) pv.searchHitCount = Number(pv.searchHitCount || 0) + 1;
+        }
+        return { success: true, mutated: Boolean(pv), data: { ok: true } };
+      }
+
+      case 'getKbFaqs': {
+        var canEditF = kbCan('kb_manage_faqs') || kbCan('kb_publish_content');
+        var faqList = activeFaqs().map(function (x) { return Object.assign({}, x, { companyName: companyNameById(x.companyId) }); });
+        if (!canEditF) faqList = faqList.filter(function (x) { return x.publishStatus === 'published'; });
+        else if (p.publishStatus && p.publishStatus !== 'all') faqList = faqList.filter(function (x) { return x.publishStatus === p.publishStatus; });
+        if (p.category && p.category !== 'all') faqList = faqList.filter(function (x) { return x.category === p.category; });
+        if (p.companyId) faqList = faqList.filter(function (x) { return x.companyId === String(p.companyId); });
+        if (p.sortBy === 'most_used') faqList.sort(function (a, b) { return (b.usageCount || 0) - (a.usageCount || 0); });
+        else if (p.sortBy === 'most_searched') faqList.sort(function (a, b) { return ((b.searchHitCount || 0) - (a.searchHitCount || 0)) || ((b.usageCount || 0) - (a.usageCount || 0)); });
+        if (p.search) {
+          faqList = faqList.map(function (x) {
+            return { x: x, s: kbScore(p.search, x.question, [x.answerText, x.companyName, x.category], x.keywords) };
+          }).filter(function (r) { return r.s > 0; }).sort(function (a, b) { return b.s - a.s; }).map(function (r) { return r.x; });
+        }
+        var hl = faqList.filter(function (x) { return x.publishStatus === 'published' && ((x.searchHitCount || 0) > 0 || (x.usageCount || 0) > 0); })
+          .slice().sort(function (a, b) { return ((b.searchHitCount || 0) - (a.searchHitCount || 0)) || ((b.usageCount || 0) - (a.usageCount || 0)); }).slice(0, 5);
+        var pgF = Math.max(1, Number(p.page || 1));
+        var psF = Math.max(6, Math.min(100, Number(p.pageSize || 24)));
+        return {
+          success: true,
+          data: {
+            items: faqList.slice((pgF - 1) * psF, pgF * psF),
+            mostSearchedHighlights: hl,
+            pagination: { page: pgF, pageSize: psF, total: faqList.length, totalPages: Math.max(1, Math.ceil(faqList.length / psF)) }
+          }
+        };
+      }
+
+      case 'saveKbFaq': {
+        if (!kbCan('kb_manage_faqs')) return kbErr('FORBIDDEN', 'لا تملك صلاحية إضافة أو تعديل الأسئلة الشائعة.');
+        var fid = String(p.id || '').trim();
+        var fQ = String(p.question || '').trim();
+        if (!fQ) return kbErr('VALIDATION_ERROR', 'نص السؤال مطلوب.');
+        var fHtml = kbSanitizeHtml(p.answerHtml !== undefined ? p.answerHtml : p.answerText);
+        var fText = kbPlainText(fHtml);
+        if (!fText) return kbErr('VALIDATION_ERROR', 'نص الإجابة مطلوب.');
+        var fCid = String(p.companyId || '').trim();
+        var dupF = activeFaqs().some(function (x) { return x.id !== fid && x.companyId === fCid && kbNorm(x.question) === kbNorm(fQ); });
+        if (dupF) return kbErr('DUPLICATE_ENTRY', 'يوجد سؤال شائع مسجل مسبقاً بنفس الصياغة.');
+        var existingF = fid ? activeFaqs().find(function (x) { return x.id === fid; }) : null;
+        if (fid && !existingF) return kbErr('NOT_FOUND', 'السؤال غير موجود.');
+        var nowF = new Date().toISOString();
+        var actorIdF = String(user.id || '');
+        var actorNameF = String(user.name || user.username || '');
+        var fStatus = ['published', 'draft', 'archived'].indexOf(String(p.publishStatus || 'published')) !== -1 ? String(p.publishStatus || 'published') : 'published';
+        var objF = {
+          id: fid || ('KBFAQ_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+          question: fQ,
+          answerHtml: fHtml,
+          answerText: fText,
+          category: String(p.category || 'general').trim(),
+          companyId: fCid,
+          companyName: companyNameById(fCid),
+          keywords: kbList(p.keywords),
+          publishStatus: fStatus,
+          usageCount: existingF ? (existingF.usageCount || 0) : 0,
+          searchHitCount: existingF ? (existingF.searchHitCount || 0) : 0,
+          createdById: existingF ? existingF.createdById : actorIdF,
+          createdByName: existingF ? existingF.createdByName : actorNameF,
+          updatedById: actorIdF,
+          updatedByName: actorNameF,
+          createdAt: existingF ? existingF.createdAt : nowF,
+          updatedAt: nowF,
+          deletedAt: ''
+        };
+        if (existingF) db.kbFaqs[db.kbFaqs.findIndex(function (x) { return x.id === fid; })] = objF;
+        else db.kbFaqs.unshift(objF);
+        kbLog('KbFaq', objF.id, existingF ? 'kb_faq_updated' : 'kb_faq_created', objF.question, (existingF ? 'تحديث سؤال شائع: ' : 'إضافة سؤال شائع: ') + objF.question, existingF, objF);
+        return { success: true, mutated: true, data: { faq: objF } };
+      }
+
+      case 'deleteKbFaq': {
+        if (!kbCan('kb_delete_content')) return kbErr('FORBIDDEN', 'لا تملك صلاحية حذف الأسئلة الشائعة.');
+        var delFid = String(p.id || '').trim();
+        var tgtF = activeFaqs().find(function (x) { return x.id === delFid; });
+        if (!tgtF) return kbErr('NOT_FOUND', 'السؤال غير موجود.');
+        tgtF.deletedAt = new Date().toISOString();
+        kbLog('KbFaq', delFid, 'kb_faq_deleted', tgtF.question, 'حذف سؤال شائع: ' + tgtF.question, tgtF, { deleted: true });
+        return { success: true, mutated: true, data: { deletedId: delFid } };
+      }
+
+      case 'recordKbFaqUsage': {
+        var fu = activeFaqs().find(function (x) { return x.id === String(p.id || ''); });
+        if (fu) {
+          fu.usageCount = Number(fu.usageCount || 0) + 1;
+          if (p.fromSearch) fu.searchHitCount = Number(fu.searchHitCount || 0) + 1;
+        }
+        return { success: true, mutated: Boolean(fu), data: { ok: true } };
+      }
+
+      case 'getKbQuickReplies': {
+        var canEditQ = kbCan('kb_manage_quick_replies') || kbCan('kb_publish_content');
+        var qrList = activeReplies().map(function (x) { return Object.assign({}, x, { companyName: companyNameById(x.companyId) }); });
+        if (!canEditQ) qrList = qrList.filter(function (x) { return x.status === 'active'; });
+        else if (p.status && p.status !== 'all') qrList = qrList.filter(function (x) { return x.status === p.status; });
+        if (p.category && p.category !== 'all') qrList = qrList.filter(function (x) { return x.category === p.category; });
+        if (p.language === 'ar' || p.language === 'en') qrList = qrList.filter(function (x) { return x.language === p.language; });
+        if (p.companyId) qrList = qrList.filter(function (x) { return x.companyId === String(p.companyId); });
+        if (p.sortBy === 'updated') qrList.sort(function (a, b) { return String(b.updatedAt).localeCompare(String(a.updatedAt)); });
+        else qrList.sort(function (a, b) { return (b.usageCount || 0) - (a.usageCount || 0); });
+        if (p.search) {
+          qrList = qrList.map(function (x) {
+            return { x: x, s: kbScore(p.search, x.title, [x.messageText, x.companyName, x.category], x.keywords) };
+          }).filter(function (r) { return r.s > 0; }).sort(function (a, b) { return b.s - a.s; }).map(function (r) { return r.x; });
+        }
+        var mostU = qrList.filter(function (x) { return x.status === 'active' && (x.usageCount || 0) > 0; }).slice(0, 6);
+        var pgQ = Math.max(1, Number(p.page || 1));
+        var psQ = Math.max(6, Math.min(100, Number(p.pageSize || 24)));
+        return {
+          success: true,
+          data: {
+            items: qrList.slice((pgQ - 1) * psQ, pgQ * psQ),
+            mostUsed: mostU,
+            pagination: { page: pgQ, pageSize: psQ, total: qrList.length, totalPages: Math.max(1, Math.ceil(qrList.length / psQ)) }
+          }
+        };
+      }
+
+      case 'saveKbQuickReply': {
+        if (!kbCan('kb_manage_quick_replies')) return kbErr('FORBIDDEN', 'لا تملك صلاحية إضافة أو تعديل الردود الجاهزة.');
+        var qid = String(p.id || '').trim();
+        var qTitle = String(p.title || '').trim();
+        var qMsg = String(p.messageText || '').trim();
+        if (!qTitle) return kbErr('VALIDATION_ERROR', 'عنوان الرد الجاهز مطلوب.');
+        if (!qMsg) return kbErr('VALIDATION_ERROR', 'نص الرد الجاهز مطلوب.');
+        var qLang = p.language === 'en' ? 'en' : 'ar';
+        var qCid = String(p.companyId || '').trim();
+        var dupQ = activeReplies().some(function (x) { return x.id !== qid && x.language === qLang && x.companyId === qCid && kbNorm(x.title) === kbNorm(qTitle); });
+        if (dupQ) return kbErr('DUPLICATE_ENTRY', 'يوجد رد جاهز مسجل مسبقاً بنفس العنوان واللغة.');
+        var existingQ = qid ? activeReplies().find(function (x) { return x.id === qid; }) : null;
+        if (qid && !existingQ) return kbErr('NOT_FOUND', 'الرد الجاهز غير موجود.');
+        var nowQ = new Date().toISOString();
+        var actorIdQ = String(user.id || '');
+        var actorNameQ = String(user.name || user.username || '');
+        var qStatus = ['active', 'draft', 'archived'].indexOf(String(p.status || 'active')) !== -1 ? String(p.status || 'active') : 'active';
+        var objQ = {
+          id: qid || ('KBQR_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+          title: qTitle,
+          messageText: qMsg,
+          category: String(p.category || 'greeting').trim(),
+          keywords: kbList(p.keywords),
+          language: qLang,
+          companyId: qCid,
+          companyName: companyNameById(qCid),
+          status: qStatus,
+          usageCount: existingQ ? (existingQ.usageCount || 0) : 0,
+          createdById: existingQ ? existingQ.createdById : actorIdQ,
+          createdByName: existingQ ? existingQ.createdByName : actorNameQ,
+          updatedById: actorIdQ,
+          updatedByName: actorNameQ,
+          createdAt: existingQ ? existingQ.createdAt : nowQ,
+          updatedAt: nowQ,
+          deletedAt: ''
+        };
+        if (existingQ) db.kbQuickReplies[db.kbQuickReplies.findIndex(function (x) { return x.id === qid; })] = objQ;
+        else db.kbQuickReplies.unshift(objQ);
+        kbLog('KbQuickReply', objQ.id, existingQ ? 'kb_quick_reply_updated' : 'kb_quick_reply_created', objQ.title, (existingQ ? 'تحديث رد جاهز: ' : 'إضافة رد جاهز: ') + objQ.title, existingQ, objQ);
+        return { success: true, mutated: true, data: { quickReply: objQ } };
+      }
+
+      case 'deleteKbQuickReply': {
+        if (!kbCan('kb_delete_content')) return kbErr('FORBIDDEN', 'لا تملك صلاحية حذف الردود الجاهزة.');
+        var delQid = String(p.id || '').trim();
+        var tgtQ = activeReplies().find(function (x) { return x.id === delQid; });
+        if (!tgtQ) return kbErr('NOT_FOUND', 'الرد الجاهز غير موجود.');
+        tgtQ.deletedAt = new Date().toISOString();
+        kbLog('KbQuickReply', delQid, 'kb_quick_reply_deleted', tgtQ.title, 'حذف رد جاهز: ' + tgtQ.title, tgtQ, { deleted: true });
+        return { success: true, mutated: true, data: { deletedId: delQid } };
+      }
+
+      case 'recordKbQuickReplyUsage': {
+        var qru = activeReplies().find(function (x) { return x.id === String(p.id || ''); });
+        if (qru) qru.usageCount = Number(qru.usageCount || 0) + 1;
+        return { success: true, mutated: Boolean(qru), data: { ok: true } };
+      }
+
+      case 'searchKnowledgeBase': {
+        var qt = String(p.query || p.search || '').trim();
+        var ct = String(p.contentType || 'all');
+        var catF = String(p.category || '');
+        var cidF = String(p.companyId || '');
+        var cityF = kbNorm(p.city || '');
+        var results = [];
+        if (ct === 'all' || ct === 'company') {
+          activeCompanies().forEach(function (c) {
+            var ec = enrichCompany(c, false);
+            if (cidF && ec.id !== cidF) return;
+            if (cityF && !ec.cities.some(function (x) { return kbNorm(x) === cityF; })) return;
+            if (catF) return;
+            var sc = kbScore(qt, ec.name, [ec.shortDescription, ec.cities.join(' '), ec.serviceTypes.join(' '), ec.phone], ec.cities);
+            if (sc > 0) results.push({ id: ec.id, entityType: 'company', title: ec.name, subtitle: ec.cities.join('، ') || ec.shortDescription.slice(0, 80), snippet: ec.shortDescription.slice(0, 140), companyId: ec.id, companyName: ec.name, city: ec.cities[0] || '', category: '', sectionKey: 'companies', status: ec.status, usageCount: 0, updatedAt: ec.updatedAt, score: sc });
+          });
+        }
+        if (ct === 'all' || ct === 'branch') {
+          activeBranches().forEach(function (b) {
+            var cn = companyNameById(b.companyId);
+            if (cidF && b.companyId !== cidF) return;
+            if (cityF && kbNorm(b.city) !== cityF) return;
+            if (catF) return;
+            var sc = kbScore(qt, b.branchName, [cn, b.city, b.district, b.fullAddress, (b.services || []).join(' ')], [b.city, b.district]);
+            if (sc > 0) results.push({ id: b.id, entityType: 'branch', title: b.branchName, subtitle: cn + ' — ' + b.city + (b.district ? ' · ' + b.district : ''), snippet: b.fullAddress || b.workingHours || b.phone, companyId: b.companyId, companyName: cn, city: b.city, category: '', sectionKey: 'branches', status: b.status, usageCount: 0, updatedAt: b.updatedAt, score: sc });
+          });
+        }
+        if (ct === 'all' || ct === 'policy') {
+          var canSeePD = kbCan('kb_manage_policies') || kbCan('kb_publish_content');
+          activePolicies().forEach(function (x) {
+            if (!canSeePD && x.publishStatus !== 'published') return;
+            var cn = companyNameById(x.companyId);
+            if (cidF && x.companyId !== cidF) return;
+            if (cityF && kbNorm(x.city) !== cityF) return;
+            if (catF && x.category !== catF) return;
+            var sc = kbScore(qt, x.title, [x.descriptionText, cn, x.city], x.keywords);
+            if (sc > 0) results.push({ id: x.id, entityType: 'policy', title: x.title, subtitle: (cn ? cn + ' · ' : '') + x.category, snippet: (x.descriptionText || '').slice(0, 150), companyId: x.companyId, companyName: cn, city: x.city, category: x.category, sectionKey: x.sectionKey, status: x.publishStatus, usageCount: x.usageCount || 0, updatedAt: x.updatedAt, score: sc });
+          });
+        }
+        if (ct === 'all' || ct === 'faq') {
+          var canSeeFD = kbCan('kb_manage_faqs') || kbCan('kb_publish_content');
+          activeFaqs().forEach(function (x) {
+            if (!canSeeFD && x.publishStatus !== 'published') return;
+            var cn = companyNameById(x.companyId);
+            if (cidF && x.companyId !== cidF) return;
+            if (cityF) return;
+            if (catF && x.category !== catF) return;
+            var sc = kbScore(qt, x.question, [x.answerText, cn], x.keywords);
+            if (sc > 0) results.push({ id: x.id, entityType: 'faq', title: x.question, subtitle: cn || x.category, snippet: (x.answerText || '').slice(0, 150), companyId: x.companyId, companyName: cn, city: '', category: x.category, sectionKey: 'faq', status: x.publishStatus, usageCount: x.usageCount || 0, updatedAt: x.updatedAt, score: sc });
+          });
+        }
+        if (ct === 'all' || ct === 'quick_reply') {
+          var canSeeQD = kbCan('kb_manage_quick_replies') || kbCan('kb_publish_content');
+          activeReplies().forEach(function (x) {
+            if (!canSeeQD && x.status !== 'active') return;
+            var cn = companyNameById(x.companyId);
+            if (cidF && x.companyId !== cidF) return;
+            if (cityF) return;
+            if (catF && x.category !== catF) return;
+            var sc = kbScore(qt, x.title, [x.messageText, cn], x.keywords);
+            if (sc > 0) results.push({ id: x.id, entityType: 'quick_reply', title: x.title, subtitle: String(x.language || 'ar').toUpperCase() + ' · ' + x.category, snippet: (x.messageText || '').slice(0, 150), companyId: x.companyId, companyName: cn, city: '', category: x.category, sectionKey: 'quick_replies', status: x.status, usageCount: x.usageCount || 0, updatedAt: x.updatedAt, score: sc });
+          });
+        }
+        results.sort(function (a, b) { return (b.score - a.score) || (b.usageCount - a.usageCount); });
+        var lim = Math.min(80, Math.max(10, Number(p.limit || 40)));
+        return { success: true, data: { query: qt, totalMatches: results.length, items: results.slice(0, lim) } };
+      }
+
+      case 'getKbAuditHistory': {
+        var revs = Array.isArray(db.kbRevisions) ? db.kbRevisions.slice() : [];
+        if (p.entityType) revs = revs.filter(function (r) { return r.entityType === String(p.entityType); });
+        if (p.entityId) revs = revs.filter(function (r) { return r.entityId === String(p.entityId); });
+        var pgR = Math.max(1, Number(p.page || 1));
+        var psR = Math.max(6, Math.min(100, Number(p.pageSize || 25)));
+        return {
+          success: true,
+          data: {
+            items: revs.slice((pgR - 1) * psR, pgR * psR),
+            pagination: { page: pgR, pageSize: psR, total: revs.length, totalPages: Math.max(1, Math.ceil(revs.length / psR)) }
+          }
+        };
+      }
+
+      case 'exportKbBackup': {
+        return {
+          success: true,
+          data: {
+            exportedAt: new Date().toISOString(),
+            exportedBy: String(user.name || user.username || ''),
+            source: 'Sandbox Local Store (mirrors Neon PostgreSQL Schema)',
+            companies: activeCompanies().map(function (c) { return enrichCompany(c, false); }),
+            branches: activeBranches().map(function (b) { return Object.assign({}, b, { companyName: companyNameById(b.companyId) }); }),
+            policies: activePolicies(),
+            faqs: activeFaqs(),
+            quickReplies: activeReplies(),
+            revisions: (db.kbRevisions || []).slice(0, 200)
+          }
+        };
+      }
     }
   }
 

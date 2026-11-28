@@ -18,6 +18,7 @@ export type CacheScope =
   | 'followUps'
   | 'problems'
   | 'customers'
+  | 'knowledgeBase'
   | 'activity'
   | 'sync';
 
@@ -354,7 +355,17 @@ const ACTION_SCOPE_MAP: Record<string, { eventType: 'delta' | 'announcement' | '
   saveDelegation: { eventType: 'delta', scopes: ['employees', 'notifications', 'activity'], persistVersion: true },
   revokeDelegation: { eventType: 'delta', scopes: ['employees', 'activity'], persistVersion: true },
   acquireReservationLock: { eventType: 'lock', scopes: [], persistVersion: false },
-  releaseReservationLock: { eventType: 'lock', scopes: [], persistVersion: false }
+  releaseReservationLock: { eventType: 'lock', scopes: [], persistVersion: false },
+  saveKbCompany: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  deleteKbCompany: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  saveKbBranch: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  deleteKbBranch: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  saveKbPolicy: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  deleteKbPolicy: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  saveKbFaq: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  deleteKbFaq: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  saveKbQuickReply: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true },
+  deleteKbQuickReply: { eventType: 'delta', scopes: ['knowledgeBase', 'activity'], persistVersion: true }
 };
 
 export function getMutationSyncSpec(action: string) {

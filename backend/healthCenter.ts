@@ -3,13 +3,23 @@ import { getPoolMetrics, runWithSavepoint, type DbClient, type DbExecutor } from
 import { redactSensitiveText } from './logger.js';
 import { testRgApiConnectionSafe } from './rgApiClient.js';
 import { SCHEMA_SQL } from './schemaSql.js';
-import { getRgTokenDiagnostics, getSyncSecretDiagnostics, resolveServerConfig } from './serverConfig.js';
 import {
+  getGasAuthFlowDiagnostics,
+  getRgTokenDiagnostics,
+  getSyncSecretDiagnostics,
+  resolveServerConfig
+} from './serverConfig.js';
+import {
+  backfillMissingOutboxIdempotencyKeys,
   classifyOutboxMirrorError,
   fetchRentalGateSnapshotReadOnly,
   flushSheetsMirrorOutbox,
+  probeGasMirrorSafe,
   reprocessFailedOutboxBatch,
   retryFailedSyncRecords,
+  testOutboxSingleUpsert,
+  testOutboxThreeWaySuite,
+  verifyGasFrozenRowsProtection,
   verifyGasMirrorAuth
 } from './syncService.js';
 
@@ -54,7 +64,12 @@ export const EXPECTED_MIGRATION_IDS = [
   '2026_11_27_005_audit_indexes_and_constraints',
   '2026_11_27_006_integrity_schema_and_extensions_recalc',
   '2026_11_27_007_customers_backfill_and_outbox_reliability',
-  '2026_11_27_008_outbox_attempt_and_error_category'
+  '2026_11_27_008_outbox_attempt_and_error_category',
+  '2026_11_27_009_reclassify_outbox_auth_and_quarantine_bulk_delete',
+  '2026_11_28_010_outbox_lifecycle_and_classification_repair',
+  '2026_11_28_011_outbox_correlation_batch_and_canonical_status',
+  '2026_11_28_012_outbox_idempotency_backfill',
+  '2026_11_28_013_knowledge_base_module'
 ];
 
 export const TABLE_CODE_REFERENCES: Record<string, string[]> = {
@@ -68,7 +83,7 @@ export const TABLE_CODE_REFERENCES: Record<string, string[]> = {
   problems: ['backend/queries.ts', 'backend/syncService.ts'],
   issues: ['backend/queries.ts'],
   problem_updates: ['backend/queries.ts'],
-  activity_log: ['backend/queries.ts', 'backend/integrityService.ts', 'backend/healthCenter.ts'],
+  activity_log: ['backend/queries.ts', 'backend/integrityService.ts', 'backend/healthCenter.ts', 'backend/kbService.ts'],
   notifications: ['backend/queries.ts', 'backend/db.ts'],
   notification_dismissals: ['backend/queries.ts', 'backend/db.ts'],
   settings: ['backend/queries.ts', 'backend/syncService.ts', 'backend/serverConfig.ts'],
@@ -95,7 +110,13 @@ export const TABLE_CODE_REFERENCES: Record<string, string[]> = {
   data_integrity_actions: ['backend/dataIntegrity.ts', 'backend/integrityService.ts'],
   realtime_events: ['backend/realtime.ts', 'backend/queries.ts'],
   idempotency_requests: ['backend/cache.ts'],
-  health_center_runs: ['backend/healthCenter.ts']
+  health_center_runs: ['backend/healthCenter.ts'],
+  kb_companies: ['backend/kbService.ts', 'backend/kbLogic.ts'],
+  kb_branches: ['backend/kbService.ts', 'backend/kbLogic.ts'],
+  kb_policies: ['backend/kbService.ts', 'backend/kbLogic.ts'],
+  kb_faqs: ['backend/kbService.ts', 'backend/kbLogic.ts'],
+  kb_quick_replies: ['backend/kbService.ts', 'backend/kbLogic.ts'],
+  kb_revisions: ['backend/kbService.ts']
 };
 
 const KNOWN_NEON_SAMPLE_TABLES = new Set(['playing_with_neon']);
@@ -1002,7 +1023,7 @@ async function collectDataIntegritySection(executor: DbExecutor, compareWithRg: 
     }
   };
 
-  const [countsQ, dupSrcQ, swappedRgQ, orphanExtQ, orphanFuQ, incompleteCustQ, extMismatchQ, extMismatchTotalQ, dualFlagQ, latestDiQ, openDiIssuesQ] = await Promise.all([
+  const [countsQ, dupSrcQ, swappedRgQ, orphanExtQ, orphanFuQ, incompleteCustQ, extMismatchQ, extMismatchTotalQ, dualFlagQ, latestDiQ, openDiIssuesQ, openDiSeverityQ] = await Promise.all([
     capDi('counts', () =>
       executor.query<{
         reservations_cnt: number;
@@ -1113,6 +1134,15 @@ async function collectDataIntegritySection(executor: DbExecutor, compareWithRg: 
         `SELECT COUNT(*)::int AS cnt FROM data_integrity_issues WHERE resolution_status = 'open'`
       ),
       [{ cnt: 0 }]
+    ),
+    capDi('open_di_issues_severity', () =>
+      executor.query<{ severity: string; cnt: number }>(
+        `SELECT COALESCE(NULLIF(LOWER(TRIM(severity)), ''), 'medium') AS severity, COUNT(*)::int AS cnt
+         FROM data_integrity_issues
+         WHERE resolution_status = 'open'
+         GROUP BY 1`
+      ),
+      []
     )
   ]);
 
@@ -1296,7 +1326,19 @@ async function collectDataIntegritySection(executor: DbExecutor, compareWithRg: 
       extensionCountMismatches: extMismatchQ.rows || [],
       extensionCountMismatchesTotal: extCounterMismatchCount,
       dualLifecycleFlagsCount,
-      openIntegrityIssuesCount: openDiIssues
+      openIntegrityIssuesCount: openDiIssues,
+      openIssuesBySeverity: (() => {
+        const sev = { critical: 0, high: 0, medium: 0, low: 0 };
+        for (const r of (openDiSeverityQ.rows || []) as Array<{ severity: string; cnt: number }>) {
+          const k = str(r.severity).toLowerCase();
+          if (k === 'critical' || k === 'high' || k === 'medium' || k === 'low') {
+            sev[k] += num(r.cnt, 0);
+          } else {
+            sev.medium += num(r.cnt, 0);
+          }
+        }
+        return sev;
+      })()
     },
     latestIntegrityRun: latestDi ? {
       id: str(latestDi.id),
@@ -1326,8 +1368,9 @@ async function collectSyncHealth(
     }
   };
 
-  const [workerQ, logsQ, cpQ, outboxCountsQ, outboxErrBreakdownQ, outboxCatStatsQ, outboxRecentErrQ, lastOutboxSentQ, syncSecretDiag, rgTokenDiag, serverCfg] = await Promise.all([
+  const [workerQ, outboxLeaseQ, logsQ, cpQ, outboxCountsQ, outboxErrBreakdownQ, outboxCatStatsQ, outboxRecentErrQ, lastOutboxSentQ, lastUpsertQ, syncSecretDiag, rgTokenDiag, gasFlowDiag, serverCfg] = await Promise.all([
     capSync('sync_worker_state', () => executor.query(`SELECT * FROM sync_worker_state WHERE id = 'primary' LIMIT 1`)),
+    capSync('outbox_worker_lease', () => executor.query(`SELECT status, is_syncing, last_trigger_type, worker_heartbeat_at FROM sync_worker_state WHERE id = 'outbox_mirror' LIMIT 1`)),
     capSync('sync_log', () => executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 20`)),
     capSync('sync_checkpoints', () => executor.query(`SELECT * FROM sync_checkpoints ORDER BY updated_at DESC LIMIT 20`)),
     capSync('outbox_counts', () =>
@@ -1336,60 +1379,111 @@ async function collectSyncHealth(
         pending_cnt: number;
         processing_cnt: number;
         retry_cnt: number;
+        retry_with_error_cnt: number;
         failed_cnt: number;
         permanent_failed_cnt: number;
+        quarantined_bulk_cnt: number;
+        missing_idempotency_cnt?: number;
+        missing_idempotency_total_cnt?: number;
+        stale_processing_cnt?: number;
+        failed_attempts_cnt: number;
+        last_error_at: any;
         oldest_unsynced_at: any;
+        oldest_pending_at: any;
         total_cnt: number;
       }>(
         `SELECT
-           COUNT(*) FILTER (WHERE status = 'sent')::int AS sent_cnt,
+           COUNT(*) FILTER (WHERE status IN ('sent', 'completed'))::int AS sent_cnt,
            COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_cnt,
            COUNT(*) FILTER (WHERE status = 'processing')::int AS processing_cnt,
            COUNT(*) FILTER (WHERE status = 'retry')::int AS retry_cnt,
-           COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_cnt,
            COUNT(*) FILTER (
-             WHERE status = 'failed'
+             WHERE status = 'retry'
+               AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> '')
+           )::int AS retry_with_error_cnt,
+           COUNT(*) FILTER (WHERE status IN ('failed', 'dead_letter'))::int AS failed_cnt,
+           COUNT(*) FILTER (
+             WHERE status IN ('failed', 'dead_letter')
                AND (
                  COALESCE(error_category, '') IN ('auth', 'sheet_frozen', 'validation')
-                 OR COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'
+                 OR COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|non-frozen|الصفوف المجمدة|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422|غير صالح|غير متطابق|مفتاح المزامنة'
                )
            )::int AS permanent_failed_cnt,
-           MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry', 'failed')) AS oldest_unsynced_at,
-           COUNT(*)::int AS total_cnt
-         FROM sheets_mirror_outbox`
-      ).catch(() =>
-        executor.query<{
-          sent_cnt: number;
-          pending_cnt: number;
-          processing_cnt: number;
-          retry_cnt: number;
-          failed_cnt: number;
-          permanent_failed_cnt: number;
-          oldest_unsynced_at: any;
-          total_cnt: number;
-        }>(
-          `SELECT
-             COUNT(*) FILTER (WHERE status = 'sent')::int AS sent_cnt,
-             COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_cnt,
-             COUNT(*) FILTER (WHERE status = 'processing')::int AS processing_cnt,
-             COUNT(*) FILTER (WHERE status = 'retry')::int AS retry_cnt,
-             COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_cnt,
-             COUNT(*) FILTER (
-               WHERE status = 'failed'
-                 AND COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'
-             )::int AS permanent_failed_cnt,
-             MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry', 'failed')) AS oldest_unsynced_at,
-             COUNT(*)::int AS total_cnt
-           FROM sheets_mirror_outbox`
-        )
-      ),
-      [{ sent_cnt: 0, pending_cnt: 0, processing_cnt: 0, retry_cnt: 0, failed_cnt: 0, permanent_failed_cnt: 0, oldest_unsynced_at: null, total_cnt: 0 }]
-    ),
+            COUNT(*) FILTER (WHERE COALESCE(action, '') = 'deleteAllReservations' AND status IN ('pending', 'retry', 'failed', 'dead_letter'))::int AS quarantined_bulk_cnt,
+            COUNT(*) FILTER (WHERE status IN ('pending', 'processing', 'retry') AND COALESCE(TRIM(idempotency_key), '') = '')::int AS missing_idempotency_cnt,
+            COUNT(*) FILTER (WHERE COALESCE(TRIM(idempotency_key), '') = '')::int AS missing_idempotency_total_cnt,
+            COUNT(*) FILTER (WHERE status = 'processing' AND locked_at IS NOT NULL AND locked_at < NOW() - INTERVAL '5 minutes')::int AS stale_processing_cnt,
+            COALESCE(SUM(retry_count) FILTER (WHERE status IN ('failed', 'dead_letter', 'retry')), 0)::int AS failed_attempts_cnt,
+            MAX(COALESCE(finished_at, last_attempt_at, updated_at, created_at)) FILTER (
+              WHERE status IN ('failed', 'dead_letter')
+                 OR (status = 'retry' AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> ''))
+            ) AS last_error_at,
+            MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry', 'failed', 'dead_letter')) AS oldest_unsynced_at,
+            MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry')) AS oldest_pending_at,
+            COUNT(*)::int AS total_cnt
+          FROM sheets_mirror_outbox`
+       ).catch(() =>
+         executor.query<{
+           sent_cnt: number;
+           pending_cnt: number;
+           processing_cnt: number;
+           retry_cnt: number;
+           retry_with_error_cnt: number;
+           failed_cnt: number;
+           permanent_failed_cnt: number;
+           quarantined_bulk_cnt: number;
+           missing_idempotency_cnt: number;
+           missing_idempotency_total_cnt: number;
+           stale_processing_cnt: number;
+           failed_attempts_cnt: number;
+           last_error_at: any;
+           oldest_unsynced_at: any;
+           oldest_pending_at: any;
+           total_cnt: number;
+         }>(
+           `SELECT
+              COUNT(*) FILTER (WHERE status IN ('sent', 'completed'))::int AS sent_cnt,
+              COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_cnt,
+              COUNT(*) FILTER (WHERE status = 'processing')::int AS processing_cnt,
+              COUNT(*) FILTER (WHERE status = 'retry')::int AS retry_cnt,
+              COUNT(*) FILTER (
+                WHERE status = 'retry'
+                  AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> '')
+              )::int AS retry_with_error_cnt,
+              COUNT(*) FILTER (WHERE status IN ('failed', 'dead_letter'))::int AS failed_cnt,
+              COUNT(*) FILTER (
+                WHERE status IN ('failed', 'dead_letter')
+                  AND COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'
+              )::int AS permanent_failed_cnt,
+              COUNT(*) FILTER (
+                WHERE COALESCE(action, '') = 'deleteAllReservations'
+                   OR COALESCE(last_error, '') ~* 'QUARANTINED_BULK_DELETE|BLOCKED_BULK_DELETE'
+              )::int AS quarantined_bulk_cnt,
+              COUNT(*) FILTER (WHERE status IN ('pending', 'processing', 'retry') AND COALESCE(TRIM(idempotency_key), '') = '')::int AS missing_idempotency_cnt,
+              COUNT(*) FILTER (WHERE COALESCE(TRIM(idempotency_key), '') = '')::int AS missing_idempotency_total_cnt,
+              COUNT(*) FILTER (
+                WHERE status = 'processing'
+                  AND COALESCE(locked_at, updated_at, created_at) < NOW() - INTERVAL '5 minutes'
+              )::int AS stale_processing_cnt,
+              COALESCE(SUM(CASE WHEN status IN ('failed', 'dead_letter', 'retry') THEN GREATEST(retry_count, 1) ELSE 0 END), 0)::int AS failed_attempts_cnt,
+              MAX(COALESCE(last_attempt_at, updated_at, created_at)) FILTER (
+                WHERE status IN ('failed', 'dead_letter')
+                   OR (status = 'retry' AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> ''))
+              ) AS last_error_at,
+              MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry', 'failed', 'dead_letter')) AS oldest_unsynced_at,
+              MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry')) AS oldest_pending_at,
+              COUNT(*)::int AS total_cnt
+            FROM sheets_mirror_outbox`
+         )
+       ),
+       [{ sent_cnt: 0, pending_cnt: 0, processing_cnt: 0, retry_cnt: 0, retry_with_error_cnt: 0, failed_cnt: 0, permanent_failed_cnt: 0, quarantined_bulk_cnt: 0, missing_idempotency_cnt: 0, missing_idempotency_total_cnt: 0, stale_processing_cnt: 0, failed_attempts_cnt: 0, last_error_at: null, oldest_unsynced_at: null, oldest_pending_at: null, total_cnt: 0 }]
+     ),
     capSync('outbox_breakdown', () =>
       executor.query<{ err: string; cnt: number }>(
-        `SELECT COALESCE(NULLIF(TRIM(last_error), ''), 'UNKNOWN_ERROR') AS err, COUNT(*)::int AS cnt
+        `SELECT COALESCE(NULLIF(TRIM(last_error), ''), '[EMPTY_ERROR_RECORDED]') AS err, COUNT(*)::int AS cnt
          FROM sheets_mirror_outbox
-         WHERE status IN ('failed', 'retry')
+         WHERE status IN ('failed', 'dead_letter')
+            OR (status = 'retry' AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> ''))
          GROUP BY 1
          ORDER BY cnt DESC
          LIMIT 10`
@@ -1398,13 +1492,23 @@ async function collectSyncHealth(
     capSync('outbox_category_stats', () =>
       executor.query<{ category: string; err: string; cnt: number; first_seen_at: any; last_seen_at: any }>(
         `SELECT
-           COALESCE(NULLIF(TRIM(error_category), ''), 'unknown') AS category,
-           MIN(COALESCE(NULLIF(TRIM(last_error), ''), 'UNKNOWN_ERROR')) AS err,
+           CASE
+             WHEN COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|HTTP_401|HTTP_403|INVALID_SECRET|غير صالح|غير متطابق|مفتاح المزامنة|accounts\\.google\\.com|ServiceLogin' THEN 'auth'
+             WHEN COALESCE(last_error, '') ~* 'non-frozen|delete all non-frozen|الصفوف المجمدة|cannot delete all' THEN 'sheet_frozen'
+             WHEN COALESCE(last_error, '') ~* 'AbortError|TimeoutError|LOCK_TIMEOUT_RECOVERED|operation was aborted|This operation was aborted|timeout|ETIMEDOUT|aborted' THEN 'timeout'
+             WHEN COALESCE(last_error, '') ~* '429|RATE_LIMIT|TOO MANY REQUESTS' THEN 'rate_limit'
+             WHEN COALESCE(last_error, '') ~* 'GAS HTTP 5' THEN 'upstream_5xx'
+             WHEN COALESCE(last_error, '') ~* 'ECONN|ENOTFOUND|FETCH|NETWORK' THEN 'network'
+             WHEN COALESCE(action, '') = 'deleteAllReservations' OR COALESCE(last_error, '') ~* 'VALIDATION_ERROR|INVALID_GAS_URL|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|GAS_NOT_FOUND|HTTP_400|HTTP_404|HTTP_422' THEN 'validation'
+             ELSE COALESCE(NULLIF(TRIM(error_category), ''), 'unknown')
+           END AS category,
+           MIN(COALESCE(NULLIF(TRIM(last_error), ''), '[EMPTY_ERROR_RECORDED]')) AS err,
            COUNT(*)::int AS cnt,
            MIN(created_at) AS first_seen_at,
            MAX(COALESCE(last_attempt_at, updated_at, created_at)) AS last_seen_at
          FROM sheets_mirror_outbox
-         WHERE status IN ('failed', 'retry')
+         WHERE status IN ('failed', 'dead_letter')
+            OR (status = 'retry' AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> ''))
          GROUP BY 1
          ORDER BY cnt DESC
          LIMIT 12`
@@ -1414,19 +1518,46 @@ async function collectSyncHealth(
       executor.query<{ id: string; entity_type: string; entity_id: string; action: string; status: string; retry_count: number; last_error: string; updated_at: any }>(
         `SELECT id, entity_type, entity_id, action, status, retry_count, last_error, updated_at
          FROM sheets_mirror_outbox
-         WHERE status IN ('failed', 'retry')
+         WHERE status IN ('failed', 'dead_letter')
+            OR (status = 'retry' AND (COALESCE(retry_count, 0) > 0 OR COALESCE(TRIM(last_error), '') <> ''))
          ORDER BY updated_at DESC
          LIMIT 20`
       )
     ),
     capSync('outbox_last_sent', () =>
       executor.query<{ sent_at: any; updated_at: any }>(
-        `SELECT COALESCE(synced_at, processed_at, updated_at) AS sent_at, updated_at
+        `SELECT COALESCE(last_success_at, synced_at, processed_at, updated_at) AS sent_at, updated_at
          FROM sheets_mirror_outbox
-         WHERE status = 'sent'
-         ORDER BY COALESCE(synced_at, processed_at, updated_at) DESC NULLS LAST
+         WHERE status IN ('sent', 'completed')
+         ORDER BY COALESCE(last_success_at, synced_at, processed_at, updated_at) DESC NULLS LAST
          LIMIT 1`
+      ).catch(() =>
+        executor.query<{ sent_at: any; updated_at: any }>(
+          `SELECT COALESCE(synced_at, processed_at, updated_at) AS sent_at, updated_at
+           FROM sheets_mirror_outbox
+           WHERE status IN ('sent', 'completed')
+           ORDER BY COALESCE(synced_at, processed_at, updated_at) DESC NULLS LAST
+           LIMIT 1`
+        )
       )
+    ),
+    capSync('outbox_last_upsert', () =>
+      executor.query<{
+        id: string;
+        entity_id: string;
+        correlation_id?: string;
+        batch_id?: string;
+        status: string;
+        sent_at: any;
+      }>(
+        `SELECT id, entity_id, correlation_id, batch_id, status,
+                COALESCE(last_success_at, synced_at, processed_at, updated_at) AS sent_at
+         FROM sheets_mirror_outbox
+         WHERE status IN ('sent', 'completed')
+           AND action = 'upsertReservation'
+         ORDER BY COALESCE(last_success_at, synced_at, processed_at, updated_at) DESC NULLS LAST
+         LIMIT 1`
+      ).catch(() => ({ rows: [] as any[] }))
     ),
     getSyncSecretDiagnostics(executor).catch(() => ({
       configured: false,
@@ -1444,6 +1575,7 @@ async function collectSyncHealth(
       hasWhitespace: false,
       hasBearerPrefix: false
     })),
+    getGasAuthFlowDiagnostics(executor).catch(() => null),
     resolveServerConfig(executor).catch(() => ({
       rgApiBaseUrl: '',
       rgToken: '',
@@ -1513,6 +1645,7 @@ async function collectSyncHealth(
     lastBatchCount: num(cp.last_batch_count, 0),
     lastCursor: str(cp.last_cursor),
     lastError: redactSensitiveText(cp.last_error),
+    meta: parseJsonSafe<Record<string, any>>(cp.meta, {}),
     lastSyncAt: cp.last_sync_at instanceof Date ? cp.last_sync_at.toISOString() : str(cp.last_sync_at),
     lastSuccessfulAt: cp.last_successful_at instanceof Date ? cp.last_successful_at.toISOString() : str(cp.last_successful_at)
   }));
@@ -1522,9 +1655,11 @@ async function collectSyncHealth(
     pending_cnt: 0,
     processing_cnt: 0,
     retry_cnt: 0,
+    retry_with_error_cnt: 0,
     failed_cnt: 0,
     permanent_failed_cnt: 0,
     oldest_unsynced_at: null,
+    oldest_pending_at: null,
     total_cnt: 0
   } as any);
   const outboxCategoryBreakdown = (outboxCatStatsQ.rows || []).map((c: any) => ({
@@ -1534,6 +1669,20 @@ async function collectSyncHealth(
     firstSeenAt: c.first_seen_at instanceof Date ? c.first_seen_at.toISOString() : str(c.first_seen_at),
     lastSeenAt: c.last_seen_at instanceof Date ? c.last_seen_at.toISOString() : str(c.last_seen_at)
   }));
+  const outboxCategoryCounts: Record<string, number> = {
+    auth: 0,
+    sheet_frozen: 0,
+    timeout: 0,
+    validation: 0,
+    rate_limit: 0,
+    upstream_5xx: 0,
+    network: 0,
+    unknown: 0
+  };
+  for (const c of outboxCategoryBreakdown) {
+    const k = str(c.category || 'unknown');
+    outboxCategoryCounts[k] = (outboxCategoryCounts[k] || 0) + num(c.count, 0);
+  }
   const outboxBreakdown = (outboxErrBreakdownQ.rows || []).map((b) => {
     const cleanErr = redactSensitiveText(b.err);
     const cls = classifyOutboxMirrorError(cleanErr, 0);
@@ -1556,30 +1705,53 @@ async function collectSyncHealth(
   }));
 
   const rgCp = checkpoints.find((c) => /rental_gate/i.test(c.source));
-  const sheetsCp = checkpoints.find((c) => /sheet|gas|apps_script/i.test(c.source));
+  const sheetsCp = checkpoints.find((c) => c.source === 'google_sheets_mirror') || checkpoints.find((c) => /sheet|gas|apps_script/i.test(c.source));
+  const gasSheetsCp = checkpoints.find((c) => c.source === 'google_apps_script_sheets');
   const gasAuthCp = checkpoints.find((c) => c.source === 'google_apps_script_auth');
+  const outboxAuthCp = checkpoints.find((c) => c.source === 'google_apps_script_outbox_auth');
+  const outboxReceiptCp = checkpoints.find((c) => c.source === 'google_apps_script_outbox_receipt');
+  const frozenProtectionCp = checkpoints.find((c) => c.source === 'google_apps_script_frozen_protection');
   const lastSuccessLog = logs.find((l) => l.status === 'success');
   const lastOutboxRow = lastOutboxSentQ.rows?.[0];
   const lastOutboxSentAt = lastOutboxRow?.sent_at instanceof Date
     ? lastOutboxRow.sent_at.toISOString()
     : (lastOutboxRow?.updated_at instanceof Date ? lastOutboxRow.updated_at.toISOString() : str(lastOutboxRow?.sent_at || lastOutboxRow?.updated_at));
+  const lastUpsertRow = lastUpsertQ.rows?.[0] || null;
+  const lastUpsertAt = lastUpsertRow?.sent_at instanceof Date
+    ? lastUpsertRow.sent_at.toISOString()
+    : (str(lastUpsertRow?.sent_at) || str((sheetsCp?.meta as any)?.lastSuccessfulUpsertAt || (gasSheetsCp?.meta as any)?.lastSuccessfulUpsertAt));
   const oldestUnsyncedIso = ob.oldest_unsynced_at instanceof Date
     ? ob.oldest_unsynced_at.toISOString()
     : str(ob.oldest_unsynced_at);
+  const oldestPendingIso = ob.oldest_pending_at instanceof Date
+    ? ob.oldest_pending_at.toISOString()
+    : (str(ob.oldest_pending_at) || oldestUnsyncedIso);
   const oldestUnsyncedAgeMinutes = oldestUnsyncedIso
     ? Math.max(0, Math.round((Date.now() - new Date(oldestUnsyncedIso).getTime()) / 60000))
     : 0;
+  const lastErrorAtIso = ob.last_error_at instanceof Date ? ob.last_error_at.toISOString() : str(ob.last_error_at);
+  const lastSuccessfulMirrorWrite = lastOutboxSentAt || sheetsCp?.lastSuccessfulAt || '';
 
   const lastSuccessBySource = {
     rentalGateApi: rgCp?.lastSuccessfulAt || (w?.last_success_at instanceof Date ? w.last_success_at.toISOString() : str(w?.last_success_at)) || lastSuccessLog?.finishedAt || '',
     neonPostgres: lastSuccessLog?.finishedAt || (w?.last_success_at instanceof Date ? w.last_success_at.toISOString() : str(w?.last_success_at)) || '',
-    googleAppsScriptSheets: sheetsCp?.lastSuccessfulAt || lastOutboxSentAt || ''
+    googleAppsScriptSheets: lastSuccessfulMirrorWrite
   };
 
   const failedOutbox = num(ob.failed_cnt, 0);
+  const retryOutbox = num(ob.retry_cnt, 0);
+  const retryWithErrors = num(ob.retry_with_error_cnt, 0);
   const permanentFailedOutbox = num(ob.permanent_failed_cnt, 0);
   const processingOutbox = num(ob.processing_cnt, 0);
-  const pendingOutbox = num(ob.pending_cnt, 0) + num(ob.retry_cnt, 0) + processingOutbox;
+  const pendingOnlyOutbox = num(ob.pending_cnt, 0);
+  const pendingOutbox = pendingOnlyOutbox + retryOutbox + processingOutbox;
+  const quarantinedBulkOutbox = num(ob.quarantined_bulk_cnt, 0);
+  const missingIdempotencyCnt = num(ob.missing_idempotency_cnt, 0);
+  const missingIdempotencyTotalCnt = Math.max(missingIdempotencyCnt, num((ob as any).missing_idempotency_total_cnt, 0));
+  const staleProcessingCnt = num(ob.stale_processing_cnt, 0);
+  const timeoutCount = num(outboxCategoryCounts.timeout, 0);
+  const frozenRowsErrorCount = num(outboxCategoryCounts.sheet_frozen, 0);
+  const activeAuthErrors = num(outboxCategoryCounts.auth, 0);
   const consecutiveErrors = num(w?.consecutive_errors, 0);
   const lastLog = logs[0] || null;
   const lastSyncFailed = lastLog && lastLog.status !== 'success';
@@ -1593,23 +1765,53 @@ async function collectSyncHealth(
   );
   const rgAuthFailedLive = liveChecks.rentalGateAuth?.authValid === false;
   const gasAuthFailedLive = liveChecks.gasMirrorAuth?.authValid === false;
+  const liveOutboxAuthValid: boolean | null = outboxAuthCp?.lastStatus === 'ok'
+    ? true
+    : (outboxAuthCp?.lastStatus === 'error' ? false : null);
+  // Critical requirement: NEVER treat active Outbox auth errors as resolved merely because verifyMirrorAuth succeeded
+  const actualOutboxAuthValid: boolean | null = activeAuthErrors > 0 || outboxAuthCp?.lastStatus === 'error'
+    ? false
+    : (outboxAuthCp?.lastStatus === 'ok' || lastSuccessfulMirrorWrite
+      ? true
+      : (typeof liveChecks.gasMirrorAuth?.authValid === 'boolean' ? liveChecks.gasMirrorAuth.authValid : null));
+  const directAuthValid: boolean | null = typeof liveChecks.gasMirrorAuth?.authValid === 'boolean'
+    ? liveChecks.gasMirrorAuth.authValid
+    : (gasAuthCp?.lastStatus === 'ok' ? true : (gasAuthCp?.lastStatus === 'error' ? false : null));
+  const actualFrozenTestPassed: boolean | null = (frozenProtectionCp?.meta as any)?.actualFrozenRowsTestPassed === true
+    ? true
+    : (frozenProtectionCp?.lastStatus === 'ok'
+      ? true
+      : (frozenProtectionCp?.lastStatus === 'error' ? false : null));
+  const protectedModeEnabled = actualFrozenTestPassed === true
+    ? true
+    : (frozenRowsErrorCount === 0 && actualFrozenTestPassed !== false);
   const deploySkewWarning = liveChecks.gasMirrorAuth?.legacyGasScript
     ? str(liveChecks.gasMirrorAuth.message)
     : (gasAuthCp && gasAuthCp.lastStatus === 'warning' && /قديمة|verifyMirrorAuth/i.test(gasAuthCp.lastError)
       ? gasAuthCp.lastError
       : '');
+  const outboxLeaseRow = outboxLeaseQ.rows?.[0] || null;
 
   let status: HealthStatus = 'healthy';
   if (
     consecutiveErrors >= 3 ||
     (lastSyncFailed && !w?.last_success_at) ||
     rgAuthFailedLive ||
-    (gasAuthFailedLive && permanentFailedOutbox > 0)
+    actualFrozenTestPassed === false ||
+    liveOutboxAuthValid === false ||
+    (gasAuthFailedLive && (permanentFailedOutbox > 0 || failedOutbox > 0)) ||
+    (activeAuthErrors > 0 && liveOutboxAuthValid !== true)
   ) {
     status = 'critical';
   } else if (
     failedOutbox > 0 ||
+    retryWithErrors > 0 ||
+    activeAuthErrors > 0 ||
+    actualOutboxAuthValid === false ||
+    frozenRowsErrorCount > 0 ||
+    processingOutbox > 0 ||
     pendingOutbox > 20 ||
+    missingIdempotencyTotalCnt > 0 ||
     consecutiveErrors > 0 ||
     lastSyncFailed ||
     missingMirrorSecretWithQueue ||
@@ -1633,7 +1835,7 @@ async function collectSyncHealth(
 
   const syncErrorCategory = rgAuthFailedLive
     ? 'rg_auth'
-    : (gasAuthFailedLive
+    : (gasAuthFailedLive || activeAuthErrors > 0
       ? 'gas_auth'
       : (/401|403|NO_RG_TOKEN|Token is malformed/i.test(latestSyncFailureMsg)
         ? 'rg_auth'
@@ -1641,17 +1843,157 @@ async function collectSyncHealth(
           ? 'gas_auth'
           : (permanentFailedOutbox > 0
             ? 'outbox_permanent'
-            : (failedOutbox > 0 ? 'outbox_retry' : (consecutiveErrors > 0 ? 'worker_sync' : 'none'))))));
+            : ((failedOutbox > 0 || retryWithErrors > 0) ? 'outbox_retry' : (consecutiveErrors > 0 ? 'worker_sync' : 'none'))))));
 
   const syncRecommendedAction = rgAuthFailedLive || /401|403|NO_RG_TOKEN|Token is malformed/i.test(latestSyncFailureMsg)
     ? 'حدّث RG_TOKEN في متغيرات البيئة (Vercel) وScript Properties وتأكد من عدم وجود مسافات أو علامات اقتباس أو تكرار Bearer.'
     : (gasAuthFailedLive || /UNAUTHORIZED|SYNC_API_SECRET/i.test(latestSyncFailureMsg)
       ? 'طابِق SYNC_API_SECRET بين Backend (Vercel/.env) وGoogle Apps Script (Script Properties) وأعد نشر GAS قبل إعادة محاولة Outbox.'
-      : (failedOutbox > 0
+      : ((failedOutbox > 0 || retryWithErrors > 0)
         ? 'راجع تصنيف أخطاء Outbox الفاشلة وتحقق من مصادقة GAS ثم أعد المعالجة على دفعات صغيرة آمنة.'
         : (deploySkewWarning || (hasSecretFormattingWarning
           ? 'يحتوي توكن أو مفتاح المزامنة على مسافات أو علامات اقتباس في البيئة — يتم تنظيفه تلقائياً لكن يُنصح بتنظيف القيمة المخزنة.'
           : ''))));
+
+  // Explicit 10-Point Developer Verification Checks
+  const gasConfigured = Boolean(serverCfg.gasWebAppUrl && syncSecretDiag.configured);
+  const gasVersionStr = str(liveChecks.gasMirrorAuth?.diagnostics?.deploymentVersion || (gasAuthCp?.meta as any)?.deploymentVersion || (sheetsCp?.meta as any)?.gasScriptVersion);
+  const checkpointCursor = str(sheetsCp?.lastCursor || gasSheetsCp?.lastCursor);
+  const tenPointChecks: Array<{
+    key: string;
+    number: number;
+    title: string;
+    status: 'healthy' | 'warning' | 'critical';
+    summary: string;
+    recommendation: string;
+    metrics: Record<string, any>;
+  }> = [
+    {
+      key: 'outbox_queue_health',
+      number: 1,
+      title: 'Outbox Queue Health',
+      status: failedOutbox > 0 || staleProcessingCnt > 0 ? 'critical' : (pendingOutbox > 20 || retryWithErrors > 0 ? 'warning' : 'healthy'),
+      summary: `pending=${pendingOnlyOutbox} · processing=${processingOutbox} · retry=${retryOutbox} · dead_letter=${failedOutbox} · completed=${num(ob.sent_cnt, 0)}`,
+      recommendation: failedOutbox > 0 ? 'أعد معالجة السجلات الفاشلة تدريجياً بدفعة 8–10 بعد التأكد من المصادقة.' : '',
+      metrics: { pending: pendingOnlyOutbox, processing: processingOutbox, retry: retryOutbox, completed: num(ob.sent_cnt, 0), deadLetter: failedOutbox, oldestUnsyncedAgeMinutes }
+    },
+    {
+      key: 'outbox_retry_health',
+      number: 2,
+      title: 'Outbox Retry Health',
+      status: permanentFailedOutbox > 0 ? 'critical' : (retryWithErrors > 0 || timeoutCount > 0 ? 'warning' : 'healthy'),
+      summary: `أخطاء مؤقتة لإعادة المحاولة=${retryWithErrors} · dead_letter=${failedOutbox} · محاولات إجمالية=${num(ob.failed_attempts_cnt, 0)} (Exponential Backoff + Jitter مفعل)`,
+      recommendation: timeoutCount > 0 ? 'شغّل وضع استرداد مهلة التنفيذ (دفعة 8 ثم التراجع التدريجي).' : '',
+      metrics: { retryWithErrors, deadLetter: failedOutbox, permanentFailed: permanentFailedOutbox, failedAttempts: num(ob.failed_attempts_cnt, 0), timeoutCount }
+    },
+    {
+      key: 'outbox_auth_health',
+      number: 3,
+      title: 'Outbox Authentication Health',
+      status: actualOutboxAuthValid === false || directAuthValid === false ? 'critical' : (directAuthValid === true && !lastSuccessfulMirrorWrite && pendingOutbox > 0 ? 'warning' : 'healthy'),
+      summary: `Direct Auth=${directAuthValid === true ? 'صالح' : (directAuthValid === false ? 'فاشل' : 'غير مختبر')} · Live Outbox Auth=${liveOutboxAuthValid === true ? 'صالح' : (liveOutboxAuthValid === false ? 'مرفوض' : 'بانتظار اختبار')} · Historical Auth DeadLetter=${activeAuthErrors}`,
+      recommendation: activeAuthErrors > 0
+        ? (liveOutboxAuthValid === true
+          ? 'مصادقة Outbox الحية ناجحة الآن — أعد معالجة أخطاء المصادقة التاريخية تدريجياً بدفعة 8.'
+          : 'ما زالت هناك عمليات Outbox مرفوضة بـ UNAUTHORIZED — شغّل الاختبار الثلاثي الحقيقي عبر Outbox للتحقق من المسار الحي.')
+        : (directAuthValid === true && !lastUpsertAt ? 'شغّل الاختبار الثلاثي الحقيقي للتأكد من مسار POST الكامل.' : ''),
+      metrics: { directAuthValid, actualOutboxAuthValid, liveOutboxAuthValid, activeAuthErrors, envVsDbConflict: Boolean((syncSecretDiag as any).envVsDbConflict), envVsDbUrlConflict: Boolean(gasFlowDiag?.gasUrl?.envVsDbConflict) }
+    },
+    {
+      key: 'sheets_mirror_health',
+      number: 4,
+      title: 'Sheets Mirror Health',
+      status: !gasConfigured || Boolean(deploySkewWarning) || gasAuthFailedLive ? 'critical' : (frozenRowsErrorCount > 0 || num(ob.failed_cnt, 0) > 0 ? 'warning' : 'healthy'),
+      summary: `مضبوط=${gasConfigured ? 'نعم' : 'لا'} · إصدار GAS=${gasVersionStr || 'غير محدد'} · آخر كتابة=${lastSuccessfulMirrorWrite || 'لا توجد'}`,
+      recommendation: !gasConfigured ? 'اضبط GAS_WEBAPP_URL و SYNC_API_SECRET في الإعدادات.' : (deploySkewWarning || ''),
+      metrics: { configured: gasConfigured, gasScriptVersion: gasVersionStr, lastSuccessfulMirrorWrite }
+    },
+    {
+      key: 'frozen_rows_protection',
+      number: 5,
+      title: 'Frozen Rows Protection',
+      status: actualFrozenTestPassed === false ? 'critical' : (frozenRowsErrorCount > 0 ? (actualFrozenTestPassed === true ? 'warning' : 'critical') : (actualFrozenTestPassed === true ? 'healthy' : 'warning')),
+      summary: actualFrozenTestPassed === true
+        ? `protectedMode=true (تم التحقق باختبار GAS الفعلي) · أخطاء تاريخية=${frozenRowsErrorCount}`
+        : (frozenRowsErrorCount > 0
+          ? `protectedMode=false · تم رصد ${frozenRowsErrorCount} خطأ صفوف مجمدة (non-frozen rows) — أعد نشر Database.gs وNeonSync.gs وشغّل اختبار الحماية الفعلي`
+          : 'شغّل اختبار حماية الصفوف المجمدة الفعلي (verifyFrozenRowsProtection) للتحقق من protectedMode.'),
+      recommendation: actualFrozenTestPassed === true && frozenRowsErrorCount > 0
+        ? 'نجح الاختبار الفعلي لحماية الصفوف المجمدة — يمكنك إعادة معالجة فئة الصفوف المجمدة تدريجياً (دفعة 8).'
+        : (frozenRowsErrorCount > 0 ? 'حدّث Google Apps Script وشغّل اختبار حماية الصفوف المجمدة الفعلي قبل إعادة المعالجة.' : ''),
+      metrics: {
+        frozenRowsErrorCount,
+        protectedMode: protectedModeEnabled,
+        actualFrozenTestPassed,
+        deleteRowCallsBlocked: Boolean((frozenProtectionCp?.meta as any)?.deleteRowCallsBlocked ?? (actualFrozenTestPassed === true)),
+        checkedAt: str(frozenProtectionCp?.lastSyncAt || '')
+      }
+    },
+    {
+      key: 'full_refresh_safety',
+      number: 6,
+      title: 'Full Refresh Safety',
+      status: quarantinedBulkOutbox > 0 ? 'warning' : 'healthy',
+      summary: quarantinedBulkOutbox > 0
+        ? `تم عزل ${quarantinedBulkOutbox} عملية deleteAllReservations ومنعها تلقائياً من المسح الشامل لـ Google Sheets.`
+        : 'عمليات deleteAllReservations التلقائية محظورة نهائياً؛ المزامنة تدريجية بالمعرف الثابت فقط وNeon محمي كمصدر حقيقة.',
+      recommendation: quarantinedBulkOutbox > 0 ? 'السجلات المعزولة تبقى محفوظة في dead_letter للتوثيق دون تنفيذ أو حذف Neon.' : '',
+      metrics: { bulkDeleteBlocked: true, quarantinedBulkCount: quarantinedBulkOutbox, incrementalUpsertOnly: true }
+    },
+    {
+      key: 'batch_processing_health',
+      number: 7,
+      title: 'Batch Processing Health',
+      status: staleProcessingCnt > 0 || timeoutCount > 3 ? 'warning' : 'healthy',
+      summary: `حجم الدفعة الآمن=8 (بحد أقصى 10) · أخطاء Timeout=${timeoutCount} · أقفال عالقة=${staleProcessingCnt} · قفل عامل=${outboxLeaseRow?.is_syncing ? 'نشط' : 'جاهز'}`,
+      recommendation: timeoutCount > 0 ? 'التنفيذ يحترم ميزانية الوقت (22s) ويفحص إيصال GAS قبل إعادة المحاولة.' : '',
+      metrics: { defaultBatchSize: 8, maxBatchSize: 10, timeoutCount, staleProcessingCnt, activeLease: Boolean(outboxLeaseRow?.is_syncing) }
+    },
+    {
+      key: 'checkpoint_recovery_health',
+      number: 8,
+      title: 'Checkpoint Recovery Health',
+      status: gasSheetsCp?.lastStatus === 'error' || sheetsCp?.lastStatus === 'error' ? 'warning' : 'healthy',
+      summary: `نقطة الاستكمال Cursor=${checkpointCursor || 'بداية الطابور'} · آخر دفعة=${num(sheetsCp?.lastBatchCount ?? gasSheetsCp?.lastBatchCount, 0)} سجل`,
+      recommendation: gasSheetsCp?.lastStatus === 'error' ? 'المؤشر محفوظ لآخر دفعة ناجحة وسيستكمل المعالجة دون تكرار.' : '',
+      metrics: { lastCursor: checkpointCursor, lastBatchCount: num(sheetsCp?.lastBatchCount ?? gasSheetsCp?.lastBatchCount, 0), lastStatus: str(sheetsCp?.lastStatus || gasSheetsCp?.lastStatus || 'idle') }
+    },
+    {
+      key: 'duplicate_prevention',
+      number: 9,
+      title: 'Duplicate Prevention',
+      status: missingIdempotencyTotalCnt > 0 ? 'warning' : 'healthy',
+      summary: `Idempotency Key نشط (ناقص نشط=${missingIdempotencyCnt} · إجمالي ناقص=${missingIdempotencyTotalCnt}) + قفل موزّع + فحص إيصال GAS قبل الإرسال وبعد AbortError.`,
+      recommendation: missingIdempotencyTotalCnt > 0 ? 'اضغط "إكمال مفاتيح Idempotency الناقصة" لملء المفاتيح القديمة بأمان دون تغيير retry_count.' : '',
+      metrics: { missingIdempotencyCnt, missingIdempotencyTotalCnt, receiptVerificationEnabled: true, uniqueKey: 'reservationNumber' }
+    },
+    {
+      key: 'last_successful_upsert',
+      number: 10,
+      title: 'Last Successful Upsert',
+      status: lastUpsertAt ? 'healthy' : (gasConfigured ? 'warning' : 'critical'),
+      summary: lastUpsertAt
+        ? `آخر upsertReservation ناجح: ${lastUpsertAt}${lastUpsertRow?.entity_id ? ` · الحجز=${str(lastUpsertRow.entity_id)}` : ''}${lastUpsertRow?.correlation_id ? ` · ${str(lastUpsertRow.correlation_id)}` : ''}`
+        : 'لم يُسجّل بعد تنفيذ upsertReservation ناجح ومكتمل عبر Outbox — نفّذ اختبار Upsert الحقيقي الآن.',
+      recommendation: !lastUpsertAt ? 'اضغط زر "اختبار Upsert حقيقي عبر Outbox" للتحقق من المسار الكامل.' : '',
+      metrics: {
+        lastSuccessfulUpsertAt: lastUpsertAt,
+        outboxId: str(lastUpsertRow?.id),
+        entityId: str(lastUpsertRow?.entity_id),
+        correlationId: str(lastUpsertRow?.correlation_id)
+      }
+    }
+  ];
+  const checksMap: Record<string, (typeof tenPointChecks)[number]> = {};
+  for (const item of tenPointChecks) {
+    checksMap[item.key] = item;
+  }
+  const tenPointSummary = {
+    total: tenPointChecks.length,
+    healthy: tenPointChecks.filter((c) => c.status === 'healthy').length,
+    warning: tenPointChecks.filter((c) => c.status === 'warning').length,
+    critical: tenPointChecks.filter((c) => c.status === 'critical').length
+  };
 
   return {
     status,
@@ -1661,6 +2003,16 @@ async function collectSyncHealth(
     deploySkewWarning,
     lastSuccessBySource,
     lastSuccessfulCheck: lastSuccessBySource.rentalGateApi || lastSuccessBySource.neonPostgres || '',
+    lastSuccessfulUpsert: {
+      at: lastUpsertAt,
+      outboxId: str(lastUpsertRow?.id),
+      entityId: str(lastUpsertRow?.entity_id),
+      correlationId: str(lastUpsertRow?.correlation_id),
+      batchId: str(lastUpsertRow?.batch_id)
+    },
+    tenPointChecks,
+    tenPointSummary,
+    checks: checksMap,
     latestFailure: latestSyncFailureMsg
       ? {
           message: redactSensitiveText(latestSyncFailureMsg),
@@ -1680,9 +2032,50 @@ async function collectSyncHealth(
       source: syncSecretDiag.source,
       length: num(syncSecretDiag.length, 0),
       hasEnvWhitespace: Boolean(syncSecretDiag.hasEnvWhitespace),
+      hasLeadingOrTrailingWhitespace: Boolean((syncSecretDiag as any).hasLeadingOrTrailingWhitespace),
+      hasNewlines: Boolean((syncSecretDiag as any).hasNewlines),
+      hasInvisibleChars: Boolean((syncSecretDiag as any).hasInvisibleChars),
       hasQuotes: Boolean(syncSecretDiag.hasQuotes),
-      hasWhitespace: Boolean(syncSecretDiag.hasWhitespace)
+      hasWhitespace: Boolean(syncSecretDiag.hasWhitespace),
+      dbDecryptFailed: Boolean((syncSecretDiag as any).dbDecryptFailed),
+      envVsDbConflict: Boolean((syncSecretDiag as any).envVsDbConflict)
     },
+    gasAuthFlowDiagnostics: gasFlowDiag,
+    gasAuthTelemetry: (() => {
+      const liveGas = liveChecks.gasMirrorAuth;
+      const liveDiag = liveGas?.diagnostics || {};
+      const liveGasInner = liveDiag?.gasDiagnostics || {};
+      const cpMeta = (gasAuthCp as any)?.meta || {};
+      const cpInner = cpMeta?.gasDiagnostics || {};
+      return {
+        correlationId: str(liveGas?.correlationId || liveDiag?.correlationId || liveGasInner?.correlationId || cpMeta?.correlationId),
+        gasScriptVersion: str(liveDiag?.deploymentVersion || liveGasInner?.gasScriptVersion || cpMeta?.deploymentVersion || cpInner?.gasScriptVersion),
+        deploymentIdHint: str(liveDiag?.deploymentIdHint || gasFlowDiag?.gasUrl?.deploymentIdHint || cpMeta?.deploymentIdHint),
+        authSource: str(liveDiag?.authSource || gasFlowDiag?.secret?.source || cpMeta?.authSource || syncSecretDiag.source),
+        receivedVia: str(liveDiag?.receivedVia || liveGasInner?.receivedVia || cpMeta?.receivedVia || cpInner?.receivedVia),
+        requestMethod: str(liveDiag?.requestMethod || liveGasInner?.requestMethod || cpMeta?.requestMethod || 'POST'),
+        secretMatch: typeof liveDiag?.secretMatch === 'boolean'
+          ? liveDiag.secretMatch
+          : (typeof liveGasInner?.secretMatch === 'boolean'
+            ? liveGasInner.secretMatch
+            : (typeof cpMeta?.secretMatch === 'boolean' ? cpMeta.secretMatch : null)),
+        httpStatus: num(liveDiag?.httpStatus ?? liveGas?.statusCode ?? cpMeta?.httpStatus, 0),
+        runtimePlatform: str(gasFlowDiag?.environment?.runtimePlatform || (gasFlowDiag?.environment?.isVercel ? 'vercel' : 'local')),
+        vercelEnv: str(gasFlowDiag?.environment?.vercelEnv || 'local'),
+        region: str(gasFlowDiag?.environment?.region)
+      };
+    })(),
+    lastFailedSync: latestSyncFailureMsg
+      ? {
+          at: (w?.last_run_at instanceof Date ? w.last_run_at.toISOString() : str(w?.last_run_at)) ||
+            lastLog?.finishedAt ||
+            outboxRecentErrors[0]?.updatedAt ||
+            syncCheckedAt,
+          error: redactSensitiveText(latestSyncFailureMsg),
+          category: syncErrorCategory,
+          correlationId: str(liveChecks.gasMirrorAuth?.correlationId || (gasAuthCp as any)?.meta?.correlationId)
+        }
+      : null,
     rgTokenDiagnostics: {
       configured: Boolean(rgTokenDiag.configured),
       source: rgTokenDiag.source,
@@ -1715,13 +2108,90 @@ async function collectSyncHealth(
     outbox: {
       total: num(ob.total_cnt, 0),
       sent: num(ob.sent_cnt, 0),
-      pending: num(ob.pending_cnt, 0),
+      completed: num(ob.sent_cnt, 0),
+      pending: pendingOnlyOutbox,
       processing: processingOutbox,
-      retry: num(ob.retry_cnt, 0),
+      retry: retryOutbox,
+      retryWithErrors,
       failed: failedOutbox,
+      deadLetter: failedOutbox,
       permanentFailed: permanentFailedOutbox,
+      quarantinedBulkDelete: quarantinedBulkOutbox,
+      failedAttemptsCount: num(ob.failed_attempts_cnt, 0),
+      pendingRetriesCount: pendingOnlyOutbox + retryOutbox,
+      lifecycle: {
+        pending: pendingOnlyOutbox,
+        processing: processingOutbox,
+        retry: retryOutbox,
+        completed: num(ob.sent_cnt, 0),
+        deadLetter: failedOutbox
+      },
+      lastErrorAt: lastErrorAtIso,
+      lastFailedMirrorWrite: lastErrorAtIso,
+      lastSuccessAt: lastOutboxSentAt,
+      lastSuccessfulMirrorWrite,
+      lastSuccessfulUpsertAt: lastUpsertAt,
+      lastCursor: checkpointCursor,
       oldestUnsyncedAt: oldestUnsyncedIso,
+      oldestPendingAt: oldestPendingIso,
       oldestUnsyncedAgeMinutes,
+      lastDurationMs: num((sheetsCp?.meta as any)?.durationMs || (sheetsCp?.meta as any)?.lastDurationMs || w?.last_duration_ms, 0),
+      unknownErrorCount: num(outboxCategoryCounts.unknown, 0),
+      timeoutCount,
+      frozenRowsErrorCount,
+      validationErrorCount: num(outboxCategoryCounts.validation, 0),
+      authErrorCount: activeAuthErrors,
+      missingIdempotencyKeys: missingIdempotencyTotalCnt,
+      missingIdempotencyActive: missingIdempotencyCnt,
+      recoveryProgress: {
+        total: num(ob.total_cnt, 0),
+        completed: num(ob.sent_cnt, 0),
+        pending: pendingOnlyOutbox,
+        processing: processingOutbox,
+        retry: retryOutbox,
+        deadLetter: failedOutbox,
+        quarantinedBulkDelete: quarantinedBulkOutbox,
+        recoverableRemaining: Math.max(0, pendingOutbox + failedOutbox - quarantinedBulkOutbox),
+        completionPercent: num(ob.total_cnt, 0) > 0 ? Math.round((num(ob.sent_cnt, 0) / num(ob.total_cnt, 0)) * 100) : 100
+      },
+      frozenRowsProtection: {
+        protectedMode: protectedModeEnabled,
+        actualTestPassed: actualFrozenTestPassed,
+        frozenRowsErrorCount,
+        deleteRowCallsBlocked: Boolean((frozenProtectionCp?.meta as any)?.deleteRowCallsBlocked ?? (actualFrozenTestPassed === true)),
+        checkedAt: str(frozenProtectionCp?.lastSyncAt || ''),
+        correlationId: str((frozenProtectionCp?.meta as any)?.correlationId || ''),
+        gasScriptVersion: str((frozenProtectionCp?.meta as any)?.gasScriptVersion || gasVersionStr)
+      },
+      lastSuccessfulGasReceipt: {
+        at: str((outboxReceiptCp?.meta as any)?.receiptAt || outboxReceiptCp?.lastSuccessfulAt || lastSuccessfulMirrorWrite),
+        correlationId: str((outboxReceiptCp?.meta as any)?.correlationId || (sheetsCp?.meta as any)?.correlationId),
+        batchId: str((outboxReceiptCp?.meta as any)?.batchId || (sheetsCp?.meta as any)?.batchId),
+        gasScriptVersion: str((outboxReceiptCp?.meta as any)?.gasScriptVersion || gasVersionStr),
+        receiptCount: num((outboxReceiptCp?.meta as any)?.receiptCount || outboxReceiptCp?.lastBatchCount, 0),
+        protectedMode: Boolean((outboxReceiptCp?.meta as any)?.protectedMode)
+      },
+      directGasAuth: {
+        valid: directAuthValid,
+        message: str(liveChecks.gasMirrorAuth?.message || gasAuthCp?.lastError)
+      },
+      actualOutboxAuth: {
+        valid: actualOutboxAuthValid,
+        liveValid: liveOutboxAuthValid,
+        activeAuthErrors,
+        historicalBacklogCount: activeAuthErrors,
+        lastSuccessfulMirrorWrite,
+        lastCheckedAt: str(outboxAuthCp?.lastSyncAt || ''),
+        authSource: str((outboxAuthCp?.meta as any)?.authSource || gasFlowDiag?.secret?.source || syncSecretDiag.source),
+        gasUrlSource: str((outboxAuthCp?.meta as any)?.gasUrlSource || gasFlowDiag?.gasUrl?.source),
+        lastError: redactSensitiveText(
+          (outboxCategoryBreakdown.find((c) => c.category === 'auth')?.sampleError) ||
+          (outboxAuthCp?.lastStatus === 'error' ? outboxAuthCp.lastError : '') ||
+          (sheetsCp?.lastStatus === 'failed' ? sheetsCp.lastError : '')
+        ),
+        correlationId: str((outboxAuthCp?.meta as any)?.correlationId || (sheetsCp?.meta as any)?.correlationId || (gasAuthCp?.meta as any)?.correlationId)
+      },
+      categoryCounts: outboxCategoryCounts,
       errorBreakdown: outboxBreakdown,
       categoryBreakdown: outboxCategoryBreakdown,
       recentErrors: outboxRecentErrors
@@ -1786,6 +2256,13 @@ function inferAffectedServiceAndFix(context: string, action: string, msg: string
       fix: 'حدّث Database.gs وReservations.gs لحماية الصفوف المجمدة واستخدام clearContent() قبل أي حذف.'
     };
   }
+  if (/AbortError|TimeoutError|LOCK_TIMEOUT_RECOVERED|operation was aborted|This operation was aborted|ETIMEDOUT|\btimeout\b/i.test(combined)) {
+    return {
+      category: 'timeout',
+      service: 'Google Apps Script / Outbox',
+      fix: 'تم إيقاف العملية بسبب مهلة التنفيذ — قلّل حجم الدفعة (8–10) وأعد المعالجة التدريجية مع التراجع الأسي.'
+    };
+  }
   if (/inconsistent types deduced|parameter \$\d+|25P02|sql|postgres|syntax error/i.test(combined)) {
     return {
       category: 'sql_parameter',
@@ -1841,16 +2318,24 @@ export function buildHealthErrorDigest(
 
   // 1. Outbox failures (always ACTIVE until outbox rows leave failed/retry)
   const catStats: any[] = Array.isArray(syH?.outbox?.categoryBreakdown) ? syH.outbox.categoryBreakdown : [];
+  const normalizeOutboxDigestCategory = (rawCat: string, inferredCat: string) => {
+    if (rawCat === 'auth') return 'gas_auth';
+    if (rawCat === 'unknown' || !rawCat) return inferredCat;
+    return rawCat;
+  };
   if (catStats.length > 0) {
     for (const c of catStats) {
-      const cat = str(c.category || 'unknown');
-      const info = inferAffectedServiceAndFix('outbox', cat, str(c.sampleError));
+      const sampleMsg = str(c.sampleError);
+      const cls = classifyOutboxMirrorError(sampleMsg, 0);
+      const rawCat = str(c.category || cls.category || 'unknown');
+      const effectiveCat = rawCat === 'unknown' ? cls.category : rawCat;
+      const info = inferAffectedServiceAndFix('outbox', effectiveCat, sampleMsg);
       pushGroup(activeMap, {
-        id: `ERR_OBX_${cat}`,
+        id: `ERR_OBX_${effectiveCat}`,
         bucket: 'active',
-        errorCategory: cat === 'unknown' ? info.category : cat,
+        errorCategory: normalizeOutboxDigestCategory(effectiveCat, info.category),
         affectedService: info.service,
-        sampleMessage: str(c.sampleError || 'OUTBOX_FAILED'),
+        sampleMessage: sampleMsg || 'OUTBOX_FAILED',
         occurrences: Math.max(1, num(c.count, 1)),
         firstSeenAt: str(c.firstSeenAt || nowIso),
         lastSeenAt: str(c.lastSeenAt || nowIso),
@@ -1860,11 +2345,13 @@ export function buildHealthErrorDigest(
     }
   } else if (Array.isArray(syH?.outbox?.errorBreakdown)) {
     for (const b of syH.outbox.errorBreakdown) {
-      const info = inferAffectedServiceAndFix('outbox', str(b.category), str(b.error));
+      const cls = classifyOutboxMirrorError(str(b.error), 0);
+      const effectiveCat = str(b.category || cls.category || 'unknown');
+      const info = inferAffectedServiceAndFix('outbox', effectiveCat, str(b.error));
       pushGroup(activeMap, {
         id: `ERR_OBX_BRK`,
         bucket: 'active',
-        errorCategory: str(b.category || info.category),
+        errorCategory: normalizeOutboxDigestCategory(effectiveCat, info.category),
         affectedService: info.service,
         sampleMessage: str(b.error),
         occurrences: Math.max(1, num(b.count, 1)),
@@ -1957,6 +2444,12 @@ export function buildHealthErrorDigest(
     });
   }
 
+  const hasActiveOutboxAuthErr = Number(syH?.outbox?.authErrorCount || 0) > 0 || syH?.outbox?.actualOutboxAuth?.valid === false;
+  const hasActiveOutboxFrozenErr = Number(syH?.outbox?.frozenRowsErrorCount || 0) > 0;
+  const isCategoryStillActive = (cat: string) =>
+    (cat === 'gas_auth' && hasActiveOutboxAuthErr) ||
+    (cat === 'sheet_frozen' && hasActiveOutboxFrozenErr);
+
   // 4. Sync logs & checkpoints
   const logs: any[] = Array.isArray(syH?.recentLogs) ? syH.recentLogs : [];
   const newestSuccessLogAt = str(logs.find((l) => l.status === 'success')?.finishedAt || lastRgSuccess);
@@ -1964,8 +2457,8 @@ export function buildHealthErrorDigest(
     if (!log || log.status === 'success') continue;
     const msg = str(log.errorMessage || `SYNC_${log.status}`);
     const logAt = str(log.finishedAt || log.startedAt || nowIso);
-    const isSupersededBySuccess = Boolean(newestSuccessLogAt && logAt && newestSuccessLogAt > logAt);
     const info = inferAffectedServiceAndFix('sync_log', log.status, msg);
+    const isSupersededBySuccess = !isCategoryStillActive(info.category) && Boolean(newestSuccessLogAt && logAt && newestSuccessLogAt > logAt);
     const bucket: 'active' | 'resolved' = isSupersededBySuccess ? 'resolved' : 'active';
     pushGroup(bucket === 'resolved' ? resolvedMap : activeMap, {
       id: `ERR_SYNCLOG_${str(log.id)}`,
@@ -1992,9 +2485,9 @@ export function buildHealthErrorDigest(
     const serviceSuccessAt = /Rental Gate/i.test(info.service)
       ? lastRgSuccess
       : (/Apps Script|Sheets|Outbox/i.test(info.service) ? lastGasSuccess : lastNeonSuccess);
-    const isResolvedBySuccess = Boolean(serviceSuccessAt && erAt && serviceSuccessAt > erAt);
+    const isResolvedBySuccess = !isCategoryStillActive(info.category) && Boolean(serviceSuccessAt && erAt && serviceSuccessAt > erAt);
     const erMs = Date.parse(erAt);
-    const isOldHistorical = Number.isFinite(erMs) && Date.now() - erMs > 24 * 60 * 60 * 1000;
+    const isOldHistorical = !isCategoryStillActive(info.category) && Number.isFinite(erMs) && Date.now() - erMs > 24 * 60 * 60 * 1000;
     const bucket: 'active' | 'historical' | 'resolved' = isResolvedBySuccess
       ? 'resolved'
       : (isOldHistorical ? 'historical' : 'active');
@@ -2139,7 +2632,8 @@ export async function runDatabaseHealthCenterScan(
     sections.data_integrity = await collectDataIntegritySection(executor, compareWithRg);
   }
   if (scope === 'all' || scope === 'sync_health') {
-    sections.sync_health = await collectSyncHealth(executor, { testLiveConnections });
+    const fetchFn = typeof payload.fetchFn === 'function' ? payload.fetchFn : undefined;
+    sections.sync_health = await collectSyncHealth(executor, { testLiveConnections, fetchFn });
   }
 
   const errorDigest = buildHealthErrorDigest(sections, new Date().toISOString());
@@ -2238,17 +2732,122 @@ export async function verifyGasMirrorAuthAction(
   return authResult;
 }
 
-export async function retryHealthCenterFailedSync(
+export async function probeGasSheetsMirrorAction(
   executor: DbExecutor,
   session: AuthSession,
   payload: Record<string, any> = {}
 ) {
   assertHealthCenterAccess(session);
+  const probeRes = await probeGasMirrorSafe(executor, { writeProbe: Boolean(payload.writeProbe) });
+  await logHealthCenterActivity(
+    executor,
+    session.user,
+    'فحص آمن لاتصال Google Sheets / GAS',
+    'google_apps_script_probe',
+    probeRes.message
+  );
+  return probeRes;
+}
+
+export async function testOutboxSingleUpsertAction(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {},
+  fetchFn: typeof fetch = fetch
+) {
+  assertHealthCenterAccess(session);
+  const res = await testOutboxSingleUpsert(
+    executor,
+    {
+      reservationNumber: str(payload.reservationNumber),
+      reservationId: str(payload.reservationId),
+      reservationPayload: payload.reservationPayload
+    },
+    fetchFn
+  );
+  await logHealthCenterActivity(
+    executor,
+    session.user,
+    'اختبار Upsert حقيقي عبر Outbox',
+    res.reservationNumber || res.entityId || res.outboxId || 'upsertReservation',
+    res.ok
+      ? `نجح Upsert عبر Outbox (${res.outboxId}) للحجز ${res.reservationNumber} · ${res.correlationId}`
+      : `فشل Upsert عبر Outbox (${res.outboxId || 'halted'}): ${res.errorMessage} · ${res.correlationId}`
+  );
+  return res;
+}
+
+export async function testOutboxThreeWaySuiteAction(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {},
+  fetchFn: typeof fetch = fetch
+) {
+  assertHealthCenterAccess(session);
+  const res = await testOutboxThreeWaySuite(
+    executor,
+    { verifyReceiptWithGas: payload.verifyReceiptWithGas !== false },
+    fetchFn
+  );
+  await logHealthCenterActivity(
+    executor,
+    session.user,
+    'اختبار Outbox الثلاثي الآمن (Reservation + FollowUp + Setting)',
+    res.correlationId || 'outbox_3way_test',
+    res.ok
+      ? `نجح الاختبار الثلاثي (sent=${res.sent} · receipts=${res.receiptVerifiedCount}/3 · cid=${res.correlationId})`
+      : `فشل الاختبار الثلاثي: ${res.errorMessage} · cid=${res.correlationId}`
+  );
+  return res;
+}
+
+export async function verifyGasFrozenRowsProtectionAction(
+  executor: DbExecutor,
+  session: AuthSession,
+  fetchFn: typeof fetch = fetch
+) {
+  assertHealthCenterAccess(session);
+  const res = await verifyGasFrozenRowsProtection(executor, fetchFn);
+  await logHealthCenterActivity(
+    executor,
+    session.user,
+    'اختبار حماية الصفوف المجمدة الفعلي في Google Apps Script',
+    res.correlationId || 'frozen_rows_protection',
+    res.message
+  );
+  return res;
+}
+
+export async function backfillOutboxIdempotencyKeysAction(
+  executor: DbExecutor,
+  session: AuthSession
+) {
+  assertHealthCenterAccess(session);
+  const res = await backfillMissingOutboxIdempotencyKeys(executor);
+  await logHealthCenterActivity(
+    executor,
+    session.user,
+    'إكمال مفاتيح Idempotency الناقصة في Outbox',
+    'outbox_idempotency_backfill',
+    `تم تحديث ${res.updatedCount} سجل · المتبقي الناقص: ${res.remainingMissingTotal}`
+  );
+  return res;
+}
+
+export async function retryHealthCenterFailedSync(
+  executor: DbExecutor,
+  session: AuthSession,
+  payload: Record<string, any> = {},
+  fetchFn: typeof fetch = fetch
+) {
+  assertHealthCenterAccess(session);
   const mode = str(payload.mode || 'outbox_transient').toLowerCase();
-  const limit = Math.min(25, Math.max(1, num(payload.limit || payload.batchSize, 15)));
+  const limit = mode === 'rg_missing_records'
+    ? Math.min(25, Math.max(1, num(payload.limit || payload.batchSize, 15)))
+    : Math.min(10, Math.max(1, num(payload.limit || payload.batchSize, 8)));
 
   if (mode === 'rg_missing_records') {
-    const syncRes = await retryFailedSyncRecords(executor, session.user, payload);
+    const syncRes = await retryFailedSyncRecords(executor, session.user, payload, fetchFn);
     await logHealthCenterActivity(
       executor,
       session.user,
@@ -2262,17 +2861,21 @@ export async function retryHealthCenterFailedSync(
   const cfg = await resolveServerConfig(executor).catch(() => ({ gasWebAppUrl: '', syncApiSecret: '' } as any));
   const gasConfigured = Boolean(str(cfg.gasWebAppUrl) && str(cfg.syncApiSecret));
 
-  if (gasConfigured || mode === 'outbox_batch' || mode === 'outbox_auth' || mode === 'outbox_sheet_frozen') {
+  if (gasConfigured || mode === 'outbox_batch' || mode === 'outbox_auth' || mode === 'outbox_sheet_frozen' || mode === 'outbox_timeout' || mode === 'outbox_validation') {
     const batchMode = mode === 'outbox_auth'
       ? 'auth'
       : (mode === 'outbox_sheet_frozen'
         ? 'sheet_frozen'
-        : (mode === 'outbox_all_failed' ? 'all' : 'transient'));
+        : (mode === 'outbox_timeout'
+          ? 'timeout'
+          : (mode === 'outbox_validation'
+            ? 'validation'
+            : (mode === 'outbox_all_failed' ? 'all' : 'transient'))));
     const batchRes = await reprocessFailedOutboxBatch(executor, {
       mode: batchMode,
       batchSize: limit,
       maxBatches: Math.min(5, Math.max(1, num(payload.maxBatches, 1)))
-    });
+    }, fetchFn);
     if (batchRes.haltedByAuth) {
       throw new Error(batchRes.authCheck?.message || 'UNAUTHORIZED: تعذر التحقق من SYNC_API_SECRET في Google Apps Script.');
     }
@@ -2290,16 +2893,19 @@ export async function retryHealthCenterFailedSync(
         sent: batchRes.sent,
         failed: batchRes.failed,
         skipped: false,
-        haltedByAuth: batchRes.haltedByAuth
+        haltedByAuth: batchRes.haltedByAuth,
+        haltedBySheetError: batchRes.haltedBySheetError
       },
       authCheck: batchRes.authCheck
     };
   }
 
-  // Fallback for offline/unit tests where GAS URL is not configured in DB settings
+  // Fallback for offline/unit tests where GAS URL is not configured in DB settings (bulk delete always excluded)
   const whereTransient = mode === 'outbox_all_failed'
-    ? `status IN ('failed', 'retry')`
-    : `status IN ('failed', 'retry') AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'`;
+    ? `status IN ('failed', 'dead_letter', 'retry') AND COALESCE(action, '') <> 'deleteAllReservations'`
+    : (mode === 'outbox_validation'
+      ? `status IN ('failed', 'dead_letter', 'retry') AND COALESCE(action, '') <> 'deleteAllReservations' AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|non-frozen|الصفوف المجمدة|QUARANTINED_BULK_DELETE|BLOCKED_BULK_DELETE|HTTP_401|HTTP_403'`
+      : `status IN ('failed', 'dead_letter', 'retry') AND COALESCE(action, '') <> 'deleteAllReservations' AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|GAS_AUTH_REQUIRED|GAS_FORBIDDEN|non-frozen|الصفوف المجمدة|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|QUARANTINED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'`);
 
   const resetQ = await executor.query<{ id: string }>(
     `WITH picked AS (
@@ -2310,7 +2916,7 @@ export async function retryHealthCenterFailedSync(
      )
      UPDATE sheets_mirror_outbox o
      SET status = 'pending',
-         retry_count = 0,
+         max_retries = GREATEST(COALESCE(o.max_retries, 8), COALESCE(o.retry_count, 0) + 3),
          next_retry_at = NOW(),
          locked_at = NULL,
          worker_id = '',

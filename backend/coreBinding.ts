@@ -226,7 +226,10 @@ export function isCoreFilesystemWritable(rootDir: string = process.cwd()): boole
   }
 }
 
-export function applyInMemoryServerConfig(cfg: FixedServerConfig): void {
+export function applyInMemoryServerConfig(
+  cfg: FixedServerConfig,
+  options: { clearMissingEnv?: boolean } = {}
+): void {
   FIXED_SERVER_CONFIG.mode = normalizeMode(cfg.mode);
   FIXED_SERVER_CONFIG.databaseUrl = sanitizeConfigToken(cfg.databaseUrl);
   FIXED_SERVER_CONFIG.gasWebAppUrl = sanitizeConfigToken(cfg.gasWebAppUrl);
@@ -236,17 +239,18 @@ export function applyInMemoryServerConfig(cfg: FixedServerConfig): void {
   FIXED_SERVER_CONFIG.updatedAt = String(cfg.updatedAt || '').trim();
   FIXED_SERVER_CONFIG.updatedBy = String(cfg.updatedBy || '').trim();
 
+  const clearMissing = options.clearMissingEnv === true;
   if (FIXED_SERVER_CONFIG.databaseUrl) process.env.DATABASE_URL = FIXED_SERVER_CONFIG.databaseUrl;
-  else delete process.env.DATABASE_URL;
+  else if (clearMissing) delete process.env.DATABASE_URL;
 
   if (FIXED_SERVER_CONFIG.gasWebAppUrl) process.env.GAS_WEBAPP_URL = FIXED_SERVER_CONFIG.gasWebAppUrl;
-  else delete process.env.GAS_WEBAPP_URL;
+  else if (clearMissing) delete process.env.GAS_WEBAPP_URL;
 
   if (FIXED_SERVER_CONFIG.rgToken) process.env.RG_TOKEN = FIXED_SERVER_CONFIG.rgToken;
-  else delete process.env.RG_TOKEN;
+  else if (clearMissing) delete process.env.RG_TOKEN;
 
   if (FIXED_SERVER_CONFIG.syncApiSecret) process.env.SYNC_API_SECRET = FIXED_SERVER_CONFIG.syncApiSecret;
-  else delete process.env.SYNC_API_SECRET;
+  else if (clearMissing) delete process.env.SYNC_API_SECRET;
 
   if (FIXED_SERVER_CONFIG.rgApiBaseUrl) {
     process.env.RG_API_BASE_URL = FIXED_SERVER_CONFIG.rgApiBaseUrl;

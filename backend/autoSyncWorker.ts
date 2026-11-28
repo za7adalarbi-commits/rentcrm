@@ -13,7 +13,8 @@ import {
   flushSheetsMirrorOutbox,
   pullFromRentalGateDirect,
   readWorkerStateRow,
-  recordWorkerSyncOutcome
+  recordWorkerSyncOutcome,
+  triggerGasIncrementalSyncAction
 } from './syncService.js';
 
 export interface AutoSyncCycleOptions {
@@ -212,29 +213,22 @@ export async function runAutoSyncCycle(
 
     // Legacy GAS Web App fallback when rgToken is empty but gasWebAppUrl is configured
     const startedIso = new Date(nowMs).toISOString();
-    const gasResp = await fetchFn(String(serverCfg.gasWebAppUrl), {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'triggerNeonIncrementalSync',
-        payload: { syncSecret: serverCfg.syncApiSecret || '', actor: SYSTEM_SYNC_ACTOR }
-      })
-    });
-    const text = await gasResp.text();
-    const parsed = JSON.parse(text);
-    if (!parsed?.success) {
-      throw new Error(parsed?.message || 'فشل تشغيل المزامنة عبر GAS.');
-    }
+    const gasData = await triggerGasIncrementalSyncAction(
+      executor,
+      SYSTEM_SYNC_ACTOR,
+      {},
+      fetchFn,
+      50000
+    );
     await recordWorkerSyncOutcome(executor, {
       triggerType: 'auto',
       startedAt: startedIso,
       finishedAt: new Date().toISOString(),
       durationMs: Date.now() - nowMs,
       ok: true,
-      importedCount: Number(parsed?.data?.importedCount || 0),
-      updatedCount: Number(parsed?.data?.updatedCount || 0),
-      extensionsCount: Number(parsed?.data?.extensionsCount || 0)
+      importedCount: Number(gasData?.importedCount || 0),
+      updatedCount: Number(gasData?.updatedCount || 0),
+      extensionsCount: Number(gasData?.extensionsCount || 0)
     });
     await flushSheetsMirrorOutbox(executor, fetchFn).catch(() => undefined);
     await emitSyncWorkerStatusRealtime(executor, 'syncWorkerCompleted').catch(() => undefined);
@@ -245,9 +239,9 @@ export async function runAutoSyncCycle(
       nextRunAt: updatedState?.next_run_at
         ? (updatedState.next_run_at instanceof Date ? updatedState.next_run_at.toISOString() : String(updatedState.next_run_at))
         : null,
-      importedCount: Number(parsed?.data?.importedCount || 0),
-      updatedCount: Number(parsed?.data?.updatedCount || 0),
-      extensionsCount: Number(parsed?.data?.extensionsCount || 0)
+      importedCount: Number(gasData?.importedCount || 0),
+      updatedCount: Number(gasData?.updatedCount || 0),
+      extensionsCount: Number(gasData?.extensionsCount || 0)
     };
   } catch (err: any) {
     const msg = String(err?.message || 'AUTO_SYNC_FAILED');
