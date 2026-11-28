@@ -1122,34 +1122,48 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
 
 function safeDeleteSheetRows_(sheet, startRow, numRows) {
   if (!sheet || !numRows || numRows <= 0) return;
-  var frozen = typeof sheet.getFrozenRows === 'function' ? Number(sheet.getFrozenRows() || 0) : 1;
+  var frozen = typeof sheet.getFrozenRows === 'function' ? Math.max(0, Number(sheet.getFrozenRows() || 0)) : 1;
+  var minKeepRow = frozen + 1;
+  var safeStart = Math.max(minKeepRow, Number(startRow || minKeepRow));
   var maxRows = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || 0) : Number(sheet.getLastRow() || 0);
   var lastRow = Number(sheet.getLastRow() || 0);
   var colCount = Math.max(1, Number(sheet.getLastColumn() || 1));
-  if (maxRows <= 0) maxRows = Math.max(lastRow, startRow + numRows - 1);
+  if (maxRows <= 0) maxRows = Math.max(lastRow, safeStart + numRows - 1);
 
-  if (maxRows - numRows <= frozen) {
-    var minKeepRow = frozen + 1;
-    var clearStart = Math.max(minKeepRow, startRow);
-    var clearCount = Math.min(numRows, Math.max(0, lastRow - clearStart + 1));
-    if (clearCount > 0) {
-      sheet.getRange(clearStart, 1, clearCount, colCount).clearContent().clearNote();
-    }
-    var extraToDelete = Math.max(0, maxRows - frozen - 1);
-    if (extraToDelete > 0) {
-      var delStart = Math.max(minKeepRow + 1, startRow);
-      var delCount = Math.min(extraToDelete, Math.max(0, maxRows - delStart + 1));
-      if (delCount > 0) {
-        sheet.deleteRows(delStart, delCount);
-      }
-    }
+  // Always clear content/notes safely first so caller semantics succeed even if physical row deletion is blocked
+  var clearCount = Math.min(numRows, Math.max(0, lastRow - safeStart + 1));
+  if (clearCount > 0 && typeof sheet.getRange === 'function') {
+    var clearedRange = sheet.getRange(safeStart, 1, clearCount, colCount);
+    if (typeof clearedRange.clearContent === 'function') clearedRange.clearContent();
+    if (typeof clearedRange.clearNote === 'function') clearedRange.clearNote();
+  }
+
+  // Never delete rows that would leave <= frozen rows in the sheet (keep >= 1 non-frozen row)
+  var maxDeletable = Math.max(0, maxRows - minKeepRow);
+  if (maxDeletable <= 0) {
     return;
   }
 
-  if (numRows === 1 && typeof sheet.deleteRow === 'function') {
-    sheet.deleteRow(startRow);
-  } else {
-    sheet.deleteRows(startRow, numRows);
+  var delStart = Math.max(minKeepRow + 1, safeStart);
+  var availableFromStart = Math.max(0, maxRows - delStart + 1);
+  var delCount = Math.min(numRows, maxDeletable, availableFromStart);
+  if (delCount <= 0) {
+    return;
+  }
+
+  try {
+    if (delCount === 1 && typeof sheet.deleteRow === 'function') {
+      sheet.deleteRow(delStart);
+    } else if (typeof sheet.deleteRows === 'function') {
+      sheet.deleteRows(delStart, delCount);
+    }
+  } catch (delErr) {
+    var msg = String(delErr && delErr.message ? delErr.message : delErr);
+    if (/non-frozen|delete all/i.test(msg)) {
+      // Content is already cleared safely above; never crash mirror sync over sheet minimum-row constraints
+      return;
+    }
+    throw delErr;
   }
 }
 

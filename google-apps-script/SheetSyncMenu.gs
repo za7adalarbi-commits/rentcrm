@@ -4,9 +4,9 @@
    التوكن يُحفظ بأمان في Script Properties (RG_TOKEN & RENTAL_TOKEN)
    ============================================================ */
 
-var API = "https://api.rentalgate.net/api/";
-var RES_URL = API + "reservations/filter";
-var EXT_URL = API + "reservation-extends/filter";
+var API = "https://api.rentalgate.net/api";
+var RES_URL = API + "/reservations/filter";
+var EXT_URL = API + "/reservation-extends/filter";
 var PAGE_SIZE = 100;       // 100 عنصر بالصفحة لتقليل عدد الطلبات إلى النصف
 var FIRST_PAGE = 0;        // الصفحات تبدأ من 0
 var MAX_PAGES = 500;
@@ -212,17 +212,35 @@ function notify_(msg, opts) {
 }
 
 function normalizeToken_(raw) {
-  return String(raw === null || raw === undefined ? "" : raw)
-    .trim()
-    .replace(/^Bearer(?:\s+|$)/i, "")
+  var s = String(raw === null || raw === undefined ? "" : raw)
+    .replace(/[\r\n]+/g, "")
     .trim();
+  while (s.length >= 2) {
+    var f = s.charAt(0), l = s.charAt(s.length - 1);
+    if ((f === '"' && l === '"') || (f === "'" && l === "'")) {
+      s = s.substring(1, s.length - 1).trim();
+    } else {
+      break;
+    }
+  }
+  s = s.replace(/^(?:Bearer(?:\s+|$))+/i, "").trim();
+  while (s.length >= 2) {
+    var f2 = s.charAt(0), l2 = s.charAt(s.length - 1);
+    if ((f2 === '"' && l2 === '"') || (f2 === "'" && l2 === "'")) {
+      s = s.substring(1, s.length - 1).trim();
+    } else {
+      break;
+    }
+  }
+  return s.replace(/^(?:Bearer(?:\s+|$))+/i, "").trim();
 }
 
 function isValidJwtLikeToken_(token) {
   var t = normalizeToken_(token);
   if (!t || t.indexOf("eyJ") !== 0) return false;
-  if (/\s/.test(t)) return false;
-  return t.split(".").length >= 2;
+  if (/[\s\x00-\x1f\x7f]/.test(t)) return false;
+  var parts = t.split(".");
+  return parts.length === 3 && Boolean(parts[0]) && Boolean(parts[1]) && Boolean(parts[2]);
 }
 
 function getToken_() {
@@ -312,10 +330,12 @@ function round2_(x) { return Math.round(x * 100) / 100; }
 /* ---------- سحب البيانات بالتوازي فائق السرعة ---------- */
 
 function buildApiReq_(url, token) {
+  var cleanTok = normalizeToken_(token);
+  var safeUrl = String(url || "").replace(/(\/api)+\/api(?=\/|$)/gi, "/api");
   return {
-    url: url,
+    url: safeUrl,
     method: "get",
-    headers: { "Authorization": "Bearer " + token, "Accept": "application/json", "lang": "ar" },
+    headers: { "Authorization": "Bearer " + cleanTok, "Accept": "application/json", "lang": "ar" },
     muteHttpExceptions: true
   };
 }

@@ -478,7 +478,7 @@ test('runDataIntegrityCheck, concurrency guard, resolveDataIntegrityIssue, and r
         });
         return { rows: [], rowCount: 1 };
       }
-      if (s.startsWith('UPDATE data_integrity_runs') && s.includes("status = 'completed'")) {
+      if (s.startsWith('UPDATE data_integrity_runs') && (s.includes("status = 'completed'") || s.includes('SET status = $2'))) {
         const [id, finished_at, duration_ms, rg_total_count, neon_total_count, reviewed_count, discrepancies_count, summary_json] = params;
         const row = runs.find((r) => r.id === id);
         if (row) {

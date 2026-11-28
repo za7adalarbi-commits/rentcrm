@@ -6,23 +6,42 @@
 var NEON_HASH_PROP_PREFIX = 'NEON_HASH_CHUNK_';
 var NEON_BATCH_SIZE = 150;
 
+function sanitizeNeonSecret_(val) {
+  var clean = normalizeStr(val).replace(/[\r\n]+/g, '');
+  while (clean.length >= 2) {
+    var first = clean.charAt(0);
+    var last = clean.charAt(clean.length - 1);
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      clean = normalizeStr(clean.substring(1, clean.length - 1));
+    } else {
+      break;
+    }
+  }
+  return clean;
+}
+
+function normalizeNeonBearer_(val) {
+  var clean = sanitizeNeonSecret_(val).replace(/^(?:Bearer\s+)+/i, '');
+  return sanitizeNeonSecret_(clean);
+}
+
 function getNeonSyncConfig_() {
   var props = PropertiesService.getScriptProperties();
   return {
-    syncUrl: normalizeStr(props.getProperty('NEON_SYNC_URL')),
-    syncSecret: normalizeStr(props.getProperty('SYNC_API_SECRET'))
+    syncUrl: sanitizeNeonSecret_(props.getProperty('NEON_SYNC_URL')),
+    syncSecret: sanitizeNeonSecret_(props.getProperty('SYNC_API_SECRET'))
   };
 }
 
 function setNeonSyncProperties(syncUrl, syncSecret) {
   var props = PropertiesService.getScriptProperties();
   var next = {};
-  if (syncUrl !== undefined && syncUrl !== null) next.NEON_SYNC_URL = normalizeStr(syncUrl);
-  if (syncSecret !== undefined && syncSecret !== null) next.SYNC_API_SECRET = normalizeStr(syncSecret);
+  if (syncUrl !== undefined && syncUrl !== null) next.NEON_SYNC_URL = sanitizeNeonSecret_(syncUrl);
+  if (syncSecret !== undefined && syncSecret !== null) next.SYNC_API_SECRET = sanitizeNeonSecret_(syncSecret);
   props.setProperties(next);
   return {
-    configured: Boolean(props.getProperty('NEON_SYNC_URL') && props.getProperty('SYNC_API_SECRET')),
-    syncUrl: normalizeStr(props.getProperty('NEON_SYNC_URL'))
+    configured: Boolean(sanitizeNeonSecret_(props.getProperty('NEON_SYNC_URL')) && sanitizeNeonSecret_(props.getProperty('SYNC_API_SECRET'))),
+    syncUrl: sanitizeNeonSecret_(props.getProperty('NEON_SYNC_URL'))
   };
 }
 
@@ -378,9 +397,22 @@ function setupNeonEveryMinuteSync(enabled) {
   return { enabled: true, intervalMinutes: 1 };
 }
 
+function handleVerifyMirrorAuth_(payload) {
+  var cfg = getNeonSyncConfig_();
+  var provided = sanitizeNeonSecret_(payload && payload.syncSecret);
+  if (!cfg.syncSecret || !constantTimeEqual_(provided, cfg.syncSecret)) {
+    throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
+  }
+  return {
+    verified: true,
+    configured: Boolean(cfg.syncSecret),
+    gasTimestamp: nowIso()
+  };
+}
+
 function handleTriggerNeonIncrementalSync_(payload) {
   var cfg = getNeonSyncConfig_();
-  var provided = normalizeStr(payload && payload.syncSecret);
+  var provided = sanitizeNeonSecret_(payload && payload.syncSecret);
   if (!cfg.syncSecret || !constantTimeEqual_(provided, cfg.syncSecret)) {
     throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
   }
@@ -394,7 +426,7 @@ function handleTriggerNeonIncrementalSync_(payload) {
 
 function handleNeonMirrorSync_(payload) {
   var cfg = getNeonSyncConfig_();
-  var provided = normalizeStr(payload && payload.syncSecret);
+  var provided = sanitizeNeonSecret_(payload && payload.syncSecret);
   if (!cfg.syncSecret || !constantTimeEqual_(provided, cfg.syncSecret)) {
     throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
   }
@@ -403,6 +435,7 @@ function handleNeonMirrorSync_(payload) {
   var applied = 0;
   var skipped = 0;
   var errors = [];
+  var failedItems = [];
 
   var resBatch = [];
   var fuBatch = [];
@@ -471,7 +504,9 @@ function handleNeonMirrorSync_(payload) {
       applied++;
     } else if (action === 'deleteAllReservations') {
       skipped++;
-      errors.push('BLOCKED_BULK_DELETE: deleteAllReservations is disabled for mirror sync to protect Google Sheets backup');
+      var bulkMsg = 'BLOCKED_BULK_DELETE: deleteAllReservations is disabled for mirror sync to protect Google Sheets backup';
+      errors.push(bulkMsg);
+      failedItems.push({ id: item.id || '', index: i, error: bulkMsg });
     } else if (action === 'upsertSetting' && data.key) {
       setBatch.push({
         key: data.key,
@@ -533,7 +568,7 @@ function handleNeonMirrorSync_(payload) {
       if (typeof bumpCacheVersion_ === 'function') bumpCacheVersion_('NTF');
       applied++;
     } else if (action === 'saveRgToken' && data.rgToken) {
-      var cleanTok = normalizeStr(data.rgToken).replace(/^Bearer\s+/i, '');
+      var cleanTok = normalizeNeonBearer_(data.rgToken);
       if (cleanTok) {
         PropertiesService.getScriptProperties().setProperties({
           RG_TOKEN: cleanTok,
@@ -569,18 +604,18 @@ function handleNeonMirrorSync_(payload) {
     applied += setBatch.length;
   }
 
-  return { applied: applied, skipped: skipped, errors: errors };
+  return { applied: applied, skipped: skipped, errors: errors, failedItems: failedItems };
 }
 
 function handleAutoBindFromServer_(payload) {
   var p = payload || {};
   var props = PropertiesService.getScriptProperties();
   var cfg = getNeonSyncConfig_();
-  var existingRgToken = normalizeStr(props.getProperty('RG_TOKEN') || props.getProperty('RENTAL_TOKEN')).replace(/^Bearer\s+/i, '');
+  var existingRgToken = normalizeNeonBearer_(props.getProperty('RG_TOKEN') || props.getProperty('RENTAL_TOKEN'));
 
-  var providedSecret = normalizeStr(p.syncSecret);
-  var providedRgToken = normalizeStr(p.rgToken).replace(/^Bearer\s+/i, '');
-  var neonSyncUrl = normalizeStr(p.neonSyncUrl);
+  var providedSecret = sanitizeNeonSecret_(p.syncSecret);
+  var providedRgToken = normalizeNeonBearer_(p.rgToken);
+  var neonSyncUrl = sanitizeNeonSecret_(p.neonSyncUrl);
 
   var secretMatches = Boolean(cfg.syncSecret && providedSecret && constantTimeEqual_(providedSecret, cfg.syncSecret));
   var rgTokenMatches = Boolean(existingRgToken && providedRgToken && constantTimeEqual_(providedRgToken, existingRgToken));

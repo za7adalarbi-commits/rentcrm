@@ -3,25 +3,86 @@
  * Token is stored strictly in Script Properties: RG_TOKEN (never exposed to clients)
  */
 
+var RG_API_BASE_URL = 'https://api.rentalgate.net/api';
 var RG_RESERVATIONS_API = 'https://api.rentalgate.net/api/reservations/filter';
 var RG_EXTENDS_API = 'https://api.rentalgate.net/api/reservation-extends/filter';
 var RG_CANCELLED_API = 'https://api.rentalgate.net/api/admin/cancelled-reservations';
 var RG_COMPANY_CHANGES_API = 'https://api.rentalgate.net/api/reservation-company-changes/admin/filter';
 var RG_RESERVATION_DETAIL_BASE = 'https://api.rentalgate.net/api/reservations/';
 
+function normalizeRgTokenGs_(raw) {
+  var clean = normalizeStr(raw).replace(/[\r\n]+/g, '');
+  while (clean.length >= 2) {
+    var first = clean.charAt(0);
+    var last = clean.charAt(clean.length - 1);
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      clean = normalizeStr(clean.substring(1, clean.length - 1));
+    } else {
+      break;
+    }
+  }
+  clean = clean.replace(/^(?:Bearer(?:\s+|$))+/i, '').trim();
+  while (clean.length >= 2) {
+    var f2 = clean.charAt(0);
+    var l2 = clean.charAt(clean.length - 1);
+    if ((f2 === '"' && l2 === '"') || (f2 === "'" && l2 === "'")) {
+      clean = normalizeStr(clean.substring(1, clean.length - 1));
+    } else {
+      break;
+    }
+  }
+  return clean.replace(/^(?:Bearer(?:\s+|$))+/i, '').trim();
+}
+
+function validateRgTokenGs_(raw) {
+  var tok = normalizeRgTokenGs_(raw);
+  if (!tok) {
+    return { valid: false, token: '', message: 'RG_TOKEN غير مضبوط في Script Properties.' };
+  }
+  if (/[\s\x00-\x1f\x7f]/.test(tok) || tok.length < 16) {
+    return { valid: false, token: '', message: 'RG_TOKEN يحتوي على مسافات أو تنسيق غير صالح (Token is malformed).' };
+  }
+  if (tok.indexOf('eyJ') === 0) {
+    var parts = tok.split('.');
+    if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
+      return { valid: false, token: '', message: 'RG_TOKEN (JWT) غير مكتمل أو غير صالح (Token is malformed).' };
+    }
+  }
+  return { valid: true, token: tok, message: '' };
+}
+
+function buildRgEndpointUrlGs_(baseOrUrl, pathSuffix) {
+  var rawBase = normalizeStr(baseOrUrl || RG_API_BASE_URL).replace(/\/+$/, '');
+  var cleanPath = normalizeStr(pathSuffix || '').replace(/^\/+/, '');
+  rawBase = rawBase.replace(/(\/api)+\/api(?=\/|$)/gi, '/api');
+  if (!cleanPath) return rawBase;
+  if (rawBase.toLowerCase().indexOf('/' + cleanPath.toLowerCase(), rawBase.length - cleanPath.length - 1) !== -1) {
+    return rawBase;
+  }
+  if (cleanPath.toLowerCase().indexOf('api/') === 0 && rawBase.toLowerCase().slice(-4) === '/api') {
+    cleanPath = cleanPath.substring(4);
+  }
+  return (rawBase + '/' + cleanPath).replace(/([^:]\/)\/+/g, '$1').replace(/(\/api)+\/api(?=\/|$)/gi, '/api');
+}
+
 function getRgToken() {
   var props = PropertiesService.getScriptProperties();
-  return normalizeStr(props.getProperty('RG_TOKEN') || props.getProperty('RENTAL_TOKEN'));
+  return normalizeRgTokenGs_(props.getProperty('RG_TOKEN') || props.getProperty('RENTAL_TOKEN'));
 }
 
 function buildRentalGateRequest_(url, token, pageZeroBased, size, extraQuery) {
+  var tokenCheck = validateRgTokenGs_(token);
+  if (!tokenCheck.valid) {
+    throw new Error('RG_API_HTTP_401: ' + tokenCheck.message);
+  }
+  var safeBaseUrl = buildRgEndpointUrlGs_(url, '');
   var pageNum = pageZeroBased !== undefined && pageZeroBased !== null ? Math.max(0, Number(pageZeroBased) || 0) : 0;
   var pageSize = size ? Math.max(1, Number(size) || 100) : 100;
   var reqUrl;
   if (extraQuery && extraQuery.directUrl) {
     reqUrl = extraQuery.directUrl;
   } else {
-    var sep = url.indexOf('?') === -1 ? '?' : '&';
+    var sep = safeBaseUrl.indexOf('?') === -1 ? '?' : '&';
     var qParts = [];
     if (extraQuery && extraQuery.cursor) {
       qParts.push('cursor=' + encodeURIComponent(extraQuery.cursor));
@@ -33,13 +94,13 @@ function buildRentalGateRequest_(url, token, pageZeroBased, size, extraQuery) {
       qParts.push('page=' + encodeURIComponent(pageNum));
       qParts.push('size=' + encodeURIComponent(pageSize));
     }
-    reqUrl = url + sep + qParts.join('&');
+    reqUrl = safeBaseUrl + sep + qParts.join('&');
   }
   return {
     url: reqUrl,
     method: 'get',
     headers: {
-      Authorization: 'Bearer ' + token,
+      Authorization: 'Bearer ' + tokenCheck.token,
       Accept: 'application/json',
       lang: 'ar'
     },
@@ -422,9 +483,12 @@ function extractLinkSrcIdGs_(row) {
 
 function fetchReservationDetailByIdGs_(token, srcId) {
   try {
-    var res = UrlFetchApp.fetch(RG_RESERVATION_DETAIL_BASE + encodeURIComponent(srcId), {
+    var tokenCheck = validateRgTokenGs_(token);
+    if (!tokenCheck.valid) return null;
+    var detailUrl = buildRgEndpointUrlGs_(RG_RESERVATION_DETAIL_BASE, encodeURIComponent(srcId));
+    var res = UrlFetchApp.fetch(detailUrl, {
       method: 'get',
-      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json', lang: 'ar' },
+      headers: { Authorization: 'Bearer ' + tokenCheck.token, Accept: 'application/json', lang: 'ar' },
       muteHttpExceptions: true
     });
     if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) return null;
@@ -597,10 +661,11 @@ function fetchBothEndpointsParallel_(resUrl, extUrl, token) {
 function saveApiToken(session, payload) {
   requireApiAccess(session);
   var p = payload || {};
-  var raw = normalizeStr(p.token || p.rgToken || p.rentalToken).replace(/^Bearer\s+/i, '');
-  if (!raw || raw.length < 16 || /\s/.test(raw)) {
-    throw new Error('صيغة التوكن غير صالحة. يرجى لصق التوكن كاملاً بدون مسافات.');
+  var tokenCheck = validateRgTokenGs_(p.token || p.rgToken || p.rentalToken);
+  if (!tokenCheck.valid) {
+    throw new Error('صيغة التوكن غير صالحة. يرجى لصق التوكن كاملاً بدون مسافات أو علامات اقتباس.');
   }
+  var raw = tokenCheck.token;
 
   PropertiesService.getScriptProperties().setProperties({
     RG_TOKEN: raw,
@@ -627,10 +692,11 @@ function saveApiToken(session, payload) {
 }
 
 function setupRentalGateTokens(token) {
-  var clean = normalizeStr(token).replace(/^Bearer\s+/i, '');
-  if (!clean) {
-    throw new Error('يرجى تمرير التوكن للدالة setupRentalGateTokens(token).');
+  var tokenCheck = validateRgTokenGs_(token);
+  if (!tokenCheck.valid) {
+    throw new Error('صيغة RG_TOKEN غير صالحة: ' + tokenCheck.message);
   }
+  var clean = tokenCheck.token;
   PropertiesService.getScriptProperties().setProperties({
     RG_TOKEN: clean,
     RENTAL_TOKEN: clean
@@ -640,16 +706,16 @@ function setupRentalGateTokens(token) {
 
 function testRentalGateConnection(session) {
   requireApiAccess(session);
-  var token = getRgToken();
-  if (!token) {
+  var tokenCheck = validateRgTokenGs_(PropertiesService.getScriptProperties().getProperty('RG_TOKEN') || PropertiesService.getScriptProperties().getProperty('RENTAL_TOKEN'));
+  if (!tokenCheck.valid) {
     return {
       connected: false,
-      hasToken: false,
-      message: 'مفتاح RG_TOKEN غير مضبوط في Script Properties.'
+      hasToken: Boolean(getRgToken()),
+      message: tokenCheck.message || 'مفتاح RG_TOKEN غير مضبوط في Script Properties.'
     };
   }
   try {
-    callRentalGateEndpoint(RG_RESERVATIONS_API, token, 0, 1);
+    callRentalGateEndpoint(RG_RESERVATIONS_API, tokenCheck.token, 0, 1);
     return {
       connected: true,
       hasToken: true,
@@ -809,10 +875,12 @@ function pullReservations(session, payload) {
 }
 
 function runRentalGateSyncInternal(actor, options) {
-  var token = getRgToken();
-  if (!token) {
-    throw new Error('لم يتم ضبط RG_TOKEN في Script Properties.');
+  var rawToken = PropertiesService.getScriptProperties().getProperty('RG_TOKEN') || PropertiesService.getScriptProperties().getProperty('RENTAL_TOKEN');
+  var tokenCheck = validateRgTokenGs_(rawToken);
+  if (!tokenCheck.valid) {
+    throw new Error(tokenCheck.message || 'لم يتم ضبط RG_TOKEN في Script Properties.');
   }
+  var token = tokenCheck.token;
 
   var actorId = (actor && (actor.employeeId || actor.id)) || 'SYSTEM';
   var actorName = (actor && actor.name) || 'المزامنة التلقائية';

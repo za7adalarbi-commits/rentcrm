@@ -787,10 +787,11 @@ function deleteRecordsWhere_(sheetName, predicateFn) {
   }
   if (matchIndices.length <= 40) {
     for (var k = matchIndices.length - 1; k >= 0; k--) {
+      var targetRow = matchIndices[k] + 2;
       if (typeof safeDeleteSheetRows_ === 'function') {
-        safeDeleteSheetRows_(sheet, matchIndices[k] + 2, 1);
+        safeDeleteSheetRows_(sheet, targetRow, 1);
       } else {
-        sheet.deleteRow(matchIndices[k] + 2);
+        sheet.getRange(targetRow, 1, 1, headers.length).clearContent().clearNote();
       }
     }
   } else {
@@ -801,7 +802,7 @@ function deleteRecordsWhere_(sheetName, predicateFn) {
       if (typeof safeDeleteSheetRows_ === 'function') {
         safeDeleteSheetRows_(sheet, 2 + keptRows.length, extraRows);
       } else {
-        sheet.deleteRows(2 + keptRows.length, extraRows);
+        sheet.getRange(2 + keptRows.length, 1, extraRows, headers.length).clearContent().clearNote();
       }
     }
   }

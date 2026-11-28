@@ -48,6 +48,11 @@ function handleApiRequest(e, method) {
       return jsonResponse(true, 'تم تنفيذ السحب والمزامنة السحابية.', trigRes);
     }
 
+    if (action === 'verifyMirrorAuth') {
+      var authRes = handleVerifyMirrorAuth_(payload);
+      return jsonResponse(true, 'تم التحقق من مطابقة SYNC_API_SECRET بنجاح.', authRes);
+    }
+
     if (action === 'autoBindFromServer') {
       var bindRes = handleAutoBindFromServer_(payload);
       flushDirtyScriptCaches_();
