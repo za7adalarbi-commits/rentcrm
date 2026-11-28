@@ -401,6 +401,8 @@ function handleNeonMirrorSync_(payload) {
 
   var items = Array.isArray(payload && payload.items) ? payload.items : [];
   var applied = 0;
+  var skipped = 0;
+  var errors = [];
 
   var resBatch = [];
   var fuBatch = [];
@@ -468,14 +470,8 @@ function handleNeonMirrorSync_(payload) {
       }
       applied++;
     } else if (action === 'deleteAllReservations') {
-      if (typeof clearSheetRecords === 'function') {
-        clearSheetRecords(RG_SHEETS.RESERVATIONS);
-        clearSheetRecords(RG_SHEETS.EXTENSIONS);
-        clearSheetRecords(RG_SHEETS.ASSIGNMENTS);
-        clearSheetRecords(RG_SHEETS.FOLLOWUPS);
-        clearSheetRecords(RG_SHEETS.FOLLOWUP_HISTORY);
-      }
-      applied++;
+      skipped++;
+      errors.push('BLOCKED_BULK_DELETE: deleteAllReservations is disabled for mirror sync to protect Google Sheets backup');
     } else if (action === 'upsertSetting' && data.key) {
       setBatch.push({
         key: data.key,
@@ -573,7 +569,7 @@ function handleNeonMirrorSync_(payload) {
     applied += setBatch.length;
   }
 
-  return { applied: applied };
+  return { applied: applied, skipped: skipped, errors: errors };
 }
 
 function handleAutoBindFromServer_(payload) {

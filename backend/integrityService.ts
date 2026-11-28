@@ -1,11 +1,14 @@
 import { crmCore, generateId, type AuthSession } from './auth.js';
-import type { DbClient, DbExecutor } from './db.js';
+import { ensureDbExecutor, runWithSavepoint, type DbClient, type DbExecutor } from './db.js';
+import { logBackendError, redactSensitiveText } from './logger.js';
 import {
   fetchRentalGateSnapshotReadOnly,
   ingestIncrementalSyncBatch,
   mapReservationRowToClient,
   type IntegrityRgSnapshotResult
 } from './syncService.js';
+
+const STALE_RUN_TIMEOUT_MINUTES = 10;
 
 function str(v: unknown, fallback = ''): string {
   if (v === null || v === undefined) return fallback;
@@ -54,25 +57,31 @@ async function logIntegrityActivity(
   const riyadh = crmCore && typeof crmCore.getRiyadhDateTimeParts === 'function'
     ? crmCore.getRiyadhDateTimeParts(nowIso)
     : { date: nowIso.slice(0, 10), time: nowIso.slice(11, 16) };
-  await client.query(
-    `INSERT INTO activity_log (
-       id, user_id, user_name, user_role, action_type, entity_type, entity_id,
-       details, changes_json, log_date, log_time, created_at
-     ) VALUES ($1,$2,$3,$4,$5,'DataIntegrity',$6,$7,$8::jsonb,$9,$10,$11::timestamptz)`,
-    [
-      generateId('ACT'),
-      str(user.id),
-      str(user.name),
-      str(user.role),
-      actionType,
-      str(entityId),
-      str(details),
-      JSON.stringify(Array.isArray(diffs) ? diffs : []),
-      riyadh.date,
-      riyadh.time,
-      nowIso
-    ]
-  ).catch(() => undefined);
+  await runWithSavepoint(
+    client,
+    'integrity_activity_log',
+    () =>
+      client.query(
+        `INSERT INTO activity_log (
+           id, user_id, user_name, user_role, action_type, entity_type, entity_id,
+           details, changes, log_date, log_time, created_at
+         ) VALUES ($1,$2,$3,$4,$5,'DataIntegrity',$6,$7,$8::jsonb,$9,$10,$11::timestamptz)`,
+        [
+          generateId('ACT'),
+          str(user.id),
+          str(user.name),
+          str(user.role),
+          actionType,
+          str(entityId),
+          str(details),
+          JSON.stringify(Array.isArray(diffs) ? diffs : []),
+          riyadh.date,
+          riyadh.time,
+          nowIso
+        ]
+      ),
+    undefined
+  );
 }
 
 async function readIntegritySettingsInternal(executor: DbClient): Promise<Record<string, any>> {
@@ -155,6 +164,7 @@ function summarizeRgSnapshotStats(rg: IntegrityRgSnapshotResult) {
 
 function formatRunRow(row: any) {
   if (!row) return null;
+  const summary = parseJsonSafe<Record<string, any>>(row.summary_json, {});
   return {
     id: str(row.id),
     runMode: str(row.run_mode || 'manual'),
@@ -162,11 +172,16 @@ function formatRunRow(row: any) {
     triggeredById: str(row.triggered_by_id),
     triggeredByName: str(row.triggered_by_name),
     scopes: parseJsonSafe<string[]>(row.scopes_json, []),
-    summary: parseJsonSafe<Record<string, any>>(row.summary_json, {}),
-    rgCount: num(row.rg_count, 0),
-    neonCount: num(row.neon_count, 0),
+    summary,
+    rgCount: num(row.rg_total_count ?? row.rg_count, 0),
+    rgTotalCount: num(row.rg_total_count ?? row.rg_count, 0),
+    neonCount: num(row.neon_total_count ?? row.neon_count, 0),
+    neonTotalCount: num(row.neon_total_count ?? row.neon_count, 0),
+    matchedCount: num(summary.matchedCount, 0),
+    rgChecked: summary.rgChecked !== false,
+    durationMs: num(row.duration_ms, 0),
     discrepanciesCount: num(row.discrepancies_count, 0),
-    errorMessage: str(row.error_message),
+    errorMessage: redactSensitiveText(str(row.error_message)),
     startedAt: row.started_at instanceof Date ? row.started_at.toISOString() : str(row.started_at),
     finishedAt: row.finished_at instanceof Date ? row.finished_at.toISOString() : str(row.finished_at)
   };
@@ -270,21 +285,45 @@ export async function getDataIntegrityReport(
   payload: Record<string, any> = {}
 ) {
   assertDeveloperAccess(session);
-  const settings = await readIntegritySettingsInternal(executor);
+  const safeExec = ensureDbExecutor(executor);
+  const settings = await readIntegritySettingsInternal(safeExec);
   const filterType = str(payload.discrepancyType);
   const filterStatus = str(payload.resolutionStatus);
   const search = str(payload.search).toLowerCase();
   const runId = str(payload.runId);
+  const queryErrors: Array<{ step: string; message: string }> = [];
+
+  const captureQuery = async <T = any>(step: string, fn: () => Promise<{ rows: T[] }>, fallbackRows: T[] = []) => {
+    try {
+      return await fn();
+    } catch (err: any) {
+      queryErrors.push({
+        step,
+        message: redactSensitiveText(err?.message || 'QUERY_FAILED').slice(0, 220)
+      });
+      return { rows: fallbackRows };
+    }
+  };
 
   const [runsRes, actionsRes, neonCountRes, extCountRes] = await Promise.all([
-    executor.query(`SELECT * FROM data_integrity_runs ORDER BY started_at DESC LIMIT 12`).catch(() => ({ rows: [] as any[] })),
-    executor.query(`SELECT * FROM data_integrity_actions ORDER BY created_at DESC LIMIT 40`).catch(() => ({ rows: [] as any[] })),
-    executor.query(`SELECT id, reservation_number, source_reservation_id, internal_status, original_status_code, original_status_ar, is_source_cancelled, is_source_rejected, cancelled_at, rejected_at, end_date, extended_until_date FROM reservations LIMIT 20000`).catch(() => ({ rows: [] as any[] })),
-    executor.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM extensions`).catch(() => ({ rows: [{ cnt: 0 }] }))
+    captureQuery('runs', () => safeExec.query(`SELECT * FROM data_integrity_runs ORDER BY started_at DESC LIMIT 15`)),
+    captureQuery('actions', () => safeExec.query(`SELECT * FROM data_integrity_actions ORDER BY created_at DESC LIMIT 40`)),
+    captureQuery('neon_reservations', () =>
+      safeExec.query(
+        `SELECT id, reservation_number, source_reservation_id, internal_status, original_status_code, original_status_ar, is_source_cancelled, is_source_rejected, cancelled_at, rejected_at, end_date, extended_until_date
+         FROM reservations
+         WHERE deleted_at IS NULL
+         LIMIT 20000`
+      )
+    ),
+    captureQuery('extensions_count', () => safeExec.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM extensions`), [{ cnt: 0 }])
   ]);
 
-  const runs = runsRes.rows.map(formatRunRow).filter(Boolean);
-  const activeRun = (runId ? runs.find((r: any) => r.id === runId) : null) || runs[0] || null;
+  const runs = (runsRes.rows || []).map(formatRunRow).filter(Boolean) as any[];
+  const latestAttempt = runs[0] || null;
+  const activeRunningRun = runs.find((r) => r.status === 'running') || null;
+  const lastValidRun = runs.find((r) => r.status === 'completed' || r.status === 'partial') || null;
+  const activeRun = (runId ? runs.find((r) => r.id === runId) : null) || lastValidRun || latestAttempt || null;
 
   const issueClauses: string[] = [];
   const issueParams: any[] = [];
@@ -301,12 +340,14 @@ export async function getDataIntegrityReport(
     issueClauses.push(`resolution_status = $${issueParams.length}`);
   }
   const issueWhere = issueClauses.length ? `WHERE ${issueClauses.join(' AND ')}` : '';
-  const issuesRes = await executor.query(
-    `SELECT * FROM data_integrity_issues ${issueWhere} ORDER BY created_at DESC LIMIT 500`,
-    issueParams
-  ).catch(() => ({ rows: [] as any[] }));
+  const issuesRes = await captureQuery('issues', () =>
+    safeExec.query(
+      `SELECT * FROM data_integrity_issues ${issueWhere} ORDER BY created_at DESC LIMIT 500`,
+      issueParams
+    )
+  );
 
-  let issues = issuesRes.rows.map(formatIssueRow);
+  let issues = (issuesRes.rows || []).map(formatIssueRow);
   if (search) {
     issues = issues.filter((it: any) =>
       `${it.reservationNumber} ${it.rgValue} ${it.neonValue} ${it.discrepancyType} ${it.typeLabelAr}`.toLowerCase().includes(search)
@@ -318,10 +359,13 @@ export async function getDataIntegrityReport(
   return {
     settings,
     latestRun: activeRun,
+    latestAttempt,
+    activeRunningRun,
     runs,
     issues,
-    actions: actionsRes.rows.map(formatActionRow),
-    liveNeonStats
+    actions: (actionsRes.rows || []).map(formatActionRow),
+    liveNeonStats,
+    queryErrors
   };
 }
 
@@ -331,7 +375,8 @@ export async function runDataIntegrityCheck(
   payload: Record<string, any> = {}
 ) {
   assertDeveloperAccess(session);
-  const settings = await readIntegritySettingsInternal(executor);
+  const safeExec = ensureDbExecutor(executor);
+  const settings = await readIntegritySettingsInternal(safeExec);
   const runMode = str(payload.runMode || 'manual');
   if (settings.paused && !payload.force && runMode === 'scheduled') {
     return { skipped: true, reason: 'PAUSED', settings };
@@ -343,104 +388,304 @@ export async function runDataIntegrityCheck(
   const dateFrom = str(payload.dateFrom !== undefined ? payload.dateFrom : settings.dateFrom);
   const dateTo = str(payload.dateTo !== undefined ? payload.dateTo : settings.dateTo);
 
-  const startedIso = new Date().toISOString();
+  const startedAtMs = Date.now();
+  const startedIso = new Date(startedAtMs).toISOString();
   const runId = generateId('DIRUN');
 
-  // Strictly read-only fetch from RG (or injected test snapshot) + strictly read-only select from Neon
-  const rgSnapshot: IntegrityRgSnapshotResult = payload._mockRgSnapshot
-    ? payload._mockRgSnapshot
-    : await fetchRentalGateSnapshotReadOnly(executor, {
-        scopes,
-        dateFrom,
-        dateTo,
-        maxPages: Math.max(10, Math.ceil(num(settings.batchSize, 100) / 10))
-      });
+  // Step 1: Atomically lock + expire stale running runs + guard concurrent runs
+  const initRes = await safeExec.withTransaction(async (tx) => {
+    await runWithSavepoint(
+      tx,
+      'di_svc_lock',
+      () => tx.query(`SELECT pg_advisory_xact_lock(92847104)`),
+      undefined
+    );
 
-  const neonResQ = await executor.query(`SELECT * FROM reservations ORDER BY updated_at DESC LIMIT 20000`);
-  const neonExtCountQ = await executor.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM extensions`);
-  const neonRows = neonResQ.rows || [];
-  const neonExtCount = num(neonExtCountQ.rows[0]?.cnt, 0);
+    await tx.query(
+      `UPDATE data_integrity_runs
+       SET status = 'failed',
+           finished_at = NOW(),
+           error_message = COALESCE(NULLIF(error_message, ''), 'STALE_RUN_TIMEOUT')
+       WHERE status = 'running'
+         AND started_at < NOW() - ($1 || ' minutes')::interval`,
+      [String(STALE_RUN_TIMEOUT_MINUTES)]
+    );
 
-  const neonSummary = summarizeNeonReservationStats(neonRows, neonExtCount);
-  const rgSummary = summarizeRgSnapshotStats(rgSnapshot);
+    const activeQ = await tx.query(
+      `SELECT id, run_mode, trigger_type, status, started_at, triggered_by_name
+       FROM data_integrity_runs
+       WHERE status = 'running'
+       ORDER BY started_at DESC
+       LIMIT 1`
+    );
+    if (activeQ.rows.length > 0 && !payload.forceConcurrentCheck) {
+      return { blockedBy: activeQ.rows[0] };
+    }
 
-  const cmpRes = crmCore.compareRgAndNeonReservations(
-    rgSnapshot.reservations || [],
-    neonRows.map((r) => mapReservationRowToClient(r, false))
-  );
-  const rawIssues: any[] = Array.isArray(cmpRes) ? cmpRes : (Array.isArray(cmpRes?.issues) ? cmpRes.issues : []);
-
-  const byType: Record<string, number> = {};
-  for (const iss of rawIssues) {
-    const dt = str(iss.discrepancyType);
-    byType[dt] = (byType[dt] || 0) + 1;
-  }
-
-  const summary = {
-    rg: rgSummary,
-    neon: neonSummary,
-    byType,
-    incompleteEndpoints: rgSnapshot.incompleteEndpoints || [],
-    pagesFetched: rgSnapshot.pagesFetched || 0
-  };
-  const finishedIso = new Date().toISOString();
-
-  await executor.withTransaction(async (tx) => {
     await tx.query(
       `INSERT INTO data_integrity_runs (
-         id, run_mode, status, triggered_by_id, triggered_by_name, scopes_json, summary_json,
-         rg_count, neon_count, discrepancies_count, error_message, started_at, finished_at
-       ) VALUES ($1,$2,'completed',$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,'',$10::timestamptz,$11::timestamptz)`,
+         id, trigger_type, run_mode, status, triggered_by_id, triggered_by_name, scopes_json, summary_json,
+         rg_total_count, neon_total_count, reviewed_count, discrepancies_count, duration_ms, error_message, started_at, finished_at
+       ) VALUES ($1,$2,$3,'running',$4,$5,$6::jsonb,'{}'::jsonb,0,0,0,0,0,'',$7::timestamptz,NULL)`,
       [
         runId,
         runMode,
-        session.user.id,
-        session.user.name,
+        runMode,
+        str(session.user.id),
+        str(session.user.name || session.username),
         JSON.stringify(scopes),
-        JSON.stringify(summary),
-        rgSummary.total,
-        neonSummary.total,
-        rawIssues.length,
-        startedIso,
-        finishedIso
+        startedIso
       ]
     );
+    return { blockedBy: null };
+  });
 
+  if (initRes.blockedBy) {
+    return {
+      skipped: true,
+      reason: 'INTEGRITY_CHECK_IN_PROGRESS',
+      blockedBy: formatRunRow(initRes.blockedBy),
+      settings
+    };
+  }
+
+  try {
+    // Strictly read-only fetch from RG (or injected test snapshot) + strictly read-only select from Neon
+    const rgSnapshot: IntegrityRgSnapshotResult = payload._mockRgSnapshot
+      ? payload._mockRgSnapshot
+      : await fetchRentalGateSnapshotReadOnly(safeExec, {
+          scopes,
+          dateFrom,
+          dateTo,
+          maxPages: Math.max(40, Math.ceil(num(settings.batchSize, 100) / 10))
+        });
+
+    const [neonResQ, neonExtCountQ, extByResQ] = await Promise.all([
+      safeExec.query(`SELECT * FROM reservations WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 20000`),
+      safeExec.query<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM extensions`),
+      safeExec.query<{ reservation_id: string; cnt: number }>(
+        `SELECT reservation_id, COUNT(*)::int AS cnt FROM extensions WHERE COALESCE(reservation_id, '') <> '' GROUP BY reservation_id`
+      ).catch(() => ({ rows: [] as Array<{ reservation_id: string; cnt: number }> }))
+    ]);
+
+    const neonRows = neonResQ.rows || [];
+    const neonExtCount = num(neonExtCountQ.rows[0]?.cnt, 0);
+    const liveExtCountMap = new Map<string, number>();
+    for (const row of extByResQ.rows || []) {
+      const rid = str(row.reservation_id);
+      if (rid) liveExtCountMap.set(rid, num(row.cnt, 0));
+    }
+
+    const neonClientRows = neonRows.map((r) => {
+      const mapped = mapReservationRowToClient(r, false);
+      const liveCnt = liveExtCountMap.get(str(r.id));
+      if (liveCnt !== undefined && num(mapped.extensionsCount, 0) === 0 && liveCnt > 0) {
+        mapped.extensionsCount = liveCnt;
+      }
+      return mapped;
+    });
+
+    const neonSummary = summarizeNeonReservationStats(neonRows, neonExtCount);
+    const rgSummary = summarizeRgSnapshotStats(rgSnapshot);
+
+    const cmpRes = crmCore.compareRgAndNeonReservations(
+      rgSnapshot.reservations || [],
+      neonClientRows
+    );
+    const cmpIssues: any[] = Array.isArray(cmpRes) ? cmpRes : (Array.isArray(cmpRes?.issues) ? cmpRes.issues : []);
+    const matchedCount = num(cmpRes?.matchedCount, 0);
+
+    const rawIssues: any[] = [...cmpIssues];
+    const seenKeys = new Set(
+      rawIssues.map((i) => `${str(i.discrepancyType)}|${str(i.reservationNumber || i.reservationId).replace(/^#+/, '')}|${str(i.fieldName)}`)
+    );
+    for (const r of neonRows) {
+      const sid = str(r.source_reservation_id || r.reservation_number).replace(/^#+/, '');
+      const cleanNum = str(r.reservation_number).replace(/^#+/, '');
+      if (cleanNum && sid && cleanNum !== sid && /^RG-/i.test(cleanNum)) {
+        const dk = `rg_number_in_reservation_number|${sid}|reservation_number`;
+        if (!seenKeys.has(dk)) {
+          seenKeys.add(dk);
+          rawIssues.push({
+            reservationId: str(r.id),
+            reservationNumber: sid,
+            discrepancyType: 'rg_number_in_reservation_number',
+            severity: 'medium',
+            sourceScope: 'reservations',
+            fieldName: 'reservation_number',
+            rgValue: sid,
+            neonValue: cleanNum,
+            rgSnapshot: { sourceReservationId: sid },
+            neonSnapshot: { id: r.id, reservationNumber: cleanNum, referenceNumber: r.reference_number }
+          });
+        }
+      }
+    }
+
+    const byType: Record<string, number> = {};
     for (const iss of rawIssues) {
+      const dt = str(iss.discrepancyType);
+      byType[dt] = (byType[dt] || 0) + 1;
+    }
+
+    const incompleteEndpoints = rgSnapshot.incompleteEndpoints || [];
+    const runStatus = incompleteEndpoints.length > 0 ? 'partial' : 'completed';
+
+    const summary = {
+      rg: rgSummary,
+      neon: neonSummary,
+      byType,
+      matchedCount,
+      rgChecked: true,
+      incompleteEndpoints,
+      pagesFetched: rgSnapshot.pagesFetched || 0
+    };
+    const finishedAtMs = Date.now();
+    const durationMs = Math.max(0, finishedAtMs - startedAtMs);
+    const finishedIso = new Date(finishedAtMs).toISOString();
+
+    await safeExec.withTransaction(async (tx) => {
+      const existingOpenMap = new Map<string, string>();
+      await runWithSavepoint(
+        tx,
+        'di_load_open_issues',
+        async () => {
+          const openQ = await tx.query<{
+            id: string;
+            discrepancy_type: string;
+            reservation_number: string;
+            reservation_id: string;
+            field_name: string;
+          }>(
+            `SELECT id, discrepancy_type, reservation_number, reservation_id, field_name
+             FROM data_integrity_issues
+             WHERE resolution_status = 'open'`
+          );
+          for (const row of openQ.rows || []) {
+            const k = `${str(row.discrepancy_type)}|${str(row.reservation_number || row.reservation_id).replace(/^#+/, '')}|${str(row.field_name)}`;
+            if (!existingOpenMap.has(k)) {
+              existingOpenMap.set(k, str(row.id));
+            }
+          }
+        },
+        undefined
+      );
+
+      for (let idx = 0; idx < rawIssues.length; idx++) {
+        const iss = rawIssues[idx];
+        const dedupKey = `${str(iss.discrepancyType)}|${str(iss.reservationNumber || iss.reservationId).replace(/^#+/, '')}|${str(iss.fieldName)}`;
+        const existingOpenId = existingOpenMap.get(dedupKey);
+        await runWithSavepoint(
+          tx,
+          `di_iss_${idx}`,
+          () => {
+            if (existingOpenId) {
+              return tx.query(
+                `UPDATE data_integrity_issues
+                 SET run_id = $2,
+                     severity = $3,
+                     source_scope = $4,
+                     reservation_id = CASE WHEN COALESCE(reservation_id, '') = '' THEN $5 ELSE reservation_id END,
+                     rg_value = $6,
+                     neon_value = $7,
+                     rg_snapshot_json = $8::jsonb,
+                     neon_snapshot_json = $9::jsonb,
+                     last_checked_at = $10::timestamptz,
+                     updated_at = $10::timestamptz
+                 WHERE id = $1`,
+                [
+                  existingOpenId,
+                  runId,
+                  str(iss.severity || 'medium'),
+                  str(iss.sourceScope || 'reservations'),
+                  str(iss.reservationId),
+                  str(iss.rgValue),
+                  str(iss.neonValue),
+                  JSON.stringify(iss.rgSnapshot || {}),
+                  JSON.stringify(iss.neonSnapshot || {}),
+                  finishedIso
+                ]
+              );
+            }
+            const newId = generateId('DISS');
+            existingOpenMap.set(dedupKey, newId);
+            return tx.query(
+              `INSERT INTO data_integrity_issues (
+                 id, run_id, discrepancy_type, severity, source_scope, reservation_id, reservation_number,
+                 field_name, rg_value, neon_value, rg_snapshot_json, neon_snapshot_json,
+                 resolution_status, last_checked_at, created_at, updated_at
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,'open',$13::timestamptz,$13::timestamptz,$13::timestamptz)`,
+              [
+                newId,
+                runId,
+                str(iss.discrepancyType),
+                str(iss.severity || 'medium'),
+                str(iss.sourceScope || 'reservations'),
+                str(iss.reservationId),
+                str(iss.reservationNumber),
+                str(iss.fieldName),
+                str(iss.rgValue),
+                str(iss.neonValue),
+                JSON.stringify(iss.rgSnapshot || {}),
+                JSON.stringify(iss.neonSnapshot || {}),
+                finishedIso
+              ]
+            );
+          },
+          undefined
+        );
+      }
+
       await tx.query(
-        `INSERT INTO data_integrity_issues (
-           id, run_id, discrepancy_type, severity, source_scope, reservation_id, reservation_number,
-           field_name, rg_value, neon_value, rg_snapshot_json, neon_snapshot_json,
-           resolution_status, created_at, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,'open',$13::timestamptz,$13::timestamptz)`,
+        `UPDATE data_integrity_runs
+         SET status = $2,
+             rg_total_count = $3,
+             neon_total_count = $4,
+             reviewed_count = $5,
+             discrepancies_count = $6,
+             summary_json = $7::jsonb,
+             duration_ms = $8,
+             finished_at = $9::timestamptz
+         WHERE id = $1`,
         [
-          generateId('DISS'),
           runId,
-          str(iss.discrepancyType),
-          str(iss.severity || 'medium'),
-          str(iss.sourceScope || 'reservations'),
-          str(iss.reservationId),
-          str(iss.reservationNumber),
-          str(iss.fieldName),
-          str(iss.rgValue),
-          str(iss.neonValue),
-          JSON.stringify(iss.rgSnapshot || {}),
-          JSON.stringify(iss.neonSnapshot || {}),
+          runStatus,
+          rgSummary.total,
+          neonSummary.total,
+          Math.max(rgSummary.total, neonSummary.total),
+          rawIssues.length,
+          JSON.stringify(summary),
+          durationMs,
           finishedIso
         ]
       );
-    }
 
-    await logIntegrityActivity(
-      tx,
-      session.user,
-      'فحص سلامة البيانات',
-      runId,
-      `RG: ${rgSummary.total} حجز · Neon: ${neonSummary.total} حجز · الفروقات المكتشفة: ${rawIssues.length}`
-    );
-  });
+      await logIntegrityActivity(
+        tx,
+        session.user,
+        'فحص سلامة البيانات',
+        runId,
+        `الحالة: ${runStatus} · RG: ${rgSummary.total} حجز · Neon: ${neonSummary.total} حجز · مطابق: ${matchedCount} · الفروقات: ${rawIssues.length}`
+      );
+    });
 
-  return getDataIntegrityReport(executor, session, { runId });
+    return getDataIntegrityReport(safeExec, session, { runId });
+  } catch (err: any) {
+    const cleanErr = redactSensitiveText(err?.message || 'DATA_INTEGRITY_ERROR').slice(0, 500);
+    await safeExec
+      .query(
+        `UPDATE data_integrity_runs
+         SET status = 'failed',
+             finished_at = NOW(),
+             duration_ms = $2,
+             error_message = $3
+         WHERE id = $1`,
+        [runId, Math.max(0, Date.now() - startedAtMs), cleanErr]
+      )
+      .catch(() => undefined);
+    await logBackendError(safeExec, 'integrityService', 'runDataIntegrityCheck', err, { runId, runMode, scopes });
+    throw err;
+  }
 }
 
 export async function recheckDataIntegrityRecord(
@@ -466,7 +711,7 @@ export async function recheckDataIntegrityRecord(
   const lookupId = reservationId || str(targetIssue?.reservation_id);
 
   const neonQ = await executor.query(
-    `SELECT * FROM reservations WHERE id = $1 OR reservation_number = $2 OR source_reservation_id = $1 LIMIT 1`,
+    `SELECT * FROM reservations WHERE deleted_at IS NULL AND (id = $1 OR reservation_number = $2 OR source_reservation_id = $1) LIMIT 1`,
     [lookupId || lookupNum, lookupNum || lookupId]
   );
   const neonRow = neonQ.rows[0] ? mapReservationRowToClient(neonQ.rows[0], false) : null;
@@ -525,7 +770,7 @@ export async function resolveDataIntegrityIssue(
   const lookupKey = str(issueRow.reservation_number || issueRow.reservation_id);
 
   const curNeonQ = await executor.query(
-    `SELECT * FROM reservations WHERE id = $1 OR reservation_number = $2 LIMIT 1`,
+    `SELECT * FROM reservations WHERE deleted_at IS NULL AND (id = $1 OR reservation_number = $2) LIMIT 1`,
     [str(issueRow.reservation_id), lookupKey]
   );
   const curNeonRaw = curNeonQ.rows[0] || null;
@@ -577,20 +822,20 @@ export async function resolveDataIntegrityIssue(
 
         await tx.query(
           `UPDATE reservations
-           SET original_status_code = $2,
-               internal_status = $3,
-               customer_name = $4,
-               customer_phone = $5,
-               start_date = $6,
-               end_date = $7,
-               car_name = $8,
-               company_name = $9,
-               last_update_text = $10,
-               last_updated_by_id = $11,
-               last_updated_by_name = $12,
-               last_updated_at = $13,
-               updated_at = $13::timestamptz
-           WHERE id = $1`,
+           SET original_status_code = $2::text,
+               internal_status = $3::text,
+               customer_name = $4::text,
+               customer_phone = $5::text,
+               start_date = $6::text,
+               end_date = $7::text,
+               car_name = $8::text,
+               company_name = $9::text,
+               last_update_text = $10::text,
+               last_updated_by_id = $11::text,
+               last_updated_by_name = $12::text,
+               last_updated_at = $13::text,
+               updated_at = $14::timestamptz
+           WHERE id = $1::text`,
           [
             str(curNeonRaw.id),
             nextCode,
@@ -602,8 +847,9 @@ export async function resolveDataIntegrityIssue(
             nextCar,
             nextComp,
             `مزامنة يدوية معتمدة من المبرمج عبر مراقبة سلامة البيانات`,
-            session.user.id,
-            session.user.name,
+            str(session.user.id),
+            str(session.user.name),
+            nowIso,
             nowIso
           ]
         );
@@ -704,20 +950,20 @@ export async function rollbackDataIntegrityAction(
   await executor.withTransaction(async (tx) => {
     await tx.query(
       `UPDATE reservations
-       SET original_status_code = $2,
-           internal_status = $3,
-           customer_name = $4,
-           customer_phone = $5,
-           start_date = $6,
-           end_date = $7,
-           car_name = $8,
-           company_name = $9,
-           last_update_text = $10,
-           last_updated_by_id = $11,
-           last_updated_by_name = $12,
-           last_updated_at = $13,
-           updated_at = $13::timestamptz
-       WHERE id = $1`,
+       SET original_status_code = $2::text,
+           internal_status = $3::text,
+           customer_name = $4::text,
+           customer_phone = $5::text,
+           start_date = $6::text,
+           end_date = $7::text,
+           car_name = $8::text,
+           company_name = $9::text,
+           last_update_text = $10::text,
+           last_updated_by_id = $11::text,
+           last_updated_by_name = $12::text,
+           last_updated_at = $13::text,
+           updated_at = $14::timestamptz
+       WHERE id = $1::text`,
       [
         resId,
         str(beforeSnap.original_status_code),
@@ -729,8 +975,9 @@ export async function rollbackDataIntegrityAction(
         str(beforeSnap.car_name),
         str(beforeSnap.company_name),
         `تراجع المبرمج عن إجراء سلامة البيانات (${actionId})`,
-        session.user.id,
-        session.user.name,
+        str(session.user.id),
+        str(session.user.name),
+        nowIso,
         nowIso
       ]
     );

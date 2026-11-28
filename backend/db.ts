@@ -119,6 +119,36 @@ export function getPool(): pg.Pool {
   return cachedPool;
 }
 
+export function getPoolMetrics(): {
+  initialized: boolean;
+  configured: boolean;
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+  maxPoolSize: number;
+} {
+  const isServerless = process.env.VERCEL === '1' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+  const maxPoolSize = Number(process.env.PG_POOL_MAX || (isServerless ? 3 : 10)) || (isServerless ? 3 : 10);
+  if (!cachedPool) {
+    return {
+      initialized: false,
+      configured: isDatabaseConfigured(),
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      maxPoolSize
+    };
+  }
+  return {
+    initialized: true,
+    configured: isDatabaseConfigured(),
+    totalCount: Number((cachedPool as any).totalCount ?? 0),
+    idleCount: Number((cachedPool as any).idleCount ?? 0),
+    waitingCount: Number((cachedPool as any).waitingCount ?? 0),
+    maxPoolSize
+  };
+}
+
 function isSavepointControlSql(text: string): boolean {
   return /^\s*(SAVEPOINT|RELEASE\s+SAVEPOINT|ROLLBACK\s+TO\s+SAVEPOINT|ROLLBACK|COMMIT)\b/i.test(String(text || ''));
 }
@@ -796,6 +826,235 @@ export async function runVersionedMigrations(executor: DbExecutor): Promise<stri
   return appliedIds;
 }
 
+export const AUDIT_AND_HEALTH_MIGRATIONS: SchemaMigrationDef[] = [
+  {
+    id: '2026_11_27_003_audit_schema_alignment_and_indexes',
+    description: 'Align customer_note_attachments, customer_note_history, data_integrity_actions, operational tables, performance indexes, and prune expired sessions',
+    async run(tx) {
+      await tx.query(`ALTER TABLE customer_note_attachments ADD COLUMN IF NOT EXISTS storage_url TEXT NOT NULL DEFAULT '';`);
+      await tx.query(`ALTER TABLE customer_note_attachments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`UPDATE customer_note_attachments SET storage_url = data_url WHERE COALESCE(storage_url, '') = '' AND COALESCE(data_url, '') <> '';`);
+
+      await tx.query(`ALTER TABLE customer_note_history ADD COLUMN IF NOT EXISTS actor_role TEXT NOT NULL DEFAULT '';`);
+      await runWithSavepoint(tx, 'cnh_defaults', async () => {
+        await tx.query(`ALTER TABLE customer_note_history ALTER COLUMN customer_id SET DEFAULT '';`);
+        await tx.query(`ALTER TABLE customer_note_history ALTER COLUMN details SET DEFAULT '';`);
+        await tx.query(`ALTER TABLE customer_note_history ALTER COLUMN source_section SET DEFAULT 'customers';`);
+      }, undefined);
+
+      await tx.query(`ALTER TABLE data_integrity_actions ADD COLUMN IF NOT EXISTS rollback_supported BOOLEAN NOT NULL DEFAULT FALSE;`);
+      await tx.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';`);
+      await tx.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'problem';`);
+      await tx.query(`ALTER TABLE issues ADD COLUMN IF NOT EXISTS customer_id TEXT NOT NULL DEFAULT '';`);
+      await tx.query(`ALTER TABLE issues ADD COLUMN IF NOT EXISTS ticket_type TEXT NOT NULL DEFAULT 'problem';`);
+      await tx.query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE reservations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;`);
+
+      await tx.query(`
+        CREATE TABLE IF NOT EXISTS realtime_events (
+          seq BIGSERIAL PRIMARY KEY,
+          id TEXT NOT NULL DEFAULT '',
+          event_type TEXT NOT NULL DEFAULT '',
+          entity_type TEXT NOT NULL DEFAULT '',
+          record_id TEXT NOT NULL DEFAULT '',
+          operation TEXT NOT NULL DEFAULT '',
+          payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+          actor_id TEXT NOT NULL DEFAULT '',
+          actor_name TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+      `);
+      await tx.query(`
+        CREATE TABLE IF NOT EXISTS idempotency_requests (
+          idempotency_key TEXT PRIMARY KEY,
+          action TEXT NOT NULL DEFAULT '',
+          response JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+      `);
+
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_sessions_expires_revoked ON sessions (expires_at, is_revoked);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_notifications_deleted_at ON notifications (deleted_at, created_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_sync_tombstones_deleted_at ON sync_tombstones (deleted_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_sheets_outbox_status_created ON sheets_mirror_outbox (status, created_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_customer_note_attachments_note ON customer_note_attachments (note_id, created_at ASC) WHERE deleted_at IS NULL;`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_customer_note_history_note ON customer_note_history (note_id, created_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_customers_phone_norm ON customers (normalized_phone) WHERE normalized_phone <> '';`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_customers_id_num ON customers (id_number) WHERE id_number <> '';`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_realtime_events_created ON realtime_events (created_at DESC);`);
+
+      await runWithSavepoint(tx, 'prune_stale_sessions', async () => {
+        await tx.query(
+          `DELETE FROM sessions
+           WHERE expires_at < NOW() - INTERVAL '7 days'
+              OR (is_revoked = TRUE AND last_seen_at < NOW() - INTERVAL '7 days')`
+        );
+      }, undefined);
+    }
+  },
+  {
+    id: '2026_11_27_004_health_center_runs',
+    description: 'Create health_center_runs persistence table and index for Developer Database Health Center',
+    async run(tx) {
+      await tx.query(`
+        CREATE TABLE IF NOT EXISTS health_center_runs (
+          id TEXT PRIMARY KEY,
+          scope TEXT NOT NULL DEFAULT 'all',
+          overall_status TEXT NOT NULL DEFAULT 'unknown',
+          triggered_by_id TEXT NOT NULL DEFAULT '',
+          triggered_by_name TEXT NOT NULL DEFAULT '',
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+          sections_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+          error_message TEXT NOT NULL DEFAULT '',
+          started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          finished_at TIMESTAMPTZ DEFAULT NULL
+        );
+      `);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_health_center_runs_started ON health_center_runs (started_at DESC);`);
+    }
+  },
+  {
+    id: '2026_11_27_005_audit_indexes_and_constraints',
+    description: 'Ensure partial active reservation, integrity issue run_id, error_logs, and sync_log lookup indexes exist idempotently',
+    async run(tx) {
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_reservations_deleted_at ON reservations (deleted_at) WHERE deleted_at IS NULL;`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_reservations_src_id_active ON reservations (source_reservation_id) WHERE deleted_at IS NULL AND COALESCE(source_reservation_id, '') <> '';`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_run ON data_integrity_issues (run_id, created_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_error_logs_created ON error_logs (created_at DESC);`);
+      await tx.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_started ON sync_log (started_at DESC);`);
+    }
+  },
+  {
+    id: '2026_11_27_006_integrity_schema_and_extensions_recalc',
+    description: 'Enforce ON DELETE RESTRICT on customer_note_history.note_id, align customers.last_contact_ts TIMESTAMPTZ, verify notifications unique index & outbox columns, and recalculate reservations.extensions_count from extensions rows',
+    async run(tx) {
+      await tx.query(`ALTER TABLE data_integrity_runs ADD COLUMN IF NOT EXISTS run_mode TEXT NOT NULL DEFAULT 'manual';`);
+      await tx.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAULT NULL;`);
+
+      // Ensure customers.last_contact_ts is TIMESTAMPTZ even if created earlier as TEXT
+      await runWithSavepoint(tx, 'mig006_last_contact_ts_type', async () => {
+        const colQ = await tx.query<{ data_type: string }>(
+          `SELECT data_type FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = 'customers' AND column_name = 'last_contact_ts'
+           LIMIT 1`
+        );
+        const dt = String(colQ?.rows?.[0]?.data_type || '').toLowerCase();
+        if (dt && dt !== 'timestamp with time zone') {
+          await tx.query(
+            `ALTER TABLE customers
+             ALTER COLUMN last_contact_ts TYPE TIMESTAMPTZ
+             USING CASE
+               WHEN BTRIM(COALESCE(last_contact_ts::text, '')) ~ '^\\d{4}-\\d{2}-\\d{2}'
+                 THEN last_contact_ts::timestamptz
+               ELSE NULL::timestamptz
+             END;`
+          );
+        }
+      }, undefined);
+
+      // Ensure notifications deduplication & event_key partial unique index exist
+      await runWithSavepoint(tx, 'mig006_notifications_idx', async () => {
+        await ensureNotificationsSchemaAndIndexes(tx);
+      }, undefined);
+
+      // Enforce ON DELETE RESTRICT FK on customer_note_history.note_id -> customer_notes(id) non-destructively
+      await runWithSavepoint(tx, 'mig006_cnh_fk_restrict', async () => {
+        const fkQ = await tx.query<{ conname: string; condef: string }>(
+          `SELECT c.conname, pg_get_constraintdef(c.oid) AS condef
+           FROM pg_constraint c
+           JOIN pg_class tbl ON tbl.oid = c.conrelid
+           JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+           WHERE ns.nspname = 'public'
+             AND tbl.relname = 'customer_note_history'
+             AND c.contype = 'f'`
+        );
+        let hasRestrictFk = false;
+        for (const fk of fkQ?.rows || []) {
+          const def = String(fk.condef || '');
+          const name = String(fk.conname || '');
+          if (/REFERENCES\s+customer_notes\s*\(/i.test(def)) {
+            if (/ON\s+DELETE\s+CASCADE/i.test(def)) {
+              const safeIdent = `"${name.replace(/"/g, '""')}"`;
+              await tx.query(`ALTER TABLE customer_note_history DROP CONSTRAINT IF EXISTS ${safeIdent};`);
+            } else {
+              hasRestrictFk = true;
+            }
+          }
+        }
+        if (!hasRestrictFk) {
+          const orphanQ = await tx.query<{ cnt: number }>(
+            `SELECT COUNT(*)::int AS cnt
+             FROM customer_note_history h
+             LEFT JOIN customer_notes n ON n.id = h.note_id
+             WHERE n.id IS NULL`
+          );
+          const orphanCount = Number(orphanQ?.rows?.[0]?.cnt || 0);
+          await tx.query(
+            `ALTER TABLE customer_note_history
+             ADD CONSTRAINT fk_customer_note_history_note_id
+             FOREIGN KEY (note_id) REFERENCES customer_notes(id) ON DELETE RESTRICT NOT VALID;`
+          );
+          if (orphanCount === 0) {
+            await tx.query(`ALTER TABLE customer_note_history VALIDATE CONSTRAINT fk_customer_note_history_note_id;`);
+          }
+        }
+      }, undefined);
+
+      // Align sheets_mirror_outbox operational columns and claim index
+      await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ DEFAULT NULL;`);
+      await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS worker_id TEXT NOT NULL DEFAULT '';`);
+      await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 8;`);
+      await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+      await tx.query(
+        `CREATE INDEX IF NOT EXISTS idx_sheets_outbox_pending_entity
+         ON sheets_mirror_outbox (status, next_retry_at, created_at ASC)
+         WHERE status IN ('pending', 'retry', 'processing');`
+      );
+
+      // Idempotent recalculation of extensions_count & has_extensions from extensions table
+      await recalculateReservationExtensionCounts(tx);
+    }
+  }
+];
+
+export async function runAuditAndHealthMigrations(executor: DbExecutor): Promise<string[]> {
+  const safeExec = ensureDbExecutor(executor);
+  const appliedIds: string[] = [];
+  let alreadyApplied = new Set<string>();
+  try {
+    const res = await safeExec.query<{ id: string }>(`SELECT id FROM schema_migrations`);
+    alreadyApplied = new Set((res?.rows || []).map((r) => String(r.id || '')));
+  } catch {
+    return appliedIds;
+  }
+
+  for (const mig of AUDIT_AND_HEALTH_MIGRATIONS) {
+    if (alreadyApplied.has(mig.id)) continue;
+    try {
+      await safeExec.withTransaction(async (tx) => {
+        await mig.run(tx);
+        await tx.query(
+          `INSERT INTO schema_migrations (id, description, checksum, applied_at)
+           VALUES ($1, $2, 'v1', NOW())
+           ON CONFLICT (id) DO NOTHING`,
+          [mig.id, mig.description]
+        );
+      });
+      appliedIds.push(mig.id);
+    } catch (err: any) {
+      console.warn(`Audit migration ${mig.id} deferred:`, String(err?.message || err).slice(0, 200));
+    }
+  }
+  return appliedIds;
+}
+
 export async function ensureSchemaInitialized(executor: DbExecutor): Promise<void> {
   if (schemaInitialized) return;
   if (schemaInitPromise) return schemaInitPromise;
@@ -827,6 +1086,7 @@ export async function ensureSchemaInitialized(executor: DbExecutor): Promise<voi
         }
       }
       await runVersionedMigrations(safeExec);
+      await runAuditAndHealthMigrations(safeExec);
       await ensureNotificationsSchemaAndIndexes(safeExec);
       await runLifecycleAndNationalIdMaintenance(safeExec);
       schemaInitialized = true;
@@ -1331,6 +1591,113 @@ export async function runLifecycleAndNationalIdMaintenance(executor: DbExecutor)
   } catch {
     // Non-fatal
   }
+}
+
+export async function recalculateReservationExtensionCounts(
+  client: DbClient,
+  targetReservationIds?: string[]
+): Promise<{ linkedOrphans: number; updatedCounts: number }> {
+  const cleanIds = Array.isArray(targetReservationIds)
+    ? Array.from(new Set(targetReservationIds.map((x) => String(x || '').trim()).filter(Boolean)))
+    : [];
+
+  return runWithSavepoint(
+    client,
+    'recalc_ext_counts',
+    async () => {
+      // 1) Non-destructively link extensions missing a valid reservation_id to their parent reservation
+      const linkSql = cleanIds.length > 0
+        ? `UPDATE extensions e
+           SET reservation_id = r.id
+           FROM reservations r
+           WHERE r.deleted_at IS NULL
+             AND r.id = ANY($1::text[])
+             AND (
+               e.reservation_id IS NULL
+               OR BTRIM(e.reservation_id) = ''
+               OR NOT EXISTS (SELECT 1 FROM reservations chk WHERE chk.id = e.reservation_id AND chk.deleted_at IS NULL)
+             )
+             AND (
+               (COALESCE(BTRIM(e.reservation_number), '') <> '' AND (
+                 e.reservation_number = r.reservation_number
+                 OR REGEXP_REPLACE(BTRIM(e.reservation_number), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.reservation_number, '')), '^#+', '')
+                 OR REGEXP_REPLACE(BTRIM(e.reservation_number), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.source_reservation_id, '')), '^#+', '')
+               ))
+               OR (COALESCE(BTRIM(e.source_reservation_id), '') <> '' AND (
+                 e.source_reservation_id = r.source_reservation_id
+                 OR REGEXP_REPLACE(BTRIM(e.source_reservation_id), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.source_reservation_id, '')), '^#+', '')
+                 OR REGEXP_REPLACE(BTRIM(e.source_reservation_id), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.reservation_number, '')), '^#+', '')
+               ))
+             )
+             AND e.reservation_id IS DISTINCT FROM r.id`
+        : `UPDATE extensions e
+           SET reservation_id = r.id
+           FROM reservations r
+           WHERE r.deleted_at IS NULL
+             AND (
+               e.reservation_id IS NULL
+               OR BTRIM(e.reservation_id) = ''
+               OR NOT EXISTS (SELECT 1 FROM reservations chk WHERE chk.id = e.reservation_id AND chk.deleted_at IS NULL)
+             )
+             AND (
+               (COALESCE(BTRIM(e.reservation_number), '') <> '' AND (
+                 e.reservation_number = r.reservation_number
+                 OR REGEXP_REPLACE(BTRIM(e.reservation_number), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.reservation_number, '')), '^#+', '')
+                 OR REGEXP_REPLACE(BTRIM(e.reservation_number), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.source_reservation_id, '')), '^#+', '')
+               ))
+               OR (COALESCE(BTRIM(e.source_reservation_id), '') <> '' AND (
+                 e.source_reservation_id = r.source_reservation_id
+                 OR REGEXP_REPLACE(BTRIM(e.source_reservation_id), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.source_reservation_id, '')), '^#+', '')
+                 OR REGEXP_REPLACE(BTRIM(e.source_reservation_id), '^#+', '') = REGEXP_REPLACE(BTRIM(COALESCE(r.reservation_number, '')), '^#+', '')
+               ))
+             )
+             AND e.reservation_id IS DISTINCT FROM r.id`;
+
+      const linkRes = await client.query(linkSql, cleanIds.length > 0 ? [cleanIds] : undefined);
+      const linkedOrphans = Number((linkRes as any)?.rowCount ?? 0);
+
+      // 2) Recompute exact extensions_count & has_extensions from extensions table ONLY where mismatched
+      const recalcSql = cleanIds.length > 0
+        ? `WITH ext_counts AS (
+             SELECT r.id AS res_id, COUNT(e.id)::int AS actual_cnt
+             FROM reservations r
+             LEFT JOIN extensions e ON e.reservation_id = r.id
+             WHERE r.deleted_at IS NULL
+               AND r.id = ANY($1::text[])
+             GROUP BY r.id
+           )
+           UPDATE reservations r
+           SET extensions_count = ec.actual_cnt,
+               has_extensions = (ec.actual_cnt > 0)
+           FROM ext_counts ec
+           WHERE r.id = ec.res_id
+             AND (
+               COALESCE(r.extensions_count, 0) IS DISTINCT FROM ec.actual_cnt
+               OR COALESCE(r.has_extensions, FALSE) IS DISTINCT FROM (ec.actual_cnt > 0)
+             )`
+        : `WITH ext_counts AS (
+             SELECT r.id AS res_id, COUNT(e.id)::int AS actual_cnt
+             FROM reservations r
+             LEFT JOIN extensions e ON e.reservation_id = r.id
+             WHERE r.deleted_at IS NULL
+             GROUP BY r.id
+           )
+           UPDATE reservations r
+           SET extensions_count = ec.actual_cnt,
+               has_extensions = (ec.actual_cnt > 0)
+           FROM ext_counts ec
+           WHERE r.id = ec.res_id
+             AND (
+               COALESCE(r.extensions_count, 0) IS DISTINCT FROM ec.actual_cnt
+               OR COALESCE(r.has_extensions, FALSE) IS DISTINCT FROM (ec.actual_cnt > 0)
+             )`;
+
+      const updRes = await client.query(recalcSql, cleanIds.length > 0 ? [cleanIds] : undefined);
+      const updatedCounts = Number((updRes as any)?.rowCount ?? 0);
+      return { linkedOrphans, updatedCounts };
+    },
+    { linkedOrphans: 0, updatedCounts: 0 }
+  );
 }
 
 export function resetSchemaInitFlagForTesting(): void {

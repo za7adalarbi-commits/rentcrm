@@ -1,7 +1,7 @@
 import { crmCore, generateId, requireApiAccess, type AuthSession } from './auth.js';
 import { ensureDbExecutor, runWithSavepoint, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
-import { resolveServerConfig } from './serverConfig.js';
+import { buildRentalGateEndpointUrl, normalizeRgApiBaseUrl, resolveServerConfig } from './serverConfig.js';
 import { extractRentalGatePagePayload } from './syncService.js';
 
 export type DataIntegrityScope = 'reservations' | 'extensions' | 'cancelled' | 'company_changes';
@@ -42,37 +42,146 @@ function normalizeScopes(raw: unknown): DataIntegrityScope[] {
   return clean.length > 0 ? Array.from(new Set(clean)) : [...VALID_SCOPES];
 }
 
+function cleanKey(v: unknown): string {
+  return String(v ?? '').trim().replace(/^#+/, '').trim();
+}
+
 async function fetchRgEndpointAll(
   baseApi: string,
   headers: Record<string, string>,
   endpoint: string,
   fetchFn: typeof fetch,
   pageSize = 200,
-  maxPages = 40
+  maxPages = 80
 ): Promise<{ items: any[]; ok: boolean; reportedTotal: number | null; error: string }> {
   const items: any[] = [];
   const seenKeys = new Set<string>();
   let reportedTotal: number | null = null;
   let error = '';
+  let firstPageSigs: string[] = [];
+  let zeroBased = true;
+  let nextUrlOverride = '';
+  let nextCursor = '';
+  const normalizedBase = normalizeRgApiBaseUrl(baseApi);
+  const baseWithSlash = `${normalizedBase}/`;
+  let baseOrigin = '';
+  try {
+    baseOrigin = new URL(normalizedBase).origin;
+  } catch {
+    baseOrigin = '';
+  }
 
-  for (let page = 0; page < maxPages; page++) {
-    const url = `${baseApi}/${endpoint}?page=${page}&size=${pageSize}`;
-    try {
-      const resp = await fetchFn(url, { method: 'GET', headers });
-      if (!resp.ok) {
-        error = `HTTP_${resp.status}`;
-        return { items, ok: false, reportedTotal, error };
+  for (let iter = 0; iter < maxPages; iter++) {
+    const pageNum = zeroBased ? iter : iter + 1;
+    let url = buildRentalGateEndpointUrl(normalizedBase, endpoint, { page: pageNum, size: pageSize });
+    if (nextUrlOverride) {
+      url = nextUrlOverride;
+    } else if (nextCursor) {
+      url = buildRentalGateEndpointUrl(normalizedBase, endpoint, { page: pageNum, size: pageSize, cursor: nextCursor });
+    }
+
+    let resp: Response | null = null;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        resp = await fetchFn(url, { method: 'GET', headers });
+        if (resp.status >= 500 && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
+        break;
+      } catch (err: any) {
+        lastErr = err;
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
       }
+    }
+
+    if (!resp) {
+      error = str(lastErr?.message || 'FETCH_ERROR').slice(0, 200);
+      return { items, ok: false, reportedTotal, error };
+    }
+    if (!resp.ok) {
+      error = `HTTP_${resp.status}`;
+      return { items, ok: false, reportedTotal, error };
+    }
+
+    try {
       const json: any = await resp.json();
-      const parsed = extractRentalGatePagePayload(json, page, pageSize);
+      const parsed = extractRentalGatePagePayload(json, pageNum, pageSize);
       if (parsed.hasExplicitTotalElements) {
         reportedTotal = Math.max(reportedTotal ?? 0, parsed.totalElements);
       }
+
+      const batchSigs = parsed.rows.map(
+        (row: any) =>
+          cleanKey(row?.extendId || row?.extensionNumber || row?.extension_number) ||
+          cleanKey(crmCore.extractSourceReservationId(row) || row?.reservationId || row?.id || crmCore.extractReservationNumber(row))
+      );
+
+      if (iter === 0) {
+        firstPageSigs = batchSigs.filter(Boolean);
+      } else if (
+        iter === 1 &&
+        zeroBased &&
+        firstPageSigs.length > 0 &&
+        batchSigs.length > 0 &&
+        batchSigs.length === firstPageSigs.length &&
+        batchSigs.every((sig: string, idx: number) => sig && sig === firstPageSigs[idx])
+      ) {
+        // Clamp 1-based API where page=0 and page=1 return identical page 1 records
+        zeroBased = false;
+        const page2Num = 2;
+        if (parsed.totalPages && page2Num > parsed.totalPages) break;
+        if (reportedTotal !== null && items.length >= reportedTotal) break;
+        const p2Url = buildRentalGateEndpointUrl(normalizedBase, endpoint, { page: page2Num, size: pageSize });
+        const p2Resp = await fetchFn(p2Url, { method: 'GET', headers });
+        if (!p2Resp.ok) {
+          error = `HTTP_${p2Resp.status}`;
+          return { items, ok: false, reportedTotal, error };
+        }
+        const p2Json: any = await p2Resp.json();
+        const p2Parsed = extractRentalGatePagePayload(p2Json, page2Num, pageSize);
+        let p2Added = 0;
+        for (const row of p2Parsed.rows) {
+          const k =
+            cleanKey(row?.extendId || row?.extensionNumber || row?.extension_number) ||
+            cleanKey(crmCore.extractSourceReservationId(row) || row?.reservationId || row?.id || crmCore.extractReservationNumber(row));
+          if (k) {
+            if (seenKeys.has(k)) continue;
+            seenKeys.add(k);
+          }
+          items.push(row);
+          p2Added++;
+        }
+        if (p2Parsed.nextPageUrl) {
+          try {
+            const u = new URL(p2Parsed.nextPageUrl, baseWithSlash);
+            if (!baseOrigin || u.origin === baseOrigin) nextUrlOverride = u.toString();
+          } catch {
+            nextUrlOverride = '';
+          }
+        } else {
+          nextUrlOverride = '';
+        }
+        nextCursor = p2Parsed.nextCursor || '';
+        const p2HasMore =
+          Boolean(nextUrlOverride || nextCursor) ||
+          (reportedTotal !== null && reportedTotal > 0 && items.length < reportedTotal && p2Parsed.rows.length > 0) ||
+          Boolean(p2Parsed.totalPages && page2Num < p2Parsed.totalPages && p2Parsed.rows.length > 0);
+        if (p2Parsed.rows.length === 0 || (p2Parsed.isLast && !p2HasMore) || (p2Added === 0 && !p2HasMore)) {
+          break;
+        }
+        continue;
+      }
+
       let added = 0;
       for (const row of parsed.rows) {
         const key =
-          str(row?.extendId || row?.extensionNumber || row?.extension_number) ||
-          str(crmCore.extractSourceReservationId(row) || row?.reservationId || row?.id || crmCore.extractReservationNumber(row));
+          cleanKey(row?.extendId || row?.extensionNumber || row?.extension_number) ||
+          cleanKey(crmCore.extractSourceReservationId(row) || row?.reservationId || row?.id || crmCore.extractReservationNumber(row));
         if (key) {
           if (seenKeys.has(key)) continue;
           seenKeys.add(key);
@@ -80,12 +189,29 @@ async function fetchRgEndpointAll(
         items.push(row);
         added++;
       }
-      const hasMore = reportedTotal !== null && reportedTotal > 0 && items.length < reportedTotal && parsed.rows.length > 0;
+
+      if (parsed.nextPageUrl) {
+        try {
+          const u = new URL(parsed.nextPageUrl, baseWithSlash);
+          nextUrlOverride = !baseOrigin || u.origin === baseOrigin ? u.toString() : '';
+        } catch {
+          nextUrlOverride = '';
+        }
+      } else {
+        nextUrlOverride = '';
+      }
+      nextCursor = parsed.nextCursor || '';
+
+      const effectivePageOneBased = zeroBased ? iter + 1 : pageNum;
+      const hasMore =
+        Boolean(nextUrlOverride || nextCursor) ||
+        (reportedTotal !== null && reportedTotal > 0 && items.length < reportedTotal && parsed.rows.length > 0) ||
+        Boolean(parsed.totalPages && effectivePageOneBased < parsed.totalPages && parsed.rows.length > 0);
       if (parsed.rows.length === 0 || (parsed.isLast && !hasMore) || (added === 0 && !hasMore)) {
         break;
       }
     } catch (err: any) {
-      error = str(err?.message || 'FETCH_ERROR').slice(0, 200);
+      error = str(err?.message || 'FETCH_PARSE_ERROR').slice(0, 200);
       return { items, ok: false, reportedTotal, error };
     }
   }
@@ -199,11 +325,21 @@ export async function runDataIntegrityCheck(
       is_source_cancelled: boolean | null;
       is_source_rejected: boolean | null;
       rcc_status: string;
+      customer_name?: string;
+      customer_phone?: string;
+      start_date?: string;
+      end_date?: string;
+      car_name?: string;
+      company_name?: string;
+      extensions_count?: number;
     }>(
       `SELECT id, source_reservation_id, reservation_number, reference_number,
               original_status_code, original_status_ar, internal_status,
-              is_source_cancelled, is_source_rejected, rcc_status
-       FROM reservations`
+              is_source_cancelled, is_source_rejected, rcc_status,
+              customer_name, customer_phone, start_date, end_date,
+              car_name, company_name, extensions_count
+       FROM reservations
+       WHERE deleted_at IS NULL`
     );
     const neonReservations = dbResRows.rows || [];
 
@@ -211,13 +347,19 @@ export async function runDataIntegrityCheck(
     const neonExtensionsCount = Number(dbExtCountRes.rows?.[0]?.cnt || 0);
 
     const issues: DataIntegrityIssueDraft[] = [];
-    const neonBySrcId = new Map<string, typeof neonReservations[number]>();
+    const seenIssueKeys = new Set<string>();
+    const pushIssue = (iss: DataIntegrityIssueDraft) => {
+      const dedupKey = `${iss.discrepancyType}|${cleanKey(iss.reservationNumber) || cleanKey(iss.reservationId)}|${iss.fieldName}`;
+      if (seenIssueKeys.has(dedupKey)) return;
+      seenIssueKeys.add(dedupKey);
+      issues.push(iss);
+    };
+
     for (const r of neonReservations) {
-      const sid = str(r.source_reservation_id || r.reservation_number);
-      if (sid) neonBySrcId.set(sid, r);
-      const cleanNum = str(r.reservation_number);
+      const sid = cleanKey(r.source_reservation_id || r.reservation_number);
+      const cleanNum = cleanKey(r.reservation_number);
       if (cleanNum && sid && cleanNum !== sid && /^RG-/i.test(cleanNum)) {
-        issues.push({
+        pushIssue({
           reservationId: str(r.id),
           reservationNumber: sid,
           discrepancyType: 'rg_number_in_reservation_number',
@@ -232,11 +374,14 @@ export async function runDataIntegrityCheck(
       }
     }
 
-    let rgTotalCount = neonReservations.length;
+    let rgTotalCount = 0;
     let reviewedCount = neonReservations.length;
-    let rgExtensionsCount = neonExtensionsCount;
+    let rgExtensionsCount = 0;
     let rgCancelledCount = 0;
     let rgCompanyChangesCount = 0;
+    let matchedCount = 0;
+    let rgChecked = false;
+    let runStatus: 'completed' | 'partial' = 'completed';
     const scopeResults: Record<string, any> = {};
 
     if (rgBaseUrl && rgToken) {
@@ -260,55 +405,45 @@ export async function runDataIntegrityCheck(
 
       if (resOut) {
         scopeResults.reservations = { ok: resOut.ok, count: resOut.items.length, reportedTotal: resOut.reportedTotal, error: resOut.error };
+        if (!resOut.ok && resOut.items.length === 0) {
+          throw new Error(`RG_INTEGRITY_FETCH_FAILED: ${resOut.error || 'تعذر جلب الحجوزات من Rental Gate API'}`);
+        }
+        rgChecked = true;
         rgTotalCount = resOut.reportedTotal ?? resOut.items.length;
         reviewedCount = Math.max(rgTotalCount, neonReservations.length);
-        const rgSrcSet = new Set<string>();
-        for (const item of resOut.items) {
-          const sid = str(crmCore.extractSourceReservationId(item) || item?.reservationId || item?.id);
-          if (!sid) continue;
-          rgSrcSet.add(sid);
-          const dbRow = neonBySrcId.get(sid);
-          if (!dbRow) {
-            issues.push({
-              reservationId: '',
-              reservationNumber: sid,
-              discrepancyType: 'missing_in_neon',
-              severity: 'high',
-              sourceScope: 'reservations',
-              fieldName: 'source_reservation_id',
-              rgValue: sid,
-              neonValue: '',
-              rgSnapshot: { reservationId: sid, status: item?.reservationStatus || item?.status || '' },
-              neonSnapshot: {}
-            });
-          }
+        if (!resOut.ok) {
+          runStatus = 'partial';
         }
-        if (resOut.ok && resOut.items.length > 0) {
-          for (const dbRow of neonReservations) {
-            const sid = str(dbRow.source_reservation_id);
-            if (sid && !rgSrcSet.has(sid)) {
-              issues.push({
-                reservationId: str(dbRow.id),
-                reservationNumber: str(dbRow.reservation_number || sid),
-                discrepancyType: 'extra_in_neon',
-                severity: 'low',
-                sourceScope: 'reservations',
-                fieldName: 'source_reservation_id',
-                rgValue: '',
-                neonValue: sid,
-                rgSnapshot: {},
-                neonSnapshot: { id: dbRow.id, reservationNumber: dbRow.reservation_number, status: dbRow.internal_status }
-              });
-            }
-          }
+
+        const cmpOut = typeof crmCore?.compareRgAndNeonReservations === 'function'
+          ? crmCore.compareRgAndNeonReservations(resOut.items, neonReservations)
+          : { issues: [], matchedCount: 0 };
+        const cmpIssues: any[] = Array.isArray(cmpOut) ? cmpOut : (Array.isArray(cmpOut?.issues) ? cmpOut.issues : []);
+        matchedCount = Number(cmpOut?.matchedCount || 0);
+
+        for (const ci of cmpIssues) {
+          if (!resOut.ok && ci.discrepancyType === 'missing_in_rg') continue;
+          pushIssue({
+            reservationId: str(ci.reservationId),
+            reservationNumber: str(ci.reservationNumber),
+            discrepancyType: str(ci.discrepancyType),
+            severity: (ci.severity === 'high' || ci.severity === 'low' ? ci.severity : 'medium'),
+            sourceScope: str(ci.sourceScope || 'reservations'),
+            fieldName: str(ci.fieldName),
+            rgValue: str(ci.rgValue),
+            neonValue: str(ci.neonValue),
+            rgSnapshot: ci.rgSnapshot || {},
+            neonSnapshot: ci.neonSnapshot || {}
+          });
         }
       }
 
       if (extOut) {
         rgExtensionsCount = extOut.reportedTotal ?? extOut.items.length;
         scopeResults.extensions = { ok: extOut.ok, count: rgExtensionsCount, neonCount: neonExtensionsCount, error: extOut.error };
+        if (!extOut.ok) runStatus = 'partial';
         if (extOut.ok && rgExtensionsCount !== neonExtensionsCount) {
-          issues.push({
+          pushIssue({
             reservationId: '',
             reservationNumber: '',
             discrepancyType: 'extensions_count_mismatch',
@@ -326,10 +461,12 @@ export async function runDataIntegrityCheck(
       if (canOut) {
         rgCancelledCount = canOut.reportedTotal ?? canOut.items.length;
         scopeResults.cancelled = { ok: canOut.ok, count: rgCancelledCount, error: canOut.error };
+        if (!canOut.ok) runStatus = 'partial';
       }
       if (rccOut) {
         rgCompanyChangesCount = rccOut.reportedTotal ?? rccOut.items.length;
         scopeResults.company_changes = { ok: rccOut.ok, count: rgCompanyChangesCount, error: rccOut.error };
+        if (!rccOut.ok) runStatus = 'partial';
       }
     } else {
       scopeResults.mode = 'neon_local_audit_only';
@@ -341,8 +478,10 @@ export async function runDataIntegrityCheck(
       runMode,
       triggerType,
       scopes,
+      rgChecked,
       rgTotalCount,
       neonTotalCount: neonReservations.length,
+      matchedCount,
       rgExtensionsCount,
       neonExtensionsCount,
       rgCancelledCount,
@@ -353,13 +492,66 @@ export async function runDataIntegrityCheck(
 
     const finalizedRun = await safeExec.withTransaction(async (tx) => {
       if (issues.length > 0) {
+        const openIssueMap = new Map<string, string>();
+        await runWithSavepoint(
+          tx,
+          'di_open_dedup_lookup',
+          async () => {
+            const openQ = await tx.query<{
+              id: string;
+              discrepancy_type: string;
+              reservation_number: string;
+              reservation_id: string;
+              field_name: string;
+            }>(
+              `SELECT id, discrepancy_type, reservation_number, reservation_id, field_name
+               FROM data_integrity_issues
+               WHERE resolution_status = 'open'`
+            );
+            for (const row of openQ.rows || []) {
+              const dk = `${str(row.discrepancy_type)}|${cleanKey(row.reservation_number || row.reservation_id)}|${str(row.field_name)}`;
+              if (!openIssueMap.has(dk)) openIssueMap.set(dk, str(row.id));
+            }
+          },
+          undefined
+        );
+
         for (let idx = 0; idx < issues.length; idx++) {
           const iss = issues[idx];
+          const dk = `${str(iss.discrepancyType)}|${cleanKey(iss.reservationNumber || iss.reservationId)}|${str(iss.fieldName)}`;
+          const existingOpenId = openIssueMap.get(dk);
           await runWithSavepoint(
             tx,
             `di_issue_${idx}`,
-            () =>
-              tx.query(
+            () => {
+              if (existingOpenId) {
+                return tx.query(
+                  `UPDATE data_integrity_issues
+                   SET run_id = $2,
+                       severity = $3,
+                       source_scope = $4,
+                       rg_value = $5,
+                       neon_value = $6,
+                       rg_snapshot_json = $7::jsonb,
+                       neon_snapshot_json = $8::jsonb,
+                       last_checked_at = NOW(),
+                       updated_at = NOW()
+                   WHERE id = $1`,
+                  [
+                    existingOpenId,
+                    runId,
+                    iss.severity,
+                    iss.sourceScope,
+                    iss.rgValue,
+                    iss.neonValue,
+                    JSON.stringify(iss.rgSnapshot || {}),
+                    JSON.stringify(iss.neonSnapshot || {})
+                  ]
+                );
+              }
+              const newId = generateId('DII');
+              openIssueMap.set(dk, newId);
+              return tx.query(
                 `INSERT INTO data_integrity_issues (
                    id, run_id, reservation_id, reservation_number, discrepancy_type, severity,
                    source_scope, field_name, rg_value, neon_value, rg_snapshot_json, neon_snapshot_json,
@@ -370,7 +562,7 @@ export async function runDataIntegrityCheck(
                    'open', NOW(), NOW(), NOW()
                  )`,
                 [
-                  generateId('DII'),
+                  newId,
                   runId,
                   iss.reservationId,
                   iss.reservationNumber,
@@ -383,7 +575,8 @@ export async function runDataIntegrityCheck(
                   JSON.stringify(iss.rgSnapshot || {}),
                   JSON.stringify(iss.neonSnapshot || {})
                 ]
-              ),
+              );
+            },
             undefined
           );
         }
@@ -391,18 +584,19 @@ export async function runDataIntegrityCheck(
 
       const updRes = await tx.query(
         `UPDATE data_integrity_runs
-         SET status = 'completed',
-             finished_at = $2::timestamptz,
-             duration_ms = $3,
-             rg_total_count = $4,
-             neon_total_count = $5,
-             reviewed_count = $6,
-             discrepancies_count = $7,
-             summary_json = $8::jsonb
+         SET status = $2,
+             finished_at = $3::timestamptz,
+             duration_ms = $4,
+             rg_total_count = $5,
+             neon_total_count = $6,
+             reviewed_count = $7,
+             discrepancies_count = $8,
+             summary_json = $9::jsonb
          WHERE id = $1
          RETURNING *`,
         [
           runId,
+          runStatus,
           finishedAtIso,
           durationMs,
           rgTotalCount,

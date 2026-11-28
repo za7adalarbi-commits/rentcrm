@@ -2,7 +2,14 @@ import crypto from 'node:crypto';
 import type { DbClient, DbExecutor } from './db.js';
 import { getDatabaseUrl } from './db.js';
 import { FIXED_SERVER_CONFIG, type FixedConnectionMode } from './fixedConfig.js';
-import { normalizeMode } from './coreBinding.js';
+import {
+  buildRentalGateEndpointUrl,
+  DEFAULT_RG_API_BASE_URL,
+  normalizeMode,
+  normalizeRgApiBaseUrl
+} from './coreBinding.js';
+
+export { buildRentalGateEndpointUrl, DEFAULT_RG_API_BASE_URL, normalizeRgApiBaseUrl };
 
 export interface ResolvedServerConfig {
   mode: FixedConnectionMode;
@@ -112,11 +119,74 @@ export async function ensureSyncApiSecret(executor: DbExecutor, updatedBy = 'Sys
   return generated;
 }
 
+export interface SyncSecretDiagnostics {
+  configured: boolean;
+  source: 'env' | 'db_encrypted' | 'db_plain' | 'fixed_config' | 'none';
+  length: number;
+  hasEnvWhitespace: boolean;
+}
+
+export async function getSyncSecretDiagnostics(executor?: DbClient): Promise<SyncSecretDiagnostics> {
+  const rawEnv = process.env.SYNC_API_SECRET;
+  const trimmedEnv = String(rawEnv || '').trim();
+  const hasEnvWhitespace = typeof rawEnv === 'string' && rawEnv !== trimmedEnv;
+  if (trimmedEnv) {
+    return {
+      configured: true,
+      source: 'env',
+      length: trimmedEnv.length,
+      hasEnvWhitespace
+    };
+  }
+
+  if (executor) {
+    const map = await readSettingsRows(executor, ['sync_api_secret_enc', 'sync_api_secret']).catch(
+      () => ({} as Record<string, string>)
+    );
+    const decrypted = decryptServerSecret(map.sync_api_secret_enc || '');
+    if (decrypted) {
+      return {
+        configured: true,
+        source: 'db_encrypted',
+        length: decrypted.length,
+        hasEnvWhitespace
+      };
+    }
+    const plain = String(map.sync_api_secret || '').trim();
+    if (plain) {
+      return {
+        configured: true,
+        source: 'db_plain',
+        length: plain.length,
+        hasEnvWhitespace
+      };
+    }
+  }
+
+  const fixed = String(FIXED_SERVER_CONFIG.syncApiSecret || '').trim();
+  if (fixed) {
+    return {
+      configured: true,
+      source: 'fixed_config',
+      length: fixed.length,
+      hasEnvWhitespace
+    };
+  }
+
+  return {
+    configured: false,
+    source: 'none',
+    length: 0,
+    hasEnvWhitespace
+  };
+}
+
 export async function resolveServerConfig(executor: DbClient): Promise<ResolvedServerConfig> {
   const envGasUrl = String(process.env.GAS_WEBAPP_URL || '').trim();
   const envRgToken = String(process.env.RG_TOKEN || '').replace(/^Bearer\s+/i, '').trim();
   const envSyncSecret = String(process.env.SYNC_API_SECRET || '').trim();
-  const envBaseUrl = String(process.env.RG_API_BASE_URL || '').trim().replace(/\/+$/, '');
+  const rawEnvBase = String(process.env.RG_API_BASE_URL || '').trim();
+  const envBaseUrl = rawEnvBase ? normalizeRgApiBaseUrl(rawEnvBase) : '';
   const envMode = normalizeMode(process.env.CONNECTION_MODE);
 
   const map = await readSettingsRows(executor, [
@@ -131,7 +201,8 @@ export async function resolveServerConfig(executor: DbClient): Promise<ResolvedS
   const fixedGasUrl = String(FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
   const fixedRgToken = String(FIXED_SERVER_CONFIG.rgToken || '').replace(/^Bearer\s+/i, '').trim();
   const fixedSyncSecret = String(FIXED_SERVER_CONFIG.syncApiSecret || '').trim();
-  const fixedBaseUrl = String(FIXED_SERVER_CONFIG.rgApiBaseUrl || '').trim().replace(/\/+$/, '');
+  const rawFixedBase = String(FIXED_SERVER_CONFIG.rgApiBaseUrl || '').trim();
+  const fixedBaseUrl = rawFixedBase ? normalizeRgApiBaseUrl(rawFixedBase) : '';
   const fixedMode = normalizeMode(FIXED_SERVER_CONFIG.mode);
 
   const dbMode = normalizeMode(map.connection_mode);
@@ -139,7 +210,8 @@ export async function resolveServerConfig(executor: DbClient): Promise<ResolvedS
   const dbRgToken = decryptServerSecret(map.rg_token_enc || '').replace(/^Bearer\s+/i, '').trim();
   const dbSyncSecret =
     decryptServerSecret(map.sync_api_secret_enc || '') || String(map.sync_api_secret || '').trim();
-  const dbBaseUrl = String(map.rg_api_base_url || '').trim().replace(/\/+$/, '');
+  const rawDbBase = String(map.rg_api_base_url || '').trim();
+  const dbBaseUrl = rawDbBase ? normalizeRgApiBaseUrl(rawDbBase) : '';
 
   const gasWebAppUrl = dbMode === 'sandbox' ? '' : (dbGasUrl || envGasUrl || fixedGasUrl);
   const mode = dbMode || fixedMode || envMode || (getDatabaseUrl() ? 'neon' : (gasWebAppUrl ? 'gas' : 'sandbox'));
@@ -148,7 +220,7 @@ export async function resolveServerConfig(executor: DbClient): Promise<ResolvedS
     mode,
     gasWebAppUrl,
     rgToken: envRgToken || dbRgToken || fixedRgToken,
-    rgApiBaseUrl: dbBaseUrl || envBaseUrl || fixedBaseUrl || 'https://api.rentalgate.net/api',
+    rgApiBaseUrl: normalizeRgApiBaseUrl(dbBaseUrl || envBaseUrl || fixedBaseUrl || DEFAULT_RG_API_BASE_URL),
     syncApiSecret: envSyncSecret || dbSyncSecret || fixedSyncSecret,
     hasEnvGasUrl: Boolean(envGasUrl),
     hasEnvRgToken: Boolean(envRgToken),

@@ -5,10 +5,16 @@ import {
   normalizeAutoSyncConfig
 } from './autoSyncLogic.js';
 import { invalidateAndBumpVersion } from './cache.js';
-import { ensureDbExecutor, runWithSavepoint, type DbClient, type DbExecutor } from './db.js';
+import {
+  ensureDbExecutor,
+  recalculateReservationExtensionCounts,
+  runWithSavepoint,
+  type DbClient,
+  type DbExecutor
+} from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
-import { resolveServerConfig } from './serverConfig.js';
+import { buildRentalGateEndpointUrl, normalizeRgApiBaseUrl, resolveServerConfig } from './serverConfig.js';
 import { upsertCustomersFromReservationsTx } from './customerHelpers.js';
 
 export function extractSyncReservationNumber(raw: any): string {
@@ -1603,6 +1609,23 @@ export async function ingestIncrementalSyncBatch(
         }
       }
 
+      // Recalculate exact extensions_count & has_extensions from extensions rows for all affected reservations
+      const touchedResIds = Array.from(
+        new Set(
+          [
+            ...persistedResList.map((r) => str(r.id)),
+            ...normalizedExts.map((ext) =>
+              str(resIdByRef.get(ext.reservationNumber) || resIdByRef.get(ext.sourceReservationId) || ext.reservationId)
+            )
+          ].filter((id) => Boolean(id) && knownDbResIds.has(id))
+        )
+      );
+      if (touchedResIds.length > 0) {
+        await recalculateReservationExtensionCounts(tx, touchedResIds);
+      } else if (normalizedExts.length > 0) {
+        await recalculateReservationExtensionCounts(tx);
+      }
+
       // Chunked UNNEST inserts for FollowUpHistory (only for reservations that actually succeeded)
       const safeHistoryBatch = historyBatch.filter((h) => !h.reservationNumber || successfullyPersistedRes.has(str(h.reservationNumber)));
       for (const hChunk of chunkList(safeHistoryBatch, 250)) {
@@ -2137,28 +2160,111 @@ export async function enqueueSheetsMirror(
   );
 }
 
+export interface OutboxErrorClassification {
+  permanent: boolean;
+  category: 'auth' | 'sheet_frozen' | 'validation' | 'timeout' | 'rate_limit' | 'upstream_5xx' | 'network' | 'unknown';
+}
+
+export function classifyOutboxMirrorError(errMessage: unknown, httpStatus = 0): OutboxErrorClassification {
+  const msg = String(errMessage || '');
+  if (httpStatus === 401 || httpStatus === 403 || /UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN/i.test(msg)) {
+    return { permanent: true, category: 'auth' };
+  }
+  if (/non-frozen/i.test(msg)) {
+    return { permanent: true, category: 'sheet_frozen' };
+  }
+  if (httpStatus === 400 || /VALIDATION_ERROR|INVALID_GAS_URL|BLOCKED_BULK_DELETE/i.test(msg)) {
+    return { permanent: true, category: 'validation' };
+  }
+  if (httpStatus === 429 || /RATE_LIMIT|TOO MANY REQUESTS/i.test(msg)) {
+    return { permanent: false, category: 'rate_limit' };
+  }
+  if (httpStatus >= 500 || /GAS HTTP 5\d{2}/i.test(msg)) {
+    return { permanent: false, category: 'upstream_5xx' };
+  }
+  if (/AbortError|timeout|ETIMEDOUT|aborted/i.test(msg)) {
+    return { permanent: false, category: 'timeout' };
+  }
+  if (/ECONN|ENOTFOUND|FETCH|NETWORK/i.test(msg)) {
+    return { permanent: false, category: 'network' };
+  }
+  return { permanent: false, category: 'unknown' };
+}
+
 export async function flushSheetsMirrorOutbox(
   executor: DbExecutor,
   fetchFn: typeof fetch = fetch
-): Promise<{ sent: number; failed: number; skipped: boolean }> {
-  const serverCfg = await resolveServerConfig(executor);
+): Promise<{ sent: number; failed: number; skipped: boolean; permanentFailed?: number }> {
+  const safeExec = ensureDbExecutor(executor);
+  const serverCfg = await resolveServerConfig(safeExec);
   const gasUrl = str(serverCfg.gasWebAppUrl);
   const syncSecret = str(serverCfg.syncApiSecret);
   if (!gasUrl || !syncSecret) {
     return { sent: 0, failed: 0, skipped: true };
   }
 
-  const pendingRes = await executor.query(
-    `SELECT * FROM sheets_mirror_outbox
-     WHERE status IN ('pending', 'retry') AND next_retry_at <= NOW()
-     ORDER BY created_at ASC
-     LIMIT 50`
-  );
-  if (pendingRes.rows.length === 0) {
+  const workerId = generateId('OBX_W');
+  const claimedRows = await safeExec.withTransaction(async (tx) => {
+    await runWithSavepoint(
+      tx,
+      'obx_release_stale_locks',
+      () =>
+        tx.query(
+          `UPDATE sheets_mirror_outbox
+           SET status = 'retry',
+               locked_at = NULL,
+               worker_id = '',
+               updated_at = NOW()
+           WHERE status = 'processing'
+             AND locked_at IS NOT NULL
+             AND locked_at < NOW() - INTERVAL '5 minutes'`
+        ),
+      undefined
+    );
+
+    const claimQ = await tx.query(
+      `WITH candidate AS (
+         SELECT o.id
+         FROM sheets_mirror_outbox o
+         WHERE o.status IN ('pending', 'retry')
+           AND o.next_retry_at <= NOW()
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sheets_mirror_outbox prev
+             WHERE prev.entity_type = o.entity_type
+               AND prev.entity_id = o.entity_id
+               AND prev.status IN ('pending', 'retry', 'processing')
+               AND (prev.created_at < o.created_at OR (prev.created_at = o.created_at AND prev.id < o.id))
+           )
+         ORDER BY o.created_at ASC, o.id ASC
+         LIMIT 15
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE sheets_mirror_outbox o
+       SET status = 'processing',
+           locked_at = NOW(),
+           worker_id = $1,
+           updated_at = NOW()
+       FROM candidate
+       WHERE o.id = candidate.id
+       RETURNING o.*`,
+      [workerId]
+    );
+    return claimQ.rows || [];
+  });
+
+  if (claimedRows.length === 0) {
     return { sent: 0, failed: 0, skipped: false };
   }
 
-  const items = pendingRes.rows.map((r) => ({
+  // Chronological order after RETURNING
+  const orderedRows = [...claimedRows].sort((a: any, b: any) => {
+    const ta = a.created_at instanceof Date ? a.created_at.getTime() : Date.parse(String(a.created_at || '')) || 0;
+    const tb = b.created_at instanceof Date ? b.created_at.getTime() : Date.parse(String(b.created_at || '')) || 0;
+    return ta !== tb ? ta - tb : str(a.id).localeCompare(str(b.id));
+  });
+
+  const items = orderedRows.map((r: any) => ({
     id: r.id,
     entityType: r.entity_type,
     entityId: r.entity_id,
@@ -2166,8 +2272,24 @@ export async function flushSheetsMirrorOutbox(
     payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {})
   }));
 
+  if (!/^https?:\/\//i.test(gasUrl)) {
+    const ids = items.map((x) => x.id);
+    await safeExec.query(
+      `UPDATE sheets_mirror_outbox
+       SET status = 'failed',
+           locked_at = NULL,
+           worker_id = '',
+           last_error = 'INVALID_GAS_URL: رابط Google Apps Script غير صالح',
+           updated_at = NOW()
+       WHERE id = ANY($1::text[])`,
+      [ids]
+    );
+    return { sent: 0, failed: ids.length, skipped: false, permanentFailed: ids.length };
+  }
+
+  let lastHttpStatus = 0;
   const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 6500) : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 25000) : null;
   try {
     const resp = await fetchFn(gasUrl, {
       method: 'POST',
@@ -2180,6 +2302,7 @@ export async function flushSheetsMirrorOutbox(
       })
     });
     if (timer) clearTimeout(timer);
+    lastHttpStatus = resp.status;
     const text = await resp.text();
     let parsed: any = null;
     try {
@@ -2192,9 +2315,15 @@ export async function flushSheetsMirrorOutbox(
     }
 
     const ids = items.map((x) => x.id);
-    await executor.query(
+    await safeExec.query(
       `UPDATE sheets_mirror_outbox
-       SET status = 'sent', processed_at = NOW(), last_error = ''
+       SET status = 'sent',
+           processed_at = NOW(),
+           synced_at = NOW(),
+           updated_at = NOW(),
+           locked_at = NULL,
+           worker_id = '',
+           last_error = ''
        WHERE id = ANY($1::text[])`,
       [ids]
     );
@@ -2202,21 +2331,39 @@ export async function flushSheetsMirrorOutbox(
   } catch (err: any) {
     if (timer) clearTimeout(timer);
     const errMsg = String(err?.message || 'MIRROR_FAILED').slice(0, 400);
-    for (const row of pendingRes.rows) {
+    const cls = classifyOutboxMirrorError(errMsg, lastHttpStatus);
+    let permanentFailed = 0;
+
+    for (const row of orderedRows) {
       const nextRetryCount = num(row.retry_count, 0) + 1;
-      const dead = nextRetryCount >= 8;
-      const delaySeconds = Math.min(3600, Math.pow(2, nextRetryCount) * 15);
-      await executor.query(
+      const maxRetries = Math.max(1, num(row.max_retries, 8));
+      const isPermanent = cls.permanent;
+      const dead = isPermanent || nextRetryCount >= maxRetries;
+      if (isPermanent) permanentFailed++;
+      const jitter = Math.floor(Math.random() * 8);
+      const delaySeconds = isPermanent
+        ? 0
+        : Math.min(1800, Math.pow(2, nextRetryCount) * 15) + jitter;
+      await safeExec.query(
         `UPDATE sheets_mirror_outbox
          SET status = $2,
              retry_count = $3,
              last_error = $4,
-             next_retry_at = NOW() + ($5 || ' seconds')::interval
+             locked_at = NULL,
+             worker_id = '',
+             updated_at = NOW(),
+             next_retry_at = CASE WHEN $2 = 'failed' THEN NOW() ELSE NOW() + ($5 || ' seconds')::interval END
          WHERE id = $1`,
         [row.id, dead ? 'failed' : 'retry', nextRetryCount, errMsg, String(delaySeconds)]
       ).catch(() => undefined);
     }
-    return { sent: 0, failed: pendingRes.rows.length, skipped: false };
+    await logBackendError(safeExec, 'syncService', 'flushSheetsMirrorOutbox', err, {
+      batchSize: orderedRows.length,
+      permanent: cls.permanent,
+      category: cls.category,
+      httpStatus: lastHttpStatus
+    }).catch(() => undefined);
+    return { sent: 0, failed: orderedRows.length, skipped: false, permanentFailed };
   }
 }
 
@@ -2804,7 +2951,7 @@ export async function pullFromRentalGateDirect(
       throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم).');
     }
 
-    const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
+    const baseApi = normalizeRgApiBaseUrl(serverCfg.rgApiBaseUrl);
     let baseOrigin = '';
     try {
       baseOrigin = new URL(baseApi).origin;
@@ -2902,7 +3049,7 @@ export async function pullFromRentalGateDirect(
           explicitNextUrl ||
           nextCursorUrl ||
           nextOffsetUrl ||
-          `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
+          buildRentalGateEndpointUrl(baseApi, endpoint, { page: step, size: pageSize });
         if (visitedUrls.has(targetUrl)) {
           if (latestReportedTotalElements !== null && latestReportedTotalElements > 0 && items.length < latestReportedTotalElements) {
             complete = false;
@@ -3019,15 +3166,19 @@ export async function pullFromRentalGateDirect(
         }
         if (!explicitNextUrl && parsedPage.nextCursor && !visitedCursors.has(parsedPage.nextCursor)) {
           visitedCursors.add(parsedPage.nextCursor);
-          const curUrl = new URL(`${baseApi}/${endpoint}`);
-          curUrl.searchParams.set('cursor', parsedPage.nextCursor);
-          curUrl.searchParams.set('size', String(pageSize));
-          if (!visitedUrls.has(curUrl.toString())) {
-            nextCursorUrl = curUrl.toString();
+          const cursorUrl = buildRentalGateEndpointUrl(baseApi, endpoint, {
+            cursor: parsedPage.nextCursor,
+            size: pageSize
+          });
+          if (!visitedUrls.has(cursorUrl)) {
+            nextCursorUrl = cursorUrl;
           }
         }
         if (!explicitNextUrl && !nextCursorUrl && parsedPage.nextPageNum !== null && (parsedPage.currentPageNum === null || parsedPage.nextPageNum > parsedPage.currentPageNum)) {
-          const npUrl = `${baseApi}/${endpoint}?page=${encodeURIComponent(String(parsedPage.nextPageNum))}&size=${pageSize}`;
+          const npUrl = buildRentalGateEndpointUrl(baseApi, endpoint, {
+            page: parsedPage.nextPageNum,
+            size: pageSize
+          });
           if (!visitedUrls.has(npUrl)) {
             explicitNextUrl = npUrl;
           }
@@ -3036,7 +3187,10 @@ export async function pullFromRentalGateDirect(
           const nextOffset = parsedPage.offset + parsedPage.rows.length;
           const totalTarget = latestReportedTotalElements ?? parsedPage.totalElements;
           if ((parsedPage.hasExplicitTotalElements && nextOffset < totalTarget) || (!parsedPage.isLast && parsedPage.rows.length >= parsedPage.effectivePageSize)) {
-            const offUrl = `${baseApi}/${endpoint}?offset=${nextOffset}&limit=${parsedPage.effectivePageSize}`;
+            const offUrl = buildRentalGateEndpointUrl(baseApi, endpoint, {
+              offset: nextOffset,
+              limit: parsedPage.effectivePageSize
+            });
             if (!visitedUrls.has(offUrl)) {
               nextOffsetUrl = offUrl;
             }
@@ -3157,7 +3311,7 @@ export async function pullFromRentalGateDirect(
 
     const fetchReservationDetailById = async (sid: string): Promise<Record<string, any> | null> => {
       try {
-        const resp = await fetchWithRetry(`${baseApi}/reservations/${encodeURIComponent(sid)}`);
+        const resp = await fetchWithRetry(buildRentalGateEndpointUrl(baseApi, `reservations/${encodeURIComponent(sid)}`));
         if (!resp.ok) return null;
         const rawJson: any = await resp.json().catch(() => null);
         if (!rawJson || typeof rawJson !== 'object') return null;
@@ -3780,7 +3934,7 @@ export async function retryFailedSyncRecords(
 
   activePullInFlight = true;
   try {
-    const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
+    const baseApi = normalizeRgApiBaseUrl(serverCfg.rgApiBaseUrl);
     const recoveredItems: any[] = [];
     const stillFailedIds: string[] = [];
 
@@ -3788,7 +3942,7 @@ export async function retryFailedSyncRecords(
       const batch = await Promise.all(
         idChunk.map(async (sid) => {
           try {
-            const resp = await fetchFn(`${baseApi}/reservations/${encodeURIComponent(sid)}`, {
+            const resp = await fetchFn(buildRentalGateEndpointUrl(baseApi, `reservations/${encodeURIComponent(sid)}`), {
               method: 'GET',
               headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }
             });
@@ -3849,6 +4003,8 @@ export interface IntegrityRgSnapshotResult {
   companyChangesCount: number;
   incompleteEndpoints: string[];
   pagesFetched: number;
+  reportedTotalElements?: number | null;
+  endpointStats?: Record<string, { ok: boolean; complete: boolean; count: number; reportedTotal: number | null; pages: number; error: string }>;
 }
 
 export async function fetchRentalGateSnapshotReadOnly(
@@ -3862,7 +4018,7 @@ export async function fetchRentalGateSnapshotReadOnly(
     throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم) لتشغيل فحص سلامة البيانات.');
   }
 
-  const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
+  const baseApi = normalizeRgApiBaseUrl(serverCfg.rgApiBaseUrl);
   const fetchJsonWithRetry = async (targetUrl: string): Promise<any> => {
     let lastErr: any = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -3887,7 +4043,11 @@ export async function fetchRentalGateSnapshotReadOnly(
           }
           throw new Error(`RG_API_HTTP_${resp.status}: ${text.slice(0, 140)}`);
         }
-        return await resp.json().catch(() => null);
+        const json: any = await resp.json().catch(() => null);
+        if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
+          throw new Error(str(json.message || json.error || 'RG_API_ERROR'));
+        }
+        return json;
       } catch (err: any) {
         if (timer) clearTimeout(timer);
         lastErr = err;
@@ -3899,7 +4059,7 @@ export async function fetchRentalGateSnapshotReadOnly(
 
   if (opts.singleSourceId) {
     const sid = str(opts.singleSourceId).replace(/^#+/, '').trim();
-    const rawJson = await fetchJsonWithRetry(`${baseApi}/reservations/${encodeURIComponent(sid)}`);
+    const rawJson = await fetchJsonWithRetry(buildRentalGateEndpointUrl(baseApi, `reservations/${encodeURIComponent(sid)}`));
     const inner =
       (rawJson?.data?.reservation && typeof rawJson.data.reservation === 'object' ? rawJson.data.reservation : null) ||
       (rawJson?.reservation && typeof rawJson.reservation === 'object' ? rawJson.reservation : null) ||
@@ -3913,7 +4073,8 @@ export async function fetchRentalGateSnapshotReadOnly(
         cancelledIdsCount: 0,
         companyChangesCount: 0,
         incompleteEndpoints: [],
-        pagesFetched: 1
+        pagesFetched: 1,
+        reportedTotalElements: 0
       };
     }
     const item = {
@@ -3932,7 +4093,8 @@ export async function fetchRentalGateSnapshotReadOnly(
       cancelledIdsCount: 0,
       companyChangesCount: 0,
       incompleteEndpoints: [],
-      pagesFetched: 1
+      pagesFetched: 1,
+      reportedTotalElements: 1
     };
   }
 
@@ -3942,26 +4104,90 @@ export async function fetchRentalGateSnapshotReadOnly(
   const incompleteEndpoints: string[] = [];
   let totalPagesFetched = 0;
 
+  let baseOrigin = '';
+  try {
+    baseOrigin = new URL(baseApi).origin;
+  } catch {
+    baseOrigin = '';
+  }
+  const resolveSafeNextUrl = (rawNext: string): string => {
+    const clean = str(rawNext);
+    if (!clean) return '';
+    try {
+      const resolved = new URL(clean, `${baseApi}/`);
+      if (baseOrigin && resolved.origin !== baseOrigin) return '';
+      return resolved.toString();
+    } catch {
+      return '';
+    }
+  };
+
   const fetchPagedRo = async (endpoint: string, optional: boolean) => {
     const rows: any[] = [];
     const seen = new Set<string>();
-    const visited = new Set<string>();
+    const visitedUrls = new Set<string>();
+    const visitedCursors = new Set<string>();
     let complete = true;
+    let succeeded = false;
+    let errorMsg = '';
+    let pages = 0;
+    let latestReportedTotal: number | null = null;
+    let latestReportedTotalPages: number | null = null;
+    let oneBasedClamped = false;
+    let consecutiveZeroAdded = 0;
+    let explicitNextUrl = '';
+    let nextCursorUrl = '';
+    let nextOffsetUrl = '';
+
     for (let step = 0; step < maxPages; step++) {
-      const url = `${baseApi}/${endpoint}?page=${step}&size=${pageSize}`;
-      if (visited.has(url)) break;
-      visited.add(url);
+      let url = '';
+      let pageParam = oneBasedClamped ? step + 1 : step;
+      let usedExplicitNext = false;
+      let usedCursor = false;
+      let usedOffset = false;
+
+      if (explicitNextUrl) {
+        url = explicitNextUrl;
+        explicitNextUrl = '';
+        usedExplicitNext = true;
+      } else if (nextCursorUrl) {
+        url = nextCursorUrl;
+        nextCursorUrl = '';
+        usedCursor = true;
+      } else if (nextOffsetUrl) {
+        url = nextOffsetUrl;
+        nextOffsetUrl = '';
+        usedOffset = true;
+      } else {
+        if (step === 1 && oneBasedClamped) pageParam = 2;
+        url = buildRentalGateEndpointUrl(baseApi, endpoint, { page: pageParam, size: pageSize });
+      }
+
+      if (visitedUrls.has(url)) break;
+      visitedUrls.add(url);
+
       let json: any;
       try {
         json = await fetchJsonWithRetry(url);
       } catch (err: any) {
-        if (!optional) throw err;
-        incompleteEndpoints.push(`${endpoint} (${str(err?.message).slice(0, 80)})`);
+        errorMsg = str(err?.message || 'FETCH_ERROR').slice(0, 160);
+        if (!optional && rows.length === 0) throw err;
         complete = false;
+        incompleteEndpoints.push(`${endpoint}${errorMsg ? ` (${errorMsg})` : ''}`);
         break;
       }
+
+      succeeded = true;
+      pages++;
       totalPagesFetched++;
-      const parsed = extractRentalGatePagePayload(json, step, pageSize);
+      const parsed = extractRentalGatePagePayload(json, pageParam, pageSize);
+      if (parsed.hasExplicitTotalElements && (parsed.totalElements > 0 || (parsed.totalElements === 0 && parsed.rows.length === 0))) {
+        latestReportedTotal = Math.max(latestReportedTotal ?? 0, parsed.totalElements);
+      }
+      if (parsed.totalPages !== null) {
+        latestReportedTotalPages = Math.max(latestReportedTotalPages ?? 0, parsed.totalPages);
+      }
+
       let added = 0;
       for (const r of parsed.rows) {
         const ek = str(r?.extendId || r?.extensionNumber || r?.extension_number);
@@ -3975,19 +4201,99 @@ export async function fetchRentalGateSnapshotReadOnly(
         rows.push(r);
         added++;
       }
-      if (parsed.isLast || (parsed.rows.length > 0 && added === 0) || parsed.rows.length === 0) break;
+
+      const isFirstProbeDuplicate = step === 1 && !usedExplicitNext && !usedCursor && !usedOffset && parsed.rows.length > 0 && added === 0;
+      if (isFirstProbeDuplicate) {
+        oneBasedClamped = true;
+        consecutiveZeroAdded = 0;
+      } else if (parsed.rows.length > 0 && added === 0) {
+        consecutiveZeroAdded++;
+      } else {
+        consecutiveZeroAdded = 0;
+      }
+
+      if (parsed.nextPageUrl) {
+        const safeNext = resolveSafeNextUrl(parsed.nextPageUrl);
+        if (safeNext && !visitedUrls.has(safeNext)) explicitNextUrl = safeNext;
+      }
+      if (!explicitNextUrl && parsed.nextCursor && !visitedCursors.has(parsed.nextCursor)) {
+        visitedCursors.add(parsed.nextCursor);
+        const cursorUrl = buildRentalGateEndpointUrl(baseApi, endpoint, {
+          cursor: parsed.nextCursor,
+          size: pageSize
+        });
+        if (!visitedUrls.has(cursorUrl)) nextCursorUrl = cursorUrl;
+      }
+      if (!explicitNextUrl && !nextCursorUrl && parsed.nextPageNum !== null && (parsed.currentPageNum === null || parsed.nextPageNum > parsed.currentPageNum)) {
+        const npUrl = buildRentalGateEndpointUrl(baseApi, endpoint, {
+          page: parsed.nextPageNum,
+          size: pageSize
+        });
+        if (!visitedUrls.has(npUrl)) explicitNextUrl = npUrl;
+      }
+      if (!explicitNextUrl && !nextCursorUrl && parsed.offset !== null && parsed.rows.length > 0) {
+        const nextOffset = parsed.offset + parsed.rows.length;
+        const totalTarget = latestReportedTotal ?? parsed.totalElements;
+        if ((parsed.hasExplicitTotalElements && nextOffset < totalTarget) || (!parsed.isLast && parsed.rows.length >= parsed.effectivePageSize)) {
+          const offUrl = buildRentalGateEndpointUrl(baseApi, endpoint, {
+            offset: nextOffset,
+            limit: parsed.effectivePageSize
+          });
+          if (!visitedUrls.has(offUrl)) nextOffsetUrl = offUrl;
+        }
+      }
+
+      const effectiveTotalElements = latestReportedTotal ?? (parsed.hasExplicitTotalElements ? parsed.totalElements : 0);
+      const hasMoreByTotal = effectiveTotalElements > 0 && rows.length < effectiveTotalElements && parsed.rows.length > 0;
+      const hasMoreByTotalPages = Boolean(
+        oneBasedClamped &&
+        latestReportedTotalPages !== null &&
+        pageParam < latestReportedTotalPages &&
+        parsed.rows.length > 0
+      );
+      const hasNextNav = Boolean(explicitNextUrl || nextCursorUrl || nextOffsetUrl);
+      const stopOnZeroAdded = parsed.rows.length > 0 && added === 0 && !isFirstProbeDuplicate && !hasNextNav && (!hasMoreByTotal || consecutiveZeroAdded >= 2);
+      if ((parsed.isLast && !hasMoreByTotal && !hasMoreByTotalPages && !hasNextNav) || stopOnZeroAdded || parsed.rows.length === 0) {
+        if (hasMoreByTotal && stopOnZeroAdded) {
+          complete = false;
+          errorMsg = `STOPPED_ON_DUPLICATE_PAGES (${rows.length}/${effectiveTotalElements})`;
+          incompleteEndpoints.push(`${endpoint} (${errorMsg})`);
+        }
+        break;
+      }
+      if (step + 1 >= maxPages) {
+        if (hasMoreByTotal || hasMoreByTotalPages || (latestReportedTotalPages !== null && pages < latestReportedTotalPages) || !parsed.isLast) {
+          complete = false;
+          errorMsg = `MAX_PAGES_REACHED (${pages}/${latestReportedTotalPages ?? maxPages})`;
+          incompleteEndpoints.push(`${endpoint} (${errorMsg})`);
+        }
+      }
     }
-    return { rows, complete };
+
+    if (complete && latestReportedTotal !== null && latestReportedTotal > 0 && rows.length < latestReportedTotal) {
+      complete = false;
+      errorMsg = errorMsg || `INCOMPLETE_COUNT (${rows.length}/${latestReportedTotal})`;
+      incompleteEndpoints.push(`${endpoint} (${errorMsg})`);
+    }
+
+    return {
+      rows,
+      pages,
+      ok: succeeded && complete,
+      complete,
+      reportedTotal: latestReportedTotal,
+      error: errorMsg
+    };
   };
 
   const [resPaged, extPaged, canPaged, rccPaged] = await Promise.all([
-    scopes.has('reservations') ? fetchPagedRo('reservations/filter', false) : Promise.resolve({ rows: [] as any[], complete: true }),
-    scopes.has('extensions') ? fetchPagedRo('reservation-extends/filter', true) : Promise.resolve({ rows: [] as any[], complete: true }),
-    scopes.has('cancelled') ? fetchPagedRo('admin/cancelled-reservations', true) : Promise.resolve({ rows: [] as any[], complete: true }),
-    scopes.has('company_changes') ? fetchPagedRo('reservation-company-changes/admin/filter', true) : Promise.resolve({ rows: [] as any[], complete: true })
+    scopes.has('reservations') ? fetchPagedRo('reservations/filter', false) : Promise.resolve({ rows: [] as any[], pages: 0, ok: true, complete: true, reportedTotal: null, error: '' }),
+    scopes.has('extensions') ? fetchPagedRo('reservation-extends/filter', true) : Promise.resolve({ rows: [] as any[], pages: 0, ok: true, complete: true, reportedTotal: null, error: '' }),
+    scopes.has('cancelled') ? fetchPagedRo('admin/cancelled-reservations', true) : Promise.resolve({ rows: [] as any[], pages: 0, ok: true, complete: true, reportedTotal: null, error: '' }),
+    scopes.has('company_changes') ? fetchPagedRo('reservation-company-changes/admin/filter', true) : Promise.resolve({ rows: [] as any[], pages: 0, ok: true, complete: true, reportedTotal: null, error: '' })
   ]);
 
-  const extractSid = (row: any) => str(row?.reservationId ?? row?.reservation_id ?? row?.sourceReservationId ?? row?.source_reservation_id ?? row?.reservation?.id ?? row?.id);
+  const extractSid = (row: any) => str(row?.reservationId ?? row?.reservation_id ?? row?.sourceReservationId ?? row?.source_reservation_id ?? row?.reservation?.id ?? row?.id).replace(/^#+/, '').trim();
   const canMap = new Map<string, any>();
   for (const c of canPaged.rows) {
     const sid = extractSid(c);
@@ -3997,6 +4303,16 @@ export async function fetchRentalGateSnapshotReadOnly(
   for (const rc of rccPaged.rows) {
     const sid = extractSid(rc);
     if (sid && !rccMap.has(sid)) rccMap.set(sid, rc);
+  }
+  const extCountBySid = new Map<string, number>();
+  const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.rows);
+  if (scopes.has('extensions')) {
+    for (const ex of dedupedExt) {
+      const esid = str(ex?.reservationId ?? ex?.reservation_id ?? ex?.sourceReservationId ?? ex?.source_reservation_id ?? ex?.reservation?.id).replace(/^#+/, '').trim();
+      const ern = str(ex?.reservationNumber ?? ex?.reservation_number).replace(/^#+/, '').trim();
+      if (esid) extCountBySid.set(esid, (extCountBySid.get(esid) || 0) + 1);
+      if (ern && ern !== esid) extCountBySid.set(ern, (extCountBySid.get(ern) || 0) + 1);
+    }
   }
 
   const enriched = resPaged.rows.map((rawItem: any) => {
@@ -4012,6 +4328,11 @@ export async function fetchRentalGateSnapshotReadOnly(
       if (rccRec.targetCompanyName) copy.newCompanyName = str(rccRec.targetCompanyName);
       if (!canRec) copy.isSourceRejected = true;
     }
+    if (scopes.has('extensions') && extPaged.complete && copy.extensionsCount === undefined && copy.extensions_count === undefined) {
+      const rnClean = str(crmCore.extractReservationNumber(rawItem)).replace(/^#+/, '').trim();
+      const cnt = extCountBySid.get(cleanSid) ?? extCountBySid.get(rnClean);
+      if (cnt !== undefined) copy.extensionsCount = cnt;
+    }
     return copy;
   });
 
@@ -4023,7 +4344,6 @@ export async function fetchRentalGateSnapshotReadOnly(
         dateTo: str(opts.dateTo)
       })
     : dedupedRes;
-  const dedupedExt = crmCore.dedupeExtensionsByNumber(extPaged.rows);
 
   return {
     reservations: filteredRes,
@@ -4031,7 +4351,15 @@ export async function fetchRentalGateSnapshotReadOnly(
     cancelledIdsCount: canMap.size,
     companyChangesCount: rccMap.size,
     incompleteEndpoints,
-    pagesFetched: totalPagesFetched
+    pagesFetched: totalPagesFetched,
+    reportedTotalElements: resPaged.reportedTotal,
+    endpointStats: {
+      reservations: { ok: resPaged.ok, complete: resPaged.complete, count: resPaged.rows.length, reportedTotal: resPaged.reportedTotal, pages: resPaged.pages, error: resPaged.error },
+      extensions: { ok: extPaged.ok, complete: extPaged.complete, count: dedupedExt.length, reportedTotal: extPaged.reportedTotal, pages: extPaged.pages, error: extPaged.error },
+      cancelled: { ok: canPaged.ok, complete: canPaged.complete, count: canMap.size, reportedTotal: canPaged.reportedTotal, pages: canPaged.pages, error: canPaged.error },
+      company_changes: { ok: rccPaged.ok, complete: rccPaged.complete, count: rccMap.size, reportedTotal: rccPaged.reportedTotal, pages: rccPaged.pages, error: rccPaged.error }
+    }
   };
 }
+
 

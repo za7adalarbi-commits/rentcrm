@@ -1,3 +1,5 @@
+import { normalizeRgApiBaseUrl } from './coreBinding.js';
+
 export interface VercelEnvSyncInput {
   mode: '' | 'neon' | 'gas' | 'sandbox';
   gasWebAppUrl?: string;
@@ -135,7 +137,8 @@ export async function syncEnvVarsToVercel(
   if (input.mode !== 'sandbox' && gasUrl) {
     entries.push({ key: 'GAS_WEBAPP_URL', value: gasUrl, type: 'plain' });
   }
-  const baseUrl = cleanStr(input.rgApiBaseUrl).replace(/\/+$/, '');
+  const rawBaseUrl = cleanStr(input.rgApiBaseUrl);
+  const baseUrl = rawBaseUrl ? normalizeRgApiBaseUrl(rawBaseUrl) : '';
   if (baseUrl) {
     entries.push({ key: 'RG_API_BASE_URL', value: baseUrl, type: 'plain' });
   }

@@ -18,6 +18,53 @@ export interface PersistCoreFilesResult {
   reason?: string;
 }
 
+export const DEFAULT_RG_API_BASE_URL = 'https://api.rentalgate.net/api';
+
+const RG_KNOWN_ENDPOINT_SUFFIX_RE = /(\/(?:reservations\/filter|reservation-extends\/filter|admin\/cancelled-reservations|reservation-company-changes\/admin\/filter|reservations(?:\/[^/?#]+)?))+$/i;
+
+export function normalizeRgApiBaseUrl(raw?: unknown): string {
+  let clean = String(raw || '').trim();
+  if (!clean) return DEFAULT_RG_API_BASE_URL;
+  clean = clean.split(/[?#]/)[0].trim().replace(/\/+$/, '');
+  if (!clean) return DEFAULT_RG_API_BASE_URL;
+
+  try {
+    const parsed = new URL(clean);
+    let pathname = parsed.pathname.replace(/\/+$/, '');
+    pathname = pathname.replace(RG_KNOWN_ENDPOINT_SUFFIX_RE, '').replace(/\/+$/, '');
+    // Collapse accidental duplicated /api segments (e.g. /api/api -> /api)
+    pathname = pathname.replace(/(\/api)+$/i, '/api').replace(/\/{2,}/g, '/');
+    if (!pathname) pathname = '/api';
+    return `${parsed.origin}${pathname}`;
+  } catch {
+    clean = clean.replace(RG_KNOWN_ENDPOINT_SUFFIX_RE, '').replace(/\/+$/, '');
+    clean = clean.replace(/(\/api)+$/i, '/api');
+    return clean || DEFAULT_RG_API_BASE_URL;
+  }
+}
+
+export function buildRentalGateEndpointUrl(
+  baseApi: unknown,
+  endpoint: string,
+  query?: Record<string, string | number | boolean | undefined | null>
+): string {
+  const cleanBase = normalizeRgApiBaseUrl(baseApi);
+  let cleanEp = String(endpoint || '').trim().replace(/^\/+/, '');
+  // Prevent /api/api/... when base already ends in /api and endpoint starts with api/
+  if (/\/api$/i.test(cleanBase) && /^api\//i.test(cleanEp)) {
+    cleanEp = cleanEp.replace(/^api\//i, '');
+  }
+  const baseWithSlash = cleanBase.endsWith('/') ? cleanBase : `${cleanBase}/`;
+  const url = cleanEp ? new URL(cleanEp, baseWithSlash) : new URL(cleanBase);
+  if (query && typeof query === 'object') {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null || v === '') continue;
+      url.searchParams.set(k, String(v));
+    }
+  }
+  return url.toString();
+}
+
 export function normalizeMode(raw: unknown): FixedConnectionMode {
   const val = String(raw || '').trim().toLowerCase();
   if (val === 'neon' || val === 'gas' || val === 'sandbox') {
@@ -63,7 +110,7 @@ export function buildFixedServerConfigTsContent(cfg: FixedServerConfig): string 
   const databaseUrl = String(cfg.databaseUrl || '').trim();
   const gasWebAppUrl = String(cfg.gasWebAppUrl || '').trim();
   const rgToken = String(cfg.rgToken || '').trim().replace(/^Bearer\s+/i, '');
-  const rgApiBaseUrl = String(cfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').trim().replace(/\/+$/, '');
+  const rgApiBaseUrl = normalizeRgApiBaseUrl(cfg.rgApiBaseUrl);
   const syncApiSecret = String(cfg.syncApiSecret || '').trim();
   const updatedAt = String(cfg.updatedAt || '').trim();
   const updatedBy = String(cfg.updatedBy || '').trim();
@@ -151,7 +198,7 @@ export function applyInMemoryServerConfig(cfg: FixedServerConfig): void {
   FIXED_SERVER_CONFIG.databaseUrl = String(cfg.databaseUrl || '').trim();
   FIXED_SERVER_CONFIG.gasWebAppUrl = String(cfg.gasWebAppUrl || '').trim();
   FIXED_SERVER_CONFIG.rgToken = String(cfg.rgToken || '').trim().replace(/^Bearer\s+/i, '');
-  FIXED_SERVER_CONFIG.rgApiBaseUrl = String(cfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').trim().replace(/\/+$/, '');
+  FIXED_SERVER_CONFIG.rgApiBaseUrl = normalizeRgApiBaseUrl(cfg.rgApiBaseUrl);
   FIXED_SERVER_CONFIG.syncApiSecret = String(cfg.syncApiSecret || '').trim();
   FIXED_SERVER_CONFIG.updatedAt = String(cfg.updatedAt || '').trim();
   FIXED_SERVER_CONFIG.updatedBy = String(cfg.updatedBy || '').trim();
@@ -231,7 +278,7 @@ export function persistCoreFilesOnDisk(
       GAS_WEBAPP_URL: cfg.gasWebAppUrl || '',
       RG_TOKEN: cfg.rgToken || '',
       SYNC_API_SECRET: cfg.syncApiSecret || '',
-      RG_API_BASE_URL: cfg.rgApiBaseUrl || 'https://api.rentalgate.net/api',
+      RG_API_BASE_URL: normalizeRgApiBaseUrl(cfg.rgApiBaseUrl),
       CONNECTION_MODE: mode
     });
     fs.writeFileSync(dotEnvPath, nextEnv, 'utf8');

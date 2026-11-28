@@ -4,6 +4,8 @@ import { ensureSchemaInitialized, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
 import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
 import * as dataIntegrity from './dataIntegrity.js';
+import * as integrityService from './integrityService.js';
+import * as healthCenter from './healthCenter.js';
 import * as queries from './queries.js';
 
 export interface CrmApiResponse<T = any> {
@@ -337,14 +339,46 @@ export async function dispatchCrmRequest(
       case 'restoreUiDefaults':
         result = await queries.restoreUiDefaults(executor, session, payload);
         break;
+      case 'getDataIntegritySettings':
+        result = await integrityService.getDataIntegritySettings(executor, session);
+        break;
+      case 'saveDataIntegritySettings':
+        result = await integrityService.saveDataIntegritySettings(executor, session, payload);
+        break;
+      case 'controlDataIntegrityMonitor':
+        result = await integrityService.controlDataIntegrityMonitor(executor, session, payload);
+        break;
+      case 'getDataIntegrityReport':
+        result = await integrityService.getDataIntegrityReport(executor, session, payload);
+        break;
       case 'runDataIntegrityCheck':
-        result = await dataIntegrity.runDataIntegrityCheck(executor, session, payload);
+        result = await integrityService.runDataIntegrityCheck(executor, session, payload);
         break;
       case 'getDataIntegrityStatus':
         result = await dataIntegrity.getDataIntegrityStatus(executor, session, payload);
         break;
+      case 'recheckDataIntegrityRecord':
+        result = await integrityService.recheckDataIntegrityRecord(executor, session, payload);
+        break;
       case 'resolveDataIntegrityIssue':
-        result = await dataIntegrity.resolveDataIntegrityIssue(executor, session, payload);
+        result = (payload && (payload.previewOnly !== undefined || payload.resolutionAction !== undefined || payload.approved !== undefined))
+          ? await integrityService.resolveDataIntegrityIssue(executor, session, payload)
+          : await dataIntegrity.resolveDataIntegrityIssue(executor, session, payload);
+        break;
+      case 'rollbackDataIntegrityAction':
+        result = await integrityService.rollbackDataIntegrityAction(executor, session, payload);
+        break;
+      case 'getDatabaseHealthCenterReport':
+        result = await healthCenter.getDatabaseHealthCenterReport(executor, session, payload);
+        break;
+      case 'runDatabaseHealthCenterScan':
+        result = await healthCenter.runDatabaseHealthCenterScan(executor, session, payload);
+        break;
+      case 'saveHealthCenterSettings':
+        result = await healthCenter.saveHealthCenterSettings(executor, session, payload);
+        break;
+      case 'retryHealthCenterFailedSync':
+        result = await healthCenter.retryHealthCenterFailedSync(executor, session, payload);
         break;
       default:
         return {

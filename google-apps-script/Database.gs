@@ -1120,6 +1120,39 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
   };
 }
 
+function safeDeleteSheetRows_(sheet, startRow, numRows) {
+  if (!sheet || !numRows || numRows <= 0) return;
+  var frozen = typeof sheet.getFrozenRows === 'function' ? Number(sheet.getFrozenRows() || 0) : 1;
+  var maxRows = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || 0) : Number(sheet.getLastRow() || 0);
+  var lastRow = Number(sheet.getLastRow() || 0);
+  var colCount = Math.max(1, Number(sheet.getLastColumn() || 1));
+  if (maxRows <= 0) maxRows = Math.max(lastRow, startRow + numRows - 1);
+
+  if (maxRows - numRows <= frozen) {
+    var minKeepRow = frozen + 1;
+    var clearStart = Math.max(minKeepRow, startRow);
+    var clearCount = Math.min(numRows, Math.max(0, lastRow - clearStart + 1));
+    if (clearCount > 0) {
+      sheet.getRange(clearStart, 1, clearCount, colCount).clearContent().clearNote();
+    }
+    var extraToDelete = Math.max(0, maxRows - frozen - 1);
+    if (extraToDelete > 0) {
+      var delStart = Math.max(minKeepRow + 1, startRow);
+      var delCount = Math.min(extraToDelete, Math.max(0, maxRows - delStart + 1));
+      if (delCount > 0) {
+        sheet.deleteRows(delStart, delCount);
+      }
+    }
+    return;
+  }
+
+  if (numRows === 1 && typeof sheet.deleteRow === 'function') {
+    sheet.deleteRow(startRow);
+  } else {
+    sheet.deleteRows(startRow, numRows);
+  }
+}
+
 function deleteRecordByKey(sheetName, keyField, keyValue) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
@@ -1135,7 +1168,7 @@ function deleteRecordByKey(sheetName, keyField, keyValue) {
 
   for (var r = keyValues.length - 1; r >= 0; r--) {
     if (normalizeStr(keyValues[r][0]) === target) {
-      sheet.deleteRow(r + 2);
+      safeDeleteSheetRows_(sheet, r + 2, 1);
       if (Array.isArray(_rgRecordsCache[sheetName])) {
         _rgRecordsCache[sheetName] = _rgRecordsCache[sheetName].filter(function (rec) {
           return normalizeStr(rec[keyField]) !== target;
@@ -1157,7 +1190,13 @@ function clearSheetRecords(sheetName) {
   var lastRow = sheet.getLastRow();
   var removedCount = Math.max(0, lastRow - 1);
   if (lastRow > 1) {
-    sheet.deleteRows(2, lastRow - 1);
+    var colCount = Math.max(1, sheet.getLastColumn());
+    sheet.getRange(2, 1, lastRow - 1, colCount).clearContent().clearNote();
+    var frozen = typeof sheet.getFrozenRows === 'function' ? Number(sheet.getFrozenRows() || 0) : 1;
+    var keepDataRow = Math.max(2, frozen + 1);
+    if (lastRow > keepDataRow) {
+      safeDeleteSheetRows_(sheet, keepDataRow + 1, lastRow - keepDataRow);
+    }
   }
   if (Array.isArray(_rgRecordsCache[sheetName])) {
     _rgRecordsCache[sheetName] = [];

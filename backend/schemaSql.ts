@@ -39,8 +39,10 @@ CREATE TABLE IF NOT EXISTS employees (
   ui_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
   status TEXT NOT NULL DEFAULT 'active',
   last_activity TEXT NOT NULL DEFAULT '',
+  last_sync_at TIMESTAMPTZ DEFAULT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ DEFAULT NULL
 );
 
 -- 3. Reservations (mirrors RG_SHEETS.RESERVATIONS — 52 columns)
@@ -124,9 +126,12 @@ CREATE TABLE IF NOT EXISTS reservations (
   penalty_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_sync_at TIMESTAMPTZ DEFAULT NULL,
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
   status_history JSONB NOT NULL DEFAULT '[]'::jsonb,
   raw_json TEXT NOT NULL DEFAULT '',
-  source_order INTEGER
+  source_order INTEGER,
+  customer_id TEXT NOT NULL DEFAULT ''
 );
 
 -- 4. Extensions (mirrors RG_SHEETS.EXTENSIONS — 23 columns)
@@ -184,6 +189,7 @@ CREATE TABLE IF NOT EXISTS follow_ups (
   notes TEXT NOT NULL DEFAULT '',
   follow_up_date TEXT NOT NULL DEFAULT '',
   follow_up_time TEXT NOT NULL DEFAULT '',
+  last_sync_at TIMESTAMPTZ DEFAULT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -221,7 +227,11 @@ CREATE TABLE IF NOT EXISTS problems (
   priority TEXT NOT NULL DEFAULT 'متوسط',
   status TEXT NOT NULL DEFAULT 'جديدة',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_sync_at TIMESTAMPTZ DEFAULT NULL,
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  customer_id TEXT NOT NULL DEFAULT '',
+  ticket_type TEXT NOT NULL DEFAULT 'problem'
 );
 
 -- 9. Issues (mirrors RG_SHEETS.ISSUES — identical schema to Problems for Sheets compatibility)
@@ -239,7 +249,9 @@ CREATE TABLE IF NOT EXISTS issues (
   priority TEXT NOT NULL DEFAULT 'متوسط',
   status TEXT NOT NULL DEFAULT 'جديدة',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  customer_id TEXT NOT NULL DEFAULT '',
+  ticket_type TEXT NOT NULL DEFAULT 'problem'
 );
 
 -- 10. ProblemUpdates (mirrors RG_SHEETS.PROBLEM_UPDATES)
@@ -378,14 +390,22 @@ CREATE TABLE IF NOT EXISTS sheets_mirror_outbox (
   id TEXT PRIMARY KEY,
   entity_type TEXT NOT NULL,
   entity_id TEXT NOT NULL,
+  record_id TEXT NOT NULL DEFAULT '',
+  operation TEXT NOT NULL DEFAULT '',
   action TEXT NOT NULL,
   payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  idempotency_key TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   retry_count INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 8,
   next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  locked_at TIMESTAMPTZ DEFAULT NULL,
+  worker_id TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  processed_at TIMESTAMPTZ
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ,
+  synced_at TIMESTAMPTZ DEFAULT NULL
 );
 
 -- 20. Server Error & Diagnostics Log (sanitized, never stores secrets)
@@ -679,24 +699,28 @@ CREATE TABLE IF NOT EXISTS customer_note_attachments (
   customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
   file_name TEXT NOT NULL DEFAULT '',
   mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-  size_bytes INTEGER NOT NULL DEFAULT 0,
-  data_base64 TEXT NOT NULL DEFAULT '',
+  file_size INTEGER NOT NULL DEFAULT 0,
+  data_url TEXT NOT NULL DEFAULT '',
+  storage_url TEXT NOT NULL DEFAULT '',
   uploaded_by_id TEXT NOT NULL DEFAULT '',
   uploaded_by_name TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS customer_note_history (
   id TEXT PRIMARY KEY,
-  note_id TEXT NOT NULL REFERENCES customer_notes(id) ON DELETE CASCADE,
-  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  note_id TEXT NOT NULL REFERENCES customer_notes(id) ON DELETE RESTRICT,
+  customer_id TEXT NOT NULL DEFAULT '',
   action_type TEXT NOT NULL DEFAULT 'update',
   field_name TEXT NOT NULL DEFAULT '',
   old_value TEXT NOT NULL DEFAULT '',
   new_value TEXT NOT NULL DEFAULT '',
-  note TEXT NOT NULL DEFAULT '',
+  details TEXT NOT NULL DEFAULT '',
+  source_section TEXT NOT NULL DEFAULT 'customers',
   actor_id TEXT NOT NULL DEFAULT '',
   actor_name TEXT NOT NULL DEFAULT '',
+  actor_role TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -758,7 +782,45 @@ CREATE TABLE IF NOT EXISTS data_integrity_actions (
   rolled_back_by_name TEXT NOT NULL DEFAULT '',
   actor_id TEXT NOT NULL DEFAULT '',
   actor_name TEXT NOT NULL DEFAULT '',
+  rollback_supported BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 29. Realtime Event Stream
+CREATE TABLE IF NOT EXISTS realtime_events (
+  seq BIGSERIAL PRIMARY KEY,
+  id TEXT NOT NULL DEFAULT '',
+  event_type TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL DEFAULT '',
+  record_id TEXT NOT NULL DEFAULT '',
+  operation TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 30. Idempotency Request Deduplication Store
+CREATE TABLE IF NOT EXISTS idempotency_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  action TEXT NOT NULL DEFAULT '',
+  response JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 31. Developer Database Health Center Runs
+CREATE TABLE IF NOT EXISTS health_center_runs (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT 'all',
+  overall_status TEXT NOT NULL DEFAULT 'unknown',
+  triggered_by_id TEXT NOT NULL DEFAULT '',
+  triggered_by_name TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  sections_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error_message TEXT NOT NULL DEFAULT '',
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at TIMESTAMPTZ DEFAULT NULL
 );
 
 ALTER TABLE data_integrity_runs ADD COLUMN IF NOT EXISTS run_mode TEXT NOT NULL DEFAULT 'manual';
@@ -768,5 +830,21 @@ ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_contact_ts TIMESTAMPTZ DEFAU
 CREATE INDEX IF NOT EXISTS idx_data_integrity_runs_started ON data_integrity_runs (started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_status ON data_integrity_issues (resolution_status, discrepancy_type, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_data_integrity_actions_created ON data_integrity_actions (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_revoked ON sessions (expires_at, is_revoked);
+CREATE INDEX IF NOT EXISTS idx_notifications_deleted_at ON notifications (deleted_at, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sync_tombstones_deleted_at ON sync_tombstones (deleted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sheets_outbox_status_created ON sheets_mirror_outbox (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customer_note_attachments_note ON customer_note_attachments (note_id, created_at ASC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_customer_note_history_note ON customer_note_history (note_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customers_phone_norm ON customers (normalized_phone) WHERE normalized_phone <> '';
+CREATE INDEX IF NOT EXISTS idx_customers_id_num ON customers (id_number) WHERE id_number <> '';
+CREATE INDEX IF NOT EXISTS idx_realtime_events_created ON realtime_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_health_center_runs_started ON health_center_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reservations_deleted_at ON reservations (deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_reservations_src_id_active ON reservations (source_reservation_id) WHERE deleted_at IS NULL AND COALESCE(source_reservation_id, '') <> '';
+CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_run ON data_integrity_issues (run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_logs_created ON error_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sync_log_started ON sync_log (started_at DESC);
 `;
+
 

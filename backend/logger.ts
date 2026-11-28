@@ -17,6 +17,16 @@ const SENSITIVE_KEYS = new Set([
   'SYNC_API_SECRET'
 ]);
 
+export function redactSensitiveText(raw: unknown): string {
+  const s = String(raw ?? '');
+  if (!s) return '';
+  return s
+    .replace(/postgres(?:ql)?:\/\/[^\s"'`)<>]+/gi, '[REDACTED_DATABASE_URL]')
+    .replace(/\bBearer\s+[A-Za-z0-9._\-+/=]{8,}/gi, 'Bearer [REDACTED_TOKEN]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g, '[REDACTED_JWT]')
+    .replace(/\b(DATABASE_URL|POSTGRES_URL|NEON_DATABASE_URL|SYNC_API_SECRET|RG_TOKEN|rgToken|syncSecret|password|token)\s*[:=]\s*["']?[^\s"',;}{]+["']?/gi, '$1=[REDACTED]');
+}
+
 export function sanitizeLogMeta(input: any, depth = 0): any {
   if (depth > 4) return '[TRUNCATED]';
   if (input === null || input === undefined) return input;
@@ -24,7 +34,8 @@ export function sanitizeLogMeta(input: any, depth = 0): any {
     if (/^(eyJ[A-Za-z0-9_-]+\.|Bearer\s+|postgres(ql)?:\/\/)/i.test(input)) {
       return '[REDACTED]';
     }
-    return input.length > 500 ? `${input.slice(0, 500)}...` : input;
+    const clean = redactSensitiveText(input);
+    return clean.length > 500 ? `${clean.slice(0, 500)}...` : clean;
   }
   if (typeof input !== 'object') return input;
   if (Array.isArray(input)) {
@@ -48,8 +59,10 @@ export async function logBackendError(
   err: unknown,
   meta?: Record<string, any>
 ): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err || 'Unknown error');
-  const stack = err instanceof Error && err.stack ? err.stack.slice(0, 2000) : '';
+  const rawMessage = err instanceof Error ? err.message : String(err || 'Unknown error');
+  const rawStack = err instanceof Error && err.stack ? err.stack : '';
+  const message = redactSensitiveText(rawMessage);
+  const stack = redactSensitiveText(rawStack).slice(0, 2000);
   const safeMeta = sanitizeLogMeta(meta || {});
 
   try {

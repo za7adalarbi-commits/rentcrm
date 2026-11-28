@@ -23,11 +23,13 @@ import {
 import { getDatabaseUrl, runWithSavepoint, type DbClient, type DbExecutor } from './db.js';
 import { isCoreFilesystemWritable, maskDatabaseUrl } from './coreBinding.js';
 import {
+  buildRentalGateEndpointUrl,
   encryptServerSecret,
   ensureSyncApiSecret,
   resolveServerConfig,
   upsertServerSetting
 } from './serverConfig.js';
+import { logBackendError } from './logger.js';
 import {
   applyUnifiedConnectionSetup as runUnifiedConnectionSetup,
   getSetupCapabilities as readSetupCapabilities
@@ -395,44 +397,60 @@ export async function logActivity(
   const nowIso = nowDate.toISOString();
   const riyadhNow = getRiyadhDateTimeParts(nowDate);
   const safeChanges = Array.isArray(changes) ? changes : [];
-  try {
-    await client.query(
-      `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, changes, log_date, log_time, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::timestamptz)`,
-      [
-        generateId('ACT'),
-        actor.id || 'SYSTEM',
-        actor.name || 'النظام',
-        actor.role || 'system',
-        actionType,
-        entityType,
-        entityId,
-        details,
-        JSON.stringify(safeChanges),
-        riyadhNow.date,
-        riyadhNow.time,
-        nowIso
-      ]
-    );
-  } catch {
-    await client.query(
-      `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, log_date, log_time, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
-      [
-        generateId('ACT'),
-        actor.id || 'SYSTEM',
-        actor.name || 'النظام',
-        actor.role || 'system',
-        actionType,
-        entityType,
-        entityId,
-        details,
-        riyadhNow.date,
-        riyadhNow.time,
-        nowIso
-      ]
-    );
-  }
+
+  const primaryOk = await runWithSavepoint(
+    client,
+    'activity_log_primary',
+    async () => {
+      await client.query(
+        `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, changes, log_date, log_time, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12::timestamptz)`,
+        [
+          generateId('ACT'),
+          actor.id || 'SYSTEM',
+          actor.name || 'النظام',
+          actor.role || 'system',
+          actionType,
+          entityType,
+          entityId,
+          details,
+          JSON.stringify(safeChanges),
+          riyadhNow.date,
+          riyadhNow.time,
+          nowIso
+        ]
+      );
+      return true;
+    },
+    false
+  );
+
+  if (primaryOk) return;
+
+  await runWithSavepoint(
+    client,
+    'activity_log_fallback',
+    async () => {
+      await client.query(
+        `INSERT INTO activity_log (id, user_id, user_name, user_role, action_type, entity_type, entity_id, details, log_date, log_time, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
+        [
+          generateId('ACT'),
+          actor.id || 'SYSTEM',
+          actor.name || 'النظام',
+          actor.role || 'system',
+          actionType,
+          entityType,
+          entityId,
+          details,
+          riyadhNow.date,
+          riyadhNow.time,
+          nowIso
+        ]
+      );
+    },
+    undefined
+  );
 }
 
 function buildNotificationEventKey(parts: unknown[]): string {
@@ -459,22 +477,92 @@ async function createNotification(
   const recEmpId = str(opts.recipientEmployeeId);
   const recRole = recEmpId ? '' : str(opts.recipientRole);
   const eventKey = str(opts.eventKey).slice(0, 220);
-  await client.query(
-    `INSERT INTO notifications (id, recipient_employee_id, recipient_role, type, title, message, entity_type, entity_id, is_read, created_at, updated_at, event_key)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW(),NOW(),$9)
-     ON CONFLICT (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '' DO NOTHING`,
-    [
-      generateId('NTF'),
-      recEmpId,
-      recRole,
-      str(opts.type || 'info'),
-      str(opts.title),
-      str(opts.message),
-      str(opts.entityType),
-      str(opts.entityId),
-      eventKey
-    ]
+  const ntfId = generateId('NTF');
+  const params = [
+    ntfId,
+    recEmpId,
+    recRole,
+    str(opts.type || 'info'),
+    str(opts.title),
+    str(opts.message),
+    str(opts.entityType),
+    str(opts.entityId),
+    eventKey
+  ];
+
+  let conflictIndexMissing = false;
+  let capturedError: any = null;
+
+  const inserted = await runWithSavepoint(
+    client,
+    'create_notification_upsert',
+    async () => {
+      try {
+        await client.query(
+          `INSERT INTO notifications (id, recipient_employee_id, recipient_role, type, title, message, entity_type, entity_id, is_read, created_at, updated_at, event_key)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW(),NOW(),$9)
+           ON CONFLICT (event_key, recipient_employee_id, recipient_role) WHERE event_key <> '' DO NOTHING`,
+          params
+        );
+        return true;
+      } catch (err: any) {
+        if (err?.code === '42P10' || /ON CONFLICT specification/i.test(String(err?.message || ''))) {
+          conflictIndexMissing = true;
+        } else {
+          capturedError = err;
+        }
+        throw err;
+      }
+    },
+    false
   );
+
+  if (inserted) return;
+
+  if (conflictIndexMissing) {
+    await runWithSavepoint(
+      client,
+      'create_notification_fallback',
+      async () => {
+        if (eventKey) {
+          const dupQ = await client.query<{ id: string }>(
+            `SELECT id FROM notifications
+             WHERE event_key = $1 AND recipient_employee_id = $2 AND recipient_role = $3
+             LIMIT 1`,
+            [eventKey, recEmpId, recRole]
+          );
+          if (dupQ.rows && dupQ.rows.length > 0) return;
+        }
+        await client.query(
+          `INSERT INTO notifications (id, recipient_employee_id, recipient_role, type, title, message, entity_type, entity_id, is_read, created_at, updated_at, event_key)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW(),NOW(),$9)`,
+          params
+        );
+      },
+      undefined
+    );
+    return;
+  }
+
+  if (capturedError) {
+    throw capturedError;
+  }
+}
+
+async function runOptionalNoteNotifications(
+  executor: DbExecutor,
+  actionLabel: string,
+  meta: Record<string, any>,
+  fn: () => Promise<void>
+): Promise<string[]> {
+  try {
+    await fn();
+    return [];
+  } catch (err: any) {
+    const msg = str(err?.message || 'OPTIONAL_NOTIFICATION_FAILED').slice(0, 240);
+    await logBackendError(executor, 'queries', actionLabel, err, meta).catch(() => undefined);
+    return [msg];
+  }
 }
 
 async function dispatchMentionNotifications(
@@ -626,10 +714,10 @@ async function getCachedReservationFacets(executor: DbExecutor): Promise<{ compa
   }
   const [compFacets, branchFacets] = await Promise.all([
     executor.query<{ company_name: string }>(
-      `SELECT DISTINCT company_name FROM reservations WHERE company_name <> '' ORDER BY company_name ASC LIMIT 200`
+      `SELECT DISTINCT company_name FROM reservations WHERE deleted_at IS NULL AND company_name <> '' ORDER BY company_name ASC LIMIT 200`
     ),
     executor.query<{ branch_name: string }>(
-      `SELECT DISTINCT branch_name FROM reservations WHERE branch_name <> '' ORDER BY branch_name ASC LIMIT 300`
+      `SELECT DISTINCT branch_name FROM reservations WHERE deleted_at IS NULL AND branch_name <> '' ORDER BY branch_name ASC LIMIT 300`
     )
   ]);
   const companies = compFacets.rows.map((c) => c.company_name);
@@ -1417,7 +1505,7 @@ export async function getReservations(
   const allowAgentViewAll = settings.allow_agent_view_all !== false;
 
   const params: any[] = [];
-  const clauses: string[] = [];
+  const clauses: string[] = ['r.deleted_at IS NULL'];
 
   if (session.user.role === 'agent' && !allowAgentViewAll) {
     params.push(JSON.stringify([session.user.id]));
@@ -1635,8 +1723,8 @@ export async function getReservations(
   const loadLifecycleCounts = async () => {
     const scopeParams: any[] = [];
     const scopeWhere = (session.user.role === 'agent' && !allowAgentViewAll)
-      ? (scopeParams.push(JSON.stringify([session.user.id])), `WHERE r.assigned_employee_ids @> $1::jsonb`)
-      : '';
+      ? (scopeParams.push(JSON.stringify([session.user.id])), `WHERE r.deleted_at IS NULL AND r.assigned_employee_ids @> $1::jsonb`)
+      : `WHERE r.deleted_at IS NULL`;
     const [lcRes, todayRadarRes] = await Promise.all([
       executor.query<{
         total_cnt: string;
@@ -1829,8 +1917,8 @@ export async function syncLocalCache(
 
   const resParams: any[] = [maxItems];
   const resWhere = session.user.role === 'agent' && !allowAgentViewAll
-    ? (resParams.push(JSON.stringify([session.user.id])), `WHERE r.assigned_employee_ids @> $2::jsonb`)
-    : '';
+    ? (resParams.push(JSON.stringify([session.user.id])), `WHERE r.deleted_at IS NULL AND r.assigned_employee_ids @> $2::jsonb`)
+    : `WHERE r.deleted_at IS NULL`;
 
   const [resRows, extRows, fuRows, prbRows] = await Promise.all([
     executor.query(
@@ -1859,7 +1947,7 @@ export async function syncLocalCache(
     ),
     executor.query(`SELECT * FROM extensions ORDER BY sequence_number ASC, start_date ASC LIMIT 5000`),
     executor.query(`SELECT * FROM follow_ups ORDER BY created_at DESC LIMIT 1500`),
-    executor.query(`SELECT * FROM problems ORDER BY updated_at DESC LIMIT 500`)
+    executor.query(`SELECT * FROM problems WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500`)
   ]);
 
   const reservations = redactReservationsList(resRows.rows.map((r) => mapReservationRowToClient(r, false)), session.user);
@@ -1887,7 +1975,7 @@ export async function getReservationDetails(
   if (!idOrNum) throw new Error('VALIDATION_ERROR: معرف الحجز مطلوب.');
 
   const resQuery = await executor.query(
-    `SELECT * FROM reservations WHERE id = $1 OR reservation_number = $1 LIMIT 1`,
+    `SELECT * FROM reservations WHERE deleted_at IS NULL AND (id = $1 OR reservation_number = $1) LIMIT 1`,
     [idOrNum]
   );
   const row = resQuery.rows[0];
@@ -1926,7 +2014,7 @@ export async function getReservationDetails(
       [reservation.id]
     ),
     executor.query(
-      `SELECT * FROM problems WHERE reservation_id = $1 ORDER BY updated_at DESC`,
+      `SELECT * FROM problems WHERE deleted_at IS NULL AND reservation_id = $1 ORDER BY updated_at DESC`,
       [reservation.id]
     ),
     executor.query(
@@ -5754,8 +5842,11 @@ export async function testRentalGateConnection(executor: DbExecutor, session: Au
         : 'متغير RG_TOKEN غير مضبوط في إعدادات بيئة الخادم (.env / Vercel).'
     };
   }
-  const baseApi = str(serverCfg.rgApiBaseUrl || 'https://api.rentalgate.net/api').replace(/\/+$/, '');
-  const resp = await fetch(`${baseApi}/reservations/filter?page=0&size=1`, {
+  const targetFilterUrl = buildRentalGateEndpointUrl(serverCfg.rgApiBaseUrl, 'reservations/filter', {
+    page: 0,
+    size: 1
+  });
+  const resp = await fetch(targetFilterUrl, {
     method: 'GET',
     headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }
   });
@@ -6675,7 +6766,7 @@ export async function getInactiveReservations(
   const settings = await getSettingsMap(executor);
   const allowAgentViewAll = settings.allow_agent_view_all !== false;
   const params: any[] = [];
-  const clauses: string[] = [];
+  const clauses: string[] = ['r.deleted_at IS NULL'];
 
   if (session.user.role === 'agent' && !allowAgentViewAll) {
     params.push(JSON.stringify([session.user.id]));
@@ -7223,10 +7314,11 @@ function formatCustomerNoteAttachmentRow(row: any): Record<string, any> {
   return {
     id: str(row.id),
     noteId: str(row.note_id ?? row.noteId),
+    customerId: str(row.customer_id ?? row.customerId),
     fileName: str(row.file_name ?? row.fileName),
     mimeType: str(row.mime_type ?? row.mimeType),
     fileSize: num(row.file_size ?? row.fileSize, 0),
-    storageUrl: str(row.storage_url ?? row.storageUrl),
+    storageUrl: str(row.storage_url ?? row.data_url ?? row.storageUrl ?? row.dataUrl),
     uploadedById: str(row.uploaded_by_id ?? row.uploadedById),
     uploadedByName: str(row.uploaded_by_name ?? row.uploadedByName),
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : str(row.created_at ?? row.createdAt)
@@ -7350,29 +7442,51 @@ async function recordCustomerNoteHistory(
   tx: DbClient,
   opts: {
     noteId: string;
+    customerId?: string;
     actionType: string;
     fieldName?: string;
     oldValue?: string;
     newValue?: string;
+    details?: string;
+    sourceSection?: string;
     actor: AuthSession['user'];
   }
 ): Promise<void> {
-  await tx.query(
-    `INSERT INTO customer_note_history (
-       id, note_id, action_type, field_name, old_value, new_value, actor_id, actor_name, actor_role, created_at
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
-    [
-      generateId('CNH'),
-      str(opts.noteId),
-      str(opts.actionType),
-      str(opts.fieldName),
-      str(opts.oldValue),
-      str(opts.newValue),
-      str(opts.actor.id),
-      str(opts.actor.name),
-      str(opts.actor.role)
-    ]
-  ).catch(() => undefined);
+  await runWithSavepoint(
+    tx,
+    'cn_history_insert',
+    async () => {
+      let custId = str(opts.customerId);
+      if (!custId && opts.noteId) {
+        const nq = await tx.query<{ customer_id: string }>(
+          `SELECT customer_id FROM customer_notes WHERE id = $1 LIMIT 1`,
+          [str(opts.noteId)]
+        );
+        custId = str(nq.rows[0]?.customer_id);
+      }
+      await tx.query(
+        `INSERT INTO customer_note_history (
+           id, note_id, customer_id, action_type, field_name, old_value, new_value,
+           details, source_section, actor_id, actor_name, actor_role, created_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())`,
+        [
+          generateId('CNH'),
+          str(opts.noteId),
+          custId,
+          str(opts.actionType),
+          str(opts.fieldName),
+          str(opts.oldValue),
+          str(opts.newValue),
+          str(opts.details || opts.newValue || ''),
+          str(opts.sourceSection || 'customers'),
+          str(opts.actor.id),
+          str(opts.actor.name),
+          str(opts.actor.role)
+        ]
+      );
+    },
+    undefined
+  );
 }
 
 async function dispatchCustomerNoteConfigNotifications(
@@ -8594,6 +8708,7 @@ export async function addCustomerNote(
   const assignedEmployeeId = str(payload.assignedEmployeeId);
 
   return runWithIdempotency(executor, session.user.id, 'addCustomerNote', str(payload.clientRequestId), async () => {
+    let resolvedCustomerName = '';
     const out = await executor.withTransaction(async (tx) => {
       if (reservationId && !reservationNumber) {
         const rq = await tx.query<{ id: string; reservation_number: string; customer_id: string }>(
@@ -8631,6 +8746,7 @@ export async function addCustomerNote(
         );
         if (!custQ.rows[0]) throw new Error('NOT_FOUND: العميل غير موجود.');
         customerName = str(custQ.rows[0].full_name);
+        resolvedCustomerName = customerName;
       }
 
       let assignedEmployeeName = '';
@@ -8685,17 +8801,20 @@ export async function addCustomerNote(
       const savedAttachments: any[] = [];
       for (const att of incomingAttachments) {
         const attId = generateId('CNATT');
+        const attUrl = str(att.storageUrl || att.dataUrl || '');
         await tx.query(
           `INSERT INTO customer_note_attachments (
-             id, note_id, file_name, mime_type, file_size, storage_url, uploaded_by_id, uploaded_by_name, created_at
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz)`,
+             id, note_id, customer_id, file_name, mime_type, file_size, data_url, storage_url, uploaded_by_id, uploaded_by_name, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
           [
             attId,
             id,
+            customerId,
             str(att.fileName || 'attachment'),
             str(att.mimeType || 'application/octet-stream'),
             Math.max(0, Math.floor(num(att.fileSize, 0))),
-            str(att.storageUrl || att.dataUrl || ''),
+            attUrl,
+            attUrl,
             session.user.id,
             session.user.name,
             nowIso
@@ -8704,10 +8823,11 @@ export async function addCustomerNote(
         savedAttachments.push({
           id: attId,
           noteId: id,
+          customerId,
           fileName: str(att.fileName || 'attachment'),
           mimeType: str(att.mimeType || 'application/octet-stream'),
           fileSize: Math.max(0, Math.floor(num(att.fileSize, 0))),
-          storageUrl: str(att.storageUrl || att.dataUrl || ''),
+          storageUrl: attUrl,
           uploadedById: session.user.id,
           uploadedByName: session.user.name,
           createdAt: nowIso
@@ -8728,42 +8848,14 @@ export async function addCustomerNote(
 
       await recordCustomerNoteHistory(tx, {
         noteId: id,
+        customerId,
         actionType: 'إنشاء ملاحظة',
         fieldName: 'status',
         oldValue: '',
         newValue: `${str(stObj.name)} — ${val.content.slice(0, 80)}`,
+        sourceSection,
         actor: session.user
       });
-
-      await dispatchMentionNotifications(tx, {
-        texts: [val.title, val.content],
-        sender: session.user,
-        entityType: 'Customer',
-        entityId: customerId || id,
-        label: customerName || reservationNumber || id,
-        sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `cnote:${id}`
-      });
-
-      await dispatchCustomerNoteConfigNotifications(tx, config, 'onAdd', {
-        actor: session.user,
-        noteId: id,
-        customerId,
-        title: `ملاحظة عميل جديدة: ${customerName || reservationNumber || ''}`.trim(),
-        message: `${session.user.name}: ${val.content.slice(0, 120)}`,
-        eventKeySeed: id
-      });
-
-      if (assignedEmployeeId) {
-        await dispatchCustomerNoteConfigNotifications(tx, config, 'onAssign', {
-          actor: session.user,
-          noteId: id,
-          customerId,
-          assignedEmployeeId,
-          title: `تم تعيين ملاحظة عميل لك (${customerName || reservationNumber || id})`,
-          message: `عين لك ${session.user.name} متابعة الملاحظة: "${val.content.slice(0, 100)}"`,
-          eventKeySeed: `${id}:${assignedEmployeeId}`
-        });
-      }
 
       if (config.activityLog?.enabled !== false && config.activityLog?.trackAdd !== false && config.activityLog?.logAdd !== false && config.buttons?.add_note?.logActivity !== false) {
         const srcTag = config.activityLog?.includeSourceSection ? ` [المصدر: ${sourceSection}]` : '';
@@ -8805,7 +8897,56 @@ export async function addCustomerNote(
       );
     });
 
-    return { note: out };
+    // Dispatch optional notifications strictly post-commit so notification failures never abort note creation
+    const label = resolvedCustomerName || reservationNumber || out.id;
+    const mentionWarn = await runOptionalNoteNotifications(
+      executor,
+      'addCustomerNote:dispatchMentionNotifications',
+      { noteId: out.id, customerId },
+      () =>
+        dispatchMentionNotifications(executor, {
+          texts: [val.title, val.content],
+          sender: session.user,
+          entityType: 'Customer',
+          entityId: customerId || out.id,
+          label,
+          sourceKey: str(payload.clientRequestId) ? `req:${str(payload.clientRequestId)}` : `cnote:${out.id}`
+        }).then(() => undefined)
+    );
+    const onAddWarn = await runOptionalNoteNotifications(
+      executor,
+      'addCustomerNote:dispatchOnAdd',
+      { noteId: out.id, customerId },
+      () =>
+        dispatchCustomerNoteConfigNotifications(executor, config, 'onAdd', {
+          actor: session.user,
+          noteId: out.id,
+          customerId,
+          title: `ملاحظة عميل جديدة: ${resolvedCustomerName || reservationNumber || ''}`.trim(),
+          message: `${session.user.name}: ${val.content.slice(0, 120)}`,
+          eventKeySeed: out.id
+        })
+    );
+    const onAssignWarn = assignedEmployeeId
+      ? await runOptionalNoteNotifications(
+          executor,
+          'addCustomerNote:dispatchOnAssign',
+          { noteId: out.id, customerId, assignedEmployeeId },
+          () =>
+            dispatchCustomerNoteConfigNotifications(executor, config, 'onAssign', {
+              actor: session.user,
+              noteId: out.id,
+              customerId,
+              assignedEmployeeId,
+              title: `تم تعيين ملاحظة عميل لك (${label})`,
+              message: `عين لك ${session.user.name} متابعة الملاحظة: "${val.content.slice(0, 100)}"`,
+              eventKeySeed: `${out.id}:${assignedEmployeeId}`
+            })
+        )
+      : [];
+
+    const notificationWarnings = [...mentionWarn, ...onAddWarn, ...onAssignWarn];
+    return notificationWarnings.length > 0 ? { note: out, notificationWarnings } : { note: out };
   });
 }
 
@@ -8858,7 +8999,7 @@ export async function updateCustomerNote(
       `UPDATE customer_notes
        SET title = $2, note_type = $3, content = $4,
            status_id = $5, status_name = $6, status_color = $7,
-           is_internal = $8, is_closed = $9,
+           is_internal = $8, is_closed = $9::boolean,
            closed_at = CASE WHEN $9::boolean AND closed_at IS NULL THEN $12::timestamptz ELSE CASE WHEN NOT $9::boolean THEN NULL::timestamptz ELSE closed_at END END,
            updated_by_id = $10, updated_by_name = $11, updated_at = $12::timestamptz
        WHERE id = $1`,
@@ -8878,10 +9019,12 @@ export async function updateCustomerNote(
 
     await recordCustomerNoteHistory(tx, {
       noteId,
+      customerId: existingObj.customerId,
       actionType: 'تعديل ملاحظة',
       fieldName: 'content',
       oldValue: existingObj.content.slice(0, 120),
       newValue: val.content.slice(0, 120),
+      sourceSection: existingObj.sourceSection,
       actor: session.user
     });
 
@@ -8889,21 +9032,27 @@ export async function updateCustomerNote(
       await logActivity(tx, session.user, 'تعديل ملاحظة عميل', 'Customer', existingObj.customerId || noteId, val.content.slice(0, 140), config.activityLog?.includeOldNewValues !== false ? diffs : []);
     }
 
-    await dispatchCustomerNoteConfigNotifications(tx, config, 'onReplyUpdate', {
-      actor: session.user,
-      noteId,
-      customerId: existingObj.customerId,
-      title: `تحديث ملاحظة عميل`,
-      message: `${session.user.name}: ${val.content.slice(0, 110)}`,
-      eventKeySeed: `${noteId}:${nowIso}`
-    });
-
     const refreshed = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [noteId]);
     const list = await enrichCustomerNoteRows(tx, refreshed.rows, session.user);
-    return list[0];
+    return { note: list[0], nowIso, content: val.content, customerId: existingObj.customerId };
   });
 
-  return { note: out };
+  const notificationWarnings = await runOptionalNoteNotifications(
+    executor,
+    'updateCustomerNote:dispatchOnReplyUpdate',
+    { noteId, customerId: out.customerId },
+    () =>
+      dispatchCustomerNoteConfigNotifications(executor, config, 'onReplyUpdate', {
+        actor: session.user,
+        noteId,
+        customerId: out.customerId,
+        title: `تحديث ملاحظة عميل`,
+        message: `${session.user.name}: ${out.content.slice(0, 110)}`,
+        eventKeySeed: `${noteId}:${out.nowIso}`
+      })
+  );
+
+  return notificationWarnings.length > 0 ? { note: out.note, notificationWarnings } : { note: out.note };
 }
 
 export async function changeCustomerNoteStatus(
@@ -8948,21 +9097,23 @@ export async function changeCustomerNoteStatus(
     await tx.query(
       `UPDATE customer_notes
        SET status_id = $2, status_name = $3, status_color = $4,
-           is_closed = $5,
+           is_closed = $5::boolean,
            closed_at = CASE WHEN $5::boolean THEN $8::timestamptz ELSE NULL::timestamptz END,
            closed_by_id = CASE WHEN $5::boolean THEN $6::text ELSE ''::text END,
            closed_by_name = CASE WHEN $5::boolean THEN $7::text ELSE ''::text END,
-           updated_by_id = $6, updated_by_name = $7, updated_at = $8::timestamptz
+           updated_by_id = $6::text, updated_by_name = $7::text, updated_at = $8::timestamptz
        WHERE id = $1`,
       [noteId, str(targetStatus.id), str(targetStatus.name), str(targetStatus.color), isClosed, session.user.id, session.user.name, nowIso]
     );
 
     await recordCustomerNoteHistory(tx, {
       noteId,
+      customerId: existingObj.customerId,
       actionType: 'تغيير الحالة',
       fieldName: 'status',
       oldValue: existingObj.statusName,
       newValue: str(targetStatus.name),
+      sourceSection: existingObj.sourceSection,
       actor: session.user
     });
 
@@ -8980,21 +9131,33 @@ export async function changeCustomerNoteStatus(
       );
     }
 
-    await dispatchCustomerNoteConfigNotifications(tx, config, isClosed ? 'onClose' : 'onStatusChange', {
-      actor: session.user,
-      noteId,
-      customerId: existingObj.customerId,
-      title: isClosed ? `تم إغلاق ملاحظة عميل (${str(targetStatus.name)})` : `تغيرت حالة ملاحظة عميل إلى ${str(targetStatus.name)}`,
-      message: `${session.user.name} غير الحالة من "${existingObj.statusName}" إلى "${str(targetStatus.name)}"`,
-      eventKeySeed: `${noteId}:${str(targetStatus.id)}:${nowIso}`
-    });
-
     const refreshed = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [noteId]);
     const list = await enrichCustomerNoteRows(tx, refreshed.rows, session.user);
-    return list[0];
+    return {
+      note: list[0],
+      nowIso,
+      isClosed,
+      customerId: existingObj.customerId,
+      oldStatusName: existingObj.statusName
+    };
   });
 
-  return { note: out };
+  const notificationWarnings = await runOptionalNoteNotifications(
+    executor,
+    'changeCustomerNoteStatus:dispatchStatusNotif',
+    { noteId, customerId: out.customerId },
+    () =>
+      dispatchCustomerNoteConfigNotifications(executor, config, out.isClosed ? 'onClose' : 'onStatusChange', {
+        actor: session.user,
+        noteId,
+        customerId: out.customerId,
+        title: out.isClosed ? `تم إغلاق ملاحظة عميل (${str(targetStatus.name)})` : `تغيرت حالة ملاحظة عميل إلى ${str(targetStatus.name)}`,
+        message: `${session.user.name} غير الحالة من "${out.oldStatusName}" إلى "${str(targetStatus.name)}"`,
+        eventKeySeed: `${noteId}:${str(targetStatus.id)}:${out.nowIso}`
+      })
+  );
+
+  return notificationWarnings.length > 0 ? { note: out.note, notificationWarnings } : { note: out.note };
 }
 
 export async function assignCustomerNoteEmployee(
@@ -9034,10 +9197,12 @@ export async function assignCustomerNoteEmployee(
 
     await recordCustomerNoteHistory(tx, {
       noteId,
+      customerId: existingObj.customerId,
       actionType: 'تعيين موظف للملاحظة',
       fieldName: 'assignedEmployee',
       oldValue: existingObj.assignedEmployeeName || 'غير معين',
       newValue: empName || 'غير معين',
+      sourceSection: existingObj.sourceSection,
       actor: session.user
     });
 
@@ -9045,24 +9210,35 @@ export async function assignCustomerNoteEmployee(
       await logActivity(tx, session.user, 'تعيين ملاحظة عميل لموظف', 'Customer', existingObj.customerId || noteId, `${empName || 'إلغاء التعيين'}`);
     }
 
-    if (employeeId) {
-      await dispatchCustomerNoteConfigNotifications(tx, config, 'onAssign', {
-        actor: session.user,
-        noteId,
-        customerId: existingObj.customerId,
-        assignedEmployeeId: employeeId,
-        title: `تم تعيين ملاحظة عميل لك`,
-        message: `عين لك ${session.user.name} متابعة الملاحظة: "${existingObj.content.slice(0, 100)}"`,
-        eventKeySeed: `${noteId}:${employeeId}:${nowIso}`
-      });
-    }
-
     const refreshed = await tx.query(`SELECT * FROM customer_notes WHERE id = $1 LIMIT 1`, [noteId]);
     const list = await enrichCustomerNoteRows(tx, refreshed.rows, session.user);
-    return list[0];
+    return {
+      note: list[0],
+      nowIso,
+      customerId: existingObj.customerId,
+      content: existingObj.content
+    };
   });
 
-  return { note: out };
+  const notificationWarnings = employeeId
+    ? await runOptionalNoteNotifications(
+        executor,
+        'assignCustomerNoteEmployee:dispatchOnAssign',
+        { noteId, customerId: out.customerId, employeeId },
+        () =>
+          dispatchCustomerNoteConfigNotifications(executor, config, 'onAssign', {
+            actor: session.user,
+            noteId,
+            customerId: out.customerId,
+            assignedEmployeeId: employeeId,
+            title: `تم تعيين ملاحظة عميل لك`,
+            message: `عين لك ${session.user.name} متابعة الملاحظة: "${out.content.slice(0, 100)}"`,
+            eventKeySeed: `${noteId}:${employeeId}:${out.nowIso}`
+          })
+      )
+    : [];
+
+  return notificationWarnings.length > 0 ? { note: out.note, notificationWarnings } : { note: out.note };
 }
 
 export async function deleteCustomerNote(
@@ -9094,10 +9270,12 @@ export async function deleteCustomerNote(
     await recordSyncTombstone(tx, 'customer_note', [noteId], { customerId: existingObj.customerId });
     await recordCustomerNoteHistory(tx, {
       noteId,
+      customerId: existingObj.customerId,
       actionType: 'حذف ملاحظة',
       fieldName: 'deleted',
       oldValue: existingObj.content.slice(0, 100),
       newValue: 'محذوفة',
+      sourceSection: existingObj.sourceSection,
       actor: session.user
     });
 
@@ -9147,16 +9325,18 @@ export async function addCustomerNoteAttachment(
     const attId = generateId('CNATT');
     const nowIso = new Date().toISOString();
     await tx.query(
-      `INSERT INTO customer_note_attachments (id, note_id, file_name, mime_type, file_size, storage_url, uploaded_by_id, uploaded_by_name, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz)`,
-      [attId, noteId, fileName, mimeType, fileSize, storageUrl, session.user.id, session.user.name, nowIso]
+      `INSERT INTO customer_note_attachments (id, note_id, customer_id, file_name, mime_type, file_size, data_url, storage_url, uploaded_by_id, uploaded_by_name, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz)`,
+      [attId, noteId, noteObj.customerId, fileName, mimeType, fileSize, storageUrl, storageUrl, session.user.id, session.user.name, nowIso]
     );
     await recordCustomerNoteHistory(tx, {
       noteId,
+      customerId: noteObj.customerId,
       actionType: 'إرفاق ملف',
       fieldName: 'attachment',
       oldValue: '',
       newValue: fileName,
+      sourceSection: noteObj.sourceSection,
       actor: session.user
     });
     if (config.activityLog?.enabled !== false && config.activityLog?.trackAttachments !== false && config.activityLog?.logAttachments !== false && config.buttons?.attach_file?.logActivity !== false) {
@@ -9201,10 +9381,12 @@ export async function deleteCustomerNoteAttachment(
     await tx.query(`UPDATE customer_note_attachments SET deleted_at = $2::timestamptz WHERE id = $1`, [attachmentId, nowIso]);
     await recordCustomerNoteHistory(tx, {
       noteId: str(att.note_id),
+      customerId: noteObj?.customerId || str(att.customer_id),
       actionType: 'حذف مرفق',
       fieldName: 'attachment',
       oldValue: str(att.file_name),
       newValue: '',
+      sourceSection: noteObj?.sourceSection || 'customers',
       actor: session.user
     });
     if (config.activityLog?.enabled !== false && config.activityLog?.trackAttachments !== false && config.activityLog?.logAttachments !== false && config.buttons?.delete_attachment?.logActivity !== false) {

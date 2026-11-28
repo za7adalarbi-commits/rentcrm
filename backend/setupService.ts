@@ -6,6 +6,7 @@ import {
   isCoreFilesystemWritable,
   maskDatabaseUrl,
   normalizeMode,
+  normalizeRgApiBaseUrl,
   persistCoreFilesOnDisk,
   type PersistCoreFilesResult
 } from './coreBinding.js';
@@ -72,11 +73,9 @@ export async function getSetupCapabilities(
     (resolved?.gasWebAppUrl) ||
     String(process.env.GAS_WEBAPP_URL || FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
 
-  const rgApiBaseUrl =
-    (resolved?.rgApiBaseUrl) ||
-    String(process.env.RG_API_BASE_URL || FIXED_SERVER_CONFIG.rgApiBaseUrl || 'https://api.rentalgate.net/api')
-      .trim()
-      .replace(/\/+$/, '');
+  const rgApiBaseUrl = normalizeRgApiBaseUrl(
+    resolved?.rgApiBaseUrl || process.env.RG_API_BASE_URL || FIXED_SERVER_CONFIG.rgApiBaseUrl
+  );
 
   const hasRgToken = Boolean(resolved?.rgToken || process.env.RG_TOKEN || FIXED_SERVER_CONFIG.rgToken);
   const hasSyncSecret = Boolean(resolved?.syncApiSecret || process.env.SYNC_API_SECRET || FIXED_SERVER_CONFIG.syncApiSecret);
@@ -180,8 +179,10 @@ export async function applyUnifiedConnectionSetup(opts: UnifiedSetupOptions) {
     ? ''
     : (inputRgToken || existingServerCfg?.rgToken || String(process.env.RG_TOKEN || FIXED_SERVER_CONFIG.rgToken || '').replace(/^Bearer\s+/i, '').trim());
 
-  const inputBaseUrl = str(payload.rgApiBaseUrl).replace(/\/+$/, '');
-  const nextBaseUrl = inputBaseUrl || existingServerCfg?.rgApiBaseUrl || String(process.env.RG_API_BASE_URL || FIXED_SERVER_CONFIG.rgApiBaseUrl || 'https://api.rentalgate.net/api').trim().replace(/\/+$/, '');
+  const rawInputBaseUrl = str(payload.rgApiBaseUrl);
+  const nextBaseUrl = normalizeRgApiBaseUrl(
+    rawInputBaseUrl || existingServerCfg?.rgApiBaseUrl || process.env.RG_API_BASE_URL || FIXED_SERVER_CONFIG.rgApiBaseUrl
+  );
 
   const inputSyncSecret = str(payload.syncApiSecret);
   let nextSyncSecret = inputSyncSecret || existingServerCfg?.syncApiSecret || String(process.env.SYNC_API_SECRET || FIXED_SERVER_CONFIG.syncApiSecret || '').trim();

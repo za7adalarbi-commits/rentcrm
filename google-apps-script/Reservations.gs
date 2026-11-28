@@ -787,14 +787,22 @@ function deleteRecordsWhere_(sheetName, predicateFn) {
   }
   if (matchIndices.length <= 40) {
     for (var k = matchIndices.length - 1; k >= 0; k--) {
-      sheet.deleteRow(matchIndices[k] + 2);
+      if (typeof safeDeleteSheetRows_ === 'function') {
+        safeDeleteSheetRows_(sheet, matchIndices[k] + 2, 1);
+      } else {
+        sheet.deleteRow(matchIndices[k] + 2);
+      }
     }
   } else {
     sheet.getRange(2, 1, values.length, headers.length).clearContent();
     sheet.getRange(2, 1, keptRows.length, headers.length).setValues(keptRows);
     var extraRows = values.length - keptRows.length;
     if (extraRows > 0) {
-      sheet.deleteRows(2 + keptRows.length, extraRows);
+      if (typeof safeDeleteSheetRows_ === 'function') {
+        safeDeleteSheetRows_(sheet, 2 + keptRows.length, extraRows);
+      } else {
+        sheet.deleteRows(2 + keptRows.length, extraRows);
+      }
     }
   }
   invalidateCache(sheetName);

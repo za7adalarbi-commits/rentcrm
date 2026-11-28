@@ -11689,10 +11689,13 @@
   var DATA_INTEGRITY_DISCREPANCY_TYPES = {
     missing_in_neon: { key: 'missing_in_neon', labelAr: 'مفقود في Neon وموجود في RG', severity: 'high' },
     missing_in_rg: { key: 'missing_in_rg', labelAr: 'مفقود في Rental Gate وموجود في Neon', severity: 'high' },
+    extra_in_neon: { key: 'extra_in_neon', labelAr: 'سجل إضافي في Neon غير موجود في RG', severity: 'low' },
     status_mismatch: { key: 'status_mismatch', labelAr: 'اختلاف حالة الحجز', severity: 'high' },
     customer_mismatch: { key: 'customer_mismatch', labelAr: 'اختلاف بيانات العميل', severity: 'medium' },
     dates_mismatch: { key: 'dates_mismatch', labelAr: 'اختلاف مواعيد الاستلام أو الإرجاع', severity: 'high' },
     vehicle_company_mismatch: { key: 'vehicle_company_mismatch', labelAr: 'اختلاف السيارة أو شركة التأجير', severity: 'medium' },
+    extensions_count_mismatch: { key: 'extensions_count_mismatch', labelAr: 'اختلاف عدد التمديدات', severity: 'medium' },
+    rg_number_in_reservation_number: { key: 'rg_number_in_reservation_number', labelAr: 'رقم مرجعي RG- محفوظ مكان رقم الحجز', severity: 'medium' },
     duplicate_record: { key: 'duplicate_record', labelAr: 'سجل مكرر في قاعدة البيانات', severity: 'high' },
     incomplete_fields: { key: 'incomplete_fields', labelAr: 'حقول أساسية ناقصة أو غير مكتملة', severity: 'low' },
     stale_record: { key: 'stale_record', labelAr: 'سجل متأخر عن آخر تحديث', severity: 'low' },
@@ -11731,30 +11734,76 @@
     };
   }
 
+  function cleanIntegrityKey(val) {
+    return normalizeStr(val).replace(/^#+/, '').trim();
+  }
+
   function buildIntegrityRecordProjection(raw, isRgSource) {
     var r = (raw && typeof raw === 'object') ? raw : {};
-    var id = normalizeStr(r.id || (isRgSource ? extractSourceReservationId(r) : r.source_id));
-    var num = normalizeStr(r.reservationNumber || r.reservation_number || (isRgSource ? extractReservationNumber(r) : '') || id);
+    var srcId = cleanIntegrityKey(
+      isRgSource
+        ? (extractSourceReservationId(r) || r.sourceReservationId || r.source_reservation_id || r.reservationId || r.id)
+        : (r.sourceReservationId || r.source_reservation_id || '')
+    );
+    var id = normalizeStr(r.id || srcId);
+    var num = normalizeStr(
+      r.reservationNumber ||
+      r.reservation_number ||
+      (isRgSource ? extractReservationNumber(r) : '') ||
+      srcId ||
+      id
+    );
+    var refNum = normalizeStr(r.referenceNumber || r.reference_number || (isRgSource ? (r.refNumber || '') : ''));
     var statusCode = isRgSource
       ? normalizeStr(extractReservationStatusCode(r, true) || r.status || r.statusCode || '')
       : normalizeStr(r.originalStatusCode || r.original_status_code || r.internalStatus || r.internal_status);
     var statusAr = isRgSource
       ? resolveSourceWorkflowStatus(r)
       : normalizeStr(r.internalStatus || r.internal_status || r.originalStatusAr || r.original_status_ar || translateOriginalStatus(statusCode));
+    var hasExtCnt = r.extensionsCount !== undefined || r.extensions_count !== undefined;
+    var hasFieldProj = Boolean(
+      r && (
+        r.customerName !== undefined ||
+        r.customer_name !== undefined ||
+        r.startDate !== undefined ||
+        r.start_date !== undefined
+      )
+    );
     return {
       id: id,
+      sourceReservationId: srcId,
       reservationNumber: num,
+      referenceNumber: refNum,
       statusCode: statusCode,
       statusAr: statusAr,
-      customerName: normalizeStr(r.customerName || r.customer_name || (r.customer && r.customer.name) || (r.user && r.user.name)),
-      customerPhone: normalizeStr(r.customerPhone || r.customer_phone || (r.customer && r.customer.phone) || (r.user && r.user.phone)),
-      startDate: formatDisplayDate(r.startDate || r.start_date || r.pickup_date),
+      customerName: normalizeStr(
+        r.customerName || r.customer_name || r.clientName ||
+        (r.client && r.client.name) || (r.customer && r.customer.name) || (r.user && r.user.name)
+      ),
+      customerPhone: normalizeStr(
+        r.customerPhone || r.customer_phone || r.clientMobile ||
+        (r.client && (r.client.mobile || r.client.phone)) ||
+        (r.customer && (r.customer.mobile || r.customer.phone)) ||
+        (r.user && r.user.phone)
+      ),
+      startDate: formatDisplayDate(r.startDate || r.start_date || r.pickup_date || r.fromDate || r.dateFrom),
       startTime: normalizeStr(r.startTime || r.start_time || extractTimeOnly(r.startDate || r.start_date)),
-      endDate: formatDisplayDate(r.actualEndDate || r.extendedUntilDate || r.extended_until_date || r.endDate || r.end_date || r.return_date),
+      endDate: formatDisplayDate(r.actualEndDate || r.extendedUntilDate || r.extended_until_date || r.endDate || r.end_date || r.return_date || r.toDate || r.dateTo),
       endTime: normalizeStr(r.endTime || r.end_time || extractTimeOnly(r.actualEndDate || r.endDate || r.end_date)),
-      carName: normalizeStr(r.carName || r.car_name || (r.car && (r.car.name || r.car.model))),
-      companyName: normalizeStr(r.companyName || r.company_name || (r.company && r.company.name) || r.newCompanyName || r.new_company_name),
+      carName: normalizeStr(
+        r.carName || r.car_name || r.carNameAr || r.carNameEn ||
+        (r.companyCar && r.companyCar.car && (r.companyCar.car.carNameAr || r.companyCar.car.carNameEn || r.companyCar.car.name)) ||
+        (r.car && (r.car.carNameAr || r.car.name || r.car.model))
+      ),
+      companyName: normalizeStr(
+        r.companyName || r.company_name || r.companyArName || r.companyEnName ||
+        (r.companyCar && r.companyCar.company && (r.companyCar.company.arabicName || r.companyCar.company.name)) ||
+        (r.company && (r.company.arabicName || r.company.name)) ||
+        r.newCompanyName || r.new_company_name
+      ),
       extensionsCount: Math.floor(toNum(r.extensionsCount !== undefined ? r.extensionsCount : r.extensions_count, 0)),
+      hasExtensionCount: hasExtCnt,
+      _hasFieldProjection: hasFieldProj,
       updatedAt: normalizeStr(r.lastUpdatedAt || r.updatedAt || r.updated_at)
     };
   }
@@ -11762,42 +11811,86 @@
   function compareRgAndNeonReservations(rgList, neonList) {
     var rgArr = Array.isArray(rgList) ? rgList : [];
     var neonArr = Array.isArray(neonList) ? neonList : [];
-    var rgByKey = {};
-    var neonByKey = {};
-    var neonKeyCounts = {};
+    var neonProjs = [];
+    var neonByAlias = {};
+    var neonCanonicalCounts = {};
+    var neonPrimaryIndexByCanonical = {};
+    var rgByAlias = {};
     var issues = [];
+    var duplicateCount = 0;
+    var missingInNeonCount = 0;
+    var missingInRgCount = 0;
+    var matchedCount = 0;
+    var mismatchedRecordSet = {};
+
+    function registerAlias(map, key, val) {
+      var clean = cleanIntegrityKey(key);
+      if (!clean) return;
+      if (map[clean] === undefined) map[clean] = val;
+      var lower = clean.toLowerCase();
+      if (map[lower] === undefined) map[lower] = val;
+    }
+
+    function lookupAlias(map, proj) {
+      var cands = [proj.sourceReservationId, proj.reservationNumber, proj.referenceNumber, proj.id];
+      for (var ci = 0; ci < cands.length; ci++) {
+        var clean = cleanIntegrityKey(cands[ci]);
+        if (!clean) continue;
+        if (map[clean] !== undefined) return map[clean];
+        var lower = clean.toLowerCase();
+        if (map[lower] !== undefined) return map[lower];
+      }
+      return undefined;
+    }
 
     for (var ni = 0; ni < neonArr.length; ni++) {
       var nProj = buildIntegrityRecordProjection(neonArr[ni], false);
-      var nKey = normalizeStr(nProj.reservationNumber || nProj.id);
-      if (!nKey) continue;
-      neonKeyCounts[nKey] = (neonKeyCounts[nKey] || 0) + 1;
-      if (!neonByKey[nKey]) {
-        neonByKey[nKey] = nProj;
+      neonProjs.push(nProj);
+      var nCanon = cleanIntegrityKey(nProj.sourceReservationId) || cleanIntegrityKey(nProj.reservationNumber) || cleanIntegrityKey(nProj.id);
+      if (!nCanon) continue;
+      neonCanonicalCounts[nCanon] = (neonCanonicalCounts[nCanon] || 0) + 1;
+      if (neonPrimaryIndexByCanonical[nCanon] === undefined) {
+        neonPrimaryIndexByCanonical[nCanon] = ni;
+        registerAlias(neonByAlias, nProj.sourceReservationId, ni);
+        registerAlias(neonByAlias, nProj.reservationNumber, ni);
+        registerAlias(neonByAlias, nProj.referenceNumber, ni);
+        registerAlias(neonByAlias, nProj.id, ni);
       } else {
+        duplicateCount++;
         issues.push({
           discrepancyType: 'duplicate_record',
           severity: 'high',
           sourceScope: 'reservations',
           reservationId: nProj.id,
-          reservationNumber: nKey,
+          reservationNumber: cleanIntegrityKey(nProj.reservationNumber) || nCanon,
           fieldName: 'reservation_number',
           rgValue: 'سجل فريد واحد',
-          neonValue: 'مكرر (' + neonKeyCounts[nKey] + ' سجلات)',
-          rgSnapshot: rgByKey[nKey] || {},
+          neonValue: 'مكرر (' + neonCanonicalCounts[nCanon] + ' سجلات)',
+          rgSnapshot: {},
           neonSnapshot: nProj
         });
       }
     }
 
+    var matchedNeonIndices = {};
+    var seenRgCanon = {};
+
     for (var ri = 0; ri < rgArr.length; ri++) {
       var rProj = buildIntegrityRecordProjection(rgArr[ri], true);
-      var rKey = normalizeStr(rProj.reservationNumber || rProj.id);
+      var rKey = cleanIntegrityKey(rProj.sourceReservationId) || cleanIntegrityKey(rProj.reservationNumber) || cleanIntegrityKey(rProj.id);
       if (!rKey) continue;
-      rgByKey[rKey] = rProj;
+      if (seenRgCanon[rKey]) continue;
+      seenRgCanon[rKey] = true;
 
-      var nMatch = neonByKey[rKey] || null;
+      registerAlias(rgByAlias, rProj.sourceReservationId, rProj);
+      registerAlias(rgByAlias, rProj.reservationNumber, rProj);
+      registerAlias(rgByAlias, rProj.referenceNumber, rProj);
+      registerAlias(rgByAlias, rProj.id, rProj);
+
+      var matchIdx = lookupAlias(neonByAlias, rProj);
+      var nMatch = matchIdx !== undefined ? neonProjs[matchIdx] : null;
       if (!nMatch) {
+        missingInNeonCount++;
         issues.push({
           discrepancyType: 'missing_in_neon',
           severity: 'high',
@@ -11813,13 +11906,36 @@
         continue;
       }
 
-      // Incomplete required fields check
-      if (!nMatch.customerName || !nMatch.customerPhone || !nMatch.startDate || !nMatch.endDate) {
+      if (!matchedNeonIndices[matchIdx]) {
+        matchedNeonIndices[matchIdx] = true;
+        matchedCount++;
+      }
+      var hasFieldIssue = false;
+
+      if (nMatch.sourceReservationId && /^RG-/i.test(nMatch.reservationNumber) && cleanIntegrityKey(nMatch.reservationNumber) !== cleanIntegrityKey(nMatch.sourceReservationId)) {
+        hasFieldIssue = true;
+        issues.push({
+          discrepancyType: 'rg_number_in_reservation_number',
+          severity: 'medium',
+          sourceScope: 'reservations',
+          reservationId: nMatch.id,
+          reservationNumber: cleanIntegrityKey(nMatch.sourceReservationId) || rKey,
+          fieldName: 'reservation_number',
+          rgValue: nMatch.sourceReservationId,
+          neonValue: nMatch.reservationNumber,
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+
+      // Incomplete required fields check (only when field projection columns are present)
+      if (nMatch._hasFieldProjection && (!nMatch.customerName || !nMatch.customerPhone || !nMatch.startDate || !nMatch.endDate)) {
         var missingCols = [];
         if (!nMatch.customerName) missingCols.push('اسم العميل');
         if (!nMatch.customerPhone) missingCols.push('رقم الجوال');
         if (!nMatch.startDate) missingCols.push('تاريخ الاستلام');
         if (!nMatch.endDate) missingCols.push('تاريخ الإرجاع');
+        hasFieldIssue = true;
         issues.push({
           discrepancyType: 'incomplete_fields',
           severity: 'low',
@@ -11840,6 +11956,7 @@
       var rgOrigNorm = normalizeStr(rProj.statusCode).toLowerCase();
       var neonOrigNorm = normalizeStr(nMatch.statusCode).toLowerCase();
       if (rgStatusLc !== neonStatusLc || (rgOrigNorm && neonOrigNorm && rgOrigNorm !== neonOrigNorm && translateOriginalStatus(rgOrigNorm) !== translateOriginalStatus(neonOrigNorm))) {
+        hasFieldIssue = true;
         issues.push({
           discrepancyType: 'status_mismatch',
           severity: 'high',
@@ -11859,6 +11976,7 @@
       var neonPhoneDigits = normalizeEmployeePhone(nMatch.customerPhone);
       if ((rgPhoneDigits && neonPhoneDigits && rgPhoneDigits !== neonPhoneDigits) ||
           (rProj.customerName && nMatch.customerName && normalizeSearchText(rProj.customerName) !== normalizeSearchText(nMatch.customerName))) {
+        hasFieldIssue = true;
         issues.push({
           discrepancyType: 'customer_mismatch',
           severity: 'medium',
@@ -11876,6 +11994,7 @@
       // Pickup / return date mismatch check
       if ((rProj.startDate && nMatch.startDate && rProj.startDate !== nMatch.startDate) ||
           (rProj.endDate && nMatch.endDate && rProj.endDate !== nMatch.endDate)) {
+        hasFieldIssue = true;
         issues.push({
           discrepancyType: 'dates_mismatch',
           severity: 'high',
@@ -11893,6 +12012,7 @@
       // Car / rental company mismatch check
       if ((rProj.companyName && nMatch.companyName && normalizeSearchText(rProj.companyName) !== normalizeSearchText(nMatch.companyName)) ||
           (rProj.carName && nMatch.carName && normalizeSearchText(rProj.carName) !== normalizeSearchText(nMatch.carName))) {
+        hasFieldIssue = true;
         issues.push({
           discrepancyType: 'vehicle_company_mismatch',
           severity: 'medium',
@@ -11906,23 +12026,47 @@
           neonSnapshot: nMatch
         });
       }
+
+      // Extensions count mismatch check when RG extension count was explicitly enriched
+      if (rProj.hasExtensionCount && nMatch.hasExtensionCount && rProj.extensionsCount !== nMatch.extensionsCount) {
+        hasFieldIssue = true;
+        issues.push({
+          discrepancyType: 'extensions_count_mismatch',
+          severity: 'medium',
+          sourceScope: 'extensions',
+          reservationId: nMatch.id,
+          reservationNumber: rKey,
+          fieldName: 'extensions_count',
+          rgValue: String(rProj.extensionsCount),
+          neonValue: String(nMatch.extensionsCount),
+          rgSnapshot: rgArr[ri],
+          neonSnapshot: nMatch
+        });
+      }
+
+      if (hasFieldIssue) {
+        mismatchedRecordSet[rKey] = true;
+      }
     }
 
-    var neonKeys = Object.keys(neonByKey);
-    for (var nki = 0; nki < neonKeys.length; nki++) {
-      var k = neonKeys[nki];
-      if (!rgByKey[k]) {
+    for (var nki = 0; nki < neonProjs.length; nki++) {
+      if (matchedNeonIndices[nki]) continue;
+      var np = neonProjs[nki];
+      var npCanon = cleanIntegrityKey(np.sourceReservationId) || cleanIntegrityKey(np.reservationNumber) || cleanIntegrityKey(np.id);
+      if (!npCanon || neonPrimaryIndexByCanonical[npCanon] !== nki) continue;
+      if (lookupAlias(rgByAlias, np) === undefined) {
+        missingInRgCount++;
         issues.push({
           discrepancyType: 'missing_in_rg',
           severity: 'high',
           sourceScope: 'reservations',
-          reservationId: neonByKey[k].id,
-          reservationNumber: k,
+          reservationId: np.id,
+          reservationNumber: cleanIntegrityKey(np.reservationNumber) || npCanon,
           fieldName: 'record',
           rgValue: 'غير موجود في استجابة Rental Gate',
-          neonValue: neonByKey[k].statusAr || neonByKey[k].statusCode || 'موجود في Neon',
+          neonValue: np.statusAr || np.statusCode || 'موجود في Neon',
           rgSnapshot: {},
-          neonSnapshot: neonByKey[k]
+          neonSnapshot: np
         });
       }
     }
@@ -11930,6 +12074,11 @@
     return {
       rgTotalCount: rgArr.length,
       neonTotalCount: neonArr.length,
+      matchedCount: matchedCount,
+      missingInNeonCount: missingInNeonCount,
+      missingInRgCount: missingInRgCount,
+      mismatchedCount: Object.keys(mismatchedRecordSet).length,
+      duplicateCount: duplicateCount,
       reviewedCount: Math.max(rgArr.length, neonArr.length),
       discrepanciesCount: issues.length,
       issues: issues
