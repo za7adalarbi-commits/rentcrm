@@ -30,9 +30,9 @@ export function normalizeRgApiBaseUrl(raw?: unknown): string {
 
   try {
     const parsed = new URL(clean);
-    let pathname = parsed.pathname.replace(/\/+$/, '');
+    let pathname = parsed.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+    pathname = pathname.replace(/(\/api)+(?=\/|$)/gi, '/api');
     pathname = pathname.replace(RG_KNOWN_ENDPOINT_SUFFIX_RE, '').replace(/\/+$/, '');
-    // Collapse accidental duplicated /api segments (e.g. /api/api -> /api)
     pathname = pathname.replace(/(\/api)+$/i, '/api').replace(/\/{2,}/g, '/');
     if (!pathname) pathname = '/api';
     return `${parsed.origin}${pathname}`;
@@ -49,11 +49,25 @@ export function buildRentalGateEndpointUrl(
   query?: Record<string, string | number | boolean | undefined | null>
 ): string {
   const cleanBase = normalizeRgApiBaseUrl(baseApi);
-  let cleanEp = String(endpoint || '').trim().replace(/^\/+/, '');
-  // Prevent /api/api/... when base already ends in /api and endpoint starts with api/
-  if (/\/api$/i.test(cleanBase) && /^api\//i.test(cleanEp)) {
-    cleanEp = cleanEp.replace(/^api\//i, '');
+  let cleanEp = String(endpoint || '').trim().split(/[?#]/)[0];
+  if (/^https?:\/\//i.test(cleanEp)) {
+    try {
+      const epUrl = new URL(cleanEp);
+      cleanEp = epUrl.pathname;
+    } catch {
+      // ignore invalid full URL fallback
+    }
   }
+  cleanEp = cleanEp.replace(/\/{2,}/g, '/').replace(/^\/+|\/+$/g, '');
+  // Prevent /api/api/... when base already ends in /api and endpoint starts with api/
+  if (/\/api$/i.test(cleanBase)) {
+    cleanEp = cleanEp.replace(/^(?:api\/)+/i, '');
+  }
+  // Collapse accidentally repeated known endpoint sequences inside endpoint string
+  cleanEp = cleanEp.replace(
+    /^(reservations\/filter|reservation-extends\/filter|admin\/cancelled-reservations|reservation-company-changes\/admin\/filter)(?:\/\1)+$/i,
+    '$1'
+  );
   const baseWithSlash = cleanBase.endsWith('/') ? cleanBase : `${cleanBase}/`;
   const url = cleanEp ? new URL(cleanEp, baseWithSlash) : new URL(cleanBase);
   if (query && typeof query === 'object') {
@@ -105,13 +119,32 @@ export function buildClientConfigJsContent(cfg: CoreClientConfigInput): string {
 `;
 }
 
+function sanitizeConfigToken(raw: unknown): string {
+  let clean = String(raw ?? '').replace(/[\r\n]+/g, '').trim();
+  while (clean.length >= 2) {
+    const first = clean[0];
+    const last = clean[clean.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      clean = clean.slice(1, -1).trim();
+    } else {
+      break;
+    }
+  }
+  return clean;
+}
+
+function normalizeConfigBearer(raw: unknown): string {
+  const clean = sanitizeConfigToken(raw).replace(/^(?:Bearer\s+)+/i, '').trim();
+  return sanitizeConfigToken(clean);
+}
+
 export function buildFixedServerConfigTsContent(cfg: FixedServerConfig): string {
   const mode = normalizeMode(cfg.mode);
-  const databaseUrl = String(cfg.databaseUrl || '').trim();
-  const gasWebAppUrl = String(cfg.gasWebAppUrl || '').trim();
-  const rgToken = String(cfg.rgToken || '').trim().replace(/^Bearer\s+/i, '');
+  const databaseUrl = sanitizeConfigToken(cfg.databaseUrl);
+  const gasWebAppUrl = sanitizeConfigToken(cfg.gasWebAppUrl);
+  const rgToken = normalizeConfigBearer(cfg.rgToken);
   const rgApiBaseUrl = normalizeRgApiBaseUrl(cfg.rgApiBaseUrl);
-  const syncApiSecret = String(cfg.syncApiSecret || '').trim();
+  const syncApiSecret = sanitizeConfigToken(cfg.syncApiSecret);
   const updatedAt = String(cfg.updatedAt || '').trim();
   const updatedBy = String(cfg.updatedBy || '').trim();
 
@@ -195,11 +228,11 @@ export function isCoreFilesystemWritable(rootDir: string = process.cwd()): boole
 
 export function applyInMemoryServerConfig(cfg: FixedServerConfig): void {
   FIXED_SERVER_CONFIG.mode = normalizeMode(cfg.mode);
-  FIXED_SERVER_CONFIG.databaseUrl = String(cfg.databaseUrl || '').trim();
-  FIXED_SERVER_CONFIG.gasWebAppUrl = String(cfg.gasWebAppUrl || '').trim();
-  FIXED_SERVER_CONFIG.rgToken = String(cfg.rgToken || '').trim().replace(/^Bearer\s+/i, '');
+  FIXED_SERVER_CONFIG.databaseUrl = sanitizeConfigToken(cfg.databaseUrl);
+  FIXED_SERVER_CONFIG.gasWebAppUrl = sanitizeConfigToken(cfg.gasWebAppUrl);
+  FIXED_SERVER_CONFIG.rgToken = normalizeConfigBearer(cfg.rgToken);
   FIXED_SERVER_CONFIG.rgApiBaseUrl = normalizeRgApiBaseUrl(cfg.rgApiBaseUrl);
-  FIXED_SERVER_CONFIG.syncApiSecret = String(cfg.syncApiSecret || '').trim();
+  FIXED_SERVER_CONFIG.syncApiSecret = sanitizeConfigToken(cfg.syncApiSecret);
   FIXED_SERVER_CONFIG.updatedAt = String(cfg.updatedAt || '').trim();
   FIXED_SERVER_CONFIG.updatedBy = String(cfg.updatedBy || '').trim();
 

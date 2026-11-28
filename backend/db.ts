@@ -1021,6 +1021,91 @@ export const AUDIT_AND_HEALTH_MIGRATIONS: SchemaMigrationDef[] = [
       // Idempotent recalculation of extensions_count & has_extensions from extensions table
       await recalculateReservationExtensionCounts(tx);
     }
+  },
+  {
+    id: '2026_11_27_007_customers_backfill_and_outbox_reliability',
+    description: 'Backfill unlinked reservations to customers safely, normalize empty phone/id_type metadata, and add outbox error_history_json & idempotency index',
+    run: async (tx) => {
+      await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS error_history_json JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+      await runWithSavepoint(
+        tx,
+        'mig007_outbox_idemp_idx',
+        async () => {
+          await tx.query(
+            `UPDATE sheets_mirror_outbox o
+             SET idempotency_key = NULL
+             WHERE COALESCE(o.idempotency_key, '') <> ''
+               AND o.id IN (
+                 SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (PARTITION BY idempotency_key ORDER BY created_at DESC, id DESC) AS rn
+                   FROM sheets_mirror_outbox
+                   WHERE COALESCE(idempotency_key, '') <> ''
+                 ) dup WHERE dup.rn > 1
+               )`
+          );
+          await tx.query(
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_sheets_outbox_idempotency_key
+             ON sheets_mirror_outbox (idempotency_key)
+             WHERE COALESCE(idempotency_key, '') <> '';`
+          );
+        },
+        undefined
+      );
+
+      // Idempotently normalize customers.normalized_phone only when currently empty and phone has digits
+      await runWithSavepoint(
+        tx,
+        'mig007_cust_norm_phone',
+        () =>
+          tx.query(
+            `UPDATE customers
+             SET normalized_phone = RIGHT(REGEXP_REPLACE(phone, '[^0-9]', '', 'g'), 12),
+                 updated_at = NOW()
+             WHERE COALESCE(TRIM(normalized_phone), '') = ''
+               AND LENGTH(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g')) >= 7`
+          ),
+        undefined
+      );
+
+      // Idempotently backfill unlinked reservations into customers without overwriting non-empty profile fields
+      await runWithSavepoint(
+        tx,
+        'mig007_cust_backfill',
+        async () => {
+          const { backfillCustomersFromReservations } = await import('./customerHelpers.js');
+          await backfillCustomersFromReservations(tx as any, { maxRows: 5000 });
+        },
+        undefined
+      );
+    }
+  },
+  {
+    id: '2026_11_27_008_outbox_attempt_and_error_category',
+    description: 'Add last_attempt_at and error_category columns + index to sheets_mirror_outbox',
+    async run(tx) {
+      await runWithSavepoint(
+        tx,
+        'mig008_outbox_cols',
+        async () => {
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS error_category TEXT NOT NULL DEFAULT '';`);
+          await tx.query(`ALTER TABLE sheets_mirror_outbox ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ DEFAULT NULL;`);
+          await tx.query(
+            `UPDATE sheets_mirror_outbox
+             SET error_category = CASE
+               WHEN COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|HTTP_401|HTTP_403' THEN 'auth'
+               WHEN COALESCE(last_error, '') ~* 'non-frozen' THEN 'sheet_frozen'
+               WHEN COALESCE(last_error, '') ~* 'VALIDATION_ERROR|INVALID_GAS_URL|BLOCKED_BULK_DELETE|HTTP_400' THEN 'validation'
+               WHEN COALESCE(last_error, '') ~* 'AbortError|timeout|ETIMEDOUT|aborted' THEN 'timeout'
+               WHEN COALESCE(last_error, '') ~* '429|RATE_LIMIT' THEN 'rate_limit'
+               WHEN COALESCE(last_error, '') ~* 'GAS HTTP 5' THEN 'upstream_5xx'
+               ELSE error_category
+             END
+             WHERE status IN ('failed', 'retry') AND COALESCE(error_category, '') = '' AND COALESCE(last_error, '') <> ''`
+          );
+        },
+        undefined
+      );
+    }
   }
 ];
 

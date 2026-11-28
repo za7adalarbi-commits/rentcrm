@@ -582,17 +582,17 @@ export async function runDataIntegrityCheck(
             if (existingOpenId) {
               return tx.query(
                 `UPDATE data_integrity_issues
-                 SET run_id = $2,
-                     severity = $3,
-                     source_scope = $4,
-                     reservation_id = CASE WHEN COALESCE(reservation_id, '') = '' THEN $5 ELSE reservation_id END,
-                     rg_value = $6,
-                     neon_value = $7,
+                 SET run_id = $2::text,
+                     severity = $3::text,
+                     source_scope = $4::text,
+                     reservation_id = CASE WHEN COALESCE(reservation_id, '') = '' THEN $5::text ELSE reservation_id END,
+                     rg_value = $6::text,
+                     neon_value = $7::text,
                      rg_snapshot_json = $8::jsonb,
                      neon_snapshot_json = $9::jsonb,
                      last_checked_at = $10::timestamptz,
                      updated_at = $10::timestamptz
-                 WHERE id = $1`,
+                 WHERE id = $1::text`,
                 [
                   existingOpenId,
                   runId,
@@ -614,7 +614,7 @@ export async function runDataIntegrityCheck(
                  id, run_id, discrepancy_type, severity, source_scope, reservation_id, reservation_number,
                  field_name, rg_value, neon_value, rg_snapshot_json, neon_snapshot_json,
                  resolution_status, last_checked_at, created_at, updated_at
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,'open',$13::timestamptz,$13::timestamptz,$13::timestamptz)`,
+               ) VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::jsonb,$12::jsonb,'open',$13::timestamptz,$13::timestamptz,$13::timestamptz)`,
               [
                 newId,
                 runId,
@@ -638,15 +638,15 @@ export async function runDataIntegrityCheck(
 
       await tx.query(
         `UPDATE data_integrity_runs
-         SET status = $2,
-             rg_total_count = $3,
-             neon_total_count = $4,
-             reviewed_count = $5,
-             discrepancies_count = $6,
+         SET status = $2::text,
+             rg_total_count = $3::int,
+             neon_total_count = $4::int,
+             reviewed_count = $5::int,
+             discrepancies_count = $6::int,
              summary_json = $7::jsonb,
-             duration_ms = $8,
+             duration_ms = $8::int,
              finished_at = $9::timestamptz
-         WHERE id = $1`,
+         WHERE id = $1::text`,
         [
           runId,
           runStatus,
@@ -879,9 +879,9 @@ export async function resolveDataIntegrityIssue(
   await executor.withTransaction(async (tx) => {
     await tx.query(
       `UPDATE data_integrity_issues
-       SET resolution_status = $2, resolved_by_id = $3, resolved_by_name = $4,
-           resolved_at = $5::timestamptz, resolution_note = $6, updated_at = $5::timestamptz
-       WHERE id = $1`,
+       SET resolution_status = $2::text, resolved_by_id = $3::text, resolved_by_name = $4::text,
+           resolved_at = $5::timestamptz, resolution_note = $6::text, updated_at = $5::timestamptz
+       WHERE id = $1::text`,
       [issueId, nextStatus, session.user.id, session.user.name, nowIso, note]
     );
     await tx.query(
@@ -889,7 +889,7 @@ export async function resolveDataIntegrityIssue(
          id, issue_id, run_id, reservation_id, reservation_number, action_type,
          actor_id, actor_name, before_snapshot_json, after_snapshot_json,
          rollback_supported, rolled_back, created_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,FALSE,$12::timestamptz)`,
+       ) VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::jsonb,$10::jsonb,$11::boolean,FALSE,$12::timestamptz)`,
       [
         actionId,
         issueId,

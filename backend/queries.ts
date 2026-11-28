@@ -30,6 +30,7 @@ import {
   upsertServerSetting
 } from './serverConfig.js';
 import { logBackendError } from './logger.js';
+import { testRgApiConnectionSafe } from './rgApiClient.js';
 import {
   applyUnifiedConnectionSetup as runUnifiedConnectionSetup,
   getSetupCapabilities as readSetupCapabilities
@@ -59,6 +60,7 @@ import {
   sanitizeExcludedStatusesList
 } from './syncService.js';
 import {
+  backfillCustomersFromReservations,
   deterministicCustomerId,
   formatCustomerSummaryRow,
   upsertCustomersFromReservationsTx
@@ -623,7 +625,8 @@ const INTERNAL_SECRET_SETTING_KEYS = new Set([
   'rg_token_enc',
   'sync_api_secret_enc',
   'sync_api_secret',
-  'rg_token'
+  'rg_token',
+  'rg_direct_token'
 ]);
 
 function isDbExecutorObj(client: DbClient): client is DbExecutor {
@@ -2656,7 +2659,7 @@ export async function recordNoAnswerFollowUp(
 
     await tx.query(
       `INSERT INTO follow_up_history (id, follow_up_id, reservation_id, reservation_number, employee_id, employee_name, change_type, previous_status, new_status, previous_action, new_action, previous_notes, new_notes, changed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::timestamptz)`,
+       VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::timestamptz)`,
       [generateId('FUH'), fuObj.id, resObj.id, resObj.reservationNumber, session.user.id, session.user.name, 'no_answer_attempt', status, status, '', action, '', notes, nowIso]
     );
 
@@ -2936,7 +2939,7 @@ export async function updateFollowUp(executor: DbExecutor, session: AuthSession,
     };
     await tx.query(
       `INSERT INTO follow_up_history (id, follow_up_id, reservation_id, reservation_number, employee_id, employee_name, change_type, previous_status, new_status, previous_action, new_action, previous_notes, new_notes, changed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::timestamptz)`,
+       VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::timestamptz)`,
       [hist.id, hist.followUpId, hist.reservationId, hist.reservationNumber, hist.employeeId, hist.employeeName, hist.changeType, hist.previousStatus, hist.newStatus, hist.previousAction, hist.newAction, hist.previousNotes, hist.newNotes, hist.changedAt]
     );
 
@@ -3356,7 +3359,7 @@ export async function createProblem(executor: DbExecutor, session: AuthSession, 
 
       const insertSql = `
         INSERT INTO %TABLE% (id, problem_number, reservation_id, reservation_number, customer_name, created_by_id, created_by_name, assigned_employee_ids, assigned_employee_names, description, priority, status, created_at, updated_at, customer_id, ticket_type)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13::timestamptz,$13::timestamptz,$14,$15)
+        VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::jsonb,$9::jsonb,$10::text,$11::text,$12::text,$13::timestamptz,$13::timestamptz,$14::text,$15::text)
       `;
       const params = [
         prb.id, prb.problemNumber, prb.reservationId || null, prb.reservationNumber, prb.customerName,
@@ -5829,53 +5832,7 @@ export async function testDatabaseHealth(executor: DbExecutor, session: AuthSess
 
 export async function testRentalGateConnection(executor: DbExecutor, session: AuthSession) {
   requireApiAccess(session);
-  const serverCfg = await resolveServerConfig(executor);
-  const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
-  const gasUrl = str(serverCfg.gasWebAppUrl);
-  if (!rgToken) {
-    return {
-      connected: Boolean(gasUrl),
-      statusCode: 0,
-      hasToken: Boolean(gasUrl),
-      message: gasUrl
-        ? 'الربط يعمل عبر Google Apps Script المضبوط على الخادم.'
-        : 'متغير RG_TOKEN غير مضبوط في إعدادات بيئة الخادم (.env / Vercel).'
-    };
-  }
-  const targetFilterUrl = buildRentalGateEndpointUrl(serverCfg.rgApiBaseUrl, 'reservations/filter', {
-    page: 0,
-    size: 1
-  });
-  const resp = await fetch(targetFilterUrl, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }
-  });
-  let parsed: any = null;
-  let totalElements = 0;
-  let sampleCount = 0;
-  try {
-    const raw = await resp.text();
-    parsed = raw ? JSON.parse(raw) : null;
-    if (parsed && typeof parsed === 'object') {
-      const pageInfo = extractRentalGatePagePayload(parsed, 0, 1);
-      sampleCount = pageInfo.rows.length;
-      totalElements = pageInfo.totalElements;
-    }
-  } catch {
-    parsed = null;
-  }
-  const apiRejected = Boolean(parsed && !Array.isArray(parsed) && parsed.success === false && !parsed.data && !parsed.content && !parsed.items);
-  const ok = resp.ok && !apiRejected && parsed !== null;
-  return {
-    connected: ok,
-    statusCode: resp.status,
-    hasToken: true,
-    sampleCount,
-    totalElements,
-    message: ok
-      ? `الاتصال بواجهة Rental Gate API يعمل بنجاح (${totalElements > 0 ? `إجمالي الحجوزات بالمنصة: ${totalElements}` : `عينة الفحص: ${sampleCount}`}).`
-      : (apiRejected && parsed?.message ? String(parsed.message) : `فشل الاتصال (HTTP ${resp.status})`)
-  };
+  return testRgApiConnectionSafe(executor, { checkAllEndpoints: true });
 }
 
 // ---------- SHIFT ANNOUNCEMENTS BANNER ----------
@@ -7562,7 +7519,7 @@ export async function getCustomers(
   const scopedAgentId = session.user.role === 'agent' && !allowAgentViewAll ? str(session.user.id) : '';
 
   const page = Math.max(1, Math.floor(num(payload.page, 1)));
-  const pageSize = Math.min(200, Math.max(10, Math.floor(num(payload.pageSize, 50))));
+  const pageSize = Math.min(200, Math.max(1, Math.floor(num(payload.pageSize ?? payload.limit, 50))));
   const sortBy = str(payload.sortBy || 'last_activity');
   const search = str(payload.search);
   const statusFilter = str(payload.status);
@@ -7591,14 +7548,39 @@ export async function getCustomers(
     executor,
     { scope: 'customers', key: cacheKey, ttlMs: 15000, bypassCache: toBool(payload.forceRefresh) },
     async () => {
+      let backfillError = '';
+      try {
+        const unlinkedCheck = await executor.query<{ hit: number }>(
+          `SELECT 1 AS hit
+           FROM reservations r
+           WHERE r.deleted_at IS NULL
+             AND (
+               COALESCE(r.customer_id, '') = ''
+               OR NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = r.customer_id)
+             )
+           LIMIT 1`
+        );
+        if ((unlinkedCheck.rows || []).length > 0) {
+          const bfRes = await backfillCustomersFromReservations(executor, { maxRows: 3000 });
+          if (bfRes?.error) {
+            backfillError = str(bfRes.error).slice(0, 200);
+            await logBackendError(executor, 'queries', 'getCustomers.backfill', new Error(backfillError), {}).catch(() => undefined);
+          }
+        }
+      } catch (bfErr: any) {
+        backfillError = str(bfErr?.message || bfErr).slice(0, 200);
+        console.warn('getCustomers auto-backfill failed:', backfillError);
+        await logBackendError(executor, 'queries', 'getCustomers.backfill', bfErr, {}).catch(() => undefined);
+      }
+
       const params: any[] = [];
       let agentScopeSql = '';
       if (scopedAgentId) {
         params.push(JSON.stringify([scopedAgentId]));
         const pJson = `$${params.length}`;
         agentScopeSql = `AND (
-          EXISTS (SELECT 1 FROM reservations rs WHERE rs.customer_id = c.id AND rs.assigned_employee_ids @> ${pJson}::jsonb)
-          OR EXISTS (SELECT 1 FROM problems ps WHERE ps.customer_id = c.id AND ps.assigned_employee_ids @> ${pJson}::jsonb)
+          EXISTS (SELECT 1 FROM reservations rs WHERE rs.deleted_at IS NULL AND rs.customer_id = c.id AND rs.assigned_employee_ids @> ${pJson}::jsonb)
+          OR EXISTS (SELECT 1 FROM problems ps WHERE ps.deleted_at IS NULL AND ps.customer_id = c.id AND ps.assigned_employee_ids @> ${pJson}::jsonb)
         )`;
       }
 
@@ -7621,7 +7603,7 @@ export async function getCustomers(
             COALESCE(STRING_AGG(DISTINCT r.reference_number, ' '), '') AS all_ref_numbers,
             MAX(r.updated_at) AS max_res_updated_at
           FROM reservations r
-          WHERE COALESCE(r.customer_id, '') <> ''
+          WHERE r.deleted_at IS NULL AND COALESCE(r.customer_id, '') <> ''
           GROUP BY r.customer_id
         ),
         prb_agg AS (
@@ -7677,7 +7659,8 @@ export async function getCustomers(
               COALESCE(
                 c.last_contact_ts,
                 CASE
-                  WHEN COALESCE(c.last_contact_at, '') ~ '^\\d{4}-\\d{2}-\\d{2}' THEN (c.last_contact_at)::timestamptz
+                  WHEN COALESCE(TRIM(c.last_contact_at), '') ~ '^(19|20)\\d{2}-((0[13578]|1[02])-(0[1-9]|[12]\\d|3[01])|(0[469]|11)-(0[1-9]|[12]\\d|30)|02-(0[1-9]|1\\d|2[0-8]))([T ]([01]\\d|2[0-3]):[0-5]\\d(:[0-5]\\d(\\.\\d+)?)?(Z|[+-]([01]\\d|2[0-3]):?[0-5]\\d)?)?$'
+                    THEN (TRIM(c.last_contact_at))::timestamptz
                   ELSE '-infinity'::timestamptz
                 END
               ),
@@ -7705,6 +7688,9 @@ export async function getCustomers(
         `${cteSql}
          SELECT
            COUNT(*)::int AS total_customers,
+           COUNT(*) FILTER (WHERE status NOT IN ('غير نشط', 'محظور'))::int AS active_customers,
+           COUNT(*) FILTER (WHERE bookings_count > 0)::int AS with_reservations_customers,
+           COUNT(*) FILTER (WHERE bookings_count = 0)::int AS without_reservations_customers,
            COUNT(*) FILTER (WHERE status = 'جديد' OR (bookings_count <= 1 AND open_problems_count = 0 AND created_at >= NOW() - INTERVAL '30 days'))::int AS new_customers,
            COUNT(*) FILTER (WHERE active_bookings_count > 0)::int AS active_booking_customers,
            COUNT(*) FILTER (WHERE past_bookings_count > 0)::int AS past_booking_customers,
@@ -7713,13 +7699,19 @@ export async function getCustomers(
            COUNT(*) FILTER (WHERE extensions_count > 0)::int AS with_extensions_customers,
            COUNT(*) FILTER (WHERE follow_ups_count = 0 AND notes_count = 0 AND effective_last_contact_ts IS NULL)::int AS unfollowed_customers,
            COUNT(*) FILTER (WHERE bookings_count > 1)::int AS repeat_customers,
-           COUNT(*) FILTER (WHERE GREATEST(created_at, updated_at) >= NOW() - INTERVAL '7 days')::int AS recent_customers
+           COUNT(*) FILTER (WHERE GREATEST(created_at, updated_at) >= NOW() - INTERVAL '7 days')::int AS recent_customers,
+           COUNT(*) FILTER (WHERE COALESCE(TRIM(phone), '') = '')::int AS missing_phone_customers,
+           COUNT(*) FILTER (WHERE COALESCE(TRIM(email), '') = '')::int AS missing_email_customers,
+           COUNT(*) FILTER (WHERE COALESCE(TRIM(id_number), '') IN ('', '-', '—', '0', 'غير متاح', 'غير محدد'))::int AS missing_id_customers
          FROM customer_summary`,
         params
       );
       const kpiRow = kpiRes.rows[0] || {};
       const kpis = {
         totalCustomers: num(kpiRow.total_customers),
+        activeCustomers: num(kpiRow.active_customers),
+        withReservationsCustomers: num(kpiRow.with_reservations_customers),
+        withoutReservationsCustomers: num(kpiRow.without_reservations_customers),
         newCustomers: num(kpiRow.new_customers),
         activeBookingCustomers: num(kpiRow.active_booking_customers),
         pastBookingCustomers: num(kpiRow.past_booking_customers),
@@ -7728,7 +7720,10 @@ export async function getCustomers(
         withExtensionsCustomers: num(kpiRow.with_extensions_customers),
         unfollowedCustomers: num(kpiRow.unfollowed_customers),
         repeatCustomers: num(kpiRow.repeat_customers),
-        recentCustomers: num(kpiRow.recent_customers)
+        recentCustomers: num(kpiRow.recent_customers),
+        missingPhoneCustomers: num(kpiRow.missing_phone_customers),
+        missingEmailCustomers: num(kpiRow.missing_email_customers),
+        missingIdCustomers: num(kpiRow.missing_id_customers)
       };
 
       // 2) Filter clauses (Reservation statuses via EXISTS so multi-booking customers never duplicate)
@@ -7744,7 +7739,7 @@ export async function getCustomers(
       if (statusFilter) {
         const resCond = buildReservationStatusFilterClause(statusFilter, filterParams);
         if (resCond) {
-          clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = customer_summary.id AND (${resCond}))`);
+          clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.deleted_at IS NULL AND r.customer_id = customer_summary.id AND (${resCond}))`);
         }
       }
       if (companyFilter) {
@@ -7753,11 +7748,11 @@ export async function getCustomers(
       }
       if (dateFrom) {
         filterParams.push(dateFrom);
-        clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = customer_summary.id AND COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD')) >= $${filterParams.length})`);
+        clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.deleted_at IS NULL AND r.customer_id = customer_summary.id AND COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD')) >= $${filterParams.length})`);
       }
       if (dateTo) {
         filterParams.push(dateTo);
-        clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.customer_id = customer_summary.id AND COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD')) <= $${filterParams.length})`);
+        clauses.push(`EXISTS (SELECT 1 FROM reservations r WHERE r.deleted_at IS NULL AND r.customer_id = customer_summary.id AND COALESCE(NULLIF(r.start_date, ''), TO_CHAR(r.created_at, 'YYYY-MM-DD')) <= $${filterParams.length})`);
       }
       if (problemFilter === 'open_problems') {
         clauses.push(`open_problems_count > 0`);
@@ -7767,7 +7762,13 @@ export async function getCustomers(
         clauses.push(`open_problems_count = 0`);
       }
 
-      if (kpiFilter === 'new') {
+      if (kpiFilter === 'active_customers') {
+        clauses.push(`status NOT IN ('غير نشط', 'محظور')`);
+      } else if (kpiFilter === 'with_reservations') {
+        clauses.push(`bookings_count > 0`);
+      } else if (kpiFilter === 'without_reservations') {
+        clauses.push(`bookings_count = 0`);
+      } else if (kpiFilter === 'new') {
         clauses.push(`(status = 'جديد' OR (bookings_count <= 1 AND open_problems_count = 0 AND created_at >= NOW() - INTERVAL '30 days'))`);
       } else if (kpiFilter === 'active') {
         clauses.push(`active_bookings_count > 0`);
@@ -7785,6 +7786,12 @@ export async function getCustomers(
         clauses.push(`bookings_count > 1`);
       } else if (kpiFilter === 'recent') {
         clauses.push(`GREATEST(created_at, updated_at) >= NOW() - INTERVAL '7 days'`);
+      } else if (kpiFilter === 'missing_phone') {
+        clauses.push(`COALESCE(TRIM(phone), '') = ''`);
+      } else if (kpiFilter === 'missing_email') {
+        clauses.push(`COALESCE(TRIM(email), '') = ''`);
+      } else if (kpiFilter === 'missing_id') {
+        clauses.push(`COALESCE(TRIM(id_number), '') IN ('', '-', '—', '0', 'غير متاح', 'غير محدد')`);
       }
 
       const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -7867,7 +7874,8 @@ export async function getCustomers(
         total,
         page: safePage,
         pageSize,
-        totalPages
+        totalPages,
+        ...(backfillError ? { backfillWarning: backfillError } : {})
       };
     }
   );
@@ -7933,10 +7941,40 @@ export async function getCustomerDetails(
   const allowAgentViewAll = settings.allow_agent_view_all !== false;
 
   const custId = str(custRow.id);
+  const custNormPhone = str(custRow.normalized_phone);
+  const custIdNum = str(custRow.id_number);
+  if (custNormPhone || custIdNum) {
+    try {
+      const linkConds: string[] = [];
+      const linkParams: any[] = [custId];
+      if (custNormPhone && custNormPhone.length >= 7) {
+        linkParams.push(`%${custNormPhone.slice(-9)}`);
+        linkConds.push(`REGEXP_REPLACE(COALESCE(r.customer_phone, ''), '[^0-9]', '', 'g') LIKE $${linkParams.length}`);
+      }
+      if (custIdNum && custIdNum.length >= 4) {
+        linkParams.push(custIdNum);
+        linkConds.push(`TRIM(COALESCE(r.customer_id_number, '')) = $${linkParams.length}`);
+      }
+      if (linkConds.length > 0) {
+        await executor.query(
+          `UPDATE reservations r
+           SET customer_id = $1
+           WHERE r.deleted_at IS NULL
+             AND COALESCE(r.customer_id, '') = ''
+             AND (${linkConds.join(' OR ')})`,
+          linkParams
+        );
+      }
+    } catch {
+      // Non-fatal in mock/unit environments
+    }
+  }
+
   const resQ = await executor.query(
     `SELECT r.*, EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed
      FROM reservations r
-     WHERE r.customer_id = $1
+     WHERE r.deleted_at IS NULL
+       AND r.customer_id = $1
      ORDER BY r.start_date DESC NULLS LAST, r.created_at DESC
      LIMIT 400`,
     [custId]
@@ -8213,7 +8251,7 @@ export async function createCustomer(
            email, id_number, id_type, status, status_override,
            notes, tags, source,
            last_contact_at, created_at, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,'manual',$14,$15::timestamptz,$15::timestamptz)`,
+         ) VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::boolean,$12::text,$13::jsonb,'manual',$14::text,$15::timestamptz,$15::timestamptz)`,
         [
           id, customerKey, fullName, phone, str(payload.countryCode || phoneMeta.countryCode), phoneMeta.normalizedPhone,
           email, idNumber, idType, status, statusOverride,
@@ -8438,7 +8476,7 @@ export async function saveCustomerNoteStatus(
         `INSERT INTO customer_note_statuses (
            id, name, description, color, sort_order, is_active, is_default,
            allow_agent_select, is_closed_status, created_by_id, created_by_name, created_at, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$12::timestamptz)`,
+         ) VALUES ($1::text,$2::text,$3::text,$4::text,$5::int,$6::boolean,$7::boolean,$8::boolean,$9::boolean,$10::text,$11::text,$12::timestamptz,$12::timestamptz)`,
         [targetId, name, description, color, sortOrder, isActive, isDefault, allowAgentSelect, isClosedStatus, session.user.id, session.user.name, nowIso]
       );
       await logActivity(tx, session.user, 'إضافة حالة ملاحظة عميل', 'CustomerNoteStatus', targetId, name);
@@ -8599,12 +8637,12 @@ export async function getCustomerNotes(
     )`);
   }
 
-  if (customerId) { params.push(customerId); clauses.push(`cn.customer_id = $${params.length}`); }
-  if (reservationId) { params.push(reservationId); clauses.push(`(cn.reservation_id = $${params.length} OR cn.reservation_number = $${params.length})`); }
-  if (problemId) { params.push(problemId); clauses.push(`(cn.problem_id = $${params.length} OR cn.problem_number = $${params.length})`); }
+  if (customerId) { params.push(customerId); clauses.push(`cn.customer_id = $${params.length}::text`); }
+  if (reservationId) { params.push(reservationId); clauses.push(`(cn.reservation_id = $${params.length}::text OR cn.reservation_number = $${params.length}::text)`); }
+  if (problemId) { params.push(problemId); clauses.push(`(cn.problem_id = $${params.length}::text OR cn.problem_number = $${params.length}::text)`); }
   if (statusFilter) {
     params.push(statusFilter);
-    const pIdx = `$${params.length}`;
+    const pIdx = `$${params.length}::text`;
     clauses.push(`(cn.status_id = ${pIdx} OR cn.status_name = ${pIdx})`);
   }
   if (noteTypeFilter) { params.push(noteTypeFilter); clauses.push(`cn.note_type = $${params.length}`); }
@@ -8787,7 +8825,7 @@ export async function addCustomerNote(
            closed_at, closed_by_id, closed_by_name, source_section,
            created_by_id, created_by_name, updated_by_id, updated_by_name, created_at, updated_at
          ) VALUES (
-           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$21,$22,$23::timestamptz,$23::timestamptz
+           $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,$15::boolean,$16::boolean,$17::text,$18::text,$19::text,$20::text,$21::text,$22::text,$21::text,$22::text,$23::timestamptz,$23::timestamptz
          )`,
         [
           id, customerId, reservationId, reservationNumber, problemId, problemNumber,

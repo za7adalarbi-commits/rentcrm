@@ -402,6 +402,9 @@ CREATE TABLE IF NOT EXISTS sheets_mirror_outbox (
   locked_at TIMESTAMPTZ DEFAULT NULL,
   worker_id TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
+  error_category TEXT NOT NULL DEFAULT '',
+  last_attempt_at TIMESTAMPTZ DEFAULT NULL,
+  error_history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   processed_at TIMESTAMPTZ,
@@ -845,6 +848,7 @@ CREATE INDEX IF NOT EXISTS idx_reservations_src_id_active ON reservations (sourc
 CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_run ON data_integrity_issues (run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_error_logs_created ON error_logs (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sync_log_started ON sync_log (started_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sheets_outbox_idempotency_key ON sheets_mirror_outbox (idempotency_key) WHERE COALESCE(idempotency_key, '') <> '';
 `;
 
 

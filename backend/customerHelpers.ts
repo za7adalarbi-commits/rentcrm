@@ -153,57 +153,63 @@ export async function upsertCustomersFromReservationsTx(
     const sourceLabel = str(opts.source || 'sync') || 'sync';
     const overwrite = Boolean(opts.overwriteProfileFields);
 
+    const computeRowStatus = (d: typeof drafts[number]) =>
+      typeof crmCore.computeCustomerLifecycleStatus === 'function'
+        ? crmCore.computeCustomerLifecycleStatus({
+            totalBookings: d.activeCount + d.pastCount,
+            activeBookingsCount: d.activeCount,
+            pastBookingsCount: d.pastCount,
+            openProblemsCount: d.probCount,
+            inProgressComplaintsCount: 0,
+            unfollowedActiveCount: Math.max(0, d.activeCount - d.followedCount),
+            isNewRecent: (d.activeCount + d.pastCount) <= 1 && d.pastCount === 0 ? 1 : 0
+          })
+        : (d.activeCount > 0 ? 'نشط' : 'جديد');
+
+    const upsertSql = `INSERT INTO customers (
+         id, customer_key, full_name, phone, country_code, normalized_phone,
+         email, id_number, id_type, status, source, created_at, updated_at
+       )
+       SELECT * FROM unnest(
+         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+         $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::timestamptz[], $13::timestamptz[]
+       )
+       ON CONFLICT (customer_key) DO UPDATE SET
+         full_name = CASE
+           WHEN $14::boolean THEN COALESCE(NULLIF(EXCLUDED.full_name, ''), customers.full_name)
+           WHEN customers.full_name IN ('', 'عميل') AND EXCLUDED.full_name NOT IN ('', 'عميل') THEN EXCLUDED.full_name
+           ELSE customers.full_name
+         END,
+         phone = COALESCE(NULLIF(customers.phone, ''), EXCLUDED.phone),
+         country_code = COALESCE(NULLIF(customers.country_code, ''), EXCLUDED.country_code),
+         normalized_phone = COALESCE(NULLIF(customers.normalized_phone, ''), EXCLUDED.normalized_phone),
+         email = CASE
+           WHEN $14::boolean AND EXCLUDED.email <> '' THEN EXCLUDED.email
+           ELSE COALESCE(NULLIF(customers.email, ''), EXCLUDED.email)
+         END,
+         id_number = CASE
+           WHEN $14::boolean AND EXCLUDED.id_number <> '' THEN EXCLUDED.id_number
+           ELSE COALESCE(NULLIF(customers.id_number, ''), EXCLUDED.id_number)
+         END,
+         id_type = CASE
+           WHEN $14::boolean AND EXCLUDED.id_type <> '' THEN EXCLUDED.id_type
+           ELSE COALESCE(NULLIF(customers.id_type, ''), EXCLUDED.id_type)
+         END,
+         status = CASE
+           WHEN customers.status_override = TRUE THEN customers.status
+           WHEN customers.status = 'محظور' THEN customers.status
+           ELSE EXCLUDED.status
+         END,
+         updated_at = GREATEST(customers.updated_at, EXCLUDED.updated_at)`;
+
     const chunkSize = 200;
     for (let i = 0; i < drafts.length; i += chunkSize) {
       const chunk = drafts.slice(i, i + chunkSize);
-      const statuses = chunk.map((d) =>
-        typeof crmCore.computeCustomerLifecycleStatus === 'function'
-          ? crmCore.computeCustomerLifecycleStatus({
-              totalBookings: d.activeCount + d.pastCount,
-              activeBookings: d.activeCount,
-              openProblems: d.probCount,
-              extensionsCount: d.extCount
-            })
-          : (d.activeCount > 0 ? 'نشط' : 'جديد')
-      );
+      const statuses = chunk.map(computeRowStatus);
 
-      await tx.query(
-        `INSERT INTO customers (
-           id, customer_key, full_name, phone, country_code, normalized_phone,
-           email, id_number, id_type, status, source, created_at, updated_at
-         )
-         SELECT * FROM unnest(
-           $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-           $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::timestamptz[], $13::timestamptz[]
-         )
-         ON CONFLICT (customer_key) DO UPDATE SET
-           full_name = CASE
-             WHEN $14::boolean THEN COALESCE(NULLIF(EXCLUDED.full_name, ''), customers.full_name)
-             WHEN customers.full_name IN ('', 'عميل') AND EXCLUDED.full_name NOT IN ('', 'عميل') THEN EXCLUDED.full_name
-             ELSE customers.full_name
-           END,
-           phone = COALESCE(NULLIF(EXCLUDED.phone, ''), customers.phone),
-           country_code = COALESCE(NULLIF(EXCLUDED.country_code, ''), customers.country_code),
-           normalized_phone = COALESCE(NULLIF(EXCLUDED.normalized_phone, ''), customers.normalized_phone),
-           email = CASE
-             WHEN $14::boolean AND EXCLUDED.email <> '' THEN EXCLUDED.email
-             ELSE COALESCE(NULLIF(customers.email, ''), EXCLUDED.email)
-           END,
-           id_number = CASE
-             WHEN $14::boolean AND EXCLUDED.id_number <> '' THEN EXCLUDED.id_number
-             ELSE COALESCE(NULLIF(customers.id_number, ''), EXCLUDED.id_number)
-           END,
-           id_type = CASE
-             WHEN $14::boolean AND EXCLUDED.id_type <> '' THEN EXCLUDED.id_type
-             ELSE COALESCE(NULLIF(customers.id_type, ''), EXCLUDED.id_type)
-           END,
-           status = CASE
-             WHEN customers.status_override = TRUE THEN customers.status
-             WHEN customers.status = 'محظور' THEN customers.status
-             ELSE EXCLUDED.status
-           END,
-           updated_at = GREATEST(customers.updated_at, EXCLUDED.updated_at)`,
-        [
+      await trySp(tx, 'rg_cust_chunk_sp');
+      try {
+        await tx.query(upsertSql, [
           chunk.map((d) => d.id),
           chunk.map((d) => d.customerKey),
           chunk.map((d) => d.fullName),
@@ -218,8 +224,58 @@ export async function upsertCustomersFromReservationsTx(
           chunk.map(() => nowIso),
           chunk.map(() => nowIso),
           overwrite
-        ]
-      );
+        ]);
+        await tryRel(tx, 'rg_cust_chunk_sp');
+      } catch (chunkErr: any) {
+        await tryRb(tx, 'rg_cust_chunk_sp');
+        console.warn('Customer chunk upsert fallback to per-row savepoints:', String(chunkErr?.message || chunkErr).slice(0, 180));
+        for (let ri = 0; ri < chunk.length; ri++) {
+          const d = chunk[ri];
+          const st = statuses[ri];
+          await trySp(tx, 'rg_cust_row_sp');
+          try {
+            const byIdQ = await tx.query<{ id: string }>(
+              `SELECT id FROM customers WHERE id = $1 OR customer_key = $2 LIMIT 1`,
+              [d.id, d.customerKey]
+            );
+            const existingRowId = str(byIdQ?.rows?.[0]?.id);
+            if (existingRowId) {
+              d.id = existingRowId;
+              keyToCustomerId.set(d.customerKey, existingRowId);
+              await tx.query(
+                `UPDATE customers
+                 SET full_name = CASE
+                       WHEN $2::boolean THEN COALESCE(NULLIF($3, ''), full_name)
+                       WHEN full_name IN ('', 'عميل') AND $3 NOT IN ('', 'عميل') THEN $3
+                       ELSE full_name
+                     END,
+                     phone = COALESCE(NULLIF(phone, ''), $4),
+                     country_code = COALESCE(NULLIF(country_code, ''), $5),
+                     normalized_phone = COALESCE(NULLIF(normalized_phone, ''), $6),
+                     email = COALESCE(NULLIF(email, ''), $7),
+                     id_number = COALESCE(NULLIF(id_number, ''), $8),
+                     id_type = COALESCE(NULLIF(id_type, ''), $9),
+                     status = CASE
+                       WHEN status_override = TRUE OR status = 'محظور' THEN status
+                       ELSE $10
+                     END,
+                     updated_at = GREATEST(updated_at, $11::timestamptz)
+                 WHERE id = $1`,
+                [existingRowId, overwrite, d.fullName, d.phone, d.countryCode, d.normalizedPhone, d.email, d.idNumber, d.idType, st, nowIso]
+              );
+            } else {
+              await tx.query(upsertSql, [
+                [d.id], [d.customerKey], [d.fullName], [d.phone], [d.countryCode], [d.normalizedPhone],
+                [d.email], [d.idNumber], [d.idType], [st], [sourceLabel], [nowIso], [nowIso], overwrite
+              ]);
+            }
+            await tryRel(tx, 'rg_cust_row_sp');
+          } catch (rowErr: any) {
+            await tryRb(tx, 'rg_cust_row_sp');
+            console.warn(`Customer row upsert skipped (${d.customerKey}):`, String(rowErr?.message || rowErr).slice(0, 160));
+          }
+        }
+      }
     }
 
     // Link reservations.customer_id
@@ -257,37 +313,67 @@ export async function upsertCustomersFromReservationsTx(
     }
 
     await tryRel(tx, 'rg_cust_batch_sp');
-  } catch {
+  } catch (err: any) {
     await tryRb(tx, 'rg_cust_batch_sp');
+    console.warn('upsertCustomersFromReservationsTx aborted:', String(err?.message || err).slice(0, 200));
   }
 
   return keyToCustomerId;
 }
 
-export async function backfillCustomersFromReservations(executor: DbExecutor): Promise<{ processed: number }> {
+export async function backfillCustomersFromReservations(
+  executor: DbClient,
+  opts: { maxRows?: number; batchSize?: number } = {}
+): Promise<{ processed: number; error?: string }> {
   try {
     const tblCheck = await executor.query<{ reg: string | null }>(`SELECT to_regclass('public.customers') AS reg`);
     if (!tblCheck?.rows?.[0]?.reg) return { processed: 0 };
 
-    const missingRes = await executor.query(
-      `SELECT id, reservation_number, customer_name, customer_phone, customer_email, customer_id_number,
-              original_status_code, original_status_ar, internal_status, is_source_cancelled, is_source_rejected,
-              extensions_count, has_extensions, has_problem, last_updated_at, updated_at, created_at
-       FROM reservations
-       WHERE COALESCE(customer_id, '') = ''
-          OR NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = reservations.customer_id)
-       ORDER BY updated_at DESC
-       LIMIT 3000`
-    );
-    const rows = missingRes?.rows || [];
-    if (rows.length === 0) return { processed: 0 };
+    const maxRows = Math.max(100, Math.min(20000, Number(opts.maxRows || 5000)));
+    const batchSize = Math.max(50, Math.min(1000, Number(opts.batchSize || 500)));
+    let totalProcessed = 0;
 
-    await executor.withTransaction(async (tx) => {
-      await upsertCustomersFromReservationsTx(tx, rows, { source: 'backfill', overwriteProfileFields: false });
-    });
-    return { processed: rows.length };
-  } catch {
-    return { processed: 0 };
+    const runWithClient = async (fn: (tx: DbClient) => Promise<void>) => {
+      if (typeof (executor as DbExecutor).withTransaction === 'function') {
+        await (executor as DbExecutor).withTransaction(fn);
+      } else {
+        await fn(executor);
+      }
+    };
+
+    while (totalProcessed < maxRows) {
+      const limitThisPass = Math.min(batchSize, maxRows - totalProcessed);
+      const missingRes = await executor.query(
+        `SELECT r.id, r.reservation_number, r.customer_name, r.customer_phone, r.customer_email, r.customer_id_number,
+                r.original_status_code, r.original_status_ar, r.internal_status, r.is_source_cancelled, r.is_source_rejected,
+                r.extensions_count, r.has_extensions, r.has_problem,
+                EXISTS (SELECT 1 FROM follow_ups fu WHERE fu.reservation_id = r.id) AS is_followed,
+                r.last_updated_at, r.updated_at, r.created_at
+         FROM reservations r
+         WHERE r.deleted_at IS NULL
+           AND (
+             COALESCE(r.customer_id, '') = ''
+             OR NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = r.customer_id)
+           )
+         ORDER BY r.updated_at DESC NULLS LAST, r.id ASC
+         LIMIT $1`,
+        [limitThisPass]
+      );
+      const rows = missingRes?.rows || [];
+      if (rows.length === 0) break;
+
+      await runWithClient(async (tx) => {
+        await upsertCustomersFromReservationsTx(tx, rows, { source: 'backfill', overwriteProfileFields: false });
+      });
+      totalProcessed += rows.length;
+      if (rows.length < limitThisPass) break;
+    }
+
+    return { processed: totalProcessed };
+  } catch (err: any) {
+    const errMsg = String(err?.message || err).slice(0, 200);
+    console.warn('backfillCustomersFromReservations failed:', errMsg);
+    return { processed: 0, error: errMsg };
   }
 }
 

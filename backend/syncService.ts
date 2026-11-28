@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { crmCore, generateId, parseJsonArray } from './auth.js';
 import {
   computeNextScheduledRunAt,
@@ -12,10 +13,20 @@ import {
   type DbClient,
   type DbExecutor
 } from './db.js';
-import { logBackendError } from './logger.js';
+import { logBackendError, redactSensitiveText } from './logger.js';
 import { broadcastCrmEvent, publishPgNotify } from './realtime.js';
+import {
+  buildRgAuthHeaders,
+  buildRgHttpError,
+  normalizeRgToken,
+  resolveSafeRgEndpointUrl,
+  rgFetchWithRetry,
+  validateRgToken
+} from './rgApiClient.js';
 import { buildRentalGateEndpointUrl, normalizeRgApiBaseUrl, resolveServerConfig } from './serverConfig.js';
 import { upsertCustomersFromReservationsTx } from './customerHelpers.js';
+
+export { buildRgHttpError };
 
 export function extractSyncReservationNumber(raw: any): string {
   const srcId = raw && typeof raw === 'object' ? String(crmCore.extractSourceReservationId(raw) || '').trim() : '';
@@ -2138,6 +2149,21 @@ export async function ingestIncrementalSyncBatch(
   }
 }
 
+// buildRgHttpError is centralized in ./rgApiClient.js and re-exported at top of file.
+
+function buildOutboxIdempotencyKey(
+  entityType: string,
+  entityId: string,
+  action: string,
+  payload: Record<string, any>
+): string {
+  const explicit = str(payload?.idempotencyKey);
+  if (explicit) return explicit;
+  const serialized = JSON.stringify(payload || {});
+  const digest = crypto.createHash('sha256').update(`${entityType}|${entityId}|${action}|${serialized}`).digest('hex').slice(0, 20);
+  return `${entityType}:${entityId}:${action}:${digest}`;
+}
+
 export async function enqueueSheetsMirror(
   client: DbClient,
   entityType: string,
@@ -2145,15 +2171,20 @@ export async function enqueueSheetsMirror(
   action: string,
   payload: Record<string, any>
 ): Promise<void> {
+  const idempotencyKey = buildOutboxIdempotencyKey(entityType, entityId, action, payload);
   await runWithSavepoint(
     client,
     'enqueue_sheets_mirror',
     async () => {
       await client.query(
         `INSERT INTO sheets_mirror_outbox (
-           id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, created_at
-         ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), NOW())`,
-        [generateId('MIR'), entityType, entityId, action, JSON.stringify(payload || {})]
+           id, entity_type, entity_id, action, payload, status, retry_count, next_retry_at, idempotency_key, created_at
+         ) VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', 0, NOW(), $6, NOW())
+         ON CONFLICT (idempotency_key) WHERE COALESCE(idempotency_key, '') <> ''
+         DO UPDATE SET
+           payload = EXCLUDED.payload,
+           updated_at = NOW()`,
+        [generateId('MIR'), entityType, entityId, action, JSON.stringify(payload || {}), idempotencyKey]
       );
     },
     undefined
@@ -2191,10 +2222,200 @@ export function classifyOutboxMirrorError(errMessage: unknown, httpStatus = 0): 
   return { permanent: false, category: 'unknown' };
 }
 
-export async function flushSheetsMirrorOutbox(
+export interface GasAuthVerificationResult {
+  ok: boolean;
+  authValid: boolean | null;
+  statusCode: number;
+  configured: boolean;
+  legacyGasScript: boolean;
+  networkError?: boolean;
+  message: string;
+}
+
+async function upsertSyncCheckpointSafe(
+  executor: DbExecutor,
+  source: string,
+  status: string,
+  batchCount: number,
+  errorMsg: string,
+  meta: Record<string, any> = {}
+): Promise<void> {
+  try {
+    const cleanErr = redactSensitiveText(errorMsg || '').slice(0, 400);
+    await executor.query(
+      `INSERT INTO sync_checkpoints (
+         source, last_sync_at, last_successful_at, last_cursor, last_batch_count, last_status, last_error, meta, updated_at
+       ) VALUES (
+         $1, NOW(), CASE WHEN $2 = 'ok' THEN NOW() ELSE NULL END, '', $3, $2, $4, $5::jsonb, NOW()
+       )
+       ON CONFLICT (source) DO UPDATE SET
+         last_sync_at = NOW(),
+         last_successful_at = CASE WHEN EXCLUDED.last_status = 'ok' THEN NOW() ELSE sync_checkpoints.last_successful_at END,
+         last_batch_count = EXCLUDED.last_batch_count,
+         last_status = EXCLUDED.last_status,
+         last_error = EXCLUDED.last_error,
+         meta = COALESCE(sync_checkpoints.meta, '{}'::jsonb) || EXCLUDED.meta,
+         updated_at = NOW()`,
+      [source, status, Math.max(0, Math.floor(batchCount)), cleanErr, JSON.stringify(meta)]
+    );
+  } catch {
+    // Non-fatal on minimal mock executors
+  }
+}
+
+export async function verifyGasMirrorAuth(
   executor: DbExecutor,
   fetchFn: typeof fetch = fetch
-): Promise<{ sent: number; failed: number; skipped: boolean; permanentFailed?: number }> {
+): Promise<GasAuthVerificationResult> {
+  const safeExec = ensureDbExecutor(executor);
+  const serverCfg = await resolveServerConfig(safeExec);
+  const gasUrl = str(serverCfg.gasWebAppUrl);
+  const syncSecret = str(serverCfg.syncApiSecret);
+
+  if (!gasUrl || !syncSecret) {
+    const msg = !gasUrl
+      ? 'GAS_NOT_CONFIGURED: رابط Google Apps Script غير مضبوط.'
+      : 'SYNC_API_SECRET_MISSING: مفتاح SYNC_API_SECRET غير مضبوط في الخادم.';
+    return {
+      ok: false,
+      authValid: false,
+      statusCode: 0,
+      configured: false,
+      legacyGasScript: false,
+      message: msg
+    };
+  }
+  if (!/^https?:\/\//i.test(gasUrl)) {
+    return {
+      ok: false,
+      authValid: false,
+      statusCode: 400,
+      configured: true,
+      legacyGasScript: false,
+      message: 'INVALID_GAS_URL: رابط Google Apps Script غير صالح.'
+    };
+  }
+
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 12000) : null;
+  try {
+    const resp = await fetchFn(gasUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      signal: ctrl?.signal,
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'verifyMirrorAuth',
+        payload: { syncSecret }
+      })
+    });
+    if (timer) clearTimeout(timer);
+    const rawText = await resp.text().catch(() => '');
+    let parsed: any = null;
+    try {
+      parsed = rawText ? JSON.parse(String(rawText).trim()) : null;
+    } catch {
+      parsed = null;
+    }
+
+    const msgText = str(parsed?.message || parsed?.error || '');
+    if (
+      resp.status === 401 ||
+      resp.status === 403 ||
+      /UNAUTHORIZED|SYNC_API_SECRET/i.test(msgText)
+    ) {
+      const authAlert = 'UNAUTHORIZED: SYNC_API_SECRET غير متطابق بين Backend (Vercel/.env) وGoogle Apps Script — أوقفت المزامنة لحماية Outbox. حدّث Script Properties أو متغير SYNC_API_SECRET.';
+      await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'error', 0, authAlert, {
+        httpStatus: resp.status
+      });
+      return {
+        ok: false,
+        authValid: false,
+        statusCode: resp.status,
+        configured: true,
+        legacyGasScript: false,
+        message: authAlert
+      };
+    }
+
+    if (/UNKNOWN_ACTION/i.test(str(parsed?.error || msgText))) {
+      const legacyWarn = 'تحذير: نسخة Google Apps Script المنشورة حالياً قديمة ولا تحتوي verifyMirrorAuth — يرجى إعادة نشر Code.gs وNeonSync.gs.';
+      await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'warning', 0, legacyWarn, {
+        legacyGasScript: true,
+        httpStatus: resp.status
+      });
+      return {
+        ok: true,
+        authValid: null,
+        statusCode: resp.status,
+        configured: true,
+        legacyGasScript: true,
+        message: legacyWarn
+      };
+    }
+
+    if (resp.ok && parsed?.success) {
+      await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'ok', 0, '', {
+        httpStatus: resp.status,
+        verifiedAt: new Date().toISOString()
+      });
+      return {
+        ok: true,
+        authValid: true,
+        statusCode: resp.status,
+        configured: true,
+        legacyGasScript: false,
+        message: 'تم التحقق من تطابق SYNC_API_SECRET مع Google Apps Script بنجاح.'
+      };
+    }
+
+    const failMsg = msgText || `GAS_AUTH_PROBE_HTTP_${resp.status}`;
+    await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_auth', 'warning', 0, failMsg, {
+      httpStatus: resp.status
+    });
+    return {
+      ok: false,
+      authValid: null,
+      statusCode: resp.status,
+      configured: true,
+      legacyGasScript: false,
+      networkError: resp.status >= 500 || resp.status === 429,
+      message: redactSensitiveText(failMsg).slice(0, 260)
+    };
+  } catch (err: any) {
+    if (timer) clearTimeout(timer);
+    const errMsg = redactSensitiveText(err?.message || 'GAS_AUTH_NETWORK_ERROR').slice(0, 260);
+    return {
+      ok: false,
+      authValid: null,
+      statusCode: 0,
+      configured: true,
+      legacyGasScript: false,
+      networkError: true,
+      message: errMsg
+    };
+  }
+}
+
+export interface FlushOutboxOptions {
+  verifyAuthBeforeSend?: boolean;
+  batchSize?: number;
+}
+
+export async function flushSheetsMirrorOutbox(
+  executor: DbExecutor,
+  fetchFnOrOpts: typeof fetch | FlushOutboxOptions = fetch,
+  maybeOpts?: FlushOutboxOptions
+): Promise<{
+  sent: number;
+  failed: number;
+  skipped: boolean;
+  permanentFailed?: number;
+  haltedByAuth?: boolean;
+  authError?: string;
+}> {
+  const fetchFn: typeof fetch = typeof fetchFnOrOpts === 'function' ? fetchFnOrOpts : fetch;
+  const opts: FlushOutboxOptions = (typeof fetchFnOrOpts === 'function' ? maybeOpts : fetchFnOrOpts) || {};
   const safeExec = ensureDbExecutor(executor);
   const serverCfg = await resolveServerConfig(safeExec);
   const gasUrl = str(serverCfg.gasWebAppUrl);
@@ -2203,6 +2424,22 @@ export async function flushSheetsMirrorOutbox(
     return { sent: 0, failed: 0, skipped: true };
   }
 
+  // Pre-flight GAS auth verification in live environments (or when explicitly enabled) so invalid secrets never burn retries or mutate outbox
+  const shouldVerifyAuth = opts.verifyAuthBeforeSend === true || (opts.verifyAuthBeforeSend !== false && fetchFn === fetch);
+  if (shouldVerifyAuth) {
+    const authCheck = await verifyGasMirrorAuth(safeExec, fetchFn);
+    if (authCheck.authValid === false) {
+      return {
+        sent: 0,
+        failed: 0,
+        skipped: true,
+        haltedByAuth: true,
+        authError: authCheck.message
+      };
+    }
+  }
+
+  const batchLimit = Math.min(25, Math.max(1, num(opts.batchSize, 15)));
   const workerId = generateId('OBX_W');
   const claimedRows = await safeExec.withTransaction(async (tx) => {
     await runWithSavepoint(
@@ -2237,7 +2474,7 @@ export async function flushSheetsMirrorOutbox(
                AND (prev.created_at < o.created_at OR (prev.created_at = o.created_at AND prev.id < o.id))
            )
          ORDER BY o.created_at ASC, o.id ASC
-         LIMIT 15
+         LIMIT $2
          FOR UPDATE SKIP LOCKED
        )
        UPDATE sheets_mirror_outbox o
@@ -2248,7 +2485,7 @@ export async function flushSheetsMirrorOutbox(
        FROM candidate
        WHERE o.id = candidate.id
        RETURNING o.*`,
-      [workerId]
+      [workerId, batchLimit]
     );
     return claimQ.rows || [];
   });
@@ -2266,25 +2503,73 @@ export async function flushSheetsMirrorOutbox(
 
   const items = orderedRows.map((r: any) => ({
     id: r.id,
+    idempotencyKey: str(r.idempotency_key),
     entityType: r.entity_type,
     entityId: r.entity_id,
     action: r.action,
     payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {})
   }));
 
-  if (!/^https?:\/\//i.test(gasUrl)) {
-    const ids = items.map((x) => x.id);
+  const recordRowFailure = async (row: any, errMsg: string, httpStatus: number): Promise<boolean> => {
+    const cleanErr = redactSensitiveText(String(errMsg || 'MIRROR_FAILED')).slice(0, 400);
+    const cls = classifyOutboxMirrorError(cleanErr, httpStatus);
+    const nextRetryCount = num(row.retry_count, 0) + 1;
+    const maxRetries = Math.max(1, num(row.max_retries, 8));
+    const isPermanent = cls.permanent;
+    const dead = isPermanent || nextRetryCount >= maxRetries;
+    const jitter = Math.floor(Math.random() * 8);
+    const delaySeconds = isPermanent ? 0 : Math.min(1800, Math.pow(2, nextRetryCount) * 15) + jitter;
+    const historyEntry = JSON.stringify([
+      {
+        at: new Date().toISOString(),
+        attempt: nextRetryCount,
+        error: cleanErr,
+        category: cls.category,
+        permanent: isPermanent,
+        httpStatus
+      }
+    ]);
     await safeExec.query(
       `UPDATE sheets_mirror_outbox
-       SET status = 'failed',
+       SET status = $2::text,
+           retry_count = $3::int,
+           last_error = $4::text,
+           error_category = $7::text,
+           last_attempt_at = NOW(),
            locked_at = NULL,
            worker_id = '',
-           last_error = 'INVALID_GAS_URL: رابط Google Apps Script غير صالح',
-           updated_at = NOW()
-       WHERE id = ANY($1::text[])`,
-      [ids]
-    );
-    return { sent: 0, failed: ids.length, skipped: false, permanentFailed: ids.length };
+           updated_at = NOW(),
+           error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $6::jsonb,
+           next_retry_at = CASE WHEN $2::text = 'failed' THEN NOW() ELSE NOW() + ($5::text || ' seconds')::interval END
+       WHERE id = $1::text`,
+      [row.id, dead ? 'failed' : 'retry', nextRetryCount, cleanErr, String(delaySeconds), historyEntry, cls.category]
+    ).catch(async () => {
+      // Fallback for older schemas before migration 008
+      await safeExec.query(
+        `UPDATE sheets_mirror_outbox
+         SET status = $2::text,
+             retry_count = $3::int,
+             last_error = $4::text,
+             locked_at = NULL,
+             worker_id = '',
+             updated_at = NOW(),
+             error_history_json = COALESCE(error_history_json, '[]'::jsonb) || $6::jsonb,
+             next_retry_at = CASE WHEN $2::text = 'failed' THEN NOW() ELSE NOW() + ($5::text || ' seconds')::interval END
+         WHERE id = $1::text`,
+        [row.id, dead ? 'failed' : 'retry', nextRetryCount, cleanErr, String(delaySeconds), historyEntry]
+      ).catch(() => undefined);
+    });
+    return isPermanent;
+  };
+
+  if (!/^https?:\/\//i.test(gasUrl)) {
+    let permanentFailed = 0;
+    for (const row of orderedRows) {
+      if (await recordRowFailure(row, 'INVALID_GAS_URL: رابط Google Apps Script غير صالح', 400)) {
+        permanentFailed++;
+      }
+    }
+    return { sent: 0, failed: orderedRows.length, skipped: false, permanentFailed };
   }
 
   let lastHttpStatus = 0;
@@ -2314,57 +2599,244 @@ export async function flushSheetsMirrorOutbox(
       throw new Error(parsed?.message || `GAS HTTP ${resp.status}`);
     }
 
+    // Check per-item partial batch results or failedItems when returned by GAS
+    const rawResults = Array.isArray(parsed.results)
+      ? parsed.results
+      : (Array.isArray(parsed.data?.results) ? parsed.data.results : null);
+    const rawFailedItems = Array.isArray(parsed.failedItems)
+      ? parsed.failedItems
+      : (Array.isArray(parsed.data?.failedItems) ? parsed.data.failedItems : null);
+
+    if (rawResults || rawFailedItems) {
+      const failedById = new Map<string, string>();
+      if (rawFailedItems) {
+        for (const fi of rawFailedItems) {
+          if (!fi || typeof fi !== 'object') continue;
+          const targetId = str(fi.id) || (typeof fi.index === 'number' && orderedRows[fi.index] ? str(orderedRows[fi.index].id) : '');
+          if (targetId) {
+            failedById.set(targetId, str(fi.error || fi.message || 'GAS_ITEM_FAILED'));
+          }
+        }
+      }
+      if (rawResults) {
+        for (let idx = 0; idx < rawResults.length; idx++) {
+          const r = rawResults[idx];
+          if (!r || typeof r !== 'object') continue;
+          const targetId = str(r.id) || (typeof r.index === 'number' && orderedRows[r.index] ? str(orderedRows[r.index].id) : (orderedRows[idx] ? str(orderedRows[idx].id) : ''));
+          if (!targetId) continue;
+          const itemOk = r.ok === true || r.success === true || r.status === 'sent' || r.status === 'applied' || r.status === 'ok';
+          if (!itemOk && (r.ok === false || r.success === false || r.status === 'failed' || r.status === 'error' || r.error)) {
+            failedById.set(targetId, str(r.error || r.message || 'GAS_ITEM_FAILED'));
+          }
+        }
+      }
+
+      const succeededIds = orderedRows.map((r: any) => str(r.id)).filter((id) => id && !failedById.has(id));
+      const failedRows = orderedRows.filter((r: any) => failedById.has(str(r.id)));
+
+      if (succeededIds.length > 0) {
+        await safeExec.query(
+          `UPDATE sheets_mirror_outbox
+           SET status = 'sent',
+               processed_at = NOW(),
+               synced_at = NOW(),
+               last_attempt_at = NOW(),
+               updated_at = NOW(),
+               locked_at = NULL,
+               worker_id = '',
+               last_error = '',
+               error_category = ''
+           WHERE id = ANY($1::text[])`,
+          [succeededIds]
+        ).catch(async () => {
+          await safeExec.query(
+            `UPDATE sheets_mirror_outbox
+             SET status = 'sent',
+                 processed_at = NOW(),
+                 synced_at = NOW(),
+                 updated_at = NOW(),
+                 locked_at = NULL,
+                 worker_id = '',
+                 last_error = ''
+             WHERE id = ANY($1::text[])`,
+            [succeededIds]
+          );
+        });
+        await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'ok', succeededIds.length, '', {
+          lastBatchSucceeded: succeededIds.length
+        });
+      }
+
+      let permanentFailed = 0;
+      for (const row of failedRows) {
+        const msg = failedById.get(str(row.id)) || 'GAS_ITEM_FAILED';
+        if (await recordRowFailure(row, msg, lastHttpStatus)) {
+          permanentFailed++;
+        }
+      }
+
+      return {
+        sent: succeededIds.length,
+        failed: failedRows.length,
+        skipped: false,
+        ...(failedRows.length > 0 ? { permanentFailed } : {})
+      };
+    }
+
     const ids = items.map((x) => x.id);
     await safeExec.query(
       `UPDATE sheets_mirror_outbox
        SET status = 'sent',
            processed_at = NOW(),
            synced_at = NOW(),
+           last_attempt_at = NOW(),
            updated_at = NOW(),
            locked_at = NULL,
            worker_id = '',
-           last_error = ''
+           last_error = '',
+           error_category = ''
        WHERE id = ANY($1::text[])`,
       [ids]
-    );
+    ).catch(async () => {
+      await safeExec.query(
+        `UPDATE sheets_mirror_outbox
+         SET status = 'sent',
+             processed_at = NOW(),
+             synced_at = NOW(),
+             updated_at = NOW(),
+             locked_at = NULL,
+             worker_id = '',
+             last_error = ''
+         WHERE id = ANY($1::text[])`,
+        [ids]
+      );
+    });
+    await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'ok', ids.length, '', {
+      lastBatchSucceeded: ids.length
+    });
     return { sent: ids.length, failed: 0, skipped: false };
   } catch (err: any) {
     if (timer) clearTimeout(timer);
-    const errMsg = String(err?.message || 'MIRROR_FAILED').slice(0, 400);
+    const errMsg = redactSensitiveText(String(err?.message || 'MIRROR_FAILED')).slice(0, 400);
     const cls = classifyOutboxMirrorError(errMsg, lastHttpStatus);
     let permanentFailed = 0;
 
     for (const row of orderedRows) {
-      const nextRetryCount = num(row.retry_count, 0) + 1;
-      const maxRetries = Math.max(1, num(row.max_retries, 8));
-      const isPermanent = cls.permanent;
-      const dead = isPermanent || nextRetryCount >= maxRetries;
-      if (isPermanent) permanentFailed++;
-      const jitter = Math.floor(Math.random() * 8);
-      const delaySeconds = isPermanent
-        ? 0
-        : Math.min(1800, Math.pow(2, nextRetryCount) * 15) + jitter;
-      await safeExec.query(
-        `UPDATE sheets_mirror_outbox
-         SET status = $2,
-             retry_count = $3,
-             last_error = $4,
-             locked_at = NULL,
-             worker_id = '',
-             updated_at = NOW(),
-             next_retry_at = CASE WHEN $2 = 'failed' THEN NOW() ELSE NOW() + ($5 || ' seconds')::interval END
-         WHERE id = $1`,
-        [row.id, dead ? 'failed' : 'retry', nextRetryCount, errMsg, String(delaySeconds)]
-      ).catch(() => undefined);
+      if (await recordRowFailure(row, errMsg, lastHttpStatus)) {
+        permanentFailed++;
+      }
     }
+    await upsertSyncCheckpointSafe(safeExec, 'google_apps_script_sheets', 'error', orderedRows.length, errMsg, {
+      category: cls.category,
+      permanent: cls.permanent,
+      httpStatus: lastHttpStatus
+    });
     await logBackendError(safeExec, 'syncService', 'flushSheetsMirrorOutbox', err, {
       batchSize: orderedRows.length,
       permanent: cls.permanent,
       category: cls.category,
       httpStatus: lastHttpStatus
     }).catch(() => undefined);
-    return { sent: 0, failed: orderedRows.length, skipped: false, permanentFailed };
+    return {
+      sent: 0,
+      failed: orderedRows.length,
+      skipped: false,
+      permanentFailed,
+      ...(cls.category === 'auth' ? { haltedByAuth: true, authError: errMsg } : {})
+    };
   }
+}
+
+export async function reprocessFailedOutboxBatch(
+  executor: DbExecutor,
+  opts: {
+    mode?: 'transient' | 'auth' | 'sheet_frozen' | 'all';
+    batchSize?: number;
+    maxBatches?: number;
+  } = {},
+  fetchFn: typeof fetch = fetch
+): Promise<{
+  authCheck: GasAuthVerificationResult;
+  requeuedCount: number;
+  sent: number;
+  failed: number;
+  haltedByAuth: boolean;
+}> {
+  const safeExec = ensureDbExecutor(executor);
+  // Step 1: Always verify GAS authentication BEFORE touching/requeuing any failed outbox records
+  const authCheck = await verifyGasMirrorAuth(safeExec, fetchFn);
+  if (!authCheck.ok && authCheck.authValid === false) {
+    return {
+      authCheck,
+      requeuedCount: 0,
+      sent: 0,
+      failed: 0,
+      haltedByAuth: true
+    };
+  }
+
+  const mode = opts.mode || 'transient';
+  const batchSize = Math.min(25, Math.max(1, num(opts.batchSize, 15)));
+  const maxBatches = Math.min(5, Math.max(1, num(opts.maxBatches, 1)));
+
+  let whereClause = `status IN ('failed', 'retry') AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'`;
+  if (mode === 'auth') {
+    whereClause = `status IN ('failed', 'retry') AND COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|HTTP_401|HTTP_403'`;
+  } else if (mode === 'sheet_frozen') {
+    whereClause = `status IN ('failed', 'retry') AND COALESCE(last_error, '') ~* 'non-frozen'`;
+  } else if (mode === 'all') {
+    whereClause = `status IN ('failed', 'retry')`;
+  }
+
+  let totalRequeued = 0;
+  let totalSent = 0;
+  let totalFailed = 0;
+  let haltedByAuth = false;
+
+  for (let b = 0; b < maxBatches; b++) {
+    const pickedQ = await safeExec.query<{ id: string }>(
+      `WITH picked AS (
+         SELECT id FROM sheets_mirror_outbox
+         WHERE ${whereClause}
+         ORDER BY created_at ASC, id ASC
+         LIMIT $1
+       )
+       UPDATE sheets_mirror_outbox o
+       SET status = 'pending',
+           retry_count = 0,
+           next_retry_at = NOW(),
+           locked_at = NULL,
+           worker_id = '',
+           updated_at = NOW()
+       FROM picked
+       WHERE o.id = picked.id
+       RETURNING o.id`,
+      [batchSize]
+    );
+    const count = (pickedQ.rows || []).length;
+    if (count === 0) break;
+    totalRequeued += count;
+
+    const flushRes = await flushSheetsMirrorOutbox(safeExec, fetchFn, {
+      verifyAuthBeforeSend: false, // verified right above
+      batchSize
+    });
+    totalSent += num(flushRes.sent, 0);
+    totalFailed += num(flushRes.failed, 0);
+    if (flushRes.haltedByAuth) {
+      haltedByAuth = true;
+      break;
+    }
+    if (count < batchSize) break;
+  }
+
+  return {
+    authCheck,
+    requeuedCount: totalRequeued,
+    sent: totalSent,
+    failed: totalFailed,
+    haltedByAuth
+  };
 }
 
 export function extractRentalGatePagePayload(
@@ -2946,10 +3418,15 @@ export async function pullFromRentalGateDirect(
   void emitSyncWorkerStatusRealtime(executor, 'syncWorkerStarted', actor?.id || 'SYSTEM_AUTO_SYNC').catch(() => undefined);
   try {
     const serverCfg = await resolveServerConfig(executor);
-    const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
-    if (!rgToken) {
-      throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم).');
+    const tokenCheck = validateRgToken(serverCfg.rgToken);
+    if (!tokenCheck.valid) {
+      throw new Error(
+        tokenCheck.reasonCode === 'EMPTY'
+          ? 'NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم).'
+          : tokenCheck.message
+      );
     }
+    const authHeaders = buildRgAuthHeaders(tokenCheck.token);
 
     const baseApi = normalizeRgApiBaseUrl(serverCfg.rgApiBaseUrl);
     let baseOrigin = '';
@@ -2964,40 +3441,14 @@ export async function pullFromRentalGateDirect(
     const retryBaseDelayMs = Math.max(0, Math.min(2000, num(payload?.retryDelayMs, 150)));
     const maxRetries = Math.max(1, Math.min(4, num(payload?.maxRetries, 3)));
 
-    const sleepMs = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
-
-    const isRetryableHttpStatus = (status: number) =>
-      status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
-
-    const fetchWithRetry = async (targetUrl: string): Promise<Response> => {
-      let lastErr: any = null;
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 25000) : null;
-        try {
-          const resp = await fetchFn(targetUrl, {
-            method: 'GET',
-            signal: ctrl?.signal,
-            headers: {
-              Authorization: `Bearer ${rgToken}`,
-              Accept: 'application/json',
-              lang: 'ar'
-            }
-          });
-          if (timer) clearTimeout(timer);
-          if (resp.ok || !isRetryableHttpStatus(resp.status) || attempt === maxRetries) {
-            return resp;
-          }
-          await sleepMs(retryBaseDelayMs * attempt);
-        } catch (err: any) {
-          if (timer) clearTimeout(timer);
-          lastErr = err;
-          if (attempt === maxRetries) throw err;
-          await sleepMs(retryBaseDelayMs * attempt);
-        }
-      }
-      throw lastErr || new Error('FETCH_RETRY_EXHAUSTED');
-    };
+    const fetchWithRetry = (targetUrl: string): Promise<Response> =>
+      rgFetchWithRetry(targetUrl, {
+        fetchFn,
+        headers: authHeaders,
+        maxRetries,
+        retryBaseDelayMs,
+        timeoutMs: 25000
+      });
 
     const resolveSafeNextUrl = (rawNext: string): string => {
       const cleaned = str(rawNext);
@@ -3089,7 +3540,10 @@ export async function pullFromRentalGateDirect(
         if (!resp.ok) {
           const errBody = await resp.text().catch(() => '');
           errorMsg = `HTTP_${resp.status}: ${errBody.slice(0, 160)}`;
-          if (optional && resp.status !== 401 && resp.status !== 403) {
+          if (resp.status === 401 || resp.status === 403) {
+            throw buildRgHttpError(resp.status, errBody.slice(0, 160));
+          }
+          if (optional) {
             complete = false;
             return {
               items,
@@ -3101,7 +3555,7 @@ export async function pullFromRentalGateDirect(
               duplicateRowsSkipped
             };
           }
-          throw new Error(`RG_API_HTTP_${resp.status}: ${errBody.slice(0, 200)}`);
+          throw buildRgHttpError(resp.status, errBody.slice(0, 200));
         }
         const json: any = await resp.json();
         if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
@@ -3312,6 +3766,9 @@ export async function pullFromRentalGateDirect(
     const fetchReservationDetailById = async (sid: string): Promise<Record<string, any> | null> => {
       try {
         const resp = await fetchWithRetry(buildRentalGateEndpointUrl(baseApi, `reservations/${encodeURIComponent(sid)}`));
+        if (resp.status === 401 || resp.status === 403) {
+          throw buildRgHttpError(resp.status);
+        }
         if (!resp.ok) return null;
         const rawJson: any = await resp.json().catch(() => null);
         if (!rawJson || typeof rawJson !== 'object') return null;
@@ -3332,7 +3789,10 @@ export async function pullFromRentalGateDirect(
           carNameEn: inner.companyCar?.car?.carNameEn ?? inner.car?.carNameEn ?? inner.carNameEn,
           carNameAr: inner.companyCar?.car?.carNameAr ?? inner.car?.carNameAr ?? inner.carNameAr
         };
-      } catch {
+      } catch (err: any) {
+        if (err?.permanent || err?.httpStatus === 401 || err?.httpStatus === 403) {
+          throw err;
+        }
         return null;
       }
     };
@@ -3357,7 +3817,9 @@ export async function pullFromRentalGateDirect(
       }
       // Safe targeted retry pass for any backfill IDs that failed during concurrent batching
       if (pendingRetryIds.length > 0) {
-        await sleepMs(retryBaseDelayMs);
+        if (retryBaseDelayMs > 0) {
+          await new Promise((r) => setTimeout(r, retryBaseDelayMs));
+        }
         for (const retryChunk of chunkList(pendingRetryIds, 3)) {
           const retried = await Promise.all(
             retryChunk.map(async (sid) => {
@@ -3946,6 +4408,9 @@ export async function retryFailedSyncRecords(
               method: 'GET',
               headers: { Authorization: `Bearer ${rgToken}`, Accept: 'application/json', lang: 'ar' }
             });
+            if (resp.status === 401 || resp.status === 403) {
+              throw buildRgHttpError(resp.status);
+            }
             if (!resp.ok) return { sid, detail: null };
             const rawJson: any = await resp.json().catch(() => null);
             const inner =
@@ -3968,7 +4433,10 @@ export async function retryFailedSyncRecords(
                 carNameAr: inner.companyCar?.car?.carNameAr ?? inner.car?.carNameAr ?? inner.carNameAr
               }
             };
-          } catch {
+          } catch (err: any) {
+            if (err?.permanent || err?.httpStatus === 401 || err?.httpStatus === 403) {
+              throw err;
+            }
             return { sid, detail: null };
           }
         })
@@ -4013,53 +4481,41 @@ export async function fetchRentalGateSnapshotReadOnly(
   fetchFn: typeof fetch = fetch
 ): Promise<IntegrityRgSnapshotResult> {
   const serverCfg = await resolveServerConfig(executor);
-  const rgToken = str(serverCfg.rgToken).replace(/^Bearer\s+/i, '');
-  if (!rgToken) {
-    throw new Error('NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم) لتشغيل فحص سلامة البيانات.');
+  const tokenCheck = validateRgToken(serverCfg.rgToken);
+  if (!tokenCheck.valid) {
+    throw new Error(
+      tokenCheck.reasonCode === 'EMPTY'
+        ? 'NO_RG_TOKEN: يرجى إدخال توكن Rental Gate في الإعدادات (أو ضبط متغير RG_TOKEN على الخادم) لتشغيل فحص سلامة البيانات.'
+        : tokenCheck.message
+    );
   }
+  const authHeaders = buildRgAuthHeaders(tokenCheck.token);
 
   const baseApi = normalizeRgApiBaseUrl(serverCfg.rgApiBaseUrl);
   const fetchJsonWithRetry = async (targetUrl: string): Promise<any> => {
-    let lastErr: any = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 20000) : null;
-      try {
-        const resp = await fetchFn(targetUrl, {
-          method: 'GET',
-          signal: ctrl?.signal,
-          headers: {
-            Authorization: `Bearer ${rgToken}`,
-            Accept: 'application/json',
-            lang: 'ar'
-          }
-        });
-        if (timer) clearTimeout(timer);
-        if (!resp.ok) {
-          const text = await resp.text().catch(() => '');
-          if ((resp.status >= 500 || resp.status === 429) && attempt < 3) {
-            await new Promise((r) => setTimeout(r, 150 * attempt));
-            continue;
-          }
-          throw new Error(`RG_API_HTTP_${resp.status}: ${text.slice(0, 140)}`);
-        }
-        const json: any = await resp.json().catch(() => null);
-        if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
-          throw new Error(str(json.message || json.error || 'RG_API_ERROR'));
-        }
-        return json;
-      } catch (err: any) {
-        if (timer) clearTimeout(timer);
-        lastErr = err;
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 150 * attempt));
-      }
+    const resp = await rgFetchWithRetry(targetUrl, {
+      fetchFn,
+      headers: authHeaders,
+      maxRetries: 3,
+      retryBaseDelayMs: 150,
+      timeoutMs: 20000
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw buildRgHttpError(resp.status, text);
     }
-    throw lastErr || new Error('RG_API_FETCH_FAILED');
+    const json: any = await resp.json().catch(() => null);
+    if (json && typeof json === 'object' && !Array.isArray(json) && json.success === false && !json.data && !json.content && !json.items) {
+      const apiErr = new Error(str(json.message || json.error || 'RG_API_ERROR'));
+      (apiErr as any).noRetry = true;
+      throw apiErr;
+    }
+    return json;
   };
 
   if (opts.singleSourceId) {
     const sid = str(opts.singleSourceId).replace(/^#+/, '').trim();
-    const rawJson = await fetchJsonWithRetry(buildRentalGateEndpointUrl(baseApi, `reservations/${encodeURIComponent(sid)}`));
+    const rawJson = await fetchJsonWithRetry(resolveSafeRgEndpointUrl(baseApi, `reservations/${encodeURIComponent(sid)}`));
     const inner =
       (rawJson?.data?.reservation && typeof rawJson.data.reservation === 'object' ? rawJson.data.reservation : null) ||
       (rawJson?.reservation && typeof rawJson.reservation === 'object' ? rawJson.reservation : null) ||
@@ -4171,6 +4627,7 @@ export async function fetchRentalGateSnapshotReadOnly(
         json = await fetchJsonWithRetry(url);
       } catch (err: any) {
         errorMsg = str(err?.message || 'FETCH_ERROR').slice(0, 160);
+        if (err?.permanent || err?.httpStatus === 401 || err?.httpStatus === 403) throw err;
         if (!optional && rows.length === 0) throw err;
         complete = false;
         incompleteEndpoints.push(`${endpoint}${errorMsg ? ` (${errorMsg})` : ''}`);

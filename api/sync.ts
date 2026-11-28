@@ -3,7 +3,7 @@ import { runAutoSyncCycle } from '../backend/autoSyncWorker.js';
 import { createPgExecutor, ensureSchemaInitialized, isDatabaseConfigured } from '../backend/db.js';
 import { logBackendError } from '../backend/logger.js';
 import { ensureSeededDatabase } from '../backend/queries.js';
-import { ensureSyncApiSecret } from '../backend/serverConfig.js';
+import { ensureSyncApiSecret, sanitizeSecretToken } from '../backend/serverConfig.js';
 import { flushSheetsMirrorOutbox, ingestIncrementalSyncBatch, readWorkerStateRow } from '../backend/syncService.js';
 import { attachAppVersionHeaders } from '../backend/versionManifest.js';
 
@@ -24,13 +24,13 @@ function parseBody(rawBody: any): Record<string, any> {
 }
 
 function extractProvidedSecret(req: any, body: Record<string, any>): string {
-  const headerSecret = String(req.headers?.['x-sync-secret'] || '').trim();
+  const headerSecret = sanitizeSecretToken(req.headers?.['x-sync-secret']);
   if (headerSecret) return headerSecret;
-  const authHeader = String(req.headers?.authorization || '').trim();
-  if (/^Bearer\s+/i.test(authHeader)) {
-    return authHeader.replace(/^Bearer\s+/i, '').trim();
+  const authHeader = sanitizeSecretToken(req.headers?.authorization);
+  if (/^(?:Bearer\s+)+/i.test(authHeader)) {
+    return sanitizeSecretToken(authHeader.replace(/^(?:Bearer\s+)+/i, ''));
   }
-  return String(body.syncSecret || req.query?.syncSecret || '').trim();
+  return sanitizeSecretToken(body.syncSecret || req.query?.syncSecret);
 }
 
 export default async function handler(req: any, res: any) {

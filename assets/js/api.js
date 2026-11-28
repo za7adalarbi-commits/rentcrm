@@ -4491,8 +4491,12 @@
         reservationIds: Array.isArray(c.reservationIds) ? c.reservationIds.slice() : [],
         isNew: Boolean(c.isNew),
         isRecent: Boolean(c.isRecent),
+        isActiveCustomer: c.isActiveCustomer !== false,
         unfollowed: Boolean(c.unfollowed),
-        isRepeat: Boolean(c.isRepeat)
+        isRepeat: Boolean(c.isRepeat),
+        missingPhone: Boolean(c.missingPhone),
+        missingEmail: Boolean(c.missingEmail),
+        missingId: Boolean(c.missingId)
       };
       return (core && core.redactCustomerSensitiveFields)
         ? core.redactCustomerSensitiveFields(mapped, user)
@@ -4501,7 +4505,10 @@
 
     var rawK = agg.kpis || {};
     var kpis = {
-      totalCustomers: Number(rawK.totalCustomers || items.length),
+      totalCustomers: Number(rawK.totalCustomers !== undefined ? rawK.totalCustomers : items.length),
+      activeCustomers: Number(rawK.activeCustomers || 0),
+      withReservationsCustomers: Number(rawK.withReservationsCustomers || 0),
+      withoutReservationsCustomers: Number(rawK.withoutReservationsCustomers || 0),
       newCustomers: Number(rawK.newCustomers || 0),
       activeBookingCustomers: Number(rawK.activeBookingCustomers || 0),
       pastBookingCustomers: Number(rawK.pastBookingCustomers || 0),
@@ -4510,7 +4517,10 @@
       withExtensionsCustomers: Number(rawK.extensionCustomers || 0),
       unfollowedCustomers: Number(rawK.unfollowedCustomers || 0),
       repeatCustomers: Number(rawK.repeatCustomers || 0),
-      recentCustomers: Number(rawK.recentUpdatedCustomers || 0)
+      recentCustomers: Number(rawK.recentUpdatedCustomers || 0),
+      missingPhoneCustomers: Number(rawK.missingPhoneCustomers || 0),
+      missingEmailCustomers: Number(rawK.missingEmailCustomers || 0),
+      missingIdCustomers: Number(rawK.missingIdCustomers || 0)
     };
 
     return { items: items, kpis: kpis };
@@ -8216,6 +8226,9 @@
           if (cPrbFilter === 'open_complaints' && c.openComplaintsCount <= 0) return false;
           if (cPrbFilter === 'no_problems' && c.openProblemsCount > 0) return false;
 
+          if (cKpi === 'active_customers' && (c.status === 'غير نشط' || c.status === 'محظور')) return false;
+          if (cKpi === 'with_reservations' && c.bookingsCount <= 0) return false;
+          if (cKpi === 'without_reservations' && c.bookingsCount > 0) return false;
           if (cKpi === 'new' && !(c.isNew || c.status === 'جديد')) return false;
           if (cKpi === 'active' && c.activeBookingsCount <= 0) return false;
           if (cKpi === 'past' && c.pastBookingsCount <= 0) return false;
@@ -8225,6 +8238,9 @@
           if (cKpi === 'unfollowed' && !c.unfollowed) return false;
           if (cKpi === 'repeat' && c.bookingsCount <= 1) return false;
           if (cKpi === 'recent' && !c.isRecent) return false;
+          if (cKpi === 'missing_phone' && !c.missingPhone) return false;
+          if (cKpi === 'missing_email' && !c.missingEmail) return false;
+          if (cKpi === 'missing_id' && !c.missingId) return false;
           return true;
         });
 
@@ -8238,7 +8254,8 @@
         });
 
         var cPage = Math.max(1, Math.floor(Number(payload.page || 1)));
-        var cPageSize = Math.min(200, Math.max(10, Math.floor(Number(payload.pageSize || 50))));
+        var rawLimit = (payload.pageSize !== undefined && payload.pageSize !== null) ? payload.pageSize : payload.limit;
+        var cPageSize = Math.min(200, Math.max(1, Math.floor(Number(rawLimit || 50))));
         var cTotal = cFiltered.length;
         var cTotalPages = Math.max(1, Math.ceil(cTotal / cPageSize));
         var cSafePage = Math.min(cPage, cTotalPages);
@@ -9428,12 +9445,28 @@
         };
       }
 
+      case 'verifyGasMirrorAuth':
       case 'getDatabaseHealthCenterReport':
       case 'runDatabaseHealthCenterScan':
       case 'saveHealthCenterSettings':
       case 'retryHealthCenterFailedSync': {
         if (session.role !== 'developer' || !core.canUserPerform(session.user, 'manage_developer_tools')) {
           return { success: false, message: 'FORBIDDEN: مركز صحة قاعدة البيانات متاح للمبرمج (Developer) فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        if (action === 'verifyGasMirrorAuth') {
+          return {
+            success: true,
+            message: 'يتطلب فحص SYNC_API_SECRET الحي اتصال الخادم السحابي وGAS_WEBAPP_URL.',
+            data: {
+              ok: false,
+              authValid: null,
+              statusCode: 0,
+              configured: false,
+              legacyGasScript: false,
+              message: 'المعاينة المحلية غير متصلة بالخادم السحابي للتحقق من SYNC_API_SECRET.'
+            },
+            error: null
+          };
         }
         if (!Array.isArray(db.healthCenterRuns)) db.healthCenterRuns = [];
         var rawHcSet = db.settings.db_health_center_settings || {};
@@ -9565,12 +9598,14 @@
               status: 'warning',
               checkedAt: hcNow,
               queryErrors: [],
+              liveChecks: { checked: false, rentalGateAuth: null, gasMirrorAuth: null },
+              deploySkewWarning: '',
               lastSuccessBySource: { rentalGateApi: '', neonPostgres: '', googleAppsScriptSheets: '' },
               worker: null,
               latestSync: (db.syncLog || [])[0] || null,
               recentLogs: (db.syncLog || []).slice(0, 15),
               checkpoints: [],
-              outbox: { total: 0, sent: 0, pending: 0, retry: 0, failed: 0, errorBreakdown: [], recentErrors: [] }
+              outbox: { total: 0, sent: 0, pending: 0, retry: 0, failed: 0, categoryBreakdown: [], errorBreakdown: [], recentErrors: [] }
             };
           }
           var allSt = ['database_health', 'schema_integrity', 'data_integrity', 'sync_health'].map(function (k) { return (newSecs[k] && newSecs[k].status) || 'unknown'; });
@@ -9612,6 +9647,7 @@
             latestRun: activeHc,
             history: hcHist,
             sections: hcSections,
+            errorDigest: { active: [], historical: [], resolved: [], counts: { active: 0, historical: 0, resolved: 0 } },
             settings: normHcSet,
             poolSnapshot: { initialized: false, configured: false, totalCount: 0, idleCount: 0, waitingCount: 0, maxPoolSize: 0 }
           },

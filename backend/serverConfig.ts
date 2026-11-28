@@ -37,8 +37,45 @@ function deriveEncryptionKey(): Buffer {
   return crypto.createHash('sha256').update(`RG_AES_KEY::${seed}`, 'utf8').digest();
 }
 
+export function hasWrappingQuotes(raw: unknown): boolean {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.replace(/[\r\n]+/g, '').trim();
+  if (trimmed.length < 2) return false;
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  return (first === '"' && last === '"') || (first === "'" && last === "'");
+}
+
+export function hasInternalOrOuterWhitespace(raw: unknown, allowBearerSpace = false): boolean {
+  if (typeof raw !== 'string') return false;
+  if (raw !== raw.trim()) return true;
+  if (/[\r\n\t]/.test(raw)) return true;
+  const checkTarget = allowBearerSpace ? raw.trim().replace(/^(?:Bearer\s+)+/i, '').trim() : raw.trim();
+  return /\s/.test(checkTarget);
+}
+
+export function sanitizeSecretToken(raw: unknown): string {
+  let clean = String(raw ?? '').replace(/[\r\n]+/g, '').trim();
+  while (clean.length >= 2) {
+    const first = clean[0];
+    const last = clean[clean.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      clean = clean.slice(1, -1).trim();
+    } else {
+      break;
+    }
+  }
+  return clean;
+}
+
+export function normalizeBearerToken(raw: unknown): string {
+  let clean = sanitizeSecretToken(raw);
+  clean = clean.replace(/^(?:Bearer\s+)+/i, '').trim();
+  return sanitizeSecretToken(clean);
+}
+
 export function encryptServerSecret(plainText: string): string {
-  const clean = String(plainText || '').trim();
+  const clean = sanitizeSecretToken(plainText);
   if (!clean) return '';
   const key = deriveEncryptionKey();
   const iv = crypto.randomBytes(12);
@@ -49,7 +86,7 @@ export function encryptServerSecret(plainText: string): string {
 }
 
 export function decryptServerSecret(storedValue: string): string {
-  const raw = String(storedValue || '').trim();
+  const raw = sanitizeSecretToken(storedValue);
   if (!raw) return '';
   if (!raw.startsWith(ENC_PREFIX)) {
     return raw;
@@ -65,7 +102,7 @@ export function decryptServerSecret(storedValue: string): string {
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-    return decrypted.toString('utf8').trim();
+    return sanitizeSecretToken(decrypted.toString('utf8'));
   } catch {
     return '';
   }
@@ -98,17 +135,17 @@ export async function upsertServerSetting(
 }
 
 export async function ensureSyncApiSecret(executor: DbExecutor, updatedBy = 'System'): Promise<string> {
-  const envSecret = String(process.env.SYNC_API_SECRET || '').trim();
+  const envSecret = sanitizeSecretToken(process.env.SYNC_API_SECRET);
   if (envSecret) return envSecret;
 
   const map = await readSettingsRows(executor, ['sync_api_secret_enc', 'sync_api_secret']);
   const decrypted = decryptServerSecret(map.sync_api_secret_enc || '');
   if (decrypted) return decrypted;
 
-  const plainFallback = String(map.sync_api_secret || '').trim();
+  const plainFallback = sanitizeSecretToken(map.sync_api_secret);
   if (plainFallback) return plainFallback;
 
-  const fixedSecret = String(FIXED_SERVER_CONFIG.syncApiSecret || '').trim();
+  const fixedSecret = sanitizeSecretToken(FIXED_SERVER_CONFIG.syncApiSecret);
   if (fixedSecret) {
     await upsertServerSetting(executor, 'sync_api_secret_enc', encryptServerSecret(fixedSecret), updatedBy);
     return fixedSecret;
@@ -124,18 +161,31 @@ export interface SyncSecretDiagnostics {
   source: 'env' | 'db_encrypted' | 'db_plain' | 'fixed_config' | 'none';
   length: number;
   hasEnvWhitespace: boolean;
+  hasQuotes: boolean;
+  hasWhitespace: boolean;
+}
+
+export interface RgTokenDiagnostics {
+  configured: boolean;
+  source: 'env' | 'db_encrypted' | 'db_plain' | 'fixed_config' | 'none';
+  length: number;
+  hasQuotes: boolean;
+  hasWhitespace: boolean;
+  hasBearerPrefix: boolean;
 }
 
 export async function getSyncSecretDiagnostics(executor?: DbClient): Promise<SyncSecretDiagnostics> {
   const rawEnv = process.env.SYNC_API_SECRET;
-  const trimmedEnv = String(rawEnv || '').trim();
-  const hasEnvWhitespace = typeof rawEnv === 'string' && rawEnv !== trimmedEnv;
+  const trimmedEnv = sanitizeSecretToken(rawEnv);
+  const hasEnvWhitespace = hasInternalOrOuterWhitespace(rawEnv, false);
   if (trimmedEnv) {
     return {
       configured: true,
       source: 'env',
       length: trimmedEnv.length,
-      hasEnvWhitespace
+      hasEnvWhitespace,
+      hasQuotes: hasWrappingQuotes(rawEnv),
+      hasWhitespace: hasEnvWhitespace
     };
   }
 
@@ -149,27 +199,35 @@ export async function getSyncSecretDiagnostics(executor?: DbClient): Promise<Syn
         configured: true,
         source: 'db_encrypted',
         length: decrypted.length,
-        hasEnvWhitespace
+        hasEnvWhitespace,
+        hasQuotes: false,
+        hasWhitespace: /\s/.test(decrypted)
       };
     }
-    const plain = String(map.sync_api_secret || '').trim();
+    const rawPlain = map.sync_api_secret;
+    const plain = sanitizeSecretToken(rawPlain);
     if (plain) {
       return {
         configured: true,
         source: 'db_plain',
         length: plain.length,
-        hasEnvWhitespace
+        hasEnvWhitespace,
+        hasQuotes: hasWrappingQuotes(rawPlain),
+        hasWhitespace: hasInternalOrOuterWhitespace(rawPlain, false)
       };
     }
   }
 
-  const fixed = String(FIXED_SERVER_CONFIG.syncApiSecret || '').trim();
+  const rawFixed = FIXED_SERVER_CONFIG.syncApiSecret;
+  const fixed = sanitizeSecretToken(rawFixed);
   if (fixed) {
     return {
       configured: true,
       source: 'fixed_config',
       length: fixed.length,
-      hasEnvWhitespace
+      hasEnvWhitespace,
+      hasQuotes: hasWrappingQuotes(rawFixed),
+      hasWhitespace: hasInternalOrOuterWhitespace(rawFixed, false)
     };
   }
 
@@ -177,15 +235,84 @@ export async function getSyncSecretDiagnostics(executor?: DbClient): Promise<Syn
     configured: false,
     source: 'none',
     length: 0,
-    hasEnvWhitespace
+    hasEnvWhitespace,
+    hasQuotes: false,
+    hasWhitespace: false
+  };
+}
+
+export async function getRgTokenDiagnostics(executor?: DbClient): Promise<RgTokenDiagnostics> {
+  const rawEnv = process.env.RG_TOKEN;
+  const envClean = normalizeBearerToken(rawEnv);
+  if (envClean) {
+    return {
+      configured: true,
+      source: 'env',
+      length: envClean.length,
+      hasQuotes: hasWrappingQuotes(rawEnv),
+      hasWhitespace: hasInternalOrOuterWhitespace(rawEnv, true),
+      hasBearerPrefix: /^(?:Bearer\s+)+/i.test(sanitizeSecretToken(rawEnv))
+    };
+  }
+
+  if (executor) {
+    const map = await readSettingsRows(executor, ['rg_token_enc', 'rg_direct_token', 'rg_token']).catch(
+      () => ({} as Record<string, string>)
+    );
+    const decryptedRaw = decryptServerSecret(map.rg_token_enc || '');
+    const decryptedClean = normalizeBearerToken(decryptedRaw);
+    if (decryptedClean) {
+      return {
+        configured: true,
+        source: 'db_encrypted',
+        length: decryptedClean.length,
+        hasQuotes: false,
+        hasWhitespace: hasInternalOrOuterWhitespace(decryptedClean, false),
+        hasBearerPrefix: /^(?:Bearer\s+)+/i.test(decryptedRaw)
+      };
+    }
+    const rawDbPlain = map.rg_direct_token || map.rg_token || '';
+    const dbPlainClean = normalizeBearerToken(rawDbPlain);
+    if (dbPlainClean) {
+      return {
+        configured: true,
+        source: 'db_plain',
+        length: dbPlainClean.length,
+        hasQuotes: hasWrappingQuotes(rawDbPlain),
+        hasWhitespace: hasInternalOrOuterWhitespace(rawDbPlain, true),
+        hasBearerPrefix: /^(?:Bearer\s+)+/i.test(sanitizeSecretToken(rawDbPlain))
+      };
+    }
+  }
+
+  const rawFixed = FIXED_SERVER_CONFIG.rgToken;
+  const fixedClean = normalizeBearerToken(rawFixed);
+  if (fixedClean) {
+    return {
+      configured: true,
+      source: 'fixed_config',
+      length: fixedClean.length,
+      hasQuotes: hasWrappingQuotes(rawFixed),
+      hasWhitespace: hasInternalOrOuterWhitespace(rawFixed, true),
+      hasBearerPrefix: /^(?:Bearer\s+)+/i.test(sanitizeSecretToken(rawFixed))
+    };
+  }
+
+  return {
+    configured: false,
+    source: 'none',
+    length: 0,
+    hasQuotes: false,
+    hasWhitespace: false,
+    hasBearerPrefix: false
   };
 }
 
 export async function resolveServerConfig(executor: DbClient): Promise<ResolvedServerConfig> {
-  const envGasUrl = String(process.env.GAS_WEBAPP_URL || '').trim();
-  const envRgToken = String(process.env.RG_TOKEN || '').replace(/^Bearer\s+/i, '').trim();
-  const envSyncSecret = String(process.env.SYNC_API_SECRET || '').trim();
-  const rawEnvBase = String(process.env.RG_API_BASE_URL || '').trim();
+  const envGasUrl = sanitizeSecretToken(process.env.GAS_WEBAPP_URL);
+  const envRgToken = normalizeBearerToken(process.env.RG_TOKEN);
+  const envSyncSecret = sanitizeSecretToken(process.env.SYNC_API_SECRET);
+  const rawEnvBase = sanitizeSecretToken(process.env.RG_API_BASE_URL);
   const envBaseUrl = rawEnvBase ? normalizeRgApiBaseUrl(rawEnvBase) : '';
   const envMode = normalizeMode(process.env.CONNECTION_MODE);
 
@@ -193,24 +320,29 @@ export async function resolveServerConfig(executor: DbClient): Promise<ResolvedS
     'connection_mode',
     'gas_webapp_url',
     'rg_token_enc',
+    'rg_direct_token',
+    'rg_token',
     'sync_api_secret_enc',
     'sync_api_secret',
     'rg_api_base_url'
   ]).catch(() => ({} as Record<string, string>));
 
-  const fixedGasUrl = String(FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
-  const fixedRgToken = String(FIXED_SERVER_CONFIG.rgToken || '').replace(/^Bearer\s+/i, '').trim();
-  const fixedSyncSecret = String(FIXED_SERVER_CONFIG.syncApiSecret || '').trim();
-  const rawFixedBase = String(FIXED_SERVER_CONFIG.rgApiBaseUrl || '').trim();
+  const fixedGasUrl = sanitizeSecretToken(FIXED_SERVER_CONFIG.gasWebAppUrl);
+  const fixedRgToken = normalizeBearerToken(FIXED_SERVER_CONFIG.rgToken);
+  const fixedSyncSecret = sanitizeSecretToken(FIXED_SERVER_CONFIG.syncApiSecret);
+  const rawFixedBase = sanitizeSecretToken(FIXED_SERVER_CONFIG.rgApiBaseUrl);
   const fixedBaseUrl = rawFixedBase ? normalizeRgApiBaseUrl(rawFixedBase) : '';
   const fixedMode = normalizeMode(FIXED_SERVER_CONFIG.mode);
 
   const dbMode = normalizeMode(map.connection_mode);
-  const dbGasUrl = String(map.gas_webapp_url || '').trim();
-  const dbRgToken = decryptServerSecret(map.rg_token_enc || '').replace(/^Bearer\s+/i, '').trim();
+  const dbGasUrl = sanitizeSecretToken(map.gas_webapp_url);
+  const dbRgToken =
+    normalizeBearerToken(decryptServerSecret(map.rg_token_enc || '')) ||
+    normalizeBearerToken(map.rg_direct_token) ||
+    normalizeBearerToken(map.rg_token);
   const dbSyncSecret =
-    decryptServerSecret(map.sync_api_secret_enc || '') || String(map.sync_api_secret || '').trim();
-  const rawDbBase = String(map.rg_api_base_url || '').trim();
+    decryptServerSecret(map.sync_api_secret_enc || '') || sanitizeSecretToken(map.sync_api_secret);
+  const rawDbBase = sanitizeSecretToken(map.rg_api_base_url);
   const dbBaseUrl = rawDbBase ? normalizeRgApiBaseUrl(rawDbBase) : '';
 
   const gasWebAppUrl = dbMode === 'sandbox' ? '' : (dbGasUrl || envGasUrl || fixedGasUrl);
@@ -232,8 +364,8 @@ export async function resolveServerConfig(executor: DbClient): Promise<ResolvedS
 export async function readPublicHealthAutoBind(
   executor?: DbClient
 ): Promise<{ mode: FixedConnectionMode; gasWebAppUrl: string }> {
-  const envGasUrl = String(process.env.GAS_WEBAPP_URL || '').trim();
-  const fixedGasUrl = String(FIXED_SERVER_CONFIG.gasWebAppUrl || '').trim();
+  const envGasUrl = sanitizeSecretToken(process.env.GAS_WEBAPP_URL);
+  const fixedGasUrl = sanitizeSecretToken(FIXED_SERVER_CONFIG.gasWebAppUrl);
   const fixedMode = normalizeMode(FIXED_SERVER_CONFIG.mode || process.env.CONNECTION_MODE);
 
   let dbMode: FixedConnectionMode = '';
@@ -247,7 +379,7 @@ export async function readPublicHealthAutoBind(
       );
       for (const row of res.rows) {
         if (row.key === 'connection_mode') dbMode = normalizeMode(row.value);
-        if (row.key === 'gas_webapp_url') dbGasUrl = String(row.value || '').trim();
+        if (row.key === 'gas_webapp_url') dbGasUrl = sanitizeSecretToken(row.value);
       }
     } catch {
       // Non-fatal fallback

@@ -115,7 +115,11 @@
       if (currentProfileState.customerId && root.RGApi && root.RGApi.markScopesStale) {
         root.RGApi.markScopesStale(['customers']);
       }
-      render(slot, root.RGApp && root.RGApp.buildAppCtx ? root.RGApp.buildAppCtx() : { toast: function () {} }).catch(function () {});
+      render(slot, root.RGApp && root.RGApp.buildAppCtx ? root.RGApp.buildAppCtx() : { toast: function () {} }).catch(function (err) {
+        if (root.RGApp && typeof root.RGApp.reportClientError === 'function') {
+          root.RGApp.reportClientError('customers:deltasync', err);
+        }
+      });
     });
   }
 
@@ -1615,6 +1619,9 @@
 
     var kpiDefs = [
       { key: 'all', label: 'إجمالي العملاء', val: Number(kpis.totalCustomers || 0), tone: 'info' },
+      { key: 'active_customers', label: 'العملاء النشطون', val: Number(kpis.activeCustomers || 0), tone: 'ok' },
+      { key: 'with_reservations', label: 'لديهم حجوزات', val: Number(kpis.withReservationsCustomers || 0), tone: 'info' },
+      { key: 'without_reservations', label: 'بدون حجوزات', val: Number(kpis.withoutReservationsCustomers || 0), tone: '' },
       { key: 'new', label: 'العملاء الجدد', val: Number(kpis.newCustomers || 0), tone: 'info' },
       { key: 'active', label: 'أصحاب حجوزات نشطة', val: Number(kpis.activeBookingCustomers || 0), tone: 'ok' },
       { key: 'past', label: 'أصحاب حجوزات سابقة', val: Number(kpis.pastBookingCustomers || 0), tone: '' },
@@ -1623,7 +1630,10 @@
       { key: 'extensions', label: 'لديهم تمديدات', val: Number(kpis.withExtensionsCustomers || 0), tone: 'warn' },
       { key: 'unfollowed', label: 'لم تتم متابعتهم', val: Number(kpis.unfollowedCustomers || 0), tone: 'warn' },
       { key: 'repeat', label: 'أكثر من حجز (متكررون)', val: Number(kpis.repeatCustomers || 0), tone: 'ok' },
-      { key: 'recent', label: 'مضافون / محدثون حديثاً', val: Number(kpis.recentCustomers || 0), tone: 'info' }
+      { key: 'recent', label: 'مضافون / محدثون حديثاً', val: Number(kpis.recentCustomers || 0), tone: 'info' },
+      { key: 'missing_phone', label: 'بدون رقم جوال', val: Number(kpis.missingPhoneCustomers || 0), tone: 'warn' },
+      { key: 'missing_email', label: 'بدون بريد إلكتروني', val: Number(kpis.missingEmailCustomers || 0), tone: '' },
+      { key: 'missing_id', label: 'بدون رقم هوية', val: Number(kpis.missingIdCustomers || 0), tone: 'warn' }
     ];
 
     var rowsHtml = items.length === 0
@@ -1660,12 +1670,24 @@
           '</tr>';
         }).join('');
 
-    var total = Number(listData && listData.total ? listData.total : items.length);
+    var total = (listData && listData.total !== undefined && listData.total !== null) ? Number(listData.total) : items.length;
     var page = Number(listData && listData.page ? listData.page : 1);
     var totalPages = Number(listData && listData.totalPages ? listData.totalPages : 1);
+    var backfillWarning = String((listData && listData.backfillWarning) || '').trim();
 
     container.innerHTML =
       '<div class="flex flex-col gap-4">' +
+        (backfillWarning ? (
+          '<div class="rg-error-banner surface-card" role="alert" style="padding:14px 16px;border:1px solid var(--status-warn-border, #f59e0b);background:var(--status-warn-bg, rgba(245,158,11,0.09));">' +
+            '<div class="flex items-center justify-between gap-3 flex-wrap">' +
+              '<div>' +
+                '<strong style="color:var(--status-warn-text, #b45309);font-size:13.5px;">تنبيه مزامنة ملفات العملاء</strong>' +
+                '<p style="margin:4px 0 0;color:var(--text-secondary);font-size:12.5px;">تعذر إكمال ربط بعض الحجوزات بالعملاء تلقائياً: ' + esc(backfillWarning) + '</p>' +
+              '</div>' +
+              '<button type="button" class="btn btn-sm btn-primary" id="cust-backfill-retry-btn">إعادة المحاولة الآن</button>' +
+            '</div>' +
+          '</div>'
+        ) : '') +
         (canShowDash ? (
           '<section id="cust-dashboard-section" class="flex flex-col gap-3">' +
             '<div class="section-header" style="margin-bottom:0;">' +
@@ -1863,6 +1885,14 @@
       });
     }
 
+    var bfRetryBtn = document.getElementById('cust-backfill-retry-btn');
+    if (bfRetryBtn) {
+      bfRetryBtn.addEventListener('click', function () {
+        if (root.RGApi && root.RGApi.markScopesStale) root.RGApi.markScopesStale(['customers']);
+        render(container, Object.assign({}, ctx || {}, { forceRefresh: true }));
+      });
+    }
+
     // Bind Directory Interactions
     container.querySelectorAll('.cust-open-profile').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -1986,44 +2016,81 @@
     }
   }
 
+  function renderErrorBanner(container, message, onRetry) {
+    container.innerHTML =
+      '<div class="rg-error-banner surface-card" role="alert" style="padding:20px;border:1px solid var(--status-danger-border, #ef4444);background:var(--status-danger-bg, rgba(239,68,68,0.08));">' +
+        '<div class="flex items-center justify-between gap-3 flex-wrap">' +
+          '<div>' +
+            '<h3 style="margin:0 0 6px;color:var(--status-danger-text, #dc2626);font-size:15px;">تعذر تحميل بيانات العملاء من الخادم</h3>' +
+            '<p style="margin:0;color:var(--text-secondary);font-size:13px;">' + esc(message || 'حدث خطأ أثناء جلب سجلات العملاء أو الإحصائيات من قاعدة البيانات.') + '</p>' +
+          '</div>' +
+          '<button type="button" class="btn btn-primary btn-sm" id="cust-retry-load-btn">إعادة المحاولة</button>' +
+        '</div>' +
+      '</div>';
+    var retryBtn = document.getElementById('cust-retry-load-btn');
+    if (retryBtn && typeof onRetry === 'function') {
+      retryBtn.addEventListener('click', onRetry);
+    }
+  }
+
   async function render(container, ctx) {
     bindGlobalDeltaRefresh();
     var cSt = getCustomersState(ctx);
     var selectedId = cSt.selectedCustomerId || currentProfileState.customerId;
 
-    if (selectedId) {
-      if (currentProfileState.data && currentProfileState.data.customer && currentProfileState.data.customer.id === selectedId) {
-        renderProfileView(container, ctx, currentProfileState.data);
-      }
-      var detRes = await root.RGApi.callApi('getCustomerDetails', { customerId: selectedId });
-      if (detRes && detRes.success && detRes.data) {
-        currentProfileState.customerId = detRes.data.customer.id;
-        currentProfileState.data = detRes.data;
-        renderProfileView(container, ctx, detRes.data);
-        return;
-      }
-      cSt.selectedCustomerId = '';
-      currentProfileState.customerId = '';
-      currentProfileState.data = null;
-      if (ctx && ctx.toast) ctx.toast((detRes && detRes.message) || 'تعذر تحميل ملف العميل.', true);
+    var existingTable = container.querySelector('.rg-cust-table-wrap');
+    if (!container.innerHTML.trim() || (!selectedId && !existingTable)) {
+      container.innerHTML =
+        '<div class="rg-loading-state flex flex-col gap-3" aria-busy="true">' +
+          '<div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>' +
+        '</div>';
+    } else if (existingTable) {
+      existingTable.style.opacity = '0.6';
+      existingTable.style.pointerEvents = 'none';
     }
 
-    var listRes = await root.RGApi.callApi('getCustomers', {
-      search: cSt.search || '',
-      status: cSt.status || '',
-      company: cSt.company || '',
-      dateFrom: cSt.dateFrom || '',
-      dateTo: cSt.dateTo || '',
-      problemFilter: cSt.problemFilter || '',
-      kpiFilter: cSt.kpiFilter || 'all',
-      sortBy: cSt.sortBy || 'last_activity',
-      page: cSt.page || 1,
-      pageSize: cSt.pageSize || 50
-    });
-    if (!listRes || !listRes.success) {
-      throw new Error((listRes && listRes.message) || 'تعذر تحميل قائمة العملاء.');
+    try {
+      if (selectedId) {
+        if (currentProfileState.data && currentProfileState.data.customer && currentProfileState.data.customer.id === selectedId) {
+          renderProfileView(container, ctx, currentProfileState.data);
+        }
+        var detRes = await root.RGApi.callApi('getCustomerDetails', { customerId: selectedId });
+        if (detRes && detRes.success && detRes.data && detRes.data.customer) {
+          currentProfileState.customerId = detRes.data.customer.id;
+          currentProfileState.data = detRes.data;
+          renderProfileView(container, ctx, detRes.data);
+          return;
+        }
+        cSt.selectedCustomerId = '';
+        currentProfileState.customerId = '';
+        currentProfileState.data = null;
+        if (ctx && ctx.toast) ctx.toast((detRes && detRes.message) || 'تعذر تحميل ملف العميل.', true);
+      }
+
+      var listRes = await root.RGApi.callApi('getCustomers', {
+        search: cSt.search || '',
+        status: cSt.status || '',
+        company: cSt.company || '',
+        dateFrom: cSt.dateFrom || '',
+        dateTo: cSt.dateTo || '',
+        problemFilter: cSt.problemFilter || '',
+        kpiFilter: cSt.kpiFilter || 'all',
+        sortBy: cSt.sortBy || 'last_activity',
+        page: cSt.page || 1,
+        pageSize: cSt.pageSize || 50,
+        forceRefresh: Boolean(ctx && ctx.forceRefresh)
+      });
+      if (!listRes || !listRes.success || !listRes.data || !Array.isArray(listRes.data.items) || !listRes.data.kpis) {
+        throw new Error((listRes && listRes.message) || 'تعذر تحميل قائمة العملاء.');
+      }
+      renderDirectoryView(container, ctx, listRes.data);
+    } catch (err) {
+      var msg = (err && err.message) ? err.message : 'تعذر تحميل قائمة العملاء.';
+      renderErrorBanner(container, msg, function () {
+        render(container, ctx);
+      });
+      if (ctx && ctx.toast) ctx.toast(msg, true);
     }
-    renderDirectoryView(container, ctx, listRes.data || {});
   }
 
   root.RGCustomers = {

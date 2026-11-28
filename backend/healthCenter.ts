@@ -1,12 +1,16 @@
 import { crmCore, generateId, type AuthSession } from './auth.js';
 import { getPoolMetrics, runWithSavepoint, type DbClient, type DbExecutor } from './db.js';
 import { redactSensitiveText } from './logger.js';
+import { testRgApiConnectionSafe } from './rgApiClient.js';
 import { SCHEMA_SQL } from './schemaSql.js';
-import { getSyncSecretDiagnostics } from './serverConfig.js';
+import { getRgTokenDiagnostics, getSyncSecretDiagnostics, resolveServerConfig } from './serverConfig.js';
 import {
+  classifyOutboxMirrorError,
   fetchRentalGateSnapshotReadOnly,
   flushSheetsMirrorOutbox,
-  retryFailedSyncRecords
+  reprocessFailedOutboxBatch,
+  retryFailedSyncRecords,
+  verifyGasMirrorAuth
 } from './syncService.js';
 
 export type HealthStatus = 'unknown' | 'healthy' | 'warning' | 'critical';
@@ -48,7 +52,9 @@ export const EXPECTED_MIGRATION_IDS = [
   '2026_11_27_003_audit_schema_alignment_and_indexes',
   '2026_11_27_004_health_center_runs',
   '2026_11_27_005_audit_indexes_and_constraints',
-  '2026_11_27_006_integrity_schema_and_extensions_recalc'
+  '2026_11_27_006_integrity_schema_and_extensions_recalc',
+  '2026_11_27_007_customers_backfill_and_outbox_reliability',
+  '2026_11_27_008_outbox_attempt_and_error_category'
 ];
 
 export const TABLE_CODE_REFERENCES: Record<string, string[]> = {
@@ -143,7 +149,8 @@ export function normalizeHealthCenterSettings(raw: unknown): {
 }
 
 export function calculateHealthCenterOverallStatus(
-  sections: Partial<Record<HealthSectionKey, { status?: HealthStatus | string }>>
+  sections: Partial<Record<HealthSectionKey, { status?: HealthStatus | string }>>,
+  errorDigest?: { active?: any[] } | null
 ): HealthStatus {
   const keys: HealthSectionKey[] = ['database_health', 'schema_integrity', 'data_integrity', 'sync_health'];
   const statuses = keys.map((k) => str(sections?.[k]?.status || 'unknown').toLowerCase() as HealthStatus);
@@ -154,6 +161,9 @@ export function calculateHealthCenterOverallStatus(
     return 'critical';
   }
   if (statuses.some((s) => s === 'warning')) {
+    return 'warning';
+  }
+  if (errorDigest && Array.isArray(errorDigest.active) && errorDigest.active.length > 0) {
     return 'warning';
   }
   if (statuses.some((s) => s === 'healthy')) {
@@ -563,9 +573,12 @@ async function collectDatabaseHealth(executor: DbExecutor) {
   let pgStatStatementsAvailable = false;
   let tableStats: any[] = [];
   let recentErrors: any[] = [];
-  let errorCounts = { total24h: 0, total7d: 0, sqlErrors: 0, txErrors: 0, syncErrors: 0 };
+  let errorCounts = { total24h: 0, total7d: 0, sqlErrors: 0, txErrors: 0, syncErrors: 0, activeSinceLastClean: 0 };
   let lastSuccessAt = connected ? new Date().toISOString() : '';
   let lastConnectionError: any = null;
+  let active24hCount = 0;
+  let activeTxErrors = 0;
+  let recentUnresolvedErrors: any[] = [];
 
   if (connected) {
     try {
@@ -698,7 +711,8 @@ async function collectDatabaseHealth(executor: DbExecutor) {
           total7d: num(es.total_7d, 0),
           sqlErrors: num(es.sql_errs, 0),
           txErrors: num(es.tx_errs, 0),
-          syncErrors: num(es.sync_errs, 0)
+          syncErrors: num(es.sync_errs, 0),
+          activeSinceLastClean: 0
         };
       }
 
@@ -719,10 +733,25 @@ async function collectDatabaseHealth(executor: DbExecutor) {
       });
 
       lastConnectionError = recentErrors.find((e) => /connect|timeout|pool|DATABASE|25P02|sql/i.test(`${e.context} ${e.message}`)) || null;
-      if (!lastSuccessAt && prevOkQ.rows?.[0]?.finished_at) {
-        const prev = prevOkQ.rows[0].finished_at;
-        lastSuccessAt = prev instanceof Date ? prev.toISOString() : str(prev);
+      const prevCleanRaw = prevOkQ.rows?.[0]?.finished_at;
+      const prevCleanMs = prevCleanRaw ? new Date(prevCleanRaw).getTime() : 0;
+      if (!lastSuccessAt && prevCleanRaw) {
+        lastSuccessAt = prevCleanRaw instanceof Date ? prevCleanRaw.toISOString() : str(prevCleanRaw);
       }
+
+      // Only unresolved/new errors after the previous clean health run should turn status into warning
+      const prevBaselineMs = prevCleanMs > 0 ? prevCleanMs : 0;
+      recentUnresolvedErrors = prevBaselineMs > 0
+        ? recentErrors.filter((e) => {
+            const ems = Date.parse(e.createdAt || '');
+            return Number.isFinite(ems) && ems > prevBaselineMs;
+          })
+        : recentErrors;
+      active24hCount = prevBaselineMs > 0 ? recentUnresolvedErrors.length : errorCounts.total24h;
+      activeTxErrors = prevBaselineMs > 0
+        ? recentUnresolvedErrors.filter((e) => e.category === 'transaction').length
+        : errorCounts.txErrors;
+      errorCounts.activeSinceLastClean = active24hCount;
 
       try {
         const pssQ = await executor.query<{
@@ -782,12 +811,12 @@ async function collectDatabaseHealth(executor: DbExecutor) {
     activityStats.idleInTransaction > 2 ||
     poolMetrics.waitingCount > 0 ||
     dbStats.deadlocks > 0 ||
-    errorCounts.txErrors > 0 ||
+    activeTxErrors > 0 ||
     latencyMs > 2500
   ) {
     status = latencyMs > 5000 || dbStats.deadlocks > 0 ? 'critical' : 'warning';
   } else if (
-    errorCounts.total24h > 0 ||
+    active24hCount > 0 ||
     latencyMs > 800 ||
     dbStats.cacheHitRatioPct < 90 ||
     queryErrors.length > 0 ||
@@ -796,9 +825,26 @@ async function collectDatabaseHealth(executor: DbExecutor) {
     status = 'warning';
   }
 
+  const checkedAt = new Date().toISOString();
+  const latestFailure = probeError
+    ? { message: probeError, at: checkedAt, category: 'connection' }
+    : (recentUnresolvedErrors[0] || null);
+  const errorCategory = !connected
+    ? 'connection'
+    : (activeTxErrors > 0
+      ? 'transaction'
+      : (queryErrors.length > 0 ? 'query' : (active24hCount > 0 ? 'runtime' : 'none')));
+  const recommendedAction = !connected
+    ? 'تحقق من متغير DATABASE_URL واتصال خادم Neon PostgreSQL.'
+    : (activeTxErrors > 0
+      ? 'راجع سجل أخطاء المعاملات (25P02 / Deadlock) وأعد تشغيل الاستعلام المتأثر.'
+      : (active24hCount > 0
+        ? 'تم رصد أخطاء حديثة في الخادم بعد آخر فحص؛ راجع أحدث السجلات أسفل البطاقة.'
+        : ''));
+
   return {
     status,
-    checkedAt: new Date().toISOString(),
+    checkedAt,
     connected,
     latencyMs,
     pgVersion,
@@ -817,7 +863,14 @@ async function collectDatabaseHealth(executor: DbExecutor) {
     errorCounts,
     recentErrors,
     lastSuccessAt,
-    lastConnectionError
+    lastConnectionError,
+    lastSuccessfulCheck: lastSuccessAt,
+    latestFailure,
+    errorCategory,
+    affectedComponent: 'neon_postgresql',
+    errorCount: active24hCount + queryErrors.length + (probeError ? 1 : 0),
+    recommendedAction,
+    repairHistory: []
   };
 }
 
@@ -899,11 +952,42 @@ async function collectSchemaIntegrity(executor: DbExecutor) {
     finalStatus = 'warning';
   }
 
+  const checkedAt = new Date().toISOString();
+  const schemaDiffCount =
+    diff.missingTables.length +
+    diff.missingColumns.length +
+    diff.constraintMismatches.length +
+    diff.missingIndexes.length +
+    diff.typeMismatches.length +
+    diff.pendingMigrations.length;
+  const schemaLatestFailure =
+    diff.missingTables[0] ||
+    diff.missingColumns[0] ||
+    diff.constraintMismatches[0] ||
+    diff.pendingMigrations[0] ||
+    queryErrors[0] ||
+    null;
+
   return {
-    checkedAt: new Date().toISOString(),
+    checkedAt,
     ...diff,
     status: finalStatus,
-    queryErrors
+    queryErrors,
+    lastSuccessfulCheck: finalStatus === 'healthy' ? checkedAt : '',
+    latestFailure: schemaLatestFailure,
+    errorCategory: diff.missingTables.length || diff.missingColumns.length
+      ? 'schema_missing'
+      : (diff.constraintMismatches.length
+        ? 'schema_constraint'
+        : (diff.pendingMigrations.length ? 'pending_migration' : (queryErrors.length ? 'query' : 'none'))),
+    affectedComponent: 'postgresql_schema',
+    errorCount: schemaDiffCount + queryErrors.length,
+    recommendedAction: diff.pendingMigrations.length
+      ? 'نفّذ الترحيلات المعلقة (Migrations) أو أعد تشغيل تهيئة القاعدة الآمنة.'
+      : ((diff.missingTables.length || diff.missingColumns.length || diff.constraintMismatches.length)
+        ? 'تأكد من مطابقة بنية Neon مع مخطط schemaSql.ts.'
+        : ''),
+    repairHistory: migQ.rows || []
   };
 }
 
@@ -1144,10 +1228,39 @@ async function collectDataIntegritySection(executor: DbExecutor, compareWithRg: 
     status = 'warning';
   }
 
+  const diCheckedAt = new Date().toISOString();
+  const diTotalErrors =
+    duplicateCount +
+    swappedCount +
+    orphanExtensions +
+    orphanChildrenTotal +
+    missingFromNeonCnt +
+    openDiIssues +
+    queryErrors.length +
+    (rgComparison.error ? 1 : 0);
+  const diErrorCategory = rgComparison.error
+    ? (/401|403|NO_RG_TOKEN/i.test(rgComparison.error) ? 'rg_auth' : 'rg_sync_compare')
+    : (duplicateCount > 0 || orphanExtensions > 0 || orphanChildrenTotal > 0 ? 'data_anomaly' : 'none');
+
   return {
     status,
-    checkedAt: new Date().toISOString(),
+    checkedAt: diCheckedAt,
     queryErrors,
+    lastSuccessfulCheck: latestDi?.finished_at
+      ? (latestDi.finished_at instanceof Date ? latestDi.finished_at.toISOString() : str(latestDi.finished_at))
+      : (status === 'healthy' ? diCheckedAt : ''),
+    latestFailure: rgComparison.error
+      ? { message: rgComparison.error, at: diCheckedAt }
+      : (queryErrors[0] || null),
+    errorCategory: diErrorCategory,
+    affectedComponent: 'data_integrity',
+    errorCount: diTotalErrors,
+    recommendedAction: /401|403|NO_RG_TOKEN/i.test(str(rgComparison.error))
+      ? 'تحقق من صلاحية توكن Rental Gate (RG_TOKEN) في الإعدادات أو متغيرات البيئة ثم أعد الفحص.'
+      : (openDiIssues > 0
+        ? 'راجع الفروقات المفتوحة واعتمد الإصلاحات من لوحة سلامة البيانات.'
+        : ''),
+    repairHistory: latestDi ? [latestDi] : [],
     counts: {
       reservations: num(counts.reservations_cnt, 0),
       customers: num(counts.customers_cnt, 0),
@@ -1199,7 +1312,10 @@ async function collectDataIntegritySection(executor: DbExecutor, compareWithRg: 
   };
 }
 
-async function collectSyncHealth(executor: DbExecutor) {
+async function collectSyncHealth(
+  executor: DbExecutor,
+  opts: { testLiveConnections?: boolean; fetchFn?: typeof fetch } = {}
+) {
   const queryErrors: Array<{ step: string; message: string }> = [];
   const capSync = async <T = any>(step: string, fn: () => Promise<{ rows: T[] }>, fallbackRows: T[] = []) => {
     try {
@@ -1210,9 +1326,9 @@ async function collectSyncHealth(executor: DbExecutor) {
     }
   };
 
-  const [workerQ, logsQ, cpQ, outboxCountsQ, outboxErrBreakdownQ, outboxRecentErrQ, lastOutboxSentQ, syncSecretDiag] = await Promise.all([
+  const [workerQ, logsQ, cpQ, outboxCountsQ, outboxErrBreakdownQ, outboxCatStatsQ, outboxRecentErrQ, lastOutboxSentQ, syncSecretDiag, rgTokenDiag, serverCfg] = await Promise.all([
     capSync('sync_worker_state', () => executor.query(`SELECT * FROM sync_worker_state WHERE id = 'primary' LIMIT 1`)),
-    capSync('sync_log', () => executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 15`)),
+    capSync('sync_log', () => executor.query(`SELECT * FROM sync_log ORDER BY started_at DESC LIMIT 20`)),
     capSync('sync_checkpoints', () => executor.query(`SELECT * FROM sync_checkpoints ORDER BY updated_at DESC LIMIT 20`)),
     capSync('outbox_counts', () =>
       executor.query<{
@@ -1233,11 +1349,39 @@ async function collectSyncHealth(executor: DbExecutor) {
            COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_cnt,
            COUNT(*) FILTER (
              WHERE status = 'failed'
-               AND COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'
+               AND (
+                 COALESCE(error_category, '') IN ('auth', 'sheet_frozen', 'validation')
+                 OR COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'
+               )
            )::int AS permanent_failed_cnt,
            MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry', 'failed')) AS oldest_unsynced_at,
            COUNT(*)::int AS total_cnt
          FROM sheets_mirror_outbox`
+      ).catch(() =>
+        executor.query<{
+          sent_cnt: number;
+          pending_cnt: number;
+          processing_cnt: number;
+          retry_cnt: number;
+          failed_cnt: number;
+          permanent_failed_cnt: number;
+          oldest_unsynced_at: any;
+          total_cnt: number;
+        }>(
+          `SELECT
+             COUNT(*) FILTER (WHERE status = 'sent')::int AS sent_cnt,
+             COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_cnt,
+             COUNT(*) FILTER (WHERE status = 'processing')::int AS processing_cnt,
+             COUNT(*) FILTER (WHERE status = 'retry')::int AS retry_cnt,
+             COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_cnt,
+             COUNT(*) FILTER (
+               WHERE status = 'failed'
+                 AND COALESCE(last_error, '') ~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'
+             )::int AS permanent_failed_cnt,
+             MIN(created_at) FILTER (WHERE status IN ('pending', 'processing', 'retry', 'failed')) AS oldest_unsynced_at,
+             COUNT(*)::int AS total_cnt
+           FROM sheets_mirror_outbox`
+        )
       ),
       [{ sent_cnt: 0, pending_cnt: 0, processing_cnt: 0, retry_cnt: 0, failed_cnt: 0, permanent_failed_cnt: 0, oldest_unsynced_at: null, total_cnt: 0 }]
     ),
@@ -1250,6 +1394,21 @@ async function collectSyncHealth(executor: DbExecutor) {
          ORDER BY cnt DESC
          LIMIT 10`
       )
+    ),
+    capSync('outbox_category_stats', () =>
+      executor.query<{ category: string; err: string; cnt: number; first_seen_at: any; last_seen_at: any }>(
+        `SELECT
+           COALESCE(NULLIF(TRIM(error_category), ''), 'unknown') AS category,
+           MIN(COALESCE(NULLIF(TRIM(last_error), ''), 'UNKNOWN_ERROR')) AS err,
+           COUNT(*)::int AS cnt,
+           MIN(created_at) AS first_seen_at,
+           MAX(COALESCE(last_attempt_at, updated_at, created_at)) AS last_seen_at
+         FROM sheets_mirror_outbox
+         WHERE status IN ('failed', 'retry')
+         GROUP BY 1
+         ORDER BY cnt DESC
+         LIMIT 12`
+      ).catch(() => ({ rows: [] as any[] }))
     ),
     capSync('outbox_recent_errors', () =>
       executor.query<{ id: string; entity_type: string; entity_id: string; action: string; status: string; retry_count: number; last_error: string; updated_at: any }>(
@@ -1273,9 +1432,65 @@ async function collectSyncHealth(executor: DbExecutor) {
       configured: false,
       source: 'none' as const,
       length: 0,
-      hasEnvWhitespace: false
+      hasEnvWhitespace: false,
+      hasQuotes: false,
+      hasWhitespace: false
+    })),
+    getRgTokenDiagnostics(executor).catch(() => ({
+      configured: false,
+      source: 'none' as const,
+      length: 0,
+      hasQuotes: false,
+      hasWhitespace: false,
+      hasBearerPrefix: false
+    })),
+    resolveServerConfig(executor).catch(() => ({
+      rgApiBaseUrl: '',
+      rgToken: '',
+      gasWebAppUrl: '',
+      syncApiSecret: '',
+      neonSyncUrl: ''
     }))
   ]);
+
+  let liveChecks: {
+    checked: boolean;
+    rentalGateAuth: any;
+    gasMirrorAuth: any;
+  } = {
+    checked: false,
+    rentalGateAuth: null,
+    gasMirrorAuth: null
+  };
+
+  if (opts.testLiveConnections || opts.fetchFn) {
+    liveChecks.checked = true;
+    const hasRgCreds = Boolean(serverCfg.rgToken);
+    const hasGasCreds = Boolean(serverCfg.gasWebAppUrl && serverCfg.syncApiSecret);
+    const [rgRes, gasRes] = await Promise.all([
+      hasRgCreds || opts.fetchFn
+        ? testRgApiConnectionSafe(executor, { checkAllEndpoints: false, fetchFn: opts.fetchFn }).catch((e: any) => ({
+            ok: false,
+            authValid: null,
+            configured: hasRgCreds,
+            message: redactSensitiveText(e?.message || 'RG_PROBE_ERROR'),
+            endpoints: []
+          }))
+        : Promise.resolve(null),
+      hasGasCreds || opts.fetchFn
+        ? verifyGasMirrorAuth(executor, opts.fetchFn || fetch).catch((e: any) => ({
+            ok: false,
+            authValid: null,
+            statusCode: 0,
+            configured: hasGasCreds,
+            legacyGasScript: false,
+            message: redactSensitiveText(e?.message || 'GAS_PROBE_ERROR')
+          }))
+        : Promise.resolve(null)
+    ]);
+    liveChecks.rentalGateAuth = rgRes;
+    liveChecks.gasMirrorAuth = gasRes;
+  }
 
   const w = workerQ.rows?.[0] || null;
   const logs = (logsQ.rows || []).map((l) => ({
@@ -1312,11 +1527,23 @@ async function collectSyncHealth(executor: DbExecutor) {
     oldest_unsynced_at: null,
     total_cnt: 0
   } as any);
-  const outboxBreakdown = (outboxErrBreakdownQ.rows || []).map((b) => ({
-    error: redactSensitiveText(b.err),
-    count: num(b.cnt, 0),
-    isTransient: !/UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422/i.test(str(b.err))
+  const outboxCategoryBreakdown = (outboxCatStatsQ.rows || []).map((c: any) => ({
+    category: str(c.category || 'unknown'),
+    sampleError: redactSensitiveText(c.err),
+    count: num(c.cnt, 0),
+    firstSeenAt: c.first_seen_at instanceof Date ? c.first_seen_at.toISOString() : str(c.first_seen_at),
+    lastSeenAt: c.last_seen_at instanceof Date ? c.last_seen_at.toISOString() : str(c.last_seen_at)
   }));
+  const outboxBreakdown = (outboxErrBreakdownQ.rows || []).map((b) => {
+    const cleanErr = redactSensitiveText(b.err);
+    const cls = classifyOutboxMirrorError(cleanErr, 0);
+    return {
+      error: cleanErr,
+      category: cls.category,
+      count: num(b.cnt, 0),
+      isTransient: !cls.permanent
+    };
+  });
   const outboxRecentErrors = (outboxRecentErrQ.rows || []).map((e) => ({
     id: str(e.id),
     entityType: str(e.entity_type),
@@ -1330,6 +1557,7 @@ async function collectSyncHealth(executor: DbExecutor) {
 
   const rgCp = checkpoints.find((c) => /rental_gate/i.test(c.source));
   const sheetsCp = checkpoints.find((c) => /sheet|gas|apps_script/i.test(c.source));
+  const gasAuthCp = checkpoints.find((c) => c.source === 'google_apps_script_auth');
   const lastSuccessLog = logs.find((l) => l.status === 'success');
   const lastOutboxRow = lastOutboxSentQ.rows?.[0];
   const lastOutboxSentAt = lastOutboxRow?.sent_at instanceof Date
@@ -1356,9 +1584,28 @@ async function collectSyncHealth(executor: DbExecutor) {
   const lastLog = logs[0] || null;
   const lastSyncFailed = lastLog && lastLog.status !== 'success';
   const missingMirrorSecretWithQueue = !syncSecretDiag.configured && (pendingOutbox > 0 || failedOutbox > 0);
+  const hasSecretFormattingWarning = Boolean(
+    syncSecretDiag.hasEnvWhitespace ||
+    syncSecretDiag.hasQuotes ||
+    syncSecretDiag.hasWhitespace ||
+    rgTokenDiag.hasQuotes ||
+    rgTokenDiag.hasWhitespace
+  );
+  const rgAuthFailedLive = liveChecks.rentalGateAuth?.authValid === false;
+  const gasAuthFailedLive = liveChecks.gasMirrorAuth?.authValid === false;
+  const deploySkewWarning = liveChecks.gasMirrorAuth?.legacyGasScript
+    ? str(liveChecks.gasMirrorAuth.message)
+    : (gasAuthCp && gasAuthCp.lastStatus === 'warning' && /قديمة|verifyMirrorAuth/i.test(gasAuthCp.lastError)
+      ? gasAuthCp.lastError
+      : '');
 
   let status: HealthStatus = 'healthy';
-  if (consecutiveErrors >= 3 || (lastSyncFailed && !w?.last_success_at)) {
+  if (
+    consecutiveErrors >= 3 ||
+    (lastSyncFailed && !w?.last_success_at) ||
+    rgAuthFailedLive ||
+    (gasAuthFailedLive && permanentFailedOutbox > 0)
+  ) {
     status = 'critical';
   } else if (
     failedOutbox > 0 ||
@@ -1366,7 +1613,9 @@ async function collectSyncHealth(executor: DbExecutor) {
     consecutiveErrors > 0 ||
     lastSyncFailed ||
     missingMirrorSecretWithQueue ||
-    syncSecretDiag.hasEnvWhitespace ||
+    hasSecretFormattingWarning ||
+    gasAuthFailedLive ||
+    Boolean(deploySkewWarning) ||
     queryErrors.length > 0
   ) {
     status = 'warning';
@@ -1374,16 +1623,73 @@ async function collectSyncHealth(executor: DbExecutor) {
     status = 'warning';
   }
 
+  const syncCheckedAt = new Date().toISOString();
+  const latestSyncFailureMsg =
+    (rgAuthFailedLive ? str(liveChecks.rentalGateAuth?.message) : '') ||
+    (gasAuthFailedLive ? str(liveChecks.gasMirrorAuth?.message) : '') ||
+    str(w?.last_error) ||
+    (lastSyncFailed ? lastLog?.errorMessage : '') ||
+    str(outboxRecentErrors[0]?.error);
+
+  const syncErrorCategory = rgAuthFailedLive
+    ? 'rg_auth'
+    : (gasAuthFailedLive
+      ? 'gas_auth'
+      : (/401|403|NO_RG_TOKEN|Token is malformed/i.test(latestSyncFailureMsg)
+        ? 'rg_auth'
+        : (/UNAUTHORIZED|SYNC_API_SECRET/i.test(latestSyncFailureMsg)
+          ? 'gas_auth'
+          : (permanentFailedOutbox > 0
+            ? 'outbox_permanent'
+            : (failedOutbox > 0 ? 'outbox_retry' : (consecutiveErrors > 0 ? 'worker_sync' : 'none'))))));
+
+  const syncRecommendedAction = rgAuthFailedLive || /401|403|NO_RG_TOKEN|Token is malformed/i.test(latestSyncFailureMsg)
+    ? 'حدّث RG_TOKEN في متغيرات البيئة (Vercel) وScript Properties وتأكد من عدم وجود مسافات أو علامات اقتباس أو تكرار Bearer.'
+    : (gasAuthFailedLive || /UNAUTHORIZED|SYNC_API_SECRET/i.test(latestSyncFailureMsg)
+      ? 'طابِق SYNC_API_SECRET بين Backend (Vercel/.env) وGoogle Apps Script (Script Properties) وأعد نشر GAS قبل إعادة محاولة Outbox.'
+      : (failedOutbox > 0
+        ? 'راجع تصنيف أخطاء Outbox الفاشلة وتحقق من مصادقة GAS ثم أعد المعالجة على دفعات صغيرة آمنة.'
+        : (deploySkewWarning || (hasSecretFormattingWarning
+          ? 'يحتوي توكن أو مفتاح المزامنة على مسافات أو علامات اقتباس في البيئة — يتم تنظيفه تلقائياً لكن يُنصح بتنظيف القيمة المخزنة.'
+          : ''))));
+
   return {
     status,
-    checkedAt: new Date().toISOString(),
+    checkedAt: syncCheckedAt,
     queryErrors,
+    liveChecks,
+    deploySkewWarning,
     lastSuccessBySource,
+    lastSuccessfulCheck: lastSuccessBySource.rentalGateApi || lastSuccessBySource.neonPostgres || '',
+    latestFailure: latestSyncFailureMsg
+      ? {
+          message: redactSensitiveText(latestSyncFailureMsg),
+          at: (w?.last_run_at instanceof Date ? w.last_run_at.toISOString() : str(w?.last_run_at)) ||
+            lastLog?.finishedAt ||
+            outboxRecentErrors[0]?.updatedAt ||
+            syncCheckedAt
+        }
+      : null,
+    errorCategory: syncErrorCategory,
+    affectedComponent: 'sync_pipeline',
+    errorCount: failedOutbox + consecutiveErrors + queryErrors.length + (rgAuthFailedLive ? 1 : 0) + (gasAuthFailedLive ? 1 : 0),
+    recommendedAction: syncRecommendedAction,
+    repairHistory: logs.slice(0, 5),
     syncSecretDiagnostics: {
       configured: Boolean(syncSecretDiag.configured),
       source: syncSecretDiag.source,
       length: num(syncSecretDiag.length, 0),
-      hasEnvWhitespace: Boolean(syncSecretDiag.hasEnvWhitespace)
+      hasEnvWhitespace: Boolean(syncSecretDiag.hasEnvWhitespace),
+      hasQuotes: Boolean(syncSecretDiag.hasQuotes),
+      hasWhitespace: Boolean(syncSecretDiag.hasWhitespace)
+    },
+    rgTokenDiagnostics: {
+      configured: Boolean(rgTokenDiag.configured),
+      source: rgTokenDiag.source,
+      length: num(rgTokenDiag.length, 0),
+      hasQuotes: Boolean(rgTokenDiag.hasQuotes),
+      hasWhitespace: Boolean(rgTokenDiag.hasWhitespace),
+      hasBearerPrefix: Boolean(rgTokenDiag.hasBearerPrefix)
     },
     worker: w ? {
       status: str(w.status || 'stopped'),
@@ -1417,7 +1723,309 @@ async function collectSyncHealth(executor: DbExecutor) {
       oldestUnsyncedAt: oldestUnsyncedIso,
       oldestUnsyncedAgeMinutes,
       errorBreakdown: outboxBreakdown,
+      categoryBreakdown: outboxCategoryBreakdown,
       recentErrors: outboxRecentErrors
+    }
+  };
+}
+
+export interface HealthErrorGroup {
+  id: string;
+  bucket: 'active' | 'historical' | 'resolved';
+  errorCategory: string;
+  affectedService: string;
+  sampleMessage: string;
+  occurrences: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastSuccessfulOperation: string;
+  suggestedFix: string;
+}
+
+export interface HealthErrorDigest {
+  active: HealthErrorGroup[];
+  historical: HealthErrorGroup[];
+  resolved: HealthErrorGroup[];
+  counts: { active: number; historical: number; resolved: number };
+}
+
+function normalizeErrSignature(msg: string): string {
+  return redactSensitiveText(msg)
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}[^\s]*/g, '<TS>')
+    .replace(/\b[A-Z]{2,6}_[A-Z0-9_]{6,}\b/g, '<ID>')
+    .replace(/\$\d+/g, '$N')
+    .replace(/\b\d+\b/g, '#')
+    .trim()
+    .slice(0, 140);
+}
+
+function inferAffectedServiceAndFix(context: string, action: string, msg: string): {
+  category: string;
+  service: string;
+  fix: string;
+} {
+  const combined = `${context} ${action} ${msg}`;
+  if (/RG_API_HTTP_401|Token is malformed|NO_RG_TOKEN|rgApiClient|pullFromRentalGate/i.test(combined)) {
+    return {
+      category: 'rg_auth',
+      service: 'Rental Gate API',
+      fix: 'تأكد من صحة RG_TOKEN وتنسيقه بدون علامات اقتباس أو مسافات أو تكرار Bearer في بيئة الإنتاج وScript Properties.'
+    };
+  }
+  if (/UNAUTHORIZED|SYNC_API_SECRET|verifyGasMirrorAuth|google_apps_script_auth/i.test(combined)) {
+    return {
+      category: 'gas_auth',
+      service: 'Google Apps Script',
+      fix: 'طابِق SYNC_API_SECRET بين Backend (Vercel/.env) وScript Properties في Apps Script ثم اختبر المصادقة.'
+    };
+  }
+  if (/non-frozen/i.test(combined)) {
+    return {
+      category: 'sheet_frozen',
+      service: 'Google Sheets Mirror',
+      fix: 'حدّث Database.gs وReservations.gs لحماية الصفوف المجمدة واستخدام clearContent() قبل أي حذف.'
+    };
+  }
+  if (/inconsistent types deduced|parameter \$\d+|25P02|sql|postgres|syntax error/i.test(combined)) {
+    return {
+      category: 'sql_parameter',
+      service: 'Neon PostgreSQL',
+      fix: 'تأكد من إضافة التحويل الصريح للأنواع (::text / ::timestamptz / ::int) في الاستعلام المتأثر.'
+    };
+  }
+  if (/outbox|flushSheetsMirrorOutbox/i.test(combined)) {
+    return {
+      category: 'sync_outbox',
+      service: 'Google Apps Script / Outbox',
+      fix: 'تحقق من مصادقة GAS ورابط Web App ثم أعد معالجة الدفعات الفاشلة تدريجياً.'
+    };
+  }
+  return {
+    category: 'runtime',
+    service: context || 'CRM Backend',
+    fix: 'راجع سجل الخطأ وأعد تشغيل الفحص بعد تطبيق التحديث.'
+  };
+}
+
+export function buildHealthErrorDigest(
+  sections: Partial<Record<HealthSectionKey, any>> = {},
+  nowIso = new Date().toISOString()
+): HealthErrorDigest {
+  const activeMap = new Map<string, HealthErrorGroup>();
+  const historicalMap = new Map<string, HealthErrorGroup>();
+  const resolvedMap = new Map<string, HealthErrorGroup>();
+
+  const pushGroup = (targetMap: Map<string, HealthErrorGroup>, g: HealthErrorGroup) => {
+    const key = `${g.bucket}|${g.affectedService}|${g.errorCategory}|${normalizeErrSignature(g.sampleMessage)}`;
+    const prev = targetMap.get(key);
+    if (!prev) {
+      targetMap.set(key, { ...g, sampleMessage: redactSensitiveText(g.sampleMessage).slice(0, 260) });
+      return;
+    }
+    prev.occurrences += g.occurrences;
+    if (g.firstSeenAt && (!prev.firstSeenAt || g.firstSeenAt < prev.firstSeenAt)) prev.firstSeenAt = g.firstSeenAt;
+    if (g.lastSeenAt && (!prev.lastSeenAt || g.lastSeenAt > prev.lastSeenAt)) prev.lastSeenAt = g.lastSeenAt;
+    if (g.lastSuccessfulOperation && (!prev.lastSuccessfulOperation || g.lastSuccessfulOperation > prev.lastSuccessfulOperation)) {
+      prev.lastSuccessfulOperation = g.lastSuccessfulOperation;
+    }
+  };
+
+  const dbH = sections.database_health || {};
+  const scH = sections.schema_integrity || {};
+  const diH = sections.data_integrity || {};
+  const syH = sections.sync_health || {};
+
+  const lastRgSuccess = str(syH?.lastSuccessBySource?.rentalGateApi);
+  const lastNeonSuccess = str(syH?.lastSuccessBySource?.neonPostgres || dbH?.lastSuccessAt);
+  const lastGasSuccess = str(syH?.lastSuccessBySource?.googleAppsScriptSheets);
+
+  // 1. Outbox failures (always ACTIVE until outbox rows leave failed/retry)
+  const catStats: any[] = Array.isArray(syH?.outbox?.categoryBreakdown) ? syH.outbox.categoryBreakdown : [];
+  if (catStats.length > 0) {
+    for (const c of catStats) {
+      const cat = str(c.category || 'unknown');
+      const info = inferAffectedServiceAndFix('outbox', cat, str(c.sampleError));
+      pushGroup(activeMap, {
+        id: `ERR_OBX_${cat}`,
+        bucket: 'active',
+        errorCategory: cat === 'unknown' ? info.category : cat,
+        affectedService: info.service,
+        sampleMessage: str(c.sampleError || 'OUTBOX_FAILED'),
+        occurrences: Math.max(1, num(c.count, 1)),
+        firstSeenAt: str(c.firstSeenAt || nowIso),
+        lastSeenAt: str(c.lastSeenAt || nowIso),
+        lastSuccessfulOperation: lastGasSuccess,
+        suggestedFix: info.fix
+      });
+    }
+  } else if (Array.isArray(syH?.outbox?.errorBreakdown)) {
+    for (const b of syH.outbox.errorBreakdown) {
+      const info = inferAffectedServiceAndFix('outbox', str(b.category), str(b.error));
+      pushGroup(activeMap, {
+        id: `ERR_OBX_BRK`,
+        bucket: 'active',
+        errorCategory: str(b.category || info.category),
+        affectedService: info.service,
+        sampleMessage: str(b.error),
+        occurrences: Math.max(1, num(b.count, 1)),
+        firstSeenAt: str(syH.outbox.oldestUnsyncedAt || nowIso),
+        lastSeenAt: nowIso,
+        lastSuccessfulOperation: lastGasSuccess,
+        suggestedFix: info.fix
+      });
+    }
+  }
+
+  // 2. Live auth probes & RG compare errors
+  if (syH?.liveChecks?.rentalGateAuth?.authValid === false) {
+    pushGroup(activeMap, {
+      id: 'ERR_LIVE_RG_AUTH',
+      bucket: 'active',
+      errorCategory: 'rg_auth',
+      affectedService: 'Rental Gate API',
+      sampleMessage: str(syH.liveChecks.rentalGateAuth.message || 'RG_API_HTTP_401'),
+      occurrences: 1,
+      firstSeenAt: str(syH.checkedAt || nowIso),
+      lastSeenAt: str(syH.checkedAt || nowIso),
+      lastSuccessfulOperation: lastRgSuccess,
+      suggestedFix: 'حدّث RG_TOKEN في متغيرات البيئة وScript Properties وتأكد من إزالة علامات الاقتباس وBearer المكررة.'
+    });
+  }
+  if (syH?.liveChecks?.gasMirrorAuth?.authValid === false) {
+    pushGroup(activeMap, {
+      id: 'ERR_LIVE_GAS_AUTH',
+      bucket: 'active',
+      errorCategory: 'gas_auth',
+      affectedService: 'Google Apps Script',
+      sampleMessage: str(syH.liveChecks.gasMirrorAuth.message || 'UNAUTHORIZED: SYNC_API_SECRET mismatch'),
+      occurrences: 1,
+      firstSeenAt: str(syH.checkedAt || nowIso),
+      lastSeenAt: str(syH.checkedAt || nowIso),
+      lastSuccessfulOperation: lastGasSuccess,
+      suggestedFix: 'طابِق SYNC_API_SECRET في Vercel/Backend وGoogle Apps Script Script Properties ثم أعد اختبار المصادقة.'
+    });
+  }
+  if (syH?.deploySkewWarning) {
+    pushGroup(activeMap, {
+      id: 'ERR_GAS_DEPLOY_SKEW',
+      bucket: 'active',
+      errorCategory: 'deploy_skew',
+      affectedService: 'Google Apps Script',
+      sampleMessage: str(syH.deploySkewWarning),
+      occurrences: 1,
+      firstSeenAt: str(syH.checkedAt || nowIso),
+      lastSeenAt: str(syH.checkedAt || nowIso),
+      lastSuccessfulOperation: lastGasSuccess,
+      suggestedFix: 'انسخ تحديثات Code.gs وNeonSync.gs وDatabase.gs إلى محرر Google Apps Script ثم أنشئ Deployment جديداً.'
+    });
+  }
+  if (diH?.rgComparison?.error) {
+    const msg = str(diH.rgComparison.error);
+    const info = inferAffectedServiceAndFix('data_integrity', 'rg_compare', msg);
+    pushGroup(activeMap, {
+      id: 'ERR_DI_RG',
+      bucket: 'active',
+      errorCategory: info.category,
+      affectedService: info.service,
+      sampleMessage: msg,
+      occurrences: 1,
+      firstSeenAt: str(diH.checkedAt || nowIso),
+      lastSeenAt: str(diH.checkedAt || nowIso),
+      lastSuccessfulOperation: lastRgSuccess,
+      suggestedFix: info.fix
+    });
+  }
+
+  // 3. Schema integrity active issues
+  const schemaDiffCount =
+    (scH?.missingTables?.length || 0) +
+    (scH?.missingColumns?.length || 0) +
+    (scH?.pendingMigrations?.length || 0) +
+    (scH?.constraintMismatches?.length || 0);
+  if (schemaDiffCount > 0) {
+    pushGroup(activeMap, {
+      id: 'ERR_SCHEMA_DIFF',
+      bucket: 'active',
+      errorCategory: 'schema_integrity',
+      affectedService: 'Neon PostgreSQL Schema',
+      sampleMessage: `اختلاف بنية القاعدة: جداول مفقودة=${scH?.missingTables?.length || 0} · أعمدة=${scH?.missingColumns?.length || 0} · قيود=${scH?.constraintMismatches?.length || 0} · migrations معلقة=${scH?.pendingMigrations?.length || 0}`,
+      occurrences: schemaDiffCount,
+      firstSeenAt: str(scH.checkedAt || nowIso),
+      lastSeenAt: str(scH.checkedAt || nowIso),
+      lastSuccessfulOperation: lastNeonSuccess,
+      suggestedFix: 'شغّل التهيئة والترحيلات الآمنة (Migrations) أو طابق Schema مع backend/schemaSql.ts.'
+    });
+  }
+
+  // 4. Sync logs & checkpoints
+  const logs: any[] = Array.isArray(syH?.recentLogs) ? syH.recentLogs : [];
+  const newestSuccessLogAt = str(logs.find((l) => l.status === 'success')?.finishedAt || lastRgSuccess);
+  for (const log of logs) {
+    if (!log || log.status === 'success') continue;
+    const msg = str(log.errorMessage || `SYNC_${log.status}`);
+    const logAt = str(log.finishedAt || log.startedAt || nowIso);
+    const isSupersededBySuccess = Boolean(newestSuccessLogAt && logAt && newestSuccessLogAt > logAt);
+    const info = inferAffectedServiceAndFix('sync_log', log.status, msg);
+    const bucket: 'active' | 'resolved' = isSupersededBySuccess ? 'resolved' : 'active';
+    pushGroup(bucket === 'resolved' ? resolvedMap : activeMap, {
+      id: `ERR_SYNCLOG_${str(log.id)}`,
+      bucket,
+      errorCategory: info.category,
+      affectedService: info.service,
+      sampleMessage: msg,
+      occurrences: 1,
+      firstSeenAt: logAt,
+      lastSeenAt: logAt,
+      lastSuccessfulOperation: newestSuccessLogAt,
+      suggestedFix: info.fix
+    });
+  }
+
+  // 5. Server error_logs grouped into Active vs Historical vs Resolved
+  const dbRecentErrs: any[] = Array.isArray(dbH?.recentErrors) ? dbH.recentErrors : [];
+  for (const er of dbRecentErrs) {
+    if (!er) continue;
+    const msg = str(er.message);
+    if (!msg) continue;
+    const erAt = str(er.createdAt || nowIso);
+    const info = inferAffectedServiceAndFix(str(er.context), str(er.action), msg);
+    const serviceSuccessAt = /Rental Gate/i.test(info.service)
+      ? lastRgSuccess
+      : (/Apps Script|Sheets|Outbox/i.test(info.service) ? lastGasSuccess : lastNeonSuccess);
+    const isResolvedBySuccess = Boolean(serviceSuccessAt && erAt && serviceSuccessAt > erAt);
+    const erMs = Date.parse(erAt);
+    const isOldHistorical = Number.isFinite(erMs) && Date.now() - erMs > 24 * 60 * 60 * 1000;
+    const bucket: 'active' | 'historical' | 'resolved' = isResolvedBySuccess
+      ? 'resolved'
+      : (isOldHistorical ? 'historical' : 'active');
+    const targetMap = bucket === 'active' ? activeMap : (bucket === 'historical' ? historicalMap : resolvedMap);
+    pushGroup(targetMap, {
+      id: `ERR_LOG_${str(er.id)}`,
+      bucket,
+      errorCategory: info.category,
+      affectedService: info.service,
+      sampleMessage: msg,
+      occurrences: 1,
+      firstSeenAt: erAt,
+      lastSeenAt: erAt,
+      lastSuccessfulOperation: serviceSuccessAt,
+      suggestedFix: info.fix
+    });
+  }
+
+  const sortRecent = (a: HealthErrorGroup, b: HealthErrorGroup) => b.lastSeenAt.localeCompare(a.lastSeenAt);
+  const active = Array.from(activeMap.values()).sort(sortRecent);
+  const historical = Array.from(historicalMap.values()).sort(sortRecent);
+  const resolved = Array.from(resolvedMap.values()).sort(sortRecent);
+
+  return {
+    active,
+    historical,
+    resolved,
+    counts: {
+      active: active.length,
+      historical: historical.length,
+      resolved: resolved.length
     }
   };
 }
@@ -1426,6 +2034,9 @@ function formatHealthRunRow(row: any) {
   if (!row) return null;
   const sections = parseJsonSafe<Record<string, any>>(row.sections_json, {});
   const summary = parseJsonSafe<Record<string, any>>(row.summary_json, {});
+  const errorDigest = summary.errorDigest && typeof summary.errorDigest === 'object'
+    ? summary.errorDigest
+    : buildHealthErrorDigest(sections, row.finished_at instanceof Date ? row.finished_at.toISOString() : str(row.finished_at));
   return {
     id: str(row.id),
     scope: str(row.scope || 'all'),
@@ -1435,6 +2046,7 @@ function formatHealthRunRow(row: any) {
     durationMs: num(row.duration_ms, 0),
     summary,
     sections,
+    errorDigest,
     errorMessage: redactSensitiveText(row.error_message),
     startedAt: row.started_at instanceof Date ? row.started_at.toISOString() : str(row.started_at),
     finishedAt: row.finished_at instanceof Date ? row.finished_at.toISOString() : str(row.finished_at)
@@ -1468,7 +2080,8 @@ export async function getDatabaseHealthCenterReport(
         sync_health: { ...emptySection }
       };
 
-  const overallStatus = activeRun ? calculateHealthCenterOverallStatus(sections) : 'unknown';
+  const errorDigest = activeRun?.errorDigest || buildHealthErrorDigest(sections);
+  const overallStatus = activeRun ? calculateHealthCenterOverallStatus(sections, errorDigest) : 'unknown';
 
   return {
     overallStatus,
@@ -1476,6 +2089,7 @@ export async function getDatabaseHealthCenterReport(
     latestRun: activeRun,
     history,
     sections,
+    errorDigest,
     settings,
     poolSnapshot: getPoolMetrics()
   };
@@ -1493,6 +2107,9 @@ export async function runDatabaseHealthCenterScan(
   const compareWithRg = payload.compareWithRg !== undefined
     ? Boolean(payload.compareWithRg)
     : (scope === 'all' || scope === 'data_integrity');
+  const testLiveConnections = payload.testLiveConnections !== undefined
+    ? Boolean(payload.testLiveConnections)
+    : Boolean(payload.compareWithRg === true);
 
   const startedAtMs = Date.now();
   const startedIso = new Date(startedAtMs).toISOString();
@@ -1522,10 +2139,11 @@ export async function runDatabaseHealthCenterScan(
     sections.data_integrity = await collectDataIntegritySection(executor, compareWithRg);
   }
   if (scope === 'all' || scope === 'sync_health') {
-    sections.sync_health = await collectSyncHealth(executor);
+    sections.sync_health = await collectSyncHealth(executor, { testLiveConnections });
   }
 
-  const overallStatus = calculateHealthCenterOverallStatus(sections);
+  const errorDigest = buildHealthErrorDigest(sections, new Date().toISOString());
+  const overallStatus = calculateHealthCenterOverallStatus(sections, errorDigest);
   const finishedAtMs = Date.now();
   const durationMs = Math.max(1, finishedAtMs - startedAtMs);
   const finishedIso = new Date(finishedAtMs).toISOString();
@@ -1541,6 +2159,10 @@ export async function runDatabaseHealthCenterScan(
     missingColumnsCount: (sections.schema_integrity?.missingColumns || []).length,
     reservationsCount: num(sections.data_integrity?.counts?.reservations, 0),
     failedOutboxCount: num(sections.sync_health?.outbox?.failed, 0),
+    activeErrorsCount: errorDigest.counts.active,
+    historicalErrorsCount: errorDigest.counts.historical,
+    resolvedErrorsCount: errorDigest.counts.resolved,
+    errorDigest,
     durationMs
   };
 
@@ -1568,7 +2190,7 @@ export async function runDatabaseHealthCenterScan(
       session.user,
       `فحص مركز صحة قاعدة البيانات (${scope})`,
       runId,
-      `الحالة: ${overallStatus} · المدة: ${durationMs}ms · الجداول: ${summary.totalTables}`
+      `الحالة: ${overallStatus} · المدة: ${durationMs}ms · الجداول: ${summary.totalTables} · أخطاء نشطة: ${errorDigest.counts.active}`
     );
   });
 
@@ -1600,6 +2222,22 @@ export async function saveHealthCenterSettings(
   return { settings: next };
 }
 
+export async function verifyGasMirrorAuthAction(
+  executor: DbExecutor,
+  session: AuthSession
+) {
+  assertHealthCenterAccess(session);
+  const authResult = await verifyGasMirrorAuth(executor);
+  await logHealthCenterActivity(
+    executor,
+    session.user,
+    'فحص مصادقة Google Apps Script',
+    'google_apps_script_auth',
+    authResult.message
+  );
+  return authResult;
+}
+
 export async function retryHealthCenterFailedSync(
   executor: DbExecutor,
   session: AuthSession,
@@ -1607,7 +2245,7 @@ export async function retryHealthCenterFailedSync(
 ) {
   assertHealthCenterAccess(session);
   const mode = str(payload.mode || 'outbox_transient').toLowerCase();
-  const limit = Math.min(100, Math.max(1, num(payload.limit, 25)));
+  const limit = Math.min(25, Math.max(1, num(payload.limit || payload.batchSize, 15)));
 
   if (mode === 'rg_missing_records') {
     const syncRes = await retryFailedSyncRecords(executor, session.user, payload);
@@ -1621,7 +2259,44 @@ export async function retryHealthCenterFailedSync(
     return { mode, syncRes };
   }
 
-  // Safe idempotent outbox retry: only requeues transient failed items unless mode === 'outbox_all_failed'
+  const cfg = await resolveServerConfig(executor).catch(() => ({ gasWebAppUrl: '', syncApiSecret: '' } as any));
+  const gasConfigured = Boolean(str(cfg.gasWebAppUrl) && str(cfg.syncApiSecret));
+
+  if (gasConfigured || mode === 'outbox_batch' || mode === 'outbox_auth' || mode === 'outbox_sheet_frozen') {
+    const batchMode = mode === 'outbox_auth'
+      ? 'auth'
+      : (mode === 'outbox_sheet_frozen'
+        ? 'sheet_frozen'
+        : (mode === 'outbox_all_failed' ? 'all' : 'transient'));
+    const batchRes = await reprocessFailedOutboxBatch(executor, {
+      mode: batchMode,
+      batchSize: limit,
+      maxBatches: Math.min(5, Math.max(1, num(payload.maxBatches, 1)))
+    });
+    if (batchRes.haltedByAuth) {
+      throw new Error(batchRes.authCheck?.message || 'UNAUTHORIZED: تعذر التحقق من SYNC_API_SECRET في Google Apps Script.');
+    }
+    await logHealthCenterActivity(
+      executor,
+      session.user,
+      'إعادة معالجة دفعة Outbox الآمنة',
+      mode,
+      `أُعيدت جدولة ${batchRes.requeuedCount} عملية · أُرسل: ${batchRes.sent} · فشل: ${batchRes.failed}`
+    );
+    return {
+      mode,
+      requeuedCount: batchRes.requeuedCount,
+      flushResult: {
+        sent: batchRes.sent,
+        failed: batchRes.failed,
+        skipped: false,
+        haltedByAuth: batchRes.haltedByAuth
+      },
+      authCheck: batchRes.authCheck
+    };
+  }
+
+  // Fallback for offline/unit tests where GAS URL is not configured in DB settings
   const whereTransient = mode === 'outbox_all_failed'
     ? `status IN ('failed', 'retry')`
     : `status IN ('failed', 'retry') AND COALESCE(last_error, '') !~* 'UNAUTHORIZED|SYNC_API_SECRET|FORBIDDEN|non-frozen|INVALID_GAS_URL|VALIDATION_ERROR|BLOCKED_BULK_DELETE|HTTP_400|HTTP_401|HTTP_403|HTTP_404|HTTP_422'`;
@@ -1630,7 +2305,7 @@ export async function retryHealthCenterFailedSync(
     `WITH picked AS (
        SELECT id FROM sheets_mirror_outbox
        WHERE ${whereTransient}
-       ORDER BY updated_at DESC
+       ORDER BY created_at ASC, id ASC
        LIMIT $1
      )
      UPDATE sheets_mirror_outbox o
@@ -1646,26 +2321,14 @@ export async function retryHealthCenterFailedSync(
     [limit]
   );
   const requeuedCount = (resetQ.rows || []).length;
-  let flushResult: { sent: number; failed: number; skipped: boolean; error?: string } = {
-    sent: 0,
-    failed: 0,
-    skipped: false
-  };
-  if (requeuedCount > 0) {
-    flushResult = await flushSheetsMirrorOutbox(executor).catch((e: any) => ({
-      sent: 0,
-      failed: requeuedCount,
-      skipped: false,
-      error: redactSensitiveText(e?.message || 'FLUSH_ERROR')
-    }));
-  }
+  const flushResult = { sent: 0, failed: 0, skipped: true };
 
   await logHealthCenterActivity(
     executor,
     session.user,
     'إعادة محاولة Outbox المزامنة',
     mode,
-    `تمت إعادة جدولة ${requeuedCount} عملية · أُرسل: ${num(flushResult?.sent, 0)}`
+    `تمت إعادة جدولة ${requeuedCount} عملية · أُرسل: 0 (GAS غير مهيأ)`
   );
 
   return {

@@ -2275,6 +2275,9 @@
 
     var kpis = {
       totalCustomers: 0,
+      activeCustomers: 0,
+      withReservationsCustomers: 0,
+      withoutReservationsCustomers: 0,
       newCustomers: 0,
       activeBookingCustomers: 0,
       pastBookingCustomers: 0,
@@ -2283,7 +2286,10 @@
       extensionCustomers: 0,
       unfollowedCustomers: 0,
       repeatCustomers: 0,
-      recentUpdatedCustomers: 0
+      recentUpdatedCustomers: 0,
+      missingPhoneCustomers: 0,
+      missingEmailCustomers: 0,
+      missingIdCustomers: 0
     };
 
     var rows = order.map(function (k) {
@@ -2304,8 +2310,15 @@
         isNewRecent: isNewRec ? 1 : 0
       });
       var hasUnfollowed = (c.unfollowedActiveCount > 0) || (c.totalBookings > 0 && c.followUpsCount === 0 && c.notesCount === 0);
+      var isActiveCust = status !== 'غير نشط' && status !== 'محظور';
+      var isMissingPhone = !normalizeStr(c.phone);
+      var isMissingEmail = !normalizeStr(c.email);
+      var isMissingId = !normalizeNationalId(c.idNumber);
 
       kpis.totalCustomers += 1;
+      if (isActiveCust) kpis.activeCustomers += 1;
+      if (c.totalBookings > 0) kpis.withReservationsCustomers += 1;
+      else kpis.withoutReservationsCustomers += 1;
       if (isNewRec || status === 'جديد') kpis.newCustomers += 1;
       if (c.activeBookingsCount > 0) kpis.activeBookingCustomers += 1;
       if (c.pastBookingsCount > 0) kpis.pastBookingCustomers += 1;
@@ -2315,13 +2328,20 @@
       if (hasUnfollowed) kpis.unfollowedCustomers += 1;
       if (c.totalBookings > 1) kpis.repeatCustomers += 1;
       if (isRecentUpd) kpis.recentUpdatedCustomers += 1;
+      if (isMissingPhone) kpis.missingPhoneCustomers += 1;
+      if (isMissingEmail) kpis.missingEmailCustomers += 1;
+      if (isMissingId) kpis.missingIdCustomers += 1;
 
       var cleanCopy = Object.assign({}, c, {
         status: status,
         isNew: isNewRec,
         isRecent: isRecentUpd,
+        isActiveCustomer: isActiveCust,
         unfollowed: hasUnfollowed,
-        isRepeat: c.totalBookings > 1
+        isRepeat: c.totalBookings > 1,
+        missingPhone: isMissingPhone,
+        missingEmail: isMissingEmail,
+        missingId: isMissingId
       });
       delete cleanCopy._lastBookingIso;
       return cleanCopy;

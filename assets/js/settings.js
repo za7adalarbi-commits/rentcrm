@@ -138,6 +138,7 @@
   async function render(container, ctx) {
     var t = ctx.t;
     var user = root.RGAuth.getUser();
+    var isDeveloperUser = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.DEVELOPER);
     var canAccessApi = root.RGCrmCore.canAccessApi(user);
     var canSync = root.RGCrmCore.canUserPerform(user, 'sync_data');
     var canManageSettings = root.RGCrmCore.canUserPerform(user, 'manage_settings');
@@ -199,8 +200,9 @@
 
     var settings = (settingsRes.success && settingsRes.data) || {};
     var syncData = (syncRes && syncRes.success && syncRes.data) || { logs: [], lastSync: null };
+    var syncLogs = Array.isArray(syncData.logs) ? syncData.logs : [];
     var caps = (capsRes && capsRes.success && capsRes.data) ? capsRes.data : {};
-    var lastSync = syncData.lastSync;
+    var lastSync = syncData.lastSync || null;
 
     var autoSyncEnabled = settings.auto_sync_enabled !== undefined ? Boolean(settings.auto_sync_enabled) : (syncData.autoSyncEnabled !== false);
     var autoSyncNorm = (root.RGCrmCore && root.RGCrmCore.normalizeAutoSyncIntervalSeconds)
@@ -290,7 +292,6 @@
         (root.RGCrmCore.ROLES && (user.role === root.RGCrmCore.ROLES.GENERAL_MANAGER || user.role === root.RGCrmCore.ROLES.DEVELOPER))
       )
     );
-    var isDeveloperUser = Boolean(user && root.RGCrmCore && root.RGCrmCore.ROLES && user.role === root.RGCrmCore.ROLES.DEVELOPER);
     var canViewDevIntegrity = Boolean(isDeveloperUser && root.RGCrmCore && root.RGCrmCore.canUserPerform(user, 'manage_developer_tools'));
     var pullPresets = (root.RGCrmCore && root.RGCrmCore.PULL_DURATION_PRESETS) || [];
     var cacheStats = (root.RGApi && root.RGApi.getLocalCacheStats) ? root.RGApi.getLocalCacheStats() : { reservationsCount: 0, customersCount: 0, detailsCount: 0 };
@@ -744,12 +745,12 @@
           '<div id="sync-action-msg" class="hidden" style="margin-bottom:14px;"></div>' +
           '<h3 style="margin:0 0 10px;font-size:14.5px;">سجل عمليات السحب (SyncLog)</h3>' +
           '<div id="sync-log-table-host">' +
-          (syncData.logs.length === 0
+          (syncLogs.length === 0
             ? '<div class="empty-state" style="padding:20px;">لا توجد عمليات مزامنة مسجلة بعد.</div>'
             : '<div class="table-wrap"><table class="data-table"><thead><tr>' +
                 '<th>المعرف</th><th>المنفذ</th><th>الحالة</th><th>مستورد</th><th>محدث</th><th>تمديدات</th><th>الصفحات</th><th>الرسالة</th><th>التوقيت</th>' +
               '</tr></thead><tbody>' +
-                syncData.logs.map(function (l) {
+                syncLogs.map(function (l) {
                   var stCls = l.status === 'success' ? 'status-success' : (l.status === 'partial' ? 'status-warning' : 'status-danger');
                   var stText = l.status === 'success' ? 'ناجح' : (l.status === 'partial' ? 'غير مكتمل' : 'فشل');
                   return '<tr>' +
@@ -1241,6 +1242,7 @@
       var logs = (root.RGApp && typeof root.RGApp.getSyncDiagnostics === 'function')
         ? root.RGApp.getSyncDiagnostics()
         : [];
+      if (!Array.isArray(logs)) logs = [];
       var channelLabel = summary.offline
         ? 'غير متصل (Offline)'
         : (summary.sseConnected ? 'بث فوري (SSE Live)' : 'مزامنة سريعة تلقائية (Polling 3s)');
@@ -3906,6 +3908,7 @@
         generatedAt: new Date().toISOString(),
         overallStatus: rep && rep.hasScanned ? rep.overallStatus : 'unknown',
         runId: rep && rep.latestRun ? rep.latestRun.id : null,
+        errorDigest: (rep && rep.errorDigest) || { active: [], historical: [], resolved: [], counts: { active: 0, historical: 0, resolved: 0 } },
         databaseHealth: {
           status: dbH.status,
           probeError: dbH.probeError || '',
@@ -3933,7 +3936,10 @@
         syncHealth: {
           status: syH.status,
           queryErrors: syH.queryErrors || [],
+          liveChecks: syH.liveChecks || null,
+          deploySkewWarning: syH.deploySkewWarning || '',
           workerLastError: syH.worker ? syH.worker.lastError : '',
+          outboxCategoryBreakdown: (syH.outbox && syH.outbox.categoryBreakdown) || [],
           outboxErrorBreakdown: (syH.outbox && syH.outbox.errorBreakdown) || [],
           outboxRecentErrors: (syH.outbox && syH.outbox.recentErrors) || []
         }
@@ -4131,6 +4137,13 @@
       var diAnom = diH.anomalies || {};
       var diOrphChild = diAnom.orphanChildren || {};
       var diIncCust = diAnom.incompleteCustomers || {};
+      var diCustQual = diAnom.customerQuality || {
+        required: { missingPhone: Number(diIncCust.missingPhone || 0) },
+        optionalSourceGaps: {
+          missingIdNumber: Number(diIncCust.missingIdNumber || 0),
+          missingEmail: Number(diIncCust.missingEmail || 0)
+        }
+      };
       var diLatest = diH.latestIntegrityRun || null;
       var rgCmp = diH.rgComparison || {};
 
@@ -4138,8 +4151,14 @@
       var syOutbox = syH.outbox || {};
       var syCheckpoints = Array.isArray(syH.checkpoints) ? syH.checkpoints : [];
       var syErrBreak = Array.isArray(syOutbox.errorBreakdown) ? syOutbox.errorBreakdown : [];
+      var syCatBreak = Array.isArray(syOutbox.categoryBreakdown) ? syOutbox.categoryBreakdown : [];
       var syRecentErrs = Array.isArray(syOutbox.recentErrors) ? syOutbox.recentErrors : [];
       var sySources = syH.lastSuccessBySource || {};
+      var syLive = syH.liveChecks || {};
+      var errDigest = rep.errorDigest || { active: [], historical: [], resolved: [], counts: { active: 0, historical: 0, resolved: 0 } };
+      var activeDigest = Array.isArray(errDigest.active) ? errDigest.active : [];
+      var historicalDigest = Array.isArray(errDigest.historical) ? errDigest.historical : [];
+      var resolvedDigest = Array.isArray(errDigest.resolved) ? errDigest.resolved : [];
 
       var totalSchemaDiffs = missingTables.length + missingCols.length + extraCols.length +
         extraTables.filter(function (t) { return !t.isSampleTable; }).length +
@@ -4195,6 +4214,60 @@
             '<button type="button" class="btn btn-sm" id="hc-save-settings-btn">حفظ الإعداد</button>' +
           '</div>' +
 
+          (function () {
+            function renderDigestList(items, rowCls, emptyText) {
+              if (!items.length) {
+                return '<div style="font-size:12px;color:var(--text-muted);">' + escapeHtml(emptyText) + '</div>';
+              }
+              return '<div class="rg-hc-scroll-list">' +
+                items.slice(0, 12).map(function (it) {
+                  return '<div class="rg-hc-issue-row ' + rowCls + '">' +
+                    '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">' +
+                      '<strong>[' + escapeHtml(it.errorCategory || 'runtime') + '] ' + escapeHtml(it.affectedService || '-') + '</strong>' +
+                      '<span class="tabular-nums" style="font-size:11.5px;">التكرار: ' + Number(it.occurrences || 1) + '</span>' +
+                    '</div>' +
+                    '<div class="mono" dir="ltr" style="font-size:11px;overflow-wrap:anywhere;">' + escapeHtml(it.sampleMessage || '') + '</div>' +
+                    '<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--text-muted);">' +
+                      '<span>أول رصد: <span class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(it.firstSeenAt, ctx)) + '</span></span>' +
+                      '<span>آخر رصد: <span class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(it.lastSeenAt, ctx)) + '</span></span>' +
+                      '<span>آخر نجاح: <span class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(it.lastSuccessfulOperation, ctx)) + '</span></span>' +
+                    '</div>' +
+                    (it.suggestedFix ? ('<div style="font-size:11.5px;color:var(--text-secondary);"><strong>الإصلاح المقترح:</strong> ' + escapeHtml(it.suggestedFix) + '</div>') : '') +
+                  '</div>';
+                }).join('') +
+              '</div>';
+            }
+            return '<section class="rg-hc-section-card ' + (activeDigest.length ? 'is-warning' : 'is-healthy') + '" id="hc-error-digest-card" style="margin-bottom:14px;">' +
+              '<div class="rg-hc-section-head">' +
+                '<div>' +
+                  '<h4 class="rg-hc-section-title">تصنيف الأخطاء: نشطة vs تاريخية vs محلولة</h4>' +
+                  '<p class="rg-hc-section-sub">فصل الأعطال النشطة التي تمنع حالة Healthy عن السجلات التاريخية أو الأخطاء التي تلتها عمليات ناجحة.</p>' +
+                '</div>' +
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
+                  '<span class="rg-hc-status-badge ' + (activeDigest.length ? 'is-critical' : 'is-healthy') + '">نشطة: ' + activeDigest.length + '</span>' +
+                  '<span class="rg-hc-status-badge ' + (historicalDigest.length ? 'is-warning' : 'is-unknown') + '">تاريخية: ' + historicalDigest.length + '</span>' +
+                  '<span class="rg-hc-status-badge is-healthy">محلولة: ' + resolvedDigest.length + '</span>' +
+                '</div>' +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head"><span>أخطاء نشطة حالياً (' + activeDigest.length + ')</span></div>' +
+                renderDigestList(activeDigest, 'is-critical', 'لا توجد أخطاء نشطة في الفحص الحالي.') +
+              '</div>' +
+              (historicalDigest.length ? (
+                '<div class="rg-hc-subbox">' +
+                  '<div class="rg-hc-subbox-head"><span>أخطاء تاريخية (أقدم من 24 ساعة) (' + historicalDigest.length + ')</span></div>' +
+                  renderDigestList(historicalDigest, 'is-warning', '') +
+                '</div>'
+              ) : '') +
+              (resolvedDigest.length ? (
+                '<div class="rg-hc-subbox">' +
+                  '<div class="rg-hc-subbox-head"><span>أخطاء سابقة تم تجاوزها بنجاح لاحق (' + resolvedDigest.length + ')</span></div>' +
+                  renderDigestList(resolvedDigest, '', '') +
+                '</div>'
+              ) : '') +
+            '</section>';
+          })() +
+
           '<div class="rg-hc-sections-grid">' +
 
             // 1. Database Health
@@ -4210,6 +4283,7 @@
                 '</div>' +
               '</div>' +
               (dbH.probeError ? '<div class="rg-hc-alert-box"><div><strong>خطأ الاتصال/الفحص:</strong> ' + escapeHtml(dbH.probeError) + '</div></div>' : '') +
+              (dbH.recommendedAction ? '<div class="rg-hc-alert-box is-warning"><div><strong>الإجراء الموصى به:</strong> ' + escapeHtml(dbH.recommendedAction) + '</div></div>' : '') +
               ((dbH.queryErrors && dbH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>تعذر بعض استعلامات المراقبة:</strong> ' + escapeHtml(dbH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
               '<div class="rg-hc-kv-grid">' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">حالة الاتصال بـ Neon</span><span class="rg-hc-kv-v ' + (dbH.connected ? 'is-success' : 'is-danger') + '">' + (hasScanned && dbH.checkedAt ? (dbH.connected ? 'متصل' : 'غير متصل') : '-') + '</span></div>' +
@@ -4331,6 +4405,7 @@
                 '</div>' +
               '</div>' +
               (rgCmp.error ? '<div class="rg-hc-alert-box is-warning"><div><strong>تعذر مقارنة RG API الحية:</strong> ' + escapeHtml(rgCmp.error) + '</div></div>' : '') +
+              (diH.recommendedAction ? '<div class="rg-hc-alert-box is-warning"><div><strong>الإجراء الموصى به:</strong> ' + escapeHtml(diH.recommendedAction) + '</div></div>' : '') +
               ((diH.queryErrors && diH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>تحذير استعلامات سلامة البيانات:</strong> ' + escapeHtml(diH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
               '<div class="rg-hc-kv-grid">' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الحجوزات: RG API / Neon</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + (rgCmp.rgTotalCount !== null && rgCmp.rgTotalCount !== undefined ? rgCmp.rgTotalCount : 'غير مفحوص') + ' / ' + Number(diCounts.reservations || 0) + '</span></div>' +
@@ -4340,7 +4415,7 @@
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">اختلاف بيانات وحالات</span><span class="rg-hc-kv-v tabular-nums ' + (Number(rgCmp.mismatchedFieldsCount || 0) > 0 ? 'is-warning' : '') + '">' + (rgCmp.mismatchedFieldsCount !== null && rgCmp.mismatchedFieldsCount !== undefined ? rgCmp.mismatchedFieldsCount : '-') + '</span></div>' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">أرقام RG المتبادلة (#)</span><span class="rg-hc-kv-v tabular-nums ' + ((diAnom.swappedRgNumbers || []).length ? 'is-warning' : '') + '">' + Number((diAnom.swappedRgNumbers || []).length) + '</span></div>' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">التمديدات غير المرتبطة</span><span class="rg-hc-kv-v tabular-nums ' + (Number(diAnom.orphanExtensionsCount || 0) > 0 ? 'is-danger' : 'is-success') + '">' + Number(diAnom.orphanExtensionsCount || 0) + '</span></div>' +
-                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">سجلات العملاء غير المكتملة</span><span class="rg-hc-kv-v tabular-nums">هوية ' + Number(diIncCust.missingIdNumber || 0) + ' · جوال ' + Number(diIncCust.missingPhone || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">سجلات العملاء (جوال إلزامي / فجوات مصدر RG)</span><span class="rg-hc-kv-v tabular-nums">جوال مفقود ' + Number((diCustQual.required && diCustQual.required.missingPhone) || 0) + ' · اختياري (هوية ' + Number((diCustQual.optionalSourceGaps && diCustQual.optionalSourceGaps.missingIdNumber) || 0) + ' / بريد ' + Number((diCustQual.optionalSourceGaps && diCustQual.optionalSourceGaps.missingEmail) || 0) + ')</span></div>' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">العلاقات المكسورة بين الجداول</span><span class="rg-hc-kv-v tabular-nums ' + (orphanTotal > 0 ? 'is-danger' : 'is-success') + '">' + orphanTotal + '</span></div>' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">تعارض عداد التمديدات / الأعلام</span><span class="rg-hc-kv-v tabular-nums">' + Number((diAnom.extensionCountMismatches || []).length) + ' / ' + Number(diAnom.dualLifecycleFlagsCount || 0) + '</span></div>' +
               '</div>' +
@@ -4372,6 +4447,8 @@
                 '</div>' +
               '</div>' +
               ((syWorker && syWorker.lastError) ? '<div class="rg-hc-alert-box is-warning"><div><strong>آخر خطأ في عامل المزامنة:</strong> ' + escapeHtml(syWorker.lastError) + '</div></div>' : '') +
+              (syH.deploySkewWarning ? '<div class="rg-hc-alert-box is-warning"><div><strong>تنبيه توافق نشر Apps Script:</strong> ' + escapeHtml(syH.deploySkewWarning) + '</div></div>' : '') +
+              (syH.recommendedAction ? '<div class="rg-hc-alert-box is-warning"><div><strong>الإجراء الموصى به:</strong> ' + escapeHtml(syH.recommendedAction) + '</div></div>' : '') +
               ((syH.queryErrors && syH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>تحذير استعلام المزامنة:</strong> ' + escapeHtml(syH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
               '<div class="rg-hc-kv-grid">' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">حالة المزامنة الحالية</span><span class="rg-hc-kv-v">' + escapeHtml(syWorker ? (syWorker.isSyncing ? 'قيد التنفيذ' : syWorker.status) : 'غير متوفر') + '</span></div>' +
@@ -4382,6 +4459,37 @@
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الحجوزات المحدّثة / التمديدات</span><span class="rg-hc-kv-v tabular-nums">' + Number((syWorker && syWorker.lastUpdatedCount) || (syH.latestSync && syH.latestSync.updatedCount) || 0) + ' / ' + Number((syWorker && syWorker.lastExtensionsCount) || (syH.latestSync && syH.latestSync.extensionsCount) || 0) + '</span></div>' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Transactional Outbox (فاشلة)</span><span class="rg-hc-kv-v tabular-nums ' + (Number(syOutbox.failed || 0) > 0 ? 'is-danger' : 'is-success') + '">' + Number(syOutbox.failed || 0) + ' <span style="font-size:11px;font-weight:500;">(من ' + Number(syOutbox.total || 0) + ')</span></span></div>' +
                 '<div class="rg-hc-kv"><span class="rg-hc-kv-k">العمليات قيد الانتظار</span><span class="rg-hc-kv-v tabular-nums">' + (Number(syOutbox.pending || 0) + Number(syOutbox.retry || 0)) + ' <span style="font-size:11px;font-weight:500;">(مرسل ' + Number(syOutbox.sent || 0) + ')</span></span></div>' +
+                (function () {
+                  var rgLive = syLive.rentalGateAuth;
+                  var gasLive = syLive.gasMirrorAuth;
+                  var rgText = !syLive.checked || !rgLive
+                    ? 'لم يُختبر حياً'
+                    : (rgLive.authValid === true ? 'متصل وصالح' : (rgLive.authValid === false ? ('فشل: ' + (rgLive.message || '401')) : (rgLive.message || 'غير محدد')));
+                  var gasText = !syLive.checked || !gasLive
+                    ? 'لم يُختبر حياً'
+                    : (gasLive.authValid === true ? 'مطابق وصالح' : (gasLive.legacyGasScript ? 'نسخة GAS قديمة' : (gasLive.authValid === false ? ('غير متطابق: ' + (gasLive.message || '401')) : (gasLive.message || 'غير محدد'))));
+                  var rgCls = rgLive && rgLive.authValid === true ? 'is-success' : (rgLive && rgLive.authValid === false ? 'is-danger' : '');
+                  var gasCls = gasLive && gasLive.authValid === true ? 'is-success' : (gasLive && (gasLive.authValid === false || gasLive.legacyGasScript) ? 'is-danger' : '');
+                  return '<div class="rg-hc-kv"><span class="rg-hc-kv-k">اختبار مصادقة RG API الحي</span><span class="rg-hc-kv-v ' + rgCls + '" style="font-size:11.5px;">' + escapeHtml(rgText) + '</span></div>' +
+                    '<div class="rg-hc-kv"><span class="rg-hc-kv-k">اختبار مصادقة GAS الحي</span><span class="rg-hc-kv-v ' + gasCls + '" style="font-size:11.5px;">' + escapeHtml(gasText) + '</span></div>';
+                })() +
+                (function () {
+                  var rtd = syH.rgTokenDiagnostics || {};
+                  var ssd = syH.syncSecretDiagnostics || {};
+                  var rgNotes = [];
+                  if (rtd.hasQuotes) rgNotes.push('علامات اقتباس');
+                  if (rtd.hasWhitespace) rgNotes.push('مسافات');
+                  if (rtd.hasBearerPrefix) rgNotes.push('بادئة Bearer');
+                  var syncNotes = [];
+                  if (ssd.hasQuotes) syncNotes.push('علامات اقتباس');
+                  if (ssd.hasWhitespace || ssd.hasEnvWhitespace) syncNotes.push('مسافات');
+                  return '<div class="rg-hc-kv"><span class="rg-hc-kv-k">تشخيص RG_TOKEN (بدون كشف)</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' +
+                    (rtd.configured ? (escapeHtml(rtd.source || 'configured') + ' · len=' + Number(rtd.length || 0) + (rgNotes.length ? ' · ' + escapeHtml(rgNotes.join(', ')) : '')) : 'غير مهيأ') +
+                    '</span></div>' +
+                    '<div class="rg-hc-kv"><span class="rg-hc-kv-k">تشخيص SYNC_API_SECRET</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' +
+                    (ssd.configured ? (escapeHtml(ssd.source || 'configured') + ' · len=' + Number(ssd.length || 0) + (syncNotes.length ? ' · ' + escapeHtml(syncNotes.join(', ')) : '')) : 'غير مهيأ') +
+                    '</span></div>';
+                })() +
               '</div>' +
               '<div class="rg-hc-subbox">' +
                 '<div class="rg-hc-subbox-head"><span>آخر مزامنة ناجحة لكل مصدر</span></div>' +
@@ -4403,24 +4511,41 @@
               '</div>' +
               '<div class="rg-hc-subbox">' +
                 '<div class="rg-hc-subbox-head">' +
-                  '<span>أخطاء المزامنة وإعادة المحاولة الآمنة (تمنع تكرار البيانات)</span>' +
+                  '<span>أخطاء المزامنة وإعادة المعالجة التدريجية الآمنة (تمنع تكرار البيانات)</span>' +
                   '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-                    '<button type="button" class="btn btn-sm btn-primary hc-retry-sync-btn" data-mode="outbox_transient">إعادة محاولة Outbox المؤقتة</button>' +
+                    '<button type="button" class="btn btn-sm" id="hc-verify-gas-auth-btn">فحص مطابقة SYNC_API_SECRET مع GAS</button>' +
+                    '<button type="button" class="btn btn-sm btn-primary hc-retry-sync-btn" data-mode="outbox_batch">معالجة دفعة Outbox الآمنة (15)</button>' +
+                    '<button type="button" class="btn btn-sm hc-retry-sync-btn" data-mode="outbox_auth">إعادة معالجة أخطاء المصادقة (15)</button>' +
+                    '<button type="button" class="btn btn-sm hc-retry-sync-btn" data-mode="outbox_sheet_frozen">إعادة معالجة أخطاء الصفوف المجمدة (15)</button>' +
+                    '<button type="button" class="btn btn-sm hc-retry-sync-btn" data-mode="outbox_transient">إعادة محاولة Outbox المؤقتة</button>' +
                     '<button type="button" class="btn btn-sm hc-retry-sync-btn" data-mode="rg_missing_records">استعادة السجلات الناقصة من RG</button>' +
                   '</div>' +
                 '</div>' +
+                (syCatBreak.length
+                  ? '<div class="rg-hc-scroll-list" style="margin-bottom:8px;">' +
+                      syCatBreak.map(function (cb) {
+                        return '<div class="rg-hc-issue-row ' + (cb.category === 'transient' ? 'is-warning' : 'is-critical') + '">' +
+                          '<div style="display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;">' +
+                            '<strong>تصنيف Outbox: <span class="mono" dir="ltr">' + escapeHtml(cb.category || 'unknown') + '</span></strong>' +
+                            '<span class="tabular-nums">العدد: ' + Number(cb.count || 0) + ' · آخر محاولة: <span class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(cb.lastSeenAt, ctx)) + '</span></span>' +
+                          '</div>' +
+                          '<div class="mono" dir="ltr" style="font-size:11px;overflow-wrap:anywhere;">' + escapeHtml(cb.sampleError || '') + '</div>' +
+                        '</div>';
+                      }).join('') +
+                    '</div>'
+                  : '') +
                 (syErrBreak.length
                   ? '<div class="rg-hc-scroll-list">' +
                       syErrBreak.map(function (eb) {
                         return '<div class="rg-hc-issue-row ' + (eb.isTransient ? 'is-warning' : 'is-critical') + '">' +
-                          '<div style="display:flex;justify-content:space-between;gap:6px;"><strong>' + (eb.isTransient ? 'خطأ مؤقت قابل للإعادة' : 'خطأ صلاحيات/إعداد') + '</strong><span class="tabular-nums">العدد: ' + Number(eb.count || 0) + '</span></div>' +
+                          '<div style="display:flex;justify-content:space-between;gap:6px;"><strong>' + (eb.isTransient ? 'خطأ مؤقت قابل للإعادة' : 'خطأ صلاحيات/إعداد/ورقة') + '</strong><span class="tabular-nums">العدد: ' + Number(eb.count || 0) + '</span></div>' +
                           '<div class="mono" dir="ltr" style="font-size:11px;overflow-wrap:anywhere;">' + escapeHtml(eb.error || '') + '</div>' +
                         '</div>';
                       }).join('') +
                     '</div>'
                   : (syRecentErrs.length
                       ? '<div class="rg-hc-scroll-list">' + syRecentErrs.slice(0, 6).map(function (re) { return '<div class="rg-hc-issue-row is-warning"><span class="mono" dir="ltr">' + escapeHtml(re.entityType + ':' + re.entityId + ' — ' + re.error) + '</span></div>'; }).join('') + '</div>'
-                      : '<div style="font-size:12px;color:var(--text-muted);">لا توجد أخطاء Outbox فاشلة حالياً.</div>')) +
+                      : (!syCatBreak.length ? '<div style="font-size:12px;color:var(--text-muted);">لا توجد أخطاء Outbox فاشلة حالياً.</div>' : ''))) +
               '</div>' +
             '</section>' +
 
@@ -4546,11 +4671,28 @@
         });
       }
 
+      var verifyGasBtn = hostEl.querySelector('#hc-verify-gas-auth-btn');
+      if (verifyGasBtn) {
+        verifyGasBtn.addEventListener('click', function () {
+          runWithLock(verifyGasBtn, 'hc:verifyGasAuth', async function () {
+            var res = await root.RGApi.callApi('verifyGasMirrorAuth', {});
+            if (res && res.success && res.data) {
+              var d = res.data;
+              ctx.toast(d.message || (d.authValid ? 'تمت مطابقة SYNC_API_SECRET بنجاح.' : 'فشل التحقق من SYNC_API_SECRET.'), !(d.ok && d.authValid !== false));
+              loadHealthReport('', true);
+            } else {
+              ctx.toast((res && res.message) || 'تعذر اختبار مصادقة Google Apps Script.', true);
+            }
+          });
+        });
+      }
+
       hostEl.querySelectorAll('.hc-retry-sync-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var mode = btn.getAttribute('data-mode') || 'outbox_transient';
+          var batchLimit = (mode === 'outbox_batch' || mode === 'outbox_auth' || mode === 'outbox_sheet_frozen') ? 15 : 25;
           runWithLock(btn, 'hc:retry:' + mode, async function () {
-            var res = await root.RGApi.callApi('retryHealthCenterFailedSync', { mode: mode, limit: 25 });
+            var res = await root.RGApi.callApi('retryHealthCenterFailedSync', { mode: mode, limit: batchLimit });
             if (res && res.success) {
               ctx.toast(res.message || 'تمت إعادة محاولة العمليات الفاشلة بأمان.');
               loadHealthReport('', true);

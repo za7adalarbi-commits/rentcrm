@@ -380,6 +380,66 @@ export async function dispatchCrmRequest(
       case 'retryHealthCenterFailedSync':
         result = await healthCenter.retryHealthCenterFailedSync(executor, session, payload);
         break;
+      case 'verifyGasMirrorAuth':
+        result = await healthCenter.verifyGasMirrorAuthAction(executor, session);
+        break;
+      case 'getCustomers':
+        result = await queries.getCustomers(executor, session, payload);
+        break;
+      case 'getCustomerDetails':
+        result = await queries.getCustomerDetails(executor, session, payload);
+        break;
+      case 'createCustomer':
+        result = await queries.createCustomer(executor, session, payload);
+        break;
+      case 'updateCustomerProfile':
+        result = await queries.updateCustomerProfile(executor, session, payload);
+        break;
+      case 'getCustomerNotesConfig':
+        result = await queries.getCustomerNotesConfig(executor, session);
+        break;
+      case 'saveCustomerNotesConfig':
+        result = await queries.saveCustomerNotesConfig(executor, session, payload);
+        break;
+      case 'getCustomerNoteStatuses':
+        result = await queries.getCustomerNoteStatuses(executor, session);
+        break;
+      case 'saveCustomerNoteStatus':
+        result = await queries.saveCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'toggleCustomerNoteStatus':
+        result = await queries.toggleCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'deleteCustomerNoteStatus':
+        result = await queries.deleteCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'getCustomerNotes':
+        result = await queries.getCustomerNotes(executor, session, payload);
+        break;
+      case 'addCustomerNote':
+        result = await queries.addCustomerNote(executor, session, payload);
+        break;
+      case 'updateCustomerNote':
+        result = await queries.updateCustomerNote(executor, session, payload);
+        break;
+      case 'changeCustomerNoteStatus':
+        result = await queries.changeCustomerNoteStatus(executor, session, payload);
+        break;
+      case 'assignCustomerNoteEmployee':
+        result = await queries.assignCustomerNoteEmployee(executor, session, payload);
+        break;
+      case 'deleteCustomerNote':
+        result = await queries.deleteCustomerNote(executor, session, payload);
+        break;
+      case 'addCustomerNoteAttachment':
+        result = await queries.addCustomerNoteAttachment(executor, session, payload);
+        break;
+      case 'deleteCustomerNoteAttachment':
+        result = await queries.deleteCustomerNoteAttachment(executor, session, payload);
+        break;
+      case 'getCustomerNoteHistory':
+        result = await queries.getCustomerNoteHistory(executor, session, payload);
+        break;
       default:
         return {
           success: false,
@@ -453,7 +513,7 @@ export async function dispatchCrmRequest(
       success: false,
       message: msg,
       data: null,
-      error: isExpectedClientErr ? msg : errorCode
+      error: errorCode
     };
   }
 }

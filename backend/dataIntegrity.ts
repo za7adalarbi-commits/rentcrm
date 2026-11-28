@@ -1,7 +1,13 @@
 import { crmCore, generateId, requireApiAccess, type AuthSession } from './auth.js';
 import { ensureDbExecutor, runWithSavepoint, type DbExecutor } from './db.js';
 import { logBackendError } from './logger.js';
-import { buildRentalGateEndpointUrl, normalizeRgApiBaseUrl, resolveServerConfig } from './serverConfig.js';
+import {
+  buildRgAuthHeaders,
+  resolveSafeRgEndpointUrl,
+  rgFetchWithRetry,
+  validateRgToken
+} from './rgApiClient.js';
+import { normalizeRgApiBaseUrl, resolveServerConfig } from './serverConfig.js';
 import { extractRentalGatePagePayload } from './syncService.js';
 
 export type DataIntegrityScope = 'reservations' | 'extensions' | 'cancelled' | 'company_changes';
@@ -53,7 +59,7 @@ async function fetchRgEndpointAll(
   fetchFn: typeof fetch,
   pageSize = 200,
   maxPages = 80
-): Promise<{ items: any[]; ok: boolean; reportedTotal: number | null; error: string }> {
+): Promise<{ items: any[]; ok: boolean; reportedTotal: number | null; error: string; isAuthError?: boolean; httpStatus?: number }> {
   const items: any[] = [];
   const seenKeys = new Set<string>();
   let reportedTotal: number | null = null;
@@ -73,30 +79,26 @@ async function fetchRgEndpointAll(
 
   for (let iter = 0; iter < maxPages; iter++) {
     const pageNum = zeroBased ? iter : iter + 1;
-    let url = buildRentalGateEndpointUrl(normalizedBase, endpoint, { page: pageNum, size: pageSize });
+    let url = resolveSafeRgEndpointUrl(normalizedBase, endpoint, { page: pageNum, size: pageSize });
     if (nextUrlOverride) {
       url = nextUrlOverride;
     } else if (nextCursor) {
-      url = buildRentalGateEndpointUrl(normalizedBase, endpoint, { page: pageNum, size: pageSize, cursor: nextCursor });
+      url = resolveSafeRgEndpointUrl(normalizedBase, endpoint, { page: pageNum, size: pageSize, cursor: nextCursor });
     }
 
     let resp: Response | null = null;
     let lastErr: any = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        resp = await fetchFn(url, { method: 'GET', headers });
-        if (resp.status >= 500 && attempt === 0) {
-          await new Promise((r) => setTimeout(r, 200));
-          continue;
-        }
-        break;
-      } catch (err: any) {
-        lastErr = err;
-        if (attempt === 0) {
-          await new Promise((r) => setTimeout(r, 200));
-          continue;
-        }
-      }
+    try {
+      resp = await rgFetchWithRetry(url, {
+        fetchFn,
+        headers,
+        maxRetries: 2,
+        retryBaseDelayMs: 200,
+        timeoutMs: 20000,
+        endpointLabel: endpoint
+      });
+    } catch (err: any) {
+      lastErr = err;
     }
 
     if (!resp) {
@@ -104,8 +106,28 @@ async function fetchRgEndpointAll(
       return { items, ok: false, reportedTotal, error };
     }
     if (!resp.ok) {
+      if (resp.status === 401) {
+        return {
+          items,
+          ok: false,
+          reportedTotal,
+          error: 'RG_API_UNAUTHORIZED_401: توكن Rental Gate غير مصرح به أو منتهي الصلاحية (401)',
+          isAuthError: true,
+          httpStatus: 401
+        };
+      }
+      if (resp.status === 403) {
+        return {
+          items,
+          ok: false,
+          reportedTotal,
+          error: 'RG_API_FORBIDDEN_403: توكن Rental Gate مرفوض الصلاحية (403)',
+          isAuthError: true,
+          httpStatus: 403
+        };
+      }
       error = `HTTP_${resp.status}`;
-      return { items, ok: false, reportedTotal, error };
+      return { items, ok: false, reportedTotal, error, httpStatus: resp.status };
     }
 
     try {
@@ -136,11 +158,31 @@ async function fetchRgEndpointAll(
         const page2Num = 2;
         if (parsed.totalPages && page2Num > parsed.totalPages) break;
         if (reportedTotal !== null && items.length >= reportedTotal) break;
-        const p2Url = buildRentalGateEndpointUrl(normalizedBase, endpoint, { page: page2Num, size: pageSize });
-        const p2Resp = await fetchFn(p2Url, { method: 'GET', headers });
+        const p2Url = resolveSafeRgEndpointUrl(normalizedBase, endpoint, { page: page2Num, size: pageSize });
+        const p2Resp = await rgFetchWithRetry(p2Url, { fetchFn, headers, maxRetries: 2, timeoutMs: 20000, endpointLabel: endpoint });
         if (!p2Resp.ok) {
+          if (p2Resp.status === 401) {
+            return {
+              items,
+              ok: false,
+              reportedTotal,
+              error: 'RG_API_UNAUTHORIZED_401: توكن Rental Gate غير مصرح به أو منتهي الصلاحية (401)',
+              isAuthError: true,
+              httpStatus: 401
+            };
+          }
+          if (p2Resp.status === 403) {
+            return {
+              items,
+              ok: false,
+              reportedTotal,
+              error: 'RG_API_FORBIDDEN_403: توكن Rental Gate مرفوض الصلاحية (403)',
+              isAuthError: true,
+              httpStatus: 403
+            };
+          }
           error = `HTTP_${p2Resp.status}`;
-          return { items, ok: false, reportedTotal, error };
+          return { items, ok: false, reportedTotal, error, httpStatus: p2Resp.status };
         }
         const p2Json: any = await p2Resp.json();
         const p2Parsed = extractRentalGatePagePayload(p2Json, page2Num, pageSize);
@@ -311,8 +353,12 @@ export async function runDataIntegrityCheck(
 
   try {
     const cfg = await resolveServerConfig(safeExec);
-    const rgBaseUrl = str(cfg.rgApiBaseUrl).replace(/\/+$/, '');
-    const rgToken = str(cfg.rgToken).replace(/^Bearer\s+/i, '').trim();
+    const rgBaseUrl = normalizeRgApiBaseUrl(cfg.rgApiBaseUrl);
+    const tokenCheck = validateRgToken(cfg.rgToken);
+    if (str(cfg.rgToken) && !tokenCheck.valid && tokenCheck.reasonCode !== 'EMPTY') {
+      throw new Error(tokenCheck.message);
+    }
+    const rgToken = tokenCheck.valid ? tokenCheck.token : '';
 
     const dbResRows = await safeExec.query<{
       id: string;
@@ -385,11 +431,7 @@ export async function runDataIntegrityCheck(
     const scopeResults: Record<string, any> = {};
 
     if (rgBaseUrl && rgToken) {
-      const headers = {
-        Authorization: `Bearer ${rgToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      };
+      const headers = buildRgAuthHeaders(rgToken, { 'Content-Type': 'application/json' });
 
       const wantRes = scopes.includes('reservations');
       const wantExt = scopes.includes('extensions');
@@ -402,6 +444,11 @@ export async function runDataIntegrityCheck(
         wantCan ? fetchRgEndpointAll(rgBaseUrl, headers, 'admin/cancelled-reservations', fetchFn) : Promise.resolve(null),
         wantRcc ? fetchRgEndpointAll(rgBaseUrl, headers, 'reservation-company-changes/admin/filter', fetchFn) : Promise.resolve(null)
       ]);
+
+      const authFailed = [resOut, extOut, canOut, rccOut].find((o) => o && o.isAuthError);
+      if (authFailed) {
+        throw new Error(authFailed.error || 'RG_API_UNAUTHORIZED_401');
+      }
 
       if (resOut) {
         scopeResults.reservations = { ok: resOut.ok, count: resOut.items.length, reportedTotal: resOut.reportedTotal, error: resOut.error };
@@ -527,16 +574,16 @@ export async function runDataIntegrityCheck(
               if (existingOpenId) {
                 return tx.query(
                   `UPDATE data_integrity_issues
-                   SET run_id = $2,
-                       severity = $3,
-                       source_scope = $4,
-                       rg_value = $5,
-                       neon_value = $6,
+                   SET run_id = $2::text,
+                       severity = $3::text,
+                       source_scope = $4::text,
+                       rg_value = $5::text,
+                       neon_value = $6::text,
                        rg_snapshot_json = $7::jsonb,
                        neon_snapshot_json = $8::jsonb,
                        last_checked_at = NOW(),
                        updated_at = NOW()
-                   WHERE id = $1`,
+                   WHERE id = $1::text`,
                   [
                     existingOpenId,
                     runId,
@@ -557,8 +604,8 @@ export async function runDataIntegrityCheck(
                    source_scope, field_name, rg_value, neon_value, rg_snapshot_json, neon_snapshot_json,
                    resolution_status, last_checked_at, created_at, updated_at
                  ) VALUES (
-                   $1, $2, $3, $4, $5, $6,
-                   $7, $8, $9, $10, $11::jsonb, $12::jsonb,
+                   $1::text, $2::text, $3::text, $4::text, $5::text, $6::text,
+                   $7::text, $8::text, $9::text, $10::text, $11::jsonb, $12::jsonb,
                    'open', NOW(), NOW(), NOW()
                  )`,
                 [
@@ -584,15 +631,15 @@ export async function runDataIntegrityCheck(
 
       const updRes = await tx.query(
         `UPDATE data_integrity_runs
-         SET status = $2,
+         SET status = $2::text,
              finished_at = $3::timestamptz,
-             duration_ms = $4,
-             rg_total_count = $5,
-             neon_total_count = $6,
-             reviewed_count = $7,
-             discrepancies_count = $8,
+             duration_ms = $4::int,
+             rg_total_count = $5::int,
+             neon_total_count = $6::int,
+             reviewed_count = $7::int,
+             discrepancies_count = $8::int,
              summary_json = $9::jsonb
-         WHERE id = $1
+         WHERE id = $1::text
          RETURNING *`,
         [
           runId,
@@ -680,13 +727,13 @@ export async function resolveDataIntegrityIssue(
     }
     const updRes = await tx.query(
       `UPDATE data_integrity_issues
-       SET resolution_status = $2,
-           resolved_by_id = $3,
-           resolved_by_name = $4,
+       SET resolution_status = $2::text,
+           resolved_by_id = $3::text,
+           resolved_by_name = $4::text,
            resolved_at = NOW(),
-           resolution_note = $5,
+           resolution_note = $5::text,
            updated_at = NOW()
-       WHERE id = $1
+       WHERE id = $1::text
        RETURNING *`,
       [issueId, nextStatus, str(session.user.id), str(session.user.name || session.username), note]
     );
@@ -695,7 +742,7 @@ export async function resolveDataIntegrityIssue(
       `INSERT INTO data_integrity_actions (
          id, issue_id, run_id, reservation_id, reservation_number, action_type,
          before_snapshot_json, after_snapshot_json, actor_id, actor_name, created_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,NOW())`,
+       ) VALUES ($1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::jsonb,$8::jsonb,$9::text,$10::text,NOW())`,
       [
         generateId('DIA'),
         issueId,
