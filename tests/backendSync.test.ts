@@ -2653,7 +2653,8 @@ test('backend updateSettings supports minutes interval and deleteAllReservations
   assert.equal(db.state.extensions.length, 0);
   assert.equal(db.state.follow_ups.length, 0);
   assert.equal(db.state.assignments.length, 0);
-  assert.ok(db.state.sheets_mirror_outbox.some((m) => m.action === 'deleteAllReservations'));
+  assert.equal(okDel.data.sheetsMirrorProtected, true);
+  assert.equal(db.state.sheets_mirror_outbox.some((m) => m.action === 'deleteAllReservations'), false);
 });
 
 test('no SQL query in backend/ or api/ mixes inconsistent type casts for the same parameter placeholder', () => {

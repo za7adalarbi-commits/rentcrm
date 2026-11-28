@@ -368,7 +368,7 @@ test('Phase 2 & 6: GAS auth verification halts outbox batch on mismatch and pres
       requeued = true;
       return { rows: [{ id: 'OBX_1' }], rowCount: 1 };
     }
-    if (sql.includes("SET status = 'sent'")) {
+    if (sql.includes("SET status = 'completed'") || sql.includes("SET status = 'sent'")) {
       sentCount += 1;
       return { rows: [], rowCount: 1 };
     }

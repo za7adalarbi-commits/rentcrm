@@ -730,8 +730,16 @@ function migrateFollowUps_(sheet) {
     return idx.map(function (k) { return k >= 0 ? row[k] : ""; });
   });
 
-  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
-  sheet.clear();
+  var firstDataRow = Math.max(2, (typeof sheet.getFrozenRows === 'function' ? Number(sheet.getFrozenRows() || 0) : 1) + 1);
+  if (typeof ensureSheetCapacity_ === 'function') {
+    ensureSheetCapacity_(sheet, Math.max(firstDataRow, firstDataRow + out.length - 1), FU_HEADERS.length);
+  }
+  var maxRowsClear = Math.max(firstDataRow, sheet.getMaxRows());
+  var maxColsClear = Math.max(FU_HEADERS.length, sheet.getMaxColumns());
+  if (maxRowsClear >= firstDataRow) {
+    sheet.getRange(firstDataRow, 1, maxRowsClear - firstDataRow + 1, maxColsClear).clearDataValidations();
+    sheet.getRange(firstDataRow, 1, maxRowsClear - firstDataRow + 1, maxColsClear).clearContent();
+  }
   writeFuHeader_(sheet);
   if (out.length) {
     FU_TEXT_COLS.forEach(function (c) { sheet.getRange(2, c, out.length, 1).setNumberFormat("@"); });
@@ -962,14 +970,25 @@ function fetchBookingsFromAPI(customStartKey, opts) {
     });
 
     var dataSheet = ss.getSheetByName("Data") || ss.insertSheet("Data");
-    dataSheet.clearContents();
+    var dataFirstRow = Math.max(2, (typeof dataSheet.getFrozenRows === 'function' ? Number(dataSheet.getFrozenRows() || 0) : 1) + 1);
+    var reqDataRows = Math.max(dataFirstRow, dataFirstRow + rows.length - 1);
+    if (typeof ensureSheetCapacity_ === 'function') {
+      ensureSheetCapacity_(dataSheet, reqDataRows, DATA_HEADERS.length);
+    } else {
+      if (dataSheet.getMaxColumns() < DATA_HEADERS.length) dataSheet.insertColumnsAfter(dataSheet.getMaxColumns(), DATA_HEADERS.length - dataSheet.getMaxColumns());
+      if (dataSheet.getMaxRows() < reqDataRows) dataSheet.insertRowsAfter(dataSheet.getMaxRows(), reqDataRows - dataSheet.getMaxRows());
+    }
+    var existingDataLast = dataSheet.getLastRow();
+    if (existingDataLast >= dataFirstRow) {
+      dataSheet.getRange(dataFirstRow, 1, existingDataLast - dataFirstRow + 1, Math.max(dataSheet.getLastColumn(), DATA_HEADERS.length)).clearContent();
+    }
     dataSheet.getRange(1, 1, 1, DATA_HEADERS.length).setValues([DATA_HEADERS]).setFontWeight("bold");
     dataSheet.setFrozenRows(1);
     if (rows.length > 0) {
       [2, 3, 9, 10, 11, 12, 13].forEach(function (c) {
-        dataSheet.getRange(2, c, rows.length, 1).setNumberFormat("@");
+        dataSheet.getRange(dataFirstRow, c, rows.length, 1).setNumberFormat("@");
       });
-      dataSheet.getRange(2, 1, rows.length, DATA_HEADERS.length).setValues(rows);
+      dataSheet.getRange(dataFirstRow, 1, rows.length, DATA_HEADERS.length).setValues(rows);
     }
 
     var added = updateFollowUps_(ss, filtered);

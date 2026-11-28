@@ -210,7 +210,9 @@ function withScriptLock(fn) {
     }
   }
   var lock = LockService.getScriptLock();
-  var acquired = lock.tryLock(20000);
+  var acquired = typeof lock.tryLock === 'function'
+    ? lock.tryLock(20000)
+    : (typeof lock.waitLock === 'function' ? (lock.waitLock(20000), true) : true);
   if (!acquired) {
     throw new Error('النظام مشغول حالياً بمعالجة عملية متزامنة أخرى، يرجى المحاولة بعد ثوانٍ.');
   }
@@ -423,18 +425,68 @@ function styleHeaderRange(range) {
     .setFontWeight('bold');
 }
 
+function ensureSheetCapacity_(sheet, minRows, minCols) {
+  if (!sheet) return;
+  var curFrozen = (typeof sheet.getFrozenRows === 'function') ? Math.max(0, Number(sheet.getFrozenRows() || 0)) : 0;
+  var minSafeRows = Math.max(2, curFrozen + 1);
+  var reqRows = Math.max(minSafeRows, Number(minRows || 0));
+  var reqCols = Math.max(1, Number(minCols || 0));
+
+  if (typeof sheet.getMaxRows === 'function' && typeof sheet.insertRowsAfter === 'function') {
+    var curRows = Math.max(1, Number(sheet.getMaxRows() || 0));
+    if (curRows < reqRows) {
+      try {
+        sheet.insertRowsAfter(curRows, reqRows - curRows);
+      } catch (rowErr) {
+        var afterRows = Math.max(1, Number(sheet.getMaxRows() || 0));
+        if (afterRows < reqRows) {
+          throw new Error('SHEET_CAPACITY_ERROR: تعذر توسيع الصفوف إلى ' + reqRows + ' (' + (rowErr && rowErr.message ? rowErr.message : rowErr) + ')');
+        }
+      }
+    }
+  }
+  if (typeof sheet.getMaxColumns === 'function' && typeof sheet.insertColumnsAfter === 'function') {
+    var curCols = Math.max(1, Number(sheet.getMaxColumns() || 0));
+    if (curCols < reqCols) {
+      try {
+        sheet.insertColumnsAfter(curCols, reqCols - curCols);
+      } catch (colErr) {
+        var afterCols = Math.max(1, Number(sheet.getMaxColumns() || 0));
+        if (afterCols < reqCols) {
+          throw new Error('SHEET_CAPACITY_ERROR: تعذر توسيع الأعمدة إلى ' + reqCols + ' (' + (colErr && colErr.message ? colErr.message : colErr) + ')');
+        }
+      }
+    }
+  }
+  try {
+    if (typeof sheet.getFrozenRows === 'function' && typeof sheet.setFrozenRows === 'function') {
+      var frozen = Number(sheet.getFrozenRows() || 0);
+      var maxRowsNow = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || 2) : 2;
+      if (frozen < 1 && maxRowsNow >= 2) {
+        sheet.setFrozenRows(1);
+      }
+    }
+  } catch (frErr) {}
+}
+
 function ensureSheetSchemaColumns(sheet, expectedHeaders) {
   if (!expectedHeaders || expectedHeaders.length === 0) return expectedHeaders || [];
   var lastCol = sheet.getLastColumn();
   if (lastCol === 0 || sheet.getLastRow() === 0) {
+    ensureSheetCapacity_(sheet, 2, expectedHeaders.length);
     sheet.getRange(1, 1, 1, expectedHeaders.length).setValues([expectedHeaders]);
     styleHeaderRange(sheet.getRange(1, 1, 1, expectedHeaders.length));
-    sheet.setFrozenRows(1);
-    var initRows = Math.max(1, sheet.getMaxRows() - 1);
+    if (typeof sheet.setFrozenRows === 'function') {
+      var maxR0 = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || 2) : 2;
+      if (maxR0 >= 2) sheet.setFrozenRows(1);
+    }
+    var firstData0 = getSheetFirstDataRow_(sheet);
+    var maxRows0 = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || firstData0) : firstData0;
+    var initRows = Math.max(1, maxRows0 - firstData0 + 1);
     for (var dc = 0; dc < expectedHeaders.length; dc++) {
       var dh = expectedHeaders[dc];
       if (RG_DATE_ONLY_FIELDS[dh] || RG_TIME_ONLY_FIELDS[dh]) {
-        sheet.getRange(2, dc + 1, initRows, 1).setNumberFormat('@');
+        sheet.getRange(firstData0, dc + 1, initRows, 1).setNumberFormat('@');
       }
     }
     return expectedHeaders.slice();
@@ -453,13 +505,16 @@ function ensureSheetSchemaColumns(sheet, expectedHeaders) {
 
   if (missingHeaders.length > 0) {
     var startCol = existingHeaders.length + 1;
+    var firstDataM = getSheetFirstDataRow_(sheet);
+    ensureSheetCapacity_(sheet, firstDataM, existingHeaders.length + missingHeaders.length);
     sheet.getRange(1, startCol, 1, missingHeaders.length).setValues([missingHeaders]);
     styleHeaderRange(sheet.getRange(1, startCol, 1, missingHeaders.length));
-    var maxBodyRows = Math.max(1, sheet.getMaxRows() - 1);
+    var maxRowsM = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || firstDataM) : firstDataM;
+    var maxBodyRows = Math.max(1, maxRowsM - firstDataM + 1);
     for (var mc = 0; mc < missingHeaders.length; mc++) {
       var mh = missingHeaders[mc];
       if (RG_DATE_ONLY_FIELDS[mh] || RG_TIME_ONLY_FIELDS[mh]) {
-        sheet.getRange(2, startCol + mc, maxBodyRows, 1).setNumberFormat('@');
+        sheet.getRange(firstDataM, startCol + mc, maxBodyRows, 1).setNumberFormat('@');
       }
     }
     existingHeaders = existingHeaders.concat(missingHeaders);
@@ -671,6 +726,13 @@ function mapSheetValuesToRecords_(fileHeaders, bodyRows, ssTz, skipRawJson) {
   return records;
 }
 
+function getSheetFirstDataRow_(sheet) {
+  var frozen = (sheet && typeof sheet.getFrozenRows === 'function')
+    ? Math.max(0, Number(sheet.getFrozenRows() || 0))
+    : 1;
+  return Math.max(2, frozen + 1);
+}
+
 function readAllRecords(sheetName, skipCache, includeRawJson) {
   if (!skipCache) {
     if (_rgRecordsCache[sheetName]) {
@@ -685,17 +747,19 @@ function readAllRecords(sheetName, skipCache, includeRawJson) {
 
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var lastRow = sheet.getLastRow();
   var lastCol = sheet.getLastColumn();
-  if (lastRow <= 1 || lastCol === 0) {
+  if (lastRow < firstDataRow || lastCol === 0) {
     if (!skipCache) _rgRecordsCache[sheetName] = [];
     return [];
   }
 
-  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var bodyRows = sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, lastCol).getValues();
   var records = mapSheetValuesToRecords_(
-    values[0],
-    values.slice(1),
+    headerRow,
+    bodyRows,
     getSpreadsheetTz_(),
     sheetName === RG_SHEETS.RESERVATIONS && !includeRawJson
   );
@@ -724,18 +788,19 @@ function readRecentRecords_(sheetName, maxRows) {
 
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var lastRow = sheet.getLastRow();
   var lastCol = sheet.getLastColumn();
-  if (lastRow <= 1 || lastCol === 0) return [];
+  if (lastRow < firstDataRow || lastCol === 0) return [];
 
-  var totalDataRows = lastRow - 1;
+  var totalDataRows = lastRow - firstDataRow + 1;
   if (totalDataRows <= limit) {
     return readAllRecords(sheetName, false);
   }
 
-  var startRow = lastRow - limit + 1;
+  var startRow = Math.max(firstDataRow, lastRow - limit + 1);
   var headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-  var tailValues = sheet.getRange(startRow, 1, limit, lastCol).getValues();
+  var tailValues = sheet.getRange(startRow, 1, lastRow - startRow + 1, lastCol).getValues();
   return mapSheetValuesToRecords_(headerRow, tailValues, getSpreadsheetTz_(), false);
 }
 
@@ -833,13 +898,14 @@ function touchEmployeeActivityThrottled_(employeeId, isoNow) {
   var idIdx = headers.indexOf('id');
   var actIdx = headers.indexOf('lastActivity');
   if (idIdx === -1 || actIdx === -1) return;
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return;
-  var idVals = sheet.getRange(2, idIdx + 1, lastRow - 1, 1).getValues();
+  if (lastRow < firstDataRow) return;
+  var idVals = sheet.getRange(firstDataRow, idIdx + 1, lastRow - firstDataRow + 1, 1).getValues();
   var stamp = isoNow || nowIso();
   for (var r = 0; r < idVals.length; r++) {
     if (normalizeStr(idVals[r][0]) === eid) {
-      sheet.getRange(r + 2, actIdx + 1).setValue(stamp);
+      sheet.getRange(firstDataRow + r, actIdx + 1).setValue(stamp);
       if (_rgRecordsCache[RG_SHEETS.EMPLOYEES]) {
         var mem = _rgRecordsCache[RG_SHEETS.EMPLOYEES];
         for (var m = 0; m < mem.length; m++) {
@@ -858,9 +924,12 @@ function touchEmployeeActivityThrottled_(employeeId, isoNow) {
 function appendRecord(sheetName, recordObj) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var row = recordToRowArray(headers, recordObj);
-  var nextRow = Math.max(2, sheet.getLastRow() + 1);
+  var nextRow = Math.max(firstDataRow, sheet.getLastRow() + 1);
+  ensureSheetCapacity_(sheet, nextRow, headers.length);
+  applyTextFormatForDateColumns_(sheet, headers, nextRow, 1);
   sheet.getRange(nextRow, 1, 1, headers.length).setValues([row]);
   if (Array.isArray(_rgRecordsCache[sheetName])) {
     _rgRecordsCache[sheetName].push(cloneRecordForCache_(sheetName, recordObj));
@@ -876,12 +945,14 @@ function batchAppendRecords(sheetName, recordsList) {
   if (!Array.isArray(recordsList) || recordsList.length === 0) return 0;
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var rows = [];
   for (var i = 0; i < recordsList.length; i++) {
     rows.push(recordToRowArray(headers, recordsList[i]));
   }
-  var startRow = Math.max(2, sheet.getLastRow() + 1);
+  var startRow = Math.max(firstDataRow, sheet.getLastRow() + 1);
+  ensureSheetCapacity_(sheet, startRow + rows.length - 1, headers.length);
   applyTextFormatForDateColumns_(sheet, headers, startRow, rows.length);
   sheet.getRange(startRow, 1, rows.length, headers.length).setValues(rows);
   if (Array.isArray(_rgRecordsCache[sheetName])) {
@@ -899,19 +970,20 @@ function batchAppendRecords(sheetName, recordsList) {
 function updateRecordByKey(sheetName, keyField, keyValue, patchObj) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var keyIndex = headers.indexOf(keyField);
   if (keyIndex === -1) throw new Error('حقل المفتاح غير موجود: ' + keyField);
 
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return null;
+  if (lastRow < firstDataRow) return null;
 
-  var keyValues = sheet.getRange(2, keyIndex + 1, lastRow - 1, 1).getValues();
+  var keyValues = sheet.getRange(firstDataRow, keyIndex + 1, lastRow - firstDataRow + 1, 1).getValues();
   var target = normalizeStr(keyValue);
 
   for (var r = 0; r < keyValues.length; r++) {
     if (normalizeStr(keyValues[r][0]) === target) {
-      var rowNum = r + 2;
+      var rowNum = firstDataRow + r;
       var rowArr = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
       var updated = {};
       for (var c = 0; c < headers.length; c++) {
@@ -944,11 +1016,12 @@ function updateRecordByKey(sheetName, keyField, keyValue, patchObj) {
 function updateRecordsWhere_(sheetName, predicateFn, patchOrUpdaterFn) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return [];
+  if (lastRow < firstDataRow) return [];
 
-  var values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  var values = sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, headers.length).getValues();
   var ssTz = getSpreadsheetTz_();
   var minDirty = -1;
   var maxDirty = -1;
@@ -987,7 +1060,7 @@ function updateRecordsWhere_(sheetName, predicateFn, patchOrUpdaterFn) {
 
   if (minDirty !== -1) {
     var sliceCount = maxDirty - minDirty + 1;
-    sheet.getRange(minDirty + 2, 1, sliceCount, headers.length).setValues(values.slice(minDirty, maxDirty + 1));
+    sheet.getRange(firstDataRow + minDirty, 1, sliceCount, headers.length).setValues(values.slice(minDirty, maxDirty + 1));
     invalidateCache(sheetName, false);
   }
   return updatedRecords;
@@ -1013,8 +1086,9 @@ function normalizeCellForDiff_(cell, fieldName, ssTz) {
   return String(cell);
 }
 
-function writeDirtyRowSpans_(sheet, colCount, existingValues, dirtyIndices) {
+function writeDirtyRowSpans_(sheet, colCount, existingValues, dirtyIndices, firstDataRow) {
   if (!dirtyIndices || dirtyIndices.length === 0) return;
+  var baseRow = firstDataRow || getSheetFirstDataRow_(sheet);
   dirtyIndices.sort(function (a, b) { return a - b; });
 
   var spans = [];
@@ -1037,7 +1111,7 @@ function writeDirtyRowSpans_(sheet, colCount, existingValues, dirtyIndices) {
   for (var s = 0; s < spans.length; s++) {
     var a = spans[s][0];
     var b = spans[s][1];
-    sheet.getRange(a + 2, 1, b - a + 1, colCount).setValues(existingValues.slice(a, b + 1));
+    sheet.getRange(a + baseRow, 1, b - a + 1, colCount).setValues(existingValues.slice(a, b + 1));
   }
 }
 
@@ -1048,6 +1122,7 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
 
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var keyIndex = headers.indexOf(keyField);
   if (keyIndex === -1) throw new Error('حقل المفتاح غير موجود: ' + keyField);
@@ -1055,7 +1130,9 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
   var ignoreDiff = (options && options.ignoreDiffKeys) || null;
   var ssTz = getSpreadsheetTz_();
   var lastRow = sheet.getLastRow();
-  var existingValues = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, headers.length).getValues() : [];
+  var existingValues = lastRow >= firstDataRow
+    ? sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, headers.length).getValues()
+    : [];
   var rowIndexByKey = {};
   for (var r = 0; r < existingValues.length; r++) {
     var k = normalizeStr(existingValues[r][keyIndex]);
@@ -1073,7 +1150,19 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
 
     if (Object.prototype.hasOwnProperty.call(rowIndexByKey, keyVal)) {
       var targetIdx = rowIndexByKey[keyVal];
-      if (targetIdx >= existingValues.length) continue;
+      if (targetIdx >= existingValues.length) {
+        var insOffset = targetIdx - existingValues.length;
+        if (insOffset >= 0 && insOffset < insertedRows.length) {
+          var pendingRow = insertedRows[insOffset];
+          for (var pc = 0; pc < headers.length; pc++) {
+            var ph = headers[pc];
+            if (Object.prototype.hasOwnProperty.call(rec, ph)) {
+              pendingRow[pc] = rec[ph] !== undefined && rec[ph] !== null ? rec[ph] : '';
+            }
+          }
+        }
+        continue;
+      }
       var targetRow = existingValues[targetIdx];
       var rowChanged = false;
       for (var c = 0; c < headers.length; c++) {
@@ -1103,10 +1192,12 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
   }
 
   if (dirtyIndices.length > 0 && existingValues.length > 0) {
-    writeDirtyRowSpans_(sheet, headers.length, existingValues, dirtyIndices);
+    ensureSheetCapacity_(sheet, firstDataRow + existingValues.length - 1, headers.length);
+    writeDirtyRowSpans_(sheet, headers.length, existingValues, dirtyIndices, firstDataRow);
   }
   if (insertedRows.length > 0) {
-    var appendStart = existingValues.length + 2;
+    var appendStart = existingValues.length + firstDataRow;
+    ensureSheetCapacity_(sheet, appendStart + insertedRows.length - 1, headers.length);
     applyTextFormatForDateColumns_(sheet, headers, appendStart, insertedRows.length);
     sheet.getRange(appendStart, 1, insertedRows.length, headers.length).setValues(insertedRows);
   }
@@ -1121,96 +1212,153 @@ function batchUpsertRecords(sheetName, keyField, recordsList, options) {
 }
 
 function safeDeleteSheetRows_(sheet, startRow, numRows) {
-  if (!sheet || !numRows || numRows <= 0) return;
-  var frozen = typeof sheet.getFrozenRows === 'function' ? Math.max(0, Number(sheet.getFrozenRows() || 0)) : 1;
-  var minKeepRow = frozen + 1;
+  // Strictly non-destructive: NEVER call deleteRow / deleteRows so frozen rows, headers,
+  // conditional formatting, and active Sheet filters can never throw "delete all non-frozen rows".
+  if (!sheet || !numRows || numRows <= 0) return true;
+  var minKeepRow = getSheetFirstDataRow_(sheet);
   var safeStart = Math.max(minKeepRow, Number(startRow || minKeepRow));
-  var maxRows = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || 0) : Number(sheet.getLastRow() || 0);
   var lastRow = Number(sheet.getLastRow() || 0);
   var colCount = Math.max(1, Number(sheet.getLastColumn() || 1));
-  if (maxRows <= 0) maxRows = Math.max(lastRow, safeStart + numRows - 1);
 
-  // Always clear content/notes safely first so caller semantics succeed even if physical row deletion is blocked
+  if (lastRow < minKeepRow || safeStart > lastRow) {
+    return true;
+  }
+
   var clearCount = Math.min(numRows, Math.max(0, lastRow - safeStart + 1));
-  if (clearCount > 0 && typeof sheet.getRange === 'function') {
-    var clearedRange = sheet.getRange(safeStart, 1, clearCount, colCount);
-    if (typeof clearedRange.clearContent === 'function') clearedRange.clearContent();
-    if (typeof clearedRange.clearNote === 'function') clearedRange.clearNote();
-  }
+  if (clearCount <= 0) return true;
 
-  // Never delete rows that would leave <= frozen rows in the sheet (keep >= 1 non-frozen row)
-  var maxDeletable = Math.max(0, maxRows - minKeepRow);
-  if (maxDeletable <= 0) {
-    return;
-  }
-
-  var delStart = Math.max(minKeepRow + 1, safeStart);
-  var availableFromStart = Math.max(0, maxRows - delStart + 1);
-  var delCount = Math.min(numRows, maxDeletable, availableFromStart);
-  if (delCount <= 0) {
-    return;
-  }
-
-  try {
-    if (delCount === 1 && typeof sheet.deleteRow === 'function') {
-      sheet.deleteRow(delStart);
-    } else if (typeof sheet.deleteRows === 'function') {
-      sheet.deleteRows(delStart, delCount);
+  var totalDataRows = lastRow - minKeepRow + 1;
+  if (totalDataRows > clearCount && typeof sheet.getRange === 'function') {
+    var relStart = safeStart - minKeepRow;
+    var allValues = sheet.getRange(minKeepRow, 1, totalDataRows, colCount).getValues();
+    var keptRows = [];
+    for (var r = 0; r < allValues.length; r++) {
+      if (r < relStart || r >= relStart + clearCount) {
+        keptRows.push(allValues[r]);
+      }
     }
-  } catch (delErr) {
-    var msg = String(delErr && delErr.message ? delErr.message : delErr);
-    if (/non-frozen|delete all/i.test(msg)) {
-      // Content is already cleared safely above; never crash mirror sync over sheet minimum-row constraints
-      return;
+    var fullDataRange = sheet.getRange(minKeepRow, 1, totalDataRows, colCount);
+    if (typeof fullDataRange.clearContent === 'function') fullDataRange.clearContent();
+    if (typeof fullDataRange.clearNote === 'function') fullDataRange.clearNote();
+    if (keptRows.length > 0) {
+      ensureSheetCapacity_(sheet, minKeepRow + keptRows.length - 1, colCount);
+      sheet.getRange(minKeepRow, 1, keptRows.length, colCount).setValues(keptRows);
     }
-    throw delErr;
+    return true;
   }
+
+  var clearedRange = sheet.getRange(safeStart, 1, clearCount, colCount);
+  if (typeof clearedRange.clearContent === 'function') clearedRange.clearContent();
+  if (typeof clearedRange.clearNote === 'function') clearedRange.clearNote();
+  return true;
+}
+
+function deleteRecordsWhere_(sheetName, predicateFn) {
+  var ss = getSpreadsheet();
+  var sheet = getSheetOrCreate(ss, sheetName);
+  var headers = getEffectiveHeaders(sheet, sheetName);
+  var lastRow = sheet.getLastRow();
+  var firstDataRow = getSheetFirstDataRow_(sheet);
+  if (lastRow < firstDataRow) return 0;
+
+  var values = sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, headers.length).getValues();
+  var ssTz = getSpreadsheetTz_();
+  var matchIndices = [];
+  var keptRows = [];
+
+  for (var r = 0; r < values.length; r++) {
+    var row = values[r];
+    var obj = {};
+    for (var c = 0; c < headers.length; c++) {
+      var h = headers[c];
+      var cell = row[c];
+      if (cell instanceof Date) {
+        if (RG_DATE_ONLY_FIELDS[h]) obj[h] = formatCellDateFast_(cell, ssTz, 'date');
+        else if (RG_TIME_ONLY_FIELDS[h]) obj[h] = formatCellDateFast_(cell, ssTz, 'time');
+        else obj[h] = cell.toISOString();
+      } else {
+        obj[h] = cell;
+      }
+    }
+    if (predicateFn(obj)) {
+      matchIndices.push(r);
+    } else {
+      keptRows.push(row);
+    }
+  }
+
+  if (matchIndices.length === 0) return 0;
+  if (keptRows.length === 0) {
+    clearSheetRecords(sheetName);
+    return matchIndices.length;
+  }
+
+  // Safely compact kept rows & clearContent on vacated tail without deleting frozen/all non-frozen rows or breaking filters
+  var dataRange = sheet.getRange(firstDataRow, 1, values.length, headers.length);
+  if (typeof dataRange.clearContent === 'function') dataRange.clearContent();
+  if (typeof dataRange.clearNote === 'function') dataRange.clearNote();
+  ensureSheetCapacity_(sheet, firstDataRow + keptRows.length - 1, headers.length);
+  sheet.getRange(firstDataRow, 1, keptRows.length, headers.length).setValues(keptRows);
+  invalidateCache(sheetName, false);
+  return matchIndices.length;
 }
 
 function deleteRecordByKey(sheetName, keyField, keyValue) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
+  var firstDataRow = getSheetFirstDataRow_(sheet);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var keyIndex = headers.indexOf(keyField);
   if (keyIndex === -1) return false;
 
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return false;
+  if (lastRow < firstDataRow) return false;
 
-  var keyValues = sheet.getRange(2, keyIndex + 1, lastRow - 1, 1).getValues();
+  var values = sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, headers.length).getValues();
   var target = normalizeStr(keyValue);
+  var keptRows = [];
+  var removed = false;
 
-  for (var r = keyValues.length - 1; r >= 0; r--) {
-    if (normalizeStr(keyValues[r][0]) === target) {
-      safeDeleteSheetRows_(sheet, r + 2, 1);
-      if (Array.isArray(_rgRecordsCache[sheetName])) {
-        _rgRecordsCache[sheetName] = _rgRecordsCache[sheetName].filter(function (rec) {
-          return normalizeStr(rec[keyField]) !== target;
-        });
-        if (RG_HOT_PERSIST_CACHE_SHEETS[sheetName]) _rgDirtyCacheSheets[sheetName] = true;
-        invalidateCache(sheetName, true);
-      } else {
-        invalidateCache(sheetName, false);
-      }
-      return true;
+  for (var r = 0; r < values.length; r++) {
+    if (normalizeStr(values[r][keyIndex]) === target) {
+      removed = true;
+    } else {
+      keptRows.push(values[r]);
     }
   }
-  return false;
+  if (!removed) return false;
+
+  var dataRange = sheet.getRange(firstDataRow, 1, values.length, headers.length);
+  if (typeof dataRange.clearContent === 'function') dataRange.clearContent();
+  if (typeof dataRange.clearNote === 'function') dataRange.clearNote();
+  if (keptRows.length > 0) {
+    ensureSheetCapacity_(sheet, firstDataRow + keptRows.length - 1, headers.length);
+    sheet.getRange(firstDataRow, 1, keptRows.length, headers.length).setValues(keptRows);
+  }
+
+  if (Array.isArray(_rgRecordsCache[sheetName])) {
+    _rgRecordsCache[sheetName] = _rgRecordsCache[sheetName].filter(function (rec) {
+      return normalizeStr(rec[keyField]) !== target;
+    });
+    if (RG_HOT_PERSIST_CACHE_SHEETS[sheetName]) _rgDirtyCacheSheets[sheetName] = true;
+    invalidateCache(sheetName, true);
+  } else {
+    invalidateCache(sheetName, false);
+  }
+  return true;
 }
 
 function clearSheetRecords(sheetName) {
   var ss = getSpreadsheet();
   var sheet = getSheetOrCreate(ss, sheetName);
   var lastRow = sheet.getLastRow();
-  var removedCount = Math.max(0, lastRow - 1);
-  if (lastRow > 1) {
+  var firstDataRow = getSheetFirstDataRow_(sheet);
+  var removedCount = Math.max(0, lastRow - firstDataRow + 1);
+  if (lastRow >= firstDataRow) {
     var colCount = Math.max(1, sheet.getLastColumn());
-    sheet.getRange(2, 1, lastRow - 1, colCount).clearContent().clearNote();
-    var frozen = typeof sheet.getFrozenRows === 'function' ? Number(sheet.getFrozenRows() || 0) : 1;
-    var keepDataRow = Math.max(2, frozen + 1);
-    if (lastRow > keepDataRow) {
-      safeDeleteSheetRows_(sheet, keepDataRow + 1, lastRow - keepDataRow);
-    }
+    var clearedRange = sheet.getRange(firstDataRow, 1, removedCount, colCount);
+    if (typeof clearedRange.clearContent === 'function') clearedRange.clearContent();
+    if (typeof clearedRange.clearNote === 'function') clearedRange.clearNote();
   }
   if (Array.isArray(_rgRecordsCache[sheetName])) {
     _rgRecordsCache[sheetName] = [];

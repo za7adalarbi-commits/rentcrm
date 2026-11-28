@@ -565,7 +565,7 @@ function createAutoSyncMockExecutor(): DbExecutor & {
       return { rows: [], rowCount: 1 };
     }
 
-    if (sql.startsWith("UPDATE sheets_mirror_outbox SET status = 'sent'") || sql.startsWith("UPDATE sheets_mirror_outbox SET attempts")) {
+    if (sql.startsWith("UPDATE sheets_mirror_outbox SET status = 'completed'") || sql.startsWith("UPDATE sheets_mirror_outbox SET status = 'sent'") || sql.startsWith("UPDATE sheets_mirror_outbox SET attempts")) {
       return { rows: [], rowCount: 0 };
     }
 

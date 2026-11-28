@@ -400,9 +400,15 @@ CREATE TABLE IF NOT EXISTS sheets_mirror_outbox (
   next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   locked_at TIMESTAMPTZ DEFAULT NULL,
   worker_id TEXT NOT NULL DEFAULT '',
+  correlation_id TEXT NOT NULL DEFAULT '',
+  batch_id TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   error_category TEXT NOT NULL DEFAULT '',
   last_attempt_at TIMESTAMPTZ DEFAULT NULL,
+  started_at TIMESTAMPTZ DEFAULT NULL,
+  finished_at TIMESTAMPTZ DEFAULT NULL,
+  last_success_at TIMESTAMPTZ DEFAULT NULL,
+  last_error_details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   error_history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -848,4 +854,150 @@ CREATE INDEX IF NOT EXISTS idx_data_integrity_issues_run ON data_integrity_issue
 CREATE INDEX IF NOT EXISTS idx_error_logs_created ON error_logs (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sync_log_started ON sync_log (started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sheets_outbox_idempotency_key ON sheets_mirror_outbox (idempotency_key) WHERE COALESCE(idempotency_key, '') <> '';
+CREATE INDEX IF NOT EXISTS idx_sheets_outbox_corr_id ON sheets_mirror_outbox (correlation_id) WHERE COALESCE(correlation_id, '') <> '';
+
+-- 32. Knowledge Base: Rental Companies
+CREATE TABLE IF NOT EXISTS kb_companies (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  normalized_name TEXT NOT NULL DEFAULT '',
+  logo_url TEXT NOT NULL DEFAULT '',
+  short_description TEXT NOT NULL DEFAULT '',
+  images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  phone TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  website TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  cities_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  service_types_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  internal_notes TEXT NOT NULL DEFAULT '',
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  updated_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 33. Knowledge Base: Company Branches & Locations
+CREATE TABLE IF NOT EXISTS kb_branches (
+  id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES kb_companies(id) ON DELETE CASCADE,
+  branch_name TEXT NOT NULL DEFAULT '',
+  normalized_key TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL DEFAULT '',
+  district TEXT NOT NULL DEFAULT '',
+  full_address TEXT NOT NULL DEFAULT '',
+  google_maps_url TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  working_hours TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  services_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  notes TEXT NOT NULL DEFAULT '',
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  updated_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 34. Knowledge Base: Policies & Terms
+CREATE TABLE IF NOT EXISTS kb_policies (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  normalized_key TEXT NOT NULL DEFAULT '',
+  description_html TEXT NOT NULL DEFAULT '',
+  description_text TEXT NOT NULL DEFAULT '',
+  section_key TEXT NOT NULL DEFAULT 'rental_gate_policies',
+  category TEXT NOT NULL DEFAULT 'rental_gate',
+  company_id TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL DEFAULT '',
+  keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  attachments_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  publish_status TEXT NOT NULL DEFAULT 'published',
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  search_hit_count INTEGER NOT NULL DEFAULT 0,
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  updated_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 35. Knowledge Base: Frequently Asked Questions
+CREATE TABLE IF NOT EXISTS kb_faqs (
+  id TEXT PRIMARY KEY,
+  question TEXT NOT NULL DEFAULT '',
+  normalized_key TEXT NOT NULL DEFAULT '',
+  answer_html TEXT NOT NULL DEFAULT '',
+  answer_text TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'general',
+  company_id TEXT NOT NULL DEFAULT '',
+  keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  publish_status TEXT NOT NULL DEFAULT 'published',
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  search_hit_count INTEGER NOT NULL DEFAULT 0,
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  updated_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 36. Knowledge Base: Quick Replies Templates
+CREATE TABLE IF NOT EXISTS kb_quick_replies (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  normalized_key TEXT NOT NULL DEFAULT '',
+  message_text TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'greeting',
+  keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  language TEXT NOT NULL DEFAULT 'ar',
+  company_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  created_by_id TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  updated_by_name TEXT NOT NULL DEFAULT '',
+  deleted_at TIMESTAMPTZ DEFAULT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 37. Knowledge Base: Revision & Backup Audit History
+CREATE TABLE IF NOT EXISTS kb_revisions (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL DEFAULT '',
+  entity_id TEXT NOT NULL DEFAULT '',
+  action_type TEXT NOT NULL DEFAULT '',
+  title_snapshot TEXT NOT NULL DEFAULT '',
+  before_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  after_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_companies_norm_name_active ON kb_companies (normalized_name) WHERE deleted_at IS NULL AND normalized_name <> '';
+CREATE INDEX IF NOT EXISTS idx_kb_companies_status_upd ON kb_companies (status, updated_at DESC) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_branches_norm_key_active ON kb_branches (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> '';
+CREATE INDEX IF NOT EXISTS idx_kb_branches_company_city ON kb_branches (company_id, city, status) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_policies_norm_key_active ON kb_policies (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> '';
+CREATE INDEX IF NOT EXISTS idx_kb_policies_sec_cat ON kb_policies (section_key, category, publish_status, updated_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_kb_policies_company ON kb_policies (company_id, city) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_faqs_norm_key_active ON kb_faqs (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> '';
+CREATE INDEX IF NOT EXISTS idx_kb_faqs_cat_usage ON kb_faqs (category, publish_status, usage_count DESC, updated_at DESC) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_quick_replies_norm_key_active ON kb_quick_replies (normalized_key) WHERE deleted_at IS NULL AND normalized_key <> '';
+CREATE INDEX IF NOT EXISTS idx_kb_quick_replies_cat_lang ON kb_quick_replies (category, language, status, usage_count DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_kb_revisions_entity_created ON kb_revisions (entity_type, entity_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kb_revisions_created ON kb_revisions (created_at DESC);
+
 

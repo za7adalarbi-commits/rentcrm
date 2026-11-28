@@ -929,7 +929,7 @@ test('7. Outbox worker classifies transient vs permanent errors, claims chronolo
       claimSql = sql;
       return { rows: outboxRows, rowCount: outboxRows.length };
     }
-    if (sql.includes("SET status = 'sent'") && sql.includes('synced_at = NOW()')) {
+    if ((sql.includes("SET status = 'completed'") || sql.includes("SET status = 'sent'")) && sql.includes('synced_at = NOW()')) {
       updates.push({ kind: 'sent', ids: params[0] });
       return { rows: [], rowCount: 2 };
     }
@@ -951,7 +951,7 @@ test('7. Outbox worker classifies transient vs permanent errors, claims chronolo
   assert.ok(updates.every((u) => u.kind === 'error' && u.status === 'retry' && u.retryCount === 1));
   assert.match(claimSql, /NOT EXISTS\s*\(/i, 'Claim query must enforce per-entity FIFO ordering');
 
-  // Case 2: Permanent UNAUTHORIZED -> moves straight to terminal 'failed'
+  // Case 2: Permanent UNAUTHORIZED -> moves straight to terminal 'dead_letter'
   updates.length = 0;
   const resPerm = await flushSheetsMirrorOutbox(mockExec, async () => ({
     ok: true,
@@ -959,7 +959,7 @@ test('7. Outbox worker classifies transient vs permanent errors, claims chronolo
     async text() { return JSON.stringify({ success: false, message: 'UNAUTHORIZED: SYNC_API_SECRET mismatch' }); }
   } as any));
   assert.equal(resPerm.permanentFailed, 2);
-  assert.ok(updates.every((u) => u.kind === 'error' && u.status === 'failed'));
+  assert.ok(updates.every((u) => u.kind === 'error' && (u.status === 'dead_letter' || u.status === 'failed')));
 
   // Case 3: Success -> marks 'sent' with synced_at
   updates.length = 0;

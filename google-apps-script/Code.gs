@@ -13,15 +13,39 @@ function doPost(e) {
 function handleApiRequest(e, method) {
   try {
     var params = (e && e.parameter) ? e.parameter : {};
+    var rawPostContents = (method === 'POST' && e && e.postData && e.postData.contents) ? String(e.postData.contents) : '';
+    if (rawPostContents && rawPostContents.charCodeAt(0) === 0xFEFF) {
+      rawPostContents = rawPostContents.slice(1);
+    }
     var body = {};
-    if (method === 'POST' && e && e.postData && e.postData.contents) {
-      body = safeJsonParse(e.postData.contents, {});
+    if (rawPostContents) {
+      body = safeJsonParse(rawPostContents, {});
     }
 
     var action = normalizeStr(body.action || params.action);
     var token = normalizeStr(body.token || params.token);
     var rawPayload = body.payload !== undefined ? body.payload : (params.payload !== undefined ? params.payload : params);
     var payload = typeof rawPayload === 'string' ? safeJsonParse(rawPayload, {}) : (rawPayload || {});
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      payload = {};
+    }
+
+    var secretSourceLoc = 'none';
+    if (payload.syncSecret !== undefined && payload.syncSecret !== null && String(payload.syncSecret) !== '') {
+      secretSourceLoc = 'payload.syncSecret';
+    } else if (body.syncSecret !== undefined && body.syncSecret !== null && String(body.syncSecret) !== '') {
+      payload = Object.assign({}, payload, { syncSecret: body.syncSecret });
+      secretSourceLoc = 'body.syncSecret';
+    } else if (params.syncSecret !== undefined && params.syncSecret !== null && String(params.syncSecret) !== '') {
+      payload = Object.assign({}, payload, { syncSecret: params.syncSecret });
+      secretSourceLoc = 'params.syncSecret';
+    }
+    var reqMeta = {
+      requestMethod: method || 'GET',
+      parsedPostBody: Boolean(rawPostContents && body && typeof body === 'object' && Object.keys(body).length > 0),
+      receivedVia: secretSourceLoc,
+      correlationId: normalizeStr(payload.correlationId || body.correlationId || params.correlationId || '')
+    };
 
     if (!action || action === 'ping') {
       return jsonResponse(true, 'RENTAL GATE CRM API متصل ويعمل بنجاح.', {
@@ -37,20 +61,31 @@ function handleApiRequest(e, method) {
     }
 
     if (action === 'syncFromNeonMirror') {
-      var mirrorRes = handleNeonMirrorSync_(payload);
+      var mirrorRes = handleNeonMirrorSync_(payload, reqMeta);
       flushDirtyScriptCaches_();
       return jsonResponse(true, 'تم تحديث نسخة Google Sheets الاحتياطية.', mirrorRes);
     }
 
     if (action === 'triggerNeonIncrementalSync') {
-      var trigRes = handleTriggerNeonIncrementalSync_(payload);
+      var trigRes = handleTriggerNeonIncrementalSync_(payload, reqMeta);
       flushDirtyScriptCaches_();
       return jsonResponse(true, 'تم تنفيذ السحب والمزامنة السحابية.', trigRes);
     }
 
     if (action === 'verifyMirrorAuth') {
-      var authRes = handleVerifyMirrorAuth_(payload);
-      return jsonResponse(true, 'تم التحقق من مطابقة SYNC_API_SECRET بنجاح.', authRes);
+      var authRes = handleVerifyMirrorAuth_(payload, reqMeta);
+      return jsonResponse(true, 'تم التحقق من مطابقة مفتاح المزامنة بنجاح.', authRes);
+    }
+
+    if (action === 'verifyOutboxReceipt') {
+      var rcRes = handleVerifyOutboxReceipt_(payload, reqMeta);
+      return jsonResponse(true, 'تم فحص إيصالات التنفيذ في Google Apps Script.', rcRes);
+    }
+
+    if (action === 'verifyFrozenRowsProtection') {
+      var frRes = handleVerifyFrozenRowsProtection_(payload, reqMeta);
+      flushDirtyScriptCaches_();
+      return jsonResponse(true, 'تم التحقق الفعلي من حماية الصفوف المجمدة في Google Sheets.', frRes);
     }
 
     if (action === 'autoBindFromServer') {
@@ -283,7 +318,8 @@ function handleApiRequest(e, method) {
     flushDirtyScriptCaches_();
     return jsonResponse(true, 'تمت العملية بنجاح.', result, null);
   } catch (err) {
-    return jsonResponse(false, err.message || 'حدث خطأ غير متوقع.', null, err.message || String(err));
+    var safeErrData = (err && err.safeData && typeof err.safeData === 'object') ? err.safeData : null;
+    return jsonResponse(false, err.message || 'حدث خطأ غير متوقع.', safeErrData, err.message || String(err));
   }
 }
 

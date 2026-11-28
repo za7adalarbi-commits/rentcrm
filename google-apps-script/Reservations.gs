@@ -753,9 +753,12 @@ function deleteRecordsWhere_(sheetName, predicateFn) {
   var sheet = getSheetOrCreate(ss, sheetName);
   var headers = getEffectiveHeaders(sheet, sheetName);
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return 0;
+  var firstDataRow = (typeof getSheetFirstDataRow_ === 'function')
+    ? getSheetFirstDataRow_(sheet)
+    : Math.max(2, (typeof sheet.getFrozenRows === 'function' ? Math.max(0, Number(sheet.getFrozenRows() || 0)) : 1) + 1);
+  if (lastRow < firstDataRow) return 0;
 
-  var values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  var values = sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, headers.length).getValues();
   var ssTz = getSpreadsheetTz_();
   var matchIndices = [];
   var keptRows = [];
@@ -783,30 +786,17 @@ function deleteRecordsWhere_(sheetName, predicateFn) {
 
   if (matchIndices.length === 0) return 0;
   if (keptRows.length === 0) {
-    return clearSheetRecords(sheetName);
+    clearSheetRecords(sheetName);
+    return matchIndices.length;
   }
-  if (matchIndices.length <= 40) {
-    for (var k = matchIndices.length - 1; k >= 0; k--) {
-      var targetRow = matchIndices[k] + 2;
-      if (typeof safeDeleteSheetRows_ === 'function') {
-        safeDeleteSheetRows_(sheet, targetRow, 1);
-      } else {
-        sheet.getRange(targetRow, 1, 1, headers.length).clearContent().clearNote();
-      }
-    }
-  } else {
-    sheet.getRange(2, 1, values.length, headers.length).clearContent();
-    sheet.getRange(2, 1, keptRows.length, headers.length).setValues(keptRows);
-    var extraRows = values.length - keptRows.length;
-    if (extraRows > 0) {
-      if (typeof safeDeleteSheetRows_ === 'function') {
-        safeDeleteSheetRows_(sheet, 2 + keptRows.length, extraRows);
-      } else {
-        sheet.getRange(2 + keptRows.length, 1, extraRows, headers.length).clearContent().clearNote();
-      }
-    }
+  var dataRange = sheet.getRange(firstDataRow, 1, values.length, headers.length);
+  if (typeof dataRange.clearContent === 'function') dataRange.clearContent();
+  if (typeof dataRange.clearNote === 'function') dataRange.clearNote();
+  if (typeof ensureSheetCapacity_ === 'function') {
+    ensureSheetCapacity_(sheet, firstDataRow + keptRows.length - 1, headers.length);
   }
-  invalidateCache(sheetName);
+  sheet.getRange(firstDataRow, 1, keptRows.length, headers.length).setValues(keptRows);
+  invalidateCache(sheetName, false);
   return matchIndices.length;
 }
 

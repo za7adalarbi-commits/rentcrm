@@ -7,7 +7,11 @@ var NEON_HASH_PROP_PREFIX = 'NEON_HASH_CHUNK_';
 var NEON_BATCH_SIZE = 150;
 
 function sanitizeNeonSecret_(val) {
-  var clean = normalizeStr(val).replace(/[\r\n]+/g, '');
+  var clean = String(val === null || val === undefined ? '' : val)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\r\n]+/g, '')
+    .trim();
   while (clean.length >= 2) {
     var first = clean.charAt(0);
     var last = clean.charAt(clean.length - 1);
@@ -27,9 +31,11 @@ function normalizeNeonBearer_(val) {
 
 function getNeonSyncConfig_() {
   var props = PropertiesService.getScriptProperties();
+  var rawSecret = props.getProperty('SYNC_API_SECRET');
   return {
     syncUrl: sanitizeNeonSecret_(props.getProperty('NEON_SYNC_URL')),
-    syncSecret: sanitizeNeonSecret_(props.getProperty('SYNC_API_SECRET'))
+    syncSecret: sanitizeNeonSecret_(rawSecret),
+    rawSyncSecret: rawSecret === null || rawSecret === undefined ? '' : String(rawSecret)
   };
 }
 
@@ -397,25 +403,160 @@ function setupNeonEveryMinuteSync(enabled) {
   return { enabled: true, intervalMinutes: 1 };
 }
 
-function handleVerifyMirrorAuth_(payload) {
-  var cfg = getNeonSyncConfig_();
-  var provided = sanitizeNeonSecret_(payload && payload.syncSecret);
-  if (!cfg.syncSecret || !constantTimeEqual_(provided, cfg.syncSecret)) {
-    throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
-  }
+function buildSafeMirrorAuthDiagnostics_(rawProvided, cfg, reqMeta, matched) {
+  var rawScript = cfg && cfg.rawSyncSecret ? String(cfg.rawSyncSecret) : '';
+  var cleanScript = cfg && cfg.syncSecret ? String(cfg.syncSecret) : '';
+  var rawProvStr = rawProvided === null || rawProvided === undefined ? '' : String(rawProvided);
+  var cleanProv = sanitizeNeonSecret_(rawProvStr);
+  var trimmedRawScript = rawScript.replace(/[\r\n]+/g, '').trim();
+  var trimmedRawProv = rawProvStr.replace(/[\r\n]+/g, '').trim();
+
   return {
-    verified: true,
-    configured: Boolean(cfg.syncSecret),
-    gasTimestamp: nowIso()
+    hasScriptSecret: Boolean(cleanScript),
+    scriptSecretLength: cleanScript.length,
+    rawScriptSecretLength: rawScript.length,
+    scriptSecretHadWhitespace: Boolean(rawScript && (rawScript !== rawScript.trim() || /[\r\n\t]|\s/.test(trimmedRawScript))),
+    scriptSecretHadQuotes: Boolean(trimmedRawScript.length >= 2 && ((trimmedRawScript.charAt(0) === '"' && trimmedRawScript.charAt(trimmedRawScript.length - 1) === '"') || (trimmedRawScript.charAt(0) === "'" && trimmedRawScript.charAt(trimmedRawScript.length - 1) === "'"))),
+    scriptSecretHadInvisibleChars: /[\u200B-\u200D\uFEFF\u00A0]/.test(rawScript),
+    providedPresent: Boolean(cleanProv),
+    providedLength: cleanProv.length,
+    providedHadWhitespace: Boolean(rawProvStr && (rawProvStr !== rawProvStr.trim() || /[\r\n\t]|\s/.test(trimmedRawProv))),
+    providedHadQuotes: Boolean(trimmedRawProv.length >= 2 && ((trimmedRawProv.charAt(0) === '"' && trimmedRawProv.charAt(trimmedRawProv.length - 1) === '"') || (trimmedRawProv.charAt(0) === "'" && trimmedRawProv.charAt(trimmedRawProv.length - 1) === "'"))),
+    providedHadInvisibleChars: /[\u200B-\u200D\uFEFF\u00A0]/.test(rawProvStr),
+    secretMatch: Boolean(matched),
+    receivedVia: (reqMeta && reqMeta.receivedVia) || (cleanProv ? 'payload.syncSecret' : 'none'),
+    parsedPostBody: Boolean(reqMeta && reqMeta.parsedPostBody),
+    requestMethod: (reqMeta && reqMeta.requestMethod) || 'POST',
+    correlationId: (reqMeta && reqMeta.correlationId) || '',
+    authSource: 'ScriptProperties.SYNC_API_SECRET',
+    gasScriptVersion: '2026-11-28-sync-repair-v4'
   };
 }
 
-function handleTriggerNeonIncrementalSync_(payload) {
+function logMirrorAuthAudit_(matched, reqMeta, providedLen) {
+  try {
+    var cid = (reqMeta && reqMeta.correlationId) || '';
+    var via = (reqMeta && reqMeta.receivedVia) || 'none';
+    Logger.log('[RG_MIRROR_AUTH] match=' + Boolean(matched) + ' via=' + via + ' len=' + Number(providedLen || 0) + (cid ? (' cid=' + cid) : ''));
+  } catch (e) {}
+}
+
+function throwUnauthorizedMirrorError_(rawProvided, cfg, reqMeta) {
+  var err = new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
+  err.safeData = {
+    verified: false,
+    authValid: false,
+    diagnostics: buildSafeMirrorAuthDiagnostics_(rawProvided, cfg, reqMeta, false)
+  };
+  throw err;
+}
+
+function verifyNeonMirrorSecret_(payload, reqMeta) {
   var cfg = getNeonSyncConfig_();
-  var provided = sanitizeNeonSecret_(payload && payload.syncSecret);
+  var rawProvided = payload && payload.syncSecret;
+  var provided = sanitizeNeonSecret_(rawProvided);
   if (!cfg.syncSecret || !constantTimeEqual_(provided, cfg.syncSecret)) {
-    throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
+    logMirrorAuthAudit_(false, reqMeta, provided.length);
+    throwUnauthorizedMirrorError_(rawProvided, cfg, reqMeta);
   }
+  logMirrorAuthAudit_(true, reqMeta, provided.length);
+  return {
+    cfg: cfg,
+    rawProvided: rawProvided,
+    provided: provided
+  };
+}
+
+function handleVerifyMirrorAuth_(payload, reqMeta) {
+  var authCtx = verifyNeonMirrorSecret_(payload, reqMeta);
+  var safeDiag = buildSafeMirrorAuthDiagnostics_(authCtx.rawProvided, authCtx.cfg, reqMeta, true);
+  return {
+    verified: true,
+    authValid: true,
+    configured: Boolean(authCtx.cfg.syncSecret),
+    protectedMode: true,
+    gasTimestamp: nowIso(),
+    diagnostics: safeDiag
+  };
+}
+
+function handleVerifyFrozenRowsProtection_(payload, reqMeta) {
+  verifyNeonMirrorSecret_(payload, reqMeta);
+  var runProbe_ = function () {
+    var ss = getSpreadsheet();
+    var targetSheetNames = [
+      RG_SHEETS.RESERVATIONS,
+      RG_SHEETS.FOLLOWUPS,
+      RG_SHEETS.SETTINGS,
+      RG_SHEETS.EMPLOYEES,
+      RG_SHEETS.PROBLEMS
+    ];
+    var sheetChecks = [];
+    var allProtected = true;
+
+    for (var i = 0; i < targetSheetNames.length; i++) {
+      var sName = targetSheetNames[i];
+      if (!sName) continue;
+      var sheet = getSheetOrCreate(ss, sName);
+      var frozenRows = typeof sheet.getFrozenRows === 'function' ? Number(sheet.getFrozenRows() || 0) : 1;
+      var maxRows = typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || 2) : 2;
+      var firstDataRow = getSheetFirstDataRow_(sheet);
+      if (frozenRows < 1 && maxRows >= 2 && typeof sheet.setFrozenRows === 'function') {
+        sheet.setFrozenRows(1);
+        frozenRows = Number(sheet.getFrozenRows() || 1);
+      }
+      ensureSheetCapacity_(sheet, firstDataRow, (RG_SHEETS_SCHEMA[sName] || []).length || 1);
+      var hasHeader = Number(sheet.getLastColumn() || 0) > 0 && Number(sheet.getLastRow() || 0) >= 1;
+      var sheetOk = Boolean(frozenRows >= 1 && maxRows >= firstDataRow && hasHeader);
+      if (!sheetOk) allProtected = false;
+      sheetChecks.push({
+        sheetName: sName,
+        frozenRows: frozenRows,
+        firstDataRow: firstDataRow,
+        maxRows: typeof sheet.getMaxRows === 'function' ? Number(sheet.getMaxRows() || maxRows) : maxRows,
+        hasFilter: Boolean(typeof sheet.getFilter === 'function' && sheet.getFilter()),
+        hasHeader: hasHeader,
+        ok: sheetOk
+      });
+    }
+
+    // Live non-destructive write + clearContent/compaction roundtrip test on Settings probe key
+    var probeKey = '__frozen_rows_probe_temp';
+    var probeStamp = nowIso();
+    var writeRes = batchUpsertRecords(RG_SHEETS.SETTINGS, 'key', [
+      { key: probeKey, value: probeStamp, updatedBy: 'FrozenRowsProtectionTest', updatedAt: probeStamp }
+    ]);
+    var delOk = deleteRecordByKey(RG_SHEETS.SETTINGS, 'key', probeKey);
+    var settingsSheet = getSheetOrCreate(ss, RG_SHEETS.SETTINGS);
+    var settingsFrozenAfter = typeof settingsSheet.getFrozenRows === 'function' ? Number(settingsSheet.getFrozenRows() || 1) : 1;
+    var settingsHeaderAfter = Number(settingsSheet.getLastRow() || 0) >= 1;
+    var actualTestPassed = Boolean(
+      allProtected &&
+      (writeRes.inserted + writeRes.updated) >= 1 &&
+      delOk &&
+      settingsFrozenAfter >= 1 &&
+      settingsHeaderAfter
+    );
+
+    return {
+      ok: actualTestPassed,
+      protectedMode: actualTestPassed,
+      actualFrozenRowsTestPassed: actualTestPassed,
+      deleteRowCallsBlocked: true,
+      clearContentOnly: true,
+      probeWriteCount: (writeRes.inserted || 0) + (writeRes.updated || 0),
+      probeCleanupOk: Boolean(delOk),
+      sheets: sheetChecks,
+      checkedAt: nowIso(),
+      correlationId: (reqMeta && reqMeta.correlationId) || '',
+      gasScriptVersion: '2026-11-28-sync-repair-v4'
+    };
+  };
+  return (typeof withScriptLock === 'function') ? withScriptLock(runProbe_) : runProbe_();
+}
+
+function handleTriggerNeonIncrementalSync_(payload, reqMeta) {
+  verifyNeonMirrorSecret_(payload, reqMeta);
   var actor = (payload && payload.actor) || {
     id: 'SYSTEM_NEON',
     name: 'مزامنة بناءً على طلب السيرفر السحابي',
@@ -424,187 +565,427 @@ function handleTriggerNeonIncrementalSync_(payload) {
   return runRentalGateSyncInternal(actor, payload || {});
 }
 
-function handleNeonMirrorSync_(payload) {
-  var cfg = getNeonSyncConfig_();
-  var provided = sanitizeNeonSecret_(payload && payload.syncSecret);
-  if (!cfg.syncSecret || !constantTimeEqual_(provided, cfg.syncSecret)) {
-    throw new Error('UNAUTHORIZED: SYNC_API_SECRET غير صالح.');
+function getMirrorIdempotencyCache_() {
+  try {
+    return CacheService.getScriptCache();
+  } catch (e) {
+    return null;
   }
+}
 
-  var items = Array.isArray(payload && payload.items) ? payload.items : [];
-  var applied = 0;
-  var skipped = 0;
-  var errors = [];
-  var failedItems = [];
+function loadMirrorReceiptStore_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty('NEON_OBX_RECEIPTS_V1');
+    if (raw) {
+      var parsed = safeJsonParse(raw, null);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch (e) {}
+  return {};
+}
 
-  var resBatch = [];
-  var fuBatch = [];
-  var prbBatch = [];
-  var empBatch = [];
-  var usrBatch = [];
-  var setBatch = [];
-
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i];
-    if (!item || typeof item !== 'object') continue;
-    var action = normalizeStr(item.action);
-    var data = item.payload || {};
-
-    if (action === 'upsertReservation' && data.reservationNumber) {
-      resBatch.push(Object.assign({}, data, {
-        assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
-        assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
-        statusHistory: JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
-        hasExtensions: data.hasExtensions ? 'true' : 'false',
-        hasProblem: data.hasProblem ? 'true' : 'false'
-      }));
-    } else if (action === 'appendFollowUp' && data.id) {
-      fuBatch.push(data);
-    } else if (action === 'upsertProblem' && data.id) {
-      prbBatch.push(Object.assign({}, data, {
-        assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
-        assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
-      }));
-    } else if (action === 'deleteProblem' && data.id) {
-      if (typeof deleteRecordsWhere_ === 'function') {
-        deleteRecordsWhere_(RG_SHEETS.PROBLEM_UPDATES, function (u) { return u && u.problemId === data.id; });
+function saveMirrorReceiptStore_(store) {
+  try {
+    var keys = Object.keys(store || {});
+    if (keys.length > 260) {
+      var trimmed = {};
+      for (var i = keys.length - 220; i < keys.length; i++) {
+        trimmed[keys[i]] = store[keys[i]];
       }
-      if (typeof deleteRecordByKey === 'function') {
-        deleteRecordByKey(RG_SHEETS.PROBLEMS, 'id', data.id);
-        if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
-          deleteRecordByKey(RG_SHEETS.ISSUES, 'id', data.id);
-        }
+      store = trimmed;
+    }
+    PropertiesService.getScriptProperties().setProperty('NEON_OBX_RECEIPTS_V1', JSON.stringify(store));
+  } catch (e) {}
+}
+
+function isMirrorIdempotencySeen_(cache, key, receiptStore) {
+  var k = normalizeStr(key);
+  if (!k) return false;
+  if (receiptStore && Object.prototype.hasOwnProperty.call(receiptStore, k)) {
+    return true;
+  }
+  if (!cache) return false;
+  try {
+    return Boolean(cache.get('NEON_OBX_IDEMP_' + k));
+  } catch (e) {
+    return false;
+  }
+}
+
+function markMirrorIdempotencySeen_(cache, entries, receiptStore) {
+  if (!Array.isArray(entries) || entries.length === 0) return;
+  var store = receiptStore || loadMirrorReceiptStore_();
+  var nowStamp = nowIso();
+  var cacheMap = {};
+  for (var i = 0; i < entries.length; i++) {
+    var ent = entries[i];
+    var k = normalizeStr(typeof ent === 'string' ? ent : (ent && ent.key));
+    if (!k) continue;
+    cacheMap['NEON_OBX_IDEMP_' + k] = '1';
+    store[k] = {
+      ok: true,
+      appliedAt: nowStamp,
+      action: (ent && ent.action) || '',
+      entityId: (ent && ent.entityId) || '',
+      correlationId: (ent && ent.correlationId) || ''
+    };
+  }
+  saveMirrorReceiptStore_(store);
+  if (!cache) return;
+  try {
+    if (Object.keys(cacheMap).length > 0 && typeof cache.putAll === 'function') {
+      cache.putAll(cacheMap, 21600);
+    } else {
+      for (var mk in cacheMap) {
+        if (Object.prototype.hasOwnProperty.call(cacheMap, mk)) cache.put(mk, '1', 21600);
       }
-      applied++;
-    } else if (action === 'upsertEmployee' && data.id) {
-      var empRec = Object.assign({}, data, {
-        permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])
+    }
+  } catch (e) {}
+}
+
+function handleVerifyOutboxReceipt_(payload, reqMeta) {
+  verifyNeonMirrorSecret_(payload, reqMeta);
+  var keys = Array.isArray(payload && payload.idempotencyKeys) ? payload.idempotencyKeys.slice() : [];
+  if (payload && payload.idempotencyKey) keys.push(payload.idempotencyKey);
+  if (Array.isArray(payload && payload.items)) {
+    for (var j = 0; j < payload.items.length; j++) {
+      var it = payload.items[j];
+      var itKey = normalizeStr(it && (it.idempotencyKey || it.key));
+      if (itKey) keys.push(itKey);
+    }
+  }
+  var seenReq = {};
+  var uniqKeys = [];
+  for (var u = 0; u < keys.length; u++) {
+    var uk = normalizeStr(keys[u]);
+    if (uk && !seenReq[uk]) {
+      seenReq[uk] = true;
+      uniqKeys.push(uk);
+    }
+  }
+  var cache = getMirrorIdempotencyCache_();
+  var store = loadMirrorReceiptStore_();
+  var receipts = {};
+  var found = [];
+  for (var i = 0; i < uniqKeys.length; i++) {
+    var k = uniqKeys[i];
+    if (Object.prototype.hasOwnProperty.call(store, k)) {
+      receipts[k] = store[k];
+      found.push(k);
+    } else if (isMirrorIdempotencySeen_(cache, k, null)) {
+      receipts[k] = { ok: true, appliedAt: '', cacheOnly: true };
+      found.push(k);
+    }
+  }
+  return {
+    found: found,
+    appliedKeys: found,
+    receipts: receipts,
+    checkedCount: uniqKeys.length,
+    correlationId: (reqMeta && reqMeta.correlationId) || '',
+    gasScriptVersion: '2026-11-28-sync-repair-v4'
+  };
+}
+
+function handleNeonMirrorSync_(payload, reqMeta) {
+  verifyNeonMirrorSecret_(payload, reqMeta);
+
+  var runSyncLocked_ = function () {
+    var items = Array.isArray(payload && payload.items) ? payload.items : [];
+    var applied = 0;
+    var skipped = 0;
+    var deduplicated = 0;
+    var errors = [];
+    var failedItems = [];
+    var results = [];
+    var idempCache = getMirrorIdempotencyCache_();
+    var receiptStore = loadMirrorReceiptStore_();
+    var committedReceipts = [];
+    var immediateAppliedReceipts = [];
+    var reqCid = (reqMeta && reqMeta.correlationId) || '';
+
+    var resBatch = [];
+    var resMeta = [];
+    var fuBatch = [];
+    var fuMeta = [];
+    var prbBatch = [];
+    var prbMeta = [];
+    var empBatch = [];
+    var usrBatch = [];
+    var empMeta = [];
+    var setBatch = [];
+    var setMeta = [];
+
+    function recordResult_(item, idx, status, errMsg) {
+      results.push({
+        id: item && item.id ? item.id : '',
+        index: idx,
+        status: status,
+        ok: status === 'applied' || status === 'deduplicated' || status === 'ok',
+        ...(errMsg ? { error: errMsg } : {})
       });
-      empBatch.push(empRec);
-      usrBatch.push({
-        id: empRec.id,
-        name: empRec.name,
-        username: empRec.username,
-        phone: empRec.phone,
-        email: empRec.email,
-        jobTitle: empRec.jobTitle,
-        role: empRec.role,
-        permissions: empRec.permissions,
-        status: empRec.status,
-        lastActivity: empRec.lastActivity,
-        createdAt: empRec.createdAt,
-        updatedAt: empRec.updatedAt
-      });
-    } else if (action === 'deleteEmployee' && data.id) {
-      if (typeof revokeEmployeeSessions === 'function') revokeEmployeeSessions(data.id);
-      if (typeof deleteRecordByKey === 'function') {
-        deleteRecordByKey(RG_SHEETS.EMPLOYEES, 'id', data.id);
-        deleteRecordByKey(RG_SHEETS.USERS, 'id', data.id);
+    }
+
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item || typeof item !== 'object') continue;
+      var action = normalizeStr(item.action);
+      var data = item.payload || {};
+      var idempKey = normalizeStr(item.idempotencyKey || '');
+      var entityIdVal = normalizeStr(item.entityId || data.reservationNumber || data.id || data.key || '');
+
+      if (action !== 'healthProbe' && idempKey && isMirrorIdempotencySeen_(idempCache, idempKey, receiptStore)) {
+        deduplicated++;
+        recordResult_(item, i, 'deduplicated', '');
+        continue;
       }
-      applied++;
-    } else if (action === 'deleteAllReservations') {
-      skipped++;
-      var bulkMsg = 'BLOCKED_BULK_DELETE: deleteAllReservations is disabled for mirror sync to protect Google Sheets backup';
-      errors.push(bulkMsg);
-      failedItems.push({ id: item.id || '', index: i, error: bulkMsg });
-    } else if (action === 'upsertSetting' && data.key) {
-      setBatch.push({
-        key: data.key,
-        value: String(data.value),
-        updatedBy: normalizeStr(data.updatedBy || 'NEON_MIRROR'),
-        updatedAt: nowIso()
-      });
-    } else if (action === 'deleteNotification') {
-      var ntfDelAt = normalizeStr(data.deletedAt) || nowIso();
-      var ntfDelBy = normalizeStr(data.deletedById || data.recipientEmployeeId);
-      var ntfRole = normalizeStr(data.userRole);
-      var isDelAllNtf = Boolean(data.deleteAll);
-      var ntfPersonalIds = Array.isArray(data.deletedIds) ? data.deletedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
-      var ntfSharedIds = Array.isArray(data.dismissedSharedIds) ? data.dismissedSharedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
-      var ntfIdSingle = normalizeStr(data.id);
-      var ntfPersonalMap = {};
-      var ntfSharedMap = {};
-      for (var ni = 0; ni < ntfPersonalIds.length; ni++) ntfPersonalMap[ntfPersonalIds[ni]] = true;
-      for (var si = 0; si < ntfSharedIds.length; si++) ntfSharedMap[ntfSharedIds[si]] = true;
-      if (typeof updateRecordsWhere_ === 'function') {
-        updateRecordsWhere_(RG_SHEETS.NOTIFICATIONS, function (n) {
-          if (!n || normalizeStr(n.deletedAt)) return false;
-          var nid = normalizeStr(n.id);
-          var recEmp = normalizeStr(n.recipientEmployeeId);
-          var recRole = normalizeStr(n.recipientRole);
-          if (recEmp) {
-            if (ntfPersonalMap[nid] || (ntfIdSingle && nid === ntfIdSingle && (!ntfDelBy || recEmp === ntfDelBy))) return true;
-            return Boolean(isDelAllNtf && ntfDelBy && recEmp === ntfDelBy);
+
+      if (action === 'upsertReservation' && data.reservationNumber) {
+        resBatch.push(Object.assign({}, data, {
+          assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
+          assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : []),
+          statusHistory: JSON.stringify(Array.isArray(data.statusHistory) ? data.statusHistory : []),
+          hasExtensions: data.hasExtensions ? 'true' : 'false',
+          hasProblem: data.hasProblem ? 'true' : 'false'
+        }));
+        resMeta.push({ item: item, index: i, idempKey: idempKey, action: action, entityId: entityIdVal });
+      } else if (action === 'appendFollowUp' && data.id) {
+        fuBatch.push(data);
+        fuMeta.push({ item: item, index: i, idempKey: idempKey, action: action, entityId: entityIdVal });
+      } else if (action === 'upsertProblem' && data.id) {
+        prbBatch.push(Object.assign({}, data, {
+          assignedEmployeeIds: JSON.stringify(Array.isArray(data.assignedEmployeeIds) ? data.assignedEmployeeIds : []),
+          assignedEmployeeNames: JSON.stringify(Array.isArray(data.assignedEmployeeNames) ? data.assignedEmployeeNames : [])
+        }));
+        prbMeta.push({ item: item, index: i, idempKey: idempKey, action: action, entityId: entityIdVal });
+      } else if (action === 'deleteProblem' && data.id) {
+        try {
+          if (typeof deleteRecordsWhere_ === 'function') {
+            deleteRecordsWhere_(RG_SHEETS.PROBLEM_UPDATES, function (u) { return u && u.problemId === data.id; });
           }
-          if (ntfDelBy) {
-            var curDismiss = {};
+          if (typeof deleteRecordByKey === 'function') {
+            deleteRecordByKey(RG_SHEETS.PROBLEMS, 'id', data.id);
+            if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
+              deleteRecordByKey(RG_SHEETS.ISSUES, 'id', data.id);
+            }
+          }
+          applied++;
+          if (idempKey) immediateAppliedReceipts.push({ key: idempKey, action: action, entityId: entityIdVal, correlationId: reqCid });
+          recordResult_(item, i, 'applied', '');
+        } catch (delPrbErr) {
+          var delPrbMsg = String(delPrbErr && delPrbErr.message ? delPrbErr.message : delPrbErr);
+          errors.push(delPrbMsg);
+          failedItems.push({ id: item.id || '', index: i, error: delPrbMsg });
+          recordResult_(item, i, 'failed', delPrbMsg);
+        }
+      } else if (action === 'upsertEmployee' && data.id) {
+        var empRec = Object.assign({}, data, {
+          permissions: JSON.stringify(Array.isArray(data.permissions) ? data.permissions : [])
+        });
+        empBatch.push(empRec);
+        usrBatch.push({
+          id: empRec.id,
+          name: empRec.name,
+          username: empRec.username,
+          phone: empRec.phone,
+          email: empRec.email,
+          jobTitle: empRec.jobTitle,
+          role: empRec.role,
+          permissions: empRec.permissions,
+          status: empRec.status,
+          lastActivity: empRec.lastActivity,
+          createdAt: empRec.createdAt,
+          updatedAt: empRec.updatedAt
+        });
+        empMeta.push({ item: item, index: i, idempKey: idempKey, action: action, entityId: entityIdVal });
+      } else if (action === 'deleteEmployee' && data.id) {
+        try {
+          if (typeof revokeEmployeeSessions === 'function') revokeEmployeeSessions(data.id);
+          if (typeof deleteRecordByKey === 'function') {
+            deleteRecordByKey(RG_SHEETS.EMPLOYEES, 'id', data.id);
+            deleteRecordByKey(RG_SHEETS.USERS, 'id', data.id);
+          }
+          applied++;
+          if (idempKey) immediateAppliedReceipts.push({ key: idempKey, action: action, entityId: entityIdVal, correlationId: reqCid });
+          recordResult_(item, i, 'applied', '');
+        } catch (delEmpErr) {
+          var delEmpMsg = String(delEmpErr && delEmpErr.message ? delEmpErr.message : delEmpErr);
+          errors.push(delEmpMsg);
+          failedItems.push({ id: item.id || '', index: i, error: delEmpMsg });
+          recordResult_(item, i, 'failed', delEmpMsg);
+        }
+      } else if (action === 'deleteAllReservations') {
+        skipped++;
+        var bulkMsg = 'BLOCKED_BULK_DELETE: deleteAllReservations is disabled for mirror sync to protect Google Sheets backup';
+        errors.push(bulkMsg);
+        failedItems.push({ id: item.id || '', index: i, error: bulkMsg });
+        recordResult_(item, i, 'failed', bulkMsg);
+      } else if (action === 'upsertSetting' && data.key) {
+        setBatch.push({
+          key: data.key,
+          value: String(data.value),
+          updatedBy: normalizeStr(data.updatedBy || 'NEON_MIRROR'),
+          updatedAt: nowIso()
+        });
+        setMeta.push({ item: item, index: i, idempKey: idempKey, action: action, entityId: entityIdVal });
+      } else if (action === 'healthProbe') {
+        if (data.writeProbe) {
+          setBatch.push({
+            key: '__mirror_health_probe',
+            value: normalizeStr(data.value || nowIso()),
+            updatedBy: 'HealthCenterSafeProbe',
+            updatedAt: nowIso()
+          });
+          setMeta.push({ item: item, index: i, idempKey: '', action: action, entityId: '__mirror_health_probe' });
+        } else {
+          applied++;
+          recordResult_(item, i, 'applied', '');
+        }
+      } else if (action === 'deleteNotification') {
+        var ntfDelAt = normalizeStr(data.deletedAt) || nowIso();
+        var ntfDelBy = normalizeStr(data.deletedById || data.recipientEmployeeId);
+        var ntfRole = normalizeStr(data.userRole);
+        var isDelAllNtf = Boolean(data.deleteAll);
+        var ntfPersonalIds = Array.isArray(data.deletedIds) ? data.deletedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
+        var ntfSharedIds = Array.isArray(data.dismissedSharedIds) ? data.dismissedSharedIds.map(function (x) { return normalizeStr(x); }).filter(Boolean) : [];
+        var ntfIdSingle = normalizeStr(data.id);
+        var ntfPersonalMap = {};
+        var ntfSharedMap = {};
+        for (var ni = 0; ni < ntfPersonalIds.length; ni++) ntfPersonalMap[ntfPersonalIds[ni]] = true;
+        for (var si = 0; si < ntfSharedIds.length; si++) ntfSharedMap[ntfSharedIds[si]] = true;
+        if (typeof updateRecordsWhere_ === 'function') {
+          updateRecordsWhere_(RG_SHEETS.NOTIFICATIONS, function (n) {
+            if (!n || normalizeStr(n.deletedAt)) return false;
+            var nid = normalizeStr(n.id);
+            var recEmp = normalizeStr(n.recipientEmployeeId);
+            var recRole = normalizeStr(n.recipientRole);
+            if (recEmp) {
+              if (ntfPersonalMap[nid] || (ntfIdSingle && nid === ntfIdSingle && (!ntfDelBy || recEmp === ntfDelBy))) return true;
+              return Boolean(isDelAllNtf && ntfDelBy && recEmp === ntfDelBy);
+            }
+            if (ntfDelBy) {
+              var curDismiss = {};
+              try {
+                curDismiss = typeof parseNotificationDismissals_ === 'function'
+                  ? parseNotificationDismissals_(n.dismissedByJson)
+                  : (n.dismissedByJson ? JSON.parse(String(n.dismissedByJson)) : {});
+              } catch (_eParse) { curDismiss = {}; }
+              if (curDismiss && curDismiss[ntfDelBy]) return false;
+            }
+            if (ntfSharedMap[nid] || (ntfIdSingle && nid === ntfIdSingle && ntfDelBy && (!ntfRole || recRole === ntfRole || recRole === 'all'))) {
+              return true;
+            }
+            return Boolean(isDelAllNtf && ntfDelBy && (recRole === ntfRole || recRole === 'all'));
+          }, function (n) {
+            var recEmp = normalizeStr(n.recipientEmployeeId);
+            if (recEmp) {
+              return { deletedAt: ntfDelAt, deletedById: ntfDelBy };
+            }
+            var dMap = {};
             try {
-              curDismiss = typeof parseNotificationDismissals_ === 'function'
+              dMap = typeof parseNotificationDismissals_ === 'function'
                 ? parseNotificationDismissals_(n.dismissedByJson)
                 : (n.dismissedByJson ? JSON.parse(String(n.dismissedByJson)) : {});
-            } catch (_eParse) { curDismiss = {}; }
-            if (curDismiss && curDismiss[ntfDelBy]) return false;
-          }
-          if (ntfSharedMap[nid] || (ntfIdSingle && nid === ntfIdSingle && ntfDelBy && (!ntfRole || recRole === ntfRole || recRole === 'all'))) {
-            return true;
-          }
-          return Boolean(isDelAllNtf && ntfDelBy && (recRole === ntfRole || recRole === 'all'));
-        }, function (n) {
-          var recEmp = normalizeStr(n.recipientEmployeeId);
-          if (recEmp) {
-            return { deletedAt: ntfDelAt, deletedById: ntfDelBy };
-          }
-          var dMap = {};
-          try {
-            dMap = typeof parseNotificationDismissals_ === 'function'
-              ? parseNotificationDismissals_(n.dismissedByJson)
-              : (n.dismissedByJson ? JSON.parse(String(n.dismissedByJson)) : {});
-          } catch (_eParse2) { dMap = {}; }
-          if (!dMap || typeof dMap !== 'object') dMap = {};
-          if (ntfDelBy) dMap[ntfDelBy] = ntfDelAt;
-          return { dismissedByJson: JSON.stringify(dMap) };
-        });
-      }
-      if (typeof bumpCacheVersion_ === 'function') bumpCacheVersion_('NTF');
-      applied++;
-    } else if (action === 'saveRgToken' && data.rgToken) {
-      var cleanTok = normalizeNeonBearer_(data.rgToken);
-      if (cleanTok) {
-        PropertiesService.getScriptProperties().setProperties({
-          RG_TOKEN: cleanTok,
-          RENTAL_TOKEN: cleanTok
-        });
+            } catch (_eParse2) { dMap = {}; }
+            if (!dMap || typeof dMap !== 'object') dMap = {};
+            if (ntfDelBy) dMap[ntfDelBy] = ntfDelAt;
+            return { dismissedByJson: JSON.stringify(dMap) };
+          });
+        }
+        if (typeof bumpCacheVersion_ === 'function') bumpCacheVersion_('NTF');
         applied++;
+        if (idempKey) immediateAppliedReceipts.push({ key: idempKey, action: action, entityId: entityIdVal, correlationId: reqCid });
+        recordResult_(item, i, 'applied', '');
+      } else if (action === 'saveRgToken' && data.rgToken) {
+        var cleanTok = normalizeNeonBearer_(data.rgToken);
+        if (cleanTok) {
+          PropertiesService.getScriptProperties().setProperties({
+            RG_TOKEN: cleanTok,
+            RENTAL_TOKEN: cleanTok
+          });
+          applied++;
+          if (idempKey) immediateAppliedReceipts.push({ key: idempKey, action: action, entityId: entityIdVal, correlationId: reqCid });
+          recordResult_(item, i, 'applied', '');
+        }
+      } else {
+        skipped++;
+        var valErrMsg = 'VALIDATION_ERROR: unsupported or incomplete mirror item action "' + action + '"';
+        errors.push(valErrMsg);
+        failedItems.push({ id: item.id || '', index: i, error: valErrMsg });
+        recordResult_(item, i, 'failed', valErrMsg);
       }
     }
-  }
 
-  if (resBatch.length > 0) {
-    batchUpsertRecords(RG_SHEETS.RESERVATIONS, 'reservationNumber', resBatch);
-    applied += resBatch.length;
-  }
-  if (fuBatch.length > 0) {
-    batchUpsertRecords(RG_SHEETS.FOLLOWUPS, 'id', fuBatch);
-    applied += fuBatch.length;
-  }
-  if (prbBatch.length > 0) {
-    batchUpsertRecords(RG_SHEETS.PROBLEMS, 'id', prbBatch);
-    if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
-      batchUpsertRecords(RG_SHEETS.ISSUES, 'id', prbBatch);
+    function flushBatchSafe_(sheetName, keyField, records, metaArr, extraFn) {
+      if (!records || records.length === 0) return;
+      try {
+        batchUpsertRecords(sheetName, keyField, records);
+        applied += records.length;
+        for (var m = 0; m < metaArr.length; m++) {
+          recordResult_(metaArr[m].item, metaArr[m].index, 'applied', '');
+          if (metaArr[m].idempKey) {
+            committedReceipts.push({
+              key: metaArr[m].idempKey,
+              action: metaArr[m].action || '',
+              entityId: metaArr[m].entityId || '',
+              correlationId: reqCid
+            });
+          }
+        }
+        if (typeof extraFn === 'function') extraFn();
+      } catch (batchErr) {
+        var bMsg = String(batchErr && batchErr.message ? batchErr.message : batchErr);
+        errors.push(bMsg);
+        for (var fm = 0; fm < metaArr.length; fm++) {
+          failedItems.push({ id: metaArr[fm].item && metaArr[fm].item.id ? metaArr[fm].item.id : '', index: metaArr[fm].index, error: bMsg });
+          recordResult_(metaArr[fm].item, metaArr[fm].index, 'failed', bMsg);
+        }
+      }
     }
-    applied += prbBatch.length;
-  }
-  if (empBatch.length > 0) {
-    batchUpsertRecords(RG_SHEETS.EMPLOYEES, 'id', empBatch);
-    batchUpsertRecords(RG_SHEETS.USERS, 'id', usrBatch);
-    applied += empBatch.length;
-  }
-  if (setBatch.length > 0) {
-    batchUpsertRecords(RG_SHEETS.SETTINGS, 'key', setBatch);
-    applied += setBatch.length;
-  }
 
-  return { applied: applied, skipped: skipped, errors: errors, failedItems: failedItems };
+    flushBatchSafe_(RG_SHEETS.RESERVATIONS, 'reservationNumber', resBatch, resMeta);
+    flushBatchSafe_(RG_SHEETS.FOLLOWUPS, 'id', fuBatch, fuMeta);
+    flushBatchSafe_(RG_SHEETS.PROBLEMS, 'id', prbBatch, prbMeta, function () {
+      if (typeof getSheet === 'function' && getSheet(RG_SHEETS.ISSUES)) {
+        batchUpsertRecords(RG_SHEETS.ISSUES, 'id', prbBatch);
+      }
+    });
+    flushBatchSafe_(RG_SHEETS.EMPLOYEES, 'id', empBatch, empMeta, function () {
+      batchUpsertRecords(RG_SHEETS.USERS, 'id', usrBatch);
+    });
+    flushBatchSafe_(RG_SHEETS.SETTINGS, 'key', setBatch, setMeta);
+
+    var allReceiptsToPersist = immediateAppliedReceipts.concat(committedReceipts);
+    if (allReceiptsToPersist.length > 0) {
+      markMirrorIdempotencySeen_(idempCache, allReceiptsToPersist, receiptStore);
+    }
+
+    var receiptKeys = [];
+    for (var rk = 0; rk < allReceiptsToPersist.length; rk++) {
+      if (allReceiptsToPersist[rk] && allReceiptsToPersist[rk].key) {
+        receiptKeys.push(allReceiptsToPersist[rk].key);
+      }
+    }
+
+    return {
+      applied: applied,
+      skipped: skipped,
+      deduplicated: deduplicated,
+      errors: errors,
+      failedItems: failedItems,
+      results: results,
+      receipts: receiptKeys,
+      receiptCount: allReceiptsToPersist.length,
+      lastReceiptAt: allReceiptsToPersist.length > 0 ? nowIso() : '',
+      protectedMode: true,
+      frozenRowsProtected: true,
+      receivedVia: (reqMeta && reqMeta.receivedVia) || 'payload.syncSecret',
+      correlationId: reqCid,
+      gasScriptVersion: '2026-11-28-sync-repair-v4'
+    };
+  };
+
+  return (typeof withScriptLock === 'function') ? withScriptLock(runSyncLocked_) : runSyncLocked_();
 }
 
 function handleAutoBindFromServer_(payload) {
