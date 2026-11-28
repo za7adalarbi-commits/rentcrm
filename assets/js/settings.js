@@ -423,6 +423,16 @@
           '<div id="dev-call-shortcuts-host"></div>' +
         '</div>' +
         (canViewDevIntegrity ? (
+          '<div class="surface-card" id="dev-health-center-card" style="border-top:3px solid var(--brand-primary);margin-bottom:16px;">' +
+            '<div class="section-header">' +
+              '<div>' +
+                '<h2 class="section-title">Database Health Center — مركز صحة قاعدة البيانات</h2>' +
+                '<p class="section-subtitle">مراقبة حقيقية وشاملة لصحة Neon PostgreSQL، تطابق الجداول والأعمدة والقيود، سلامة البيانات مقارنة بـ Rental Gate API، وسلامة المزامنة وOutbox (مخصص للمبرمج فقط).</p>' +
+              '</div>' +
+              '<span class="status-tag status-danger">DEVELOPER ONLY</span>' +
+            '</div>' +
+            '<div id="dev-health-center-host"><div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div></div>' +
+          '</div>' +
           '<div class="surface-card" id="dev-integrity-card" style="border-top:3px solid var(--brand-primary);margin-bottom:16px;">' +
             '<div class="section-header">' +
               '<div>' +
@@ -1002,6 +1012,11 @@
     var devShortcutsHost = document.getElementById('dev-call-shortcuts-host');
     if (isDeveloperUser && devShortcutsHost && root.RGApp && typeof root.RGApp.mountCallShortcutsControlPanel === 'function') {
       root.RGApp.mountCallShortcutsControlPanel(devShortcutsHost, ctx, {});
+    }
+
+    var devHealthHost = document.getElementById('dev-health-center-host');
+    if (canViewDevIntegrity && devHealthHost) {
+      mountDatabaseHealthCenterPanel(devHealthHost, ctx);
     }
 
     var devIntegrityHost = document.getElementById('dev-integrity-host');
@@ -3494,9 +3509,47 @@
       var intSettings = (core && core.normalizeDataIntegritySettings) ? core.normalizeDataIntegritySettings(rep.settings) : (rep.settings || {});
       var liveStats = rep.liveNeonStats || {};
       var latestRun = rep.latestRun || null;
+      var latestAttempt = rep.latestAttempt || latestRun || null;
+      var activeRunningRun = rep.activeRunningRun || null;
+      var diQueryErrors = Array.isArray(rep.queryErrors) ? rep.queryErrors : [];
       var issues = Array.isArray(rep.issues) ? rep.issues : [];
       var actions = Array.isArray(rep.actions) ? rep.actions : [];
       var typeCatalog = (core && core.DATA_INTEGRITY_DISCREPANCY_TYPES) || {};
+
+      var attemptAlertHtml = '';
+      if (activeRunningRun) {
+        attemptAlertHtml +=
+          '<div class="rg-hc-alert-box is-warning" style="margin-bottom:10px;">' +
+            '<div><strong>فحص قيد التنفيذ حالياً:</strong> بدأ منذ <span class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(activeRunningRun.startedAt, ctx)) + '</span> بواسطة ' + escapeHtml(activeRunningRun.triggeredByName || '-') + '.</div>' +
+          '</div>';
+      }
+      if (latestAttempt && (latestAttempt.status === 'failed' || latestAttempt.status === 'partial')) {
+        var attIsFail = latestAttempt.status === 'failed';
+        var attErrTxt = latestAttempt.errorMessage || (attIsFail ? 'تعذر إتمام الفحص عبر Rental Gate API.' : 'اكتمل الفحص جزئياً بسبب عدم اكتمال بعض نقاط نهاية RG API.');
+        attemptAlertHtml +=
+          '<div class="rg-hc-alert-box ' + (attIsFail ? '' : 'is-warning') + '" style="margin-bottom:10px;">' +
+            '<div style="flex:1;min-width:220px;">' +
+              '<strong>' + (attIsFail ? 'فشل آخر محاولة فحص:' : 'تحذير — آخر فحص مكتمل جزئياً:') + '</strong> ' +
+              escapeHtml(attErrTxt) +
+              ' <span class="mono" dir="ltr" style="font-size:11px;opacity:.85;">(' + escapeHtml(formatSettingDateTime(latestAttempt.finishedAt || latestAttempt.startedAt, ctx)) + ')</span>' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm" id="di-copy-attempt-err-btn">نسخ تفاصيل الخطأ</button>' +
+          '</div>';
+      }
+      if (diQueryErrors.length) {
+        attemptAlertHtml +=
+          '<div class="rg-hc-alert-box is-warning" style="margin-bottom:10px;">' +
+            '<div><strong>تحذير استعلامات المراقبة (' + diQueryErrors.length + '):</strong> ' + escapeHtml(diQueryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div>' +
+          '</div>';
+      }
+
+      var latestRunStatusLbl = latestRun
+        ? (latestRun.status === 'partial' ? 'مكتمل جزئياً' : (latestRun.status === 'failed' ? 'فشل' : 'مكتمل'))
+        : '';
+      var latestRunStatusCls = latestRun
+        ? (latestRun.status === 'partial' ? 'status-warning' : (latestRun.status === 'failed' ? 'status-danger' : 'status-success'))
+        : 'status-neutral';
+      var latestRgChecked = latestRun ? (latestRun.rgChecked !== false && Number(latestRun.rgCount || 0) >= 0) : false;
 
       hostEl.innerHTML =
         '<div class="rg-integrity-summary-grid">' +
@@ -3508,12 +3561,23 @@
           '<div class="rg-integrity-stat"><span class="k">التمديدات</span><span class="v tabular-nums">' + Number(liveStats.extensionsCount || 0) + '</span></div>' +
         '</div>' +
 
+        attemptAlertHtml +
+
         (latestRun ? (
-          '<div style="padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);margin-bottom:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12.5px;">' +
-            '<span>آخر فحص: <strong dir="ltr">' + escapeHtml(formatSettingDateTime(latestRun.finishedAt || latestRun.startedAt, ctx)) + '</strong> (' + escapeHtml(latestRun.runMode === 'scheduled' ? 'مجدول' : 'يدوي') + ')</span>' +
-            '<span>Rental Gate API: <strong class="tabular-nums">' + Number(latestRun.rgCount || 0) + '</strong> · Neon: <strong class="tabular-nums">' + Number(latestRun.neonCount || 0) + '</strong> · الفروقات المكتشفة: <strong class="tabular-nums">' + Number(latestRun.discrepanciesCount || 0) + '</strong></span>' +
+          '<div style="padding:10px 12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);margin-bottom:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;font-size:12.5px;">' +
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
+              '<span class="status-tag ' + latestRunStatusCls + '">' + escapeHtml(latestRunStatusLbl) + '</span>' +
+              '<span>آخر فحص صالح: <strong dir="ltr">' + escapeHtml(formatSettingDateTime(latestRun.finishedAt || latestRun.startedAt, ctx)) + '</strong> (' + escapeHtml(latestRun.runMode === 'scheduled' ? 'مجدول' : 'يدوي') + ')</span>' +
+            '</div>' +
+            '<span>' +
+              'Rental Gate API: <strong class="tabular-nums">' + (latestRgChecked ? Number(latestRun.rgCount || 0) : 'غير مفحوص') + '</strong>' +
+              ' · Neon: <strong class="tabular-nums">' + Number(latestRun.neonCount || 0) + '</strong>' +
+              ' · المتطابقة: <strong class="tabular-nums">' + Number(latestRun.matchedCount || 0) + '</strong>' +
+              ' · الفروقات المكتشفة: <strong class="tabular-nums">' + Number(latestRun.discrepanciesCount || 0) + '</strong>' +
+              (latestRun.durationMs ? (' · المدة: <strong class="mono tabular-nums" dir="ltr">' + Number(latestRun.durationMs) + 'ms</strong>') : '') +
+            '</span>' +
           '</div>'
-        ) : '') +
+        ) : '<div style="padding:10px 12px;border:1px dashed var(--border-strong);border-radius:var(--radius-sm);margin-bottom:12px;font-size:12.5px;color:var(--text-muted);">لم يتم تسجيل أي فحص مقارنة مكتمل حتى الآن — اضغط "فحص الآن (قراءة فقط)" لبدء أول مقارنة مع Rental Gate API.</div>') +
 
         '<div style="padding:12px;border:1px solid var(--border-hairline);border-radius:var(--radius-sm);background:var(--bg-surface-subtle);margin-bottom:12px;">' +
           '<div class="form-grid-4">' +
@@ -3708,9 +3772,797 @@
           });
         });
       });
+      var copyErrBtn = hostEl.querySelector('#di-copy-attempt-err-btn');
+      if (copyErrBtn && latestAttempt) {
+        copyErrBtn.addEventListener('click', function () {
+          var payloadStr = JSON.stringify({
+            runId: latestAttempt.id,
+            status: latestAttempt.status,
+            startedAt: latestAttempt.startedAt,
+            finishedAt: latestAttempt.finishedAt,
+            errorMessage: latestAttempt.errorMessage || '',
+            queryErrors: diQueryErrors
+          }, null, 2);
+          copyToClipboardSafe(payloadStr, 'تفاصيل خطأ فحص سلامة البيانات', ctx);
+        });
+      }
     }
 
     loadReport();
+  }
+
+  function copyToClipboardSafe(text, label, ctx) {
+    var val = String(text || '');
+    if (!val) {
+      if (ctx && ctx.toast) ctx.toast('لا توجد تفاصيل لنسخها.', true);
+      return;
+    }
+    var onDone = function () {
+      if (ctx && ctx.toast) ctx.toast('تم نسخ ' + (label || 'التفاصيل') + ' إلى الحافظة.');
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(val).then(onDone).catch(function () {
+        fallbackCopyText(val);
+        onDone();
+      });
+    } else {
+      fallbackCopyText(val);
+      onDone();
+    }
+  }
+
+  function fallbackCopyText(val) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = val;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch (_e) {}
+  }
+
+  async function mountDatabaseHealthCenterPanel(hostEl, ctx) {
+    if (!hostEl) return;
+    var state = {
+      loading: true,
+      report: null,
+      selectedRunId: '',
+      compareWithRg: true,
+      timerId: null
+    };
+
+    var STATUS_META = {
+      healthy: { label: 'Healthy — سليم', short: 'Healthy', cls: 'is-healthy' },
+      warning: { label: 'Warning — تحذير', short: 'Warning', cls: 'is-warning' },
+      critical: { label: 'Critical — حرج', short: 'Critical', cls: 'is-critical' },
+      unknown: { label: 'Unknown — غير معروف', short: 'Unknown', cls: 'is-unknown' }
+    };
+
+    function badgeHtml(status) {
+      var key = String(status || 'unknown').toLowerCase();
+      var meta = STATUS_META[key] || STATUS_META.unknown;
+      return '<span class="rg-hc-status-badge ' + meta.cls + '">' + escapeHtml(meta.label) + '</span>';
+    }
+
+    function clearTimer() {
+      if (state.timerId) {
+        clearInterval(state.timerId);
+        state.timerId = null;
+      }
+    }
+
+    function syncAutoRefreshTimer() {
+      clearTimer();
+      if (!hostEl.isConnected) return;
+      var rep = state.report || {};
+      var setObj = rep.settings || {};
+      if (!setObj.autoRefreshEnabled) return;
+      var sec = Math.min(3600, Math.max(15, Math.round(Number(setObj.autoRefreshIntervalSec || 60))));
+      state.timerId = setInterval(function () {
+        if (!hostEl.isConnected) {
+          clearTimer();
+          return;
+        }
+        loadHealthReport(state.selectedRunId, true);
+      }, sec * 1000);
+    }
+
+    async function loadHealthReport(runId, silent) {
+      if (!silent) {
+        state.loading = true;
+        renderHealthPanel();
+      }
+      try {
+        var res = await root.RGApi.callApi('getDatabaseHealthCenterReport', {
+          abortKey: 'set:hc',
+          runId: runId || state.selectedRunId || ''
+        });
+        if (res && res.aborted) return;
+        if (res && res.success && res.data) {
+          state.report = res.data;
+          if (!state.selectedRunId && res.data.latestRun && res.data.latestRun.id) {
+            state.selectedRunId = res.data.latestRun.id;
+          }
+          syncAutoRefreshTimer();
+        } else if (!silent && ctx && ctx.toast && res && res.message) {
+          ctx.toast(res.message, true);
+        }
+      } catch (_e) {}
+      state.loading = false;
+      renderHealthPanel();
+    }
+
+    function buildErrorBundleText(rep) {
+      var secs = (rep && rep.sections) || {};
+      var dbH = secs.database_health || {};
+      var scH = secs.schema_integrity || {};
+      var diH = secs.data_integrity || {};
+      var syH = secs.sync_health || {};
+      var bundle = {
+        generatedAt: new Date().toISOString(),
+        overallStatus: rep && rep.hasScanned ? rep.overallStatus : 'unknown',
+        runId: rep && rep.latestRun ? rep.latestRun.id : null,
+        databaseHealth: {
+          status: dbH.status,
+          probeError: dbH.probeError || '',
+          queryErrors: dbH.queryErrors || [],
+          lastConnectionError: dbH.lastConnectionError || null,
+          recentErrors: (dbH.recentErrors || []).slice(0, 15)
+        },
+        schemaIntegrity: {
+          status: scH.status,
+          queryErrors: scH.queryErrors || [],
+          missingTables: scH.missingTables || [],
+          missingColumns: scH.missingColumns || [],
+          extraColumns: scH.extraColumns || [],
+          typeMismatches: scH.typeMismatches || [],
+          constraintMismatches: scH.constraintMismatches || [],
+          missingIndexes: scH.missingIndexes || [],
+          pendingMigrations: scH.pendingMigrations || []
+        },
+        dataIntegrity: {
+          status: diH.status,
+          queryErrors: diH.queryErrors || [],
+          rgError: (diH.rgComparison && diH.rgComparison.error) || '',
+          anomalies: diH.anomalies || {}
+        },
+        syncHealth: {
+          status: syH.status,
+          queryErrors: syH.queryErrors || [],
+          workerLastError: syH.worker ? syH.worker.lastError : '',
+          outboxErrorBreakdown: (syH.outbox && syH.outbox.errorBreakdown) || [],
+          outboxRecentErrors: (syH.outbox && syH.outbox.recentErrors) || []
+        }
+      };
+      return JSON.stringify(bundle, null, 2);
+    }
+
+    function openErrorDetailsModal(rep) {
+      var modalRoot = document.getElementById('modal-root');
+      if (!modalRoot) return;
+      var txt = buildErrorBundleText(rep);
+      modalRoot.innerHTML =
+        '<div class="modal-backdrop" id="hc-err-modal" role="dialog" aria-modal="true">' +
+          '<div class="modal-panel" style="max-width:780px;">' +
+            '<div class="modal-header">' +
+              '<h3 class="modal-title">تفاصيل الأخطاء والاختلافات التقنية للمبرمج</h3>' +
+              '<button type="button" class="btn btn-sm" id="hc-err-close">إغلاق</button>' +
+            '</div>' +
+            '<p style="margin:0;font-size:12px;color:var(--text-secondary);">جميع بيانات الاعتماد وروابط الاتصال السرية محجوبة تلقائياً.</p>' +
+            '<pre class="mono" dir="ltr" style="max-height:55vh;overflow:auto;padding:12px;border-radius:8px;border:1px solid var(--border-strong);background:var(--bg-surface-subtle);font-size:11.5px;white-space:pre-wrap;overflow-wrap:anywhere;">' + escapeHtml(txt) + '</pre>' +
+            '<div class="modal-footer">' +
+              '<button type="button" class="btn btn-primary" id="hc-err-copy">نسخ تفاصيل الخطأ</button>' +
+              '<button type="button" class="btn" id="hc-err-cancel">إغلاق</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      var closeM = function () { modalRoot.innerHTML = ''; };
+      modalRoot.querySelector('#hc-err-close').addEventListener('click', closeM);
+      modalRoot.querySelector('#hc-err-cancel').addEventListener('click', closeM);
+      modalRoot.querySelector('#hc-err-copy').addEventListener('click', function () {
+        copyToClipboardSafe(txt, 'تقرير الأخطاء التقنية', ctx);
+      });
+    }
+
+    function exportHealthJson(rep) {
+      try {
+        var jsonText = JSON.stringify(rep, null, 2);
+        var blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        var dt = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        a.href = url;
+        a.download = 'rg-database-health-' + dt + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        if (ctx && ctx.toast) ctx.toast('تم تصدير تقرير JSON بنجاح.');
+      } catch (_e) {
+        if (ctx && ctx.toast) ctx.toast('تعذر تصدير ملف JSON.', true);
+      }
+    }
+
+    function exportHealthPdf(rep) {
+      if (!root.RGReports || typeof root.RGReports.openPdfStudio !== 'function') {
+        if (ctx && ctx.toast) ctx.toast('وحدة تصدير PDF غير متاحة حالياً.', true);
+        return;
+      }
+      var secs = (rep && rep.sections) || {};
+      var dbH = secs.database_health || {};
+      var scH = secs.schema_integrity || {};
+      var diH = secs.data_integrity || {};
+      var syH = secs.sync_health || {};
+      var hasScanned = Boolean(rep && rep.hasScanned);
+      var ov = hasScanned ? (rep.overallStatus || 'unknown') : 'unknown';
+      var latestRun = rep && rep.latestRun ? rep.latestRun : null;
+
+      var sectionRows = [
+        {
+          section: '1. صحة قاعدة البيانات (Database Health)',
+          status: dbH.status || 'unknown',
+          metrics: 'الاتصال: ' + (dbH.connected ? 'متصل' : 'غير متصل') + ' · Latency: ' + Number(dbH.latencyMs || 0) + 'ms · أخطاء SQL/TX: ' + Number((dbH.errorCounts && dbH.errorCounts.sqlErrors) || 0) + '/' + Number((dbH.errorCounts && dbH.errorCounts.txErrors) || 0),
+          checkedAt: formatSettingDateTime(dbH.checkedAt, ctx)
+        },
+        {
+          section: '2. تطابق الجداول والأعمدة (Schema Integrity)',
+          status: scH.status || 'unknown',
+          metrics: 'الجداول: ' + Number(scH.totalTables || 0) + '/' + Number(scH.expectedTables || 0) + ' · أعمدة مفقودة: ' + Number((scH.missingColumns || []).length) + ' · قيود مفقودة: ' + Number((scH.constraintMismatches || []).length),
+          checkedAt: formatSettingDateTime(scH.checkedAt, ctx)
+        },
+        {
+          section: '3. سلامة البيانات (Data Integrity)',
+          status: diH.status || 'unknown',
+          metrics: 'Neon: ' + Number((diH.counts && diH.counts.reservations) || 0) + ' · RG API: ' + ((diH.rgComparison && diH.rgComparison.rgTotalCount !== null && diH.rgComparison.rgTotalCount !== undefined) ? diH.rgComparison.rgTotalCount : 'غير مفحوص') + ' · مكرر: ' + Number(((diH.anomalies && diH.anomalies.duplicateBookings) || []).length),
+          checkedAt: formatSettingDateTime(diH.checkedAt, ctx)
+        },
+        {
+          section: '4. سلامة المزامنة (Sync Health)',
+          status: syH.status || 'unknown',
+          metrics: 'Worker: ' + ((syH.worker && syH.worker.status) || '-') + ' · Outbox فاشلة: ' + Number((syH.outbox && syH.outbox.failed) || 0) + ' · معلقة: ' + (Number((syH.outbox && syH.outbox.pending) || 0) + Number((syH.outbox && syH.outbox.retry) || 0)),
+          checkedAt: formatSettingDateTime(syH.checkedAt, ctx)
+        }
+      ];
+
+      var diffRows = [];
+      (scH.missingTables || []).forEach(function (x) {
+        diffRows.push({ category: 'جدول مفقود', target: x.table, details: (x.codeRefs || []).join(', ') });
+      });
+      (scH.missingColumns || []).forEach(function (x) {
+        diffRows.push({ category: 'عمود مفقود', target: x.table + '.' + x.column, details: 'النوع المتوقع: ' + x.expectedType });
+      });
+      (scH.constraintMismatches || []).forEach(function (x) {
+        diffRows.push({ category: 'قيد/علاقة مفقودة', target: x.table + ' (' + x.constraintType + ')', details: (x.columns || []).join(', ') });
+      });
+      ((diH.rgComparison && diH.rgComparison.diffPreview) || []).slice(0, 20).forEach(function (d) {
+        diffRows.push({ category: 'تعارض بيانات RG/Neon', target: (d.reservationNumber || '-') + ' · ' + (d.fieldName || d.type), details: 'RG: ' + (d.rgValue || '-') + ' | Neon: ' + (d.neonValue || '-') });
+      });
+      ((syH.outbox && syH.outbox.recentErrors) || []).slice(0, 15).forEach(function (o) {
+        diffRows.push({ category: 'خطأ Outbox', target: o.entityType + ':' + o.entityId, details: o.error || o.status });
+      });
+
+      root.RGReports.openPdfStudio({
+        title: 'تقرير مركز صحة قاعدة البيانات — Database Health Center',
+        filename: 'database-health-center-' + new Date().toISOString().slice(0, 10) + '.pdf',
+        lang: 'ar',
+        scopeKey: 'db_health_center',
+        summaryItems: [
+          { label: 'التقييم العام', value: (STATUS_META[ov] && STATUS_META[ov].short) || ov },
+          { label: 'آخر فحص', value: latestRun ? formatSettingDateTime(latestRun.finishedAt || latestRun.startedAt, ctx) : 'لم يُنفذ بعد' },
+          { label: 'حالة Neon PostgreSQL', value: dbH.connected ? ('متصل (' + Number(dbH.latencyMs || 0) + 'ms)') : 'غير متصل' },
+          { label: 'الجداول / الأعمدة', value: Number(scH.totalTables || 0) + ' / ' + Number(scH.totalColumns || 0) },
+          { label: 'حجوزات Neon / RG', value: Number((diH.counts && diH.counts.reservations) || 0) + ' / ' + ((diH.rgComparison && diH.rgComparison.rgTotalCount !== null && diH.rgComparison.rgTotalCount !== undefined) ? diH.rgComparison.rgTotalCount : '-') },
+          { label: 'مهام Outbox الفاشلة', value: String(Number((syH.outbox && syH.outbox.failed) || 0)) }
+        ],
+        columns: [
+          { key: 'section', label: 'القسم' },
+          { key: 'status', label: 'الحالة' },
+          { key: 'metrics', label: 'المؤشرات الرئيسية' },
+          { key: 'checkedAt', label: 'تاريخ الفحص' }
+        ],
+        rows: sectionRows,
+        tables: diffRows.length ? [{
+          title: 'الاختلافات والأخطاء المرصودة',
+          columns: [
+            { key: 'category', label: 'التصنيف' },
+            { key: 'target', label: 'العنصر / المرجع' },
+            { key: 'details', label: 'التفاصيل' }
+          ],
+          rows: diffRows
+        }] : [],
+        extraSections: [{
+          title: 'آخر مزامنة ناجحة حسب المصدر',
+          lines: [
+            'Rental Gate API: ' + formatSettingDateTime(syH.lastSuccessBySource && syH.lastSuccessBySource.rentalGateApi, ctx),
+            'Neon PostgreSQL: ' + formatSettingDateTime(syH.lastSuccessBySource && syH.lastSuccessBySource.neonPostgres, ctx),
+            'Google Apps Script / Sheets: ' + formatSettingDateTime(syH.lastSuccessBySource && syH.lastSuccessBySource.googleAppsScriptSheets, ctx)
+          ]
+        }],
+        initialSettings: { paperSize: 'a4', orientation: 'landscape' },
+        ctx: ctx
+      });
+    }
+
+    function renderHealthPanel() {
+      if (!hostEl.isConnected) {
+        clearTimer();
+        return;
+      }
+      if (state.loading && !state.report) {
+        hostEl.innerHTML = '<div class="rg-skeleton-table-rows"><div class="rg-skeleton-row"></div><div class="rg-skeleton-row"></div></div>';
+        return;
+      }
+      var rep = state.report || {};
+      var hasScanned = Boolean(rep.hasScanned);
+      var overallStatus = hasScanned ? String(rep.overallStatus || 'unknown').toLowerCase() : 'unknown';
+      if (!hasScanned && overallStatus === 'healthy') overallStatus = 'unknown';
+      var latestRun = rep.latestRun || null;
+      var history = Array.isArray(rep.history) ? rep.history : [];
+      var secs = rep.sections || {};
+      var dbH = secs.database_health || { status: 'unknown' };
+      var scH = secs.schema_integrity || { status: 'unknown' };
+      var diH = secs.data_integrity || { status: 'unknown' };
+      var syH = secs.sync_health || { status: 'unknown' };
+      var hcSet = rep.settings || { autoRefreshEnabled: false, autoRefreshIntervalSec: 60 };
+      var poolSnap = rep.poolSnapshot || dbH.pool || {};
+
+      var dbConns = dbH.connections || {};
+      var dbPool = dbH.pool || {};
+      var dbStats = dbH.databaseStats || {};
+      var dbErrCounts = dbH.errorCounts || {};
+      var slowQueries = Array.isArray(dbH.slowQueries) ? dbH.slowQueries : [];
+      var recentDbErrs = Array.isArray(dbH.recentErrors) ? dbH.recentErrors : [];
+
+      var missingTables = Array.isArray(scH.missingTables) ? scH.missingTables : [];
+      var missingCols = Array.isArray(scH.missingColumns) ? scH.missingColumns : [];
+      var extraCols = Array.isArray(scH.extraColumns) ? scH.extraColumns : [];
+      var extraTables = Array.isArray(scH.extraTables) ? scH.extraTables : [];
+      var typeMismatches = Array.isArray(scH.typeMismatches) ? scH.typeMismatches : [];
+      var constraintMismatches = Array.isArray(scH.constraintMismatches) ? scH.constraintMismatches : [];
+      var missingIndexes = Array.isArray(scH.missingIndexes) ? scH.missingIndexes : [];
+      var pendingMigrations = Array.isArray(scH.pendingMigrations) ? scH.pendingMigrations : [];
+      var appliedMigrations = Array.isArray(scH.migrations) ? scH.migrations : [];
+
+      var diCounts = diH.counts || {};
+      var diAnom = diH.anomalies || {};
+      var diOrphChild = diAnom.orphanChildren || {};
+      var diIncCust = diAnom.incompleteCustomers || {};
+      var diLatest = diH.latestIntegrityRun || null;
+      var rgCmp = diH.rgComparison || {};
+
+      var syWorker = syH.worker || null;
+      var syOutbox = syH.outbox || {};
+      var syCheckpoints = Array.isArray(syH.checkpoints) ? syH.checkpoints : [];
+      var syErrBreak = Array.isArray(syOutbox.errorBreakdown) ? syOutbox.errorBreakdown : [];
+      var syRecentErrs = Array.isArray(syOutbox.recentErrors) ? syOutbox.recentErrors : [];
+      var sySources = syH.lastSuccessBySource || {};
+
+      var totalSchemaDiffs = missingTables.length + missingCols.length + extraCols.length +
+        extraTables.filter(function (t) { return !t.isSampleTable; }).length +
+        typeMismatches.length + constraintMismatches.length + missingIndexes.length + pendingMigrations.length;
+
+      var orphanTotal = Number(diOrphChild.followUps || 0) + Number(diOrphChild.assignments || 0) + Number(diOrphChild.customerNotes || 0);
+
+      hostEl.innerHTML =
+        '<div class="rg-hc-shell">' +
+          '<div class="rg-hc-banner ' + ((STATUS_META[overallStatus] && STATUS_META[overallStatus].cls) || 'is-unknown') + '" id="hc-overall-banner">' +
+            '<div class="rg-hc-banner-main">' +
+              '<div class="rg-hc-banner-title-row">' +
+                '<h3 class="rg-hc-banner-title">Overall Database Health</h3>' +
+                badgeHtml(overallStatus) +
+              '</div>' +
+              '<div class="rg-hc-banner-meta">' +
+                (latestRun
+                  ? ('<span>آخر فحص: <strong dir="ltr">' + escapeHtml(formatSettingDateTime(latestRun.finishedAt || latestRun.startedAt, ctx)) + '</strong></span>' +
+                     '<span>النطاق: <strong>' + escapeHtml(latestRun.scope || 'all') + '</strong></span>' +
+                     '<span>المدة: <strong class="mono tabular-nums" dir="ltr">' + Number(latestRun.durationMs || 0) + 'ms</strong></span>' +
+                     '<span>بواسطة: <strong>' + escapeHtml(latestRun.triggeredByName || '-') + '</strong></span>')
+                  : '<span>لم يتم تنفيذ أي فحص فعلي بعد — لا تُعرض حالة Healthy قبل اكتمال الفحص الحقيقي.</span>') +
+                '<span>Pool: <strong class="mono tabular-nums" dir="ltr">' + Number(poolSnap.totalCount || 0) + '/' + Number(poolSnap.maxPoolSize || 0) + '</strong></span>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="rg-hc-controls-bar">' +
+            '<div class="rg-hc-controls-group">' +
+              '<button type="button" class="btn btn-primary btn-sm" id="hc-scan-all-btn">فحص شامل لجميع الأقسام</button>' +
+              '<label class="checkbox-item" style="margin:0;"><input type="checkbox" id="hc-compare-rg-chk"' + (state.compareWithRg ? ' checked' : '') + '> <span>مقارنة حية مع RG API</span></label>' +
+            '</div>' +
+            '<div class="rg-hc-controls-group">' +
+              '<select class="select" id="hc-history-select" aria-label="سجل الفحوصات السابقة" style="min-width:220px;">' +
+                (history.length
+                  ? history.map(function (h) {
+                      var sel = (latestRun && latestRun.id === h.id) ? ' selected' : '';
+                      return '<option value="' + escapeHtml(h.id) + '"' + sel + '>' + escapeHtml(formatSettingDateTime(h.finishedAt || h.startedAt, ctx) + ' · ' + h.scope + ' (' + h.overallStatus + ')') + '</option>';
+                    }).join('')
+                  : '<option value="">سجل الفحوصات السابقة (فارغ)</option>') +
+              '</select>' +
+              '<button type="button" class="btn btn-sm" id="hc-view-errors-btn">تفاصيل الأخطاء</button>' +
+              '<button type="button" class="btn btn-sm" id="hc-copy-errors-btn">نسخ الأخطاء للمبرمج</button>' +
+              '<button type="button" class="btn btn-sm" id="hc-export-json-btn">تصدير JSON</button>' +
+              '<button type="button" class="btn btn-sm" id="hc-export-pdf-btn">تصدير PDF</button>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="rg-hc-autorefresh-bar">' +
+            '<label class="checkbox-item" style="margin:0;"><input type="checkbox" id="hc-autorefresh-chk"' + (hcSet.autoRefreshEnabled ? ' checked' : '') + '> <span>تفعيل التحديث التلقائي للعرض كل</span></label>' +
+            '<input type="number" class="input tabular-nums" id="hc-autorefresh-sec" min="15" max="3600" style="width:90px;" value="' + Number(hcSet.autoRefreshIntervalSec || 60) + '" aria-label="الفاصل بالثواني">' +
+            '<span style="color:var(--text-muted);">ثانية (15–3600)</span>' +
+            '<button type="button" class="btn btn-sm" id="hc-save-settings-btn">حفظ الإعداد</button>' +
+          '</div>' +
+
+          '<div class="rg-hc-sections-grid">' +
+
+            // 1. Database Health
+            '<section class="rg-hc-section-card ' + ((STATUS_META[dbH.status] && STATUS_META[dbH.status].cls) || 'is-unknown') + '" id="hc-sec-database">' +
+              '<div class="rg-hc-section-head">' +
+                '<div>' +
+                  '<h4 class="rg-hc-section-title">1. Database Health — صحة قاعدة البيانات</h4>' +
+                  '<p class="rg-hc-section-sub">' + escapeHtml(dbH.pgVersion || 'Neon PostgreSQL') + (dbH.dbName ? (' · ' + escapeHtml(dbH.dbName)) : '') + '</p>' +
+                '</div>' +
+                '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">' +
+                  badgeHtml(dbH.status || 'unknown') +
+                  '<button type="button" class="btn btn-sm hc-rescan-btn" data-section="database_health">إعادة فحص</button>' +
+                '</div>' +
+              '</div>' +
+              (dbH.probeError ? '<div class="rg-hc-alert-box"><div><strong>خطأ الاتصال/الفحص:</strong> ' + escapeHtml(dbH.probeError) + '</div></div>' : '') +
+              ((dbH.queryErrors && dbH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>تعذر بعض استعلامات المراقبة:</strong> ' + escapeHtml(dbH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
+              '<div class="rg-hc-kv-grid">' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">حالة الاتصال بـ Neon</span><span class="rg-hc-kv-v ' + (dbH.connected ? 'is-success' : 'is-danger') + '">' + (hasScanned && dbH.checkedAt ? (dbH.connected ? 'متصل' : 'غير متصل') : '-') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">زمن الاستجابة</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + (dbH.checkedAt ? (Number(dbH.latencyMs || 0) + ' ms') : '-') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Connection Pool</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + Number(dbPool.totalCount || 0) + '/' + Number(dbPool.maxPoolSize || 0) + ' (idle ' + Number(dbPool.idleCount || 0) + ', wait ' + Number(dbPool.waitingCount || 0) + ')</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الاتصالات النشطة</span><span class="rg-hc-kv-v tabular-nums">' + Number(dbConns.active || 0) + ' / ' + Number(dbConns.maxConnections || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">حالة الاستعلامات</span><span class="rg-hc-kv-v tabular-nums">انتظار ' + Number(dbConns.waiting || 0) + ' · Tx معلقة ' + Number(dbConns.idleInTransaction || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">أطول استعلام نشط</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + Number(dbConns.longestQueryMs || 0) + ' ms</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">أخطاء SQL (7 أيام)</span><span class="rg-hc-kv-v tabular-nums ' + (Number(dbErrCounts.sqlErrors || 0) > 0 ? 'is-danger' : '') + '">' + Number(dbErrCounts.sqlErrors || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">أخطاء Transactions</span><span class="rg-hc-kv-v tabular-nums ' + (Number(dbErrCounts.txErrors || 0) > 0 ? 'is-danger' : '') + '">' + Number(dbErrCounts.txErrors || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">استهلاك القاعدة / Cache Hit</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + Number(dbStats.dbSizeMb || 0) + ' MB · ' + Number(dbStats.cacheHitRatioPct || 0) + '%</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Commits / Rollbacks / Deadlocks</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + Number(dbStats.commits || 0) + ' / ' + Number(dbStats.rollbacks || 0) + ' / ' + Number(dbStats.deadlocks || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">آخر اتصال ناجح</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' + escapeHtml(formatSettingDateTime(dbH.lastSuccessAt, ctx)) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">آخر خطأ اتصال</span><span class="rg-hc-kv-v" style="font-size:11.5px;">' + escapeHtml(dbH.lastConnectionError ? (dbH.lastConnectionError.message || '').slice(0, 70) : 'لا يوجد') + '</span></div>' +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head"><span>الاستعلامات البطيئة (' + slowQueries.length + ')</span><span class="mono" style="font-size:11px;color:var(--text-muted);">' + (dbH.pgStatStatementsAvailable ? 'pg_stat_statements' : 'pg_stat_activity') + '</span></div>' +
+                (slowQueries.length
+                  ? '<div class="table-wrap"><table class="rg-hc-table-mini"><thead><tr><th>الاستعلام</th><th>Calls</th><th>Mean</th><th>Max</th></tr></thead><tbody>' +
+                      slowQueries.slice(0, 6).map(function (sq) {
+                        return '<tr><td class="mono" dir="ltr" style="max-width:260px;overflow-wrap:anywhere;">' + escapeHtml(sq.query || '') + '</td><td class="tabular-nums">' + Number(sq.calls || 0) + '</td><td class="mono tabular-nums" dir="ltr">' + Number(sq.meanMs || 0) + 'ms</td><td class="mono tabular-nums" dir="ltr">' + Number(sq.maxMs || 0) + 'ms</td></tr>';
+                      }).join('') +
+                    '</tbody></table></div>'
+                  : '<div style="font-size:12px;color:var(--text-muted);">لا توجد استعلامات بطيئة مرصودة حالياً.</div>') +
+              '</div>' +
+              (recentDbErrs.length ? (
+                '<div class="rg-hc-subbox">' +
+                  '<div class="rg-hc-subbox-head"><span>أحدث أخطاء الخادم وSQL (' + recentDbErrs.length + ')</span><button type="button" class="btn btn-sm hc-copy-db-errs">نسخ</button></div>' +
+                  '<div class="rg-hc-scroll-list">' +
+                    recentDbErrs.slice(0, 8).map(function (er) {
+                      return '<div class="rg-hc-issue-row ' + (er.category === 'transaction' || er.category === 'sql' ? 'is-critical' : 'is-warning') + '">' +
+                        '<div style="display:flex;justify-content:space-between;gap:6px;"><strong>[' + escapeHtml(er.category || 'runtime') + '] ' + escapeHtml(er.action || er.context || '-') + '</strong><span class="mono" dir="ltr" style="font-size:11px;color:var(--text-muted);">' + escapeHtml(formatSettingDateTime(er.createdAt, ctx)) + '</span></div>' +
+                        '<div style="overflow-wrap:anywhere;">' + escapeHtml(er.message || '') + '</div>' +
+                      '</div>';
+                    }).join('') +
+                  '</div>' +
+                '</div>'
+              ) : '') +
+            '</section>' +
+
+            // 2. Schema Integrity
+            '<section class="rg-hc-section-card ' + ((STATUS_META[scH.status] && STATUS_META[scH.status].cls) || 'is-unknown') + '" id="hc-sec-schema">' +
+              '<div class="rg-hc-section-head">' +
+                '<div>' +
+                  '<h4 class="rg-hc-section-title">2. Schema Integrity — تطابق الجداول والأعمدة</h4>' +
+                  '<p class="rg-hc-section-sub">مقارنة البنية الفعلية في Neon مع مخطط الكود (schemaSql.ts + Migrations)</p>' +
+                '</div>' +
+                '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">' +
+                  badgeHtml(scH.status || 'unknown') +
+                  '<button type="button" class="btn btn-sm hc-rescan-btn" data-section="schema_integrity">إعادة فحص</button>' +
+                '</div>' +
+              '</div>' +
+              ((scH.queryErrors && scH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>ملاحظة استعلام Schema:</strong> ' + escapeHtml(scH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
+              '<div class="rg-hc-kv-grid">' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">إجمالي الجداول (فعلي / متوقع)</span><span class="rg-hc-kv-v tabular-nums">' + Number(scH.totalTables || 0) + ' / ' + Number(scH.expectedTables || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">إجمالي الأعمدة (فعلي / متوقع)</span><span class="rg-hc-kv-v tabular-nums">' + Number(scH.totalColumns || 0) + ' / ' + Number(scH.expectedColumns || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الجداول المفقودة</span><span class="rg-hc-kv-v tabular-nums ' + (missingTables.length ? 'is-danger' : 'is-success') + '">' + missingTables.length + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الأعمدة المفقودة</span><span class="rg-hc-kv-v tabular-nums ' + (missingCols.length ? 'is-danger' : 'is-success') + '">' + missingCols.length + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الأعمدة الزائدة</span><span class="rg-hc-kv-v tabular-nums ' + (extraCols.length ? 'is-warning' : '') + '">' + extraCols.length + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">اختلاف أنواع البيانات</span><span class="rg-hc-kv-v tabular-nums ' + (typeMismatches.length ? 'is-warning' : '') + '">' + typeMismatches.length + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">اختلاف القيود والعلاقات</span><span class="rg-hc-kv-v tabular-nums ' + (constraintMismatches.length ? 'is-danger' : 'is-success') + '">' + constraintMismatches.length + ' <span style="font-size:11px;font-weight:500;">(' + Number(scH.totalConstraints || 0) + '/' + Number(scH.expectedConstraints || 0) + ')</span></span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Indexes المفقودة (من ' + Number(scH.totalIndexes || 0) + ')</span><span class="rg-hc-kv-v tabular-nums ' + (missingIndexes.length ? 'is-warning' : 'is-success') + '">' + missingIndexes.length + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">حالة Migrations</span><span class="rg-hc-kv-v tabular-nums ' + (pendingMigrations.length ? 'is-danger' : 'is-success') + '">' + Number(scH.appliedMigrationsCount || 0) + ' مطبق · ' + pendingMigrations.length + ' معلق</span></div>' +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head"><span>اختلافات Schema بين التطبيق وNeon (' + totalSchemaDiffs + ')</span></div>' +
+                (totalSchemaDiffs > 0
+                  ? '<div class="rg-hc-scroll-list">' +
+                      missingTables.map(function (m) {
+                        return '<div class="rg-hc-issue-row is-critical"><strong>جدول مفقود: <span class="mono">' + escapeHtml(m.table) + '</span></strong><span class="rg-hc-code-refs">' + escapeHtml((m.codeRefs || []).join(' · ')) + '</span></div>';
+                      }).join('') +
+                      missingCols.map(function (c) {
+                        return '<div class="rg-hc-issue-row is-critical"><strong>عمود مفقود: <span class="mono">' + escapeHtml(c.table + '.' + c.column) + '</span> (' + escapeHtml(c.expectedType) + ')</strong><span class="rg-hc-code-refs">' + escapeHtml((c.codeRefs || []).join(' · ')) + '</span></div>';
+                      }).join('') +
+                      constraintMismatches.map(function (cm) {
+                        return '<div class="rg-hc-issue-row ' + (cm.constraintType === 'PRIMARY KEY' ? 'is-critical' : 'is-warning') + '"><strong>قيد/علاقة مفقودة: <span class="mono">' + escapeHtml(cm.table) + '</span> — ' + escapeHtml(cm.constraintType) + ' (' + escapeHtml((cm.columns || []).join(', ')) + (cm.refTable ? (' -> ' + escapeHtml(cm.refTable)) : '') + ')</strong><span class="rg-hc-code-refs">' + escapeHtml((cm.codeRefs || []).join(' · ')) + '</span></div>';
+                      }).join('') +
+                      typeMismatches.map(function (tm) {
+                        return '<div class="rg-hc-issue-row is-warning"><strong>اختلاف نوع عمود: <span class="mono">' + escapeHtml(tm.table + '.' + tm.column) + '</span></strong><span>المتوقع: <code dir="ltr">' + escapeHtml(tm.expectedType) + '</code> · الفعلي: <code dir="ltr">' + escapeHtml(tm.actualType) + '</code></span><span class="rg-hc-code-refs">' + escapeHtml((tm.codeRefs || []).join(' · ')) + '</span></div>';
+                      }).join('') +
+                      missingIndexes.map(function (ix) {
+                        return '<div class="rg-hc-issue-row is-warning"><strong>Index مفقود: <span class="mono">' + escapeHtml(ix.index) + '</span> على <span class="mono">' + escapeHtml(ix.table) + '</span></strong><span class="rg-hc-code-refs">' + escapeHtml((ix.codeRefs || []).join(' · ')) + '</span></div>';
+                      }).join('') +
+                      extraCols.map(function (ec) {
+                        return '<div class="rg-hc-issue-row is-warning"><strong>عمود زائد في Neon: <span class="mono">' + escapeHtml(ec.table + '.' + ec.column) + '</span> (' + escapeHtml(ec.actualType) + ')</strong></div>';
+                      }).join('') +
+                      extraTables.filter(function (et) { return !et.isSampleTable; }).map(function (et) {
+                        return '<div class="rg-hc-issue-row is-warning"><strong>جدول زائد: <span class="mono">' + escapeHtml(et.table) + '</span></strong><span>' + escapeHtml(et.note || '') + '</span></div>';
+                      }).join('') +
+                      pendingMigrations.map(function (pm) {
+                        return '<div class="rg-hc-issue-row is-critical"><strong>Migration معلق: <span class="mono">' + escapeHtml(pm) + '</span></strong><span class="rg-hc-code-refs">backend/db.ts</span></div>';
+                      }).join('') +
+                    '</div>'
+                  : '<div style="font-size:12px;color:var(--text-muted);">' + (hasScanned && scH.totalTables > 0 ? 'جميع الجداول والأعمدة والقيود والـ Indexes والـ Migrations متطابقة مع الكود.' : 'بانتظار تنفيذ الفحص الفعلي لـ Neon PostgreSQL.') + '</div>') +
+                (extraTables.filter(function (t) { return t.isSampleTable; }).length ? '<div style="font-size:11px;color:var(--text-muted);">ملاحظة: يوجد جدول Neon التجريبي (' + escapeHtml(extraTables.filter(function (t) { return t.isSampleTable; }).map(function (t) { return t.table; }).join(', ')) + ') ولا يؤثر على CRM.</div>' : '') +
+              '</div>' +
+              (appliedMigrations.length ? (
+                '<div class="rg-hc-subbox">' +
+                  '<div class="rg-hc-subbox-head"><span>سجل Migrations المطبقة (' + appliedMigrations.length + ')</span></div>' +
+                  '<div class="table-wrap"><table class="rg-hc-table-mini"><thead><tr><th>المعرف</th><th>الوصف</th><th>التاريخ</th></tr></thead><tbody>' +
+                    appliedMigrations.slice(-6).reverse().map(function (mg) {
+                      return '<tr><td class="mono" dir="ltr">' + escapeHtml(mg.id) + '</td><td>' + escapeHtml(mg.description || '-') + '</td><td class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(mg.appliedAt, ctx)) + '</td></tr>';
+                    }).join('') +
+                  '</tbody></table></div>' +
+                '</div>'
+              ) : '') +
+            '</section>' +
+
+            // 3. Data Integrity
+            '<section class="rg-hc-section-card ' + ((STATUS_META[diH.status] && STATUS_META[diH.status].cls) || 'is-unknown') + '" id="hc-sec-data">' +
+              '<div class="rg-hc-section-head">' +
+                '<div>' +
+                  '<h4 class="rg-hc-section-title">3. Data Integrity — سلامة البيانات</h4>' +
+                  '<p class="rg-hc-section-sub">فحص البيانات ومقارنة الحجوزات والتمديدات بين Neon وRental Gate API (قراءة فقط)</p>' +
+                '</div>' +
+                '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">' +
+                  badgeHtml(diH.status || 'unknown') +
+                  '<button type="button" class="btn btn-sm hc-rescan-btn" data-section="data_integrity">إعادة فحص</button>' +
+                '</div>' +
+              '</div>' +
+              (rgCmp.error ? '<div class="rg-hc-alert-box is-warning"><div><strong>تعذر مقارنة RG API الحية:</strong> ' + escapeHtml(rgCmp.error) + '</div></div>' : '') +
+              ((diH.queryErrors && diH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>تحذير استعلامات سلامة البيانات:</strong> ' + escapeHtml(diH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
+              '<div class="rg-hc-kv-grid">' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الحجوزات: RG API / Neon</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + (rgCmp.rgTotalCount !== null && rgCmp.rgTotalCount !== undefined ? rgCmp.rgTotalCount : 'غير مفحوص') + ' / ' + Number(diCounts.reservations || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">المتطابقة بين المصدرين</span><span class="rg-hc-kv-v tabular-nums">' + (rgCmp.matchedCount !== null && rgCmp.matchedCount !== undefined ? rgCmp.matchedCount : '-') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الحجوزات المفقودة في Neon</span><span class="rg-hc-kv-v tabular-nums ' + (Number(rgCmp.missingFromNeonCount || 0) > 0 ? 'is-danger' : '') + '">' + (rgCmp.missingFromNeonCount !== null && rgCmp.missingFromNeonCount !== undefined ? rgCmp.missingFromNeonCount : '-') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الحجوزات المكررة</span><span class="rg-hc-kv-v tabular-nums ' + ((diAnom.duplicateBookings || []).length ? 'is-danger' : 'is-success') + '">' + Number((diAnom.duplicateBookings || []).length) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">اختلاف بيانات وحالات</span><span class="rg-hc-kv-v tabular-nums ' + (Number(rgCmp.mismatchedFieldsCount || 0) > 0 ? 'is-warning' : '') + '">' + (rgCmp.mismatchedFieldsCount !== null && rgCmp.mismatchedFieldsCount !== undefined ? rgCmp.mismatchedFieldsCount : '-') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">أرقام RG المتبادلة (#)</span><span class="rg-hc-kv-v tabular-nums ' + ((diAnom.swappedRgNumbers || []).length ? 'is-warning' : '') + '">' + Number((diAnom.swappedRgNumbers || []).length) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">التمديدات غير المرتبطة</span><span class="rg-hc-kv-v tabular-nums ' + (Number(diAnom.orphanExtensionsCount || 0) > 0 ? 'is-danger' : 'is-success') + '">' + Number(diAnom.orphanExtensionsCount || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">سجلات العملاء غير المكتملة</span><span class="rg-hc-kv-v tabular-nums">هوية ' + Number(diIncCust.missingIdNumber || 0) + ' · جوال ' + Number(diIncCust.missingPhone || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">العلاقات المكسورة بين الجداول</span><span class="rg-hc-kv-v tabular-nums ' + (orphanTotal > 0 ? 'is-danger' : 'is-success') + '">' + orphanTotal + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">تعارض عداد التمديدات / الأعلام</span><span class="rg-hc-kv-v tabular-nums">' + Number((diAnom.extensionCountMismatches || []).length) + ' / ' + Number(diAnom.dualLifecycleFlagsCount || 0) + '</span></div>' +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head">' +
+                  '<span>نتائج آخر فحص مقارنة (' + (diLatest ? escapeHtml(formatSettingDateTime(diLatest.finishedAt || diLatest.startedAt, ctx)) : 'لم يُنفذ') + ')</span>' +
+                  '<button type="button" class="btn btn-sm" id="hc-goto-integrity-btn">فتح لوحة معاينة الفروقات والموافقة</button>' +
+                '</div>' +
+                ((rgCmp.diffPreview && rgCmp.diffPreview.length)
+                  ? '<div class="table-wrap"><table class="rg-hc-table-mini"><thead><tr><th>رقم الحجز</th><th>النوع / الحقل</th><th>RG API</th><th>Neon</th></tr></thead><tbody>' +
+                      rgCmp.diffPreview.slice(0, 12).map(function (d) {
+                        return '<tr><td class="mono">' + escapeHtml(d.reservationNumber || '-') + '</td><td>' + escapeHtml((d.type || '') + (d.fieldName ? (' · ' + d.fieldName) : '')) + '</td><td>' + escapeHtml(d.rgValue || '-') + '</td><td>' + escapeHtml(d.neonValue || '-') + '</td></tr>';
+                      }).join('') +
+                    '</tbody></table></div>'
+                  : '<div style="font-size:12px;color:var(--text-muted);">' + (rgCmp.checkedLive ? 'لا توجد فروقات غير متطابقة في المعاينة الحية الحالية.' : 'فعّل "مقارنة حية مع RG API" واضغط إعادة فحص لعرض الفروقات الفورية دون أي تعديل تلقائي.') + '</div>') +
+              '</div>' +
+            '</section>' +
+
+            // 4. Sync Health
+            '<section class="rg-hc-section-card ' + ((STATUS_META[syH.status] && STATUS_META[syH.status].cls) || 'is-unknown') + '" id="hc-sec-sync">' +
+              '<div class="rg-hc-section-head">' +
+                '<div>' +
+                  '<h4 class="rg-hc-section-title">4. Sync Health — سلامة المزامنة</h4>' +
+                  '<p class="rg-hc-section-sub">RG API · Backend · Neon PostgreSQL · Apps Script / Sheets · Outbox</p>' +
+                '</div>' +
+                '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">' +
+                  badgeHtml(syH.status || 'unknown') +
+                  '<button type="button" class="btn btn-sm hc-rescan-btn" data-section="sync_health">إعادة فحص</button>' +
+                '</div>' +
+              '</div>' +
+              ((syWorker && syWorker.lastError) ? '<div class="rg-hc-alert-box is-warning"><div><strong>آخر خطأ في عامل المزامنة:</strong> ' + escapeHtml(syWorker.lastError) + '</div></div>' : '') +
+              ((syH.queryErrors && syH.queryErrors.length) ? '<div class="rg-hc-alert-box is-warning"><div><strong>تحذير استعلام المزامنة:</strong> ' + escapeHtml(syH.queryErrors.map(function (q) { return q.step + ': ' + q.message; }).join(' | ')) + '</div></div>' : '') +
+              '<div class="rg-hc-kv-grid">' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">حالة المزامنة الحالية</span><span class="rg-hc-kv-v">' + escapeHtml(syWorker ? (syWorker.isSyncing ? 'قيد التنفيذ' : syWorker.status) : 'غير متوفر') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">آخر مزامنة ناجحة</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' + escapeHtml(formatSettingDateTime(syWorker && syWorker.lastSuccessAt, ctx)) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">وقت المزامنة القادمة</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' + escapeHtml(syWorker && syWorker.autoSyncEnabled ? formatSettingDateTime(syWorker.nextRunAt, ctx) : 'متوقفة') + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">مدة آخر عملية مزامنة</span><span class="rg-hc-kv-v mono tabular-nums" dir="ltr">' + Number((syWorker && syWorker.lastDurationMs) || (syH.latestSync && syH.latestSync.durationMs) || 0) + ' ms</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">السجلات المسحوبة / الجديدة</span><span class="rg-hc-kv-v tabular-nums">' + Number((syWorker && syWorker.lastImportedCount) || (syH.latestSync && syH.latestSync.importedCount) || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">الحجوزات المحدّثة / التمديدات</span><span class="rg-hc-kv-v tabular-nums">' + Number((syWorker && syWorker.lastUpdatedCount) || (syH.latestSync && syH.latestSync.updatedCount) || 0) + ' / ' + Number((syWorker && syWorker.lastExtensionsCount) || (syH.latestSync && syH.latestSync.extensionsCount) || 0) + '</span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Transactional Outbox (فاشلة)</span><span class="rg-hc-kv-v tabular-nums ' + (Number(syOutbox.failed || 0) > 0 ? 'is-danger' : 'is-success') + '">' + Number(syOutbox.failed || 0) + ' <span style="font-size:11px;font-weight:500;">(من ' + Number(syOutbox.total || 0) + ')</span></span></div>' +
+                '<div class="rg-hc-kv"><span class="rg-hc-kv-k">العمليات قيد الانتظار</span><span class="rg-hc-kv-v tabular-nums">' + (Number(syOutbox.pending || 0) + Number(syOutbox.retry || 0)) + ' <span style="font-size:11px;font-weight:500;">(مرسل ' + Number(syOutbox.sent || 0) + ')</span></span></div>' +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head"><span>آخر مزامنة ناجحة لكل مصدر</span></div>' +
+                '<div class="rg-hc-source-grid">' +
+                  '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Rental Gate API</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' + escapeHtml(formatSettingDateTime(sySources.rentalGateApi, ctx)) + '</span></div>' +
+                  '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Neon PostgreSQL</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' + escapeHtml(formatSettingDateTime(sySources.neonPostgres, ctx)) + '</span></div>' +
+                  '<div class="rg-hc-kv"><span class="rg-hc-kv-k">Google Apps Script / Sheets</span><span class="rg-hc-kv-v mono" dir="ltr" style="font-size:11.5px;">' + escapeHtml(formatSettingDateTime(sySources.googleAppsScriptSheets, ctx)) + '</span></div>' +
+                '</div>' +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head"><span>حالة Checkpoints (' + syCheckpoints.length + ')</span></div>' +
+                (syCheckpoints.length
+                  ? '<div class="table-wrap"><table class="rg-hc-table-mini"><thead><tr><th>المصدر</th><th>الحالة</th><th>الدفعة</th><th>آخر نجاح</th></tr></thead><tbody>' +
+                      syCheckpoints.slice(0, 8).map(function (cp) {
+                        return '<tr><td class="mono" dir="ltr">' + escapeHtml(cp.source) + '</td><td>' + escapeHtml(cp.lastStatus || '-') + '</td><td class="tabular-nums">' + Number(cp.lastBatchCount || 0) + '</td><td class="mono" dir="ltr">' + escapeHtml(formatSettingDateTime(cp.lastSuccessfulAt || cp.lastSyncAt, ctx)) + '</td></tr>';
+                      }).join('') +
+                    '</tbody></table></div>'
+                  : '<div style="font-size:12px;color:var(--text-muted);">لا توجد Checkpoints مسجلة بعد.</div>') +
+              '</div>' +
+              '<div class="rg-hc-subbox">' +
+                '<div class="rg-hc-subbox-head">' +
+                  '<span>أخطاء المزامنة وإعادة المحاولة الآمنة (تمنع تكرار البيانات)</span>' +
+                  '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+                    '<button type="button" class="btn btn-sm btn-primary hc-retry-sync-btn" data-mode="outbox_transient">إعادة محاولة Outbox المؤقتة</button>' +
+                    '<button type="button" class="btn btn-sm hc-retry-sync-btn" data-mode="rg_missing_records">استعادة السجلات الناقصة من RG</button>' +
+                  '</div>' +
+                '</div>' +
+                (syErrBreak.length
+                  ? '<div class="rg-hc-scroll-list">' +
+                      syErrBreak.map(function (eb) {
+                        return '<div class="rg-hc-issue-row ' + (eb.isTransient ? 'is-warning' : 'is-critical') + '">' +
+                          '<div style="display:flex;justify-content:space-between;gap:6px;"><strong>' + (eb.isTransient ? 'خطأ مؤقت قابل للإعادة' : 'خطأ صلاحيات/إعداد') + '</strong><span class="tabular-nums">العدد: ' + Number(eb.count || 0) + '</span></div>' +
+                          '<div class="mono" dir="ltr" style="font-size:11px;overflow-wrap:anywhere;">' + escapeHtml(eb.error || '') + '</div>' +
+                        '</div>';
+                      }).join('') +
+                    '</div>'
+                  : (syRecentErrs.length
+                      ? '<div class="rg-hc-scroll-list">' + syRecentErrs.slice(0, 6).map(function (re) { return '<div class="rg-hc-issue-row is-warning"><span class="mono" dir="ltr">' + escapeHtml(re.entityType + ':' + re.entityId + ' — ' + re.error) + '</span></div>'; }).join('') + '</div>'
+                      : '<div style="font-size:12px;color:var(--text-muted);">لا توجد أخطاء Outbox فاشلة حالياً.</div>')) +
+              '</div>' +
+            '</section>' +
+
+          '</div>' +
+        '</div>';
+
+      if (root.RGCrmDropdowns && typeof root.RGCrmDropdowns.enhanceAll === 'function') {
+        root.RGCrmDropdowns.enhanceAll(hostEl);
+      }
+
+      var scanAllBtn = hostEl.querySelector('#hc-scan-all-btn');
+      var compareChk = hostEl.querySelector('#hc-compare-rg-chk');
+      if (compareChk) {
+        compareChk.addEventListener('change', function () {
+          state.compareWithRg = Boolean(compareChk.checked);
+        });
+      }
+      if (scanAllBtn) {
+        scanAllBtn.addEventListener('click', function () {
+          runWithLock(scanAllBtn, 'hc:scanAll', async function () {
+            var res = await root.RGApi.callApi('runDatabaseHealthCenterScan', {
+              section: 'all',
+              compareWithRg: state.compareWithRg
+            });
+            if (res && res.success && res.data) {
+              state.report = res.data;
+              state.selectedRunId = res.data.latestRun ? res.data.latestRun.id : '';
+              syncAutoRefreshTimer();
+              renderHealthPanel();
+              ctx.toast('اكتمل الفحص الشامل لمركز صحة قاعدة البيانات.');
+            } else {
+              ctx.toast((res && res.message) || 'تعذر تنفيذ الفحص الشامل.', true);
+            }
+          });
+        });
+      }
+
+      hostEl.querySelectorAll('.hc-rescan-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var sec = btn.getAttribute('data-section') || 'all';
+          runWithLock(btn, 'hc:scan:' + sec, async function () {
+            var res = await root.RGApi.callApi('runDatabaseHealthCenterScan', {
+              section: sec,
+              compareWithRg: state.compareWithRg
+            });
+            if (res && res.success && res.data) {
+              state.report = res.data;
+              state.selectedRunId = res.data.latestRun ? res.data.latestRun.id : '';
+              syncAutoRefreshTimer();
+              renderHealthPanel();
+              ctx.toast('تمت إعادة فحص القسم بنجاح.');
+            } else {
+              ctx.toast((res && res.message) || 'تعذر إعادة فحص القسم.', true);
+            }
+          });
+        });
+      });
+
+      var histSel = hostEl.querySelector('#hc-history-select');
+      if (histSel) {
+        histSel.addEventListener('change', function () {
+          var rid = String(histSel.value || '');
+          if (!rid) return;
+          state.selectedRunId = rid;
+          loadHealthReport(rid, false);
+        });
+      }
+
+      var viewErrBtn = hostEl.querySelector('#hc-view-errors-btn');
+      if (viewErrBtn) {
+        viewErrBtn.addEventListener('click', function () { openErrorDetailsModal(rep); });
+      }
+      var copyAllErrBtn = hostEl.querySelector('#hc-copy-errors-btn');
+      if (copyAllErrBtn) {
+        copyAllErrBtn.addEventListener('click', function () {
+          copyToClipboardSafe(buildErrorBundleText(rep), 'تفاصيل أخطاء مركز صحة قاعدة البيانات', ctx);
+        });
+      }
+      var copyDbErrBtn = hostEl.querySelector('.hc-copy-db-errs');
+      if (copyDbErrBtn) {
+        copyDbErrBtn.addEventListener('click', function () {
+          copyToClipboardSafe(JSON.stringify(recentDbErrs, null, 2), 'أخطاء قاعدة البيانات', ctx);
+        });
+      }
+      var expJsonBtn = hostEl.querySelector('#hc-export-json-btn');
+      if (expJsonBtn) {
+        expJsonBtn.addEventListener('click', function () { exportHealthJson(rep); });
+      }
+      var expPdfBtn = hostEl.querySelector('#hc-export-pdf-btn');
+      if (expPdfBtn) {
+        expPdfBtn.addEventListener('click', function () { exportHealthPdf(rep); });
+      }
+
+      var saveSetBtn = hostEl.querySelector('#hc-save-settings-btn');
+      if (saveSetBtn) {
+        saveSetBtn.addEventListener('click', function () {
+          var arEnabled = Boolean((hostEl.querySelector('#hc-autorefresh-chk') || {}).checked);
+          var arSec = Number((hostEl.querySelector('#hc-autorefresh-sec') || {}).value || 60);
+          runWithLock(saveSetBtn, 'hc:saveSettings', async function () {
+            var res = await root.RGApi.callApi('saveHealthCenterSettings', {
+              autoRefreshEnabled: arEnabled,
+              autoRefreshIntervalSec: arSec
+            });
+            if (res && res.success) {
+              if (!state.report) state.report = {};
+              state.report.settings = (res.data && res.data.settings) || { autoRefreshEnabled: arEnabled, autoRefreshIntervalSec: arSec };
+              syncAutoRefreshTimer();
+              ctx.toast(res.message || 'تم حفظ إعدادات التحديث التلقائي.');
+            } else {
+              ctx.toast((res && res.message) || 'تعذر حفظ الإعدادات.', true);
+            }
+          });
+        });
+      }
+
+      var gotoIntBtn = hostEl.querySelector('#hc-goto-integrity-btn');
+      if (gotoIntBtn) {
+        gotoIntBtn.addEventListener('click', function () {
+          var el = document.getElementById('dev-integrity-card');
+          if (el && typeof el.scrollIntoView === 'function') {
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        });
+      }
+
+      hostEl.querySelectorAll('.hc-retry-sync-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var mode = btn.getAttribute('data-mode') || 'outbox_transient';
+          runWithLock(btn, 'hc:retry:' + mode, async function () {
+            var res = await root.RGApi.callApi('retryHealthCenterFailedSync', { mode: mode, limit: 25 });
+            if (res && res.success) {
+              ctx.toast(res.message || 'تمت إعادة محاولة العمليات الفاشلة بأمان.');
+              loadHealthReport('', true);
+            } else {
+              ctx.toast((res && res.message) || 'تعذر إعادة المحاولة.', true);
+            }
+          });
+        });
+      });
+    }
+
+    loadHealthReport('', false);
   }
 
   root.RGSettings = {

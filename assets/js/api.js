@@ -9233,15 +9233,20 @@
               updatedAt: runNow
             });
           }
+          var matchedSandboxCnt = Math.max(0, resAllInt.length - freshIssues.length);
           var newRun = {
             id: genId('DIRUN'),
             runMode: payload.runMode || 'manual',
             scopes: Array.isArray(payload.scopes) && payload.scopes.length ? payload.scopes : normIntSettings.scopes,
             status: 'completed',
             rgCount: resAllInt.length,
+            rgTotalCount: resAllInt.length,
             neonCount: resAllInt.length,
+            neonTotalCount: resAllInt.length,
+            matchedCount: matchedSandboxCnt,
+            rgChecked: true,
             discrepanciesCount: freshIssues.length,
-            summary: { rg: liveStatsObj, neon: liveStatsObj, byType: {} },
+            summary: { rg: liveStatsObj, neon: liveStatsObj, byType: {}, matchedCount: matchedSandboxCnt, rgChecked: true },
             triggeredById: session.employeeId,
             triggeredByName: session.user.name,
             startedAt: runNow,
@@ -9257,11 +9262,14 @@
             data: {
               run: newRun,
               latestRun: newRun,
+              latestAttempt: newRun,
+              activeRunningRun: null,
               runs: (db.dataIntegrityRuns || []).slice(0, 20),
               issues: freshIssues,
               actions: (db.dataIntegrityActions || []).slice(0, 50),
               settings: normIntSettings,
-              liveNeonStats: liveStatsObj
+              liveNeonStats: liveStatsObj,
+              queryErrors: []
             },
             error: null
           };
@@ -9401,16 +9409,211 @@
           }
           return true;
         });
+        var latestDiRun = (db.dataIntegrityRuns || [])[0] || null;
         return {
           success: true,
           message: '',
           data: {
             settings: normIntSettings,
-            latestRun: (db.dataIntegrityRuns || [])[0] || null,
+            latestRun: latestDiRun,
+            latestAttempt: latestDiRun,
+            activeRunningRun: null,
             runs: (db.dataIntegrityRuns || []).slice(0, 20),
             issues: repIssues,
             actions: (db.dataIntegrityActions || []).slice(0, 50),
-            liveNeonStats: liveStatsObj
+            liveNeonStats: liveStatsObj,
+            queryErrors: []
+          },
+          error: null
+        };
+      }
+
+      case 'getDatabaseHealthCenterReport':
+      case 'runDatabaseHealthCenterScan':
+      case 'saveHealthCenterSettings':
+      case 'retryHealthCenterFailedSync': {
+        if (session.role !== 'developer' || !core.canUserPerform(session.user, 'manage_developer_tools')) {
+          return { success: false, message: 'FORBIDDEN: مركز صحة قاعدة البيانات متاح للمبرمج (Developer) فقط.', data: null, error: 'FORBIDDEN' };
+        }
+        if (!Array.isArray(db.healthCenterRuns)) db.healthCenterRuns = [];
+        var rawHcSet = db.settings.db_health_center_settings || {};
+        var normHcSet = {
+          autoRefreshEnabled: Boolean(rawHcSet.autoRefreshEnabled),
+          autoRefreshIntervalSec: Math.min(3600, Math.max(15, Math.round(Number(rawHcSet.autoRefreshIntervalSec || 60))))
+        };
+        if (action === 'saveHealthCenterSettings') {
+          var nextHcIn = payload.settings || payload || {};
+          normHcSet = {
+            autoRefreshEnabled: Boolean(nextHcIn.autoRefreshEnabled),
+            autoRefreshIntervalSec: Math.min(3600, Math.max(15, Math.round(Number(nextHcIn.autoRefreshIntervalSec || 60))))
+          };
+          db.settings.db_health_center_settings = normHcSet;
+          appendSandboxActivity(db, session.user, 'تحديث إعدادات مركز صحة قاعدة البيانات', 'DbHealthCenter', 'db_health_center_settings', '');
+          saveSandboxDb(db);
+          return { success: true, message: 'تم حفظ إعدادات مركز صحة قاعدة البيانات.', data: { settings: normHcSet }, error: null };
+        }
+        if (action === 'retryHealthCenterFailedSync') {
+          appendSandboxActivity(db, session.user, 'إعادة محاولة المزامنة من مركز صحة قاعدة البيانات', 'DbHealthCenter', String(payload.mode || 'outbox_transient'), '');
+          saveSandboxDb(db);
+          return {
+            success: true,
+            message: 'تمت إعادة جدولة العمليات المتوقفة بأمان (وضع المعاينة المحلية).',
+            data: { mode: String(payload.mode || 'outbox_transient'), requeuedCount: 0, flushResult: { sent: 0, failed: 0, skipped: true } },
+            error: null
+          };
+        }
+        if (action === 'runDatabaseHealthCenterScan') {
+          var hcScope = String(payload.section || payload.scope || 'all').toLowerCase();
+          var hcNow = new Date().toISOString();
+          var prevRun = db.healthCenterRuns[0] || null;
+          var prevSecs = (prevRun && prevRun.sections) || {};
+          var resListHc = db.reservations || [];
+          var openDiCnt = (db.dataIntegrityIssues || []).filter(function (i) { return i && i.resolutionStatus === 'open'; }).length;
+          var swappedList = resListHc.filter(function (r) { return r && r.sourceReservationId && /^RG-/i.test(String(r.reservationNumber || '')) && r.reservationNumber !== r.sourceReservationId; });
+          var newSecs = {
+            database_health: prevSecs.database_health || { status: 'unknown', checkedAt: '' },
+            schema_integrity: prevSecs.schema_integrity || { status: 'unknown', checkedAt: '' },
+            data_integrity: prevSecs.data_integrity || { status: 'unknown', checkedAt: '' },
+            sync_health: prevSecs.sync_health || { status: 'unknown', checkedAt: '' }
+          };
+          if (hcScope === 'all' || hcScope === 'database_health') {
+            newSecs.database_health = {
+              status: 'warning',
+              checkedAt: hcNow,
+              connected: false,
+              latencyMs: 1,
+              pgVersion: 'Sandbox Preview (غير متصل بـ Neon)',
+              dbName: 'localStorage',
+              probeError: 'المتصفح يعمل حالياً في وضع المعاينة المحلية؛ قم بضبط DATABASE_URL على الخادم لفحص Neon PostgreSQL الفعلي.',
+              queryErrors: [],
+              pool: { initialized: false, configured: false, totalCount: 0, idleCount: 0, waitingCount: 0, maxPoolSize: 0 },
+              connections: { maxConnections: 0, total: 0, active: 0, idle: 0, idleInTransaction: 0, waiting: 0, longestQueryMs: 0 },
+              databaseStats: { commits: 0, rollbacks: 0, deadlocks: 0, cacheHitRatioPct: 0, dbSizeBytes: 0, dbSizeMb: 0 },
+              pgStatStatementsAvailable: false,
+              slowQueries: [],
+              tableStats: [],
+              errorCounts: { total24h: 0, total7d: 0, sqlErrors: 0, txErrors: 0, syncErrors: 0 },
+              recentErrors: [],
+              lastSuccessAt: '',
+              lastConnectionError: null
+            };
+          }
+          if (hcScope === 'all' || hcScope === 'schema_integrity') {
+            newSecs.schema_integrity = {
+              status: 'unknown',
+              checkedAt: hcNow,
+              totalTables: 0,
+              expectedTables: 38,
+              totalColumns: 0,
+              expectedColumns: 0,
+              totalConstraints: 0,
+              expectedConstraints: 0,
+              totalIndexes: 0,
+              missingTables: [],
+              missingColumns: [],
+              extraTables: [],
+              extraColumns: [],
+              typeMismatches: [],
+              missingIndexes: [],
+              constraintMismatches: [],
+              appliedMigrationsCount: 0,
+              pendingMigrations: [],
+              migrations: [],
+              queryErrors: [{ step: 'schema_probe', message: 'يتطلب اتصال Neon PostgreSQL عبر /api/crm لقراءة information_schema.' }]
+            };
+          }
+          if (hcScope === 'all' || hcScope === 'data_integrity') {
+            newSecs.data_integrity = {
+              status: (openDiCnt > 0 || swappedList.length > 0) ? 'warning' : 'warning',
+              checkedAt: hcNow,
+              queryErrors: [],
+              counts: {
+                reservations: resListHc.length,
+                customers: (db.customers || []).length,
+                extensions: (db.extensions || []).length,
+                followUps: (db.followUps || []).length,
+                problems: (db.problems || []).length,
+                customerNotes: (db.customerNotes || []).length,
+                activeNotifications: (db.notifications || []).length
+              },
+              anomalies: {
+                duplicateBookings: [],
+                swappedRgNumbers: swappedList.map(function (r) { return { id: r.id, reservation_number: r.reservationNumber, source_reservation_id: r.sourceReservationId, reference_number: r.referenceNumber }; }),
+                orphanExtensionsCount: 0,
+                orphanChildren: { followUps: 0, assignments: 0, customerNotes: 0 },
+                incompleteCustomers: { missingIdNumber: 0, missingPhone: 0, missingEmail: 0 },
+                extensionCountMismatches: [],
+                dualLifecycleFlagsCount: 0,
+                openIntegrityIssuesCount: openDiCnt
+              },
+              latestIntegrityRun: (db.dataIntegrityRuns || [])[0] || null,
+              rgComparison: {
+                checkedLive: false,
+                rgTotalCount: null,
+                neonTotalCount: resListHc.length,
+                matchedCount: null,
+                missingFromNeonCount: null,
+                extraInNeonCount: null,
+                mismatchedFieldsCount: openDiCnt > 0 ? openDiCnt : null,
+                diffPreview: [],
+                error: 'يتطلب اتصال الخادم و RG_TOKEN لتنفيذ المقارنة الحية.'
+              }
+            };
+          }
+          if (hcScope === 'all' || hcScope === 'sync_health') {
+            newSecs.sync_health = {
+              status: 'warning',
+              checkedAt: hcNow,
+              queryErrors: [],
+              lastSuccessBySource: { rentalGateApi: '', neonPostgres: '', googleAppsScriptSheets: '' },
+              worker: null,
+              latestSync: (db.syncLog || [])[0] || null,
+              recentLogs: (db.syncLog || []).slice(0, 15),
+              checkpoints: [],
+              outbox: { total: 0, sent: 0, pending: 0, retry: 0, failed: 0, errorBreakdown: [], recentErrors: [] }
+            };
+          }
+          var allSt = ['database_health', 'schema_integrity', 'data_integrity', 'sync_health'].map(function (k) { return (newSecs[k] && newSecs[k].status) || 'unknown'; });
+          var calcOverall = allSt.every(function (s) { return s === 'unknown'; })
+            ? 'unknown'
+            : (allSt.indexOf('critical') !== -1 ? 'critical' : (allSt.indexOf('warning') !== -1 ? 'warning' : (allSt.every(function (s) { return s === 'healthy'; }) ? 'healthy' : 'warning')));
+          var hcRun = {
+            id: genId('DHC'),
+            scope: hcScope,
+            overallStatus: calcOverall,
+            triggeredById: session.employeeId,
+            triggeredByName: session.user.name,
+            durationMs: 12,
+            summary: { scope: hcScope, overallStatus: calcOverall, reservationsCount: resListHc.length, durationMs: 12 },
+            sections: newSecs,
+            errorMessage: '',
+            startedAt: hcNow,
+            finishedAt: hcNow
+          };
+          db.healthCenterRuns.unshift(hcRun);
+          db.healthCenterRuns = db.healthCenterRuns.slice(0, 20);
+          appendSandboxActivity(db, session.user, 'فحص مركز صحة قاعدة البيانات (' + hcScope + ')', 'DbHealthCenter', hcRun.id, calcOverall);
+          saveSandboxDb(db);
+        }
+        var hcHist = (db.healthCenterRuns || []).slice(0, 20);
+        var activeHc = (payload.runId ? hcHist.find(function (r) { return r.id === payload.runId; }) : null) || hcHist[0] || null;
+        var hcSections = activeHc ? activeHc.sections : {
+          database_health: { status: 'unknown', checkedAt: '' },
+          schema_integrity: { status: 'unknown', checkedAt: '' },
+          data_integrity: { status: 'unknown', checkedAt: '' },
+          sync_health: { status: 'unknown', checkedAt: '' }
+        };
+        return {
+          success: true,
+          message: '',
+          data: {
+            overallStatus: activeHc ? activeHc.overallStatus : 'unknown',
+            hasScanned: Boolean(activeHc),
+            latestRun: activeHc,
+            history: hcHist,
+            sections: hcSections,
+            settings: normHcSet,
+            poolSnapshot: { initialized: false, configured: false, totalCount: 0, idleCount: 0, waitingCount: 0, maxPoolSize: 0 }
           },
           error: null
         };
